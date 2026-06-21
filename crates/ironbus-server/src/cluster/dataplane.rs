@@ -110,6 +110,7 @@
 //!   **cross-cluster geo** plane (C7) are separate.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ironbus_core::clock::Clock;
 use ironbus_core::epoch_cache::{EpochCache, LeaderEpochEndOffset};
@@ -118,12 +119,13 @@ use ironbus_core::types::Offset;
 use ironbus_proto::frame::FrameType;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Log;
+use ironbus_storage::read_plane::ReadPlane;
 
 use super::ack_level::ClusterAckLevel;
 use super::isr::{AckReplicatedBody, IsrConfig, IsrTracker, QuorumAckGate};
 use super::replication::{
     DivergenceTruncation, EpochAwareFollower, FetchRecordsBody, FetchResponseBody, Follower,
-    OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReplicationError, ReplicationLeader,
+    OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReadPlaneLeader, ReplicationError,
 };
 use super::state_machine::Placement;
 
@@ -279,15 +281,22 @@ pub type AckToken = u64;
 
 /// The per-partition DATA-plane role this node runs, derived from the committed placement.
 ///
-/// `'a` borrows the partition's [`Log`] for the LEADER role (the leader serves bytes from the same log
-/// the engine appends to — it never copies). The FOLLOWER role OWNS its replica log (it appends the
-/// leader's bytes to its own copy). `None` holds no state.
-enum PartitionRole<'a, F: Filesystem, C: Clock> {
-    /// This node LEADS the partition: it serves fetches from the leader log + gates produces through
-    /// the ISR quorum.
+/// The LEADER role holds an `Arc`-shared, off-actor [`ReadPlane`] of the partition's log (#654, #715),
+/// NOT a `&Log` borrow: the leader serves committed bytes from the same log the engine appends to, but
+/// it READS them through the lock-free read plane and NEVER writes (or borrows) the log. The engine's
+/// single append actor stays the ONLY writer — the data plane is never a second writer. Holding an
+/// `Arc` (rather than a borrow) is exactly what makes the controller `Send`, so the data plane can run
+/// on a peer-I/O thread alongside the append actor. The FOLLOWER role OWNS its replica log (it appends
+/// the leader's bytes to its OWN copy, via its OWN single writer). `None` holds no state.
+enum PartitionRole<F: Filesystem, C: Clock> {
+    /// This node LEADS the partition: it serves fetches from the leader's read plane + gates produces
+    /// through the ISR quorum.
     Leader {
-        /// A read-only replication view over the leader's partition log (serves `FetchRecords`).
-        log: &'a Log<F, C>,
+        /// The leader's `Arc`-shared, off-actor [`ReadPlane`] (#654): the lock-free view of the SEALED,
+        /// flushed prefix the leader serves `FetchRecords` from. NOT a `&Log` borrow — the leader never
+        /// writes (or borrows) its log here; the append actor remains the sole writer. This `Arc` is
+        /// what makes the role (and the whole controller) `Send`.
+        plane: Arc<ReadPlane<F>>,
         /// The leader's epoch cache (answers `OffsetForLeaderEpoch` queries; the leader-epoch fence).
         epochs: EpochCache,
         /// The ISR tracker: the leader's own fsync'd frontier + every follower's reported frontier.
@@ -310,14 +319,14 @@ enum PartitionRole<'a, F: Filesystem, C: Clock> {
 /// Transport-agnostic by construction: it holds the role state and the ISR / gate logic, and returns
 /// [`DataPlaneAction`]s describing what to send — the caller owns the wire. This is what makes it both
 /// the serve-path driver AND the unit under the in-process 3-node test (the test plays the transport).
-pub struct DataPlaneController<'a, F: Filesystem, C: Clock> {
+pub struct DataPlaneController<F: Filesystem, C: Clock> {
     /// This node's cluster id (the same `u64` node-id space the metadata group / runtime use).
     node_id: u64,
     /// The per-partition role this node runs, keyed by partition id.
-    roles: BTreeMap<u64, PartitionRole<'a, F, C>>,
+    roles: BTreeMap<u64, PartitionRole<F, C>>,
 }
 
-impl<'a, F: Filesystem, C: Clock> DataPlaneController<'a, F, C> {
+impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
     /// A fresh controller for `node_id` with no roles yet. Roles are added by
     /// [`start_leader`](Self::start_leader) / [`start_follower`](Self::start_follower) or, in one shot
     /// from the committed metadata, by [`apply_placement`](Self::apply_placement) /
@@ -360,27 +369,30 @@ impl<'a, F: Filesystem, C: Clock> DataPlaneController<'a, F, C> {
         )
     }
 
-    /// Register this node as the LEADER of `partition`, serving fetches from `log` and gating produces
-    /// through an [`IsrTracker`] / [`QuorumAckGate`] sized by `isr_config` over `replica_ids` (the full
-    /// committed replica set; the leader is implicit and need not appear). The leader's `epochs` cache
-    /// answers divergence queries; pass an [`EpochCache`] seeded with the partition's leader-epoch
-    /// history (or a fresh one for a fresh partition).
+    /// Register this node as the LEADER of `partition`, serving fetches from the `Arc`-shared, off-actor
+    /// read `plane` (#654, #715) — NOT a `&Log` borrow, so the leader never writes (or borrows) its log
+    /// and the controller stays `Send`. Gates produces through an [`IsrTracker`] / [`QuorumAckGate`]
+    /// sized by `isr_config` over `replica_ids` (the full committed replica set; the leader is implicit
+    /// and need not appear). The leader's `epochs` cache answers divergence queries; pass an
+    /// [`EpochCache`] seeded with the partition's leader-epoch history (or a fresh one for a fresh
+    /// partition).
     pub fn start_leader(
         &mut self,
         partition: u64,
-        log: &'a Log<F, C>,
+        plane: Arc<ReadPlane<F>>,
         epochs: EpochCache,
         replica_ids: &[u64],
         isr_config: IsrConfig,
     ) {
         let mut isr = IsrTracker::new(self.node_id, replica_ids, isr_config);
-        // Seed the ISR tracker's own-frontier with the log's current durable head so the leader's
-        // quorum-commit starts from the truth (a recovered log may already hold records).
-        isr.observe_leader_fsync(log.flushed_offset().get());
+        // Seed the ISR tracker's own-frontier with the read plane's current flushed frontier (the same
+        // committed head Log::flushed_offset publishes), so the leader's quorum-commit starts from the
+        // truth (a recovered log may already hold records).
+        isr.observe_leader_fsync(plane.flushed());
         self.roles.insert(
             partition,
             PartitionRole::Leader {
-                log,
+                plane,
                 epochs,
                 isr,
                 gate: QuorumAckGate::new(),
@@ -402,16 +414,18 @@ impl<'a, F: Filesystem, C: Clock> DataPlaneController<'a, F, C> {
 
     /// Remove this node's role for `partition` (it no longer holds a replica). Returns `true` if a role
     /// was held and removed, `false` if this node held no role for the partition. A follower's replica
-    /// log is dropped with the role (closing its files); a leader's log is borrowed (owned by the
-    /// engine) and merely un-referenced here.
+    /// log is dropped with the role (closing its files); a leader's read plane is an `Arc` (the engine
+    /// owns the log) and merely un-referenced here.
     pub fn stop_partition(&mut self, partition: u64) -> bool {
         self.roles.remove(&partition).is_some()
     }
 
     // ---- LEADER role: serve fetches + gate produces ----------------------------------------------
 
-    /// Serve a follower's `FetchRecords` for `partition` from the leader log (zero-copy CRC-framed
-    /// bytes + the leader's high-watermark). Leader-only.
+    /// Serve a follower's `FetchRecords` for `partition` from the leader's off-actor read plane (#654,
+    /// #715): zero-copy CRC-framed bytes of the SEALED, flushed prefix + the leader's high-watermark
+    /// (the read plane's flushed frontier). Leader-only. The leader NEVER writes its log here — it only
+    /// reads the immutable sealed bytes through the `Arc`-shared plane (the single-writer invariant).
     ///
     /// # Errors
     /// [`DataPlaneError::UnknownPartition`] if this node holds no role for `partition`;
@@ -423,8 +437,8 @@ impl<'a, F: Filesystem, C: Clock> DataPlaneController<'a, F, C> {
         req: &FetchRecordsBody,
     ) -> Result<FetchResponseBody, DataPlaneError> {
         match self.roles.get(&partition) {
-            Some(PartitionRole::Leader { log, .. }) => {
-                Ok(ReplicationLeader::new(log).serve_fetch(req)?)
+            Some(PartitionRole::Leader { plane, .. }) => {
+                Ok(ReadPlaneLeader::new(plane).serve_fetch(req)?)
             }
             Some(PartitionRole::Follower { .. }) => Err(DataPlaneError::WrongRole {
                 partition,
@@ -445,8 +459,8 @@ impl<'a, F: Filesystem, C: Clock> DataPlaneController<'a, F, C> {
         req: &OffsetForLeaderEpochBody,
     ) -> Result<OffsetForLeaderEpochResponse, DataPlaneError> {
         match self.roles.get(&partition) {
-            Some(PartitionRole::Leader { log, epochs, .. }) => {
-                Ok(ReplicationLeader::new(log).serve_epoch_query(epochs, req))
+            Some(PartitionRole::Leader { plane, epochs, .. }) => {
+                Ok(ReadPlaneLeader::new(plane).serve_epoch_query(epochs, req))
             }
             Some(PartitionRole::Follower { .. }) => Err(DataPlaneError::WrongRole {
                 partition,
@@ -831,14 +845,15 @@ pub enum AckDisposition {
 /// to the parked wire-`PubAck` bytes and returns for the caller to flush. Below `min_isr` the gate
 /// releases NOTHING (the no-false-ack property), so a parked ack stays withheld — on the REAL wire.
 ///
-/// `'a` is the controller's borrow of the leader partition log; `F`/`C` are the broker's filesystem /
-/// clock seams (the same the engine uses), so the seam is held alongside the engine on a clustered
-/// serve.
-pub struct ProduceAckSeam<'a, F: Filesystem, C: Clock> {
+/// `F`/`C` are the broker's filesystem / clock seams (the same the engine uses), so the seam is held
+/// alongside the engine on a clustered serve. There is NO lifetime: the controller it owns serves
+/// leader fetches through the `Arc`-shared off-actor read plane (#654, #715), not a `&Log` borrow, so
+/// the whole seam is `Send` and can be held in shared broker state and driven on a peer-I/O thread.
+pub struct ProduceAckSeam<F: Filesystem, C: Clock> {
     /// The data-plane controller (#703) this seam drives. Present ONLY on a clustered serve; a
     /// single-node / no-cluster broker never constructs a [`ProduceAckSeam`] at all, so the parking
     /// path is unreachable by construction (the single-node guarantee).
-    controller: DataPlaneController<'a, F, C>,
+    controller: DataPlaneController<F, C>,
     /// The next per-park token. Monotonic; keys [`Self::parked`] and is what the controller's gate
     /// holds + hands back on release. Wraps only after `u64::MAX` parks, which is unreachable.
     next_token: u64,
@@ -848,12 +863,12 @@ pub struct ProduceAckSeam<'a, F: Filesystem, C: Clock> {
     parked: BTreeMap<AckToken, Vec<u8>>,
 }
 
-impl<'a, F: Filesystem, C: Clock> ProduceAckSeam<'a, F, C> {
+impl<F: Filesystem, C: Clock> ProduceAckSeam<F, C> {
     /// Build the seam around a clustered serve's [`DataPlaneController`]. Called ONLY on a clustered
     /// serve (a [`ClusterConfig`](super::ClusterConfig) present); a no-cluster broker never reaches
     /// here, so the parking path is never constructed (the single-node byte-identical guarantee).
     #[must_use]
-    pub fn new(controller: DataPlaneController<'a, F, C>) -> Self {
+    pub fn new(controller: DataPlaneController<F, C>) -> Self {
         Self {
             controller,
             next_token: 0,
@@ -864,14 +879,14 @@ impl<'a, F: Filesystem, C: Clock> ProduceAckSeam<'a, F, C> {
     /// The underlying controller (for role queries / serve-path frame routing). The seam owns it so the
     /// gate's parked state and the parked-bytes side-table can never drift apart.
     #[must_use]
-    pub fn controller(&self) -> &DataPlaneController<'a, F, C> {
+    pub fn controller(&self) -> &DataPlaneController<F, C> {
         &self.controller
     }
 
     /// Mutable access to the underlying controller (the serve-path peer reader routes follower fetches /
     /// epoch queries through it). The produce-ack release path goes through
     /// [`Self::on_follower_report`], which keeps the side-table consistent.
-    pub fn controller_mut(&mut self) -> &mut DataPlaneController<'a, F, C> {
+    pub fn controller_mut(&mut self) -> &mut DataPlaneController<F, C> {
         &mut self.controller
     }
 
@@ -1044,6 +1059,84 @@ mod tests {
         out
     }
 
+    /// The engine's `Arc`-shared, off-actor read plane over a leader log (#654, #715) — what the leader
+    /// role serves fetches from after the #715 refactor (NO `&Log` borrow). The test owns the log; the
+    /// plane keeps observing it (the append actor would keep publishing in a real serve).
+    fn leader_plane(log: &Log<InMemoryFs, ManualClock>) -> Arc<ReadPlane<InMemoryFs>> {
+        Arc::new(log.read_plane().expect("read plane builds"))
+    }
+
+    /// The first offset the leader's read plane does NOT serve off-actor (the sealed-served end): chain
+    /// `read_range_raw` from 0 until it reports no more sealed bytes below the flushed frontier. The
+    /// read plane serves the SEALED prefix; this is the offset a follower converges to over the live
+    /// transport before the active (flushed-but-unsealed) tail seals. Used so byte-identity asserts over
+    /// exactly the replicated range.
+    fn plane_served_end(plane: &ReadPlane<InMemoryFs>) -> u64 {
+        let flushed = plane.flushed();
+        let mut next = 0u64;
+        let mut guard = 0u32;
+        while next < flushed {
+            guard += 1;
+            assert!(guard < 100_000, "read-plane chain failed to terminate");
+            let raw = plane
+                .read_range_raw(Offset::new(next), 1_000, None)
+                .expect("read plane serves");
+            let advanced = raw.run.next_offset.get();
+            if advanced > next {
+                next = advanced;
+            } else {
+                // Nothing more is served off-actor from here (the active tail): stop at the sealed end.
+                break;
+            }
+        }
+        next
+    }
+
+    /// Assert a follower replica is BYTE-IDENTICAL to the leader over the range the read plane served.
+    ///
+    /// A follower replicates frames VERBATIM and seals at the same cap, so a SEALED follower segment is
+    /// byte-for-byte the leader's same-named file (footer included). The follower's LAST (still-active)
+    /// segment holds the same RECORDS but has not sealed yet (it seals on its next roll), so it equals
+    /// the leader's same-named SEALED file MINUS the trailing seal footer — i.e. the leader's file is a
+    /// byte-identical PREFIX-superset. So: every follower file is a byte-identical prefix of the leader's
+    /// same-named file, at least one matches EXACTLY (proving real sealed replication), and the follower
+    /// covered the whole sealed-served prefix. This is the exact invariant the read-plane leader serve
+    /// guarantees; the active flushed tail (and the follower's own trailing seal) close on the next roll
+    /// (FLAGGED).
+    fn assert_replicated_byte_identical(
+        follower_log: &Log<InMemoryFs, ManualClock>,
+        leader_log: &Log<InMemoryFs, ManualClock>,
+        served_end: u64,
+    ) {
+        let leader: std::collections::BTreeMap<String, Vec<u8>> =
+            dump_segments(leader_log).into_iter().collect();
+        let follower = dump_segments(follower_log);
+        assert!(
+            follower.iter().any(|(_, b)| !b.is_empty()),
+            "follower replicated at least one segment file"
+        );
+        let mut any_exact = false;
+        for (name, bytes) in &follower {
+            let leader_bytes = leader
+                .get(name)
+                .unwrap_or_else(|| panic!("leader missing replicated segment file {name}"));
+            assert!(
+                leader_bytes.starts_with(bytes),
+                "follower segment {name} is not a byte-identical prefix of the leader's"
+            );
+            any_exact |= bytes == leader_bytes;
+        }
+        assert!(
+            any_exact,
+            "no fully-sealed follower segment is byte-identical to the leader's (no real replication)"
+        );
+        assert!(
+            follower_log.next_offset().get() >= served_end,
+            "follower ({}) did not cover the read plane's sealed-served prefix ({served_end})",
+            follower_log.next_offset().get()
+        );
+    }
+
     /// The R=3 / `min_isr=2` quorum config (the design default for `R>=3`), no lag eviction.
     fn quorum3() -> IsrConfig {
         IsrConfig {
@@ -1058,8 +1151,8 @@ mod tests {
     /// follower reports its fsync'd frontier back and the leader records it (the `handle_frame` ->
     /// `ReleaseAcks` action). Returns the acks the leader released on this round.
     fn fetch_round(
-        leader: &mut DataPlaneController<'_, InMemoryFs, ManualClock>,
-        follower: &mut DataPlaneController<'_, InMemoryFs, ManualClock>,
+        leader: &mut DataPlaneController<InMemoryFs, ManualClock>,
+        follower: &mut DataPlaneController<InMemoryFs, ManualClock>,
         partition: u64,
     ) -> Vec<AckToken> {
         // follower -> leader: fetch request
@@ -1122,10 +1215,24 @@ mod tests {
         let leader_hw = leader_log.flushed_offset().get();
         assert_eq!(leader_hw, 25);
 
-        // Node 1 leads P over replicas {1,2,3}, min_isr=2 (a 2-of-3 quorum).
+        // Node 1 leads P over replicas {1,2,3}, min_isr=2 (a 2-of-3 quorum). The leader serves through
+        // the engine's OFF-ACTOR read plane (#654, #715), NOT a &Log borrow — it never writes its log.
+        let plane = leader_plane(&leader_log);
+        // The read plane serves the SEALED prefix; the active flushed tail seals later (FLAGGED). The
+        // multi-segment small cap leaves a healthy sealed prefix to replicate + quorum-ack here.
+        let served_end = plane_served_end(&plane);
+        assert!(
+            served_end > 0 && served_end <= leader_hw,
+            "the read plane serves a non-empty sealed prefix (served_end={served_end})"
+        );
         let mut leader = DataPlaneController::new(1);
-        leader.start_leader(P, &leader_log, EpochCache::new(), &[1, 2, 3], quorum3());
-        // The leader's own log is already fsync'd to 25; the ISR tracker was seeded with that on start.
+        leader.start_leader(
+            P,
+            Arc::clone(&plane),
+            EpochCache::new(),
+            &[1, 2, 3],
+            quorum3(),
+        );
 
         // Nodes 2 and 3 each follow P with a fresh replica log.
         let mut follower2 = DataPlaneController::new(2);
@@ -1133,15 +1240,19 @@ mod tests {
         let mut follower3 = DataPlaneController::new(3);
         follower3.start_follower(P, open_log(InMemoryFs::new(), small_config()));
 
-        // PARK all 25 produce acks behind the quorum gate (a real serve parks each produce's PubAck;
-        // here token == offset). The leader has locally fsync'd, but no follower has the data yet.
-        for off in 0..leader_hw {
+        // PARK a produce ack for each sealed-served offset behind the quorum gate (a real serve parks
+        // each produce's PubAck; here token == offset). The leader has locally fsync'd, but no follower
+        // has the data yet.
+        for off in 0..served_end {
             leader.park_produce_ack(P, off, off).unwrap();
         }
-        assert_eq!(leader.pending_ack_count(P), 25);
+        assert_eq!(
+            leader.pending_ack_count(P),
+            usize::try_from(served_end).unwrap()
+        );
 
-        // No follower has fsync'd => the 2-of-3 quorum-commit is 0 (only the leader is at 25) => NO ack
-        // releases. This is the no-false-ack property: leader-only is NOT a quorum.
+        // No follower has fsync'd => the 2-of-3 quorum-commit is 0 (only the leader) => NO ack releases.
+        // This is the no-false-ack property: leader-only is NOT a quorum.
         let released = leader.release_quorum_acked(P).unwrap();
         assert!(
             released.is_empty(),
@@ -1149,33 +1260,35 @@ mod tests {
         );
         assert_eq!(leader.quorum_commit(P), Some(0));
 
-        // Replicate to follower 2 to catch-up. Each round: follower fetches, leader serves, follower
-        // applies + reports, leader records the report and releases the now-quorum-committed acks.
+        // Replicate to follower 2 to catch-up over the read-plane-served prefix. Each round: follower
+        // fetches, leader serves (via the read plane), follower applies + reports, leader records the
+        // report and releases the now-quorum-committed acks.
         let mut released_to_f2: Vec<AckToken> = Vec::new();
-        for _ in 0..(leader_hw + 2) {
-            if follower2.follower_high_watermark(P).unwrap() >= leader_hw {
+        for _ in 0..(leader_hw + 4) {
+            if follower2.follower_high_watermark(P).unwrap() >= served_end {
                 break;
             }
             released_to_f2.extend(fetch_round(&mut leader, &mut follower2, P));
         }
-        // With follower 2 caught up the 2-of-3 quorum (leader + follower2) is met at 25, so ALL 25 acks
-        // released — and ONLY after the quorum fsync'd (not on the leader alone above).
+        // With follower 2 caught up to the sealed-served prefix the 2-of-3 quorum (leader + follower2)
+        // is met at served_end, so ALL parked acks released — and ONLY after the quorum fsync'd.
         let mut all = released_to_f2;
         all.sort_unstable();
-        assert_eq!(all, (0..leader_hw).collect::<Vec<_>>());
-        assert_eq!(leader.pending_ack_count(P), 0, "every ack released");
-        assert_eq!(leader.quorum_commit(P), Some(25));
+        assert_eq!(all, (0..served_end).collect::<Vec<_>>());
+        assert_eq!(leader.pending_ack_count(P), 0, "every parked ack released");
+        assert_eq!(leader.quorum_commit(P), Some(served_end));
 
-        // Follower 2's replica log is BYTE-IDENTICAL to the leader's.
-        assert_eq!(
-            dump_segments(follower2.follower_log(P).unwrap()),
-            dump_segments(&leader_log),
-            "follower 2 replica is byte-identical to the leader"
+        // Follower 2's replica is BYTE-IDENTICAL to the leader over the read-plane-served prefix (every
+        // replicated segment file matches the leader's same-named file).
+        assert_replicated_byte_identical(
+            follower2.follower_log(P).unwrap(),
+            &leader_log,
+            served_end,
         );
 
         // Catch follower 3 up too (its reports release nothing new — the acks already released).
-        for _ in 0..(leader_hw + 2) {
-            if follower3.follower_high_watermark(P).unwrap() >= leader_hw {
+        for _ in 0..(leader_hw + 4) {
+            if follower3.follower_high_watermark(P).unwrap() >= served_end {
                 break;
             }
             let none_new = fetch_round(&mut leader, &mut follower3, P);
@@ -1184,10 +1297,10 @@ mod tests {
                 "acks already released, none re-release"
             );
         }
-        assert_eq!(
-            dump_segments(follower3.follower_log(P).unwrap()),
-            dump_segments(&leader_log),
-            "follower 3 replica is byte-identical to the leader"
+        assert_replicated_byte_identical(
+            follower3.follower_log(P).unwrap(),
+            &leader_log,
+            served_end,
         );
     }
 
@@ -1209,10 +1322,16 @@ mod tests {
         // reports, so both sit at offset 0 — lagging the leader's frontier (10) by far more than the
         // bound. Both are EVICTED for lag, dropping the ISR to the leader alone (size 1 < min_isr 2):
         // there is genuinely no quorum.
+        let plane = leader_plane(&leader_log);
+        let served_end = plane_served_end(&plane);
+        assert!(
+            served_end > 0,
+            "the read plane serves a non-empty sealed prefix"
+        );
         let mut leader = DataPlaneController::new(1);
         leader.start_leader(
             P,
-            &leader_log,
+            Arc::clone(&plane),
             EpochCache::new(),
             &[1, 2, 3],
             IsrConfig {
@@ -1220,7 +1339,7 @@ mod tests {
                 max_lag_records: 3,
             },
         );
-        for off in 0..leader_hw {
+        for off in 0..served_end {
             leader.park_produce_ack(P, off, off).unwrap();
         }
 
@@ -1234,7 +1353,7 @@ mod tests {
         );
         assert_eq!(
             leader.pending_ack_count(P),
-            usize::try_from(leader_hw).unwrap(),
+            usize::try_from(served_end).unwrap(),
             "every ack still parked, awaiting a quorum"
         );
 
@@ -1243,20 +1362,21 @@ mod tests {
         let mut follower2 = DataPlaneController::new(2);
         follower2.start_follower(P, open_log(InMemoryFs::new(), small_config()));
         let mut released: Vec<AckToken> = Vec::new();
-        for _ in 0..(leader_hw + 2) {
-            if follower2.follower_high_watermark(P).unwrap() >= leader_hw {
+        for _ in 0..(leader_hw + 4) {
+            if follower2.follower_high_watermark(P).unwrap() >= served_end {
                 break;
             }
             released.extend(fetch_round(&mut leader, &mut follower2, P));
         }
         released.sort_unstable();
-        assert_eq!(released, (0..leader_hw).collect::<Vec<_>>());
+        assert_eq!(released, (0..served_end).collect::<Vec<_>>());
         assert_eq!(leader.pending_ack_count(P), 0);
     }
 
     // ---- a divergent follower self-heals ---------------------------------------------------------
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one coherent self-heal scenario (build lineages, diverge, heal)
     fn a_divergent_follower_self_heals_then_converges_byte_identical() {
         use ironbus_core::epoch_cache::LeaderEpochEndOffset;
 
@@ -1285,17 +1405,25 @@ mod tests {
         follower
             .assign_follower_epoch(P, LeaderEpoch::new(1), Offset::new(0))
             .unwrap();
-        // Catch the follower up to the old leader.
-        {
-            let mut old_leader = DataPlaneController::new(1);
-            old_leader.start_leader(P, &old_leader_log, old_epochs.clone(), &[1, 2], {
+        // Catch the follower up to the old leader's read-plane-served prefix (the leader serves through
+        // the off-actor read plane #654/#715, the SEALED prefix). The small cap leaves an 18-record log
+        // with a sealed prefix that covers the divergence region [10,14) and the divergent suffix.
+        let old_served = {
+            let old_plane = leader_plane(&old_leader_log);
+            let old_served = plane_served_end(&old_plane);
+            assert!(
+                old_served >= 14,
+                "the old leader's sealed prefix must cover the divergent suffix (got {old_served})"
+            );
+            let mut old_leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+            old_leader.start_leader(P, Arc::clone(&old_plane), old_epochs.clone(), &[1, 2], {
                 IsrConfig {
                     min_isr: 1,
                     max_lag_records: 0,
                 }
             });
-            for _ in 0..20 {
-                if follower.follower_high_watermark(P).unwrap() >= 18 {
+            for _ in 0..24 {
+                if follower.follower_high_watermark(P).unwrap() >= old_served {
                     break;
                 }
                 let req = follower.make_fetch_request(P, 8, 4096).unwrap();
@@ -1305,8 +1433,9 @@ mod tests {
             follower
                 .assign_follower_epoch(P, LeaderEpoch::new(5), Offset::new(10))
                 .unwrap();
-        }
-        assert_eq!(follower.follower_high_watermark(P).unwrap(), 18);
+            old_served
+        };
+        assert_eq!(follower.follower_high_watermark(P).unwrap(), old_served);
 
         // A NEW leader takes over with a DIFFERENT lineage: epoch 1 from 0, epoch 6 from 14. Only the
         // epoch-1 prefix [0,10) and the epoch-5 segment up to 14 are the common committed lineage; the
@@ -1333,8 +1462,14 @@ mod tests {
         new_epochs
             .assign(LeaderEpoch::new(6), Offset::new(14))
             .unwrap();
-        let mut new_leader = DataPlaneController::new(1);
-        new_leader.start_leader(P, &new_leader_log, new_epochs, &[1, 2], {
+        let new_plane = leader_plane(&new_leader_log);
+        let new_served = plane_served_end(&new_plane);
+        assert!(
+            new_served >= 14,
+            "the new leader's sealed prefix must cover the clean lineage past divergence (got {new_served})"
+        );
+        let mut new_leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+        new_leader.start_leader(P, Arc::clone(&new_plane), new_epochs, &[1, 2], {
             IsrConfig {
                 min_isr: 1,
                 max_lag_records: 0,
@@ -1354,20 +1489,20 @@ mod tests {
             .expect("the follower self-heals to the divergence point");
         assert!(!healed.is_no_op(), "the divergent suffix was truncated");
 
-        // Re-fetch the clean lineage forward from the new leader; the follower converges byte-identical.
+        // Re-fetch the clean lineage forward from the new leader's read-plane-served prefix; the
+        // follower converges byte-identical over the replicated range.
         for _ in 0..30 {
-            if follower.follower_high_watermark(P).unwrap() >= new_leader_log.flushed_offset().get()
-            {
+            if follower.follower_high_watermark(P).unwrap() >= new_served {
                 break;
             }
             let req = follower.make_fetch_request(P, 8, 4096).unwrap();
             let resp = new_leader.serve_fetch(P, &req).unwrap();
             follower.apply_fetch_response(P, &resp).unwrap();
         }
-        assert_eq!(
-            dump_segments(follower.follower_log(P).unwrap()),
-            dump_segments(&new_leader_log),
-            "after self-heal the follower is byte-identical to the new leader's lineage"
+        assert_replicated_byte_identical(
+            follower.follower_log(P).unwrap(),
+            &new_leader_log,
+            new_served,
         );
     }
 
@@ -1384,12 +1519,14 @@ mod tests {
         let hw = log.flushed_offset().get();
 
         // A single-replica placement (replicas == [this node], min_isr == 1) is the degenerate
-        // leader-only shape: the quorum-commit is the leader's own fsync'd frontier and the gate
-        // releases on the local fsync alone — exactly the single-node I2 ack, no follower required.
-        let mut node = DataPlaneController::new(1);
+        // leader-only shape: the quorum-commit is the leader's own fsync'd frontier (seeded from the
+        // read plane's flushed frontier = the full committed prefix) and the gate releases on the local
+        // fsync alone — exactly the single-node I2 ack, no follower required.
+        let plane = leader_plane(&log);
+        let mut node = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
         node.start_leader(
             P,
-            &log,
+            Arc::clone(&plane),
             EpochCache::new(),
             &[1],
             IsrConfig {
@@ -1435,10 +1572,11 @@ mod tests {
         leader_log.sync().unwrap();
 
         assert_eq!(role_for_placement(1, &placement), PlacementRole::Leader);
-        let mut leader = DataPlaneController::new(1);
+        let plane = leader_plane(&leader_log);
+        let mut leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
         leader.start_leader(
             P,
-            &leader_log,
+            Arc::clone(&plane),
             EpochCache::new(),
             &placement.replicas,
             quorum3(),
@@ -1488,7 +1626,10 @@ mod tests {
 
     /// Stand up a leader controller for partition `P` over a fresh `replica_ids` / `config`, with a
     /// log already fsync'd to `n` records (the leader's local I2 done), plus a follower controller per
-    /// non-leader replica. Returns `(seam_around_leader, followers)`.
+    /// non-leader replica. The leader serves through the OFF-ACTOR read plane (#654, #715), NOT a &Log
+    /// borrow. Returns `(seam_around_leader, followers, served_end)` — `served_end` is the read plane's
+    /// sealed-served prefix end, the offset a follower converges to before the active tail seals, so a
+    /// seam test parks within the range that actually replicates over the wire.
     fn led_cluster(
         partition: u64,
         leader_id: u64,
@@ -1496,11 +1637,13 @@ mod tests {
         config: IsrConfig,
         n: u32,
     ) -> (
-        ProduceAckSeam<'static, InMemoryFs, ManualClock>,
-        Vec<DataPlaneController<'static, InMemoryFs, ManualClock>>,
+        ProduceAckSeam<InMemoryFs, ManualClock>,
+        Vec<DataPlaneController<InMemoryFs, ManualClock>>,
+        u64,
     ) {
-        // Leak the leader log so the borrow is 'static for the test (the seam borrows it for the
-        // leader role); the test owns the process, so this is a test-only convenience, not prod code.
+        // Leak the leader log so the read plane keeps observing it for the test's lifetime (the append
+        // actor would keep publishing in a real serve); the test owns the process. The leader role
+        // holds only an Arc<ReadPlane> (Send), never the log.
         let leader_log: &'static Log<InMemoryFs, ManualClock> = {
             let mut log = open_log(InMemoryFs::new(), small_config());
             for i in 0..n {
@@ -1509,10 +1652,12 @@ mod tests {
             log.sync().unwrap();
             Box::leak(Box::new(log))
         };
+        let plane = leader_plane(leader_log);
+        let served_end = plane_served_end(&plane);
         let mut leader = DataPlaneController::new(leader_id);
         leader.start_leader(
             partition,
-            leader_log,
+            Arc::clone(&plane),
             EpochCache::new(),
             replica_ids,
             config,
@@ -1526,19 +1671,24 @@ mod tests {
                 f
             })
             .collect();
-        (ProduceAckSeam::new(leader), followers)
+        (ProduceAckSeam::new(leader), followers, served_end)
     }
 
     #[test]
     fn clustered_c2_fsync_led_produce_parks_the_wire_puback_until_quorum_fsync_then_sends_it() {
         const P: u64 = 0;
         // Node 1 leads P over {1,2,3}, min_isr=2 — a real serving leader with a local fsync done.
-        let (mut seam, mut followers) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 25);
+        let (mut seam, mut followers, served_end) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 25);
         assert!(seam.controller().is_leader(P));
+        assert!(
+            served_end > 0,
+            "the read plane serves a non-empty sealed prefix"
+        );
 
         // A real C2-fsync produce to the LED partition: thread its REAL wire PubAck through the seam.
         // The leader has locally fsync'd (I2); the gate must now WITHHOLD the wire ack until quorum.
-        let offset = 24; // the last produced record's offset
+        // Park the LAST sealed-served offset (it replicates over the wire; the active tail seals later).
+        let offset = served_end - 1;
         let reply = wire_pub_ack(offset);
         let disposition = seam
             .on_local_fsynced_ack(ClusterAckLevel::C2Fsync, P, offset, reply.clone())
@@ -1575,7 +1725,7 @@ mod tests {
                 // REAL wire PubAck frames to flush to the producer connection.
                 released.extend(seam.on_follower_report(P, &report).unwrap());
             }
-            if followers[0].follower_high_watermark(P).unwrap() >= 25 {
+            if followers[0].follower_high_watermark(P).unwrap() >= served_end {
                 break;
             }
         }
@@ -1609,9 +1759,13 @@ mod tests {
         const P: u64 = 0;
         // Node 1 leads P over {1,2,3}, min_isr=2. Only the leader exists in the ISR's eyes until a
         // follower reports; with NO follower report the ISR is below min_isr (no quorum).
-        let (mut seam, mut followers) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 10);
+        let (mut seam, mut followers, served_end) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 10);
+        assert!(
+            served_end > 0,
+            "the read plane serves a non-empty sealed prefix"
+        );
 
-        let offset = 9;
+        let offset = served_end - 1;
         let reply = wire_pub_ack(offset);
         let disposition = seam
             .on_local_fsynced_ack(ClusterAckLevel::C2Fsync, P, offset, reply)
@@ -1641,7 +1795,7 @@ mod tests {
         // A 1-node cluster (replicas == [1], min_isr == 1) is the degenerate leader-only shape — the
         // closest a cluster gets to single-node. Even here, C1 / C2-pagecache must ack IMMEDIATELY with
         // the verbatim reply bytes and NEVER park (the single-node-shaped guarantee).
-        let mut single = DataPlaneController::new(1);
+        let mut single = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
         let single_log: &'static Log<InMemoryFs, ManualClock> = {
             let mut log = open_log(InMemoryFs::new(), small_config());
             log.append(&rec(b"only")).unwrap();
@@ -1650,7 +1804,7 @@ mod tests {
         };
         single.start_leader(
             P,
-            single_log,
+            leader_plane(single_log),
             EpochCache::new(),
             &[1],
             IsrConfig {
@@ -1723,8 +1877,12 @@ mod tests {
         // Node 1 leads {1,2,3}, min_isr=2, log fsync'd to 5. The follower reports fsync of the WHOLE
         // range BEFORE the produce's ack is threaded — so when the produce parks, the offset is already
         // quorum-committed and the seam hands the REAL reply straight back to write now.
-        let (mut seam, mut followers) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 5);
-        // Catch follower 2 fully up so its reported fsync'd frontier is 5.
+        let (mut seam, mut followers, served_end) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 5);
+        assert!(
+            served_end > 0,
+            "the read plane serves a non-empty sealed prefix"
+        );
+        // Catch follower 2 fully up so its reported fsync'd frontier is the sealed-served end.
         for _ in 0..20 {
             let req = followers[0].make_fetch_request(P, 8, 4096).unwrap();
             let action = seam
@@ -1738,21 +1896,22 @@ mod tests {
             }
             let report = followers[0].follower_report(P).unwrap();
             let _ = seam.on_follower_report(P, &report).unwrap();
-            if followers[0].follower_high_watermark(P).unwrap() >= 5 {
+            if followers[0].follower_high_watermark(P).unwrap() >= served_end {
                 break;
             }
         }
-        // quorum_commit is now 5 (leader + follower2 both fsync'd through offset 4). A produce at
-        // offset 4 is already quorum-committed: parking it releases the real reply immediately.
-        let reply = wire_pub_ack(4);
+        // quorum_commit is now served_end (leader + follower2 both fsync'd through served_end-1). A
+        // produce at served_end-1 is already quorum-committed: parking it releases the real reply now.
+        let offset = served_end - 1;
+        let reply = wire_pub_ack(offset);
         let disposition = seam
-            .on_local_fsynced_ack(ClusterAckLevel::C2Fsync, P, 4, reply.clone())
+            .on_local_fsynced_ack(ClusterAckLevel::C2Fsync, P, offset, reply.clone())
             .unwrap();
         match disposition {
             AckDisposition::WriteNowBatch(frames) => {
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0], reply, "the real reply releases straight back");
-                assert_eq!(pub_ack_offset(&frames[0]), 4);
+                assert_eq!(pub_ack_offset(&frames[0]), offset);
             }
             other => panic!("expected an already-committed fast release, got {other:?}"),
         }

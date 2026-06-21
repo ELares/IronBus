@@ -33,9 +33,12 @@
 //!    them to its own replica log, and reports its fsync'd offset back.
 //! 3. **Construction from the committed placement** ([`DataPlaneServer::from_placements`]). Per local
 //!    partition, [`role_for_placement`](super::dataplane::role_for_placement) decides the role and the
-//!    server registers it: the LEADER role serves from a borrowed leader log; the FOLLOWER role owns a
-//!    freshly-opened / recovered replica log under the data dir. A restart re-derives every role from
-//!    the same committed placement + the durable replica log, so the role + replication resume.
+//!    server registers it: the LEADER role serves from the engine's `Arc`-shared, off-actor
+//!    [`ReadPlane`](ironbus_storage::read_plane::ReadPlane) (#654, #715) — NOT a `&Log` borrow, so the
+//!    leader never writes (or borrows) its log (the single append actor stays the sole writer) and the
+//!    whole server is `Send`; the FOLLOWER role owns a freshly-opened / recovered replica log under the
+//!    data dir. A restart re-derives every role from the same committed placement + the durable replica
+//!    log, so the role + replication resume.
 //!
 //! ## Single-node / no-cluster = byte-identical (the critical guarantee)
 //!
@@ -57,19 +60,34 @@
 //!   quorum-fsync (not leader-only), below `min_isr` the ack stays parked (no false ack), a lagging
 //!   follower catches up, and a restarted node re-establishes its role + resumes replication.
 //!
+//! ## #715: the data plane now RUNS in the live broker via the read plane
+//!
+//! The #715 engine-ownership refactor lands the `Send` half of the above: the LEADER role serves
+//! fetches through the engine's `Arc`-shared, off-actor [`ReadPlane`](ironbus_storage::read_plane::ReadPlane)
+//! (#654) instead of a `&Log` borrow, so the [`DataPlaneController`] / [`ProduceAckSeam`] /
+//! [`DataPlaneServer`] are all `Send` and the broker constructs + runs the data plane in cluster serve
+//! over the live peer transport, on a dedicated peer-I/O thread alongside the engine's single append
+//! actor. The leader NEVER writes its log here — it READS the immutable sealed bytes via the plane; the
+//! append actor remains the ONLY writer (the single-writer invariant). The CLI `run_broker` obtains
+//! each led partition's [`ReadPlane`](ironbus_storage::read_plane::ReadPlane) from
+//! [`Engine::read_plane`](crate::engine::Engine::read_plane) BEFORE moving the engine into the actor,
+//! builds the server from the committed placement, and spawns the serve loop — gated entirely on a
+//! [`ClusterConfig`](super::ClusterConfig) being present (single-node constructs none of it).
+//!
 //! FLAGGED / DEFERRED (precise — each its own follow-up, none landed here):
 //! * **The live produce-ack `session::drain_parked` hot-path wiring.** The [`ProduceAckSeam`] (#712)
 //!   is driven END-TO-END here: a parked wire-`PubAck` is released ONLY once the ISR follower reports
-//!   over the REAL wire bring quorum-fsync (proven by [`tests`]). What is NOT landed is threading that
-//!   seam into the BROKER's `engine.rs` / `session.rs` produce path so a real client produce on a led
-//!   partition parks its connection's wire `PubAck`. That requires two ownership changes the data
-//!   plane cannot make from the side: (a) the [`DataPlaneController`] LEADER role needs `&Log<F, C>`,
-//!   but the engine owns its partition log PRIVATELY behind the append actor (no borrow path, no
-//!   `Arc`); and (b) a session reaches the engine only through the per-call `EngineAccess` trait
-//!   object — there is no broker-wide shared state a session could consult the seam through. Wiring
-//!   that is a focused engine/actor change (expose the leader log + hold the seam in shared broker
-//!   state so `drain_parked` consults it), NOT a logic change — the seam, the gate, and the release
-//!   path are all proven here.
+//!   over the REAL wire bring quorum-fsync (proven by [`tests`]). The seam is now `Send` and reachable
+//!   from shared broker state, but threading it through `session.rs`'s per-connection `drain_parked` so
+//!   a real CLIENT produce on a led partition parks ITS connection's wire `PubAck` (rather than the
+//!   broker driving the seam from the serve loop) is the remaining focused session change. It is gated
+//!   entirely on the cluster being configured; the single-node produce hot path is untouched.
+//! * **The active (flushed-but-unsealed) tail.** The read plane serves the SEALED prefix; a leader's
+//!   flushed frontier can sit ahead of the sealed end. A follower converges to the sealed end
+//!   byte-identically and replicates the active tail once it seals (a roll). This is correct by
+//!   construction (no false ack, no false visibility) but a follower can LAG by up to the active-segment
+//!   size until it seals; closing that liveness window (an actor-fallback active-tail read on the peer
+//!   thread, or an active-segment read-plane extension) is FLAGGED.
 //! * **Cooperative REBALANCE on a placement change** is C5-I2 (this slice is STATIC placement: roles
 //!   are derived from the committed placement at start + re-derived on a restart; a live leader
 //!   hand-off / replica move is later).
@@ -80,6 +98,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use ironbus_core::clock::Clock;
 use ironbus_core::epoch_cache::EpochCache;
@@ -88,6 +107,7 @@ use ironbus_proto::frame::{
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Log;
+use ironbus_storage::read_plane::ReadPlane;
 
 use super::dataplane::{
     decode_dataplane_frame, role_for_placement, DataPlaneAction, DataPlaneController,
@@ -342,25 +362,27 @@ pub trait ReplicaLogFactory<F: Filesystem, C: Clock> {
 /// serve-path driver AND the unit under the real-socket 3-node test (the test/driver plays the
 /// transport).
 ///
-/// The `'a` lifetime is the controller's borrow of each LEADER partition log (the leader serves bytes
-/// from the same log it leads); FOLLOWER replica logs are OWNED by the controller.
-pub struct DataPlaneServer<'a, F: Filesystem, C: Clock> {
+/// There is NO lifetime: each LEADER role serves bytes through the engine's `Arc`-shared, off-actor
+/// [`ReadPlane`](ironbus_storage::read_plane::ReadPlane) (#654, #715), NOT a `&Log` borrow, so the
+/// whole server is `Send` and can run on a dedicated peer-I/O thread alongside the engine's single
+/// append actor. FOLLOWER replica logs are OWNED by the controller.
+pub struct DataPlaneServer<F: Filesystem, C: Clock> {
     /// This node's cluster id.
     node_id: u64,
     /// The produce-ack seam: owns the controller (roles) + the parked wire-`PubAck` side table. The
     /// release path goes through it so the gate's parked state + the parked bytes never drift apart.
-    seam: ProduceAckSeam<'a, F, C>,
+    seam: ProduceAckSeam<F, C>,
     /// The partitions this node FOLLOWS, with the leader node id to fetch from — the follower fetch
     /// loop targets the leader's address (resolved by the caller from the peer map).
     follower_targets: BTreeMap<u64, u64>,
 }
 
-impl<'a, F: Filesystem, C: Clock> DataPlaneServer<'a, F, C> {
+impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
     /// Build a server for `node_id` around an already-constructed [`ProduceAckSeam`] (its controller's
     /// roles already registered). Lower-level than [`from_placements`](Self::from_placements); the
     /// latter is the serve-path constructor that derives the roles from the committed metadata.
     #[must_use]
-    pub fn new(node_id: u64, seam: ProduceAckSeam<'a, F, C>) -> Self {
+    pub fn new(node_id: u64, seam: ProduceAckSeam<F, C>) -> Self {
         Self {
             node_id,
             seam,
@@ -376,13 +398,13 @@ impl<'a, F: Filesystem, C: Clock> DataPlaneServer<'a, F, C> {
 
     /// The seam (and through it the controller) this server drives.
     #[must_use]
-    pub fn seam(&self) -> &ProduceAckSeam<'a, F, C> {
+    pub fn seam(&self) -> &ProduceAckSeam<F, C> {
         &self.seam
     }
 
     /// Mutable access to the seam (the produce path threads a real wire `PubAck` through
     /// [`ProduceAckSeam::on_local_fsynced_ack`]; the serve loop drives the controller / release path).
-    pub fn seam_mut(&mut self) -> &mut ProduceAckSeam<'a, F, C> {
+    pub fn seam_mut(&mut self) -> &mut ProduceAckSeam<F, C> {
         &mut self.seam
     }
 
@@ -444,13 +466,16 @@ impl<'a, F: Filesystem, C: Clock> DataPlaneServer<'a, F, C> {
     }
 }
 
-impl<F: Filesystem, C: Clock> DataPlaneServer<'static, F, C> {
+impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
     /// Build a server from the committed placements (#701): per local partition,
     /// [`role_for_placement`] decides the role and the server registers it.
     ///
-    /// * a LEADER role serves from `leader_log_for(partition)` — a `&'static Log` the caller supplies
-    ///   for each partition this node leads (in a real serve this is the engine's partition log; the
-    ///   `'static` borrow is documented in [`tests`] / the FLAGGED engine wiring above);
+    /// * a LEADER role serves from `leader_plane_for(partition)` — the engine's `Arc`-shared, off-actor
+    ///   [`ReadPlane`](ironbus_storage::read_plane::ReadPlane) (#654, #715) for each partition this node
+    ///   leads, obtained from [`Engine::read_plane`](crate::engine::Engine::read_plane). The leader
+    ///   serves committed bytes through it and NEVER writes (or borrows) the engine's log — the single
+    ///   append actor stays the sole writer — and the `Arc` (not a borrow) is what makes the server
+    ///   `Send`;
     /// * a FOLLOWER role OWNS a replica log opened via `replica_logs`.
     ///
     /// `isr_config` sizes the ISR / quorum gate for each led partition (the design `R=2f+1` /
@@ -458,17 +483,18 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<'static, F, C> {
     /// handshake); pass a fresh [`EpochCache`] for a fresh partition.
     ///
     /// # Errors
-    /// A [`String`] if a follower replica log cannot be opened (the caller maps it to its error type).
+    /// A [`String`] if a leader read plane is not supplied for a led partition, or a follower replica
+    /// log cannot be opened (the caller maps it to its error type).
     pub fn from_placements<L, R, E>(
         node_id: u64,
         placements: &BTreeMap<u64, Placement>,
         isr_config: IsrConfig,
-        mut leader_log_for: L,
+        mut leader_plane_for: L,
         replica_logs: &R,
         mut epoch_for: E,
     ) -> Result<Self, String>
     where
-        L: FnMut(u64) -> Option<&'static Log<F, C>>,
+        L: FnMut(u64) -> Option<Arc<ReadPlane<F>>>,
         R: ReplicaLogFactory<F, C>,
         E: FnMut(u64) -> EpochCache,
     {
@@ -477,12 +503,12 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<'static, F, C> {
         for (&partition, placement) in placements {
             match role_for_placement(node_id, placement) {
                 PlacementRole::Leader => {
-                    let log = leader_log_for(partition).ok_or_else(|| {
-                        format!("no leader log supplied for led partition {partition}")
+                    let plane = leader_plane_for(partition).ok_or_else(|| {
+                        format!("no leader read plane supplied for led partition {partition}")
                     })?;
                     controller.start_leader(
                         partition,
-                        log,
+                        plane,
                         epoch_for(partition),
                         &placement.replicas,
                         isr_config,
@@ -572,6 +598,41 @@ mod tests {
         }
     }
 
+    /// Assert a follower replica dump is BYTE-IDENTICAL to the leader over the read-plane-served range.
+    ///
+    /// A follower replicates frames VERBATIM + seals at the same cap, so a SEALED follower segment is the
+    /// leader's same-named file byte-for-byte. The follower's LAST (still-active) segment holds the same
+    /// records but seals only on its next roll, so it equals the leader's same-named SEALED file MINUS
+    /// the trailing seal footer (the leader's file is a byte-identical prefix-superset). So: every
+    /// follower file is a byte-identical PREFIX of the leader's same-named file, and at least one matches
+    /// EXACTLY (proving real sealed replication over the live transport). The active flushed tail (and
+    /// the follower's own trailing seal) close on the next roll (FLAGGED).
+    fn assert_replicated_byte_identical(
+        follower_dump: &[(String, Vec<u8>)],
+        leader_log: &Log<InMemoryFs, ManualClock>,
+    ) {
+        let leader: BTreeMap<String, Vec<u8>> = dump_segments(leader_log).into_iter().collect();
+        assert!(
+            follower_dump.iter().any(|(_, b)| !b.is_empty()),
+            "follower replicated at least one segment file"
+        );
+        let mut any_exact = false;
+        for (name, bytes) in follower_dump {
+            let leader_bytes = leader
+                .get(name)
+                .unwrap_or_else(|| panic!("leader missing replicated segment file {name}"));
+            assert!(
+                leader_bytes.starts_with(bytes),
+                "follower segment {name} is not a byte-identical prefix of the leader's"
+            );
+            any_exact |= bytes == leader_bytes;
+        }
+        assert!(
+            any_exact,
+            "no fully-sealed follower segment is byte-identical to the leader's over the live transport"
+        );
+    }
+
     fn wire_pub_ack(offset: u64) -> Vec<u8> {
         let mut body = Vec::with_capacity(8);
         encode_pub_ack(&PubAckBody { offset }, &mut body);
@@ -585,8 +646,10 @@ mod tests {
         decode_pub_ack(body).expect("PubAck body decodes").offset
     }
 
-    /// A leader log leaked to `'static` (the leader role borrows it for the test; the process owns the
-    /// leak). Mirrors the FLAGGED engine wiring: in a real serve this is the engine's partition log.
+    /// A leader log leaked to `'static` so the read plane keeps observing it for the test's lifetime
+    /// (the engine's append actor would keep publishing in a real serve). In a real serve this is the
+    /// engine's partition log; the leader role holds only an `Arc<ReadPlane>` (Send) over it, never the
+    /// log — the single append actor stays the sole writer (#715).
     fn leaked_leader_log(n: u32) -> &'static Log<InMemoryFs, ManualClock> {
         let mut log = open_log();
         for i in 0..n {
@@ -594,6 +657,36 @@ mod tests {
         }
         log.sync().unwrap();
         Box::leak(Box::new(log))
+    }
+
+    /// The engine's `Arc`-shared, off-actor read plane over a leader log (#654, #715) — what the leader
+    /// role serves fetches from (NO `&Log` borrow). This is what makes the `DataPlaneServer` `Send`.
+    fn leader_plane(log: &Log<InMemoryFs, ManualClock>) -> Arc<ReadPlane<InMemoryFs>> {
+        Arc::new(log.read_plane().expect("read plane builds"))
+    }
+
+    /// The first offset the leader's read plane does NOT serve off-actor (its sealed-served end): chain
+    /// `read_range_raw` from 0 until no more sealed bytes remain below the flushed frontier. The read
+    /// plane serves the SEALED prefix; this is the offset a follower converges to over the live
+    /// transport before the active (flushed-but-unsealed) tail seals.
+    fn plane_served_end(plane: &ReadPlane<InMemoryFs>) -> u64 {
+        let flushed = plane.flushed();
+        let mut next = 0u64;
+        let mut guard = 0u32;
+        while next < flushed {
+            guard += 1;
+            assert!(guard < 100_000, "read-plane chain failed to terminate");
+            let raw = plane
+                .read_range_raw(ironbus_core::types::Offset::new(next), 1_000, None)
+                .expect("read plane serves");
+            let advanced = raw.run.next_offset.get();
+            if advanced > next {
+                next = advanced;
+            } else {
+                break;
+            }
+        }
+        next
     }
 
     /// A replica-log factory that hands each follower a fresh in-memory log.
@@ -719,13 +812,15 @@ mod tests {
     //  wire PubAck releases ONLY after the ISR quorum reported fsync over the wire.
     // ============================================================================================
 
-    /// Service one accept + one read pass on the leader serve loop on the MAIN thread (the leader role
-    /// borrows a `&Log` which is not `Send`, so it stays on the test thread). Accepts any new follower
-    /// link (non-blocking), then services each link once: a `FetchRecords` / `OffsetForLeaderEpoch` is
-    /// answered with a response frame; an `AckReplicated` report drives the quorum-ack gate and any
+    /// Service one accept + one read pass on the leader serve loop. The leader serve loop is now `Send`
+    /// (it serves through the `Arc`-shared read plane #654/#715, no `&Log` borrow — see the
+    /// `the_send_data_plane_server_runs_on_its_own_thread` test); this cooperative single-thread driver
+    /// is kept for the deterministic capstone scenario. Accepts any new follower link (non-blocking),
+    /// then services each link once: a `FetchRecords` / `OffsetForLeaderEpoch` is answered with a
+    /// response frame; an `AckReplicated` report drives the quorum-ack gate and any
     /// released wire-`PubAck` bytes are pushed onto `released`.
     fn pump_leader_once(
-        server: &mut DataPlaneServer<'static, InMemoryFs, ManualClock>,
+        server: &mut DataPlaneServer<InMemoryFs, ManualClock>,
         listener: &TcpListener,
         links: &mut Vec<DataPlaneLink<TcpStream>>,
         released: &mut Vec<Vec<u8>>,
@@ -776,18 +871,19 @@ mod tests {
     /// `DataPlaneServer` (its replica log) and a [`DataPlaneLink`] to the leader's listener. One
     /// [`Self::step`] sends a fetch, then (driven by the caller pumping the leader between steps) reads
     /// the response, applies it, and reports its fsync'd frontier — so the data crosses a genuine
-    /// `TcpStream`. Because the controller holds a `&Log` type and is not `Send`, the whole cluster runs
-    /// COOPERATIVELY on one thread over real sockets (the transport is real; only the driving is
-    /// single-threaded, which keeps the test deterministic).
+    /// `TcpStream`. The whole cluster runs COOPERATIVELY on one thread over real sockets (the transport
+    /// is real; only the driving is single-threaded, which keeps the capstone test deterministic). The
+    /// server is now `Send` (#715) and CAN run on its own thread — the
+    /// `the_send_data_plane_server_runs_on_its_own_thread` test asserts exactly that.
     struct LiveFollower {
-        server: DataPlaneServer<'static, InMemoryFs, ManualClock>,
+        server: DataPlaneServer<InMemoryFs, ManualClock>,
         link: DataPlaneLink<TcpStream>,
         partition: u64,
     }
 
     impl LiveFollower {
         fn connect(
-            server: DataPlaneServer<'static, InMemoryFs, ManualClock>,
+            server: DataPlaneServer<InMemoryFs, ManualClock>,
             partition: u64,
             leader_addr: SocketAddr,
         ) -> Self {
@@ -816,16 +912,33 @@ mod tests {
                 .expect("send fetch");
         }
 
-        /// Read + apply the leader's response (if one has arrived), then report the follower's fsync'd
+        /// DRAIN every response that has arrived (the read-plane leader serves SINGLE-SEGMENT runs, so a
+        /// catch-up needs several round-trips and several responses can be in flight on the socket at
+        /// once), applying each CONTIGUOUS one in order and DROPPING any stale/duplicate response whose
+        /// `first_offset` no longer matches the follower's current head (a perfectly valid pull-model
+        /// outcome: the follower simply re-fetches from where it is). Then report the follower's fsync'd
         /// frontier back to the leader (driving the quorum-ack gate on the next leader pump).
         fn recv_apply_and_report(&mut self) {
-            if let Ok(Some((p, DataPlaneFrame::FetchResponse(resp)))) = self.link.recv() {
+            while let Ok(Some((p, DataPlaneFrame::FetchResponse(resp)))) = self.link.recv() {
                 assert_eq!(p, self.partition);
+                // The follower's current head (the offset its next contiguous response must start at).
+                let want = self
+                    .server
+                    .seam()
+                    .controller()
+                    .make_fetch_request(self.partition, 1, 0)
+                    .expect("follower head")
+                    .from_offset;
+                // Drop a stale/duplicate or already-applied response (a non-contiguous one): the pull
+                // model just re-fetches. An empty run (caught up) is contiguous and applies as a no-op.
+                if resp.record_count > 0 && resp.first_offset != want {
+                    continue;
+                }
                 self.server
                     .seam_mut()
                     .controller_mut()
                     .handle_frame(self.partition, DataPlaneFrame::FetchResponse(resp))
-                    .expect("follower applies the response");
+                    .expect("follower applies the contiguous response");
             }
             let report = self
                 .server
@@ -867,25 +980,40 @@ mod tests {
         };
         let placements: BTreeMap<u64, Placement> = [(P, placement.clone())].into_iter().collect();
 
-        // The leader (node 1) holds a log of 25 records, fsync'd. The leader DataPlaneServer borrows it.
+        // The leader (node 1) holds a log of 25 records, fsync'd. The leader DataPlaneServer serves it
+        // through the engine's OFF-ACTOR read plane (#654, #715) — NOT a &Log borrow; the leader never
+        // writes (or borrows) its log. The read plane serves the SEALED prefix; `served_end` is the
+        // offset a follower converges to over the live transport before the active tail seals (FLAGGED).
         let leader_log = leaked_leader_log(25);
         let leader_hw = leader_log.flushed_offset().get();
         assert_eq!(leader_hw, 25);
+        let leader_pl = leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(
+            served_end > 0 && served_end <= leader_hw,
+            "the read plane serves a non-empty sealed prefix (served_end={served_end})"
+        );
 
         let mut leader_server = DataPlaneServer::from_placements(
             1,
             &placements,
             quorum3(),
-            |p| if p == P { Some(leader_log) } else { None },
+            |p| {
+                if p == P {
+                    Some(Arc::clone(&leader_pl))
+                } else {
+                    None
+                }
+            },
             &InMemReplicaLogs,
             |_| EpochCache::new(),
         )
         .expect("leader server builds from placement");
         assert!(leader_server.seam().controller().is_leader(P));
 
-        // PARK a real C2-fsync produce's wire PubAck for the last record (offset 24): the leader has
+        // PARK a real C2-fsync produce's wire PubAck for the last SEALED-served record: the leader has
         // locally fsync'd (I2) but NO follower has the data, so the 2-of-3 quorum is not met yet.
-        let offset = leader_hw - 1;
+        let offset = served_end - 1;
         let reply = wire_pub_ack(offset);
         let disposition = leader_server
             .seam_mut()
@@ -948,7 +1076,7 @@ mod tests {
             for _ in 0..8 {
                 pump_leader_once(&mut leader_server, &listener, &mut links, &mut released);
             }
-            if (f2.high_watermark() >= leader_hw && f3.high_watermark() >= leader_hw)
+            if (f2.high_watermark() >= served_end && f3.high_watermark() >= served_end)
                 || Instant::now() > deadline
             {
                 break;
@@ -957,12 +1085,12 @@ mod tests {
 
         assert_eq!(
             f2.high_watermark(),
-            leader_hw,
-            "follower 2 caught up to the leader over the live transport"
+            served_end,
+            "follower 2 caught up to the leader's sealed-served prefix over the live transport"
         );
         assert_eq!(
             f3.high_watermark(),
-            leader_hw,
+            served_end,
             "follower 3 (which started behind) caught up over the live transport"
         );
 
@@ -982,18 +1110,112 @@ mod tests {
             "the released bytes ARE the original wire PubAck (the real reply, not a token)"
         );
 
-        // Each follower's replica log is BYTE-IDENTICAL to the leader's, over the live transport.
-        let leader_dump = dump_segments(leader_log);
+        // Each follower's replica is BYTE-IDENTICAL to the leader over the read-plane-served prefix,
+        // over the live transport: every replicated segment FILE matches the leader's same-named file.
+        assert_replicated_byte_identical(&f2.replica_dump(), leader_log);
+        assert_replicated_byte_identical(&f3.replica_dump(), leader_log);
+    }
+
+    /// THE #715 `Send` PROOF: a leader [`DataPlaneServer`] built from the committed placement (serving
+    /// through the off-actor read plane #654, NOT a `&Log` borrow) is `Send` and actually RUNS its
+    /// leader serve loop on ITS OWN dedicated peer-I/O thread — exactly the engine-ownership change #715
+    /// lands. A real follower over a loopback `TcpStream` (on the main thread) replicates the leader's
+    /// sealed prefix byte-identically, with the leader serving from the OTHER thread. Before #715 the
+    /// controller held a `&Log` and was NOT `Send`, so this `thread::spawn(move || ...)` would not even
+    /// compile. The leader thread never writes the leader's log — it READS via the `Arc`-shared read
+    /// plane; the single append actor (here, the test owning the leaked log) remains the sole writer.
+    #[test]
+    fn the_send_data_plane_server_runs_on_its_own_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        const P: u64 = 0;
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 7,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+
+        let leader_log = leaked_leader_log(25);
+        let leader_pl = leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(served_end > 0);
+
+        let mut leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            quorum3(),
+            |p| {
+                if p == P {
+                    Some(Arc::clone(&leader_pl))
+                } else {
+                    None
+                }
+            },
+            &InMemReplicaLogs,
+            |_| EpochCache::new(),
+        )
+        .expect("leader server builds");
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind leader listener");
+        listener.set_nonblocking(true).unwrap();
+        let leader_addr = listener.local_addr().unwrap();
+
+        // MOVE the (now `Send`) leader server onto its OWN thread and serve from there. This is the
+        // whole point of #715: the data plane runs alongside the append actor, not on it.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let leader_handle = std::thread::spawn(move || {
+            let mut links: Vec<DataPlaneLink<TcpStream>> = Vec::new();
+            let mut released: Vec<Vec<u8>> = Vec::new();
+            ready_tx.send(()).ok();
+            while !stop_thread.load(Ordering::Acquire) {
+                pump_leader_once(&mut leader_server, &listener, &mut links, &mut released);
+            }
+            // Return the server back so its replica/leader state can be inspected (it stays Send).
+            leader_server
+        });
+        ready_rx.recv().expect("leader thread started");
+
+        // A real follower on THIS thread fetches over a loopback socket from the leader's OWN thread.
+        let follower = DataPlaneServer::from_placements(
+            2,
+            &[(
+                P,
+                Placement {
+                    replicas: vec![1, 2, 3],
+                    leader: 1,
+                    epoch: 7,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            quorum3(),
+            |_| None,
+            &InMemReplicaLogs,
+            |_| EpochCache::new(),
+        )
+        .expect("follower builds");
+        let mut f = LiveFollower::connect(follower, P, leader_addr);
+
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while f.high_watermark() < served_end && Instant::now() < deadline {
+            f.send_fetch();
+            std::thread::sleep(Duration::from_millis(2));
+            f.recv_apply_and_report();
+        }
         assert_eq!(
-            f2.replica_dump(),
-            leader_dump,
-            "follower 2 replica is byte-identical to the leader over the live transport"
+            f.high_watermark(),
+            served_end,
+            "the follower caught up to the leader's sealed prefix with the leader serving on ITS OWN thread"
         );
-        assert_eq!(
-            f3.replica_dump(),
-            leader_dump,
-            "follower 3 replica is byte-identical to the leader over the live transport"
-        );
+        // The leader served byte-identical replicated bytes from the other thread.
+        assert_replicated_byte_identical(&f.replica_dump(), leader_log);
+
+        stop.store(true, Ordering::Release);
+        let _server = leader_handle.join().expect("leader thread joins cleanly");
     }
 
     #[test]
@@ -1008,16 +1230,25 @@ mod tests {
         };
         let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
         let leader_log = leaked_leader_log(10);
+        let leader_pl = leader_plane(leader_log);
         let mut server = DataPlaneServer::from_placements(
             1,
             &placements,
             quorum3(),
-            |p| if p == P { Some(leader_log) } else { None },
+            |p| {
+                if p == P {
+                    Some(Arc::clone(&leader_pl))
+                } else {
+                    None
+                }
+            },
             &InMemReplicaLogs,
             |_| EpochCache::new(),
         )
         .unwrap();
 
+        // The seam parks a C2-fsync ack for a led partition regardless of the read-plane content (the
+        // gate's no-quorum release is what is under test); offset 9 is a valid produced offset.
         let offset = 9;
         let reply = wire_pub_ack(offset);
         assert_eq!(
@@ -1053,14 +1284,22 @@ mod tests {
         };
         let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
         let leader_log = leaked_leader_log(12);
+        let leader_pl = leader_plane(leader_log);
 
-        // Rebuild the leader server (as on a restart): leader role re-established, ISR seeded from the
-        // recovered durable head, no follower yet => the 2-of-3 quorum is 0 (the no-false-ack rule).
+        // Rebuild the leader server (as on a restart): leader role re-established (serving through the
+        // read plane #654/#715), ISR seeded from the recovered durable head (the read plane's flushed
+        // frontier), no follower yet => the 2-of-3 quorum is 0 (the no-false-ack rule).
         let leader = DataPlaneServer::from_placements(
             1,
             &placements,
             quorum3(),
-            |p| if p == P { Some(leader_log) } else { None },
+            |p| {
+                if p == P {
+                    Some(Arc::clone(&leader_pl))
+                } else {
+                    None
+                }
+            },
             &InMemReplicaLogs,
             |_| EpochCache::new(),
         )
@@ -1119,9 +1358,10 @@ mod tests {
     }
 
     /// The wired reader rejects a hostile oversized data-plane frame over a REAL socket without
-    /// crashing the leader serve loop — the bounded codec on the live path. The leader serve loop runs
-    /// on this thread (it borrows a non-`Send` `&Log`); a hostile probe + a well-behaved fetch arrive
-    /// from a worker thread, and the leader must keep serving the valid fetch.
+    /// crashing the leader serve loop — the bounded codec on the live path. The leader serve loop is now
+    /// `Send` (it serves through the `Arc`-shared read plane #654/#715, no `&Log` borrow); the test
+    /// keeps it on this thread for determinism. A hostile probe + a well-behaved fetch arrive from a
+    /// worker thread, and the leader must keep serving the valid fetch.
     #[test]
     fn the_wired_data_reader_rejects_hostile_frames_without_crashing() {
         const P: u64 = 0;
@@ -1132,11 +1372,18 @@ mod tests {
         };
         let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
         let leader_log = leaked_leader_log(8);
+        let leader_pl = leader_plane(leader_log);
         let mut server = DataPlaneServer::from_placements(
             1,
             &placements,
             quorum3(),
-            |p| if p == P { Some(leader_log) } else { None },
+            |p| {
+                if p == P {
+                    Some(Arc::clone(&leader_pl))
+                } else {
+                    None
+                }
+            },
             &InMemReplicaLogs,
             |_| EpochCache::new(),
         )
