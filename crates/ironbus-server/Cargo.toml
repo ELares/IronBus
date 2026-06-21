@@ -145,6 +145,14 @@ zeroize = { version = "=1.8.2", default-features = false }
 # rust-version 1.60, the latest 1.x at or below the 1.78 floor (same =-pin discipline as
 # zeroize/lz4_flex/blake3). Apache-2.0 OR MIT, pure Rust, no transitive deps.
 base64ct = { version = "=1.6.0", default-features = false }
+# `getrandom`: the OS CSPRNG for the per-credential salt the `ironbus server passwd` minting path
+# (#631) feeds to Argon2id (`SaltString::encode_b64` over 16 fresh random bytes). Minting (NOT the
+# broker hot path) is the only caller — the broker only VERIFIES against the stored PHC string, which
+# already carries its own salt — so this never touches the record path. Pure Rust on the broker's
+# Linux/musl targets (the `getrandom(2)` syscall path, no `links` key, no C build script), MIT OR
+# Apache-2.0, ALREADY resolved in the lockfile (`0.2.17`, via `rand`/`raft`), so it adds NO new crate
+# to the graph and is already on the deny.toml allow-list + cffi-ban allowlist. MSRV well below 1.78.
+getrandom = { version = "0.2", default-features = false }
 
 # Structured tracing (#16, #99). `tracing` is the instrumentation facade; `tracing-subscriber` (the
 # `fmt` + `json` features only, no `env-filter`/`ansi`, to keep the transitive surface minimal)

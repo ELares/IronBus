@@ -777,6 +777,10 @@ USAGE:
                   [--disk-full-policy <drop-new|drop-oldest>]
                   [--key-shared-group <name>]... [--broadcast-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>] [--enable-admin]
+    ironbus passwd --auth-config <path> --user <name> [--scopes <publish,subscribe,admin>]
+                  [--password-file <path>] [--remove]
+                  (sets/updates or removes a username+password identity; the password is read from
+                   --password-file or stdin and stored as an Argon2id hash, never echoed; Unix only)
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
                   [--ack | --nack [--delay-ms <n>] | --term]
@@ -1182,6 +1186,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "sub" => run_sub(rest, out),
         "cumulative-ack" => run_cumulative_ack(rest, out),
         "serve" => run_serve(rest, out),
+        "passwd" => run_passwd(rest, out),
         "admin" => run_admin(rest, out),
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
@@ -5082,6 +5087,477 @@ fn load_one_credential(
         return Err(format!("identity `{name}` `mtls_san` is empty"));
     }
     Ok(ironbus_server::auth::CredentialSet::Mtls { san_identities })
+}
+
+/// The parsed `passwd` verb arguments (#631): which identity table, which user, the action (set with
+/// scopes, or remove), and where to read the password from. The password itself is NEVER held here —
+/// it is read securely at apply time and dropped immediately.
+#[cfg(unix)]
+#[derive(Debug)]
+struct PasswdArgs {
+    /// The `--auth-config` identity-table file to edit (created `0o600` if absent).
+    auth_config: String,
+    /// The `--user` whose password+scopes to set or remove.
+    user: String,
+    /// `--remove`: delete this user's identity instead of setting it.
+    remove: bool,
+    /// The scopes to grant (set mode only); empty is allowed (an authenticated-but-unprivileged
+    /// identity). Ignored for `--remove`.
+    scopes: Vec<String>,
+    /// `--password-file`: read the password bytes from this file (a trailing newline is trimmed). When
+    /// absent, the password is read from stdin (the same secure, non-echoing source the `pub` verb
+    /// uses for the payload). A secret is NEVER taken from a CLI flag or an env var (docs/SECRETS.md).
+    password_file: Option<String>,
+}
+
+/// Runs `ironbus passwd` (#631, V2-M7): set/update or remove a username+password identity in the
+/// `--auth-config` identity table, writing the Argon2id PHC HASH (never the plaintext) at owner-only
+/// `0o600`. The password is read securely (a `--password-file` reference or stdin) and is NEVER echoed,
+/// logged, or placed on the command line. This is the operator-facing minting tool the auth spec calls
+/// "the operator mints the PHC string out of band".
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing/duplicate flag, an unknown scope, an empty password, a
+/// group/world-accessible existing table (`StrictModes`, fail-closed), or a TOML parse/IO failure.
+#[cfg(unix)]
+fn run_passwd(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut auth_config: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut remove = false;
+    let mut scopes: Vec<String> = Vec::new();
+    let mut password_file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--auth-config" => auth_config = Some(take_value("--auth-config", args, &mut i)?),
+            "--user" => user = Some(take_value("--user", args, &mut i)?),
+            "--remove" => {
+                remove = true;
+                i += 1;
+            }
+            "--scopes" => {
+                // A comma-separated list, e.g. `--scopes publish,subscribe`. Each is validated below.
+                let raw = take_value("--scopes", args, &mut i)?;
+                for s in raw.split(',') {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        scopes.push(s.to_string());
+                    }
+                }
+            }
+            "--password-file" => {
+                password_file = Some(take_value("--password-file", args, &mut i)?);
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for passwd")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "passwd takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let auth_config = auth_config
+        .ok_or_else(|| CliError::Usage("passwd requires `--auth-config <path>`".to_string()))?;
+    let user =
+        user.ok_or_else(|| CliError::Usage("passwd requires `--user <name>`".to_string()))?;
+    let args = PasswdArgs {
+        auth_config,
+        user,
+        remove,
+        scopes,
+        password_file,
+    };
+    cmd_passwd(&args, out)
+}
+
+/// The non-Unix `passwd` stub: the identity-table edit relies on POSIX `0o600` ownership/mode for the
+/// fail-closed secret-file guard (docs/SECRETS.md), the same reason `serve` is Unix-only, so this is a
+/// clean refusal rather than a half-secure write on a platform without the perm model.
+#[cfg(not(unix))]
+fn run_passwd(_args: &[String], _out: &mut impl Write) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        "passwd is only supported on Unix (it relies on POSIX owner-only 0600 file permissions for \
+         the credential table); edit the identity table on a Unix host"
+            .to_string(),
+    ))
+}
+
+/// Applies the `passwd` action to the identity table (#631): parse the existing table (if any),
+/// set/update or remove the user's username+password identity, and write the result back at `0o600`.
+#[cfg(unix)]
+fn cmd_passwd(args: &PasswdArgs, out: &mut impl Write) -> Result<(), CliError> {
+    // Validate the scopes up front (a typed reject for an unknown scope; same vocabulary as the table
+    // loader), so a bad `--scopes` never reaches the (slow) hash or the file write.
+    for s in &args.scopes {
+        if !matches!(s.as_str(), "publish" | "subscribe" | "admin") {
+            return Err(CliError::Usage(format!(
+                "unknown scope `{s}` (expected any of publish, subscribe, admin)"
+            )));
+        }
+    }
+
+    // Read + parse the existing table, if present. A present table is StrictModes-checked fail-closed
+    // (it carries credential hashes), exactly like `serve` would, BEFORE it is read or rewritten — so
+    // `passwd` never widens a secret file's exposure and never reads a group/world-readable one.
+    let path = Path::new(&args.auth_config);
+    let mut identities: Vec<RawIdentity> = if path.exists() {
+        strict_mode_check_secret_file(&args.auth_config)?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            CliError::Usage(format!(
+                "cannot read --auth-config `{}`: {e}",
+                args.auth_config
+            ))
+        })?;
+        parse_identity_table(&raw)?
+    } else {
+        Vec::new()
+    };
+
+    if args.remove {
+        let before = identities.len();
+        identities.retain(|id| id.name != args.user);
+        if identities.len() == before {
+            return Err(CliError::Usage(format!(
+                "no identity named `{}` in `{}` to remove",
+                args.user, args.auth_config
+            )));
+        }
+    } else {
+        passwd_apply_set(&mut identities, args)?;
+    }
+
+    write_identity_table_0600(path, &args.auth_config, &identities)?;
+
+    // A confirmation line — naming the user and the action, NEVER the password or the hash.
+    if args.remove {
+        writeln!(
+            out,
+            "removed identity `{}` from {}",
+            args.user, args.auth_config
+        )?;
+    } else {
+        writeln!(
+            out,
+            "set password for `{}` in {} (scopes: {})",
+            args.user,
+            args.auth_config,
+            if args.scopes.is_empty() {
+                "none".to_string()
+            } else {
+                args.scopes.join(", ")
+            }
+        )?;
+    }
+    Ok(())
+}
+
+/// The SET arm of `passwd` (#631): read the password securely, mint the Argon2id PHC hash, and UPSERT
+/// the username+password identity into `identities`. The plaintext buffer is dropped immediately after
+/// minting; only the HASH is retained. A user that currently holds a DIFFERENT mechanism (token /
+/// mTLS) is converted to the password mechanism (passwd manages the password mechanism); its scopes
+/// are taken from `--scopes`.
+///
+/// # Errors
+/// [`CliError::Usage`] for an empty password or a hashing/CSPRNG failure.
+#[cfg(unix)]
+fn passwd_apply_set(identities: &mut Vec<RawIdentity>, args: &PasswdArgs) -> Result<(), CliError> {
+    let phc = {
+        let password = read_password_secret(args.password_file.as_deref())?;
+        if password.is_empty() {
+            return Err(CliError::Usage(
+                "refusing to set an empty password; provide a non-empty password on stdin or via \
+                 --password-file"
+                    .to_string(),
+            ));
+        }
+        let phc = ironbus_server::auth::mint_password_phc(&password)
+            .map_err(|e| CliError::Usage(format!("could not mint the password hash: {e}")))?;
+        // `password` (a Vec<u8>) drops here; the plaintext window is narrow and it is never logged.
+        drop(password);
+        phc
+    };
+    let mechanism = RawMechanism::Password {
+        username: args.user.clone(),
+        phc_hashes: vec![phc],
+    };
+    if let Some(existing) = identities.iter_mut().find(|id| id.name == args.user) {
+        existing.scopes.clone_from(&args.scopes);
+        existing.mechanism = mechanism;
+    } else {
+        identities.push(RawIdentity {
+            name: args.user.clone(),
+            scopes: args.scopes.clone(),
+            mechanism,
+        });
+    }
+    Ok(())
+}
+
+/// Renders + writes the identity table at OWNER-ONLY `0o600` (#631, the secret-file mode). Opens with
+/// the mode set at create time (no group/world-readable window between create and chmod), and ALSO sets
+/// the mode explicitly afterward so an EXISTING file is tightened to `0o600` too.
+///
+/// # Errors
+/// [`CliError::Usage`] if the file cannot be written or its permissions cannot be set.
+#[cfg(unix)]
+fn write_identity_table_0600(
+    path: &Path,
+    display_path: &str,
+    identities: &[RawIdentity],
+) -> Result<(), CliError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let rendered = render_identity_table(identities);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            CliError::Usage(format!("cannot write --auth-config `{display_path}`: {e}"))
+        })?;
+    f.write_all(rendered.as_bytes()).map_err(|e| {
+        CliError::Usage(format!("cannot write --auth-config `{display_path}`: {e}"))
+    })?;
+    drop(f);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        CliError::Usage(format!(
+            "wrote `{display_path}` but could not set owner-only 0600 permissions: {e}; chmod 600 it \
+             manually"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Reads a password securely from a `--password-file` reference, or from stdin when none is given
+/// (#631, docs/SECRETS.md: a secret is sourced by REFERENCE, never a CLI flag/env var). A single
+/// trailing newline (and a trailing CR) is trimmed so a `printf 'pw\n' > file` or a piped `echo` does
+/// not embed the newline in the password. The bytes are returned owned so the caller drops them
+/// promptly; this function never logs or echoes them.
+#[cfg(unix)]
+fn read_password_secret(password_file: Option<&str>) -> Result<Vec<u8>, CliError> {
+    let mut bytes = if let Some(file) = password_file {
+        // The password file is a secret reference: StrictModes-check it fail-closed (owner-only),
+        // exactly like the identity table and the TLS key.
+        strict_mode_check_secret_file(file)?;
+        std::fs::read(file)
+            .map_err(|e| CliError::Usage(format!("cannot read --password-file `{file}`: {e}")))?
+    } else {
+        let mut buf = Vec::new();
+        io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| CliError::Usage(format!("cannot read the password from stdin: {e}")))?;
+        buf
+    };
+    // Trim exactly one trailing newline (and an accompanying CR), the shape a `printf`/`echo`/heredoc
+    // produces, so the stored hash is over the intended password, not "password\n".
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    Ok(bytes)
+}
+
+/// The mechanism + credentials of a parsed `[[identity]]`, kept verbatim so a `passwd` edit RE-RENDERS
+/// every untouched identity unchanged (#631). Only the password arm is mutated by `passwd`; the token
+/// and mTLS arms are preserved exactly as they were read.
+#[cfg(unix)]
+#[derive(Debug)]
+enum RawMechanism {
+    /// `token_hashes = [..]` bearer-token digests, preserved verbatim.
+    Bearer { token_hashes: Vec<String> },
+    /// `username` + `password_hashes = [..]` Argon2id PHC strings (the arm `passwd` writes).
+    Password {
+        username: String,
+        phc_hashes: Vec<String>,
+    },
+    /// `mtls_san = [..]` accepted SAN identities, preserved verbatim.
+    Mtls { san_identities: Vec<String> },
+}
+
+/// A parsed `[[identity]]` (#631): the name, the scope list, and exactly one mechanism. Used by
+/// `passwd` to round-trip the table (preserve every other identity, mutate only the target).
+#[cfg(unix)]
+#[derive(Debug)]
+struct RawIdentity {
+    name: String,
+    scopes: Vec<String>,
+    mechanism: RawMechanism,
+}
+
+/// Parses an identity table's TOML into [`RawIdentity`] entries (#631), reusing the SAME field rules as
+/// the broker's `load_auth_config` (exactly one mechanism per identity; a `name` and a `scopes` list).
+/// It does NOT verify the hashes (that is the broker's job at load); it only structures the table for a
+/// faithful round-trip.
+///
+/// # Errors
+/// [`CliError::Usage`] for invalid TOML, a missing `name`/`scopes`, or zero/multiple mechanisms.
+#[cfg(unix)]
+fn parse_identity_table(raw: &str) -> Result<Vec<RawIdentity>, CliError> {
+    let parsed: toml::Value = raw
+        .parse()
+        .map_err(|e| CliError::Usage(format!("identity table is not valid TOML: {e}")))?;
+    // An empty/absent `[[identity]]` array is fine for passwd (a fresh table is being built); only a
+    // present-but-malformed `identity` key is an error.
+    let Some(identities) = parsed.get("identity") else {
+        return Ok(Vec::new());
+    };
+    let identities = identities.as_array().ok_or_else(|| {
+        CliError::Usage("`identity` must be an array of `[[identity]]` tables".to_string())
+    })?;
+    let mut out = Vec::with_capacity(identities.len());
+    for (i, ident) in identities.iter().enumerate() {
+        let name = ident
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| CliError::Usage(format!("identity #{i} is missing a string `name`")))?
+            .to_string();
+        let mut scopes = Vec::new();
+        if let Some(arr) = ident.get("scopes").and_then(toml::Value::as_array) {
+            for s in arr {
+                let s = s.as_str().ok_or_else(|| {
+                    CliError::Usage(format!("identity `{name}` has a non-string scope"))
+                })?;
+                scopes.push(s.to_string());
+            }
+        }
+        let has_token = ident.get("token_hashes").is_some();
+        let has_password =
+            ident.get("password_hashes").is_some() || ident.get("username").is_some();
+        let has_mtls = ident.get("mtls_san").is_some();
+        let count = usize::from(has_token) + usize::from(has_password) + usize::from(has_mtls);
+        if count != 1 {
+            return Err(CliError::Usage(format!(
+                "identity `{name}` must declare EXACTLY one mechanism (found {count})"
+            )));
+        }
+        let mechanism = if has_token {
+            RawMechanism::Bearer {
+                token_hashes: string_array(ident, "token_hashes", &name)?,
+            }
+        } else if has_password {
+            let username = ident
+                .get("username")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "identity `{name}` password mechanism needs a `username`"
+                    ))
+                })?
+                .to_string();
+            RawMechanism::Password {
+                username,
+                phc_hashes: string_array(ident, "password_hashes", &name)?,
+            }
+        } else {
+            RawMechanism::Mtls {
+                san_identities: string_array(ident, "mtls_san", &name)?,
+            }
+        };
+        out.push(RawIdentity {
+            name,
+            scopes,
+            mechanism,
+        });
+    }
+    Ok(out)
+}
+
+/// Extracts a TOML string array field (`token_hashes` / `password_hashes` / `mtls_san`) for an
+/// identity, with a typed error for a non-array or non-string element (#631).
+#[cfg(unix)]
+fn string_array(ident: &toml::Value, key: &str, name: &str) -> Result<Vec<String>, CliError> {
+    let arr = ident
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| CliError::Usage(format!("identity `{name}` `{key}` must be a list")))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        out.push(
+            v.as_str()
+                .ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "identity `{name}` `{key}` has a non-string element"
+                    ))
+                })?
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// Renders [`RawIdentity`] entries to canonical identity-table TOML (#631): one `[[identity]]` block
+/// per identity, deterministic field order, with TOML basic-string quoting so a hash/name containing a
+/// `\` or `"` is escaped correctly. The output round-trips through [`parse_identity_table`] and the
+/// broker's `load_auth_config`.
+#[cfg(unix)]
+fn render_identity_table(identities: &[RawIdentity]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "# IronBus auth identity table (managed by `ironbus passwd`). Owner-only 0600.\n\
+         # Each [[identity]] declares a name, a scopes list, and exactly one mechanism.\n\
+         # Secrets are HASHES (Argon2id PHC / SHA-256 token digests), never plaintext."
+    );
+    for id in identities {
+        let _ = writeln!(s, "\n[[identity]]");
+        let _ = writeln!(s, "name = {}", toml_string(&id.name));
+        let scopes: Vec<String> = id.scopes.iter().map(|x| toml_string(x)).collect();
+        let _ = writeln!(s, "scopes = [{}]", scopes.join(", "));
+        match &id.mechanism {
+            RawMechanism::Bearer { token_hashes } => {
+                let _ = writeln!(s, "token_hashes = [{}]", quote_list(token_hashes));
+            }
+            RawMechanism::Password {
+                username,
+                phc_hashes,
+            } => {
+                let _ = writeln!(s, "username = {}", toml_string(username));
+                let _ = writeln!(s, "password_hashes = [{}]", quote_list(phc_hashes));
+            }
+            RawMechanism::Mtls { san_identities } => {
+                let _ = writeln!(s, "mtls_san = [{}]", quote_list(san_identities));
+            }
+        }
+    }
+    s
+}
+
+/// Quotes a list of strings as a TOML inline array body (comma-separated basic strings).
+#[cfg(unix)]
+fn quote_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|x| toml_string(x))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Quotes a string as a TOML BASIC string, escaping `\`, `"`, and the control chars TOML requires, so
+/// a value with a quote or backslash round-trips losslessly (#631). Argon2id PHC strings and SHA-256
+/// digests are printable ASCII, but quoting defensively keeps an arbitrary name/value safe.
+#[cfg(unix)]
+fn toml_string(value: &str) -> String {
+    let mut s = String::with_capacity(value.len() + 2);
+    s.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => s.push_str("\\\""),
+            '\\' => s.push_str("\\\\"),
+            '\n' => s.push_str("\\n"),
+            '\r' => s.push_str("\\r"),
+            '\t' => s.push_str("\\t"),
+            other => s.push(other),
+        }
+    }
+    s.push('"');
+    s
 }
 
 /// The fatal usage error for a `--tls-*` flag (or `IRONBUS_TLS_*` env var) set in a build where the
@@ -14643,6 +15119,270 @@ mod tests {
         .unwrap();
         assert!(on.config.enable_admin, "admin is on with --enable-admin");
         assert_eq!(on.config.max_in_flight, 8, "the trailing flag still parses");
+    }
+
+    // `#[cfg(unix)]`: `passwd` writes the identity table at POSIX 0600 and is Unix-only; the test
+    // stages files with `from_mode` and reads back the mode, the same `cfg(unix)` precedent as the
+    // `load_auth_config` test above.
+    #[cfg(unix)]
+    #[test]
+    fn passwd_sets_a_password_that_round_trips_through_the_verify_path() {
+        use ironbus_server::auth::Scope;
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("auth.toml");
+        // The password is sourced from a FILE (a secret reference), never the command line. The file is
+        // owner-only so the StrictModes check passes.
+        let pw_file = dir.path().join("pw.txt");
+        {
+            let mut f = std::fs::File::create(&pw_file).unwrap();
+            // A trailing newline (the `printf 'pw\n'` shape) must be trimmed by the reader.
+            f.write_all(b"s3cr3t-pass\n").unwrap();
+        }
+        std::fs::set_permissions(&pw_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut out = Vec::new();
+        run_passwd(
+            &[
+                "--auth-config".to_string(),
+                table.to_str().unwrap().to_string(),
+                "--user".to_string(),
+                "alice".to_string(),
+                "--scopes".to_string(),
+                "subscribe,admin".to_string(),
+                "--password-file".to_string(),
+                pw_file.to_str().unwrap().to_string(),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        let stdout = String::from_utf8(out).unwrap();
+        // NEVER echoes the password (nor the hash) on the confirmation line.
+        assert!(stdout.contains("set password for `alice`"));
+        assert!(
+            !stdout.contains("s3cr3t-pass"),
+            "must not echo the password: {stdout}"
+        );
+
+        // The written table is OWNER-ONLY 0600, and its contents are the HASH, not the plaintext.
+        let mode = std::fs::metadata(&table).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the identity table must be owner-only 0600");
+        let written = std::fs::read_to_string(&table).unwrap();
+        assert!(
+            !written.contains("s3cr3t-pass"),
+            "the table must store only the hash"
+        );
+        assert!(
+            written.contains("$argon2id$"),
+            "the table stores an Argon2id PHC string"
+        );
+
+        // Round-trip: the broker's loader accepts it, and the password verifies with the pinned scopes.
+        let transport = ts(None, None, None, Some(table.to_str().unwrap()), false);
+        let cfg = load_auth_config(&transport)
+            .unwrap()
+            .expect("an auth config");
+        let (id, _) = cfg
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Password,
+                    material: ironbus_proto::message::pack_password_material(
+                        b"alice",
+                        b"s3cr3t-pass",
+                    )
+                    .unwrap(),
+                },
+                None,
+            )
+            .expect("the set password verifies");
+        assert_eq!(id.name, "alice");
+        assert!(id.scopes.has(Scope::Subscribe) && id.scopes.has(Scope::Admin));
+        assert!(
+            !id.scopes.has(Scope::Publish),
+            "no implication: publish was not granted"
+        );
+        // The WRONG password is rejected.
+        assert!(cfg
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Password,
+                    material: ironbus_proto::message::pack_password_material(b"alice", b"wrong")
+                        .unwrap(),
+                },
+                None,
+            )
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passwd_update_and_remove_preserve_other_identities() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("auth.toml");
+        // Seed a table with a TOKEN identity that passwd must PRESERVE untouched.
+        let token_hex = {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write as _;
+            let d = Sha256::digest(b"tok");
+            let mut s = String::new();
+            for b in d {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
+        {
+            let mut f = std::fs::File::create(&table).unwrap();
+            write!(
+                f,
+                "[[identity]]\nname = \"producer\"\nscopes = [\"publish\"]\ntoken_hashes = [\"{token_hex}\"]\n"
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&table, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Set a password user via stdin is awkward in-test; use a password file.
+        let pw_file = dir.path().join("pw.txt");
+        std::fs::write(&pw_file, b"pw1").unwrap();
+        std::fs::set_permissions(&pw_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let set = |scopes: &str, out: &mut Vec<u8>| {
+            run_passwd(
+                &[
+                    "--auth-config".to_string(),
+                    table.to_str().unwrap().to_string(),
+                    "--user".to_string(),
+                    "bob".to_string(),
+                    "--scopes".to_string(),
+                    scopes.to_string(),
+                    "--password-file".to_string(),
+                    pw_file.to_str().unwrap().to_string(),
+                ],
+                out,
+            )
+        };
+        set("subscribe", &mut Vec::new()).unwrap();
+        // Update bob's scopes (re-set) — must not duplicate the identity.
+        set("subscribe,admin", &mut Vec::new()).unwrap();
+
+        let cfg = load_auth_config(&ts(None, None, None, Some(table.to_str().unwrap()), false))
+            .unwrap()
+            .expect("config");
+        // The preserved token identity still authenticates.
+        assert!(cfg
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Bearer,
+                    material: b"tok".to_vec(),
+                },
+                None,
+            )
+            .is_ok());
+        // bob authenticates with the UPDATED scopes.
+        let (bob, _) = cfg
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Password,
+                    material: ironbus_proto::message::pack_password_material(b"bob", b"pw1")
+                        .unwrap(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(bob.scopes.has(ironbus_server::auth::Scope::Admin));
+
+        // REMOVE bob; the token identity survives, bob no longer authenticates.
+        run_passwd(
+            &[
+                "--auth-config".to_string(),
+                table.to_str().unwrap().to_string(),
+                "--user".to_string(),
+                "bob".to_string(),
+                "--remove".to_string(),
+            ],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let cfg2 = load_auth_config(&ts(None, None, None, Some(table.to_str().unwrap()), false))
+            .unwrap()
+            .expect("config");
+        assert!(cfg2
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Password,
+                    material: ironbus_proto::message::pack_password_material(b"bob", b"pw1")
+                        .unwrap(),
+                },
+                None,
+            )
+            .is_err());
+        assert!(cfg2
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Bearer,
+                    material: b"tok".to_vec(),
+                },
+                None,
+            )
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passwd_rejects_an_empty_password_and_an_unknown_scope_and_a_missing_remove_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("auth.toml");
+        let pw_file = dir.path().join("pw.txt");
+        std::fs::write(&pw_file, b"").unwrap(); // empty password
+        std::fs::set_permissions(&pw_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Empty password is refused (no identity table is written).
+        let e = run_passwd(
+            &[
+                "--auth-config".to_string(),
+                table.to_str().unwrap().to_string(),
+                "--user".to_string(),
+                "x".to_string(),
+                "--password-file".to_string(),
+                pw_file.to_str().unwrap().to_string(),
+            ],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, CliError::Usage(_)));
+
+        // Unknown scope is refused.
+        std::fs::write(&pw_file, b"p").unwrap();
+        let e = run_passwd(
+            &[
+                "--auth-config".to_string(),
+                table.to_str().unwrap().to_string(),
+                "--user".to_string(),
+                "x".to_string(),
+                "--scopes".to_string(),
+                "superuser".to_string(),
+                "--password-file".to_string(),
+                pw_file.to_str().unwrap().to_string(),
+            ],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, CliError::Usage(_)));
+
+        // Removing a non-existent user is a typed error (the table does not exist / has no such user).
+        let e = run_passwd(
+            &[
+                "--auth-config".to_string(),
+                table.to_str().unwrap().to_string(),
+                "--user".to_string(),
+                "ghost".to_string(),
+                "--remove".to_string(),
+            ],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, CliError::Usage(_)));
     }
 
     #[test]
