@@ -119,17 +119,19 @@ fn split_lines(stdout: &str) -> Vec<&str> {
     lines
 }
 
-/// Detects and STRIPS a leading-or-anywhere global `--json` from `args`, returning the
-/// remaining args and whether `--json` was present. Only the global occurrence is consumed:
-/// because every position is scanned, a per-command `--json` (e.g. `peek --json`) is ALSO
-/// removed here so the inner command never double-handles it; the inner command therefore runs
-/// in its plain (human) mode and its output is captured into the envelope. A `--` terminator is
-/// respected: tokens after the first bare `--` are positional and never treated as the flag, so a
-/// literal `--json` payload (e.g. `pub -- --json`) is preserved.
+/// Detects and STRIPS the global `--json` flag, returning the remaining args and whether it was
+/// present. The global flag is the LEADING form only — it precedes the subcommand
+/// (`ironbus --json <cmd> ...`). A `--json` that appears AFTER the subcommand name belongs to that
+/// subcommand (e.g. `dump --json` / `peek --json` / `dlq peek --json` have their OWN structured
+/// `--json` output) and is left untouched in `rest` for the subcommand to handle — so the global
+/// envelope never clobbers a command's native machine-readable output. A `--` terminator is
+/// respected: tokens after the first bare `--` are positional and never treated as the flag (a
+/// literal `--json` payload like `pub -- --json` is preserved).
 pub(crate) fn strip_global_json(args: &[String]) -> (Vec<String>, bool) {
     let mut json = false;
     let mut rest = Vec::with_capacity(args.len());
     let mut after_terminator = false;
+    let mut seen_subcommand = false;
     for a in args {
         if after_terminator {
             rest.push(a.clone());
@@ -140,9 +142,14 @@ pub(crate) fn strip_global_json(args: &[String]) -> (Vec<String>, bool) {
             rest.push(a.clone());
             continue;
         }
-        if a == "--json" {
+        // The global `--json` is only consumed BEFORE the subcommand. Once the subcommand (the first
+        // bare, non-`-` token) is seen, a later `--json` is the subcommand's own flag.
+        if a == "--json" && !seen_subcommand {
             json = true;
             continue;
+        }
+        if !a.starts_with('-') {
+            seen_subcommand = true;
         }
         rest.push(a.clone());
     }
@@ -169,14 +176,28 @@ mod tests {
     }
 
     #[test]
-    fn strip_global_json_removes_the_flag_anywhere() {
-        let args: Vec<String> = ["peek", "--json", "--data-dir", "/x"]
+    fn strip_global_json_strips_only_the_leading_global_flag() {
+        // LEADING `--json` (before the subcommand) is the global flag: stripped, json=true.
+        let args: Vec<String> = ["--json", "peek", "--data-dir", "/x"]
             .iter()
             .map(|s| (*s).to_string())
             .collect();
         let (rest, json) = strip_global_json(&args);
         assert!(json);
         assert_eq!(rest, vec!["peek", "--data-dir", "/x"]);
+    }
+
+    #[test]
+    fn strip_global_json_leaves_a_subcommands_own_trailing_json() {
+        // A `--json` AFTER the subcommand belongs to that subcommand (e.g. dump/peek/dlq emit their
+        // own structured JSON): NOT consumed as the global flag, left intact in `rest`.
+        let args: Vec<String> = ["peek", "--json", "--data-dir", "/x"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let (rest, json) = strip_global_json(&args);
+        assert!(!json);
+        assert_eq!(rest, vec!["peek", "--json", "--data-dir", "/x"]);
     }
 
     #[test]
