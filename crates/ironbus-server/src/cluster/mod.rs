@@ -297,15 +297,18 @@ pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAc
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
-pub use placement::{decide_placement, placement_command, placement_node_from, PlacementOutcome};
+pub use placement::{
+    decide_placement, placement_command, placement_node_from, reassign_leadership, FailoverOutcome,
+    PlacementOutcome,
+};
 pub use replication::{
     ApplyOutcome, DivergenceTruncation, EpochAwareFollower, FetchRecordsBody, FetchResponseBody,
     Follower, OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReadPlaneLeader,
     ReplicationError, ReplicationFrame, ReplicationLeader, ReplicationLink, MAX_REPL_FETCH_BYTES,
 };
 pub use runtime::{
-    dataplane_addr, ClusterConfig, ClusterRuntime, ClusterStatus, MetadataProposer, RuntimeError,
-    DATAPLANE_PORT_OFFSET,
+    dataplane_addr, partitions_led_by, plan_failovers, ClusterConfig, ClusterRuntime,
+    ClusterStatus, MetadataProposer, RuntimeError, DATAPLANE_PORT_OFFSET,
 };
 pub use serve::{
     decode_dataplane_peer_frame, encode_dataplane_peer_frame, DataPlaneLink, DataPlaneRuntime,

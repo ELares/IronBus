@@ -784,6 +784,87 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
     }
 }
 
+// The #618 leaderless-FAILOVER promotion needs `F: Clone` (it builds a [`ReadPlane`] over the
+// follower's owned log via [`Log::read_plane`], which clones the filesystem handle behind an `Arc` so
+// the plane outlives the log). It is a SEPARATE impl block so the rest of the controller — and the
+// no-cluster path — keeps the looser `F: Filesystem` bound; nothing on the single-node path links this.
+impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
+    /// PROMOTE this node from FOLLOWER to LEADER of `partition` on a leaderless-node FAILOVER (#618),
+    /// serving the SAME committed log it already holds as a follower — NO data copy. This is the
+    /// data-plane half of the failover: the metadata plane committed a
+    /// [`PlacePartition`](super::state_machine::MetadataCommand::PlacePartition) naming THIS node the new
+    /// leader at a strictly-higher `new_epoch` (the #618
+    /// [`reassign_leadership`](super::placement::reassign_leadership)); this applies it locally.
+    ///
+    /// It takes the follower's OWNED replica [`Log`] out of the role (so its writer is dropped — the
+    /// single-writer invariant), builds the leader's read plane over THAT log (the leader serves the
+    /// records it already holds, zero byte copy), seeds the leader's epoch cache with the follower's
+    /// learned epoch history PLUS the new boundary `(new_epoch, current_frontier)` — the KIP-101 FENCE:
+    /// a stale/returning old leader at a lower epoch is rejected — and registers the leader role over
+    /// `replica_ids` / `isr_config`.
+    ///
+    /// `new_epoch` MUST strictly exceed the dead leader's epoch (the failover re-placement guarantees
+    /// this via [`reassign_leadership`](super::placement::reassign_leadership)); the epoch-cache `assign`
+    /// enforces strict monotonicity and fails closed if it does not.
+    ///
+    /// # Errors
+    /// - [`DataPlaneError::WrongRole`] if this node is already the leader (idempotent re-promotion is a
+    ///   no-op caller-side; a double-promote is a logic error surfaced here);
+    /// - [`DataPlaneError::UnknownPartition`] if this node holds no role for `partition`;
+    /// - [`DataPlaneError::Replication`] if the read plane cannot be built or the epoch boundary cannot
+    ///   be assigned (a backward epoch — fail-closed).
+    pub fn promote_follower_to_leader(
+        &mut self,
+        partition: u64,
+        new_epoch: LeaderEpoch,
+        replica_ids: &[u64],
+        isr_config: IsrConfig,
+    ) -> Result<(), DataPlaneError> {
+        // Take the role out so we can consume the follower (or restore it on a wrong-role error).
+        let role = self
+            .roles
+            .remove(&partition)
+            .ok_or(DataPlaneError::UnknownPartition { partition })?;
+        let follower = match role {
+            PartitionRole::Follower { follower } => follower,
+            // Already a leader: not a follower to promote. Put it back and report the wrong role.
+            leader @ PartitionRole::Leader { .. } => {
+                self.roles.insert(partition, leader);
+                return Err(DataPlaneError::WrongRole {
+                    partition,
+                    needed: "follower",
+                });
+            }
+        };
+        // Split the follower into its owned log + its learned epoch history. The log is the committed
+        // data this node ALREADY holds — promotion serves it as-is (no fetch, no copy).
+        let (follower, mut epochs) = follower.into_parts();
+        let log = follower.into_log();
+        // The frontier the new epoch begins at: the first offset NOT yet held (its durable prefix). All
+        // records from here on are served under the new (bumped) leadership epoch.
+        let frontier = log.next_offset();
+        // Build the leader's read plane over the SAME log (zero byte copy). The plane holds its own
+        // Arc<Filesystem> over the same directory, so it stays valid for the leader role's lifetime.
+        let plane = Arc::new(
+            log.read_plane()
+                .map_err(|e| DataPlaneError::Replication(ReplicationError::Storage(e)))?,
+        );
+        // SEED THE FENCE: record the new (strictly-higher) leadership epoch starting at the current
+        // frontier. `assign` is a no-op if the epoch is unchanged and FAILS CLOSED if it regresses, so a
+        // failover that did not bump the epoch is rejected here rather than silently un-fencing the old
+        // leader. After this the leader answers OffsetForLeaderEpoch under the new epoch — the KIP-101
+        // fence a returning old leader is truncated against.
+        epochs
+            .assign(new_epoch, frontier)
+            .map_err(|e| DataPlaneError::Replication(ReplicationError::EpochCache(e)))?;
+        // The owned `log` is dropped here (its writer released) — the promoted leader serves through the
+        // read plane only; in a live broker its append actor becomes the sole writer (FLAGGED hot-path).
+        drop(log);
+        self.start_leader(partition, plane, epochs, replica_ids, isr_config);
+        Ok(())
+    }
+}
+
 /// The disposition of a produce's wire `PubAck` after the seam looks at the cluster ack level + role
 /// (the output of [`ProduceAckSeam::on_local_fsynced_ack`]).
 ///
