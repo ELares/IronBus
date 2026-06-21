@@ -367,6 +367,22 @@ pub enum FrameType {
     /// — see `crate::cluster::geo` in `ironbus-server`). It is a NEW append-only tag a CLIENT never
     /// sends and an intra-cluster peer never sends; tags 1-39 are byte-for-byte unchanged.
     MirrorPull,
+    /// The EDGE LEAF-SPOKE write-through PUSH frame (#625, V2-C7-I3, wire tag 41). The asymmetric twin
+    /// of [`FrameType::MirrorPull`]: where a leaf MIRRORS a hub stream by PULLING (tag 40, the read-side
+    /// bridge), a leaf FORWARDS its locally-produced records UP to the hub by PUSHING this frame on the
+    /// SAME outbound link the leaf dialed (the hub never dials the leaf — leaves sit behind NAT). The
+    /// leaf is NOT a Raft voter; this is an async, resumable, de-duplicated forward, not a quorum write.
+    /// Request and response SHARE this one tag (distinguished by a leading `kind` byte, like
+    /// [`FrameType::MirrorPull`]). Body (request): `kind: u8 = 0`, `from_leaf_offset: u64` (the leaf's
+    /// own local offset the run starts at — the leaf's durable push cursor), `record_count: u32`,
+    /// `frame_bytes_len: u32`, then the hub stream name as a u16-length-prefixed name, then the verbatim
+    /// CRC-framed local record bytes (the hub RE-VALIDATES every frame before appending — fail-closed,
+    /// never a blind-trusted byte). Body (response): `kind: u8 = 1`, `accepted_through_leaf_offset: u64`
+    /// (the leaf offset the hub durably appended through; the leaf advances its push cursor to it). It is
+    /// a NEW append-only tag a CLIENT never sends and an intra-cluster peer never sends; tags 1-40 are
+    /// byte-for-byte unchanged. The geo leaf layer (`crate::cluster::leaf` in `ironbus-server`) is its
+    /// only encoder/decoder.
+    LeafPush,
 }
 
 impl FrameType {
@@ -414,6 +430,7 @@ impl FrameType {
             FrameType::OffsetForLeaderEpoch => 38,
             FrameType::SegmentFingerprints => 39,
             FrameType::MirrorPull => 40,
+            FrameType::LeafPush => 41,
         }
     }
 
@@ -462,6 +479,7 @@ impl FrameType {
             38 => FrameType::OffsetForLeaderEpoch,
             39 => FrameType::SegmentFingerprints,
             40 => FrameType::MirrorPull,
+            41 => FrameType::LeafPush,
             _ => return None,
         })
     }
@@ -594,7 +612,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 40] = [
+    const ALL_TYPES: [FrameType; 41] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -635,6 +653,7 @@ mod tests {
         FrameType::OffsetForLeaderEpoch,
         FrameType::SegmentFingerprints,
         FrameType::MirrorPull,
+        FrameType::LeafPush,
     ];
 
     #[test]
@@ -693,6 +712,7 @@ mod tests {
         assert_eq!(FrameType::OffsetForLeaderEpoch.as_u8(), 38);
         assert_eq!(FrameType::SegmentFingerprints.as_u8(), 39);
         assert_eq!(FrameType::MirrorPull.as_u8(), 40);
+        assert_eq!(FrameType::LeafPush.as_u8(), 41);
     }
 
     #[test]
@@ -709,8 +729,8 @@ mod tests {
         // 37 is the cluster AckReplicated report (#593, V2-C2-I2), the next free tag after the subject
         // verbs; 38 is the cluster OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the
         // cluster SegmentFingerprints divergence-advertisement (#611, V2-C4-I1); 40 is the
-        // cross-cluster MirrorPull (#623, V2-C7-I1); 41 is now the next-free (still unknown) tag, so it
-        // frames but is not a known type.
+        // cross-cluster MirrorPull (#623, V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through
+        // (#625, V2-C7-I3); 42 is now the next-free (still unknown) tag, so it frames but is not known.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -718,7 +738,8 @@ mod tests {
         );
         assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
-        assert_eq!(FrameType::from_u8(41), None);
+        assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
+        assert_eq!(FrameType::from_u8(42), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -760,7 +781,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(34), Some(FrameType::BindSubject));
         // 37 is the cluster AckReplicated report (#593); 38 is the cluster OffsetForLeaderEpoch
         // divergence-query (#599); 39 is the cluster SegmentFingerprints divergence-advertisement
-        // (#611); 40 is the cross-cluster MirrorPull (#623); 41 is the next-free (still unknown) tag.
+        // (#611); 40 is the cross-cluster MirrorPull (#623); 41 is the edge leaf-spoke LeafPush (#625);
+        // 42 is the next-free (still unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -768,7 +790,8 @@ mod tests {
         );
         assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
-        assert_eq!(FrameType::from_u8(41), None);
+        assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
+        assert_eq!(FrameType::from_u8(42), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -845,9 +868,10 @@ mod tests {
         // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is the cluster
         // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the cluster SegmentFingerprints
         // divergence-advertisement (#611, V2-C4-I1); 40 is the cross-cluster MirrorPull (#623,
-        // V2-C7-I1); 41 is now the next-free (still unknown) tag, so it frames but is not a known type.
-        // (Tags 27 = cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the
-        // cluster replication-fetch verbs #590; 34-36 = the subject-routing verbs #585.)
+        // V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through (#625, V2-C7-I3); 42 is now the
+        // next-free (still unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer
+        // Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch
+        // verbs #590; 34-36 = the subject-routing verbs #585.)
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -855,7 +879,8 @@ mod tests {
         );
         assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
-        assert_eq!(FrameType::from_u8(41), None);
+        assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
+        assert_eq!(FrameType::from_u8(42), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -882,9 +907,10 @@ mod tests {
         // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is the cluster
         // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the cluster SegmentFingerprints
         // divergence-advertisement (#611, V2-C4-I1); 40 is the cross-cluster MirrorPull (#623,
-        // V2-C7-I1); 41 is now the next-free (still unknown) tag, so it frames but is not a known type.
-        // (Tags 27 = cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the
-        // cluster replication-fetch verbs #590; 34-36 = the subject-routing verbs #585.)
+        // V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through (#625, V2-C7-I3); 42 is now the
+        // next-free (still unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer
+        // Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch
+        // verbs #590; 34-36 = the subject-routing verbs #585.)
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -892,7 +918,8 @@ mod tests {
         );
         assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
-        assert_eq!(FrameType::from_u8(41), None);
+        assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
+        assert_eq!(FrameType::from_u8(42), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -1087,7 +1114,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 41u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 42u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
