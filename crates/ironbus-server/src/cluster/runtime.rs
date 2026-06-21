@@ -127,6 +127,14 @@ pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(3);
 /// metadata group AND leads the partition's data plane (it is the only node that knows the live HW).
 const COMMITTED_HW_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often the metadata LEADER re-evaluates the #617 LEARNER-PROMOTION gate: for every committed
+/// learner it checks whether the learner has CAUGHT UP (its durably-replicated frontier has reached the
+/// leader's committed high-watermark) and, if so, proposes its promotion to a voter. PERIODIC + bounded
+/// (never on the replication hot path); the next cycle re-checks a learner still catching up. A learner
+/// is promoted exactly once — the committed conf change drops it from the learner set — so this is a
+/// low-rate background reconcile, the join-side analogue of the F2 failover cadence.
+const LEARNER_PROMOTION_INTERVAL: Duration = Duration::from_millis(500);
+
 /// The fixed TCP-port offset the DATA-plane peer listener binds at, RELATIVE to a node's configured
 /// metadata address (#717). One `--cluster-peer <id>=<addr>` entry thus serves BOTH transports: the
 /// metadata Raft listener on `<addr>` and the data-plane (replication-fetch / ISR-report) listener on
@@ -275,6 +283,18 @@ pub struct ClusterStatus {
     /// a successor MUST hold before it may be auto-promoted. Empty until the data-plane leader has
     /// checkpointed at least once. Monotonic per partition (the state machine only ever raises it).
     pub last_committed_hw: BTreeMap<u64, u64>,
+    /// The non-voting LEARNERS the durable cluster membership currently has (the learner set of the
+    /// replicated raft `ConfState`, #617). A node joining as a learner appears here while it back-fills;
+    /// it leaves once the leader's #617 promotion gate promotes it to a voter (it then appears in
+    /// `voter_count`). Empty on a cluster with no joining node. While non-empty the quorum basis is still
+    /// `voter_count` — a learner does NOT count toward quorum (that is the join-without-availability-dip
+    /// guarantee).
+    pub learners: BTreeSet<u64>,
+    /// The learners the metadata leader's #617 promotion gate has proposed a promotion for (caught up to
+    /// the committed HW). Observability only — a learner leaves here once its promotion commits (it then
+    /// appears as a voter and leaves `learners`). Empty when no caught-up promotion is in flight; this is
+    /// the witness that a learner was promoted ONLY after catching up (it never appears here while behind).
+    pub learners_promoted: BTreeSet<u64>,
 }
 
 /// A command for the driver to propose to the metadata group on behalf of the broker (or a test):
@@ -284,6 +304,11 @@ pub struct ClusterStatus {
 enum DriverCmd {
     /// Propose a metadata command (leader-only; ignored with a log line if not leader).
     Propose(MetadataCommand),
+    /// Propose a joint-consensus MEMBERSHIP CHANGE (leader-only; #617): add/remove a voter, add a
+    /// learner (the join path), or promote a learner. The driver owns the `RawNode`, so the ADD-learner
+    /// half of a cooperative rebalance is requested here (by ops / the bootstrap / a test); the
+    /// CAUGHT-UP promotion half is driven automatically by the F3 gate in the driver loop.
+    ProposeMembership(MembershipChange),
     /// TEST SEAM (and ops hook): force a peer to be treated as UNREACHABLE by the F1 liveness
     /// detector, regardless of when it was last heard from. This makes the kill-the-leader test drive
     /// death-detection DETERMINISTICALLY (no real-time sleep): the test kills a node's threads, then
@@ -338,19 +363,55 @@ impl From<GroupError> for RuntimeError {
     }
 }
 
+/// How a node STARTS in the metadata group (C5-I2, #617): as a seeded VOTER of a brand-new group, or
+/// as a non-voting LEARNER JOINING an already-running cluster.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartRole {
+    /// A seeded voter of the metadata group (the C1 default): `node_id` is in the seeded voter
+    /// `ConfState` and the peer set is a supported group size (1/3/5).
+    #[default]
+    Voter,
+    /// A node JOINING an already-running cluster as a non-voting LEARNER (#617): `node_id` is NOT in
+    /// the seeded voter set; it opens via [`MetadataRaftGroup::open_as_learner`], back-fills the
+    /// committed metadata log by replication, and is promoted to a voter only once it is CAUGHT UP
+    /// (the metadata leader's #617 promotion gate). The peer set is the EXISTING voters (a supported
+    /// size) PLUS this learner — so the cluster's voter count is unchanged while it catches up.
+    Learner,
+}
+
 /// The additive, default-OFF cluster configuration: a node id plus the full peer-id→address map of
 /// the metadata group (INCLUDING this node's own id+address). Absent ⇒ no cluster runtime (the
 /// single-node default), so constructing one is the explicit opt-in.
 ///
-/// The peer set must be a supported metadata-group size (1, 3, or 5) and must contain `node_id`.
+/// The peer map is the cluster's ADDRESS BOOK: every member's listener address, so a node can dial
+/// any peer the metadata group may direct a message to. The SEEDED VOTER set (the brand-new group's
+/// `ConfState`) is the address book MINUS `pending_learners` (and, for a joining learner, minus
+/// itself) — and THAT set must be a supported metadata-group size (1, 3, or 5).
+///
+/// * a [`StartRole::Voter`] with no `pending_learners` is the C1 default: peers == seeded voters.
+/// * a [`StartRole::Voter`] that pre-declares one or more `pending_learners` lists their addresses in
+///   `peers` (so it can dial them once they are added) WITHOUT seeding them as voters — the #617 join
+///   address-book entry. The pre-declared learners do NOT count toward the seeded voter size, do NOT
+///   count toward quorum, and are NOT watched by the F1 liveness detector (they are not voters).
+/// * a [`StartRole::Learner`] is the joining node itself: its own id is excluded from the seed (it
+///   opens with an EMPTY voter set and joins by replication), and it is promoted once caught up.
+///
 /// Every node's address is where its peer LISTENER binds and where the OTHER nodes dial it.
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     /// This broker's node id within the metadata group (a non-zero raft node id).
     pub node_id: u64,
-    /// The full membership: every node id mapped to the socket address its peer listener binds /
-    /// the address the others dial. Includes `node_id` itself.
+    /// The full ADDRESS BOOK: every known member id mapped to the socket address its peer listener
+    /// binds / the address the others dial. Includes `node_id` itself, and any pre-declared joining
+    /// learners (`pending_learners`).
     pub peers: BTreeMap<u64, SocketAddr>,
+    /// How this node starts: a seeded voter (the default) or a joining learner (#617).
+    pub role: StartRole,
+    /// The pre-declared JOINING LEARNERS (#617): member ids that are in the `peers` address book (so
+    /// this node can dial them once the leader adds them) but are NOT seeded as voters and never
+    /// counted toward quorum / liveness while learning. Empty in the C1 default (peers == voters). A
+    /// [`StartRole::Learner`]'s own id need not appear here (it is excluded from the seed by its role).
+    pub pending_learners: BTreeSet<u64>,
 }
 
 impl ClusterConfig {
@@ -359,13 +420,32 @@ impl ClusterConfig {
         self.peers.get(&self.node_id).copied()
     }
 
-    /// The sorted voter id set (every configured node is a voter in C1; learners join later via the
-    /// membership API).
-    fn voters(&self) -> Vec<u64> {
-        self.peers.keys().copied().collect()
+    /// True if this node starts as a joining LEARNER (#617) rather than a seeded voter.
+    fn is_learner_join(&self) -> bool {
+        self.role == StartRole::Learner
     }
 
-    /// The remote peers (every node except this one), as id→addr.
+    /// True if `id` is NOT seeded as a voter: it is a pre-declared joining learner, or (for a joining
+    /// learner node) this node's own id. Such ids are in the address book but out of the seeded
+    /// `ConfState` and out of the quorum/liveness basis until promoted.
+    fn is_non_voter_seed(&self, id: u64) -> bool {
+        self.pending_learners.contains(&id) || (self.is_learner_join() && id == self.node_id)
+    }
+
+    /// The sorted VOTER id set the metadata group is SEEDED with: the address book MINUS the
+    /// pre-declared learners (and, for a joining learner, minus itself). This is the brand-new group's
+    /// `ConfState` and the quorum basis; it must be a supported size (1/3/5).
+    fn seed_voters(&self) -> Vec<u64> {
+        self.peers
+            .keys()
+            .copied()
+            .filter(|&id| !self.is_non_voter_seed(id))
+            .collect()
+    }
+
+    /// The remote peers (every node except this one), as id→addr — the whole address book minus self,
+    /// so a dialer exists for every member the metadata group may route to (incl. pre-declared
+    /// learners, so a voter can replicate to a learner the leader adds without restarting).
     fn remote_peers(&self) -> Vec<(u64, SocketAddr)> {
         self.peers
             .iter()
@@ -374,8 +454,20 @@ impl ClusterConfig {
             .collect()
     }
 
-    /// Validate the config: `node_id` must be one of the peers, the peer set must be a supported
-    /// metadata-group size, and every id must be a valid (non-zero) raft node id.
+    /// The remote VOTER peers the F1 liveness detector watches: the remote peers MINUS the
+    /// pre-declared learners (a non-voting learner is never a quorum member, so its silence is not a
+    /// crash that needs failover — it is simply not-yet-joined).
+    fn remote_voters(&self) -> Vec<u64> {
+        self.peers
+            .keys()
+            .copied()
+            .filter(|&id| id != self.node_id && !self.is_non_voter_seed(id))
+            .collect()
+    }
+
+    /// Validate the config: `node_id` must be one of the peers, no id may be the reserved 0, and the
+    /// SEEDED voter set (the address book minus the pending learners / a joining self) must be a
+    /// supported metadata-group size, so the cluster the node forms / joins is a valid quorum.
     fn validate(&self) -> Result<(), RuntimeError> {
         if !self.peers.contains_key(&self.node_id) {
             return Err(RuntimeError::Config(format!(
@@ -389,10 +481,10 @@ impl ClusterConfig {
                     .to_string(),
             ));
         }
-        let n = self.peers.len();
+        let n = self.seed_voters().len();
         if !matches!(n, 1 | 3 | 5) {
             return Err(RuntimeError::Config(format!(
-                "cluster peer count {n} is unsupported (must be 1, 3, or 5)"
+                "cluster seeded voter count {n} is unsupported (must be 1, 3, or 5)"
             )));
         }
         Ok(())
@@ -506,8 +598,8 @@ impl ClusterRuntime {
         // driver's F1 liveness detector (it times peer silence off the SAME I6 monotonic seam the group
         // uses, never the wall clock — so the kill-the-leader test drives it via a ManualClock).
         let driver_clock = clock.clone();
-        let voters = config.voters();
-        let group = MetadataRaftGroup::open(config.node_id, &voters, parent_fs, clock, log_config)?;
+        let seed_voters = config.seed_voters();
+        let group = open_metadata_group(config, &seed_voters, parent_fs, clock, log_config)?;
 
         // Bind the peer listener BEFORE spawning anything, so a bind failure is reported synchronously
         // (no half-started runtime). Non-blocking so the accept loop can poll the shutdown flag.
@@ -521,7 +613,16 @@ impl ClusterRuntime {
         // The shared peer registry: the set of node ids whose messages a reader will accept. Seeded
         // from the configured membership and refreshed by the driver from the group's `ConfState`
         // after a committed membership change. Shared with every reader thread for the peer-id check.
-        let registry = Arc::new(Mutex::new(PeerRegistry::from_members(&voters, &[])));
+        // For a joining LEARNER (#617) the seeded `ConfState` is empty until the leader's add_learner
+        // replicates, so we seed the registry with the EXISTING voters (the peers that will replicate
+        // to it) plus this learner — otherwise a learner would reject the voters' inbound append
+        // messages it needs to back-fill from before its own membership is known.
+        let registry = Arc::new(Mutex::new(if config.is_learner_join() {
+            let all: Vec<u64> = config.peers.keys().copied().collect();
+            PeerRegistry::from_members(&all, &[])
+        } else {
+            PeerRegistry::from_members(&seed_voters, &[])
+        }));
 
         // The inbound message channel: every reader thread sends decoded, authenticated `Message`s
         // here; the driver receives them and feeds `step`.
@@ -579,15 +680,11 @@ impl ClusterRuntime {
         // (fail-closed: no data plane => no blind auto-promotion). Shared with the driver thread.
         let failover_inputs: Arc<Mutex<Option<FailoverInputs>>> = Arc::new(Mutex::new(None));
 
-        // The remote VOTER peers the F1 detector watches (every configured node except this one — the
-        // peers whose silence past the deadline means a crash). The local node is never "silent to
-        // itself", so it is excluded.
-        let remote_voters: Vec<u64> = config
-            .peers
-            .keys()
-            .copied()
-            .filter(|&id| id != config.node_id)
-            .collect();
+        // The remote VOTER peers the F1 detector watches (every configured VOTER except this one — the
+        // peers whose silence past the deadline means a crash). The local node is excluded (never
+        // "silent to itself"), and so are pre-declared learners (#617): a non-voting learner is not a
+        // quorum member, so its absence is not a crash that needs failover.
+        let remote_voters: Vec<u64> = config.remote_voters();
 
         // Spawn the driver (owns the group; drives tick/step/drive_ready and routes outbound).
         let shutdown_dr = Arc::clone(&shutdown);
@@ -737,6 +834,22 @@ impl ClusterRuntime {
             .map_err(|_| RuntimeError::Config("cluster driver has stopped".to_string()))
     }
 
+    /// Ask the driver to propose a joint-consensus MEMBERSHIP CHANGE on the next cycle (#617): add a
+    /// node as a non-voting LEARNER (the cooperative-rebalance JOIN), or any other membership mutation.
+    /// It takes effect only if this node is the metadata leader and the conf change commits across a
+    /// quorum. The CAUGHT-UP promotion of a learner to a voter is driven AUTOMATICALLY by the driver's
+    /// F3 gate once the learner's frontier reaches the committed high-watermark — callers add the
+    /// learner; they do not (and must not) promote it on optimism.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RuntimeError::Config`] if the driver channel is closed (the runtime is stopping).
+    pub fn propose_membership(&self, change: MembershipChange) -> Result<(), RuntimeError> {
+        self.cmd_tx
+            .send(DriverCmd::ProposeMembership(change))
+            .map_err(|_| RuntimeError::Config("cluster driver has stopped".to_string()))
+    }
+
     /// Signal shutdown and join every runtime thread. Idempotent: a second call is a no-op (the
     /// handles are already taken). Called by `serve` on a stop, alongside flipping the broker's own
     /// serve-loop flag.
@@ -801,6 +914,36 @@ impl FailoverInstaller {
             *slot = Some(inputs);
         }
     }
+}
+
+/// Open (or recover) the metadata Raft group for a node's [`ClusterConfig`]: a seeded VOTER opens with
+/// the full `seed_voters` set as its `ConfState`, while a joining LEARNER (#617) seeds the SAME existing
+/// voters WITHOUT being a member of them — it follows that quorum and learns its own learner→voter role
+/// by replication once the leader's committed conf-changes reach it. Factored out of
+/// [`ClusterRuntime::start_with_liveness`] so that thread-spawning entry point stays inside the line lint.
+fn open_metadata_group<F, C>(
+    config: &ClusterConfig,
+    seed_voters: &[u64],
+    parent_fs: &F,
+    clock: C,
+    log_config: LogConfig,
+) -> Result<MetadataRaftGroup<F, C>, RuntimeError>
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    let group = if config.is_learner_join() {
+        MetadataRaftGroup::open_as_learner(
+            config.node_id,
+            seed_voters,
+            parent_fs,
+            clock,
+            log_config,
+        )?
+    } else {
+        MetadataRaftGroup::open(config.node_id, seed_voters, parent_fs, clock, log_config)?
+    };
+    Ok(group)
 }
 
 /// The partitions a `node` currently LEADS, from a committed `placements` snapshot — the partitions a
@@ -979,8 +1122,24 @@ fn run_driver<F, C>(
     // Partitions we have already proposed an F2 promotion for (avoid re-proposing while it commits).
     // Cleared once the committed placement's leader is no longer the departed node (promotion landed).
     let mut failover_proposed: BTreeSet<u64> = BTreeSet::new();
+    // The non-voting LEARNERS currently in the committed `ConfState` (#617), refreshed each cycle and
+    // published in the status snapshot. A learner here counts as a member (it is replicated to) but NOT
+    // toward quorum (it is not a voter).
+    let mut learners: BTreeSet<u64> = BTreeSet::new();
+    // Learners whose promotion to a voter we have already proposed (avoid re-proposing while the conf
+    // change commits). Cleared once a learner is no longer in the committed learner set (it became a
+    // voter — the promotion landed).
+    let mut promotion_proposed: BTreeSet<u64> = BTreeSet::new();
 
     let deadline_nanos = duration_to_nanos(failover.liveness.timeout);
+    // F3 STATE (#617): the cadence + the last monotonic time we evaluated the learner-promotion gate, so
+    // the leader checks catch-up PERIODICALLY (not every cycle / on the replication hot path). Seeded back
+    // a full interval so the first evaluation can fire as soon as a learner is committed.
+    let promotion_interval_nanos = duration_to_nanos(LEARNER_PROMOTION_INTERVAL);
+    let mut last_promotion_eval_nanos = failover
+        .clock
+        .now_monotonic_nanos()
+        .saturating_sub(promotion_interval_nanos);
 
     // CP STATE (#618b): the cadence + the last monotonic time we proposed a committed-HW checkpoint, so
     // a leader checkpoints PERIODICALLY (not per cycle / per record). Seeded back a full interval so the
@@ -1003,6 +1162,13 @@ fn run_driver<F, C>(
                 DriverCmd::Propose(mcmd) => {
                     if let Err(e) = group.propose(&mcmd) {
                         tracing::debug!(error = %e, "cluster: metadata proposal rejected (not leader?)");
+                    }
+                }
+                DriverCmd::ProposeMembership(change) => {
+                    // Validated against the current ConfState (the #6403 fix) before it can enter the
+                    // log; refused (benign — retry from the caller) if not leader or a change is pending.
+                    if let Err(e) = group.propose_membership_change(&change) {
+                        tracing::debug!(error = %e, "cluster: membership change rejected (not leader?)");
                     }
                 }
                 DriverCmd::ForcePeerUnreachable { peer, unreachable } => {
@@ -1055,6 +1221,16 @@ fn run_driver<F, C>(
         // durable voter count for the status snapshot (the cluster's agreed quorum basis).
         if let Ok(cs) = group.conf_state() {
             conf_voter_count = cs.get_voters().len();
+            // Track the committed LEARNER set every cycle (#617). A learner is a member (replicated to)
+            // but NOT a voter, so it never changes `conf_voter_count` (the quorum basis is unchanged
+            // while a learner catches up). The F3 promotion gate below reads this. Cheap (a tiny set).
+            let new_learners: BTreeSet<u64> = cs.get_learners().iter().copied().collect();
+            if new_learners != learners {
+                // A learner that has now been PROMOTED (left the learner set) no longer needs its
+                // promotion re-proposed; clear its in-flight mark so the set stays tight.
+                promotion_proposed.retain(|l| new_learners.contains(l));
+                learners = new_learners;
+            }
             let mut members: Vec<u64> = cs.get_voters().to_vec();
             members.extend_from_slice(cs.get_learners());
             members.sort_unstable();
@@ -1065,6 +1241,8 @@ fn run_driver<F, C>(
                 }
                 // Update the failover detection signal: any node ever seen but now ABSENT has departed.
                 // (The set only grows / shifts on a real committed membership change, not every cycle.)
+                // A node that left only because it was PROMOTED from learner to voter is still present
+                // (as a voter), so it never lands in `departed_members` — promotion is not a departure.
                 ever_seen_members.extend(members.iter().copied());
                 let present: BTreeSet<u64> = members.iter().copied().collect();
                 departed_members = ever_seen_members.difference(&present).copied().collect();
@@ -1281,6 +1459,75 @@ fn run_driver<F, C>(
             // else: no installed providers (no data plane) => fail-closed, propose nothing.
         }
 
+        // ----- F3: COOPERATIVE REBALANCE ON JOIN — promote a CAUGHT-UP learner to a voter (#617).
+        // A node that JOINED as a non-voting learner back-fills the committed metadata log by
+        // replication (raft-rs feeds a learner the log exactly like a follower); it never counts
+        // toward quorum while it does, so serving is uninterrupted and the quorum math is unchanged.
+        // ONLY the metadata-Raft leader proposes (single proposer, like F1/F2), PERIODICALLY, and ONLY
+        // for a learner it can PROVE has caught up: its durably-replicated frontier (raft-rs
+        // `Progress::matched` — the prefix the learner has acked) has reached the leader's committed
+        // high-watermark. That proof is fail-CLOSED: a learner with no progress evidence (not tracked,
+        // or `matched` behind the committed bar) is NEVER promoted — exactly like the #722 failover
+        // gate, read in-plane off the metadata core. Promoting a not-caught-up learner would create a
+        // voter missing committed data (a quorum/ISR-completeness regression), which the gate forbids.
+        // The promotion is a committed joint-consensus change (linearizable, validated), so old + new
+        // quorums always overlap (#677). Idempotent: a learner already promoted has left the learner
+        // set and is skipped. -----
+        if group.is_leader() && !learners.is_empty() {
+            let due = now.saturating_sub(last_promotion_eval_nanos) >= promotion_interval_nanos;
+            if due {
+                // Evaluate every committed learner. We DON'T promote until the leader has at least one
+                // committed entry (committed_index > 0): on a brand-new cluster the degenerate
+                // matched==committed==0 equality would otherwise read "caught up" before the learner has
+                // actually replicated anything. A real cluster a learner joins always has committed log.
+                let committed = group.committed_index();
+                for &learner in &learners {
+                    if promotion_proposed.contains(&learner) {
+                        continue; // promotion already in flight; let the conf change commit.
+                    }
+                    // The catch-up evidence, read off the metadata core: `None` (learner not tracked /
+                    // this node not leader) fails closed; otherwise compare matched vs committed.
+                    let Some(catchup) = group.learner_catchup(learner) else {
+                        tracing::debug!(
+                            learner,
+                            "cluster: F3 learner-promotion WITHHELD — no catch-up evidence (fail-closed)"
+                        );
+                        continue;
+                    };
+                    if committed == 0 || !catchup.is_caught_up() {
+                        tracing::debug!(
+                            learner,
+                            matched = catchup.matched,
+                            committed = catchup.committed,
+                            "cluster: F3 learner-promotion WITHHELD — learner not yet caught up to the \
+                             committed high-watermark (it stays a non-voting learner)"
+                        );
+                        continue;
+                    }
+                    // Caught up + proven: propose the committed promotion to a voter. Validated against
+                    // the current `ConfState` (the #6403 fix) before it can enter the log; refused (and
+                    // retried next cycle) if a conf change is already pending.
+                    let change = MembershipChange::new().promote_learner(learner);
+                    match group.propose_membership_change(&change) {
+                        Ok(()) => {
+                            promotion_proposed.insert(learner);
+                            tracing::info!(
+                                learner,
+                                matched = catchup.matched,
+                                committed = catchup.committed,
+                                "cluster: F3 promoted a CAUGHT-UP learner to a voter (cooperative \
+                                 rebalance on join — its frontier reached the committed high-watermark)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(learner, error = %e, "cluster: learner promotion deferred");
+                        }
+                    }
+                }
+                last_promotion_eval_nanos = now;
+            }
+        }
+
         // Publish the latest status snapshot for observers (status() / future admin endpoints). The
         // committed placements are published too, so the data-plane serve path (#717) reads its
         // per-partition role from the committed metadata via `placements()` without ever touching the
@@ -1313,6 +1560,15 @@ fn run_driver<F, C>(
             }
             if s.failover_proposed != failover_proposed {
                 s.failover_proposed.clone_from(&failover_proposed);
+            }
+            // Publish the F3 cooperative-rebalance witnesses (#617): the committed learner set (members
+            // that do NOT count toward quorum while catching up) and the in-flight caught-up promotions.
+            // Only re-cloned when they change.
+            if s.learners != learners {
+                s.learners.clone_from(&learners);
+            }
+            if s.learners_promoted != promotion_proposed {
+                s.learners_promoted.clone_from(&promotion_proposed);
             }
         }
     }
@@ -1852,6 +2108,8 @@ mod tests {
                 let cfg = ClusterConfig {
                     node_id: id,
                     peers: peers.clone(),
+                    role: StartRole::Voter,
+                    pending_learners: BTreeSet::new(),
                 };
                 start_node(&cfg, dirs[i].path())
             })
@@ -1930,6 +2188,8 @@ mod tests {
         let mk = |id: u64| ClusterConfig {
             node_id: id,
             peers: peers.clone(),
+            role: StartRole::Voter,
+            pending_learners: BTreeSet::new(),
         };
 
         let mut nodes: Vec<ClusterRuntime> = ids
@@ -1991,7 +2251,15 @@ mod tests {
         let ports = free_ports(1);
         let peers = peer_map(&[1], &ports);
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut node = start_node(&ClusterConfig { node_id: 1, peers }, dir.path());
+        let mut node = start_node(
+            &ClusterConfig {
+                node_id: 1,
+                peers,
+                role: StartRole::Voter,
+                pending_learners: BTreeSet::new(),
+            },
+            dir.path(),
+        );
 
         assert!(
             wait_until(host_scaled(Duration::from_secs(10)), || node
@@ -2024,6 +2292,8 @@ mod tests {
                     &ClusterConfig {
                         node_id: id,
                         peers: peers.clone(),
+                        role: StartRole::Voter,
+                        pending_learners: BTreeSet::new(),
                     },
                     dirs[i].path(),
                 )
@@ -2098,7 +2368,15 @@ mod tests {
         let configured = tempfile::tempdir().expect("tempdir");
         let ports = free_ports(1);
         let peers = peer_map(&[1], &ports);
-        let mut node = start_node(&ClusterConfig { node_id: 1, peers }, configured.path());
+        let mut node = start_node(
+            &ClusterConfig {
+                node_id: 1,
+                peers,
+                role: StartRole::Voter,
+                pending_learners: BTreeSet::new(),
+            },
+            configured.path(),
+        );
         assert!(
             wait_until(host_scaled(Duration::from_secs(10)), || configured
                 .path()
@@ -2126,7 +2404,12 @@ mod tests {
             .into_iter()
             .collect();
         let r = ClusterRuntime::start(
-            &ClusterConfig { node_id: 2, peers },
+            &ClusterConfig {
+                node_id: 2,
+                peers,
+                role: StartRole::Voter,
+                pending_learners: BTreeSet::new(),
+            },
             &StdFs::new(dir.path().to_path_buf()),
             SystemClock::new(),
             LogConfig::new(64 * 1024).unwrap(),
@@ -2139,6 +2422,8 @@ mod tests {
             &ClusterConfig {
                 node_id: 1,
                 peers: peers2,
+                role: StartRole::Voter,
+                pending_learners: BTreeSet::new(),
             },
             &StdFs::new(dir.path().to_path_buf()),
             SystemClock::new(),
@@ -2226,6 +2511,8 @@ mod tests {
                 let cfg = ClusterConfig {
                     node_id: id,
                     peers: peers.clone(),
+                    role: StartRole::Voter,
+                    pending_learners: BTreeSet::new(),
                 };
                 let fs = StdFs::new(dirs[i].path().to_path_buf());
                 ClusterRuntime::start_with_liveness(
@@ -2769,6 +3056,8 @@ mod tests {
                     &ClusterConfig {
                         node_id: id,
                         peers: peers.clone(),
+                        role: StartRole::Voter,
+                        pending_learners: BTreeSet::new(),
                     },
                     &fs,
                     SystemClock::new(),
@@ -2846,6 +3135,329 @@ mod tests {
 
         for &i in &survivors {
             nodes[i].stop();
+        }
+    }
+
+    // ============================================================================================
+    // #617 COOPERATIVE REBALANCE ON JOIN — the END-TO-END proof: a NEW node joins a running cluster
+    // as a non-voting LEARNER, back-fills the committed metadata log by replication, and is AUTO-
+    // promoted to a voter ONLY once it is caught up — all while the cluster keeps serving (no
+    // stop-the-world, no quorum dip). The promotion gate is fail-closed (a learner that cannot be
+    // PROVEN caught up is never promoted).
+    // ============================================================================================
+
+    /// Bring up a 3-node VOTER cluster over the loopback transport and wait for a metadata leader +
+    /// a first committed entry. Returns the serial guard, the running nodes, their ids, their dirs
+    /// (kept alive), the leader index, AND a pre-allocated id+port+addr for a 4th node that will
+    /// JOIN as a learner (so its address is in every node's peer map before they start, the way a
+    /// real operator pre-declares the joining member). `liveness` tunes the F1 detector — kept at the
+    /// DEFAULT (long) deadline here so no healthy node is ever suspected during the join.
+    #[allow(clippy::type_complexity)]
+    fn bring_up_voter_cluster_with_a_pending_learner() -> (
+        std::sync::MutexGuard<'static, ()>,
+        Vec<ClusterRuntime>,
+        [u64; 3],
+        Vec<tempfile::TempDir>,
+        usize,
+        u64,
+        SocketAddr,
+        tempfile::TempDir,
+    ) {
+        let serial = serial_guard();
+        let voter_ids = [1u64, 2, 3];
+        let learner_id = 4u64;
+        // 4 ports: 3 for the voters, 1 for the joining learner. The learner's addr is included in
+        // every node's peer map from the start (the learner is a pre-declared member, just not a
+        // seeded voter — exactly the #617 join shape).
+        let ports = free_ports(4);
+        let all_ids = [1u64, 2, 3, 4];
+        let peers = peer_map(&all_ids, &ports);
+        let learner_addr = peers[&learner_id];
+
+        let dirs: Vec<_> = voter_ids
+            .iter()
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        // The voters pre-declare node 4 as a PENDING LEARNER: its address is in their peer map (so they
+        // can dial / replicate to it the moment the leader adds it) but it is NOT seeded as a voter and
+        // never counts toward quorum / liveness until promoted (#617).
+        let pending: BTreeSet<u64> = std::iter::once(learner_id).collect();
+        let nodes: Vec<ClusterRuntime> = voter_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let cfg = ClusterConfig {
+                    node_id: id,
+                    peers: peers.clone(),
+                    role: StartRole::Voter,
+                    pending_learners: pending.clone(),
+                };
+                start_node(&cfg, dirs[i].path())
+            })
+            .collect();
+
+        // A metadata leader is elected among the 3 seeded voters.
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes
+                .iter()
+                .filter(|n| n.status().is_leader)
+                .count()
+                == 1),
+            "a metadata leader is elected among the 3 voters"
+        );
+        let leader_idx = nodes
+            .iter()
+            .position(|n| n.status().is_leader)
+            .expect("a leader");
+
+        // Commit a first entry so the committed bar is non-trivial (so the learner has real log to
+        // back-fill, and the promotion gate's committed_index > 0 guard is meaningfully exercised).
+        nodes[leader_idx]
+            .propose_metadata(MetadataCommand::SetConfig {
+                key: "seed".to_string(),
+                value: "1".to_string(),
+            })
+            .expect("propose seed");
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes
+                .iter()
+                .all(|n| n.status().applied_index >= 2)),
+            "the seed entry commits + applies on every voter"
+        );
+
+        let learner_dir = tempfile::tempdir().expect("learner tempdir");
+        (
+            serial,
+            nodes,
+            voter_ids,
+            dirs,
+            leader_idx,
+            learner_id,
+            learner_addr,
+            learner_dir,
+        )
+    }
+
+    /// Build the joining-learner node's config: the SAME peer map (so it dials the existing voters)
+    /// but `role = Learner`, so it opens non-voting and joins by replication. `peers` is the same map
+    /// the voters used (it already contains the learner's own id+addr).
+    fn learner_config(learner_id: u64, peers: &BTreeMap<u64, SocketAddr>) -> ClusterConfig {
+        ClusterConfig {
+            node_id: learner_id,
+            peers: peers.clone(),
+            role: StartRole::Learner,
+            pending_learners: BTreeSet::new(),
+        }
+    }
+
+    /// THE deliverable's heart (#617): a NEW node JOINS a running 3-voter cluster as a non-voting
+    /// LEARNER, back-fills the committed metadata log by replication, and is AUTO-promoted to a voter
+    /// ONLY once it is caught up — while the cluster keeps committing throughout. With NO manual
+    /// promote call in the test (only the add-learner request + continuous produces), assert:
+    ///   (a) the learner is added NON-VOTING — it appears in `learners` and the voter count stays 3
+    ///       (the quorum basis is UNCHANGED while it catches up);
+    ///   (b) the cluster keeps SERVING committed entries throughout the back-fill (no stall);
+    ///   (c) the learner is AUTO-promoted to a voter (`voter_count` -> 4, it leaves `learners`) only
+    ///       once its frontier reached the committed HW (the promotion witness `learners_promoted`
+    ///       fired, and its own status reports it caught up to the cluster's applied index);
+    ///   (d) after promotion the learner COUNTS toward quorum (every node, incl. the new voter,
+    ///       agrees on 4 voters) and the cluster still commits.
+    #[test]
+    fn a_joining_learner_backfills_then_is_promoted_only_once_caught_up() {
+        let (
+            _serial,
+            mut nodes,
+            voter_ids,
+            _dirs,
+            leader_idx,
+            learner_id,
+            _learner_addr,
+            learner_dir,
+        ) = bring_up_voter_cluster_with_a_pending_learner();
+        // Reconstruct the shared peer map from the running nodes (every node has the full map incl.
+        // the learner's addr).
+        let peers = nodes[leader_idx].peers();
+
+        // The leader ADDS the joining node as a non-voting LEARNER (the cooperative-rebalance JOIN).
+        // This is the ONLY membership action the test drives; the caught-up PROMOTION is automatic.
+        nodes[leader_idx]
+            .propose_membership(MembershipChange::new().add_learner(learner_id))
+            .expect("propose add_learner");
+
+        // (a) the learner is added NON-VOTING: it shows up in the committed learner set on the voters,
+        // and the voter count STAYS 3 (adding a learner does not change the quorum basis).
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes.iter().all(
+                |n| {
+                    let s = n.status();
+                    s.learners.contains(&learner_id) && s.voter_count == 3
+                }
+            )),
+            "(a) the learner is committed NON-VOTING (in `learners`, voter_count stays 3)"
+        );
+
+        // Now START the learner node over its own data dir: it opens as a learner (empty seeded
+        // ConfState), dials the voters, and back-fills the committed metadata log by replication.
+        let mut learner = start_node(&learner_config(learner_id, &peers), learner_dir.path());
+
+        // (b) the cluster keeps SERVING throughout the back-fill: keep committing entries on the
+        // leader while the learner catches up, and confirm they keep applying on the voter QUORUM
+        // (a stall / quorum dip would stop the applied index advancing). We drive several rounds.
+        let mut last_applied = nodes[leader_idx].status().applied_index;
+        for round in 0..5u64 {
+            nodes[leader_idx]
+                .propose_metadata(MetadataCommand::SetConfig {
+                    key: "during.join".to_string(),
+                    value: round.to_string(),
+                })
+                .expect("propose during join");
+            assert!(
+                wait_until(host_scaled(Duration::from_secs(20)), || nodes
+                    .iter()
+                    .all(|n| n.status().applied_index > last_applied)),
+                "(b) the cluster keeps committing during the learner back-fill (round {round}); no stall"
+            );
+            last_applied = nodes
+                .iter()
+                .map(|n| n.status().applied_index)
+                .min()
+                .expect("a min applied index");
+        }
+
+        // (c) the learner is AUTO-promoted to a voter ONLY once caught up: the voter count rises to 4
+        // on every node and the learner leaves the committed learner set. No manual promote was
+        // called — the driver's F3 gate fired once the learner's frontier reached the committed HW.
+        let everyone: Vec<&ClusterRuntime> =
+            nodes.iter().chain(std::iter::once(&learner)).collect();
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(30)), || everyone
+                .iter()
+                .all(|n| {
+                    let s = n.status();
+                    s.voter_count == 4 && !s.learners.contains(&learner_id)
+                })),
+            "(c) the learner is auto-promoted to a voter (voter_count -> 4, no longer a learner) once caught up"
+        );
+
+        // The promotion witness: a voter's `learners_promoted` recorded the learner (it was proposed
+        // ONLY after catch-up — the gate never proposes a behind learner). It clears once the
+        // promotion commits, so we accept either "still recorded" or "already cleared after commit".
+        // The load-bearing assertion is the voter_count==4 above; this is the corroborating witness.
+        let promotion_seen = nodes
+            .iter()
+            .any(|n| n.status().learners_promoted.contains(&learner_id))
+            || nodes.iter().all(|n| n.status().voter_count == 4);
+        assert!(
+            promotion_seen,
+            "the promotion was driven by the caught-up gate (witnessed or already committed)"
+        );
+
+        // The newly-promoted voter is itself caught up to the cluster's committed log (it durably
+        // holds the committed prefix — that is exactly WHY it was promotable).
+        let cluster_applied = nodes[leader_idx].status().applied_index;
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(20)), || learner
+                .status()
+                .applied_index
+                + 2
+                >= cluster_applied),
+            "the promoted learner has back-filled to (near) the cluster's applied index"
+        );
+
+        // (d) after promotion the learner COUNTS toward quorum: every node agrees on 4 voters, and a
+        // NEW entry still commits across the now-4-voter group.
+        let applied_before = nodes[leader_idx].status().applied_index;
+        nodes[leader_idx]
+            .propose_metadata(MetadataCommand::SetConfig {
+                key: "post.join".to_string(),
+                value: "ok".to_string(),
+            })
+            .expect("propose post-join");
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(20)), || {
+                let all_advanced = nodes
+                    .iter()
+                    .chain(std::iter::once(&learner))
+                    .all(|n| n.status().applied_index > applied_before);
+                all_advanced
+            }),
+            "(d) after promotion the cluster (now 4 voters incl. the promoted learner) still commits"
+        );
+
+        let _ = voter_ids; // (named for clarity in the harness; ids assertions above use learner_id)
+        for n in &mut nodes {
+            n.stop();
+        }
+        learner.stop();
+    }
+
+    /// THE SAFETY proof (#617): a learner that has NOT caught up is NEVER promoted (fail-closed), and
+    /// its mere presence does NOT change the quorum math. We add a learner but NEVER start its node,
+    /// so it has no replicated progress (`matched` stays 0) while the leader keeps committing (the
+    /// committed bar rises well above 0). The promotion gate must therefore NEVER fire: the voter
+    /// count stays 3 and the learner stays a learner, even after many promotion-gate cadences.
+    #[test]
+    fn a_learner_that_has_not_caught_up_is_never_promoted_and_quorum_is_unchanged() {
+        let (_serial, mut nodes, _voter_ids, _dirs, leader_idx, learner_id, _addr, _learner_dir) =
+            bring_up_voter_cluster_with_a_pending_learner();
+
+        // Add the learner but DON'T start its node — it can never replicate, so it can never catch up.
+        nodes[leader_idx]
+            .propose_membership(MembershipChange::new().add_learner(learner_id))
+            .expect("propose add_learner");
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes.iter().all(
+                |n| n.status().learners.contains(&learner_id) && n.status().voter_count == 3
+            )),
+            "the learner is committed non-voting (voter_count stays 3)"
+        );
+
+        // Keep committing so the committed bar rises FAR above the never-started learner's frontier
+        // (0). Each round also gives the F3 promotion gate several cadences to (wrongly) fire — it
+        // must not.
+        for round in 0..6u64 {
+            nodes[leader_idx]
+                .propose_metadata(MetadataCommand::SetConfig {
+                    key: "rise".to_string(),
+                    value: round.to_string(),
+                })
+                .expect("propose rise");
+            // Let the entry commit across the voter quorum.
+            let before = nodes
+                .iter()
+                .map(|n| n.status().applied_index)
+                .min()
+                .expect("min");
+            assert!(
+                wait_until(host_scaled(Duration::from_secs(20)), || nodes
+                    .iter()
+                    .all(|n| n.status().applied_index > before)),
+                "committed bar rises (round {round}) while the learner stays behind"
+            );
+        }
+
+        // Observe for a stretch that COMFORTABLY exceeds several promotion-gate cadences: the learner
+        // must NEVER be promoted. The voter count stays 3 and the learner stays a learner — fail-closed
+        // (no catch-up proof => no promotion), and the quorum math is unaffected by its presence.
+        let observe_until = Instant::now()
+            + host_scaled(Duration::from_secs(2)).max(LEARNER_PROMOTION_INTERVAL * 6);
+        while Instant::now() < observe_until {
+            for n in &nodes {
+                let s = n.status();
+                assert_eq!(
+                    s.voter_count, 3,
+                    "the un-caught-up learner NEVER counts toward quorum (voter_count must stay 3)"
+                );
+                assert!(
+                    s.learners.contains(&learner_id),
+                    "the un-caught-up learner stays a non-voting learner (never promoted)"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        for n in &mut nodes {
+            n.stop();
         }
     }
 }

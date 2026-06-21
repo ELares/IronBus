@@ -174,6 +174,40 @@ impl MembershipChange {
     }
 }
 
+/// The committed-frontier catch-up evidence for a joining LEARNER (C5-I2, #617): how far the learner
+/// has DURABLY replicated the metadata log (`matched`) versus the bar it must clear before it may be
+/// promoted to a voter (`committed`). On the metadata-Raft LEADER, `matched` is the learner's
+/// acknowledged log index (raft-rs `Progress::matched` — the prefix the learner has durably persisted +
+/// acked, the only frontier the leader can VOUCH for), and `committed` is the leader's own committed
+/// high-watermark. A learner is "caught up" once `matched >= committed`: it durably holds every
+/// committed entry, so promoting it to a voter cannot create a voter that is missing committed data
+/// (the quorum/ISR-completeness invariant). This is the metadata-plane analogue of the #722 data-plane
+/// `own_frontier >= committed_hw` failover gate — same fail-closed shape, read in-plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LearnerCatchup {
+    /// The learner node id this evidence is about.
+    pub node: u64,
+    /// The learner's durably-replicated, acked metadata-log index (raft-rs `Progress::matched`). This is
+    /// the prefix the learner is PROVEN to hold; an unknown / never-heard-from learner reads 0.
+    pub matched: u64,
+    /// The committed high-watermark the learner must reach (the metadata leader's own committed index):
+    /// the bar every voter must hold. The learner is promotable only once `matched >= committed`.
+    pub committed: u64,
+}
+
+impl LearnerCatchup {
+    /// THE PROMOTION GATE (#617): a learner may be promoted to a voter ONLY when its durably-replicated
+    /// frontier has reached the committed high-watermark — `matched >= committed`. Fail-CLOSED by
+    /// construction: a learner with no recorded progress (`matched == 0`) against any committed bar
+    /// `> 0` is NOT caught up, so a learner whose catch-up cannot be proven is never promoted. Promoting
+    /// a not-caught-up learner would admit a voter missing committed data (a quorum-completeness
+    /// regression), which this predicate forbids.
+    #[must_use]
+    pub fn is_caught_up(self) -> bool {
+        self.matched >= self.committed
+    }
+}
+
 /// A typed peer-id / membership-change validation failure — the #6403-class rejections. Every
 /// variant means the change was REFUSED before it could enter the metadata log, so a mangled /
 /// duplicate / phantom peer can never reach consensus and freeze quorum.
@@ -509,6 +543,52 @@ mod tests {
             validate_change(&MembershipChange::new(), &conf),
             Err(PeerIdError::EmptyChange)
         );
+    }
+
+    #[test]
+    fn learner_catchup_gate_is_caught_up_only_at_or_past_the_committed_bar() {
+        // Caught up: the learner's durably-replicated frontier reaches the committed bar.
+        assert!(LearnerCatchup {
+            node: 4,
+            matched: 100,
+            committed: 100,
+        }
+        .is_caught_up());
+        // Past the bar (the bar can lag the leader's latest matched briefly) is still caught up.
+        assert!(LearnerCatchup {
+            node: 4,
+            matched: 105,
+            committed: 100,
+        }
+        .is_caught_up());
+        // Behind the bar: NOT caught up — promoting it would create a voter missing committed data.
+        assert!(!LearnerCatchup {
+            node: 4,
+            matched: 99,
+            committed: 100,
+        }
+        .is_caught_up());
+    }
+
+    #[test]
+    fn learner_catchup_gate_fails_closed_with_no_progress() {
+        // A learner with NO recorded progress (matched == 0) against a real committed bar is never
+        // caught up — the fail-closed default (no proof of catch-up => no promotion).
+        assert!(!LearnerCatchup {
+            node: 4,
+            matched: 0,
+            committed: 1,
+        }
+        .is_caught_up());
+        // The degenerate empty-log cluster (nothing committed yet): a learner at 0 trivially holds the
+        // empty committed prefix. Promotion is gated additionally on the leader having committed entries
+        // in the driver, so this degenerate equality never drives a premature promotion in practice.
+        assert!(LearnerCatchup {
+            node: 4,
+            matched: 0,
+            committed: 0,
+        }
+        .is_caught_up());
     }
 
     #[test]
