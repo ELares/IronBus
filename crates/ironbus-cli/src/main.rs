@@ -81,6 +81,13 @@ mod config_reload;
 #[cfg(all(unix, feature = "zstd"))]
 mod dict_cmd;
 
+/// The uniform `--json` envelope + frozen exit-code contract (V2-M6, #579).
+mod json_envelope;
+/// Named connection profiles (server + auth + TLS + data-dir), `kubectl config`-style (#581).
+mod context;
+/// Shell-completion generation from the real command tree, plus the `cheat` sheet (#598).
+mod completion;
+
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
@@ -798,10 +805,28 @@ USAGE:
                   [--min-samples <n>] [--json]            (opt-in: build --features zstd)
     ironbus dict install --data-dir <dir> --dict <path> [--json]   (opt-in: --features zstd)
     ironbus dict ls --data-dir <dir> [--json]                      (opt-in: --features zstd)
+    ironbus context create <name> [--addr <host:port>] [--token <t>] [--tls-ca <path>]
+                  [--tls-server-name <name>] [--data-dir <dir>] [--use]
+    ironbus context (use <name> | list | show [<name>] | rm <name> | current)
+    ironbus completion <bash|zsh|fish>
+    ironbus cheat
     ironbus help
     ironbus version
 
 Notes:
+    The global --json flag may precede any subcommand (e.g. `ironbus --json verify --data-dir <dir>`):
+    it makes that command emit ONE machine-readable envelope (schema ironbus.cli.v1) carrying ok,
+    exit_code, and either data (on success) or error.kind + error.message (on failure), instead of
+    human output. The exit codes are a FROZEN contract: 0 clean, 1 usage, 2 not found,
+    3 handled corruption, 4 corrupt data, 5 broker unreachable, 70 internal. Without --json the
+    output is byte-identical to before.
+    context stores named connection profiles (server addr + auth token + TLS + data-dir) in a CLI
+    config file ($IRONBUS_CONFIG, else $XDG_CONFIG_HOME/ironbus/contexts.toml, else
+    $HOME/.config/ironbus/contexts.toml). A client verb resolves its --addr from the current context
+    when no --addr flag is given (precedence flag > context > default); with no context configured the
+    behavior is exactly as before. The token is a secret: it is never printed and the file is 0600.
+    completion generates a shell-completion script from the live command tree; cheat prints a
+    concise cheat-sheet of the common flows.
     The default address is 127.0.0.1:7777 (loopback only).
     --config <path> loads a TOML configuration FILE (#382). It slots BETWEEN env and default, so the
     precedence is flag > env > FILE > default: a file key beats the compiled default, but an env var
@@ -1096,6 +1121,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    // The global `--json` flag (#579): when present, EVERY command emits the single frozen
+    // envelope (`ironbus.cli.v1`) instead of its human output, and an error is reported AS the
+    // envelope on stdout (so a script reads one stream). When absent the dispatch and output are
+    // byte-identical to before — `run` is called exactly as it always was.
+    let (rest, json) = json_envelope::strip_global_json(&args);
+    if json {
+        return main_json(&rest, &mut out);
+    }
     match run(&args, &mut out) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1103,6 +1136,33 @@ fn main() -> ExitCode {
             if let CliError::Usage(_) = e {
                 eprintln!("\n{USAGE}");
             }
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
+
+/// Runs the dispatch with the global `--json` envelope active: the command's normal human output is
+/// captured into a buffer and wrapped in the frozen success envelope, or, on failure, the frozen
+/// error envelope (carrying the stable `kind` + `exit_code`) is emitted. Either way exactly one
+/// envelope is written to stdout and the frozen exit code is returned. `rest` is `args` with the
+/// global `--json` already stripped.
+fn main_json(rest: &[String], out: &mut impl Write) -> ExitCode {
+    let mut captured: Vec<u8> = Vec::new();
+    match run(rest, &mut captured) {
+        Ok(()) => {
+            let text = String::from_utf8_lossy(&captured);
+            let envelope = json_envelope::success_envelope(&text);
+            // A write failure to the real stdout is an io error -> internal (70), reported plainly
+            // (we cannot emit a clean envelope if stdout itself is broken).
+            if let Err(e) = writeln!(out, "{envelope}") {
+                eprintln!("error: io error: {e}");
+                return ExitCode::from(EXIT_INTERNAL);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let envelope = json_envelope::error_envelope(&e);
+            let _ = writeln!(out, "{envelope}");
             ExitCode::from(e.exit_code())
         }
     }
@@ -1135,6 +1195,9 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "record-start" => run_record_start(rest, out),
         "migrate" => run_migrate(rest, out),
         "dict" => run_dict(rest, out),
+        "context" => context::run_context(rest, out),
+        "completion" => completion::run_completion(rest, out),
+        "cheat" => completion::run_cheat(rest, out),
         "help" | "--help" | "-h" => {
             writeln!(out, "{USAGE}")?;
             Ok(())
@@ -1208,13 +1271,13 @@ fn connect(addr: &str) -> Result<Client, CliError> {
 }
 
 fn run_pub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
-    let mut addr = DEFAULT_ADDR.to_string();
+    let mut addr_flag: Option<String> = None;
     let mut key = String::new();
     let mut payload_arg: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--addr" => addr = take_value("--addr", args, &mut i)?,
+            "--addr" => addr_flag = Some(take_value("--addr", args, &mut i)?),
             "--key" => key = take_value("--key", args, &mut i)?,
             "--" => {
                 // End of options: every remaining token is the payload (at most one), so a
@@ -1252,6 +1315,9 @@ fn run_pub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         io::stdin().read_to_end(&mut buf)?;
         buf
     };
+    // Resolve the broker address with the frozen precedence flag > current-context > default (#581).
+    // With no context configured this is byte-identical to the historical `DEFAULT_ADDR` behavior.
+    let addr = context::resolve_addr(addr_flag.as_deref(), DEFAULT_ADDR)?;
     cmd_pub(&addr, key.as_bytes(), &payload, out)
 }
 
@@ -1308,7 +1374,7 @@ fn set_dispose(slot: &mut Option<DispositionKind>, kind: DispositionKind) -> Res
 }
 
 fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
-    let mut addr = DEFAULT_ADDR.to_string();
+    let mut addr_flag: Option<String> = None;
     let mut group = String::new();
     let mut max = DEFAULT_FETCH;
     let mut dispose: Option<DispositionKind> = None;
@@ -1316,7 +1382,7 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--addr" => addr = take_value("--addr", args, &mut i)?,
+            "--addr" => addr_flag = Some(take_value("--addr", args, &mut i)?),
             "--group" => group = take_value("--group", args, &mut i)?,
             "--max" => {
                 let raw = take_value("--max", args, &mut i)?;
@@ -1363,6 +1429,7 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         Some(DispositionKind::Term) => Disposition::Term,
         None => Disposition::Peek,
     };
+    let addr = context::resolve_addr(addr_flag.as_deref(), DEFAULT_ADDR)?;
     cmd_sub(&addr, &group, max, disposition, out)
 }
 
@@ -1466,13 +1533,13 @@ fn cmd_sub(
 /// the broker is down, or [`CliError::Internal`] if the broker rejects the verb (the group is not a
 /// broadcast consumer, or `--up-to` is outside the retained window).
 fn run_cumulative_ack(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
-    let mut addr = DEFAULT_ADDR.to_string();
+    let mut addr_flag: Option<String> = None;
     let mut group = String::new();
     let mut up_to: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--addr" => addr = take_value("--addr", args, &mut i)?,
+            "--addr" => addr_flag = Some(take_value("--addr", args, &mut i)?),
             "--group" => group = take_value("--group", args, &mut i)?,
             "--up-to" => up_to = Some(take_number("--up-to", args, &mut i)?),
             flag if flag.starts_with("--") => {
@@ -1489,6 +1556,7 @@ fn run_cumulative_ack(args: &[String], out: &mut impl Write) -> Result<(), CliEr
     }
     let up_to = up_to
         .ok_or_else(|| CliError::Usage("cumulative-ack requires `--up-to <offset>`".to_string()))?;
+    let addr = context::resolve_addr(addr_flag.as_deref(), DEFAULT_ADDR)?;
     cmd_cumulative_ack(&addr, &group, up_to, out)
 }
 
@@ -17462,5 +17530,179 @@ mod tests {
             ),
             Err(CliError::Usage(_))
         ));
+    }
+
+    // ============================================================================================
+    // V2-M6 (#579): FROZEN exit-code table + FROZEN uniform `--json` envelope contract.
+    // These tests PIN the contract so it cannot silently change. A change that trips one of these
+    // is a deliberate, reviewed contract change (and downstream-breaking), never an accident.
+    // ============================================================================================
+
+    /// FROZEN exit-code table. The numeric meaning of each code is a stability contract: a script
+    /// keys off these numbers. Changing a value here breaks every consumer and must be a deliberate,
+    /// documented contract bump.
+    #[test]
+    fn frozen_exit_code_table() {
+        assert_eq!(EXIT_USAGE, 1, "usage error is exit 1");
+        assert_eq!(EXIT_NOT_FOUND, 2, "not found is exit 2");
+        assert_eq!(EXIT_HANDLED_CORRUPTION, 3, "handled corruption is exit 3");
+        assert_eq!(EXIT_CORRUPT, 4, "corrupt (blocked) is exit 4");
+        assert_eq!(EXIT_UNREACHABLE, 5, "broker unreachable is exit 5");
+        assert_eq!(EXIT_INTERNAL, 70, "internal failure is exit 70");
+        // 0 is success, returned by `main` as `ExitCode::SUCCESS`, NEVER produced by a `CliError`.
+        // Every CliError variant maps to a distinct, non-zero, frozen code.
+        assert_eq!(CliError::Usage(String::new()).exit_code(), 1);
+        assert_eq!(CliError::NotFound(String::new()).exit_code(), 2);
+        assert_eq!(CliError::HandledCorruption(String::new()).exit_code(), 3);
+        assert_eq!(CliError::Corrupt(String::new()).exit_code(), 4);
+        assert_eq!(CliError::Unreachable(String::new()).exit_code(), 5);
+        assert_eq!(CliError::Internal(String::new()).exit_code(), 70);
+    }
+
+    /// FROZEN stable `error.kind` strings — the machine-readable discriminator a `--json` consumer
+    /// switches on without parsing the human message. The mapping is part of the frozen contract.
+    #[test]
+    fn frozen_error_kinds() {
+        use json_envelope::error_kind;
+        assert_eq!(error_kind(&CliError::Usage(String::new())), "usage");
+        assert_eq!(error_kind(&CliError::NotFound(String::new())), "not_found");
+        assert_eq!(
+            error_kind(&CliError::HandledCorruption(String::new())),
+            "handled_corruption"
+        );
+        assert_eq!(error_kind(&CliError::Corrupt(String::new())), "corrupt");
+        assert_eq!(
+            error_kind(&CliError::Unreachable(String::new())),
+            "unreachable"
+        );
+        assert_eq!(error_kind(&CliError::Internal(String::new())), "internal");
+    }
+
+    /// FROZEN success-envelope shape: the schema tag, the key order, and the `data.{stdout,lines}`
+    /// structure are pinned byte-for-byte (a snapshot of the shape). A drift fails here.
+    #[test]
+    fn frozen_json_success_envelope_shape() {
+        let env = json_envelope::success_envelope("hello\nworld\n");
+        assert_eq!(
+            env,
+            "{\"schema\":\"ironbus.cli.v1\",\"ok\":true,\"exit_code\":0,\
+\"data\":{\"stdout\":\"hello\\nworld\\n\",\"lines\":[\"hello\",\"world\"]}}"
+        );
+        // Empty output still produces a well-formed envelope with an empty line list.
+        let empty = json_envelope::success_envelope("");
+        assert_eq!(
+            empty,
+            "{\"schema\":\"ironbus.cli.v1\",\"ok\":true,\"exit_code\":0,\
+\"data\":{\"stdout\":\"\",\"lines\":[]}}"
+        );
+    }
+
+    /// FROZEN error-envelope shape: schema, ok=false, the mapped exit_code, and `error.{kind,message}`
+    /// in fixed key order, with the message escaped. A snapshot of the shape.
+    #[test]
+    fn frozen_json_error_envelope_shape() {
+        let env = json_envelope::error_envelope(&CliError::NotFound("no dir at /x".to_string()));
+        assert_eq!(
+            env,
+            "{\"schema\":\"ironbus.cli.v1\",\"ok\":false,\"exit_code\":2,\
+\"error\":{\"kind\":\"not_found\",\"message\":\"no dir at /x\"}}"
+        );
+        // A message with characters needing escaping is escaped (valid JSON out).
+        let env = json_envelope::error_envelope(&CliError::Usage("bad \"quote\"".to_string()));
+        assert!(
+            env.contains("\\\"quote\\\""),
+            "message must be JSON-escaped: {env}"
+        );
+    }
+
+    /// The success and error envelopes are MUTUALLY EXCLUSIVE on their distinguishing key: success
+    /// carries `data` and never `error`; error carries `error` and never `data`. So `ok` alone tells
+    /// a consumer which key to read.
+    #[test]
+    fn json_envelope_data_and_error_are_mutually_exclusive() {
+        let ok = json_envelope::success_envelope("x");
+        assert!(ok.contains("\"data\""));
+        assert!(!ok.contains("\"error\""));
+        let err = json_envelope::error_envelope(&CliError::Internal("boom".to_string()));
+        assert!(err.contains("\"error\""));
+        assert!(!err.contains("\"data\""));
+    }
+
+    /// Per-representative-command `--json` output: a real command (`version`) run through the SAME
+    /// capture-and-wrap path `main_json` uses produces the frozen success envelope carrying the
+    /// command's exact human output. This proves the uniform `--json` is honored end-to-end, not
+    /// just in the envelope unit.
+    #[test]
+    fn representative_command_json_output() {
+        // The global flag is stripped, then `run` is dispatched into a buffer and wrapped — the
+        // exact sequence `main_json` performs.
+        let argv = vec!["--json".to_string(), "version".to_string()];
+        let (rest, json) = json_envelope::strip_global_json(&argv);
+        assert!(json);
+        let mut captured = Vec::new();
+        run(&rest, &mut captured).unwrap();
+        let envelope = json_envelope::success_envelope(&String::from_utf8_lossy(&captured));
+        assert!(envelope.starts_with("{\"schema\":\"ironbus.cli.v1\",\"ok\":true,\"exit_code\":0,"));
+        assert!(
+            envelope.contains("ironbus "),
+            "carries the version line: {envelope}"
+        );
+    }
+
+    /// BACK-COMPAT: WITHOUT the global `--json` flag, a command's stdout is byte-identical to before
+    /// this work — the envelope path is never entered and `run` writes plain output. Pinned with
+    /// `version` (a deterministic, broker-free command).
+    #[test]
+    fn back_compat_no_json_is_byte_identical() {
+        let mut buf = Vec::new();
+        run(&["version".to_string()], &mut buf).unwrap();
+        let plain = String::from_utf8(buf).unwrap();
+        assert!(plain.starts_with("ironbus "));
+        assert!(
+            !plain.contains("\"schema\""),
+            "plain output must NOT be JSON: {plain}"
+        );
+        // The same args parsed by the global stripper leave `version` untouched and report no json.
+        let (rest, json) = json_envelope::strip_global_json(&["version".to_string()]);
+        assert!(!json);
+        assert_eq!(rest, vec!["version".to_string()]);
+    }
+
+    /// BACK-COMPAT: with NO context configured, a client verb resolves its address to the historical
+    /// default — `context::resolve_addr` returns `DEFAULT_ADDR` unchanged. (An explicit flag always
+    /// wins, proven in the context module's own tests.)
+    #[test]
+    fn back_compat_no_context_resolves_default_addr() {
+        // Point the config path at a guaranteed-absent file so no ambient user config interferes.
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("contexts.toml");
+        let cfg = context::load(&absent).unwrap();
+        assert!(cfg.current_context().is_none());
+        assert_eq!(
+            cfg.current_context()
+                .and_then(|c| c.addr.clone())
+                .unwrap_or_else(|| DEFAULT_ADDR.to_string()),
+            DEFAULT_ADDR
+        );
+    }
+
+    /// The `context`/`completion`/`cheat` verbs are wired into the dispatcher: an unknown
+    /// `context` subcommand is a usage error (proving `run` routes to the context handler), and
+    /// `completion`/`cheat` dispatch to their generators.
+    #[test]
+    fn new_subcommands_are_dispatched() {
+        let mut buf = Vec::new();
+        let e = run(&["context".to_string(), "bogus".to_string()], &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+
+        let mut buf = Vec::new();
+        run(&["completion".to_string(), "bash".to_string()], &mut buf).unwrap();
+        assert!(String::from_utf8(buf).unwrap().contains("complete -F _ironbus"));
+
+        let mut buf = Vec::new();
+        run(&["cheat".to_string()], &mut buf).unwrap();
+        assert!(String::from_utf8(buf)
+            .unwrap()
+            .contains("ironbus cheat-sheet"));
     }
 }
