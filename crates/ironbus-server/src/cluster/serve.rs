@@ -102,7 +102,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ironbus_core::clock::Clock;
 use ironbus_core::epoch_cache::EpochCache;
@@ -119,6 +119,9 @@ use super::dataplane::{
     DataPlaneError, DataPlaneFrame, PlacementRole, ProduceAckSeam,
 };
 use super::isr::IsrConfig;
+use super::rereplication::{
+    FetchBudget, ReReplicationThrottle, FULL_CATCHUP_BYTES, FULL_CATCHUP_RECORDS,
+};
 use super::state_machine::Placement;
 
 /// The hard maximum size, in bytes, of a single inbound DATA-plane peer frame (the partition prefix
@@ -620,11 +623,12 @@ const DATAPLANE_POLL: Duration = Duration::from_millis(100);
 
 /// The follower fetch budgets: how many records / bytes a follower asks for per `FetchRecords`. The
 /// leader's read plane already bounds a response to a single sealed segment run, so a catch-up is
-/// several rounds; these are generous upper bounds, themselves under
-/// [`MAX_REPL_FETCH_BYTES`](super::replication::MAX_REPL_FETCH_BYTES).
-const FETCH_MAX_RECORDS: u32 = 1024;
-const FETCH_MAX_BYTES: u32 = 1024 * 1024;
-
+/// several rounds; these are the FULL (un-throttled) upper bounds, themselves under
+/// [`MAX_REPL_FETCH_BYTES`](super::replication::MAX_REPL_FETCH_BYTES). The canonical values live in
+/// [`rereplication`](super::rereplication) ([`FULL_CATCHUP_RECORDS`] / [`FULL_CATCHUP_BYTES`]), which
+/// owns the CoDel re-replication throttle (#619) that shapes these down under contention while a
+/// follower is far behind; the steady-state / healthy-link fetch still uses the full budget.
+///
 /// A LIVE, running data-plane server: the piece that finally CONSTRUCTS, SPAWNS, and DRIVES the proven
 /// [`DataPlaneServer`] over real `TcpStream`s in a serving cluster (V2-C2-I9, #717). Where
 /// [`DataPlaneServer::from_placements`] builds the (transport-agnostic) per-partition roles and the
@@ -1031,13 +1035,27 @@ fn run_follower_fetch<F, C>(
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
 {
+    // The CoDel re-replication throttle (#619) for THIS partition. It is OWNED here, not per-link, so
+    // it survives a reconnect mid-catch-up (a divergent / recovered follower that drops and redials
+    // keeps its adapted budget). A monotonic origin gives the throttle deterministic nanosecond
+    // timestamps from a `std::time::Instant` delta (no wall clock), so the production path drives the
+    // SAME pure controller the unit tests inject a clock into.
+    let mut throttle = ReReplicationThrottle::default_throttle();
+    let origin = Instant::now();
     while !shutdown.load(Ordering::Acquire) {
         match TcpStream::connect_timeout(&leader_addr, DATAPLANE_POLL) {
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(DATAPLANE_POLL));
                 let _ = stream.set_write_timeout(Some(DATAPLANE_POLL));
                 let mut link = DataPlaneLink::new(stream);
-                follower_fetch_loop(partition, &mut link, &server, shutdown);
+                follower_fetch_loop(
+                    partition,
+                    &mut link,
+                    &server,
+                    shutdown,
+                    &mut throttle,
+                    origin,
+                );
             }
             Err(_) => {
                 // Leader not reachable yet (it may still be binding / electing); back off and retry.
@@ -1050,31 +1068,71 @@ fn run_follower_fetch<F, C>(
 /// Drive one connected follower link: fetch → apply → report, on a cadence, until shutdown or the link
 /// breaks (then [`run_follower_fetch`] reconnects). Each round takes the server lock only to BUILD the
 /// fetch request and to APPLY the response + build the report — never across a socket read/write.
+///
+/// ## Re-replication rate-limit (#619)
+///
+/// `throttle` is the CoDel-style controlled-delay throttle on this partition's CATCH-UP fetch (see
+/// [`ReReplicationThrottle`]). Each round:
+/// 1. it [`decide`](ReReplicationThrottle::decide)s the fetch budget from the follower's BACKLOG
+///    (`leader_high_watermark - follower_next_offset`, observed from the last response): far behind
+///    (re-replicating) + a contended link → a SHRUNK budget + an inter-fetch backoff that yields the
+///    link to live traffic; near the head (tailing) or an idle link → the FULL budget;
+/// 2. it times the fetch round-trip + the local apply (the catch-up's per-fetch SERVICE DELAY) and
+///    feeds it back as the CoDel sojourn, so a link contended by live produce / consume / replication
+///    drives the budget down WITHOUT any cross-thread coordination.
+///
+/// The throttle only ever changes the REQUEST budget + adds a sleep — never WHAT is applied — so
+/// re-replication stays byte-identical, in-order, CRC-revalidated, and gap-free (the apply path is
+/// untouched). The budget floors at [`MIN_CATCHUP_RECORDS`] and the backoff is capped, so the catch-up
+/// always makes forward progress and converges. `origin` is the monotonic instant the partition's
+/// throttle clock is measured from.
 fn follower_fetch_loop<F, C>(
     partition: u64,
     link: &mut DataPlaneLink<TcpStream>,
     server: &Arc<Mutex<DataPlaneServer<F, C>>>,
     shutdown: &AtomicBool,
+    throttle: &mut ReReplicationThrottle,
+    origin: Instant,
 ) where
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
 {
+    // The budget the throttle decided for the NEXT fetch. Seeded full-rate: the first fetch of a
+    // freshly-dialed link runs at full budget (the backlog is not known until the first response), and
+    // the throttle shapes every subsequent fetch from the observed backlog + service delay.
+    let mut budget = FetchBudget {
+        max_records: FULL_CATCHUP_RECORDS,
+        max_bytes: FULL_CATCHUP_BYTES,
+    };
     while !shutdown.load(Ordering::Acquire) {
-        // Build the next fetch request under a short lock (the follower's current frontier + budgets).
+        // Build the next fetch request under a short lock (the follower's current frontier + the
+        // throttle's current budget — capped below the historical full budget only while catching up
+        // under contention).
         let req = {
             let Ok(srv) = server.lock() else {
                 return;
             };
             match srv.seam().controller().make_fetch_request(
                 partition,
-                FETCH_MAX_RECORDS,
-                FETCH_MAX_BYTES,
+                budget.max_records,
+                budget.max_bytes,
             ) {
                 Ok(req) => req,
                 // No longer a follower of this partition (a future rebalance): stop fetching.
                 Err(_) => return,
             }
         };
+        // The follower's next offset BEFORE this fetch — the backlog is measured against the leader's
+        // high-watermark in the response.
+        let from_offset = req.from_offset;
+        // Time the catch-up's per-fetch NETWORK round-trip: request-sent → response-received. This,
+        // NOT the total fetch+apply+fsync, is the CoDel sojourn — LINK saturation (the contention this
+        // rate-limit protects against) shows up as the network leg stretching, whereas the local
+        // apply / fsync is host-disk jitter, not link contention, and would otherwise trip the throttle
+        // on its own baseline work. The throttle further subtracts the minimum-observed network leg as
+        // the uncontended baseline (see `ReReplicationThrottle::observe_fetch`), so only the STANDING
+        // (above-baseline) network delay drives the throttle.
+        let fetch_sent = Instant::now();
         if link
             .send(partition, &DataPlaneFrame::FetchRequest(req))
             .is_err()
@@ -1084,6 +1142,9 @@ fn follower_fetch_loop<F, C>(
         // Read the response (blocking up to the read timeout). On a timeout, loop and re-fetch.
         match link.recv() {
             Ok(Some((p, DataPlaneFrame::FetchResponse(resp)))) if p == partition => {
+                // The network round-trip ended here (response received), BEFORE the local apply/fsync.
+                let net_nanos = u64::try_from(fetch_sent.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let leader_hw = resp.high_watermark;
                 // Apply + build the report under a short lock, then send the report off-lock.
                 let report = {
                     let Ok(mut srv) = server.lock() else {
@@ -1105,6 +1166,9 @@ fn follower_fetch_loop<F, C>(
                     }
                     srv.seam().controller().follower_report(partition).ok()
                 };
+                // The follower's next offset AFTER the apply (its fsync'd frontier) — what it just
+                // reported. The backlog is the leader's high-watermark minus this.
+                let next_offset = report.as_ref().map_or(from_offset, |r| r.fsynced_offset);
                 if let Some(report) = report {
                     if link
                         .send(partition, &DataPlaneFrame::AckReplicated(report))
@@ -1113,10 +1177,23 @@ fn follower_fetch_loop<F, C>(
                         return;
                     }
                 }
-                // If the leader served a non-empty run there may be more to pull; loop promptly.
-                // Otherwise pace the next poll so a caught-up follower does not hot-loop.
+                // Drive the throttle from this fetch's NETWORK round-trip + the follower's backlog. The
+                // throttle internally treats a near-the-head backlog as steady-state (full-rate, no
+                // throttle); only a far-behind follower's catch-up is rate-limited.
+                let now_nanos = elapsed_nanos(origin, fetch_sent);
+                let backlog = leader_hw.saturating_sub(next_offset);
+                throttle.observe_fetch(net_nanos, now_nanos);
+                let decision = throttle.decide(backlog, now_nanos);
+                budget = decision.budget;
+                // If the leader served a non-empty run there may be more to pull; otherwise pace the
+                // next poll so a caught-up follower does not hot-loop (the #726 discipline). While
+                // re-replicating under contention, ALSO sleep the throttle's inter-fetch backoff, so
+                // the catch-up yields the link to live traffic — a throttled-waiting follower BLOCKS,
+                // it never busy-spins.
                 if resp.record_count == 0 {
                     sleep_interruptible(DATAPLANE_POLL, shutdown);
+                } else if decision.yield_for_ms > 0 {
+                    sleep_interruptible(Duration::from_millis(decision.yield_for_ms), shutdown);
                 }
             }
             Ok(Some(_)) => {
@@ -1135,6 +1212,13 @@ fn follower_fetch_loop<F, C>(
             Ok(None) | Err(_) => return,
         }
     }
+}
+
+/// The monotonic nanoseconds elapsed from a partition's throttle `origin` to the instant `at`, for the
+/// CoDel clock. Saturates at `u64::MAX` (≈585 years; unreachable) so a long-lived follower's clock
+/// never wraps.
+fn elapsed_nanos(origin: Instant, at: Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(origin).as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Sleep for `dur` but wake early if shutdown is set, in small slices, so a stop is never delayed by a
@@ -3234,5 +3318,158 @@ mod live_runtime_tests {
         leader_rt.stop();
         f2_rt.stop();
         f3_rt.stop();
+    }
+
+    // ---- C5-I4 (#619): re-replication rate-limit converges + stays byte-identical -----------------
+
+    /// THE #619 CORRECTNESS HEADLINE: a FAR-BEHIND follower whose backlog exceeds the catch-up
+    /// threshold ([`super::super::rereplication::CATCHUP_BACKLOG_THRESHOLD`]) — i.e. it is genuinely
+    /// RE-REPLICATING, so the CoDel re-replication throttle is engaged on its catch-up fetch — still
+    /// converges to the leader's served prefix BYTE-IDENTICAL, IN-ORDER, and GAP-FREE over the real
+    /// loopback transport. This proves the throttle only ever changes the fetch RATE / budget, never
+    /// WHAT is applied: the catch-up runs through the throttled path (a far-behind follower) and the
+    /// result is indistinguishable from an un-throttled catch-up.
+    ///
+    /// On an idle loopback link the per-fetch NETWORK round-trip stays under the CoDel target, so the
+    /// throttle keeps the full budget and convergence is fast — exactly the "healthy link → full-rate
+    /// catch-up" behavior. The contended-link budget-shrink + live-traffic-yield + bounded-progress
+    /// properties are proven DETERMINISTICALLY (no wall-clock flake) by the
+    /// `super::super::rereplication` unit tests; THIS test is the end-to-end correctness-through-the-
+    /// throttle proof and is deliberately insensitive to whether the throttle transiently engages (see
+    /// the big-segment note below), since correctness — not a convergence speed — is what it asserts.
+    #[test]
+    fn live_runtime_far_behind_follower_converges_byte_identical_through_the_rereplication_throttle(
+    ) {
+        use crate::cluster::rereplication::CATCHUP_BACKLOG_THRESHOLD;
+
+        // LARGE segments (64 KiB) for this test only: the leader's read plane serves one sealed segment
+        // run per fetch, so big segments mean each fetch pulls MANY records and the whole backlog
+        // converges in a handful of fetches. That keeps the test FAST and STABLE even if the
+        // wall-clock-driven throttle transiently engages on a contended CI host (a small per-fetch
+        // backoff over a few fetches is negligible) — the property under test is correctness-through-
+        // the-throttle (byte-identity), NOT a particular convergence speed (the throttle's
+        // contended-behaviour is proven deterministically in the `rereplication` unit tests).
+        fn big_config() -> LogConfig {
+            LogConfig {
+                max_segment_bytes: 64 * 1024,
+                max_total_bytes: 0,
+                ..LogConfig::default()
+            }
+        }
+        fn leaked_big_leader(dir: &std::path::Path, n: u32) -> &'static Log<StdFs, ManualClock> {
+            let fs = StdFs::new(dir.to_path_buf());
+            let mut log =
+                Log::open(fs, ManualClock::new(), big_config()).expect("leader log opens");
+            for i in 0..n {
+                log.append(&rec(format!("rep-{i:05}").as_bytes())).unwrap();
+            }
+            log.sync().unwrap();
+            Box::leak(Box::new(log))
+        }
+        struct BigReplicaLogs {
+            root: std::path::PathBuf,
+        }
+        impl ReplicaLogFactory<StdFs, ManualClock> for BigReplicaLogs {
+            fn open_replica_log(&self, partition: u64) -> Result<Log<StdFs, ManualClock>, String> {
+                let dir = self.root.join("replicas").join(partition.to_string());
+                std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+                Log::open(StdFs::new(dir), ManualClock::new(), big_config())
+                    .map_err(|e| format!("open replica {partition}: {e}"))
+            }
+        }
+
+        const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let placement = Placement {
+            replicas: vec![1, 2],
+            leader: 1,
+            epoch: 2,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        // R=2, min_isr=1: this test is about the catch-up converging through the throttle, not the
+        // quorum-ack gate.
+        let isr = IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        };
+        let data_addrs: BTreeMap<u64, SocketAddr> = (1u64..=2)
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        // A leader log with a backlog WELL ABOVE the catch-up threshold, so a fresh follower (at
+        // offset 0) is unambiguously RE-REPLICATING and its catch-up runs through the throttled path.
+        let backlog_records =
+            u32::try_from(CATCHUP_BACKLOG_THRESHOLD).expect("threshold fits u32") * 3;
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_big_leader(leader_dir.path(), backlog_records);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(
+            served_end > CATCHUP_BACKLOG_THRESHOLD,
+            "the leader's served prefix ({served_end}) exceeds the catch-up threshold \
+             ({CATCHUP_BACKLOG_THRESHOLD}), so the follower is genuinely re-replicating"
+        );
+
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            isr,
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &BigReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .expect("leader server");
+        let mut leader_rt =
+            DataPlaneRuntime::start(leader_server, data_addrs[&1], &data_addrs).expect("leader rt");
+
+        let f_dir = tempfile::tempdir().expect("f dir");
+        let follower = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            isr,
+            |_| None,
+            &BigReplicaLogs {
+                root: f_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .expect("follower server");
+        let mut f_rt =
+            DataPlaneRuntime::start(follower, data_addrs[&2], &data_addrs).expect("f rt");
+
+        let hw = |rt: &DataPlaneRuntime<StdFs, ManualClock>| {
+            rt.server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        // The far-behind follower's catch-up runs through the throttle and CONVERGES to the served
+        // prefix in bounded time. A generous, host-scaled-style cap (the catch-up is multi-round at
+        // the full budget on an idle link, so it is fast; the cap only guards a slow CI host).
+        let converged = wait_until(Duration::from_secs(60), || hw(&f_rt) >= served_end);
+        assert!(
+            converged,
+            "the far-behind follower's throttled catch-up converged to the served prefix \
+             (hw={}, served_end={served_end})",
+            hw(&f_rt)
+        );
+
+        // The throttled catch-up is BYTE-IDENTICAL to the leader (the throttle changed only the rate,
+        // never the bytes): every follower segment is a byte-identical prefix of the leader's, and at
+        // least one sealed segment matches exactly. The byte-identity check also implies in-order +
+        // gap-free (a gap or reorder would diverge the bytes and the apply would have failed closed).
+        {
+            let f = f_rt.server().lock().unwrap();
+            let dump = dump_segments(f.seam().controller().follower_log(P).unwrap());
+            assert_replicated_byte_identical(&dump, leader_log);
+        }
+
+        f_rt.stop();
+        leader_rt.stop();
     }
 }
