@@ -48,9 +48,12 @@
 //! * **DATA-log replication (C2)** — this runtime replicates only the cluster METADATA (membership /
 //!   placement / config) over the one metadata Raft group; the broker's produce/consume data logs
 //!   are untouched.
-//! * **Snapshot transfer / log compaction (#660)**, **mTLS peer auth**, and **dynamic peer
-//!   discovery** are out of scope: peers are a static configured set, plaintext TCP, bound by the
-//!   [`transport`] codec's size + recursion limits and the [`PeerRegistry`] peer-id check.
+//! * **Metadata-log snapshot + compaction (#660)** IS wired here: the driver snapshots the applied
+//!   metadata state machine and truncates the metadata log on a bounded cadence / log-size threshold
+//!   (so the metadata log stays bounded), and a far-behind learner is caught up via snapshot transfer.
+//! * **mTLS peer auth** and **dynamic peer discovery** are out of scope: peers are a static configured
+//!   set, plaintext TCP, bound by the [`transport`] codec's size + recursion limits and the
+//!   [`PeerRegistry`] peer-id check.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -143,6 +146,24 @@ const COMMITTED_HW_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
 /// is promoted exactly once — the committed conf change drops it from the learner set — so this is a
 /// low-rate background reconcile, the join-side analogue of the F2 failover cadence.
 const LEARNER_PROMOTION_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often a node SNAPSHOTS the metadata state machine + COMPACTS the metadata Raft log (#660), so
+/// the log does not grow without bound. It is deliberately PERIODIC + LOW-RATE — the metadata-log-over-
+/// IronBus-log (#659) appends one record per membership/placement/config/committed-HW change, which is a
+/// background control-plane rate, NOT a hot path, so a coarse cadence keeps the log bounded with
+/// negligible cost. EVERY node snapshots its OWN applied state (not just the leader): a snapshot is a
+/// purely-local compaction of already-committed state — it needs no consensus round and never changes
+/// client-visible behavior — so each node bounds its own log independently. It is the metadata-log
+/// analogue of [`COMMITTED_HW_CHECKPOINT_INTERVAL`]: bounded, self-healing (a skipped cycle simply
+/// snapshots more next time), and crash-safe (the snapshot is durable before the log prefix is dropped).
+const METADATA_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The retained-metadata-log length (entries above the last snapshot) past which a node snapshots +
+/// compacts EARLY, ahead of the [`METADATA_SNAPSHOT_INTERVAL`] cadence (#660). This bounds the log by
+/// SIZE as well as by time: a burst of membership/placement churn that appends faster than the cadence
+/// still triggers a compaction once the tail crosses this threshold, so the log can never grow without
+/// bound between periodic snapshots. It is generous (the metadata log is small) but finite.
+const METADATA_SNAPSHOT_LOG_THRESHOLD: u64 = 1024;
 
 /// The fixed TCP-port offset the DATA-plane peer listener binds at, RELATIVE to a node's configured
 /// metadata address (#717). One `--cluster-peer <id>=<addr>` entry thus serves BOTH transports: the
@@ -304,6 +325,11 @@ pub struct ClusterStatus {
     /// appears as a voter and leaves `learners`). Empty when no caught-up promotion is in flight; this is
     /// the witness that a learner was promoted ONLY after catching up (it never appears here while behind).
     pub learners_promoted: BTreeSet<u64>,
+    /// The index of the last metadata-log SNAPSHOT/compaction (#660), `0` before any. Every metadata log
+    /// entry at or below it is subsumed by the durable snapshot; the retained log is the bounded tail
+    /// above it. Observability: it RISES as the driver snapshots + compacts on its cadence, which is the
+    /// witness that the metadata log is being bounded (not growing forever).
+    pub snapshot_index: u64,
 }
 
 /// A command for the driver to propose to the metadata group on behalf of the broker (or a test):
@@ -1159,6 +1185,17 @@ fn run_driver<F, C>(
         .now_monotonic_nanos()
         .saturating_sub(checkpoint_interval_nanos);
 
+    // SNAPSHOT STATE (#660): the cadence + the last monotonic time we snapshotted + compacted the
+    // metadata log, so EVERY node bounds its OWN log PERIODICALLY (not per cycle). Unlike the checkpoint
+    // / promotion cadences this is NOT leader-only — a snapshot is a purely-local compaction of
+    // already-applied committed state, so each node compacts independently. Seeded back a full interval
+    // so the first compaction can fire once enough has been applied.
+    let snapshot_interval_nanos = duration_to_nanos(METADATA_SNAPSHOT_INTERVAL);
+    let mut last_snapshot_nanos = failover
+        .clock
+        .now_monotonic_nanos()
+        .saturating_sub(snapshot_interval_nanos);
+
     // TICK CADENCE (#632): raft's `tick()` advances a LOGICAL election/heartbeat counter and MUST be
     // driven on a fixed WALL-CLOCK cadence (`heartbeat_tick=3` × `TICK_INTERVAL` = ~300 ms heartbeats,
     // `election_tick=10` = ~1 s election). The loop below wakes on EVERY inbound peer message (so a
@@ -1382,6 +1419,36 @@ fn run_driver<F, C>(
             }
         }
 
+        // ----- SNAPSHOT + COMPACT the metadata log (#660). On a cadence OR once the retained log tail
+        // crosses the size threshold, snapshot the applied metadata state machine and TRUNCATE the log
+        // up to it, so the metadata log stays BOUNDED instead of growing forever (one record per
+        // membership/placement/config/committed-HW change, #659). This runs on EVERY node (not just the
+        // leader): a snapshot is a purely-local compaction of already-committed+applied state — no
+        // consensus round, no client-visible change — so each node bounds its own log independently. It
+        // is crash-safe (the snapshot is fsynced to its dual-slot checkpoint BEFORE the log prefix is
+        // dropped) and self-healing (a deferred/failed snapshot is simply retried next cycle). The
+        // snapshot ALSO enables snapshot-based catch-up: a far-behind learner gets the snapshot + the
+        // tail rather than the whole (now-compacted) log. -----
+        let snapshot_due = now.saturating_sub(last_snapshot_nanos) >= snapshot_interval_nanos;
+        let snapshot_over_threshold = group.retained_log_len() >= METADATA_SNAPSHOT_LOG_THRESHOLD;
+        if snapshot_due || snapshot_over_threshold {
+            match group.create_snapshot() {
+                Ok(true) => {
+                    tracing::debug!(
+                        snapshot_index = group.snapshot_index(),
+                        "cluster: snapshotted + compacted the metadata log (#660)"
+                    );
+                }
+                Ok(false) => {} // nothing new applied since the last snapshot — a no-op.
+                Err(e) => {
+                    // A snapshot/compaction failure is surfaced but NOT fatal: the log is still
+                    // correct (just un-compacted), and the next cycle retries.
+                    tracing::warn!(error = %e, "cluster: metadata snapshot/compaction deferred");
+                }
+            }
+            last_snapshot_nanos = now;
+        }
+
         // ----- F2: AUTO-FIRE the failover — PROVABLY committed-safe, fail-closed (#618b). On a committed
         // membership shrink (`departed_members` non-empty), the metadata leader auto-promotes a partition
         // a departed node LED, but ONLY a successor it can PROVE holds every committed record — i.e.
@@ -1589,6 +1656,9 @@ fn run_driver<F, C>(
                 s.last_committed_hw = group.state().committed_hws();
             }
             s.applied_index = applied;
+            // Publish the metadata-log snapshot index (#660): it rises as the driver snapshots +
+            // compacts, the witness that the metadata log is being bounded.
+            s.snapshot_index = group.snapshot_index();
             // Publish the leaderless-failover detection signal (the departed-members set), so the
             // data-plane failover driver can re-place every partition a departed node led (#618). Only
             // re-cloned when it actually changed (a committed membership shrink), not every tick.
@@ -2403,6 +2473,71 @@ mod tests {
         assert!(
             dir.path().join(super::super::METADATA_SUBDIR).exists(),
             "a configured 1-member cluster does create its metaraft/ log"
+        );
+        node.stop();
+    }
+
+    /// THE RUNTIME-LEVEL SNAPSHOT-CADENCE TEST (#660): a live single-node runtime, on its bounded
+    /// snapshot cadence, SNAPSHOTS the metadata state machine + COMPACTS the metadata log — the
+    /// driver's published `snapshot_index` RISES, the witness the metadata log is being bounded
+    /// (not growing forever). It also proves the snapshot trigger is wired into the live driver loop
+    /// without disrupting consensus (the node stays leader and keeps applying).
+    #[test]
+    fn the_runtime_snapshots_and_compacts_the_metadata_log_on_its_cadence() {
+        let ports = free_ports(1);
+        let peers = peer_map(&[1], &ports);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut node = start_node(
+            &ClusterConfig {
+                node_id: 1,
+                peers,
+                role: StartRole::Voter,
+                pending_learners: BTreeSet::new(),
+            },
+            dir.path(),
+        );
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(10)), || node
+                .status()
+                .is_leader),
+            "the lone voter self-elects"
+        );
+
+        // Commit a handful of metadata writes so the state machine has real committed state to
+        // snapshot (and an applied index above the genesis no-op).
+        for i in 0..5u64 {
+            node.propose_metadata(MetadataCommand::SetConfig {
+                key: format!("k{i}"),
+                value: i.to_string(),
+            })
+            .expect("propose");
+        }
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(10)), || node
+                .status()
+                .applied_index
+                >= 5),
+            "the metadata writes commit + apply"
+        );
+
+        // The driver snapshots + compacts on the METADATA_SNAPSHOT_INTERVAL cadence: within a couple
+        // of intervals the published snapshot_index rises to cover the applied state. The deadline is
+        // a generous host-scaled bound around that bounded cadence (no wall-clock flake).
+        let snapshotted = wait_until(host_scaled(Duration::from_secs(40)), || {
+            let s = node.status();
+            s.snapshot_index > 0 && s.snapshot_index <= s.applied_index
+        });
+        let final_status = node.status();
+        assert!(
+            snapshotted,
+            "the runtime snapshotted + compacted the metadata log on its cadence \
+             (snapshot_index={}, applied_index={})",
+            final_status.snapshot_index, final_status.applied_index
+        );
+        // The node is still the healthy leader after compaction (consensus undisturbed).
+        assert!(
+            node.status().is_leader,
+            "the node remains leader after snapshot + compaction"
         );
         node.stop();
     }
