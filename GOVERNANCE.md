@@ -5,6 +5,30 @@ reviews and merges pull requests, and is responsible for keeping the design
 coherent. Every change still follows the contribution process: green CI plus an
 independent review before merge.
 
+## Independence (org-agnostic)
+
+IronBus is an **independent, org-agnostic open-source project**. It is owned by no
+single company, employer, or organization; copyright is held collectively by "The
+IronBus Authors" and the project is licensed under
+[MIT](LICENSE-MIT) **OR** [Apache-2.0](LICENSE-APACHE) at the user's option.
+
+Because of that, the source and all tracked files must stay **org-neutral**: no
+references that couple IronBus to a specific company, employer, internal
+deployment, or private infrastructure may ever be committed — no org names, hosts,
+account handles, ticket trackers, or vendor-internal jargon. This is not merely a
+style preference; it is a project invariant:
+
+- The general rule — *no org-specific reference of any kind* — is upheld in review.
+- The concrete, known-risk subset is **CI-enforced**: the
+  [`org-agnostic hygiene`](.github/workflows/org-agnostic.yml) gate greps every
+  tracked file for each term in
+  [`.github/forbidden-org-terms.txt`](.github/forbidden-org-terms.txt) and **fails
+  the build** if any is found, so an org-specific reference can never land on
+  `main`. Add terms to that list as the project's contributor base grows.
+
+A contribution that would tie IronBus to one organization is out of scope by
+construction, regardless of who contributes it.
+
 ## How decisions are made
 
 - **Decisions are recorded on their owning GitHub issues.** Each subsystem has a

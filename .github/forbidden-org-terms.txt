@@ -1,0 +1,11 @@
+# Org-specific / vendor-lock terms forbidden anywhere in IronBus.
+#
+# IronBus is an INDEPENDENT, ORG-AGNOSTIC open-source project (see GOVERNANCE.md). It must never
+# carry references that couple it to a specific company, employer, org, or private deployment.
+# This list is the enforced (CI-failing) subset; the general policy — no org-specific references
+# of ANY kind — is in GOVERNANCE.md and is upheld in review. Add terms here as needed.
+#
+# Format: one case-insensitive substring per line; lines starting with '#' are comments.
+# The org-agnostic CI gate (.github/workflows/org-agnostic.yml) greps every tracked file
+# (except this list) for each term and fails the build if any is found.
+butlr

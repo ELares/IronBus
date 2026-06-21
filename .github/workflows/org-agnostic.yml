@@ -1,0 +1,44 @@
+name: org-agnostic hygiene
+
+# IronBus is an independent, org-agnostic open-source project (GOVERNANCE.md). This gate enforces
+# that no org-specific / vendor-lock reference is ever committed: it greps every tracked file for
+# each term in .github/forbidden-org-terms.txt and fails the build if any is found.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-org-references:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: forbid org-specific / vendor-lock references in tracked files
+        run: |
+          set -euo pipefail
+          terms_file=.github/forbidden-org-terms.txt
+          if [ ! -f "$terms_file" ]; then
+            echo "::error::$terms_file is missing — the org-agnostic gate cannot run"
+            exit 1
+          fi
+          found=0
+          while IFS= read -r raw; do
+            term="${raw%%$'\r'}"
+            [ -z "$term" ] && continue
+            case "$term" in \#*) continue ;; esac
+            # Search every tracked file EXCEPT the terms list itself (which legitimately holds the terms).
+            if git grep -I -i -n -e "$term" -- . ":(exclude)$terms_file" > /tmp/org_hits 2>/dev/null; then
+              echo "::error::forbidden org-specific term '$term' found — IronBus must stay org-agnostic (see GOVERNANCE.md):"
+              cat /tmp/org_hits
+              found=1
+            fi
+          done < "$terms_file"
+          if [ "$found" = "1" ]; then
+            echo "::error::org-agnostic hygiene FAILED: remove the org-specific reference(s) above. IronBus is org-neutral and open-source."
+            exit 1
+          fi
+          echo "org-agnostic hygiene: no forbidden org-specific references in tracked files"
