@@ -6132,10 +6132,16 @@ fn cmd_serve(
     health_addr: Option<&str>,
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
+    geo: &GeoConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    // The geo (cross-cluster mirror/source) plane is spawned only on the Unix serve path (#623), so the
+    // non-Unix stub just consumes the parsed config to keep this signature byte-for-byte identical to
+    // the Unix one (a mismatched arity is the recurring #288/#99 Windows footgun, invisible to a macOS
+    // reviewer).
+    let _ = geo;
     // The #87 materialized-config line, `Profile::name`, and `DiskFullPolicyArg::as_str` are reached
     // only from the Unix serve path, so build (and discard) the line here too: a function/method read
     // only on cfg(unix) trips the Windows `-D warnings` `never used` lint, invisible to a macOS
