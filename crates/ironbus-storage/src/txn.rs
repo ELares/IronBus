@@ -44,7 +44,9 @@ use crate::log::{Append, Log, LogConfig};
 use crate::naming::segment_file_name;
 use crate::segment::{SegmentReader, StorageError};
 use ironbus_core::clock::Clock;
-use ironbus_core::txn::{TxnConfig, TxnOutcome, TxnState, TxnTable};
+use ironbus_core::txn::{
+    BackCheckBook, BackCheckConfig, TxnConfig, TxnOutcome, TxnState, TxnTable,
+};
 use ironbus_core::types::RecordFlags;
 use std::collections::HashMap;
 
@@ -64,6 +66,13 @@ pub const TXN_HALF_MAGIC: [u8; 4] = *b"TXNH";
 
 /// The 4-byte magic that opens an OP (resolution-marker) record's metadata header.
 pub const TXN_OP_MAGIC: [u8; 4] = *b"TXNO";
+
+/// The 4-byte magic that opens a BACK (back-check bookkeeping) record's metadata header (#640 part 2).
+/// A back-check record durably persists a still-`Prepared` txn's back-check schedule + attempt count
+/// so they SURVIVE a broker restart and the scan resumes; on replay it rebuilds the in-memory
+/// [`BackCheckBook`]. A `headers` blob that does not begin with a recognized txn magic is foreign to
+/// this store and is skipped, never misread.
+pub const TXN_BACK_MAGIC: [u8; 4] = *b"TXNB";
 
 /// The op-marker kind byte: the transaction COMMITTED (its half message is appended to the real
 /// stream and becomes visible). The marker also carries the real offset the payload landed at.
@@ -99,6 +108,10 @@ const HALF_FIXED_LEN: usize = 4 + 1 + 2 + 2 + 2 + 1;
 /// The fixed-size prefix of an OP record's metadata blob: `magic`(4) + `version`(1) + `op_kind`(1) +
 /// `txn_id_len`(2) + `real_offset`(8).
 const OP_FIXED_LEN: usize = 4 + 1 + 1 + 2 + 8;
+
+/// The fixed-size prefix of a BACK record's metadata blob (#640 part 2): `magic`(4) + `version`(1) +
+/// `txn_id_len`(2) + `attempts`(4) + `next_eligible`(8).
+const BACK_FIXED_LEN: usize = 4 + 1 + 2 + 4 + 8;
 
 /// Encodes the HALF (prepared) record's metadata blob (the segment record's `headers` field): the
 /// fixed prefix, then `txn_id`, the `stream` name, and the original headers, then a trailing crc32c
@@ -153,6 +166,26 @@ pub fn encode_op_meta(txn_id: &[u8], outcome: TxnOutcome, real_offset: u64) -> O
     Some(out)
 }
 
+/// Encodes a BACK (back-check bookkeeping) record's metadata blob (#640 part 2): the fixed prefix
+/// (magic, version, `txn_id_len`, `attempts`, `next_eligible`), then `txn_id`, then a trailing crc32c.
+/// This durably pins a still-`Prepared` txn's back-check schedule + attempt count so they survive a
+/// restart. Returns `None` if `txn_id` overflows its `u16` length (unreachable from the bounded wire
+/// path).
+#[must_use]
+pub fn encode_back_meta(txn_id: &[u8], attempts: u32, next_eligible: u64) -> Option<Vec<u8>> {
+    let txn_len = u16::try_from(txn_id.len()).ok()?;
+    let mut out = Vec::with_capacity(BACK_FIXED_LEN + txn_id.len() + 4);
+    out.extend_from_slice(&TXN_BACK_MAGIC);
+    out.push(TXN_FORMAT_VERSION);
+    out.extend_from_slice(&txn_len.to_le_bytes());
+    out.extend_from_slice(&attempts.to_le_bytes());
+    out.extend_from_slice(&next_eligible.to_le_bytes());
+    out.extend_from_slice(txn_id);
+    let crc = ironbus_core::crc::crc32c(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Some(out)
+}
+
 /// A decoded HALF record's metadata (the txn id, the real stream, the original flags + the byte range
 /// of the original headers within the blob).
 struct HalfMeta {
@@ -169,11 +202,19 @@ struct OpMeta {
     real_offset: u64,
 }
 
+/// A decoded BACK (back-check bookkeeping) record's metadata (#640 part 2).
+struct BackMeta {
+    txn_id: Vec<u8>,
+    attempts: u32,
+    next_eligible: u64,
+}
+
 /// What a single durable txn record decoded to (or `None` for a foreign / corrupt blob, which is
 /// skipped on replay rather than misread).
 enum TxnRecordMeta {
     Half(HalfMeta),
     Op(OpMeta),
+    Back(BackMeta),
 }
 
 /// Reads a little-endian `u16` at `at` as a `usize`, or `None` if `blob` is too short.
@@ -222,6 +263,8 @@ fn decode_meta(blob: &[u8]) -> Option<TxnRecordMeta> {
         decode_half_meta(blob).map(TxnRecordMeta::Half)
     } else if magic == TXN_OP_MAGIC {
         decode_op_meta(blob).map(TxnRecordMeta::Op)
+    } else if magic == TXN_BACK_MAGIC {
+        decode_back_meta(blob).map(TxnRecordMeta::Back)
     } else {
         None
     }
@@ -290,6 +333,33 @@ fn decode_op_meta(blob: &[u8]) -> Option<OpMeta> {
     })
 }
 
+/// Decodes a BACK (back-check bookkeeping) record's metadata blob (#640 part 2, see
+/// [`encode_back_meta`]). The version must match [`TXN_FORMAT_VERSION`] (an unknown version fails
+/// closed), the crc must validate, and the declared txn-id span must fit exactly within the blob.
+fn decode_back_meta(blob: &[u8]) -> Option<BackMeta> {
+    let body = verify_crc(blob)?;
+    if body.len() < BACK_FIXED_LEN {
+        return None;
+    }
+    if *body.get(4)? != TXN_FORMAT_VERSION {
+        return None;
+    }
+    let txn_len = read_u16(body, 5)?;
+    let attempts = read_u32_le(body, 7)?;
+    let next_eligible = read_u64(body, 11)?;
+    let txn_start = BACK_FIXED_LEN;
+    let txn_end = txn_start.checked_add(txn_len)?;
+    if body.len() != txn_end {
+        return None;
+    }
+    let txn_id = body.get(txn_start..txn_end)?.to_vec();
+    Some(BackMeta {
+        txn_id,
+        attempts,
+        next_eligible,
+    })
+}
+
 /// The durable transactional half-message store: a segmented [`Log`] under `txn/` holding the half
 /// records and op markers, plus the in-memory [`TxnTable`] lifecycle and the buffered prepared
 /// payloads, rebuilt at open by replaying the durable records (V2-M8, #640).
@@ -297,6 +367,11 @@ pub struct TxnStore<F: Filesystem, C: Clock> {
     log: Log<F, C>,
     /// The pure lifecycle state machine, rebuilt at open from the replayed records.
     table: TxnTable,
+    /// The pure back-check schedule + attempt-count book (#640 part 2), rebuilt at open from the
+    /// replayed BACK records (clamped against the live clock — see [`TxnStore::replay`]) so the scan
+    /// resumes after a restart. EMPTY when no txn is under back-check, so a non-transactional broker
+    /// pays nothing.
+    back_check: BackCheckBook,
     /// The buffered prepared payloads, keyed by `txn_id`, for every CURRENTLY-`Prepared` txn: the
     /// half message the engine appends to the real stream on a commit. An entry is inserted on a
     /// fresh prepare and removed on resolve (commit OR rollback). Bounded by the table's
@@ -306,6 +381,9 @@ pub struct TxnStore<F: Filesystem, C: Clock> {
     half_records: u64,
     /// The number of op markers durably written across this store's lifetime (for observability).
     op_records: u64,
+    /// The number of back-check bookkeeping records durably written across this store's lifetime
+    /// (#640 part 2, for observability).
+    back_records: u64,
 }
 
 impl<F: Filesystem, C: Clock> std::fmt::Debug for TxnStore<F, C> {
@@ -316,8 +394,10 @@ impl<F: Filesystem, C: Clock> std::fmt::Debug for TxnStore<F, C> {
                 "resolved_tombstones",
                 &self.table.resolved_tombstone_count(),
             )
+            .field("under_back_check", &self.back_check.len())
             .field("half_records", &self.half_records)
             .field("op_records", &self.op_records)
+            .field("back_records", &self.back_records)
             .finish_non_exhaustive()
     }
 }
@@ -359,8 +439,8 @@ impl From<StorageError> for TxnStoreError {
 
 impl<F: Filesystem, C: Clock> TxnStore<F, C> {
     /// Opens (recovering, or creating fresh) the txn store rooted at the `txn/` subdirectory of
-    /// `parent_fs`, rebuilding the in-memory lifecycle table and the buffered prepared payloads by
-    /// replaying the durable half + op records in order.
+    /// `parent_fs`, rebuilding the in-memory lifecycle table, the buffered prepared payloads, and the
+    /// back-check book by replaying the durable half + op + back records in order.
     ///
     /// # Errors
     /// Propagates a storage error from creating the subdirectory, opening the txn log, or scanning
@@ -370,15 +450,18 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
         clock: C,
         config: LogConfig,
         txn_config: TxnConfig,
+        back_check_config: BackCheckConfig,
     ) -> Result<TxnStore<F, C>, StorageError> {
         let txn_fs = parent_fs.subdir(TXN_SUBDIR).map_err(StorageError::Io)?;
         let log = Log::open(txn_fs, clock, config)?;
         let mut store = TxnStore {
             log,
             table: TxnTable::new(txn_config),
+            back_check: BackCheckBook::new(back_check_config),
             prepared_payloads: HashMap::new(),
             half_records: 0,
             op_records: 0,
+            back_records: 0,
         };
         store.replay()?;
         Ok(store)
@@ -405,13 +488,26 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
     /// never misread.
     fn replay(&mut self) -> Result<(), StorageError> {
         self.table = TxnTable::new(self.table.config());
+        self.back_check = BackCheckBook::new(self.back_check.config());
         self.prepared_payloads.clear();
         self.half_records = 0;
         self.op_records = 0;
+        self.back_records = 0;
         let flushed = self.log.flushed_offset().get();
         if flushed == 0 {
             return Ok(());
         }
+        // The durable BACK records carry the LAST persisted attempt count per txn (the op-records are
+        // replayed in durable order, so a later BACK record supersedes an earlier one for the same
+        // txn). We collect them into `restored_attempts` during the scan and apply them to the book
+        // AFTER the half/op replay has settled which txns are still Prepared, so a BACK record for a
+        // txn that later resolved (its op-marker followed) is correctly dropped. `next_eligible` is
+        // REBASED against the live monotonic clock at open (a persisted absolute monotonic instant is
+        // meaningless after a reboot — the monotonic origin resets), so a recovered txn is promptly
+        // re-eligible for its next back-check WITHOUT a from-a-previous-boot instant either starving the
+        // scan (a far-future value) or storming it: the ATTEMPT COUNT (the terminal-default gate) is
+        // what is preserved exactly; the schedule merely resumes.
+        let mut restored_attempts: HashMap<Vec<u8>, u32> = HashMap::new();
         let ids = crate::naming::segment_ids(self.log.filesystem()).map_err(StorageError::Io)?;
         for id in ids {
             let scan =
@@ -454,11 +550,35 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
                         self.table
                             .restore(&o.txn_id, TxnState::Resolved(o.outcome), instant);
                         // A resolved txn no longer needs its buffered payload (it was either appended
-                        // to the real stream on commit, or discarded on rollback).
+                        // to the real stream on commit, or discarded on rollback), nor its back-check
+                        // bookkeeping (it is settled — never back-check it again).
                         self.prepared_payloads.remove(&o.txn_id);
+                        restored_attempts.remove(&o.txn_id);
                         let _ = o.real_offset; // recorded for inspection; the engine dedups the append
                     }
+                    TxnRecordMeta::Back(b) => {
+                        self.back_records = self.back_records.saturating_add(1);
+                        // Record the last persisted attempt count for this txn; a later BACK record (or
+                        // an OP record) supersedes it. `next_eligible` from the record is NOT trusted
+                        // (rebased below against the live clock), only `attempts`.
+                        restored_attempts.insert(b.txn_id, b.attempts);
+                        let _ = b.next_eligible;
+                    }
                 }
+            }
+        }
+        // Apply the back-check bookkeeping to the book for every txn that is STILL Prepared after the
+        // half/op settle (a BACK record whose txn resolved was already removed from `restored_attempts`
+        // by its OP record). The schedule is rebased to "eligible now" (the live monotonic now is read
+        // by the engine, which re-enrolls on open; here, with no live clock, we use 0 as the
+        // replay-stable floor so the engine's first scan after open finds it due — the engine clamps
+        // against its real `now`). The attempt count is preserved EXACTLY.
+        for (txn_id, attempts) in restored_attempts {
+            if matches!(self.table.state(&txn_id), Some(TxnState::Prepared)) {
+                // next_eligible = 0: immediately eligible on the engine's first post-open scan (which
+                // passes a real monotonic `now`); the preserved attempt count drives the terminal
+                // default exactly as before the restart.
+                self.back_check.restore(&txn_id, attempts, 0);
             }
         }
         Ok(())
@@ -474,6 +594,26 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
     /// Mutably borrows the pure lifecycle table (the engine drives prepare/commit/rollback on it).
     pub fn table_mut(&mut self) -> &mut TxnTable {
         &mut self.table
+    }
+
+    /// Borrows the pure back-check book (#640 part 2; for the engine's scan `due` query and tests).
+    #[must_use]
+    pub fn back_check(&self) -> &BackCheckBook {
+        &self.back_check
+    }
+
+    /// Mutably borrows the pure back-check book (#640 part 2; the engine enrolls/forgets txns and
+    /// records attempts on it). A back-check enroll/attempt that must SURVIVE a restart also calls
+    /// [`TxnStore::append_back_check`] to durably persist the bookkeeping.
+    pub fn back_check_mut(&mut self) -> &mut BackCheckBook {
+        &mut self.back_check
+    }
+
+    /// The number of currently-enrolled (under-back-check) txns (#640 part 2), for observability and
+    /// the scan's hot-path no-op gate.
+    #[must_use]
+    pub fn under_back_check(&self) -> usize {
+        self.back_check.len()
     }
 
     /// The buffered prepared payload for `txn_id`, or `None` if the txn is not currently prepared
@@ -582,6 +722,44 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
         Ok(())
     }
 
+    /// Durably appends a BACK (back-check bookkeeping) record for `txn_id` (#640 part 2) recording its
+    /// current `attempts` count and `next_eligible` instant, and fsyncs it BEFORE returning, so the
+    /// back-check schedule + attempt count SURVIVE a broker restart and the scan resumes. The caller
+    /// (the engine) writes this AFTER it bumps the in-memory [`BackCheckBook`] for an issued attempt, so
+    /// a crash after the bump but before this append simply re-checks the txn (a safe at-least-once
+    /// back-check; the resolution is idempotent), and a crash after this append replays the recorded
+    /// attempt count (the terminal-default gate is preserved). It is a NO-OP on the real stream and the
+    /// lifecycle — pure bookkeeping — so it never affects delivery.
+    ///
+    /// `next_eligible` is persisted but treated as advisory on replay: a monotonic instant is rebased
+    /// against the live clock at open (see [`TxnStore::replay`]), so only `attempts` is authoritative
+    /// across a restart. The append is its own framed, CRC'd, version-tagged record in the same `txn/`
+    /// log, interleaved with the half/op records by durable order.
+    ///
+    /// # Errors
+    /// [`TxnStoreError::Unframable`] (unreachable from the bounded wire path) or a storage error from
+    /// the append or its durability barrier.
+    pub fn append_back_check(
+        &mut self,
+        txn_id: &[u8],
+        attempts: u32,
+        next_eligible: u64,
+    ) -> Result<(), TxnStoreError> {
+        let meta =
+            encode_back_meta(txn_id, attempts, next_eligible).ok_or(TxnStoreError::Unframable)?;
+        self.log.append(&Append {
+            timestamp_ms: self.log.now_unix_millis(),
+            flags: RecordFlags::EMPTY,
+            key: &[],
+            headers: &meta,
+            payload: &[],
+        })?;
+        // fsync the back-check record BEFORE returning: the recorded attempt count survives a restart.
+        self.log.sync()?;
+        self.back_records = self.back_records.saturating_add(1);
+        Ok(())
+    }
+
     /// The number of currently-`Prepared` (unresolved) half messages.
     #[must_use]
     pub fn prepared_count(&self) -> usize {
@@ -599,6 +777,13 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
     #[must_use]
     pub fn op_records(&self) -> u64 {
         self.op_records
+    }
+
+    /// The number of back-check bookkeeping records durably written across this store's lifetime
+    /// (#640 part 2), for observability.
+    #[must_use]
+    pub fn back_records(&self) -> u64 {
+        self.back_records
     }
 
     /// Borrows the underlying txn log (for inspection and tests).
@@ -621,7 +806,14 @@ mod tests {
     }
 
     fn store(fs: &InMemoryFs) -> TxnStore<InMemoryFs, ManualClock> {
-        TxnStore::open(fs, ManualClock::new(), config(), TxnConfig::default()).unwrap()
+        TxnStore::open(
+            fs,
+            ManualClock::new(),
+            config(),
+            TxnConfig::default(),
+            BackCheckConfig::default(),
+        )
+        .unwrap()
     }
 
     fn half(payload: &[u8]) -> Append<'static> {
@@ -646,7 +838,7 @@ mod tests {
                 assert_eq!(h.orig_flags, RecordFlags::COMPRESSED);
                 assert_eq!(h.orig_headers, b"hh");
             }
-            TxnRecordMeta::Op(_) => panic!("expected a half record"),
+            _ => panic!("expected a half record"),
         }
     }
 
@@ -661,8 +853,24 @@ mod tests {
                     assert_eq!(o.outcome, outcome);
                     assert_eq!(o.real_offset, off);
                 }
-                TxnRecordMeta::Half(_) => panic!("expected an op record"),
+                _ => panic!("expected an op record"),
             }
+        }
+    }
+
+    #[test]
+    fn back_meta_round_trips() {
+        // #640 part 2: a back-check record carries the txn id, attempt count, and next-eligible instant.
+        let blob = encode_back_meta(b"tx1", 3, 0x0102_0304).unwrap();
+        assert_eq!(&blob[0..4], &TXN_BACK_MAGIC);
+        assert_eq!(blob[4], TXN_FORMAT_VERSION);
+        match decode_meta(&blob).unwrap() {
+            TxnRecordMeta::Back(b) => {
+                assert_eq!(b.txn_id, b"tx1");
+                assert_eq!(b.attempts, 3);
+                assert_eq!(b.next_eligible, 0x0102_0304);
+            }
+            _ => panic!("expected a back record"),
         }
     }
 
@@ -862,7 +1070,113 @@ mod tests {
         let blob = encode_half_meta(&at_cap, "s", RecordFlags::EMPTY, b"").unwrap();
         match decode_meta(&blob).unwrap() {
             TxnRecordMeta::Half(h) => assert_eq!(h.txn_id, at_cap),
-            TxnRecordMeta::Op(_) => panic!("half expected"),
+            _ => panic!("half expected"),
         }
+    }
+
+    #[test]
+    fn the_v1_back_format_is_byte_frozen() {
+        // #640 part 2: pin the EXACT bytes a v1 back-check record produces, so an accidental format
+        // drift breaks a test here, not a deployed store. magic + version + txn_id_len + attempts +
+        // next_eligible + txn_id + crc.
+        let blob = encode_back_meta(b"t", 0x0203_0405, 0x0607_0809_0a0b_0c0d).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"TXNB");
+        expected.push(1); // version
+        expected.extend_from_slice(&1u16.to_le_bytes()); // txn_id_len
+        expected.extend_from_slice(&0x0203_0405u32.to_le_bytes()); // attempts
+        expected.extend_from_slice(&0x0607_0809_0a0b_0c0du64.to_le_bytes()); // next_eligible
+        expected.extend_from_slice(b"t");
+        let crc = ironbus_core::crc::crc32c(&expected);
+        expected.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(blob, expected);
+    }
+
+    #[test]
+    fn decode_rejects_a_corrupt_back_crc() {
+        let mut blob = encode_back_meta(b"tx1", 2, 5).unwrap();
+        let n = blob.len();
+        blob[n - 5] ^= 0x01; // flip a body byte; the crc no longer matches
+        assert!(decode_meta(&blob).is_none());
+    }
+
+    /// A store with a deterministic back-check config (retry 50, 3-attempt cap, timeout 0) so a test
+    /// can pin the in-memory schedule exactly.
+    fn back_store(fs: &InMemoryFs) -> TxnStore<InMemoryFs, ManualClock> {
+        TxnStore::open(
+            fs,
+            ManualClock::new(),
+            config(),
+            TxnConfig::default(),
+            BackCheckConfig {
+                timeout: 0,
+                retry: 50,
+                max_attempts: 3,
+                batch: 256,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_back_check_schedule_and_attempt_count_survive_a_restart() {
+        // The durability headline (#640 part 2): a back-check record persists the attempt count so it
+        // replays after a restart, and the scan resumes (the recovered txn is still Prepared, enrolled,
+        // and immediately due on the engine's next scan with its preserved count).
+        let fs = InMemoryFs::new();
+        {
+            let mut s = back_store(&fs);
+            s.table_mut().prepare(b"tx1", 1).unwrap();
+            s.append_half(b"tx1", "orders", &half(b"p")).unwrap();
+            // Enroll + record TWO back-check attempts durably (as the engine's scan would). The
+            // in-memory schedule advances by the config retry (50); the durable append persists the
+            // matching (attempts, next_eligible) pair.
+            s.back_check_mut().enroll(b"tx1", 0);
+            s.back_check_mut().record_attempt(b"tx1", 10); // -> (1, 60)
+            let (a1, ne1) = s.back_check().bookkeeping(b"tx1").unwrap();
+            s.append_back_check(b"tx1", a1, ne1).unwrap();
+            assert_eq!((a1, ne1), (1, 60));
+            s.back_check_mut().record_attempt(b"tx1", 70); // -> (2, 120)
+            let (a2, ne2) = s.back_check().bookkeeping(b"tx1").unwrap();
+            s.append_back_check(b"tx1", a2, ne2).unwrap();
+            assert_eq!((a2, ne2), (2, 120));
+            assert_eq!(s.under_back_check(), 1);
+        }
+        // Reopen: the txn is still Prepared, the back-check book is rebuilt with the LAST persisted
+        // attempt count (2), and it is immediately eligible (next_eligible rebased to 0 against the live
+        // clock) so the scan resumes.
+        let reopened = back_store(&fs);
+        assert_eq!(reopened.table().state(b"tx1"), Some(TxnState::Prepared));
+        assert_eq!(reopened.under_back_check(), 1);
+        assert_eq!(reopened.back_check().bookkeeping(b"tx1"), Some((2, 0)));
+        // It is due on the next scan (eligible at instant 0), and one more attempt (the 3rd, at the cap)
+        // fires the terminal default — the count carried across the restart exactly.
+        assert_eq!(reopened.back_check().due(0), vec![b"tx1".to_vec()]);
+    }
+
+    #[test]
+    fn a_resolved_txns_back_check_record_is_dropped_on_replay() {
+        // A back-check record for a txn that LATER committed (its op-marker followed in durable order)
+        // must NOT re-enroll the resolved txn on replay — it is settled, never back-check it again.
+        let fs = InMemoryFs::new();
+        {
+            let mut s = store(&fs);
+            s.table_mut().prepare(b"tx1", 1).unwrap();
+            s.append_half(b"tx1", "orders", &half(b"p")).unwrap();
+            s.back_check_mut().enroll(b"tx1", 0);
+            s.back_check_mut().record_attempt(b"tx1", 10);
+            s.append_back_check(b"tx1", 1, 60).unwrap();
+            // The producer reconnected and committed: the op-marker supersedes the back-check record.
+            s.table_mut().commit(b"tx1", 70).unwrap();
+            s.mark_committed(b"tx1", 99).unwrap();
+        }
+        let reopened = store(&fs);
+        assert_eq!(
+            reopened.table().state(b"tx1"),
+            Some(TxnState::Resolved(TxnOutcome::Committed))
+        );
+        // No back-check bookkeeping survives for the resolved txn.
+        assert_eq!(reopened.under_back_check(), 0);
+        assert!(reopened.back_check().bookkeeping(b"tx1").is_none());
     }
 }
