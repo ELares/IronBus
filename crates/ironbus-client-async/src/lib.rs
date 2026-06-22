@@ -80,8 +80,8 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 // directly. They are the SYNC client's types, shared unchanged — the wire contract is identical.
 #[doc(no_inline)]
 pub use ironbus_client::{
-    ClientConfig, ClientError, DeadLetter, Fetch, Gap, Message, ProduceAck, StreamBatch,
-    StreamConsumerConfig, Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES,
+    ClientConfig, ClientError, DeadLetter, Fetch, Gap, Message, ProduceAck, ProgressOutcome,
+    StreamBatch, StreamConsumerConfig, Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES,
     DEFAULT_STREAM_FETCH_RECORDS,
 };
 
@@ -787,6 +787,117 @@ impl AsyncClient {
         match first_err {
             Some(e) => Err(e),
             None => Ok(statuses),
+        }
+    }
+
+    /// Negatively-acks a fetched message so the broker requeues it for redelivery. `delay_ms`
+    /// caps the redelivery backoff for this attempt; `None` lets the broker apply its configured
+    /// backoff schedule. Returns `true` if the broker requeued it, `false` if the token was fenced
+    /// (stale: it already redelivered, was acked, or you nacked it before; either way do not drop
+    /// local state). The async port of [`ironbus_client::Client::nack`].
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
+    pub async fn nack(
+        &mut self,
+        offset: u64,
+        generation: u64,
+        delay_ms: Option<u64>,
+    ) -> Result<bool, ClientError> {
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Nack,
+                offset,
+                generation,
+                // u64::MAX is the wire sentinel for "no explicit delay, use the server schedule".
+                delay_ms: delay_ms.unwrap_or(u64::MAX),
+            },
+            &mut body,
+        );
+        self.send(FrameType::Ack, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::AckStatus, body) => match body.as_slice() {
+                [status] => Ok(*status == 1),
+                _ => Err(ClientError::BadResponse(
+                    "nack reply was not a one-byte status",
+                )),
+            },
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Terminates delivery of a fetched message: an intentional drop. The broker commits past it so
+    /// it never redelivers and is NOT dead-lettered. Returns `true` if it was dropped, `false` if the
+    /// token was fenced (stale: it already redelivered or was acked). The async port of
+    /// [`ironbus_client::Client::term`].
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
+    pub async fn term(&mut self, offset: u64, generation: u64) -> Result<bool, ClientError> {
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Term,
+                offset,
+                generation,
+                delay_ms: 0,
+            },
+            &mut body,
+        );
+        self.send(FrameType::Ack, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::AckStatus, body) => match body.as_slice() {
+                [status] => Ok(*status == 1),
+                _ => Err(ClientError::BadResponse(
+                    "term reply was not a one-byte status",
+                )),
+            },
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Reports that work on a fetched message is still in progress, extending its lease by one
+    /// visibility window so it is not redelivered while the consumer keeps working. The async port
+    /// of [`ironbus_client::Client::progress`].
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
+    pub async fn progress(
+        &mut self,
+        offset: u64,
+        generation: u64,
+    ) -> Result<ProgressOutcome, ClientError> {
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Progress,
+                offset,
+                generation,
+                delay_ms: 0,
+            },
+            &mut body,
+        );
+        self.send(FrameType::Ack, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::AckStatus, body) => match body.as_slice() {
+                [1] => Ok(ProgressOutcome::Extended),
+                [2] => Ok(ProgressOutcome::CapReached),
+                [0] => Ok(ProgressOutcome::Fenced),
+                _ => Err(ClientError::BadResponse(
+                    "progress reply was not a known one-byte status",
+                )),
+            },
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
 

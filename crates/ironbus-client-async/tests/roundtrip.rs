@@ -8,7 +8,7 @@
 //! This proves the async client speaks the same wire as the broker, end to end.
 
 use ironbus_client_async::proto::{ConsumeTier, PubBody};
-use ironbus_client_async::{AsyncClient, ClientConfig, StreamConsumerConfig};
+use ironbus_client_async::{AsyncClient, ClientConfig, ProgressOutcome, StreamConsumerConfig};
 use ironbus_core::clock::Clock;
 use ironbus_core::delivery::DeliveryConfig;
 use ironbus_core::lease::LeaseConfig;
@@ -323,6 +323,126 @@ async fn async_produce_window_returns_fifo_offsets_against_a_real_server() {
         assert_eq!(fetched.messages[i].payload, *payload);
         assert_eq!(fetched.messages[i].offset, i as u64);
     }
+
+    shutdown.store(true, Ordering::Release);
+    handle.join().unwrap();
+}
+
+/// The consume-settle NAK path end to end: produce a record, subscribe, fetch it, NAK it (the broker
+/// requeues it), then a re-fetch REDELIVERS it under a fresh generation — proving the async `nack`
+/// requeued it. The stale (nacked) token can no longer ack; the fresh one commits and drains. The async
+/// port of the sync client's `a_nacked_message_is_redelivered_against_a_real_server`.
+#[tokio::test]
+async fn async_nack_redelivers_a_message_against_a_real_server() {
+    let (addr, shutdown, handle) = start_server();
+
+    let mut c = AsyncClient::connect(addr).await.unwrap();
+    let off = c
+        .produce(&PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"retry-me",
+        })
+        .await
+        .unwrap();
+
+    c.subscribe("workers").await.unwrap();
+    let first = c.fetch(10).await.unwrap().messages;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].payload, b"retry-me");
+
+    // Nack with no explicit delay: the default 30s visibility means the record would not otherwise
+    // redeliver within this test, so the nack is what brings it back. The in-process server has an
+    // empty backoff schedule, so `None` requeues it immediately.
+    assert!(c
+        .nack(first[0].offset, first[0].generation, None)
+        .await
+        .unwrap());
+
+    let second = c.fetch(10).await.unwrap().messages;
+    assert_eq!(second.len(), 1, "the nacked record is redelivered");
+    assert_eq!(second[0].offset, off);
+    assert_eq!(second[0].payload, b"retry-me");
+    assert_ne!(
+        second[0].generation, first[0].generation,
+        "redelivery fences the old generation"
+    );
+
+    // The stale (nacked) token can no longer commit; the fresh one does.
+    assert!(
+        !c.ack(first[0].offset, first[0].generation).await.unwrap(),
+        "the nacked generation is fenced"
+    );
+    assert!(
+        c.ack(second[0].offset, second[0].generation).await.unwrap(),
+        "the redelivered generation commits"
+    );
+    assert!(
+        c.fetch(10).await.unwrap().messages.is_empty(),
+        "the committed record is not redelivered"
+    );
+
+    shutdown.store(true, Ordering::Release);
+    handle.join().unwrap();
+}
+
+/// The consume-settle TERM and PROGRESS paths end to end: produce two records, fetch both, extend the
+/// first's lease with `progress` (Extended), `term` the second (an intentional drop — committed past,
+/// never redelivered), then ack the first so the whole prefix is committed and nothing remains. A
+/// `progress`/`term` on a now-stale token is fenced. The async port of the sync client's
+/// `term_drops_a_message_and_progress_extends_a_lease`.
+#[tokio::test]
+async fn async_term_drops_and_progress_extends_against_a_real_server() {
+    let (addr, shutdown, handle) = start_server();
+
+    let mut c = AsyncClient::connect(addr).await.unwrap();
+    for p in [&b"keep"[..], b"drop"] {
+        c.produce(&PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        })
+        .await
+        .unwrap();
+    }
+
+    c.subscribe("workers").await.unwrap();
+    let msgs = c.fetch(10).await.unwrap().messages;
+    assert_eq!(msgs.len(), 2);
+
+    // Progress on the first: the lease is extended.
+    assert_eq!(
+        c.progress(msgs[0].offset, msgs[0].generation)
+            .await
+            .unwrap(),
+        ProgressOutcome::Extended
+    );
+    // Term the second: an intentional drop (committed past, never redelivered, not dead-lettered).
+    assert!(c.term(msgs[1].offset, msgs[1].generation).await.unwrap());
+
+    // Ack the first; now the whole prefix is committed and nothing remains.
+    assert!(c.ack(msgs[0].offset, msgs[0].generation).await.unwrap());
+    assert!(
+        c.fetch(10).await.unwrap().messages.is_empty(),
+        "the termed record never redelivers"
+    );
+
+    // A progress or term on a now-stale token is fenced.
+    assert_eq!(
+        c.progress(msgs[0].offset, msgs[0].generation)
+            .await
+            .unwrap(),
+        ProgressOutcome::Fenced
+    );
+    assert!(!c.term(msgs[1].offset, msgs[1].generation).await.unwrap());
 
     shutdown.store(true, Ordering::Release);
     handle.join().unwrap();
