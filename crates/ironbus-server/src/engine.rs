@@ -3880,6 +3880,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     // carry the durable txn dedup — a flagged follow-up — so its commit redrive is at-least-once; the
     // default stream, the common case, is exactly-once.)
     //
+    // DURABILITY-SCOPE CAVEATS (be honest about what the guarantee rests on — see docs/RECOVERY.md
+    // "Transactional messages (2PC)"):
+    //   (a) The default-stream exactly-once / no-committed-empty guarantee is SCOPED to
+    //       `DurabilityLevel::Sync` (the default). It rests on A3 (the real record's covering fsync)
+    //       running BEFORE B (the op-marker, which ALWAYS force-fsyncs). Under a RELAXED level
+    //       (`interval`/`async`/`none`) A3 is a no-fsync `flush_no_sync`, so a power cut can leave the
+    //       lifecycle state Committed (B fsync'd) while the unsynced real record is lost — a
+    //       committed-but-empty txn. This is consistent with the relaxed-level acked-loss waiver (I2 is
+    //       already waived there), but it is a NEW asymmetry: the lifecycle marker is durable while its
+    //       record is not. Use `sync` (the default) for the no-committed-empty guarantee.
+    //   (b) A NAMED (non-default) target stream's commit redrive is at-least-once on a crash (only the
+    //       default stream carries the durable txn-id seq dedup), as noted above.
+    //   (c) The txn-id dedup high-water shares the bounded LRU `producer-seq.ckpt` slot, so a VERY late
+    //       default-stream redrive whose high-water was evicted degrades to at-least-once (safe — never
+    //       loss, never a flip); immediate redrives are unaffected (see `commit_real_append`).
+    //
     // The INVISIBILITY invariant holds throughout: the payload lives in `txn/` (never the real stream)
     // until step A, and a consumer never reads `txn/`; a rolled-back txn's payload is never written to
     // the real stream at all.
@@ -3956,6 +3972,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// already-committed txn returns the original offset and appends nothing; a commit of an
     /// already-rolled-back txn is REFUSED. See the module-level crash-safety argument above.
     ///
+    /// DURABILITY SCOPE: the no-committed-empty guarantee (a durable Committed marker always has its
+    /// real record durable too) holds under [`DurabilityLevel::Sync`] (the default), where A3 force-
+    /// fsyncs the record before the op-marker B. Under a RELAXED level A3 is a no-fsync flush while B
+    /// always fsyncs, so a power cut can leave a Committed lifecycle over a lost (unsynced) record — a
+    /// committed-but-empty txn, consistent with that level's acked-loss waiver. See caveat (a) in the
+    /// module-level argument and docs/RECOVERY.md.
+    ///
     /// # Errors
     /// [`EngineError::Txn`] for an unknown id or a commit-after-rollback (refused, never flipped); a
     /// storage error from the real-stream append, the op-marker append, or a durability barrier.
@@ -4022,6 +4045,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// out-of-order guard. After the append the durable seq high-water is FLUSHED (the caller's
     /// responsibility, via [`Engine::flush_txn_commit_dedup`]) before the op-marker, so the dedup
     /// identity is durable before the commit point.
+    ///
+    /// DEDUP HIGH-WATER AGING (caveat (c)): the txn-id high-water shares the bounded (LRU, ~4096-entry)
+    /// `producer-seq.ckpt` slot. A VERY late default-stream redrive whose high-water was EVICTED by
+    /// newer producers before the redrive runs degrades to at-least-once (it re-appends a fresh copy) —
+    /// which is SAFE (never loss, never a flipped outcome). An immediate crash-recovery redrive is
+    /// unaffected: the txn pseudo-ids were just written and sort to the front of the LRU, so they are
+    /// still present when recovery replays the Prepared txn.
     fn commit_real_append(
         &mut self,
         txn_id: &[u8],

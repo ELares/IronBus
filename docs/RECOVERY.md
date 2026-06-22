@@ -678,3 +678,83 @@ is clean, with the restored cursors/DLQ/log-head equal to the source. The **NATS
 a NATS snapshot has no offline whole-store consistency proof of cursors-vs-log-vs-DLQ; here
 the manifest self-check plus the `verify` oracle make "this backup restores to a consistent
 dir" a checkable property, not a hope.
+
+---
+
+## 9. Transactional messages (2PC): the half-message commit point and its durability scope (#640)
+
+A transactional half message (`prepare` → `commit`/`rollback`, the two-phase-commit
+core in #640) buffers a payload INVISIBLE to consumers under a producer-supplied
+`txn_id`, then either makes it visible at one durable commit point or discards it.
+The buffered half lives in the `txn/` subtree (its own log, never the real stream),
+so a consumer never sees a Prepared payload, and the `txn/` subtree is not even
+materialized until the first `prepare` (a non-transactional broker is byte-for-byte
+unchanged). This section ratifies the COMMIT-POINT crash ordering and — because the
+"SHIP-WITH-DOC" review turned on exactly this — states the THREE durability-scope
+caveats that keep the exactly-once claim honest. The engine code is
+`Engine::txn_commit` / `commit_real_append` / `flush_txn_commit_dedup` and the clamp
+`seed_producer_seq_from_recovered` in `crates/ironbus-server/src/engine.rs`; the
+on-disk op-marker fsync is `TxnStore::append_op` in
+`crates/ironbus-storage/src/txn.rs`.
+
+### 9.1 The commit-point ordering
+
+A fresh commit (or a crash-recovery redrive of a Prepared txn) runs four ordered
+steps, designed so the real append is exactly-once across a crash:
+
+- **A** — WRITE the buffered payload to the real stream, no fsync (assigns the
+  offset, records the txn-id seq high-water IN MEMORY), DEDUPED by the durable
+  txn-id producer-seq (#639) so a redrive re-write is a duplicate at the original
+  offset.
+- **A2** — fsync the producer-seq CHECKPOINT (`producer-seq.ckpt`), making the
+  dedup identity durable BEFORE the record.
+- **A3** — the COMMIT-BATCH covering fsync, making the real record durable.
+- **B** — append + fsync the COMMITTED op-marker (the COMMIT POINT, carrying the
+  real offset).
+
+The crash windows map onto the longest-valid-prefix model of sections 1–3:
+
+| Crash window | On reopen | Outcome |
+|---|---|---|
+| after `prepare`, before A | txn replays as Prepared (only the half record is durable) | a later commit is a FRESH resolve; still invisible |
+| after A3, before B | txn replays as Prepared (no op-marker), payload still buffered | recovery re-commits; A re-writes the SAME payload under the SAME txn-id seq, which the durable high-water (made durable in A2) recognizes as a DUPLICATE at the original offset → exactly once |
+| between A2 and A3 | high-water durable, real record LOST in the torn tail | recovery's `seed_producer_seq_from_recovered` CLAMPS a high-water whose offset is at/past the durable head and DROPS it, so the redrive re-writes FRESH at the real head → no double (the first write was lost), no loss (the redrive lands it) |
+| after B | txn replays as Committed | no replay work; a retried commit is a benign idempotent no-op returning the recorded offset |
+
+A2 is ordered BEFORE A3 specifically so the between-A2-and-A3 window degrades to the
+CLAMP (drop a phantom high-water), not to a double-append. This is the recovery half
+of the I2 ack-implies-durable contract (section 1.3 / [DURABILITY.md](DURABILITY.md)),
+specialized to the 2PC commit point.
+
+### 9.2 The three durability-scope caveats (post-review, stated honestly)
+
+**(a) Exactly-once is SCOPED to `DurabilityLevel::Sync` (the default).** The
+default-stream exactly-once / no-committed-empty guarantee rests on A3 (the real
+record's covering fsync) happening BEFORE B (the op-marker, which ALWAYS
+force-fsyncs). Under a RELAXED durability level (`interval`/`async`/`none`) A3 is a
+no-fsync `flush_no_sync` while the op-marker B still force-fsyncs — so a power cut can
+leave the lifecycle state Committed (B durable) while the unsynced real record is lost
+(committed-but-empty). This is consistent with the relaxed-level acked-loss waiver
+(I2 is already waived there, [DURABILITY.md](DURABILITY.md)), but it is a NEW
+asymmetry: the lifecycle marker is durable while its record is not. Use `sync` (the
+default) for the no-committed-empty guarantee.
+
+**(b) Named-stream commit redrive is at-least-once on crash.** Only the DEFAULT stream
+carries the durable txn-id seq dedup. A NAMED (non-default) target stream is
+exactly-once in NORMAL operation, but a crash-recovery redrive (a Prepared replay
+re-appending) can DUPLICATE at a new offset (never loss, never a double-append in
+normal operation). Closing this is a flagged follow-up: thread the engine producer-seq
+dedup through `StreamSet::append_to` with a per-stream-namespaced high-water.
+
+**(c) The dedup high-water can age out.** The txn-id dedup high-water shares the
+bounded (LRU, ~4096-entry) `producer-seq.ckpt` slot. A VERY late default-stream
+redrive whose high-water was EVICTED by newer producers before it runs degrades to
+at-least-once (safe — never loss, never a flipped outcome). An IMMEDIATE
+crash-recovery redrive is unaffected: the txn pseudo-ids were just written and sort to
+the front of the LRU, so they are still present when recovery replays the Prepared txn.
+
+All three caveats are SAFE failure modes (at-least-once or a refused conflict, never a
+silent loss and never a flipped commit/rollback outcome). They are pinned in the engine
+doc comments (the module-level crash-safety argument and the `txn_commit` /
+`commit_real_append` doc) and exercised by the engine txn tests (the clamp branch by
+`crash_between_a2_and_a3_clamps_the_phantom_high_water_and_redrives_fresh`).

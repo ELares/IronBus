@@ -2577,6 +2577,15 @@ impl Client {
     /// per-connection seed) plus a monotonic per-connection counter, so two `prepare`s on this
     /// connection — and on different connections (distinct local addresses) — never collide. Bounded
     /// well under the 256-byte wire cap.
+    ///
+    /// COLLISION SCOPE: the `<local_addr>#<seq>` id is unique only WITHIN a connection's lifetime. An
+    /// EPHEMERAL local port REUSED by a later connection (after this one closes) whose per-connection
+    /// counter has reset to 0 can re-mint an id a still-prepared txn already holds. Because the id is
+    /// the broker's idempotency key, this surfaces as a broker ERROR (a spent / still-prepared id is
+    /// refused) — NEVER a silent merge of two distinct half messages. For transactions that must
+    /// survive a reconnect (or that derive their identity from a local transaction), supply a stable
+    /// caller-chosen id via [`Client::prepare_with_id`] (a UUID, a snowflake, a content hash) instead
+    /// of an auto-minted one — that is the durable choice.
     fn mint_txn_id(&mut self) -> TxnId {
         let seq = self.next_txn_seq;
         self.next_txn_seq = self.next_txn_seq.wrapping_add(1);
