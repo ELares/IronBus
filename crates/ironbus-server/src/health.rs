@@ -348,9 +348,13 @@ where
                     // v1 keeps its historical generic `application/json` Content-Type so a v1 pin is
                     // byte-for-byte the prior response (header AND body); only the body schema is the
                     // contract, but holding the header steady too keeps a v1 consumer untouched.
-                    Ok(snapshot) => {
-                        respond_json(&mut stream, 200, "OK", &admin_body(&snapshot), "application/json")
-                    }
+                    Ok(snapshot) => respond_json(
+                        &mut stream,
+                        200,
+                        "OK",
+                        &admin_body(&snapshot),
+                        "application/json",
+                    ),
                     Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
                 },
                 AcceptDecision::ServeV2 => match admin_snapshot(engine, connz, data_dir) {
@@ -1973,11 +1977,9 @@ fn admin_connections_section(s: &mut String, snapshot: &AdminSnapshot) {
 fn admin_storage_section(s: &mut String, snapshot: &AdminSnapshot) {
     // `-1` (the `crate::rss::UNAVAILABLE` / `RSS_UNAVAILABLE` sentinel) when RSS cannot be read on
     // this platform, matching the `/metrics` `ironbus_*` RAM gauges; otherwise the live RSS in bytes.
-    let rss_bytes = snapshot
-        .rss
-        .map_or(crate::rss::RSS_UNAVAILABLE, |b| {
-            i64::try_from(b).unwrap_or(i64::MAX)
-        });
+    let rss_bytes = snapshot.rss.map_or(crate::rss::RSS_UNAVAILABLE, |b| {
+        i64::try_from(b).unwrap_or(i64::MAX)
+    });
     let _ = write!(
         s,
         "\"storage\":{{\
@@ -5258,7 +5260,12 @@ mod tests {
             assert!(matches!(g.poll_in("billing", 0).unwrap(), Poll::Message(_)));
         }
 
-        let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
+        // Pin v1 explicitly so this remains a v1 field-correctness test (no Accept now defaults to v2,
+        // #577); the v1 response carries the generic `application/json` Content-Type.
+        let r = request(
+            addr,
+            "GET /admin HTTP/1.1\r\nAccept: application/vnd.ironbus.admin.v1+json\r\n\r\n",
+        );
         let (status, body) = split_body(&r);
         assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
         assert!(
@@ -5674,9 +5681,10 @@ mod tests {
     }
 
     #[test]
-    fn admin_serves_v1_for_an_absent_or_wildcard_accept() {
-        // A plain `curl` (no Accept, or `*/*`, or `application/json`) takes the current v1, exactly as
-        // `/metrics` ignores Accept, so the endpoint stays curl-friendly while still being pinnable.
+    fn admin_serves_the_newest_version_for_an_absent_or_wildcard_accept() {
+        // A plain `curl` (no Accept, or `*/*`, or `application/json`) takes the NEWEST version (v2,
+        // #577), exactly as `/metrics` ignores Accept, so the endpoint stays curl-friendly while
+        // still being version-pinnable. The v2 body carries the three new objects by name.
         let (addr, shutdown, handle, _engine) = start_with_admin();
         for accept_line in [
             "",                             // no Accept header at all
@@ -5687,22 +5695,26 @@ mod tests {
             let (status, body) = split_body(&r);
             assert!(
                 status.starts_with("HTTP/1.1 200 OK"),
-                "accept `{accept_line}` should serve v1: {r}"
+                "accept `{accept_line}` should serve the newest version: {r}"
             );
-            assert!(body.contains("\"schema_version\":1"), "{body}");
+            assert!(body.contains("\"schema_version\":2"), "{body}");
+            for key in ["\"connections\":{", "\"storage\":{", "\"recovery\":{"] {
+                assert!(body.contains(key), "v2 object {key} present: {body}");
+            }
         }
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 
     #[test]
-    fn admin_rejects_an_explicit_non_v1_admin_accept_with_406() {
-        // An Accept that explicitly names a DIFFERENT IronBus-admin version is 406 Not Acceptable, so
-        // a future v2-only consumer can never silently misread a v1 body. This is the version-pin
-        // teeth: it fails if the negotiation is dropped (every Accept would 200).
+    fn admin_rejects_an_explicit_unknown_admin_accept_with_406() {
+        // An Accept that explicitly names an IronBus-admin version that is neither v1 NOR v2 (an
+        // unknown future version) is 406 Not Acceptable, so a future-version-only consumer can never
+        // silently misread a v1/v2 body. This is the version-pin teeth: it fails if the negotiation
+        // is dropped (every Accept would 200). v2 is now SUPPORTED, so only the unknown versions 406.
         let (addr, shutdown, handle, _engine) = start_with_admin();
         for bad in [
-            "application/vnd.ironbus.admin.v2+json",
+            "application/vnd.ironbus.admin.v3+json",
             "application/vnd.ironbus.admin.v99+json",
         ] {
             let r = request(
@@ -5714,9 +5726,11 @@ mod tests {
                 status.starts_with("HTTP/1.1 406 Not Acceptable"),
                 "accept `{bad}` should be 406: {r}"
             );
+            // The 406 names BOTH supported versions so a client can re-pin.
             assert!(
-                body.contains("application/vnd.ironbus.admin.v1+json"),
-                "the 406 names the supported version: {body}"
+                body.contains("application/vnd.ironbus.admin.v1+json")
+                    && body.contains("application/vnd.ironbus.admin.v2+json"),
+                "the 406 names the supported versions: {body}"
             );
         }
         shutdown.store(true, Ordering::Release);
@@ -5724,18 +5738,24 @@ mod tests {
     }
 
     #[test]
-    fn admin_serves_v1_when_a_non_v1_admin_type_is_offered_alongside_v1() {
-        // A consumer may offer several media types; if ANY is the v1 type, it is served (the client
-        // accepts v1), even if it also lists a future version. Content negotiation picks the
-        // supported representation rather than rejecting.
+    fn admin_serves_v1_when_v1_is_offered_alongside_v2() {
+        // A consumer may offer several media types; if ANY is the v1 type, v1 is served — a v1 pin
+        // is the back-compat-safe choice for a client that accepts EITHER, so an existing v1 consumer
+        // that future-proofs its Accept by also listing v2 is never silently upgraded to v2 (#577).
         let (addr, shutdown, handle, _engine) = start_with_admin();
         let r = request(
             addr,
             "GET /admin HTTP/1.1\r\nAccept: application/vnd.ironbus.admin.v2+json, \
              application/vnd.ironbus.admin.v1+json\r\n\r\n",
         );
-        let (status, _body) = split_body(&r);
+        let (status, body) = split_body(&r);
         assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+        assert!(body.contains("\"schema_version\":1"), "v1 pin wins: {body}");
+        // The v2-only objects are ABSENT from a v1 body (additive only in v2).
+        assert!(
+            !body.contains("\"connections\":{"),
+            "v1 has no v2 object: {body}"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -5767,12 +5787,14 @@ mod tests {
     #[test]
     fn admin_accept_decision_classifies_each_case() {
         // The negotiation logic, unit-tested directly (lower-cased input, as the parser produces).
-        assert_eq!(admin_accept_decision(""), AcceptDecision::ServeV1);
-        assert_eq!(admin_accept_decision("*/*"), AcceptDecision::ServeV1);
+        // Unpinned -> NEWEST (v2): absent, wildcard, or a generic JSON type.
+        assert_eq!(admin_accept_decision(""), AcceptDecision::ServeV2);
+        assert_eq!(admin_accept_decision("*/*"), AcceptDecision::ServeV2);
         assert_eq!(
             admin_accept_decision("application/json"),
-            AcceptDecision::ServeV1
+            AcceptDecision::ServeV2
         );
+        // An explicit v1 pin -> the UNCHANGED v1 body (parameters tolerated).
         assert_eq!(
             admin_accept_decision("application/vnd.ironbus.admin.v1+json"),
             AcceptDecision::ServeV1
@@ -5781,16 +5803,37 @@ mod tests {
             admin_accept_decision("application/vnd.ironbus.admin.v1+json;q=0.9"),
             AcceptDecision::ServeV1
         );
+        // An explicit v2 pin -> v2 (the version is now SUPPORTED, no longer a 406).
         assert_eq!(
             admin_accept_decision("application/vnd.ironbus.admin.v2+json"),
+            AcceptDecision::ServeV2
+        );
+        assert_eq!(
+            admin_accept_decision("application/vnd.ironbus.admin.v2+json;q=0.9"),
+            AcceptDecision::ServeV2
+        );
+        // An explicit UNKNOWN admin version (neither v1 nor v2) -> 406.
+        assert_eq!(
+            admin_accept_decision("application/vnd.ironbus.admin.v3+json"),
             AcceptDecision::UnsupportedVersion
         );
-        // v2 offered alongside v1 -> serve v1 (the client accepts v1).
+        assert_eq!(
+            admin_accept_decision("application/vnd.ironbus.admin.v99+json"),
+            AcceptDecision::UnsupportedVersion
+        );
+        // v1 wins over v2 when BOTH are offered (back-compat-safe for an either-acceptor).
         assert_eq!(
             admin_accept_decision(
                 "application/vnd.ironbus.admin.v2+json,application/vnd.ironbus.admin.v1+json"
             ),
             AcceptDecision::ServeV1
+        );
+        // v2 wins over an unknown version when both are offered (the supported one is served).
+        assert_eq!(
+            admin_accept_decision(
+                "application/vnd.ironbus.admin.v3+json,application/vnd.ironbus.admin.v2+json"
+            ),
+            AcceptDecision::ServeV2
         );
     }
 
@@ -5807,5 +5850,348 @@ mod tests {
             parse_accept_header("\r\nAccept: a/b\r\nAccept: c/d\r\n"),
             "a/b,c/d"
         );
+    }
+
+    // ── /admin v2 (#577) ──────────────────────────────────────────────────────────────────────────
+
+    /// An admin-enabled health server sharing a caller-supplied `Arc<ConnectionMetrics>` and the temp
+    /// dir as the data dir, so a v2 test can drive LIVE connz signals (the wire server would) and read
+    /// a real disk-free figure. Returns the bound addr, the shutdown flag, the join handle, the shared
+    /// engine, and the shared connz handle. The engine config is `start_with_admin`'s, so the v1 body
+    /// fields a v2 body also carries match the existing v1 expectations.
+    #[allow(clippy::type_complexity)]
+    fn start_with_admin_connz() -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+        Arc<ConnectionMetrics>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
+                log: LogConfig::default().with_max_total_bytes(1_000_000),
+                lease: LeaseConfig {
+                    visibility_nanos: 1234,
+                    hard_cap_nanos: 5678,
+                },
+                delivery: DeliveryConfig::new(7, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 4096,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 2048,
+                max_age_ms: 99,
+                max_messages: 33,
+                max_groups: 100,
+                group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropOldest,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let connz = Arc::new(ConnectionMetrics::new());
+        let data_dir = std::env::temp_dir();
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let connz = Arc::clone(&connz);
+            move || {
+                serve_health_connz(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    true, // admin enabled
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                    &connz,
+                    Some(&data_dir),
+                )
+                .unwrap();
+            }
+        });
+        (addr, shutdown, handle, engine, connz)
+    }
+
+    #[test]
+    fn admin_v2_carries_connections_storage_and_recovery_with_correct_values() {
+        // The #577 contract: an unpinned (or v2-pinned) `/admin` request gets the v2 body, which adds
+        // the three new bounded objects BY NAME with values that mirror the live connz / storage /
+        // recovery state. Drive a known connz fixture and assert each field.
+        use crate::connz::RejectReason;
+        let (addr, shutdown, handle, engine, connz) = start_with_admin_connz();
+        // Connz fixture: 3 accepted, 1 closed (open == 2), 1 refused, 2 authenticated, and one of each
+        // pre-auth-DoS reason except locked_out (which gets two), so every field has a distinct value.
+        connz.record_accept();
+        connz.record_accept();
+        connz.record_accept();
+        connz.record_close();
+        connz.record_refused();
+        connz.record_authenticated();
+        connz.record_authenticated();
+        connz.record_rejected(RejectReason::RateLimited);
+        connz.record_rejected(RejectReason::HalfOpenCap);
+        connz.record_rejected(RejectReason::LockedOut);
+        connz.record_rejected(RejectReason::LockedOut);
+        connz.record_rejected(RejectReason::AuthFailed);
+        // Storage fixture: produce 2 records so the segment count / durable bytes are non-trivial.
+        {
+            let mut g = engine.lock().unwrap();
+            for payload in [&b"alpha"[..], &b"beta"[..]] {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+            }
+        }
+
+        // An explicit v2 pin gets the v2 body (200), labeled with the versioned media type.
+        let r = request(
+            addr,
+            "GET /admin HTTP/1.1\r\nAccept: application/vnd.ironbus.admin.v2+json\r\n\r\n",
+        );
+        let (status, body) = split_body(&r);
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+        assert!(
+            r.contains("Content-Type: application/vnd.ironbus.admin.v2+json"),
+            "v2 labels the response: {r}"
+        );
+        assert!(body.contains("\"schema_version\":2"), "{body}");
+
+        // connections: the bounded aggregate with the exact fixture counts, including the nested
+        // rejected{reason} object (open == accepted - closed == 2).
+        assert!(
+            body.contains(
+                "\"connections\":{\"open\":2,\"accepted\":3,\"closed\":1,\"refused\":1,\
+                 \"authenticated\":2,\"rejected\":{\"rate_limited\":1,\"half_open_cap\":1,\
+                 \"locked_out\":2,\"auth_failed\":1}}"
+            ),
+            "connections object: {body}"
+        );
+
+        // storage: 1 segment, the durable bytes are non-zero, and disk-free is a real positive figure
+        // (the temp fs) or the -1 sentinel on an exotic host. No ceiling is configured, so the RAM
+        // headroom / rss-over-cap are the -1 unavailable sentinel.
+        assert!(body.contains("\"storage\":{\"segment_count\":1,"), "{body}");
+        assert!(
+            !body.contains("\"durable_record_bytes\":0,\"disk_free_bytes\""),
+            "durable bytes are non-zero after two produces: {body}"
+        );
+        assert!(body.contains("\"ram_ceiling_bytes\":0,"), "{body}");
+        assert!(
+            body.contains("\"ram_headroom_bytes\":-1,"),
+            "no ceiling -> headroom sentinel: {body}"
+        );
+        assert!(
+            body.contains("\"rss_over_cap_ratio_permille\":-1"),
+            "no ceiling -> ratio sentinel: {body}"
+        );
+
+        // recovery: a fresh in-memory broker opened CLEAN once, with no torn-tail / corruption repairs.
+        assert!(
+            body.contains(
+                "\"recovery\":{\"runs_by_outcome\":{\"clean\":1,\"torn_tail_truncated\":0,\
+                 \"quarantined\":0,\"data_loss\":0},\"torn_tail_repairs\":0,\
+                 \"corruption_repairs_by_artifact\":{\"segment\":0,\"cursor\":0,\"dlq\":0}}"
+            ),
+            "recovery object: {body}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_v1_body_is_frozen_byte_for_byte() {
+        // NON-NEGOTIABLE #1 (#577): an `Accept: ...v1+json` request gets the EXACT v1 body. This is the
+        // frozen-schema snapshot for v1: it renders `admin_body` from a fully-determined fixture and
+        // asserts the WHOLE string, so any field added/removed/reordered/renamed in the v1 path fails
+        // here. The fixture is constructed directly (not via the engine) so the snapshot is fully
+        // deterministic — no clock, no disk, no platform-dependent reading enters the v1 body.
+        let snapshot = frozen_admin_fixture();
+        let body = admin_body(&snapshot);
+        assert_eq!(
+            body,
+            "{\"schema_version\":1,\
+             \"broker\":{\"healthy\":true,\"flushed_offset\":7,\"committed_offset\":3,\
+             \"earliest_retained_offset\":1,\"consumer_lag\":4,\"durable_record_bytes\":512,\
+             \"durable_record_count\":6,\"segment_count\":2,\"recovery_truncated_bytes\":0,\
+             \"produced\":10,\"produced_bytes\":1024,\"produce_rejected\":0,\"delivered\":8,\
+             \"redelivered\":1,\"dead_lettered\":2,\"acks\":5,\"segments_reaped\":0,\
+             \"segments_force_reaped\":0,\"truncations\":0,\"truncated_records\":0},\
+             \"segments\":{\"count\":2,\"earliest_retained_offset\":1,\"head_offset\":7,\
+             \"durable_record_count\":6,\"durable_record_bytes\":512},\
+             \"consumers\":[{\"name\":\"\",\"committed_offset\":3,\"consumer_lag\":4,\"in_flight\":1}],\
+             \"groups\":[{\"name\":\"\",\"committed_offset\":3,\"consumer_lag\":4,\"in_flight\":1}],\
+             \"resilience\":{\"frozen\":false,\"last_skip_offset\":0,\"records_skipped\":0,\
+             \"bytes_skipped\":0,\"recovery_truncated_bytes\":0,\"counter_checkpoint_repairs\":0},\
+             \"dlq\":{\"records\":2,\"last_dead_lettered_offset\":5},\
+             \"config\":{\"max_total_bytes\":1000000,\"max_segment_bytes\":4096,\
+             \"max_retained_bytes\":2048,\"max_age_ms\":99,\"max_messages\":33,\"max_in_flight\":16,\
+             \"consumer_credit\":64,\"consumer_credit_bytes\":4096,\"max_deliver\":7,\
+             \"max_groups\":100,\"group_idle_evict_nanos\":0,\"visibility_nanos\":1234,\
+             \"hard_cap_nanos\":5678,\"disk_full_policy\":\"drop-oldest\",\"ram_ceiling_bytes\":0,\
+             \"daily_physical_write_budget_bytes\":0}}",
+            "the v1 body schema is FROZEN; if this changed intentionally it is a NEW version, not a v1 edit"
+        );
+    }
+
+    #[test]
+    fn admin_v2_body_is_frozen_byte_for_byte() {
+        // NON-NEGOTIABLE (#577): the v2 schema is FROZEN by a whole-string snapshot. v2 is the v1 body
+        // (schema_version bumped to 2) followed by the three new bounded objects in order. The fixture
+        // sets the connz / storage / recovery fields to fully-determined values (RSS forced to a known
+        // figure under a known ceiling, so the headroom / ratio are deterministic), so the WHOLE string
+        // is reproducible and any v2 shape drift fails here.
+        let mut snapshot = frozen_admin_fixture();
+        // A determined connz fixture.
+        snapshot.connz = ConnectionMetricsSnapshot {
+            accepted: 30,
+            closed: 10,
+            refused: 4,
+            currently_open: 20,
+            authenticated: 25,
+            rejected_rate_limited: 1,
+            rejected_half_open_cap: 2,
+            rejected_locked_out: 3,
+            rejected_auth_failed: 4,
+        };
+        // A determined storage fixture: a 1000-byte ceiling with a 400-byte RSS, so headroom == 600 and
+        // rss-over-cap == 400 per-mille; a fixed disk-free figure (no platform read enters the snapshot).
+        snapshot.ram_ceiling_bytes = 1000;
+        snapshot.rss = Some(400);
+        snapshot.disk_free = 99_999;
+        // A determined recovery fixture: two clean opens, one torn-tail-truncated, plus repairs.
+        snapshot.counters.recovery = crate::engine::RecoveryCounters {
+            runs_by_outcome: [2, 1, 0, 0],
+            torn_tail_repairs: 3,
+            corruption_repairs_by_artifact: [1, 0, 2],
+        };
+        let body = admin_body_v2(&snapshot);
+        assert_eq!(
+            body,
+            "{\"schema_version\":2,\
+             \"broker\":{\"healthy\":true,\"flushed_offset\":7,\"committed_offset\":3,\
+             \"earliest_retained_offset\":1,\"consumer_lag\":4,\"durable_record_bytes\":512,\
+             \"durable_record_count\":6,\"segment_count\":2,\"recovery_truncated_bytes\":0,\
+             \"produced\":10,\"produced_bytes\":1024,\"produce_rejected\":0,\"delivered\":8,\
+             \"redelivered\":1,\"dead_lettered\":2,\"acks\":5,\"segments_reaped\":0,\
+             \"segments_force_reaped\":0,\"truncations\":0,\"truncated_records\":0},\
+             \"segments\":{\"count\":2,\"earliest_retained_offset\":1,\"head_offset\":7,\
+             \"durable_record_count\":6,\"durable_record_bytes\":512},\
+             \"consumers\":[{\"name\":\"\",\"committed_offset\":3,\"consumer_lag\":4,\"in_flight\":1}],\
+             \"groups\":[{\"name\":\"\",\"committed_offset\":3,\"consumer_lag\":4,\"in_flight\":1}],\
+             \"resilience\":{\"frozen\":false,\"last_skip_offset\":0,\"records_skipped\":0,\
+             \"bytes_skipped\":0,\"recovery_truncated_bytes\":0,\"counter_checkpoint_repairs\":0},\
+             \"dlq\":{\"records\":2,\"last_dead_lettered_offset\":5},\
+             \"config\":{\"max_total_bytes\":1000000,\"max_segment_bytes\":4096,\
+             \"max_retained_bytes\":2048,\"max_age_ms\":99,\"max_messages\":33,\"max_in_flight\":16,\
+             \"consumer_credit\":64,\"consumer_credit_bytes\":4096,\"max_deliver\":7,\
+             \"max_groups\":100,\"group_idle_evict_nanos\":0,\"visibility_nanos\":1234,\
+             \"hard_cap_nanos\":5678,\"disk_full_policy\":\"drop-oldest\",\"ram_ceiling_bytes\":0,\
+             \"daily_physical_write_budget_bytes\":0},\
+             \"connections\":{\"open\":20,\"accepted\":30,\"closed\":10,\"refused\":4,\
+             \"authenticated\":25,\"rejected\":{\"rate_limited\":1,\"half_open_cap\":2,\
+             \"locked_out\":3,\"auth_failed\":4}},\
+             \"storage\":{\"segment_count\":2,\"durable_record_bytes\":512,\"disk_free_bytes\":99999,\
+             \"ram_ceiling_bytes\":1000,\"rss_bytes\":400,\"ram_headroom_bytes\":600,\
+             \"rss_over_cap_ratio_permille\":400},\
+             \"recovery\":{\"runs_by_outcome\":{\"clean\":2,\"torn_tail_truncated\":1,\
+             \"quarantined\":0,\"data_loss\":0},\"torn_tail_repairs\":3,\
+             \"corruption_repairs_by_artifact\":{\"segment\":1,\"cursor\":0,\"dlq\":2}}}",
+            "the v2 body schema is FROZEN; a deliberate change is a NEW version, not a v2 edit"
+        );
+
+        // And the v1 renderer over the SAME augmented snapshot is byte-for-byte the frozen v1 body: the
+        // v2-only fields never leak into a v1 response, proving v2 is purely additive.
+        assert_eq!(
+            admin_body(&snapshot),
+            admin_body(&frozen_admin_fixture()),
+            "the v2-only snapshot fields must not change the v1 body"
+        );
+    }
+
+    /// A fully-determined [`AdminSnapshot`] fixture for the frozen-schema snapshots: every field is a
+    /// fixed literal (no clock, disk, or platform read), the config matches the `start_with_admin`
+    /// harness, and the v2-only off-lock fields default to the at-rest/unavailable block (a v2 test
+    /// overrides them). Constructed directly so the snapshot bodies are reproducible on any platform.
+    fn frozen_admin_fixture() -> AdminSnapshot {
+        let counters = Counters {
+            produced: 10,
+            produced_bytes: 1024,
+            delivered: 8,
+            redelivered: 1,
+            dead_lettered: 2,
+            acks: 5,
+            ..Counters::default()
+        };
+        AdminSnapshot {
+            healthy: true,
+            flushed: 7,
+            committed: 3,
+            earliest_retained: 1,
+            durable_record_bytes: 512,
+            durable_record_count: 6,
+            segment_count: 2,
+            recovered_truncated_bytes: 0,
+            last_dead_lettered: 5,
+            dlq_records: 2,
+            counters,
+            groups: vec![GroupConsumerStat {
+                group: String::new(),
+                committed: 3,
+                in_flight: 1,
+            }],
+            config: EngineConfigSnapshot {
+                max_total_bytes: 1_000_000,
+                max_segment_bytes: 4096,
+                max_retained_bytes: 2048,
+                max_age_ms: 99,
+                max_messages: 33,
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 4096,
+                max_deliver: 7,
+                max_groups: 100,
+                group_idle_evict_nanos: 0,
+                visibility_nanos: 1234,
+                hard_cap_nanos: 5678,
+                disk_full_policy: DiskFullPolicy::DropOldest,
+                ram_ceiling_bytes: 0,
+                daily_physical_write_budget_bytes: 0,
+            },
+            // The v2-only off-lock fields at their at-rest/unavailable defaults; a v2 test overrides them.
+            ram_ceiling_bytes: 0,
+            connz: ConnectionMetricsSnapshot::default(),
+            disk_free: crate::rss::UNAVAILABLE,
+            rss: None,
+        }
     }
 }
