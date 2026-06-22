@@ -49,6 +49,7 @@ impl Subject {
 /// The parsed `report` invocation: which subject, which health-server address, and an optional
 /// `--filter <name>` that narrows the `groups`/`streams` views to one name (an explicit selection;
 /// it also SKIPS the interactive picker, keeping the verb scriptable).
+#[derive(Debug)]
 struct ReportArgs {
     subject: Subject,
     addr: Option<String>,
@@ -623,7 +624,7 @@ ironbus_stream_produced_total{stream=\"audit\"} 40
     #[test]
     fn group_and_stream_names_are_sorted_and_deduped() {
         let m = metrics();
-        assert_eq!(group_names(&m), vec!["".to_string(), "orders".to_string()]);
+        assert_eq!(group_names(&m), vec![String::new(), "orders".to_string()]);
         assert_eq!(
             stream_names(&m),
             vec!["audit".to_string(), "events".to_string()]

@@ -154,26 +154,23 @@ fn run_check(addr: &str, out: &mut impl Write) -> Result<(), CliError> {
         ProbeState::Up => Probe::Up,
         ProbeState::Down(reason) => Probe::Down(reason),
         ProbeState::Unreachable => return unreachable(out, addr),
-        ProbeState::Unknown(why) => return unknown(out, addr, why),
+        ProbeState::Unknown(why) => return unknown(out, addr, &why),
     };
     let ready = match probe_state(addr, "/readyz") {
         ProbeState::Up => Probe::Up,
         ProbeState::Down(reason) => Probe::Down(reason),
         ProbeState::Unreachable => return unreachable(out, addr),
-        ProbeState::Unknown(why) => return unknown(out, addr, why),
+        ProbeState::Unknown(why) => return unknown(out, addr, &why),
     };
-    match (&live, &ready) {
-        (Probe::Up, Probe::Up) => {
-            writeln!(out, "IRONBUS OK - live and ready")?;
-            Ok(())
-        }
-        _ => {
-            let reason = degraded_reason(&live, &ready);
-            writeln!(out, "IRONBUS CRITICAL - {reason}")?;
-            Err(CliError::HandledCorruption(format!(
-                "broker at {addr} is reachable but degraded: {reason}"
-            )))
-        }
+    if let (Probe::Up, Probe::Up) = (&live, &ready) {
+        writeln!(out, "IRONBUS OK - live and ready")?;
+        Ok(())
+    } else {
+        let reason = degraded_reason(&live, &ready);
+        writeln!(out, "IRONBUS CRITICAL - {reason}")?;
+        Err(CliError::HandledCorruption(format!(
+            "broker at {addr} is reachable but degraded: {reason}"
+        )))
     }
 }
 
@@ -226,7 +223,7 @@ fn unreachable(out: &mut impl Write, addr: &str) -> Result<(), CliError> {
 }
 
 /// Writes the UNKNOWN one-line status and returns the frozen exit-70 error.
-fn unknown(out: &mut impl Write, addr: &str, why: String) -> Result<(), CliError> {
+fn unknown(out: &mut impl Write, addr: &str, why: &str) -> Result<(), CliError> {
     writeln!(out, "IRONBUS UNKNOWN - {why}")?;
     Err(CliError::Internal(format!(
         "probing broker at {addr}: {why}"
