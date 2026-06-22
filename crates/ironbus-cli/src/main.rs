@@ -13601,6 +13601,191 @@ mod tests {
         }
     }
 
+    // --- `config validate` / `serve --check-only` (#637, V2-M7). ---
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn config_validate_accepts_a_valid_serve_config_and_exits_zero_without_serving() {
+        // A valid loopback serve config validates ok with NO side effect (no listener, no lock, no
+        // engine): the verb returns Ok and prints "ok". Loopback `--addr` needs no auth/TLS, so the
+        // fail-closed bind invariant passes.
+        let mut buf = Vec::new();
+        run(
+            &argv(&[
+                "config",
+                "validate",
+                "--addr",
+                "127.0.0.1:0",
+                "--data-dir",
+                "/tmp/ironbus-cli-validate-never-created",
+            ]),
+            &mut buf,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf).contains("ok: serve config is valid"),
+            "{}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    #[test]
+    fn serve_check_only_validates_and_exits_without_serving() {
+        // The serve-path twin: `serve --check-only` runs the same validator and returns Ok with the
+        // broker NOT started (no bind). Same valid config as above.
+        let mut buf = Vec::new();
+        run(
+            &argv(&[
+                "serve",
+                "--check-only",
+                "--addr",
+                "127.0.0.1:0",
+                "--data-dir",
+                "/tmp/ironbus-cli-checkonly-never-created",
+            ]),
+            &mut buf,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf).contains("broker not started"),
+            "{}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_the_same_config_serve_rejects_at_startup() {
+        // FAITHFULNESS: `config validate` must reject EXACTLY what `serve` rejects at startup. Drive
+        // both with the SAME invalid config (a zero --max-deliver without the opt-in) and assert both
+        // fail with the SAME frozen usage exit code and the SAME flag in the message.
+        let bad = argv(&[
+            "--addr",
+            "127.0.0.1:0",
+            "--data-dir",
+            "/tmp/ironbus-cli-validate-bad",
+            "--max-deliver",
+            "0",
+        ]);
+        let mut serve_args = vec!["serve".to_string()];
+        serve_args.extend(bad.iter().cloned());
+        let mut validate_args = vec!["config".to_string(), "validate".to_string()];
+        validate_args.extend(bad.iter().cloned());
+
+        let mut b1 = Vec::new();
+        let serve_err = run(&serve_args, &mut b1).unwrap_err();
+        let mut b2 = Vec::new();
+        let validate_err = run(&validate_args, &mut b2).unwrap_err();
+
+        assert_eq!(serve_err.exit_code(), EXIT_USAGE);
+        assert_eq!(validate_err.exit_code(), EXIT_USAGE);
+        // Same message shape (both name --max-deliver), proving the same validator ran.
+        match (serve_err, validate_err) {
+            (CliError::Usage(s), CliError::Usage(v)) => {
+                assert!(s.contains("--max-deliver"), "serve: {s}");
+                assert_eq!(s, v, "config validate and serve must reject identically");
+            }
+            other => panic!("expected both Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_a_missing_data_dir_for_disk_storage() {
+        // The data-dir rule is part of the validator, so `config validate` catches it (exit 1).
+        let mut buf = Vec::new();
+        let e = run(&argv(&["config", "validate", "--addr", "127.0.0.1:0"]), &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--data-dir"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_needs_a_known_sub_verb() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            run(&argv(&["config"]), &mut buf).unwrap_err().exit_code(),
+            EXIT_USAGE
+        );
+        let e = run(&argv(&["config", "frobnicate"]), &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("validate"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    // `#[cfg(unix)]`: the StrictModes secret-file permission check runs only on Unix (POSIX mode
+    // bits), so a world-readable-secret rejection is a Unix-only property; the test stages a 0o644
+    // file via `PermissionsExt`. Gated so the Windows build compiles (the recurring cfg precedent).
+    #[cfg(unix)]
+    #[test]
+    fn config_validate_rejects_a_world_readable_secret_file_fail_closed_via_the_full_validator() {
+        // A configured secret reference (the `--auth-config` identity table) that is group/world-
+        // readable is refused fail-closed by the SAME validator `serve` runs, so `config validate`
+        // catches it BEFORE a real startup would — and never reads the file contents.
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A well-formed identity table (so it would parse) — but the PERMISSIONS fail first.
+        writeln!(
+            f,
+            "[[identity]]\nname = \"x\"\nscopes = [\"publish\"]\nmtls_san = [\"spiffe://x/y\"]"
+        )
+        .unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut buf = Vec::new();
+        let e = run(
+            &argv(&[
+                "config",
+                "validate",
+                "--addr",
+                "127.0.0.1:0",
+                "--data-dir",
+                "/tmp/ironbus-cli-validate-secret",
+                "--auth-config",
+                path.to_str().unwrap(),
+            ]),
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(m.contains("group- or world-accessible"), "{m}");
+                assert!(m.contains("contents were not read"), "never reads: {m}");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+
+        // Tightening it to 0o600 makes the SAME config validate ok (the secret ref now resolves and
+        // the table parses). Owned by the test user, so the owner check passes too.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut buf2 = Vec::new();
+        run(
+            &argv(&[
+                "config",
+                "validate",
+                "--addr",
+                "127.0.0.1:0",
+                "--data-dir",
+                "/tmp/ironbus-cli-validate-secret",
+                "--auth-config",
+                path.to_str().unwrap(),
+            ]),
+            &mut buf2,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&buf2).contains("ok: serve config is valid"));
+    }
+
     #[test]
     fn serve_rejects_a_non_numeric_max_deliver() {
         let mut buf = Vec::new();
