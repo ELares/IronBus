@@ -758,3 +758,24 @@ silent loss and never a flipped commit/rollback outcome). They are pinned in the
 doc comments (the module-level crash-safety argument and the `txn_commit` /
 `commit_real_append` doc) and exercised by the engine txn tests (the clamp branch by
 `crash_between_a2_and_a3_clamps_the_phantom_high_water_and_redrives_fresh`).
+
+### 9.3 Transaction-id choice across reconnects (auto-minted vs caller-supplied)
+
+The `txn_id` is the broker's IDEMPOTENCY KEY (it anchors the lifecycle, the dedup
+high-water, and the commit/rollback resolution). The client offers two ways to
+choose it (`crates/ironbus-client/src/lib.rs`):
+
+- **Auto-minted** (`Client::prepare`): `<local_addr>#<seq>` — the connection's local
+  socket address plus a monotonic per-connection counter. Unique WITHIN a connection
+  and across concurrently-open connections (distinct local addresses), but NOT durable
+  across a reconnect: an EPHEMERAL local port REUSED by a later connection whose
+  counter has reset to 0 can re-mint an id a still-prepared txn already holds. Because
+  the id is the idempotency key, this surfaces as a broker ERROR (a spent /
+  still-prepared id is refused) — NEVER a silent merge of two distinct half messages.
+- **Caller-supplied** (`Client::prepare_with_id`): a stable id you control (a UUID, a
+  snowflake, a content hash). This is the DURABLE choice for a transaction that must
+  survive a reconnect, or that derives its identity from the producer's own local
+  transaction — it makes the cross-connection idempotency explicit instead of relying
+  on the per-connection mint.
+
+For transactions that span a reconnect, prefer `prepare_with_id` with a stable id.
