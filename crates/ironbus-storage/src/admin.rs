@@ -849,7 +849,7 @@ pub const BACKUP_MANIFEST_FILE: &str = "MANIFEST";
 /// never share a namespace (a manifest can never be mistaken for a captured file, or vice versa).
 pub const BACKUP_DATA_SUBDIR: &str = "data";
 
-/// The magic prefix of the manifest payload (IronBus BacKuP), distinguishing a real IronBus backup
+/// The magic prefix of the manifest payload (IronBus `BacKuP`), distinguishing a real IronBus backup
 /// manifest from an unrelated file a foreign tool might leave: a restore refuses a `MANIFEST` whose
 /// payload does not start with this, fail-closed, rather than materializing an arbitrary tree.
 const BACKUP_MAGIC: &str = "IBBKP";
@@ -1067,7 +1067,7 @@ fn capture_consistency_fields<F: Filesystem + Clone>(
 
 /// Serializes the manifest payload: a magic + version header, the captured durable offsets / cursor /
 /// DLQ counts (the consistency self-check), then one line per captured file (`crc32c len rel_path`).
-/// A line-oriented, std-only grammar (no serde, no new dep) whose every field is ASCII; the rel_path
+/// A line-oriented, std-only grammar (no serde, no new dep) whose every field is ASCII; the `rel_path`
 /// is the last field so a `/` in it (a nested file) is unambiguous (the first two fields never contain
 /// a space). The reader splits the first two fields off and takes the rest verbatim as the path.
 fn encode_manifest(
