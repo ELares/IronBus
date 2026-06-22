@@ -5260,6 +5260,19 @@ fn build_preauth_config(
 /// # Errors
 /// [`CliError::Usage`] for an unrecognized sink (not `stderr` and not `@<path>`), or
 /// [`CliError::Internal`] if the audit file cannot be opened/created.
+// The audit sink is a Unix owner-only (0o600) file / stderr stream and the serve path itself is
+// Unix-only (StdFs is `cfg(unix)`), so on non-Unix the broker never actually serves and the emitter is
+// always the disabled (Null) one. This stub keeps the cross-platform serve-dispatch call site identical
+// (the recurring #288/#99 Windows arity/scope footgun: a `cfg(unix)`-only fn called from shared code).
+#[cfg(not(unix))]
+fn build_audit_emitter(
+    _config: &ServeConfig,
+) -> Result<ironbus_server::audit::AuditEmitter, CliError> {
+    let clock =
+        std::sync::Arc::new(SystemClock::new()) as std::sync::Arc<dyn ironbus_core::clock::Clock>;
+    Ok(ironbus_server::audit::AuditEmitter::disabled(clock))
+}
+
 #[cfg(unix)]
 fn build_audit_emitter(
     config: &ServeConfig,
