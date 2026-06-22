@@ -258,6 +258,16 @@ pub struct AuditEmitter {
     clock: Arc<dyn Clock>,
 }
 
+impl std::fmt::Debug for AuditEmitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No secret here, but a clock trait object is not `Debug`; render the shape only.
+        f.debug_struct("AuditEmitter")
+            .field("seq", &self.seq.load(Ordering::Relaxed))
+            .field("sink", &self.sink)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AuditEmitter {
     /// Builds an emitter over a sink and a clock. The sequence starts at 0 and the first emitted event
     /// is sequence 0 (the per-process count of events emitted before it).

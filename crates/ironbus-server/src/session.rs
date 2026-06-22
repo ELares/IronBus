@@ -417,6 +417,17 @@ pub struct Session {
         std::sync::Arc<crate::preauth::PreAuthGuard>,
         std::net::IpAddr,
     )>,
+    /// The structured security audit-event emitter (#635, V2-M7). The connect-time auth OUTCOME
+    /// (success/failure) and every per-verb SCOPE DENIAL are emitted through it, carrying the identity
+    /// NAME (never a credential). `None` is the default for a session that does not audit (every test
+    /// that does not assert on the stream, and a serve built with no audit sink); when present it is a
+    /// cheap `Arc`-clone of the broker's single emitter, shared across connections so the sequence is
+    /// one monotonic space. A `None` emitter, or an emitter over the `Null` sink, is the zero-cost path.
+    audit: Option<crate::audit::AuditEmitter>,
+    /// The resolved identity NAME pinned at a successful `Connect` (#635), used as the audit subject for
+    /// a later scope denial. Empty until authenticated; never a credential. Only meaningful on an
+    /// auth-required broker (a no-auth broker never authenticates and never denies a scope).
+    identity_name: String,
 }
 
 impl Session {
@@ -481,6 +492,19 @@ impl Session {
         peer_ip: std::net::IpAddr,
     ) -> Session {
         self.preauth = Some((guard, peer_ip));
+        self
+    }
+
+    /// Attaches the shared security audit-event emitter (#635, V2-M7) so the `Connect` handshake emits
+    /// the auth OUTCOME (success/failure) and every scope-gated verb emits a SCOPE DENIAL through it,
+    /// carrying the identity NAME (never a credential). A builder-style setter (like
+    /// [`with_connz`](Session::with_connz) / [`with_preauth`](Session::with_preauth)) so every existing
+    /// call site is unchanged and only the server's live accept path opts in. Takes a cheap `Clone` of
+    /// the broker's single emitter (a shared sequence + sink). When never called the handshake/gate run
+    /// the byte-for-byte historical path (no audit emission).
+    #[must_use]
+    pub fn with_audit(mut self, audit: crate::audit::AuditEmitter) -> Session {
+        self.audit = Some(audit);
         self
     }
 
@@ -699,24 +723,24 @@ impl Session {
             // without `subscribe` is refused with the uniform Authorization Violation, BEFORE the verb
             // runs, with no implication from any other scope it might hold (admin does NOT grant it).
             Some(FrameType::Ack) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "Ack", out)?;
                 self.handle_ack(engine, body, out).map(|()| true)
             }
             // A cumulative ack commits the broadcast cursor (when accepted), so it returns `true` to
             // run the interval checkpoint, exactly like a per-message Ack (#288).
             Some(FrameType::CumulativeAck) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "CumulativeAck", out)?;
                 self.handle_cumulative_ack(engine, body, out).map(|()| true)
             }
             Some(FrameType::Flow) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "Flow", out)?;
                 self.handle_flow(engine, body, out).map(|()| true)
             }
             // The batch-pull FETCH (#489): the amortized twin of Flow. It runs the SAME per-record poll
             // loop bounded by max_records/max_bytes/expires/no_wait, so it returns `true` to run the
             // interval checkpoint exactly like Flow (it commits cursor progress the same way).
             Some(FrameType::Fetch) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "Fetch", out)?;
                 self.handle_fetch(engine, body, out).map(|()| true)
             }
             // The Tier-S STREAMING fetch (#544): a consumer-managed-offset contiguous read. It grants
@@ -724,18 +748,18 @@ impl Session {
             // interval checkpoint to flush — it returns `false`. Durability is the separate periodic
             // StreamCommit below.
             Some(FrameType::StreamFetch) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "StreamFetch", out)?;
                 self.handle_stream_fetch(engine, body, out).map(|()| false)
             }
             // The Tier-S periodic CUMULATIVE COMMIT (#544): advances the streaming group's committed
             // cursor (when accepted), so it returns `true` to run the interval checkpoint, exactly like
             // the broadcast CumulativeAck.
             Some(FrameType::StreamCommit) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "StreamCommit", out)?;
                 self.handle_stream_commit(engine, body, out).map(|()| true)
             }
             Some(FrameType::Sub) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "Sub", out)?;
                 self.handle_sub(engine, body, out).map(|()| false)
             }
             // The stream-addressed verbs (#588, M2-I10): each is GATED on the negotiated
@@ -750,22 +774,22 @@ impl Session {
             // and durable head — stored operational state — so it requires `subscribe` (a consumer
             // read), not anonymous. None is reachable from `publish` alone.
             Some(FrameType::StreamDeclare) => {
-                self.require_scope(crate::auth::Scope::Admin, out)?;
+                self.require_scope(crate::auth::Scope::Admin, "StreamDeclare", out)?;
                 self.handle_stream_declare(engine, body, out)
                     .map(|()| false)
             }
             Some(FrameType::StreamInfo) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "StreamInfo", out)?;
                 self.handle_stream_info(engine, body, out).map(|()| false)
             }
             // Stream-addressed produce/consume require the same scopes as their default-stream twins:
             // PubTo needs `publish`, SubTo needs `subscribe`.
             Some(FrameType::PubTo) => {
-                self.require_scope(crate::auth::Scope::Publish, out)?;
+                self.require_scope(crate::auth::Scope::Publish, "PubTo", out)?;
                 self.handle_pub_to(engine, body, out).map(|()| false)
             }
             Some(FrameType::SubTo) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "SubTo", out)?;
                 self.handle_sub_to(engine, body, out).map(|()| false)
             }
             // The subject-addressed verbs (#585, M2-I9): also GATED on the negotiated `streams_enabled`
@@ -775,19 +799,19 @@ impl Session {
             // (`false`, like Pub/PubTo). BindSubject mutates the routing trie -> `admin`; PubSubject
             // produces -> `publish`; SubSubject consumes -> `subscribe`.
             Some(FrameType::BindSubject) => {
-                self.require_scope(crate::auth::Scope::Admin, out)?;
+                self.require_scope(crate::auth::Scope::Admin, "BindSubject", out)?;
                 self.handle_bind_subject(engine, body, out).map(|()| false)
             }
             Some(FrameType::PubSubject) => {
-                self.require_scope(crate::auth::Scope::Publish, out)?;
+                self.require_scope(crate::auth::Scope::Publish, "PubSubject", out)?;
                 self.handle_pub_subject(engine, body, out).map(|()| false)
             }
             Some(FrameType::SubSubject) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "SubSubject", out)?;
                 self.handle_sub_subject(engine, body, out).map(|()| false)
             }
             Some(FrameType::Unsub) => {
-                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.require_scope(crate::auth::Scope::Subscribe, "Unsub", out)?;
                 self.handle_unsub(engine, out).map(|()| true)
             }
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
@@ -851,6 +875,12 @@ impl Session {
             // fallback), a malformed/unknown-mechanism auth section, or a bad/unmatched credential —
             // collapses to the SAME outcome, so there is no oracle, and the close happens after the
             // one uniform Err. A well-formed, verified credential pins the identity's scopes.
+            // The selected mechanism for the audit event (#635): the SAFE handle (`bearer` / `password`
+            // / `mtls` / `unknown`), never the credential. `unknown` covers a missing/malformed section.
+            let mechanism = match parse_connect_auth(body) {
+                Ok(Some(cred)) => audit_mechanism(cred.mechanism),
+                Ok(None) | Err(_) => crate::audit::Mechanism::Unknown,
+            };
             let resolved = match parse_connect_auth(body) {
                 Ok(Some(cred)) => auth.authenticate(&cred, self.peer_san.as_deref()).ok(),
                 // No credential, a malformed section, or an unknown mechanism: all "no resolution",
@@ -865,16 +895,32 @@ impl Session {
                 if let Some((guard, ip)) = self.preauth.as_ref() {
                     guard.on_auth_failure(*ip);
                 }
+                // Emit the FAILED authn outcome to the audit stream (#635): the mechanism and the
+                // `<unknown>` subject (a failed lookup never echoes attacker-supplied bytes), never the
+                // presented credential. The wire still sees only the uniform Authorization Violation.
+                self.emit_audit(crate::audit::AuditEvent::AuthOutcome {
+                    identity: crate::audit::UNKNOWN_IDENTITY.to_string(),
+                    mechanism,
+                    outcome: crate::audit::Outcome::Failure,
+                });
                 reply_auth_violation(out);
                 return Err(SessionError::AuthViolation);
             };
-            // Pin the identity's scopes for the connection lifetime. The audit event (#635, the
-            // trusted-side `outcome`) is the FLAGGED follow-up; no credential is logged here and the
-            // wire saw no oracle.
-            if let crate::auth::AuthOutcome::Authenticated { scopes, .. } = outcome {
-                self.scopes = scopes;
+            // Pin the identity's scopes (and the identity NAME, for a later scope-denial audit subject)
+            // for the connection lifetime. The NAME is a safe handle; no credential is retained.
+            if let crate::auth::AuthOutcome::Authenticated { identity, scopes } = &outcome {
+                self.scopes = *scopes;
+                self.identity_name = identity.clone();
             }
             self.authenticated = true;
+            // Emit the SUCCESSFUL authn outcome to the audit stream (#635): the resolved identity NAME,
+            // the mechanism, success — never the credential. Emitted AFTER the scopes are pinned, so a
+            // success event always reflects a fully-authenticated connection.
+            self.emit_audit(crate::audit::AuditEvent::AuthOutcome {
+                identity: self.identity_name.clone(),
+                mechanism,
+                outcome: crate::audit::Outcome::Success,
+            });
             // Report the SUCCESSFUL auth to the pre-auth `DoS` guard (#633): it clears this IP's
             // failed-auth window so an occasional fat-fingered password before a correct one never
             // accumulates toward a lockout. A no-op when no `DoS` defense is wired.
@@ -1000,13 +1046,33 @@ impl Session {
     fn require_scope(
         &self,
         scope: crate::auth::Scope,
+        verb: &'static str,
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
         if self.scope_denied(scope) {
+            // Emit the SCOPE DENIAL audit event (#635): the pinned identity NAME, the required scope,
+            // and the verb. The wire still sees only the uniform Authorization Violation (no oracle);
+            // the audit event, on the trusted side, distinguishes the denial for the operator.
+            self.emit_audit(crate::audit::AuditEvent::AuthzDenial {
+                identity: self.identity_name.clone(),
+                scope: scope.as_str(),
+                verb,
+            });
             reply_auth_violation(out);
             return Err(SessionError::AuthViolation);
         }
         Ok(())
+    }
+
+    /// Emits one security audit event (#635) through the attached emitter, or does nothing when no
+    /// emitter is attached (the default; the byte-for-byte historical path). The emitter itself is also
+    /// zero-cost over the `Null` sink, so this is cheap on both the no-emitter and no-sink paths. The
+    /// event carries only safe handles (the identity NAME, the mechanism/scope/verb tags), never a
+    /// credential — the type forecloses a leak.
+    fn emit_audit(&self, event: crate::audit::AuditEvent) {
+        if let Some(audit) = self.audit.as_ref() {
+            audit.emit(&event);
+        }
     }
 
     /// The pure (no side-effect) half of the scope gate: whether the named scope is DENIED for this
@@ -1051,6 +1117,14 @@ impl Session {
         // Violation, after draining any parked acks so the wire order is preserved, then the connection
         // closes. On a no-auth broker the gate is inert (loopback-dev, byte-for-byte unchanged).
         if self.scope_denied(crate::auth::Scope::Publish) {
+            // Emit the SCOPE DENIAL audit event (#635) for the direct `Pub` path (the pipelined loop
+            // calls `handle_pub` directly, bypassing `dispatch`/`require_scope`, so the audit emission
+            // lives here too). Identity NAME + scope + verb, never a credential.
+            self.emit_audit(crate::audit::AuditEvent::AuthzDenial {
+                identity: self.identity_name.clone(),
+                scope: crate::auth::Scope::Publish.as_str(),
+                verb: "Pub",
+            });
             // Drain the earlier produces' acks FIRST (so they reach the wire ahead of the close), then
             // write the uniform violation, then close — the same pre-submit error ordering as above.
             drain_parked(engine, member_id, parked, out)?;
@@ -3520,6 +3594,19 @@ fn reply_auth_violation(out: &mut Vec<u8>) {
         FrameType::Err,
         crate::auth::AuthError::MESSAGE.as_bytes(),
     );
+}
+
+/// Maps a wire [`AuthMechanism`](ironbus_proto::message::AuthMechanism) to the SAFE audit mechanism
+/// handle (#635): `bearer` / `password` / `mtls`, or `unknown` for any future/unrecognized selector
+/// (the wire enum is `#[non_exhaustive]`). Never a credential — only the mechanism name.
+fn audit_mechanism(m: ironbus_proto::message::AuthMechanism) -> crate::audit::Mechanism {
+    use ironbus_proto::message::AuthMechanism as W;
+    match m {
+        W::Bearer => crate::audit::Mechanism::Bearer,
+        W::Password => crate::audit::Mechanism::Password,
+        W::Mtls => crate::audit::Mechanism::Mtls,
+        _ => crate::audit::Mechanism::Unknown,
+    }
 }
 
 /// Emits a publish-ack reply (`PubAck` for a fresh produce, `PubAckDuplicate` for a #33 dedup hit)
@@ -10400,5 +10487,164 @@ mod tests {
             .unwrap();
         // The Flow returns the delivered record then a FlowEnd terminator — no auth gate in the way.
         assert_eq!(decode_all(&out)[0].0, FrameType::Deliver);
+    }
+
+    // --- The security AUDIT-EVENT stream (#635, V2-M7) wired through the session. ---
+
+    /// A capturing audit emitter over a shared `Vec<u8>` so a test reads back exactly what was emitted,
+    /// plus a `ManualClock` so the wall-clock stamp is deterministic.
+    fn capturing_audit() -> (crate::audit::AuditEmitter, Arc<std::sync::Mutex<Vec<u8>>>) {
+        use ironbus_core::clock::ManualClock;
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let buf_clone = Arc::clone(&buf);
+        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let clock = Arc::new(ManualClock::at_unix_millis(1_700_000_000_123))
+            as Arc<dyn ironbus_core::clock::Clock>;
+        let emitter = crate::audit::AuditEmitter::new(
+            crate::audit::AuditSink::writer(Box::new(SharedBuf(buf_clone))),
+            clock,
+        );
+        (emitter, buf)
+    }
+
+    fn audit_text(buf: &Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_successful_connect_emits_an_authn_success_event_with_the_name_not_the_credential() {
+        let e = DirectEngine::new(engine());
+        let token = b"audit-success-token-32-bytes!!!!";
+        let auth = bearer_auth(token, &[Scope::Publish]);
+        let (audit, buf) = capturing_audit();
+        let mut s =
+            Session::with_member_id_and_auth(MemberId::new(0), auth, None).with_audit(audit);
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+
+        let text = audit_text(&buf);
+        assert!(text.contains("event=authn_outcome"), "{text}");
+        assert!(text.contains("identity=\"id\""), "the resolved name: {text}");
+        assert!(text.contains("mechanism=bearer"), "{text}");
+        assert!(text.contains("outcome=success"), "{text}");
+        // The load-bearing no-leak property: the presented token never appears in the audit stream.
+        assert!(
+            !text.contains("audit-success-token"),
+            "the credential must never reach the audit stream: {text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_connect_emits_an_authn_failure_event_with_unknown_and_no_credential() {
+        let e = DirectEngine::new(engine());
+        let auth = bearer_auth(b"the-right-token-padding-32bytes!", &[Scope::Publish]);
+        let (audit, buf) = capturing_audit();
+        let mut s =
+            Session::with_member_id_and_auth(MemberId::new(0), auth, None).with_audit(audit);
+        let mut out = Vec::new();
+        // Present the WRONG token: the connect fails (uniform violation) and closes.
+        let wrong = b"a-totally-wrong-token-32-bytes!!";
+        let err = s
+            .process(&e, &connect_with_bearer(wrong), &mut out)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::AuthViolation));
+
+        let text = audit_text(&buf);
+        assert!(text.contains("event=authn_outcome"), "{text}");
+        assert!(text.contains("outcome=failure"), "{text}");
+        assert!(text.contains("mechanism=bearer"), "{text}");
+        // A failed lookup records `<unknown>`, never the attacker-supplied or stored credential.
+        assert!(text.contains("identity=\"<unknown>\""), "{text}");
+        assert!(
+            !text.contains("wrong-token") && !text.contains("the-right-token"),
+            "no credential (presented or stored) in the audit stream: {text}"
+        );
+    }
+
+    #[test]
+    fn a_scope_denial_emits_an_authz_denial_event_with_the_scope_and_verb() {
+        let e = DirectEngine::new(engine());
+        // A subscribe-only identity attempts a Pub (publish scope): denied + audited.
+        let token = b"sub-only-audit-token-32-bytes!!!";
+        let auth = bearer_auth(token, &[Scope::Subscribe]);
+        let (audit, buf) = capturing_audit();
+        let mut s =
+            Session::with_member_id_and_auth(MemberId::new(0), auth, None).with_audit(audit);
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        out.clear();
+        // Clear the buffer's success event so the assertion targets the denial only.
+        buf.lock().unwrap().clear();
+
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"x",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        let err = s
+            .process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::AuthViolation));
+
+        let text = audit_text(&buf);
+        assert!(text.contains("event=authz_denial"), "{text}");
+        assert!(text.contains("identity=\"id\""), "the pinned name: {text}");
+        assert!(text.contains("scope=publish"), "{text}");
+        assert!(text.contains("verb=Pub"), "{text}");
+    }
+
+    #[test]
+    fn a_consume_scope_denial_via_dispatch_is_audited_with_the_verb_name() {
+        let e = DirectEngine::new(engine());
+        // A publish-only identity attempts a Flow (subscribe scope), denied through `require_scope`.
+        let token = b"pub-only-audit-token-32-bytes!!!";
+        let auth = bearer_auth(token, &[Scope::Publish]);
+        let (audit, buf) = capturing_audit();
+        let mut s =
+            Session::with_member_id_and_auth(MemberId::new(0), auth, None).with_audit(audit);
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        buf.lock().unwrap().clear();
+
+        let _ = s
+            .process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap_err();
+        let text = audit_text(&buf);
+        assert!(text.contains("event=authz_denial"), "{text}");
+        assert!(text.contains("scope=subscribe"), "{text}");
+        assert!(text.contains("verb=Flow"), "{text}");
+    }
+
+    #[test]
+    fn no_audit_emitter_is_byte_for_byte_the_historical_path() {
+        // A session built WITHOUT `.with_audit(..)` runs the exact historical auth path: a valid
+        // connect still succeeds, a denial still closes, and nothing is emitted (there is no sink).
+        let e = DirectEngine::new(engine());
+        let token = b"no-audit-emitter-token-32bytes!!";
+        let auth = bearer_auth(token, &[Scope::Publish]);
+        let mut s = Session::with_member_id_and_auth(MemberId::new(0), auth, None); // no .with_audit
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+        assert!(s.authenticated && s.audit.is_none());
     }
 }
