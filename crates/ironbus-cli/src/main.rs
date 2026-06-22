@@ -1974,6 +1974,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             &parsed.leaf,
             parsed.leaf_hub_serve.as_deref(),
             &parsed.transport,
+            None,
         )?;
         writeln!(
             out,
@@ -2040,6 +2041,7 @@ fn run_config(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 &parsed.leaf,
                 parsed.leaf_hub_serve.as_deref(),
                 &parsed.transport,
+                None,
             )?;
             writeln!(out, "ok: serve config is valid")?;
             Ok(())
@@ -4064,12 +4066,21 @@ fn finish_serve(
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    // Build the security AUDIT emitter ONCE (#635), from `--audit-log` (a sink reference, never an
+    // inline secret), and thread it through BOTH the validator and `cmd_serve`, so: (a) a fail-closed
+    // secret-file refusal at the VALIDATOR stage (which runs the StrictModes checks first) is audited
+    // before the broker exits, and (b) the startup config-change event and every connection's
+    // auth-outcome / scope-denial use the SAME single-sequence emitter. With no `--audit-log` it is the
+    // `Null` (zero-cost) emitter. Built only on the real serve path; `config validate` / `--check-only`
+    // build no emitter and pass `None` (a pure check, no emission).
+    let audit = build_audit_emitter(config)?;
     // Run the FULL pre-side-effect validation (the storage/cluster/geo/leaf interplay, the data-dir
     // resolution, the tuning-range checks, and — on Unix — the fail-closed bind invariant + secret-
     // file StrictModes checks). This is the EXACT validator `serve --check-only` and `config validate`
     // run, so a config those verbs accept is a config `serve` will not reject at startup (and vice
     // versa). It has NO side effect (no dir created, no lock, no listener), so it is safe to run here
-    // before `cmd_serve` and identically in the check-only/validate paths.
+    // before `cmd_serve` and identically in the check-only/validate paths. The emitter is passed so a
+    // secret-file refusal is audited at this stage.
     let data_dir = validate_serve_invocation(
         addr,
         data_dir,
@@ -4080,6 +4091,7 @@ fn finish_serve(
         leaf,
         leaf_hub_serve,
         transport,
+        Some(&audit),
     )?;
     cmd_serve(
         addr,
@@ -4096,6 +4108,7 @@ fn finish_serve(
         cluster_peer_clients,
         leaf_hub_serve,
         transport,
+        audit,
         reload,
         out,
     )
@@ -4130,6 +4143,11 @@ fn validate_serve_invocation(
     leaf: &LeafConfig,
     leaf_hub_serve: Option<&str>,
     transport: &TransportSecurityFlags,
+    // The audit emitter (#635) for the SERVE path, so a fail-closed secret-file refusal at this
+    // (validator) stage is AUDITED before the broker exits. `None` for `config validate` /
+    // `serve --check-only` (a pure check, no emission). The validator runs the StrictModes secret
+    // checks FIRST (before `cmd_serve`), so the refusal must be emitted here to be observable.
+    audit: Option<&ironbus_server::audit::AuditEmitter>,
 ) -> Result<Option<String>, CliError> {
     // The metadata-cluster plane (#684) is a DURABLE, on-disk feature: it roots its `metaraft/`
     // log under the data dir and recovers it on restart. `--storage memory` has no data dir and no
@@ -4216,14 +4234,22 @@ fn validate_serve_invocation(
             let _ = health_bind_decision(haddr, config.health_allow_public)?;
         }
         let _ = wire_bind_decision(addr, transport)?;
-        let _ = load_auth_config(transport)?;
+        // Run the secret checks WITH the serve path's audit emitter (so a fail-closed refusal is
+        // audited here, the validator stage), or `None` for `config validate` / `--check-only` (a
+        // pure check, no emission).
+        let _ = load_auth_config(transport, audit)?;
     }
     #[cfg(not(unix))]
     {
         // `serve` is Unix-only off Unix; consume the bind/secret inputs so the non-Unix `-D warnings`
         // build does not trip unused-variable, and so `config validate` still type-checks the same
         // surface (the recurring #288/#99 footgun).
-        let _ = (addr, health_addr, transport.tls_cert.is_some());
+        let _ = (
+            addr,
+            health_addr,
+            transport.tls_cert.is_some(),
+            audit.is_some(),
+        );
     }
     Ok(data_dir)
 }
@@ -5093,33 +5119,88 @@ fn wire_bind_decision(
 /// contents. A missing or unreadable file is also fatal (fail closed, never a silent no-secret).
 #[cfg(unix)]
 fn strict_mode_check_secret_file(path: &str) -> Result<(), CliError> {
+    strict_mode_check_secret_file_inner(path).map_err(|(_condition, err)| err)
+}
+
+/// The condition strings for a [`AuditEvent::SecretPermissionRefusal`](ironbus_server::audit::AuditEvent::SecretPermissionRefusal)
+/// (#635), matching `docs/SECRETS.md`'s frozen condition set. Returned alongside the typed error so the
+/// SERVE path can emit the refusal audit event with the structured condition (the audited check), while
+/// the non-serve callers (the config validator, `passwd`) keep the plain string error.
+#[cfg(unix)]
+const SECRET_REFUSAL_UNREADABLE: &str = "unreadable";
+#[cfg(unix)]
+const SECRET_REFUSAL_GROUP_WORLD: &str = "group_world_readable";
+#[cfg(unix)]
+const SECRET_REFUSAL_WRONG_OWNER: &str = "wrong_owner";
+
+/// The shared body of the `StrictModes` check (#635): returns `Ok(())` when the file is owner-only and
+/// owned by the broker's uid, or `Err((condition, CliError))` naming both the audit condition tag and
+/// the human error. The contents are NEVER read — only `stat`'d.
+#[cfg(unix)]
+fn strict_mode_check_secret_file_inner(path: &str) -> Result<(), (&'static str, CliError)> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).map_err(|e| {
-        CliError::Usage(format!(
-            "refusing to start: secret-bearing file `{path}` could not be read ({e}); a configured \
-             secret reference must resolve to a readable, owner-only file"
-        ))
+        (
+            SECRET_REFUSAL_UNREADABLE,
+            CliError::Usage(format!(
+                "refusing to start: secret-bearing file `{path}` could not be read ({e}); a configured \
+                 secret reference must resolve to a readable, owner-only file"
+            )),
+        )
     })?;
     // `mode & 0o077`: any group/other read/write/execute bit is fatal.
     let mode = meta.mode();
     if mode & 0o077 != 0 {
-        return Err(CliError::Usage(format!(
-            "refusing to start: secret-bearing file `{path}` is group- or world-accessible (mode \
-             {:o}); a secret must be owner-only (chmod 0600). The file contents were not read.",
-            mode & 0o7777
-        )));
+        return Err((
+            SECRET_REFUSAL_GROUP_WORLD,
+            CliError::Usage(format!(
+                "refusing to start: secret-bearing file `{path}` is group- or world-accessible (mode \
+                 {:o}); a secret must be owner-only (chmod 0600). The file contents were not read.",
+                mode & 0o7777
+            )),
+        ));
     }
     // Wrong-owner: a 0600 file owned by ANOTHER user is still readable by that user.
     let uid = meta.uid();
     let our_uid = unsafe_getuid();
     if uid != our_uid && our_uid != 0 {
-        return Err(CliError::Usage(format!(
-            "refusing to start: secret-bearing file `{path}` is owned by uid {uid}, not the broker's \
-             uid {our_uid}; a secret file must be owned by the user the broker runs as. The file \
-             contents were not read."
-        )));
+        return Err((
+            SECRET_REFUSAL_WRONG_OWNER,
+            CliError::Usage(format!(
+                "refusing to start: secret-bearing file `{path}` is owned by uid {uid}, not the \
+                 broker's uid {our_uid}; a secret file must be owned by the user the broker runs as. \
+                 The file contents were not read."
+            )),
+        ));
     }
     Ok(())
+}
+
+/// The SERVE-path `StrictModes` check (#635): runs [`strict_mode_check_secret_file_inner`] and, on a
+/// failure, EMITS the [`SecretPermissionRefusal`](ironbus_server::audit::AuditEvent::SecretPermissionRefusal)
+/// audit event (the file PATH + the failing condition, never the contents) through `audit` before
+/// returning the fail-closed error — so a fail-closed boot is observable on the audit stream, exactly
+/// the #635 invariant. `audit` is `None` on the non-serve callers (the config validator), which keep the
+/// plain check with no emission and no side effect.
+#[cfg(unix)]
+fn strict_mode_check_secret_file_audited(
+    path: &str,
+    audit: Option<&ironbus_server::audit::AuditEmitter>,
+) -> Result<(), CliError> {
+    match strict_mode_check_secret_file_inner(path) {
+        Ok(()) => Ok(()),
+        Err((condition, err)) => {
+            if let Some(audit) = audit {
+                audit.emit(
+                    &ironbus_server::audit::AuditEvent::SecretPermissionRefusal {
+                        path: path.to_string(),
+                        condition,
+                    },
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 /// The broker process's real user id, for the `StrictModes` wrong-owner check (#635). `libc::getuid`
@@ -5247,11 +5328,15 @@ fn build_audit_emitter(
 #[cfg(unix)]
 fn load_auth_config(
     transport: &TransportSecurityFlags,
+    audit: Option<&ironbus_server::audit::AuditEmitter>,
 ) -> Result<Option<std::sync::Arc<ironbus_server::auth::AuthConfig>>, CliError> {
     use ironbus_server::auth::{AuthConfig, Identity, Scope, ScopeSet};
-    // StrictModes-check the TLS private key first if present (the most sensitive on-box material).
+    // StrictModes-check the TLS private key first if present (the most sensitive on-box material). On
+    // the SERVE path `audit` is `Some(_)`, so a permission/owner/missing failure EMITS the
+    // `secret_permission_refusal` audit event (#635) before the fail-closed error; the config-validator
+    // passes `None` (no emission, pure check).
     if let Some(key) = &transport.tls_key {
-        strict_mode_check_secret_file(key)?;
+        strict_mode_check_secret_file_audited(key, audit)?;
     }
     let Some(path) = &transport.auth_config else {
         // No identity-table file. An mTLS client-CA alone is a configured auth identity, but it maps
@@ -5261,7 +5346,7 @@ fn load_auth_config(
         return Ok(None);
     };
     // The identity-table file carries credential HASHES, so it is StrictModes-checked fail-closed.
-    strict_mode_check_secret_file(path)?;
+    strict_mode_check_secret_file_audited(path, audit)?;
     let raw = std::fs::read_to_string(path)
         .map_err(|e| CliError::Usage(format!("cannot read --auth-config `{path}`: {e}")))?;
     let parsed: toml::Value = raw
@@ -6061,6 +6146,10 @@ fn cmd_serve(
     cluster_peer_clients: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
     leaf_hub_serve: Option<&str>,
     transport: &TransportSecurityFlags,
+    // The security AUDIT emitter (#635), built ONCE in `finish_serve` (so the validator's secret-file
+    // refusal and this serve's events share one sequence) and handed in. With no `--audit-log` it is
+    // the `Null` (zero-cost) emitter.
+    audit: ironbus_server::audit::AuditEmitter,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -6110,8 +6199,9 @@ fn cmd_serve(
     // an auth identity is configured. This is the in-memory `AuthConfig` the accept loop pins per
     // connection; `None` is the no-auth (loopback-dev) broker. Done AFTER the bind guard so a
     // misconfigured non-loopback bind fails on the invariant first, and BEFORE any listener so a bad
-    // secret file fails closed pre-listen.
-    let auth = load_auth_config(transport)?;
+    // secret file fails closed pre-listen. The audit emitter (built once in `finish_serve`) is threaded
+    // in so a refusal here is audited too (a direct caller that skipped the validator still audits it).
+    let auth = load_auth_config(transport, Some(&audit))?;
     // The pre-auth DoS defenses (#633) are ON for a NON-LOOPBACK bind, INERT on loopback (the trust
     // boundary is the host itself, so the zero-config loopback-dev path stays byte-for-byte unchanged —
     // no rate limit, no half-open cap, no lockout). `Some(_)` here means a non-loopback bind, exactly
@@ -6239,6 +6329,7 @@ fn cmd_serve(
                 client_ack_slot,
                 auth,
                 preauth_cfg,
+                audit,
                 reload,
                 out,
             );
@@ -6290,6 +6381,7 @@ fn cmd_serve(
                 None,
                 auth,
                 preauth_cfg,
+                audit,
                 reload,
                 out,
             )
@@ -7536,6 +7628,10 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     client_ack_slot: Option<ironbus_server::actor::ClientAckSlot<F, SystemClock>>,
     auth: Option<std::sync::Arc<ironbus_server::auth::AuthConfig>>,
     preauth_cfg: Option<ironbus_server::preauth::PreAuthConfig>,
+    // The security AUDIT emitter (#635), built in `cmd_serve` BEFORE the secret checks (so a boot
+    // refusal is audited) and shared here for the startup config-change event and every connection's
+    // auth-outcome / scope-denial. With no `--audit-log` it is the `Null` (zero-cost) emitter.
+    audit: ironbus_server::audit::AuditEmitter,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -7695,12 +7791,10 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // only at the very end (after the drain completes). The legacy behavior tore the health server down
     // together with the wire loop; #637 keeps it up so `/readyz` 503 is observable for the whole drain.
     let health_shutdown = Arc::new(AtomicBool::new(false));
-    // The security AUDIT emitter (#635): built from `--audit-log` (a sink reference, never an inline
-    // secret), shared across connections and the config-change events. With no sink it is the `Null`
-    // emitter (zero-cost). The clock is the broker's wall+monotonic seam (for the audit envelope's
-    // wall-clock stamp). A startup CONFIG-CHANGE event records that the broker materialized its config
-    // (secret-free summary), so the audit trail begins at boot.
-    let audit = build_audit_emitter(config)?;
+    // The security AUDIT emitter (#635) was built in `cmd_serve` (BEFORE the secret checks, so a boot
+    // refusal is audited) and handed in. A startup CONFIG-CHANGE event records that the broker
+    // materialized its config (secret-free summary), so the audit trail begins at boot. With no
+    // `--audit-log` it is the `Null` emitter, so this is zero-cost.
     audit.emit(&ironbus_server::audit::AuditEvent::ConfigChange {
         summary: "startup".to_string(),
     });
@@ -7712,6 +7806,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         reload,
         config,
         data_dir,
+        audit.clone(),
     )?;
 
     // The monotonic clock the liveness watchdog (#95) measures against. ONE clock instance is shared
@@ -7780,8 +7875,9 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         preauth_guard,
         // The audit emitter (#635) rides into every connection so the auth OUTCOME and scope DENIALS
         // are emitted; a `Null`-sink emitter is zero-cost, so a broker with no `--audit-log` is
-        // byte-for-byte the historical accept path.
-        Some(audit.clone()),
+        // byte-for-byte the historical accept path. This is the LAST use of `audit`, so move it in
+        // (the signal thread already took its own clone).
+        Some(audit),
     )
     .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
     // The wire serve returned: either a stop signal flipped `shutdown` (the signal thread already
@@ -7813,8 +7909,16 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     }
     // A fatal serve-loop error is reported AFTER readiness has shed (above) but BEFORE the drain: a
     // broken listener means there is nothing left to drain into, so surface the error rather than run
-    // a drain whose result the caller would discard.
-    result?;
+    // a drain whose result the caller would discard. Stop + JOIN the health server first on this path
+    // too (the same deterministic teardown the success path does below), so an error exit never leaks
+    // the health thread — it does not depend on the drain, so it is torn down here.
+    if let Err(e) = result {
+        health_shutdown.store(true, Ordering::Release);
+        if let Some(h) = health_handle {
+            let _ = h.join();
+        }
+        return Err(e);
+    }
     // Graceful-shutdown DRAIN (#195 + #637): readiness has ALREADY shed 503 (above / since the signal),
     // so an orchestrator has stopped routing new work — now drain the in-flight work. Ask the append
     // actor to flush its pending produce batch (the one covering fsync) and force a final checkpoint of
@@ -8085,6 +8189,7 @@ fn spawn_signal_thread<F: Filesystem + 'static>(
     reload: ReloadSource<'_>,
     config: &ServeConfig,
     data_dir: Option<&Path>,
+    audit: ironbus_server::audit::AuditEmitter,
 ) -> Result<SignalThread, CliError> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
@@ -8137,6 +8242,12 @@ fn spawn_signal_thread<F: Filesystem + 'static>(
                             reload_pins,
                             &mut out,
                         );
+                        // Audit the CONFIG CHANGE (#635): a SIGHUP reload was applied (the
+                        // `ConfigChange` event covers a live reload, not just startup). Secret-free
+                        // summary; `reload_running_config` already logged WHAT changed to stderr.
+                        audit.emit(&ironbus_server::audit::AuditEvent::ConfigChange {
+                            summary: "sighup-reload".to_string(),
+                        });
                     }
                     None => {
                         // No config file to re-read (config is the startup flags/env only). A SIGHUP
@@ -8472,9 +8583,15 @@ fn cmd_serve(
     cluster_peer_clients: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
     leaf_hub_serve: Option<&str>,
     transport: &TransportSecurityFlags,
+    // The #635 audit emitter: built in `finish_serve` and passed to BOTH cmd_serve twins (the recurring
+    // #288/#99 footgun: a new serve arg MUST appear in both signatures). The non-Unix stub consumes it.
+    audit: ironbus_server::audit::AuditEmitter,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    // The #635 audit emitter is used only on the Unix serve path; consume it here so the non-Unix
+    // `-D warnings` build does not trip unused-variable (the recurring #288/#99 footgun).
+    let _ = audit;
     // The geo (cross-cluster mirror/source) plane is spawned only on the Unix serve path (#623), so the
     // non-Unix stub just consumes the parsed config to keep this signature byte-for-byte identical to
     // the Unix one (a mismatched arity is the recurring #288/#99 Windows footgun, invisible to a macOS
@@ -15843,7 +15960,7 @@ mod tests {
 
         // Round-trip: the broker's loader accepts it, and the password verifies with the pinned scopes.
         let transport = ts(None, None, None, Some(table.to_str().unwrap()), false);
-        let cfg = load_auth_config(&transport)
+        let cfg = load_auth_config(&transport, None)
             .unwrap()
             .expect("an auth config");
         let (id, _) = cfg
@@ -15880,6 +15997,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    // One linear round-trip test (mint a table, update, remove, re-load and assert each step);
+    // the #635 `load_auth_config` audit-emitter parameter widened two call lines, nudging the body
+    // just over the line cap. It is a single cohesive scenario, so allow the length rather than split.
+    #[allow(clippy::too_many_lines)]
     fn passwd_update_and_remove_preserve_other_identities() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
@@ -15929,9 +16050,12 @@ mod tests {
         // Update bob's scopes (re-set) — must not duplicate the identity.
         set("subscribe,admin", &mut Vec::new()).unwrap();
 
-        let cfg = load_auth_config(&ts(None, None, None, Some(table.to_str().unwrap()), false))
-            .unwrap()
-            .expect("config");
+        let cfg = load_auth_config(
+            &ts(None, None, None, Some(table.to_str().unwrap()), false),
+            None,
+        )
+        .unwrap()
+        .expect("config");
         // The preserved token identity still authenticates.
         assert!(cfg
             .authenticate(
@@ -15967,9 +16091,12 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        let cfg2 = load_auth_config(&ts(None, None, None, Some(table.to_str().unwrap()), false))
-            .unwrap()
-            .expect("config");
+        let cfg2 = load_auth_config(
+            &ts(None, None, None, Some(table.to_str().unwrap()), false),
+            None,
+        )
+        .unwrap()
+        .expect("config");
         assert!(cfg2
             .authenticate(
                 &ironbus_proto::message::AuthCredential {
@@ -16483,7 +16610,7 @@ mod tests {
         drop(f);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let transport = ts(None, None, None, Some(path.to_str().unwrap()), false);
-        let cfg = load_auth_config(&transport)
+        let cfg = load_auth_config(&transport, None)
             .unwrap()
             .expect("an auth config");
         assert!(cfg.has_any_identity());

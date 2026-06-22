@@ -875,14 +875,18 @@ impl Session {
             // fallback), a malformed/unknown-mechanism auth section, or a bad/unmatched credential —
             // collapses to the SAME outcome, so there is no oracle, and the close happens after the
             // one uniform Err. A well-formed, verified credential pins the identity's scopes.
-            // The selected mechanism for the audit event (#635): the SAFE handle (`bearer` / `password`
-            // / `mtls` / `unknown`), never the credential. `unknown` covers a missing/malformed section.
-            let mechanism = match parse_connect_auth(body) {
+            // Parse the credential ONCE (the same single parse as the historical path), then derive
+            // BOTH the audit mechanism handle and the auth resolution from it — so the audit wiring adds
+            // no second parse and the no-audit path is byte-for-byte unchanged. The mechanism for the
+            // audit event (#635) is the SAFE handle (`bearer` / `password` / `mtls` / `unknown`), never
+            // the credential; `unknown` covers a missing/malformed section.
+            let parsed_cred = parse_connect_auth(body);
+            let mechanism = match &parsed_cred {
                 Ok(Some(cred)) => audit_mechanism(cred.mechanism),
                 Ok(None) | Err(_) => crate::audit::Mechanism::Unknown,
             };
-            let resolved = match parse_connect_auth(body) {
-                Ok(Some(cred)) => auth.authenticate(&cred, self.peer_san.as_deref()).ok(),
+            let resolved = match &parsed_cred {
+                Ok(Some(cred)) => auth.authenticate(cred, self.peer_san.as_deref()).ok(),
                 // No credential, a malformed section, or an unknown mechanism: all "no resolution",
                 // which becomes the uniform violation below.
                 Ok(None) | Err(_) => None,

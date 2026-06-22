@@ -323,6 +323,64 @@ fn audit_log_routes_the_config_change_event_to_stderr_and_to_a_file_owner_only()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_fail_closed_secret_permission_refusal_is_audited_before_the_broker_exits() {
+    // #635: a fail-closed boot on a group/world-readable secret file emits a structured
+    // `secret_permission_refusal` audit event (the PATH + condition, never the contents) BEFORE the
+    // broker exits non-zero — so an operator/SIEM watching the audit stream sees the refusal.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("ironbus-m7-refusal-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A WORLD-READABLE (0o644) auth-config secret file: the StrictModes check refuses it fail-closed.
+    let auth_path = dir.join("auth.toml");
+    {
+        let mut f = std::fs::File::create(&auth_path).unwrap();
+        writeln!(
+            f,
+            "[[identity]]\nname = \"x\"\nscopes = [\"publish\"]\nmtls_san = [\"spiffe://x/y\"]"
+        )
+        .unwrap();
+    }
+    std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let (mut guard, stderr) = spawn_and_capture_stderr(&[
+        "serve",
+        "--data-dir",
+        &data_dir,
+        "--addr",
+        "127.0.0.1:0",
+        "--auth-config",
+        auth_path.to_str().unwrap(),
+        "--audit-log",
+        "stderr",
+    ]);
+    // The broker refuses to start (non-zero exit), never listening.
+    let code = wait_for_exit(&mut guard.0, Duration::from_secs(10));
+    assert_eq!(
+        code,
+        Some(1),
+        "a group/world-readable secret file is a fail-closed usage error (exit 1)"
+    );
+    let captured = stderr.join();
+    assert!(
+        captured.contains("event=secret_permission_refusal"),
+        "the boot refusal is audited: {captured}"
+    );
+    assert!(
+        captured.contains("condition=group_world_readable"),
+        "the audited condition: {captured}"
+    );
+    assert!(
+        captured.contains("path=\"") && captured.contains("auth.toml"),
+        "the audited path (safe handle): {captured}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A captured-stderr handle so a test can read the broker's stderr after it stops.
 struct StderrCapture(std::sync::mpsc::Receiver<String>);
 
