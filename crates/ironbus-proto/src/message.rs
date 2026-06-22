@@ -2422,6 +2422,159 @@ pub fn decode_sub_to(body: &[u8]) -> Result<SubToBody<'_>, BodyError> {
 }
 
 // ===================================================================================
+// TRANSACTIONAL HALF-MESSAGE WIRE BODIES (#640, V2-M8): the prepare/commit/rollback verbs for the
+// RocketMQ-style transactional half-message 2PC. Each rides the SAME `body_version: u8` + `field_len:
+// u16` frame as the explicit-stream-id verbs (#588), so a future version appends fields without a wire
+// break. TxnPrepare carries the txn id + target stream + the verbatim `PubBody` tail; TxnCommit and
+// TxnRollback share one `TxnResolveBody` shape (just the txn id). The txn-id field is `u16`-length-
+// prefixed and capped at `MAX_TXN_ID_LEN` BEFORE any read (fail-closed): a malformed/oversized id is a
+// typed `BodyError`, never a panic or over-read.
+// ===================================================================================
+
+/// The hard cap on a transaction-id byte length the proto codecs enforce at the wire boundary (#640):
+/// the engine's `ironbus_core::txn` further bounds it (the same 256), but this cap fails a
+/// hostile/oversized id closed at decode time BEFORE it crosses into the server, so a malformed-id
+/// frame is a typed [`BodyError::BadLength`] rather than a large reservation. Kept in lockstep with
+/// `ironbus_core::txn::MAX_TXN_ID_LEN` (proto is dependency-light and does not import core).
+pub const MAX_TXN_ID_LEN: usize = 256;
+
+/// Reads a `u16`-length-prefixed transaction-id field, enforcing [`MAX_TXN_ID_LEN`] (#640). A declared
+/// length over the cap is a typed [`BodyError::BadLength`] (fail-closed) BEFORE the bytes are taken, so
+/// a hostile id cannot force an over-read; a short body is [`BodyError::Truncated`] via [`Reader::take`].
+/// The returned slice borrows the body (zero-copy).
+fn read_txn_id<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], BodyError> {
+    let len = r.u16()? as usize;
+    if len > MAX_TXN_ID_LEN {
+        return Err(BodyError::BadLength);
+    }
+    r.take(len)
+}
+
+/// A producer's TRANSACTIONAL HALF-MESSAGE PREPARE (the `TxnPrepare` frame body, tag 44, #640): a
+/// producer-supplied `txn_id`, the REAL target `stream_id`, and the verbatim [`PubBody`] bytes (the
+/// half message's payload). The broker durably stores the half message INVISIBLE to consumers and acks;
+/// a later [`TxnResolveBody`] commit/rollback resolves it. The `pub_body` is carried as an opaque
+/// borrowed slice (decoded by the caller with [`decode_pub`]), so the publish body codec is shared
+/// UNCHANGED with `Pub`/`PubTo`.
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16` (over the `txn_id` + `stream_id`
+/// fields), then the v1 block: `txn_id: u16-len + bytes`, `stream_id: u16-len + bytes`; then the verbatim
+/// `PubBody` bytes as the REMAINDER after the block (so a future version may grow the block while the
+/// `PubBody` stays the tail).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxnPrepareBody<'a> {
+    /// The producer-supplied transaction id (the lifecycle key, capped at [`MAX_TXN_ID_LEN`]).
+    pub txn_id: &'a [u8],
+    /// The REAL target stream the committed payload is appended to (empty = the default stream).
+    pub stream_id: &'a [u8],
+    /// The verbatim [`PubBody`] bytes, decoded by the caller with [`decode_pub`].
+    pub pub_body: &'a [u8],
+}
+
+/// Encodes a `TxnPrepare` body onto the end of `out` (#640): the version byte, the field-block length
+/// over the `txn_id` + `stream_id` fields, those two fields, then the verbatim `pub_body` bytes. The
+/// caller produces `pub_body` with [`encode_pub`].
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the txn id, stream id, or their framed block exceeds the
+/// `u16` wire limit.
+pub fn encode_txn_prepare(req: &TxnPrepareBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    // The block is the two u16-len-prefixed fields: (2 + txn_id) + (2 + stream_id).
+    let block_len = 2usize
+        .checked_add(req.txn_id.len())
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_add(req.stream_id.len()))
+        .ok_or(BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(block_len).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    push_var(out, req.txn_id)?;
+    push_var(out, req.stream_id)?;
+    out.extend_from_slice(req.pub_body);
+    Ok(())
+}
+
+/// Decodes a `TxnPrepare` body (#640) into its `txn_id`, `stream_id`, and the verbatim `pub_body` tail,
+/// cap-before-alloc and panic-free. The caller decodes `pub_body` with [`decode_pub`]. A body too short
+/// for its declared block, a txn id over [`MAX_TXN_ID_LEN`], or a stream id over [`MAX_STREAM_ID_LEN`]
+/// is a typed [`BodyError`] (fail-closed). An EMPTY body is NOT valid ([`BodyError::Truncated`]).
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id/stream, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_txn_prepare(body: &[u8]) -> Result<TxnPrepareBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    // The PubBody is everything AFTER the declared block (a future version may grow the block without
+    // disturbing the PubBody tail).
+    let pub_body = r.rest();
+    let mut fr = Reader::new(block);
+    let txn_id = read_txn_id(&mut fr)?;
+    let stream_id = read_stream_id(&mut fr)?;
+    Ok(TxnPrepareBody {
+        txn_id,
+        stream_id,
+        pub_body,
+    })
+}
+
+/// A producer's TRANSACTIONAL COMMIT or ROLLBACK (the `TxnCommit` tag 45 / `TxnRollback` tag 46 frame
+/// body, #640): it names the `txn_id` to resolve. The two verbs share this one body shape (the
+/// [`FrameType`](crate::frame::FrameType)
+/// disambiguates commit vs rollback), exactly as a request/response pair shares a tag elsewhere. A commit
+/// replies a [`PubAck`](crate::frame::FrameType::PubAck) carrying the committed offset; a rollback replies
+/// a body-less `Ok`.
+///
+/// Layout (version+length framed, forward-compatible): `body_version: u8` ([`STREAM_WIRE_BODY_VERSION`]),
+/// `field_len: u16` (the length of the v1 block), then the v1 block: `txn_id: u16-len + bytes`. Bytes past
+/// `field_len` (a future version's appended fields) are TOLERATED and ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxnResolveBody<'a> {
+    /// The transaction id to commit or roll back (capped at [`MAX_TXN_ID_LEN`]).
+    pub txn_id: &'a [u8],
+}
+
+/// Encodes a `TxnCommit` / `TxnRollback` body onto the end of `out` (#640): the version byte, the
+/// field-block length over the `txn_id`, then the `txn_id`.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the txn id exceeds the `u16` wire limit.
+pub fn encode_txn_resolve(req: &TxnResolveBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.txn_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.txn_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.txn_id);
+    Ok(())
+}
+
+/// Decodes a `TxnCommit` / `TxnRollback` body (#640) into its `txn_id`, cap-before-alloc and panic-free.
+/// A body too short for its declared block, or a txn id over [`MAX_TXN_ID_LEN`], is a typed
+/// [`BodyError`] (fail-closed). An EMPTY body is NOT valid ([`BodyError::Truncated`]).
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_txn_resolve(body: &[u8]) -> Result<TxnResolveBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let txn_id = read_txn_id(&mut fr)?;
+    Ok(TxnResolveBody { txn_id })
+}
+
+// ===================================================================================
 // SUBJECT-ADDRESSED WIRE BODIES (#585, V2-M2-I9): the subject->stream binding + subject-addressed
 // pub/sub verbs that complete the SUBJECTS story — BindSubject (tag 34), PubSubject (tag 35), SubSubject
 // (tag 36). Each rides the SAME `body_version: u8` + `field_len: u16` frame as the explicit-stream-id
@@ -4672,6 +4825,110 @@ mod tests {
         let pb = decode_pub(decoded.pub_body).unwrap();
         assert_eq!(pb.payload, b"hello-named-stream");
         assert_eq!(pb.key, b"k");
+    }
+
+    #[test]
+    fn txn_prepare_carries_txn_id_stream_and_the_verbatim_pub_body() {
+        // #640: TxnPrepare prefixes the txn id + target stream, then carries the EXISTING PubBody bytes
+        // verbatim, so the session reuses decode_pub UNCHANGED. Every field round-trips and the pub_body
+        // decodes back through the existing codec.
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 9,
+                key: b"k",
+                headers: b"h",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"half-message",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        for (txn, stream) in [
+            (b"tx-1".as_slice(), b"orders".as_slice()),
+            (b"tx-1", b""), // default stream
+        ] {
+            let mut buf = Vec::new();
+            encode_txn_prepare(
+                &TxnPrepareBody {
+                    txn_id: txn,
+                    stream_id: stream,
+                    pub_body: &pub_body,
+                },
+                &mut buf,
+            )
+            .unwrap();
+            assert_eq!(
+                buf[0], STREAM_WIRE_BODY_VERSION,
+                "leads with the body version"
+            );
+            let decoded = decode_txn_prepare(&buf).unwrap();
+            assert_eq!(decoded.txn_id, txn);
+            assert_eq!(decoded.stream_id, stream);
+            assert_eq!(decoded.pub_body, pub_body.as_slice());
+            // The carried pub_body decodes through the UNCHANGED PubBody codec.
+            let pb = decode_pub(decoded.pub_body).unwrap();
+            assert_eq!(pb.payload, b"half-message");
+        }
+    }
+
+    #[test]
+    fn txn_resolve_round_trips_the_txn_id() {
+        // #640: TxnCommit / TxnRollback share the TxnResolveBody shape, carrying just the txn id.
+        for txn in [b"tx-1".as_slice(), b"a-very-distinct-uuid-1234"] {
+            let mut buf = Vec::new();
+            encode_txn_resolve(&TxnResolveBody { txn_id: txn }, &mut buf).unwrap();
+            assert_eq!(buf[0], STREAM_WIRE_BODY_VERSION);
+            assert_eq!(decode_txn_resolve(&buf).unwrap().txn_id, txn);
+        }
+    }
+
+    #[test]
+    fn txn_bodies_reject_malformed_and_oversized_input() {
+        // An empty body is truncated (no version byte).
+        assert_eq!(decode_txn_prepare(&[]), Err(BodyError::Truncated));
+        assert_eq!(decode_txn_resolve(&[]), Err(BodyError::Truncated));
+        // A wrong body version fails closed.
+        let mut buf = Vec::new();
+        encode_txn_resolve(&TxnResolveBody { txn_id: b"t" }, &mut buf).unwrap();
+        buf[0] = STREAM_WIRE_BODY_VERSION + 1;
+        assert!(matches!(
+            decode_txn_resolve(&buf),
+            Err(BodyError::BadHandshakeVersion { .. })
+        ));
+        // An over-cap txn id is rejected by the inner cap check (cap-before-alloc): the declared
+        // inner length is over MAX_TXN_ID_LEN, so read_txn_id fails BadLength before taking the id
+        // bytes. The outer block is fully supplied so the outer take succeeds first.
+        let over = u16::try_from(MAX_TXN_ID_LEN + 1).unwrap();
+        let mut bad = Vec::new();
+        bad.push(STREAM_WIRE_BODY_VERSION);
+        let field_len = 2u16 + over; // inner len field (2) + the declared id bytes
+        bad.extend_from_slice(&field_len.to_le_bytes());
+        bad.extend_from_slice(&over.to_le_bytes()); // declared txn_id len, over the cap
+        bad.extend_from_slice(&vec![0u8; over as usize]); // fill the block so the outer take succeeds
+        assert_eq!(decode_txn_resolve(&bad), Err(BodyError::BadLength));
+    }
+
+    #[test]
+    fn txn_prepare_tolerates_a_future_appended_block_field() {
+        // #640 forward-compat: a future version may append fields INSIDE the declared block; a v1 reader
+        // takes the WHOLE declared block and reads only the v1 fields, leaving the PubBody tail intact.
+        let mut buf = Vec::new();
+        buf.push(STREAM_WIRE_BODY_VERSION);
+        // block = txn_id("t") + stream_id("s") + a future trailing field, all inside field_len.
+        let mut block = Vec::new();
+        push_var(&mut block, b"t").unwrap();
+        push_var(&mut block, b"s").unwrap();
+        block.extend_from_slice(b"\xAA\xBB"); // a future field a v1 reader ignores
+        buf.extend_from_slice(&u16::try_from(block.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&block);
+        buf.extend_from_slice(b"PUBBODYTAIL"); // the verbatim pub_body after the block
+        let decoded = decode_txn_prepare(&buf).unwrap();
+        assert_eq!(decoded.txn_id, b"t");
+        assert_eq!(decoded.stream_id, b"s");
+        assert_eq!(decoded.pub_body, b"PUBBODYTAIL");
     }
 
     #[test]
