@@ -57,3 +57,9 @@ pub mod sim;
 /// recovers to its own valid prefix + loss report without touching a sibling — and per-record cost
 /// stays flat as streams grow (no per-record structure is added).
 pub mod streamset;
+/// The durable transactional half-message store (`txn/` sub-log, V2-M8, #640 part 1/2): a second
+/// segmented [`log::Log`] (modeled on the `dlq/` sink) holding the durable, consumer-INVISIBLE half
+/// (prepared) messages and their resolution (commit/rollback) op-markers, plus the in-memory
+/// [`ironbus_core::txn::TxnTable`] lifecycle it rebuilds by replaying both record kinds at open.
+/// Absent entirely from a deployment that never produces a transactional message.
+pub mod txn;
