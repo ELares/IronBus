@@ -2575,6 +2575,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// count) lives in the txn store's [`ironbus_core::txn::BackCheckBook`]; this is only the (lost-on-
     /// restart, rebuilt-by-re-registration) routing.
     txn_back_check: TxnBackCheck,
+    /// The back-check tunables (V2-M8, #640 part 2): applied to the txn store's `BackCheckBook` at open
+    /// AND whenever set via [`Engine::set_back_check_config`], so a deployment (or a test) can pick the
+    /// timeout / retry cadence / attempt cap. Defaults to [`ironbus_core::txn::BackCheckConfig::default`]
+    /// (a 30 s timeout, a 15 s retry, a 5-attempt cap), the production-safe schedule.
+    back_check_config: ironbus_core::txn::BackCheckConfig,
     /// The per-STREAM default message TTL (V2-M4, #549): a record reached on the poll path whose
     /// EFFECTIVE TTL (the lower of this and the record's own per-message TTL) has passed against the
     /// WALL-clock seam (anchored to the record's durable producer `timestamp_ms`) is EXPIRED — skipped
@@ -2997,6 +3002,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // in the txn store; this routing is rebuilt by the producers' re-registration after a
             // restart (a reconnecting producer re-sends `TxnListen`).
             txn_back_check: TxnBackCheck::new(),
+            // The back-check tunables (#640 part 2): the production-safe default schedule until an
+            // operator (or a test) overrides it via `set_back_check_config`.
+            back_check_config: ironbus_core::txn::BackCheckConfig::default(),
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
@@ -4062,7 +4070,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 self.log.clock_clone(),
                 self.txn_config,
                 ironbus_core::txn::TxnConfig::default(),
-                ironbus_core::txn::BackCheckConfig::default(),
+                self.back_check_config,
             )
             .map_err(EngineError::Storage)?;
             self.txn = Some(store);
@@ -4362,6 +4370,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn txn_under_back_check(&self) -> usize {
         self.txn.as_ref().map_or(0, TxnStore::under_back_check)
+    }
+
+    /// Sets the back-check tunables (#640 part 2): the timeout before a Prepared half message is first
+    /// back-checked, the retry cadence, the attempt cap, and the per-pass batch cap. Server-side only
+    /// (NOT on the wire), like [`Engine::set_confirm_group`]. Applied to the open txn store's book
+    /// immediately (so it takes effect without a reopen) AND remembered for a later lazy open. A
+    /// deployment configures it once at boot; the default is the production-safe 30 s/15 s/5-attempt
+    /// schedule.
+    pub fn set_back_check_config(&mut self, config: ironbus_core::txn::BackCheckConfig) {
+        self.back_check_config = config;
+        if let Some(store) = self.txn.as_mut() {
+            store.back_check_mut().set_config(config);
+        }
     }
 
     /// Registers (or re-registers, after a reconnect) producer connection `member` as the live listener

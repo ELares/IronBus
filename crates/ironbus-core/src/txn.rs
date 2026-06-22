@@ -696,6 +696,20 @@ impl BackCheckBook {
         self.config
     }
 
+    /// Replaces the config (re-applying the floors), leaving the enrolled entries untouched. The
+    /// schedule decisions for already-enrolled txns use the NEW config from here on (a longer/shorter
+    /// retry, a different attempt cap). Used to set a deployment's back-check tunables (and by tests to
+    /// pick a short, deterministic timeout); a per-txn entry's recorded `next_eligible`/`attempts` are
+    /// not rewritten — only future `due`/`record_attempt` decisions adopt the new config.
+    pub fn set_config(&mut self, config: BackCheckConfig) {
+        self.config = BackCheckConfig {
+            timeout: config.timeout,
+            retry: config.retry.max(1),
+            max_attempts: config.max_attempts.max(1),
+            batch: config.batch.max(1),
+        };
+    }
+
     /// The number of currently-enrolled (under-back-check) txns.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1276,6 +1290,24 @@ mod tests {
         assert_eq!(b.config().retry, 1);
         assert_eq!(b.config().max_attempts, 1);
         assert_eq!(b.config().batch, 1);
+    }
+
+    #[test]
+    fn set_config_replaces_tunables_and_re_floors() {
+        let mut b = book();
+        b.set_config(BackCheckConfig {
+            timeout: 5,
+            retry: 0,        // re-floored to 1
+            max_attempts: 0, // re-floored to 1
+            batch: 0,        // re-floored to 1
+        });
+        assert_eq!(b.config().timeout, 5);
+        assert_eq!(b.config().retry, 1);
+        assert_eq!(b.config().max_attempts, 1);
+        assert_eq!(b.config().batch, 1);
+        // A new attempt uses the new (1-attempt) cap immediately.
+        b.enroll(b"tx1", 0);
+        assert_eq!(b.record_attempt(b"tx1", 0), AttemptOutcome::TerminalDefault);
     }
 
     #[test]
