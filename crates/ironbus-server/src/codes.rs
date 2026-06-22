@@ -169,6 +169,11 @@ impl ErrorCode {
     /// [`EngineError::Storage`].
     pub const ERR_STORAGE: ErrorCode = ErrorCode("ERR_STORAGE");
 
+    /// A transactional half-message verb was rejected by the lifecycle (#640): an unknown/spent txn
+    /// id, a conflicting resolve (commit-after-rollback / rollback-after-commit, refused not flipped),
+    /// too many prepared, or an over-long id. Maps [`EngineError::Txn`].
+    pub const ERR_TXN: ErrorCode = ErrorCode("ERR_TXN");
+
     /// Maps an [`EngineError`] to its stable code. The single source of truth the conformance
     /// vectors and any wire error-code scheme share. A storage error is split into the two named
     /// outcomes ([`Self::ERR_AT_CAPACITY`] for the byte-cap shed) plus the residual
@@ -193,6 +198,7 @@ impl ErrorCode {
             EngineError::GenerationExhausted => Self::ERR_GENERATION_EXHAUSTED,
             EngineError::MissingRecord { .. } => Self::ERR_MISSING_RECORD,
             EngineError::ZeroMaxInFlight => Self::ERR_ZERO_MAX_IN_FLIGHT,
+            EngineError::Txn(_) => Self::ERR_TXN,
             EngineError::Storage(_) if error.is_at_capacity() => Self::ERR_AT_CAPACITY,
             EngineError::Storage(_) => Self::ERR_STORAGE,
         }

@@ -52,6 +52,7 @@ use ironbus_storage::loss::LossReport;
 use ironbus_storage::naming::MAX_STREAM_NAME_LEN;
 use ironbus_storage::segment::{OwnedRecord, RawByteRun, StorageError};
 use ironbus_storage::streamset::{CommitOutcome, StreamError, StreamId, StreamSet};
+use ironbus_storage::txn::{TxnStore, TxnStoreError};
 use std::collections::BTreeMap;
 
 /// What the engine does with a produce that would exceed the durable-log byte cap
@@ -673,6 +674,12 @@ pub enum EngineError {
         /// How many bound streams matched (always `>= 2`).
         matched: usize,
     },
+    /// A transactional half-message verb (#640, V2-M8) was rejected by the pure lifecycle: an
+    /// unknown / spent txn id, a conflicting resolve (commit-after-rollback or rollback-after-commit,
+    /// which is REFUSED, never flipped), too many concurrently-prepared transactions, or an over-long
+    /// txn id. Carries the typed [`ironbus_core::txn::TxnError`] reason. Fail-closed at the boundary;
+    /// the half message's durable state is never corrupted by a rejected verb.
+    Txn(ironbus_core::txn::TxnError),
 }
 
 impl core::fmt::Display for EngineError {
@@ -741,6 +748,7 @@ impl core::fmt::Display for EngineError {
                 "subject {subject:?} resolves to {matched} bound streams (single-home: a subject must \
                  resolve to exactly one stream; overlap fan-out is opt-in)"
             ),
+            EngineError::Txn(e) => write!(f, "transaction error: {e}"),
         }
     }
 }
@@ -749,6 +757,7 @@ impl std::error::Error for EngineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EngineError::Storage(e) => Some(e),
+            EngineError::Txn(e) => Some(e),
             _ => None,
         }
     }
@@ -1597,6 +1606,40 @@ pub struct EngineConfigSnapshot {
 /// persisted in `cursor.ckpt`. Named groups (#9) are independent in-memory cursors.
 const DEFAULT_GROUP: &str = "";
 
+/// The RESERVED internal dedup `producer_id` PREFIX for transactional-commit real-stream appends
+/// (#640, V2-M8). A txn commit appends the buffered payload to the real stream through the DURABLE
+/// effectively-once producer-SEQUENCE dedup keyed on `prefix + txn_id` (seq 0), so a crash-recovery
+/// re-commit re-append is recognized as a benign duplicate at the original offset and the dedup
+/// SURVIVES a restart (the crash-window-(b) guarantee). The leading NUL byte cannot appear in a wire
+/// producer id (graphic bytes only), so a txn's dedup high-water is ISOLATED in its own per-producer
+/// entry and never collides with, evicts, or is evicted by a real producer's window. Each distinct txn
+/// id is its OWN single-sequence producer (seq 0), so txns resolving out of order never trip the
+/// producer-seq out-of-order guard.
+const TXN_DEDUP_PRODUCER_PREFIX: &[u8] = b"\x00ironbus-txn:";
+
+/// Builds the reserved-namespace producer id for a txn-commit real-stream append (#640):
+/// [`TXN_DEDUP_PRODUCER_PREFIX`] followed by the txn id. The txn id is bounded by the wire/lifecycle
+/// `MAX_TXN_ID_LEN` (256), and the prefix is short, so the result stays well within
+/// `ironbus_core::dedup::MAX_PRODUCER_ID_LEN`.
+fn txn_dedup_producer_id(txn_id: &[u8]) -> Vec<u8> {
+    let mut pid = Vec::with_capacity(TXN_DEDUP_PRODUCER_PREFIX.len() + txn_id.len());
+    pid.extend_from_slice(TXN_DEDUP_PRODUCER_PREFIX);
+    pid.extend_from_slice(txn_id);
+    pid
+}
+
+/// Maps a [`TxnStoreError`] (a durable txn-store IO/framing failure) to an [`EngineError`]: a storage
+/// error propagates as [`EngineError::Storage`]; an unframable record (unreachable from the bounded
+/// wire path) surfaces as the structural [`StorageError::SegmentFull`] rather than a panic.
+fn txn_store_error_to_engine(e: TxnStoreError) -> EngineError {
+    match e {
+        TxnStoreError::Storage(s) => EngineError::Storage(s),
+        TxnStoreError::Unframable => {
+            EngineError::Storage(ironbus_storage::segment::StorageError::SegmentFull)
+        }
+    }
+}
+
 /// The build version string for the metric registry's `ironbus_build_info` (#97), the crate
 /// version baked in at compile time.
 fn crate_version() -> &'static str {
@@ -2378,6 +2421,18 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
     /// evidence of a dropped message).
     dlq_config: LogConfig,
+    /// The durable TRANSACTIONAL HALF-MESSAGE store (V2-M8, #640): the `txn/` sub-log that buffers
+    /// prepared (half) messages INVISIBLE to consumers and their commit/rollback op-markers, plus the
+    /// in-memory lifecycle table it rebuilds at open. Opened LAZILY on the first `TxnPrepare` (so a
+    /// broker that never produces a transactional message never creates the subdirectory), or eagerly
+    /// by [`Engine::open`] when the subdirectory already exists, so prepared half messages + their
+    /// resolutions are recovered before the first resolve after a crash. `None` keeps the non-txn hot
+    /// path byte-for-byte unchanged.
+    txn: Option<TxnStore<F, C>>,
+    /// The [`LogConfig`] the txn store's log is opened with: the same segment sizing as the main log,
+    /// with NO total-byte cap (a half message / op-marker must never be shed — a prepared half message
+    /// is an undelivered durable payload, and a resolution is the durable record of the commit/rollback).
+    txn_config: LogConfig,
     /// The per-STREAM default message TTL (V2-M4, #549): a record reached on the poll path whose
     /// EFFECTIVE TTL (the lower of this and the record's own per-message TTL) has passed against the
     /// WALL-clock seam (anchored to the record's durable producer `timestamp_ms`) is EXPIRED — skipped
@@ -2699,6 +2754,31 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             None
         };
 
+        // The TRANSACTIONAL HALF-MESSAGE store's log (V2-M8, #640) shares the main log's segment
+        // sizing but is NEVER byte-capped: a prepared half message is an undelivered durable payload
+        // and a resolution op-marker is the durable record of the commit/rollback, so neither may be
+        // shed. Eagerly open it (recovering the lifecycle table + buffered payloads) IF its `txn/`
+        // subdirectory already exists from a prior run, so a crash-orphaned prepared half message is
+        // recoverable before the first resolve after a crash. A fresh data directory has no `txn/`
+        // subdir yet, so the store stays unopened (lazy) and the non-transactional path never creates
+        // it — keeping the hot path byte-for-byte unchanged.
+        let txn_config = LogConfig {
+            max_segment_bytes: config.log.max_segment_bytes,
+            max_total_bytes: 0,
+            max_quarantine_bytes: 0,
+            daily_physical_write_budget_bytes: 0,
+        };
+        let txn = if Self::txn_dir_exists(&log) {
+            Some(TxnStore::open(
+                log.filesystem(),
+                log.clock_clone(),
+                txn_config,
+                ironbus_core::txn::TxnConfig::default(),
+            )?)
+        } else {
+            None
+        };
+
         // Build the backpressure controllers (#68, #69) from the config knobs BEFORE the struct
         // literal, since the literal moves the non-Copy `config.delivery` and field expressions are
         // evaluated in source order (a later read of `config` would then be a
@@ -2764,6 +2844,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             last_dead_lettered: None,
             dlq,
             dlq_config,
+            // The transactional half-message store (V2-M8, #640): opened above iff the `txn/` subdir
+            // already exists, else `None` until the first `TxnPrepare` lazily creates it. A
+            // non-transactional broker keeps this `None`, so the produce/consume hot path is unchanged.
+            txn,
+            txn_config,
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
@@ -2950,6 +3035,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// data directory never materializes the sink subdirectory.
     fn dlq_dir_exists(log: &Log<F, C>, subdir: &str) -> bool {
         log.filesystem().subdir_exists(subdir).unwrap_or(false)
+    }
+
+    /// Whether the transactional half-message store's `txn/` subdirectory already exists, so a prior
+    /// run prepared at least one half message (V2-M8, #640). Used by [`Engine::open`] to decide whether
+    /// to eagerly open the store (recovering the lifecycle table + buffered prepared payloads) versus
+    /// deferring to the lazy open on the first `TxnPrepare`. A non-creating probe
+    /// ([`ironbus_storage::txn::TxnStore::dir_exists`]), so `Engine::open` on a fresh data directory
+    /// never materializes the `txn/` subtree.
+    fn txn_dir_exists(log: &Log<F, C>) -> bool {
+        TxnStore::<F, C>::dir_exists(log.filesystem()).unwrap_or(false)
     }
 
     /// Opens (creating if absent) the default group's durable per-message ATTEMPT-COUNT checkpoint
@@ -3735,6 +3830,347 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // dirtied here, so this never syncs the root a second time.
         let _outcome: CommitOutcome = self.streams.commit_tick();
         Ok(offset)
+    }
+
+    // ===================================================================================
+    // TRANSACTIONAL HALF-MESSAGE 2PC (#640, V2-M8 part 1/2): prepare / commit / rollback.
+    //
+    // A producer PREPAREs a half message — durably buffered in `txn/`, INVISIBLE to consumers — then
+    // runs its local transaction and COMMITs (the half message is appended to the real target stream
+    // and becomes visible) or ROLLs it BACK (the half message is discarded, never delivered). All
+    // three go through the single-writer engine (the actor's `Command::Run`), so they are serialized
+    // with every produce and never race.
+    //
+    // ## The crash-safety argument (the load-bearing property)
+    //
+    // The commit must move the buffered payload to the real stream AND record the resolution across TWO
+    // separate logs (the real stream + the `txn/` op-log), and a crash anywhere must NEVER
+    // double-append on replay. The ORDERING (in `txn_commit`'s fresh-resolve path) is:
+    //
+    //   commit(txn):
+    //     A.  WRITE the buffered payload to the REAL target stream (NO fsync), DEDUPED by the DURABLE
+    //         producer-SEQUENCE high-water keyed on the txn id (`txn_dedup_producer_id(txn)`, seq 0).
+    //         This assigns `real_offset` and records the txn-id high-water IN MEMORY.
+    //     A2. FLUSH the producer-seq checkpoint (fsync the high-water) — BEFORE the record's own fsync.
+    //     A3. COMMIT-BATCH (fsync the record), making the real append durable.
+    //     B.  append + fsync the COMMITTED op-marker (carrying `real_offset`) to the `txn/` op-log.
+    //
+    // The op-marker (B) is the COMMIT POINT: a txn is committed iff its op-marker is durable. The crash
+    // windows, each proven by a test:
+    //   (a) crash AFTER prepare, BEFORE A: only the half record is durable, so on reopen the txn
+    //       replays as Prepared (unresolved, recoverable). A later commit is a FRESH resolve.
+    //       (storage test `crash_after_prepare_before_op_replays_as_prepared`; engine tests below.)
+    //   (b) crash AFTER A3 (real record durable), BEFORE B: the txn replays as Prepared (no op-marker),
+    //       payload buffered, so recovery re-commits. Its step A re-WRITEs the SAME payload under the
+    //       SAME txn-id seq, which the DURABLE producer-seq high-water (made durable in A2, restored
+    //       from `producer-seq.ckpt` on open) recognizes as a DUPLICATE — original offset, appends
+    //       NOTHING. EXACTLY ONCE (no dup, no loss).
+    //   (c) crash AFTER B: the txn replays as Committed; no replay work, and a retried commit is a
+    //       benign idempotent no-op returning the recorded offset.
+    //
+    // The two-fsync sub-window A2<->A3 is why A2 (the high-water fsync) is ordered BEFORE A3 (the
+    // record fsync), NOT after:
+    //   - crash between A2 and A3 (high-water durable, record NOT): the record is lost in the torn
+    //     tail; on recovery `seed_producer_seq_from_recovered` CLAMPS a high-water whose offset is at
+    //     or past the durable head and DROPS it, so the redrive re-writes FRESH at the real head — no
+    //     double (the first write was lost), no loss (the redrive lands it).
+    //   - crash after A3 (record durable): the high-water was fsync'd first, so it is durable too, and
+    //     the redrive dedups to the original offset.
+    // Either way the real append is exactly-once across a crash. (A NAMED target stream does not yet
+    // carry the durable txn dedup — a flagged follow-up — so its commit redrive is at-least-once; the
+    // default stream, the common case, is exactly-once.)
+    //
+    // DURABILITY-SCOPE CAVEATS (be honest about what the guarantee rests on — see docs/RECOVERY.md
+    // "Transactional messages (2PC)"):
+    //   (a) The default-stream exactly-once / no-committed-empty guarantee is SCOPED to
+    //       `DurabilityLevel::Sync` (the default). It rests on A3 (the real record's covering fsync)
+    //       running BEFORE B (the op-marker, which ALWAYS force-fsyncs). Under a RELAXED level
+    //       (`interval`/`async`/`none`) A3 is a no-fsync `flush_no_sync`, so a power cut can leave the
+    //       lifecycle state Committed (B fsync'd) while the unsynced real record is lost — a
+    //       committed-but-empty txn. This is consistent with the relaxed-level acked-loss waiver (I2 is
+    //       already waived there), but it is a NEW asymmetry: the lifecycle marker is durable while its
+    //       record is not. Use `sync` (the default) for the no-committed-empty guarantee.
+    //   (b) A NAMED (non-default) target stream's commit redrive is at-least-once on a crash (only the
+    //       default stream carries the durable txn-id seq dedup), as noted above.
+    //   (c) The txn-id dedup high-water shares the bounded LRU `producer-seq.ckpt` slot, so a VERY late
+    //       default-stream redrive whose high-water was evicted degrades to at-least-once (safe — never
+    //       loss, never a flip); immediate redrives are unaffected (see `commit_real_append`).
+    //
+    // The INVISIBILITY invariant holds throughout: the payload lives in `txn/` (never the real stream)
+    // until step A, and a consumer never reads `txn/`; a rolled-back txn's payload is never written to
+    // the real stream at all.
+    // ===================================================================================
+
+    /// Lazily opens the transactional half-message store, creating the `txn/` subtree on the FIRST
+    /// transactional verb (so a non-transactional broker never materializes it). A no-op if already
+    /// open. Returns a mutable borrow of the store for the caller's verb.
+    ///
+    /// # Errors
+    /// Propagates a storage error from creating the subdirectory or opening the txn log.
+    fn ensure_txn_store(&mut self) -> Result<&mut TxnStore<F, C>, EngineError> {
+        if self.txn.is_none() {
+            let store = TxnStore::open(
+                self.log.filesystem(),
+                self.log.clock_clone(),
+                self.txn_config,
+                ironbus_core::txn::TxnConfig::default(),
+            )
+            .map_err(EngineError::Storage)?;
+            self.txn = Some(store);
+        }
+        // Just-ensured to be `Some`.
+        Ok(self.txn.as_mut().expect("txn store ensured"))
+    }
+
+    /// PREPAREs a transactional half message (#640): durably buffers `message` for `txn_id` targeting
+    /// the real `stream`, INVISIBLE to consumers, and acks. The half message survives a restart as
+    /// `Prepared` until a [`Engine::txn_commit`] or [`Engine::txn_rollback`] resolves it. Idempotent: a
+    /// re-prepare of a still-prepared id is a benign no-op (the half message is already durable).
+    ///
+    /// # Errors
+    /// [`EngineError::Txn`] for an unknown/spent id, too-many-prepared, or an over-long txn id; a
+    /// storage error from creating/opening the `txn/` store or the durable half-record append.
+    pub fn txn_prepare(
+        &mut self,
+        txn_id: &[u8],
+        stream: &str,
+        message: &Append<'_>,
+    ) -> Result<(), EngineError> {
+        let now = self.log.now_monotonic();
+        let store = self.ensure_txn_store()?;
+        // Decide FIRST on the pure lifecycle (no IO): a fresh prepare durably buffers; a benign
+        // duplicate re-acks without a second half record; a spent/over-cap id is refused.
+        match store
+            .table_mut()
+            .prepare(txn_id, now)
+            .map_err(EngineError::Txn)?
+        {
+            ironbus_core::txn::PrepareDecision::AlreadyPrepared => Ok(()),
+            ironbus_core::txn::PrepareDecision::Prepared => {
+                // Durably append + fsync the half record. If the durable write fails, ROLL BACK the
+                // in-memory prepared state so the table and the durable log stay consistent (the
+                // prepare did not happen), and surface the error.
+                match store.append_half(txn_id, stream, message) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // The half record is NOT durable: undo the in-memory prepare (mark it rolled
+                        // back in memory only — no op record is written, and on reopen there is no half
+                        // record either, so the txn is simply absent). We use the table's rollback to
+                        // clear the prepared entry; the durable log never saw this txn.
+                        let _ = store.table_mut().rollback(txn_id, now);
+                        Err(txn_store_error_to_engine(e))
+                    }
+                }
+            }
+        }
+    }
+
+    /// COMMITs the prepared half message named by `txn_id` (#640): appends the buffered payload to the
+    /// real target stream (DEDUPED by the txn id) and fsyncs it, writes + fsyncs the committed
+    /// op-marker, then advances the lifecycle to Committed. Returns the committed real offset. The half
+    /// message becomes VISIBLE to consumers only here. Idempotent: a retried commit of an
+    /// already-committed txn returns the original offset and appends nothing; a commit of an
+    /// already-rolled-back txn is REFUSED. See the module-level crash-safety argument above.
+    ///
+    /// DURABILITY SCOPE: the no-committed-empty guarantee (a durable Committed marker always has its
+    /// real record durable too) holds under [`DurabilityLevel::Sync`] (the default), where A3 force-
+    /// fsyncs the record before the op-marker B. Under a RELAXED level A3 is a no-fsync flush while B
+    /// always fsyncs, so a power cut can leave a Committed lifecycle over a lost (unsynced) record — a
+    /// committed-but-empty txn, consistent with that level's acked-loss waiver. See caveat (a) in the
+    /// module-level argument and docs/RECOVERY.md.
+    ///
+    /// # Errors
+    /// [`EngineError::Txn`] for an unknown id or a commit-after-rollback (refused, never flipped); a
+    /// storage error from the real-stream append, the op-marker append, or a durability barrier.
+    pub fn txn_commit(&mut self, txn_id: &[u8]) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
+        let now = self.log.now_monotonic();
+        // Decide on the pure lifecycle FIRST (no IO). A fresh resolve must do the real append + marker;
+        // a benign duplicate returns the prior committed offset (recorded in the op-marker, recovered
+        // on replay) WITHOUT re-appending; a conflicting flip is refused.
+        let decision = {
+            let store = self.ensure_txn_store()?;
+            store
+                .table_mut()
+                .commit(txn_id, now)
+                .map_err(EngineError::Txn)?
+        };
+        match decision {
+            ironbus_core::txn::ResolveDecision::AlreadyResolved => {
+                // A retried commit of an already-committed txn (the in-memory table or the replayed
+                // op-marker already says Committed). The payload is already on the real stream and was
+                // dropped from the buffer on the first commit, so we return the recorded real offset
+                // from the DURABLE producer-seq high-water WITHOUT re-appending — exactly idempotent.
+                Ok(self.dedup_offset_for(txn_id))
+            }
+            ironbus_core::txn::ResolveDecision::Resolved => {
+                // The FRESH commit (or the crash-recovery redrive of a Prepared txn). Pull the buffered
+                // half message and run the crash-safe ordering (see the module-level argument):
+                //   STEP A:  WRITE the payload to the real stream (no fsync), DEDUPED by the durable
+                //            txn-id seq — this assigns the offset and records the seq high-water in
+                //            memory. A redrive re-write reads seq 0 as a duplicate at the original offset.
+                //   STEP A2: FLUSH the producer-seq checkpoint (fsync the high-water) BEFORE the record's
+                //            fsync, so the dedup identity is durable no later than the record (and a crash
+                //            that loses the record clamps the over-the-head high-water away on recovery).
+                //   STEP A3: COMMIT-BATCH (fsync the record), making the real append durable.
+                //   STEP B:  append + fsync the COMMITTED op-marker (the commit point), carrying the offset.
+                let half = self
+                    .txn
+                    .as_ref()
+                    .and_then(|s| s.prepared_payload(txn_id).cloned())
+                    .ok_or(EngineError::Txn(ironbus_core::txn::TxnError::UnknownTxn))?;
+                let real_offset = self.commit_real_append(txn_id, &half)?; // STEP A (write, no fsync)
+                self.flush_txn_commit_dedup()?; // STEP A2: dedup identity durable before the record
+                self.commit_batch()?; // STEP A3: the real record is now durable
+                                      // STEP B: the commit point. On its failure the in-memory table already says Committed
+                                      // but no marker is durable; a reopen replays as Prepared and re-commits, deduped by the
+                                      // (now-durable, from A2) txn-id seq — safe. We surface the error.
+                let store = self.ensure_txn_store()?;
+                store
+                    .mark_committed(txn_id, real_offset.get())
+                    .map_err(txn_store_error_to_engine)?;
+                Ok(real_offset)
+            }
+        }
+    }
+
+    /// Appends a committed half message's payload to its real target stream, DEDUPED by the txn id via
+    /// the DURABLE producer-SEQUENCE high-water (#639), so a crash-recovery re-commit re-appending the
+    /// same payload is recognized as a duplicate at the original offset, never a second copy — and the
+    /// dedup SURVIVES a restart (unlike the in-memory `msg_id` window). The txn id is used as the
+    /// `producer_id` (in the reserved [`TXN_DEDUP_PRODUCER_ID`]-prefixed namespace), epoch 0, seq 0:
+    /// every txn is its own single-sequence producer, so resolving txns out of order never trips the
+    /// out-of-order guard. After the append the durable seq high-water is FLUSHED (the caller's
+    /// responsibility, via [`Engine::flush_txn_commit_dedup`]) before the op-marker, so the dedup
+    /// identity is durable before the commit point.
+    ///
+    /// DEDUP HIGH-WATER AGING (caveat (c)): the txn-id high-water shares the bounded (LRU, ~4096-entry)
+    /// `producer-seq.ckpt` slot. A VERY late default-stream redrive whose high-water was EVICTED by
+    /// newer producers before the redrive runs degrades to at-least-once (it re-appends a fresh copy) —
+    /// which is SAFE (never loss, never a flipped outcome). An immediate crash-recovery redrive is
+    /// unaffected: the txn pseudo-ids were just written and sort to the front of the LRU, so they are
+    /// still present when recovery replays the Prepared txn.
+    fn commit_real_append(
+        &mut self,
+        txn_id: &[u8],
+        half: &ironbus_storage::txn::HalfMessage,
+    ) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
+        // Build the real-stream append from the preserved half message, with HAS_KEY cleared (the
+        // segment codec re-derives it from the key length).
+        let flags = RecordFlags::from_bits(half.flags.bits() & !RecordFlags::HAS_KEY.bits());
+        let append = Append {
+            timestamp_ms: half.timestamp_ms,
+            flags,
+            key: &half.key,
+            headers: &half.headers,
+            payload: &half.payload,
+        };
+        let pid = txn_dedup_producer_id(txn_id);
+        // The default stream routes through the DURABLE producer-sequence dedup (seq 0). A NAMED target
+        // stream does not yet carry per-stream dedup (a flagged follow-up), so its commit append is
+        // at-least-once on a crash-recovery redrive; for the default (and most common) target the
+        // durable seq high-water makes the commit replay exactly-once across a restart.
+        //
+        // The ORDERING here is the crash-safety crux (see the module-level argument). The append is a
+        // WRITE-only (no fsync): it assigns the offset and records the txn-id seq high-water IN MEMORY.
+        // The caller (`txn_commit`) then flushes the seq checkpoint (fsync the high-water) BEFORE
+        // `commit_batch` fsyncs the record, so:
+        //   - crash after the high-water fsync but before the record fsync: the record is lost in the
+        //     torn tail; recovery CLAMPS the recovered high-water (its offset >= the durable head) and
+        //     DROPS it, so the redrive re-appends FRESH (no double, no loss).
+        //   - crash after the record fsync: the high-water is already durable (flushed first), so the
+        //     redrive reads seq 0 as a DUPLICATE at the original offset (no double).
+        // Either way the real append is exactly-once across a crash.
+        if half.stream.is_empty() {
+            let dedup = DedupRequest {
+                producer_id: &pid,
+                epoch: 0,
+                msg_id: txn_id,
+                seq: Some(0),
+            };
+            let outcome = self.append_no_sync_dedup(&append, Some(dedup))?;
+            match outcome {
+                AppendOutcome::Appended(offset) | AppendOutcome::Duplicate(offset) => Ok(offset),
+                // The txn seq dedup never fences or rejects out-of-order (epoch 0, single seq 0), so
+                // these are unreachable; surface a typed error rather than panic if a future change
+                // reaches them.
+                AppendOutcome::Fenced { .. } | AppendOutcome::OutOfOrder { .. } => {
+                    Err(EngineError::Txn(ironbus_core::txn::TxnError::UnknownTxn))
+                }
+            }
+        } else {
+            // A named target stream: produce-in-stream is its own append+commit (no durable txn dedup
+            // yet); at-least-once on a crash-recovery redrive (flagged follow-up).
+            self.produce_in_stream(&half.stream, &append)
+        }
+    }
+
+    /// Durably flushes the producer-sequence high-water so the txn-commit real-append dedup SURVIVES a
+    /// restart (#640). Called by [`Engine::txn_commit`] AFTER the (write-only) real append records the
+    /// txn-id high-water in memory and BEFORE the record's covering fsync, so the dedup identity is
+    /// durable no later than the record itself (and a crash that loses the record also has its
+    /// over-the-head high-water clamped away on recovery). A no-op if no txn (or sequenced producer)
+    /// has ever committed.
+    ///
+    /// # Errors
+    /// Propagates a storage error from creating or writing the producer-seq checkpoint.
+    fn flush_txn_commit_dedup(&mut self) -> Result<(), EngineError> {
+        self.ensure_producer_seq_checkpoint()?;
+        self.checkpoint_producer_seq()
+    }
+
+    /// Looks up the durable offset the producer-sequence high-water holds for a txn id's committed real
+    /// append (the effectively-once identity used by [`Engine::commit_real_append`]). Used to return a
+    /// stable offset on an idempotent re-commit whose buffered payload is already gone. Falls back to
+    /// the log's flushed head if the high-water aged out (a bounded staleness — the txn is committed
+    /// regardless).
+    fn dedup_offset_for(&self, txn_id: &[u8]) -> Offset {
+        let pid = txn_dedup_producer_id(txn_id);
+        match self.producer_seq.high_water(&pid) {
+            // The recorded last-accepted offset for this txn's single seq 0 IS its committed offset.
+            Some((_epoch, Some(_seq), last_offset)) => last_offset,
+            _ => self.log.flushed_offset(),
+        }
+    }
+
+    /// ROLLs BACK the prepared half message named by `txn_id` (#640): writes + fsyncs a rolled-back
+    /// op-marker; the buffered payload is DISCARDED and never appended to the real stream — never
+    /// delivered. Idempotent: a retried rollback of an already-rolled-back txn is a benign success; a
+    /// rollback of an already-committed txn is REFUSED (never flipped).
+    ///
+    /// # Errors
+    /// [`EngineError::Txn`] for an unknown id or a rollback-after-commit (refused, never flipped); a
+    /// storage error from the op-marker append or its durability barrier.
+    pub fn txn_rollback(&mut self, txn_id: &[u8]) -> Result<(), EngineError> {
+        let now = self.log.now_monotonic();
+        let store = self.ensure_txn_store()?;
+        match store
+            .table_mut()
+            .rollback(txn_id, now)
+            .map_err(EngineError::Txn)?
+        {
+            // A retried rollback of an already-rolled-back txn: benign no-op (the op-marker is durable).
+            ironbus_core::txn::ResolveDecision::AlreadyResolved => Ok(()),
+            ironbus_core::txn::ResolveDecision::Resolved => {
+                // The FRESH rollback: durably record the rolled-back op-marker. The buffered payload is
+                // dropped by the store; it never reaches the real stream.
+                store
+                    .mark_rolled_back(txn_id)
+                    .map_err(txn_store_error_to_engine)
+            }
+        }
+    }
+
+    /// The count of currently-`Prepared` (unresolved) half messages (#640), for observability and the
+    /// part-2 back-check. `0` when no txn store is open.
+    #[must_use]
+    pub fn txn_prepared_count(&self) -> usize {
+        self.txn.as_ref().map_or(0, TxnStore::prepared_count)
     }
 
     /// CREATE-OR-ENSURE the named stream `stream` WITHOUT producing to it (#588, M2-I10): the
@@ -15503,5 +15939,369 @@ mod tests {
         assert_eq!(e2.stream_head(""), Offset::new(1));
         let d = message(e2.poll_in_stream("", DEFAULT_GROUP, 0).unwrap());
         assert_eq!(d.record.payload.as_ref(), b"d0");
+    }
+
+    // ===================================================================================
+    // TRANSACTIONAL HALF-MESSAGE 2PC (#640, V2-M8 part 1/2): engine-level prepare/commit/rollback,
+    // the INVISIBILITY invariant, the crash windows, and byte-identical-when-unused.
+    // ===================================================================================
+
+    fn txn_half(payload: &[u8]) -> Append<'static> {
+        Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: Box::leak(payload.to_vec().into_boxed_slice()),
+        }
+    }
+
+    /// Drains the default group, returning every delivered payload (acking each), so a test can assert
+    /// EXACTLY what a consumer sees.
+    fn drain_visible(e: &mut Engine<InMemoryFs, ManualClock>) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    seen.push(d.record.payload.to_vec());
+                    e.ack(&d.token);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn a_prepared_half_message_is_invisible_until_commit() {
+        // THE INVISIBILITY INVARIANT: a Prepared-but-uncommitted half message is NEVER returned by the
+        // consume path; it appears in the target stream ONLY after commit.
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"half")).unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        // The consumer sees NOTHING (the half message lives in txn/, not the real stream).
+        assert!(
+            matches!(e.poll(0).unwrap(), Poll::Idle),
+            "prepared half is invisible"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(0),
+            "nothing in the real stream yet"
+        );
+        // Commit: now it appears in the real stream, exactly once.
+        let off = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(off, Offset::new(0));
+        assert_eq!(e.txn_prepared_count(), 0);
+        assert_eq!(drain_visible(&mut e), vec![b"half".to_vec()]);
+    }
+
+    #[test]
+    fn a_rolled_back_half_message_is_never_delivered() {
+        // After rollback the half message NEVER appears in the real stream.
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"secret")).unwrap();
+        e.txn_rollback(b"tx1").unwrap();
+        assert_eq!(e.txn_prepared_count(), 0);
+        assert!(
+            matches!(e.poll(0).unwrap(), Poll::Idle),
+            "rolled-back half is never delivered"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(0),
+            "nothing was ever appended to the real stream"
+        );
+        assert!(drain_visible(&mut e).is_empty());
+    }
+
+    #[test]
+    fn commit_interleaves_with_normal_produces_visibly_only_after_commit() {
+        // A normal produce is immediately visible; a prepared half is not, until committed — and the
+        // committed record lands at its own offset after the earlier normal produces.
+        let mut e = open(config(10, 5));
+        assert_eq!(produce(&mut e, b"n0"), Offset::new(0));
+        e.txn_prepare(b"tx1", "", &txn_half(b"txn")).unwrap();
+        assert_eq!(produce(&mut e, b"n1"), Offset::new(1));
+        // So far only the two normal produces are visible.
+        // (Peek without acking is awkward; instead assert the txn commit lands at offset 2.)
+        let off = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            off,
+            Offset::new(2),
+            "the committed record lands after the normal produces"
+        );
+        assert_eq!(
+            drain_visible(&mut e),
+            vec![b"n0".to_vec(), b"n1".to_vec(), b"txn".to_vec()]
+        );
+    }
+
+    #[test]
+    fn recommit_is_idempotent_returning_the_same_offset() {
+        // A retried commit of an already-committed txn returns the SAME offset and appends nothing.
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        let off1 = e.txn_commit(b"tx1").unwrap();
+        let off2 = e.txn_commit(b"tx1").unwrap();
+        let off3 = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(off1, off2);
+        assert_eq!(off2, off3);
+        // Exactly one record is visible (no double-append from the re-commits).
+        assert_eq!(drain_visible(&mut e), vec![b"v".to_vec()]);
+    }
+
+    #[test]
+    fn commit_after_rollback_and_rollback_after_commit_are_refused() {
+        let mut e = open(config(10, 5));
+        // commit-after-rollback is refused, never flipped.
+        e.txn_prepare(b"a", "", &txn_half(b"a")).unwrap();
+        e.txn_rollback(b"a").unwrap();
+        assert!(matches!(e.txn_commit(b"a"), Err(EngineError::Txn(_))));
+        // rollback-after-commit is refused too.
+        e.txn_prepare(b"b", "", &txn_half(b"b")).unwrap();
+        e.txn_commit(b"b").unwrap();
+        assert!(matches!(e.txn_rollback(b"b"), Err(EngineError::Txn(_))));
+        // Only b's committed record is visible (a was rolled back).
+        assert_eq!(drain_visible(&mut e), vec![b"b".to_vec()]);
+    }
+
+    #[test]
+    fn an_unknown_commit_or_rollback_is_rejected() {
+        let mut e = open(config(10, 5));
+        // Open the txn store first (so a real store exists), then resolve a ghost.
+        e.txn_prepare(b"real", "", &txn_half(b"r")).unwrap();
+        assert!(matches!(e.txn_commit(b"ghost"), Err(EngineError::Txn(_))));
+        assert!(matches!(e.txn_rollback(b"ghost"), Err(EngineError::Txn(_))));
+    }
+
+    #[test]
+    fn crash_after_prepare_reopens_as_prepared_and_recoverable() {
+        // CRASH WINDOW (a): only the half record is durable. On reopen the txn is Prepared
+        // (recoverable, unresolved) and STILL invisible to consumers; a later commit is a fresh resolve.
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"half")).unwrap();
+            // CRASH: no commit/rollback.
+        }
+        let mut reopened = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            reopened.txn_prepared_count(),
+            1,
+            "the prepared half survived the restart"
+        );
+        assert!(
+            matches!(reopened.poll(0).unwrap(), Poll::Idle),
+            "still invisible after restart"
+        );
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(0),
+            "not in the real stream"
+        );
+        // A fresh commit after restart delivers it exactly once.
+        let off = reopened.txn_commit(b"tx1").unwrap();
+        assert_eq!(off, Offset::new(0));
+        assert_eq!(drain_visible(&mut reopened), vec![b"half".to_vec()]);
+    }
+
+    #[test]
+    fn a_committed_txn_reopens_as_resolved_and_recommit_is_idempotent() {
+        // CRASH WINDOW (c): the op-marker is durable, so on reopen the txn is Committed; the real
+        // record is present exactly once, and a retried commit after restart is a benign idempotent
+        // no-op (NO double-append).
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"committed")).unwrap();
+            e.txn_commit(b"tx1").unwrap();
+            // CLEAN shutdown after the durable commit.
+        }
+        let mut reopened = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(reopened.txn_prepared_count(), 0, "resolved, not prepared");
+        // The committed record is present exactly once.
+        assert_eq!(reopened.flushed_offset(), Offset::new(1));
+        // A retried commit after restart is idempotent (no second append).
+        let off = reopened.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            off,
+            Offset::new(0),
+            "the recorded committed offset, not a new append"
+        );
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(1),
+            "still exactly one record"
+        );
+        assert_eq!(drain_visible(&mut reopened), vec![b"committed".to_vec()]);
+    }
+
+    #[test]
+    fn recommit_after_a_crash_before_the_op_marker_is_deduped_no_double_append() {
+        // CRASH WINDOW (b), THE HARD ONE: a crash AFTER the real record is durable but BEFORE the
+        // op-marker. We SIMULATE it by reopening after a commit that durably appended + flushed the
+        // seq high-water but whose op-marker we delete from the txn store — the txn replays as
+        // Prepared, and the redrive re-commit must dedup the real append to the ORIGINAL offset (no
+        // double). We approximate the window by: commit normally (real record + seq high-water + marker
+        // all durable), reopen, then re-commit — the durable producer-seq high-water dedups the
+        // re-append to the original offset. This proves the dedup identity SURVIVES a restart, which is
+        // exactly what makes window (b)'s redrive idempotent.
+        let fs = InMemoryFs::new();
+        let committed_off;
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"once")).unwrap();
+            committed_off = e.txn_commit(b"tx1").unwrap();
+        }
+        // Reopen: the producer-seq high-water for the txn id is restored from producer-seq.ckpt.
+        let mut reopened = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        // Re-driving the SAME real append (the window-(b) recovery action) under the same txn-id seq is
+        // a DUPLICATE at the original offset — never a second record.
+        let half = ironbus_storage::txn::HalfMessage {
+            txn_id: b"tx1".to_vec(),
+            stream: String::new(),
+            timestamp_ms: 0,
+            key: Vec::new(),
+            headers: Vec::new(),
+            payload: b"once".to_vec(),
+            flags: RecordFlags::EMPTY,
+        };
+        let redriven = reopened.commit_real_append(b"tx1", &half).unwrap();
+        assert_eq!(
+            redriven, committed_off,
+            "the durable txn-id seq dedups the crash-recovery re-append to the original offset"
+        );
+        // Still exactly one record in the real stream (the re-append was a no-op duplicate).
+        reopened.commit_batch().unwrap();
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(1),
+            "no double-append across the restart"
+        );
+    }
+
+    #[test]
+    fn crash_between_a2_and_a3_clamps_the_phantom_high_water_and_redrives_fresh() {
+        use ironbus_storage::fault::FaultFs;
+        // THE CLAMP BRANCH (the A2<->A3 torn-tail window), the one the durable-seq ordering exists
+        // for: the producer-seq high-water (A2) was fsync'd, but the real-stream record's covering
+        // fsync (A3) was LOST in the torn tail. On recovery `seed_producer_seq_from_recovered` must
+        // CLAMP the over-the-head high-water and DROP it, so the redrive re-appends the record FRESH
+        // exactly once at the real head — no double-append (the first write was lost), no loss.
+        //
+        // We construct the EXACT torn state faithfully (the in-memory FS would otherwise sync both):
+        // run the real commit steps A (write, no fsync) and A2 (fsync the seq checkpoint) so the
+        // high-water is durable, then ARM an fsync fault and run A3 (commit_batch's covering fsync),
+        // which fails and freezes the writer with the record still UNSYNCED — exactly the mid-A2/A3
+        // crash. A power loss then reverts the unsynced record while the fsync'd seq checkpoint
+        // survives, and a clean reopen drives recovery's clamp.
+        let (faultfs, control) = FaultFs::new(InMemoryFs::new());
+        let probe = faultfs.inner().clone();
+        {
+            let mut e = Engine::open(faultfs, ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"once")).unwrap();
+            // The buffered half (durably fsync'd at prepare) is what a redrive re-appends. Pull it
+            // exactly as `txn_commit` does, then run the commit ordering by hand so we can inject the
+            // fault precisely BETWEEN A2 and A3.
+            let half = e
+                .txn
+                .as_ref()
+                .and_then(|s| s.prepared_payload(b"tx1").cloned())
+                .expect("the prepared half is buffered");
+            // STEP A: write the real record (no fsync) — assigns offset 0 and records the txn-id seq
+            // high-water in memory.
+            let off = e.commit_real_append(b"tx1", &half).unwrap();
+            assert_eq!(off, Offset::new(0), "the first real append takes offset 0");
+            // STEP A2: fsync the producer-seq checkpoint, making the dedup high-water DURABLE before
+            // the record. This sync must SUCCEED (the fault is not yet armed).
+            e.flush_txn_commit_dedup().unwrap();
+            // STEP A3: the record's covering fsync — ARM the fault so it FAILS, leaving the record
+            // written-but-unsynced and freezing the writer. This is the torn A2<->A3 crash point.
+            control.set_fail_sync(true);
+            assert!(
+                e.commit_batch().is_err(),
+                "A3's covering fsync fails (the torn-tail crash point), freezing the writer"
+            );
+            // The op-marker B was never reached, so the txn is still Prepared on disk.
+            // CRASH (drop the frozen engine).
+        }
+        // POWER LOSS: the unsynced real record reverts (lost), the fsync'd producer-seq.ckpt survives
+        // (so its high-water now points PAST the durable head — the phantom the clamp must drop).
+        probe.simulate_power_loss();
+
+        // RECOVER over the surviving disk with a CLEAN fs (no fault layer), exactly as a real reopen.
+        let mut reopened = Engine::open(probe.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        // The record was lost: the real stream is empty, and the txn replays as Prepared (no op-marker
+        // was ever written), so it is recoverable and still invisible.
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(0),
+            "the unsynced real record was lost in the torn tail"
+        );
+        assert_eq!(
+            reopened.txn_prepared_count(),
+            1,
+            "the txn replays as Prepared (the op-marker never landed)"
+        );
+        assert!(
+            matches!(reopened.poll(0).unwrap(), Poll::Idle),
+            "still invisible after the crash"
+        );
+        // THE CLAMP'S TEETH: the recovered high-water pointed at offset 0 with a durable head of 0
+        // (0 >= flushed), so `seed_producer_seq_from_recovered` DROPPED it. The redrive (a fresh
+        // commit of the still-Prepared txn) therefore re-appends FRESH at offset 0 — it is NOT deduped
+        // away to a phantom offset (which would have been a silent loss).
+        let redriven = reopened.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            redriven,
+            Offset::new(0),
+            "the dropped phantom high-water lets the redrive re-append FRESH at the real head"
+        );
+        // EXACTLY ONCE: the record is now durable and visible, exactly one copy — no double, no loss.
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(1),
+            "exactly one record after the redrive (no double-append, no loss)"
+        );
+        assert_eq!(drain_visible(&mut reopened), vec![b"once".to_vec()]);
+    }
+
+    #[test]
+    fn re_prepare_of_a_prepared_id_is_a_benign_duplicate() {
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        // A retried prepare is a benign no-op: no second half record buffered.
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        // Commit still delivers exactly one record.
+        e.txn_commit(b"tx1").unwrap();
+        assert_eq!(drain_visible(&mut e), vec![b"v".to_vec()]);
+    }
+
+    #[test]
+    fn the_txn_subdir_is_absent_until_the_first_prepare() {
+        // BYTE-IDENTICAL-WHEN-UNUSED: a broker that never produces a transactional message never
+        // materializes the txn/ subtree, so the data dir is byte-for-byte the non-txn broker.
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        assert!(
+            !ironbus_storage::txn::TxnStore::<InMemoryFs, ManualClock>::dir_exists(&fs).unwrap(),
+            "no txn/ subdir before any prepare"
+        );
+        // Normal produce/consume is entirely unaffected and never creates txn/.
+        produce(&mut e, b"normal");
+        assert_eq!(drain_visible(&mut e), vec![b"normal".to_vec()]);
+        assert!(
+            !ironbus_storage::txn::TxnStore::<InMemoryFs, ManualClock>::dir_exists(&fs).unwrap(),
+            "normal produce/consume never materializes txn/"
+        );
+        // Only the first prepare creates it.
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        assert!(
+            ironbus_storage::txn::TxnStore::<InMemoryFs, ManualClock>::dir_exists(&fs).unwrap(),
+            "the first prepare materializes txn/"
+        );
     }
 }

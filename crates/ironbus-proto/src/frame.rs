@@ -415,6 +415,42 @@ pub enum FrameType {
     /// cluster data plane (`crate::cluster::dataplane` / `crate::cluster::serve` in `ironbus-server`) is
     /// its only encoder/decoder.
     CommittedHwQuery,
+    /// Producer → broker TRANSACTIONAL HALF-MESSAGE PREPARE (#640, V2-M8, wire tag 44). The producer
+    /// sends a half (prepared) message: a target stream + the verbatim [`crate::message::PubBody`]
+    /// payload + a producer-supplied transaction id. The broker durably stores the half message in its
+    /// `<data_dir>/txn/` half-log and acks, but the message is INVISIBLE to consumers — it is NOT in
+    /// the real target stream. The producer then runs its local transaction and sends
+    /// [`FrameType::TxnCommit`] (the half message becomes visible) or [`FrameType::TxnRollback`] (it is
+    /// discarded, never delivered). This is the `RocketMQ` transactional-message model adapted to
+    /// IronBus. The SUCCESS reply is a body-less [`FrameType::Ok`] (the half message is durable); a
+    /// malformed body / over-long id / too-many-prepared is an [`FrameType::Err`]. It is a NEW
+    /// append-only tag a non-transactional client never sends; tags 1-43 are byte-for-byte unchanged,
+    /// and a deployment that never sends it has no `txn/` subtree (the hot path is unchanged). Body: a
+    /// [`crate::message::TxnPrepareBody`] (`body_version: u8`, `field_len: u16` over `txn_id` then
+    /// `stream_id` each u16-length-prefixed, then the verbatim `PubBody` bytes as the remainder).
+    TxnPrepare,
+    /// Producer → broker TRANSACTIONAL COMMIT (#640, V2-M8, wire tag 45). Commits the prepared half
+    /// message named by `txn_id`: the broker appends the buffered payload to the REAL target stream
+    /// (the half message becomes visible to consumers) and writes a committed op-marker, then returns
+    /// the committed offset. IDEMPOTENT: a retried commit of an already-committed txn returns the
+    /// original offset and appends nothing (never an error); a commit of an already-ROLLED-BACK txn is
+    /// REFUSED (the outcome is never silently flipped). The SUCCESS reply is a [`FrameType::PubAck`]
+    /// (tag 14) carrying the committed offset (reusing the frozen 8-byte-offset body); an unknown /
+    /// already-rolled-back / malformed txn id is an [`FrameType::Err`]. A NEW append-only tag a
+    /// non-transactional client never sends; tags 1-44 are byte-for-byte unchanged. Body: a
+    /// [`crate::message::TxnResolveBody`] (`body_version: u8`, `field_len: u16` over the `txn_id`
+    /// u16-length name).
+    TxnCommit,
+    /// Producer → broker TRANSACTIONAL ROLLBACK (#640, V2-M8, wire tag 46). Rolls back the prepared
+    /// half message named by `txn_id`: the broker writes a rolled-back op-marker and the buffered
+    /// payload is DISCARDED — it is never appended to the real stream, never delivered to a consumer.
+    /// IDEMPOTENT: a retried rollback of an already-rolled-back txn is a benign success; a rollback of
+    /// an already-COMMITTED txn is REFUSED (never flipped). The SUCCESS reply is a body-less
+    /// [`FrameType::Ok`]; an unknown / already-committed / malformed txn id is an [`FrameType::Err`]. A
+    /// NEW append-only tag a non-transactional client never sends; tags 1-45 are byte-for-byte
+    /// unchanged. Body: a [`crate::message::TxnResolveBody`] (the same shape as `TxnCommit`: a
+    /// `txn_id` u16-length name in a version/length-framed block).
+    TxnRollback,
 }
 
 impl FrameType {
@@ -465,6 +501,9 @@ impl FrameType {
             FrameType::LeafPush => 41,
             FrameType::NotLeader => 42,
             FrameType::CommittedHwQuery => 43,
+            FrameType::TxnPrepare => 44,
+            FrameType::TxnCommit => 45,
+            FrameType::TxnRollback => 46,
         }
     }
 
@@ -516,6 +555,9 @@ impl FrameType {
             41 => FrameType::LeafPush,
             42 => FrameType::NotLeader,
             43 => FrameType::CommittedHwQuery,
+            44 => FrameType::TxnPrepare,
+            45 => FrameType::TxnCommit,
+            46 => FrameType::TxnRollback,
             _ => return None,
         })
     }
@@ -648,7 +690,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 43] = [
+    const ALL_TYPES: [FrameType; 46] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -692,6 +734,9 @@ mod tests {
         FrameType::LeafPush,
         FrameType::NotLeader,
         FrameType::CommittedHwQuery,
+        FrameType::TxnPrepare,
+        FrameType::TxnCommit,
+        FrameType::TxnRollback,
     ];
 
     #[test]
@@ -753,6 +798,9 @@ mod tests {
         assert_eq!(FrameType::LeafPush.as_u8(), 41);
         assert_eq!(FrameType::NotLeader.as_u8(), 42);
         assert_eq!(FrameType::CommittedHwQuery.as_u8(), 43);
+        assert_eq!(FrameType::TxnPrepare.as_u8(), 44);
+        assert_eq!(FrameType::TxnCommit.as_u8(), 45);
+        assert_eq!(FrameType::TxnRollback.as_u8(), 46);
     }
 
     #[test]
@@ -771,8 +819,9 @@ mod tests {
         // cluster SegmentFingerprints divergence-advertisement (#611, V2-C4-I1); 40 is the
         // cross-cluster MirrorPull (#623, V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through
         // (#625, V2-C7-I3); 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read
-        // dirty-tier CommittedHwQuery confirm (#739); 44 is now the next-free (still unknown) tag, so it
-        // frames but is not known.
+        // dirty-tier CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs
+        // TxnPrepare/TxnCommit/TxnRollback (#640, V2-M8); 47 is now the next-free (still unknown) tag,
+        // so it frames but is not known.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -783,7 +832,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
         assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
-        assert_eq!(FrameType::from_u8(44), None);
+        assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
+        assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
+        assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
+        assert_eq!(FrameType::from_u8(47), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -827,7 +879,8 @@ mod tests {
         // divergence-query (#599); 39 is the cluster SegmentFingerprints divergence-advertisement
         // (#611); 40 is the cross-cluster MirrorPull (#623); 41 is the edge leaf-spoke LeafPush (#625);
         // 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read dirty-tier
-        // CommittedHwQuery confirm (#739); 44 is the next-free (still unknown) tag.
+        // CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs (#640); 47 is
+        // the next-free (still unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -838,7 +891,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
         assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
-        assert_eq!(FrameType::from_u8(44), None);
+        assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
+        assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
+        assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
+        assert_eq!(FrameType::from_u8(47), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -876,6 +932,37 @@ mod tests {
                 assert_eq!(body, b"\x01\x02");
             }
             FrameDecode::Incomplete { .. } => panic!("complete"),
+        }
+    }
+
+    #[test]
+    fn txn_half_message_tags_are_the_next_free_tags_after_committed_hw_query() {
+        // #640 (V2-M8): the transactional half-message verbs TxnPrepare (44), TxnCommit (45), and
+        // TxnRollback (46) take the next FREE tags after the follower-read CommittedHwQuery confirm
+        // (43). Pinned here so a future reorder breaks a test, not a deployed protocol. They are
+        // ADDITIVE: tags 1-43 are byte-for-byte unchanged, and a non-transactional client never sends
+        // them; 47 is the next-free (still unknown) tag.
+        assert_eq!(FrameType::TxnPrepare.as_u8(), 44);
+        assert_eq!(FrameType::TxnCommit.as_u8(), 45);
+        assert_eq!(FrameType::TxnRollback.as_u8(), 46);
+        assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
+        assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
+        assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
+        assert_eq!(FrameType::from_u8(47), None);
+        for ty in [
+            FrameType::TxnPrepare,
+            FrameType::TxnCommit,
+            FrameType::TxnRollback,
+        ] {
+            let mut buf = Vec::new();
+            encode_frame(ty, b"\x01\x02", &mut buf).unwrap();
+            match decode_frame(&buf).unwrap() {
+                FrameDecode::Frame { type_tag, body, .. } => {
+                    assert_eq!(FrameType::from_u8(type_tag), Some(ty));
+                    assert_eq!(body, b"\x01\x02");
+                }
+                FrameDecode::Incomplete { .. } => panic!("complete"),
+            }
         }
     }
 
@@ -931,7 +1018,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
         assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
-        assert_eq!(FrameType::from_u8(44), None);
+        assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
+        assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
+        assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
+        assert_eq!(FrameType::from_u8(47), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -974,7 +1064,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
         assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
-        assert_eq!(FrameType::from_u8(44), None);
+        assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
+        assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
+        assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
+        assert_eq!(FrameType::from_u8(47), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -1169,7 +1262,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 44u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 47u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
