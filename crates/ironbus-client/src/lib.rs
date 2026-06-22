@@ -4500,6 +4500,67 @@ mod tests {
     }
 
     #[test]
+    fn fire_and_forget_producer_coalesces_yet_every_record_lands_in_order_end_to_end() {
+        // The coalescing QoS-0 producer batches many fire-and-forget Pubs into the wire buffer and
+        // writes them with one `write_all` (here via the explicit flush, the batch being well under the
+        // 32 KiB auto-flush threshold), yet every record still lands durably IN ORDER, and the coalesced
+        // no-ack batch does NOT desync the connection: a following at-least-once produce on the SAME
+        // connection still gets its PubAck at the next offset.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        {
+            let mut producer = c.fire_and_forget_producer();
+            for i in 0..5u8 {
+                producer
+                    .send(&PubBody {
+                        flags: 0,
+                        timestamp_ms: 0,
+                        key: b"",
+                        headers: b"",
+                        dedup: None,
+                        fire_and_forget: false, // forced true by the producer
+                        payload: &[b'a' + i],
+                    })
+                    .unwrap();
+            }
+            // The 5 small publishes are still buffered (well under the 32 KiB flush threshold); the
+            // explicit flush is what puts them on the wire with one `write_all`.
+            producer.flush().unwrap();
+        }
+        // A normal at-least-once produce on the SAME connection still gets its PubAck at offset 5,
+        // proving the 5 coalesced no-ack frames did not leave a stray reply on the wire.
+        let offset = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"alo",
+            })
+            .unwrap();
+        assert_eq!(
+            offset, 5,
+            "the at-least-once produce landed after the 5 coalesced QoS-0 ones"
+        );
+        // Fetch: all 6 records are durable and in order; the coalesced batch landed at offsets 0..=4.
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(
+            messages.len(),
+            6,
+            "all 5 coalesced records plus the at-least-once one are durable"
+        );
+        for (i, m) in messages.iter().take(5).enumerate() {
+            assert_eq!(m.offset, i as u64);
+            assert_eq!(m.payload, vec![b'a' + i as u8]);
+        }
+        assert_eq!(messages[5].payload, b"alo");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn produce_dedup_surfaces_duplicate_true_on_a_retry_end_to_end() {
         // The #33 end-to-end client property: an opt-in dedup produce is a fresh PubAck (duplicate =
         // false) the first time; the SAME (producer, msg_id) retried is a PubAckDuplicate the client
