@@ -1640,6 +1640,141 @@ fn txn_store_error_to_engine(e: TxnStoreError) -> EngineError {
     }
 }
 
+/// One `TxnCheck` the broker's back-check scan has queued for delivery to a producer connection (#640
+/// part 2): the producer connection (`member`) to push it to, and the `txn_id` to ask about. Drained
+/// onto the wire on that producer's own serve pass (the thread-per-connection server only writes a
+/// connection's socket from that connection's pass), exactly like a Level-2 `ReadyConfirm`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadyCheck {
+    /// The producer connection (`MemberId` raw value) the `TxnCheck` is routed to.
+    pub member: u64,
+    /// The in-doubt transaction id to ask the producer's listener about.
+    pub txn_id: Vec<u8>,
+}
+
+/// The default cap on QUEUED-but-undrained `TxnCheck`s the broker holds at once (#640 part 2): the
+/// global ready-queue bound, the same drop-oldest discipline as the Level-2 confirm ready queue. A
+/// producer that registered a listener but never drives a pass (so its `TxnCheck`s never leave the
+/// queue) cannot grow it without bound; an over-cap push drops the oldest queued check (the txn stays
+/// Prepared and is re-checked on a later scan, so nothing is lost).
+const DEFAULT_MAX_PENDING_CHECKS: usize = 65_536;
+
+/// The broker-side back-check ROUTER (#640 part 2): the in-memory, session-scoped routing + delivery
+/// state that turns the durable [`ironbus_core::txn::BackCheckBook`] schedule into a `TxnCheck` pushed
+/// to the right (re)connected producer. It holds three small maps, all EMPTY until a producer both
+/// runs transactions and registers a listener — so a non-transactional (or non-back-checking) broker
+/// pays nothing and the hot path is byte-for-byte unchanged.
+///
+/// - `group_listener`: the live route — each registered listener GROUP to the producer connection
+///   (`MemberId`) that currently holds it. A reconnecting producer re-registers the same group,
+///   superseding the stale binding, so the route follows the producer across a crash.
+/// - `txn_owner`: each still-`Prepared` txn to the listener group that owns it (recorded at prepare),
+///   so the scan knows which connection to route a txn's `TxnCheck` to. A txn with no owning group (a
+///   producer that prepared without registering a listener) is simply not routable — its back-check
+///   waits, and the bounded attempt cap eventually applies the SAFE terminal default (rollback), so a
+///   listener-less producer's crashed half message is still never stuck forever.
+/// - `pending`: the FIFO queue of [`ReadyCheck`]s awaiting drain by their producer connection, bounded
+///   drop-oldest like the confirm ready queue.
+#[derive(Clone, Debug, Default)]
+pub struct TxnBackCheck {
+    /// Each registered listener group to the live producer connection (`MemberId` raw) holding it.
+    group_listener: std::collections::HashMap<Vec<u8>, u64>,
+    /// Each still-`Prepared` txn id to its owning listener group (recorded at prepare, removed on
+    /// resolve), so the scan routes a `TxnCheck` to the group's current listener.
+    txn_owner: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// The FIFO queue of `TxnCheck`s awaiting drain by their producer connection, oldest first.
+    pending: std::collections::VecDeque<ReadyCheck>,
+    /// The cap on queued-but-undrained `TxnCheck`s (drop-oldest past it).
+    max_pending: usize,
+}
+
+impl TxnBackCheck {
+    /// A fresh, empty router at the default queue cap.
+    fn new() -> TxnBackCheck {
+        TxnBackCheck {
+            group_listener: std::collections::HashMap::new(),
+            txn_owner: std::collections::HashMap::new(),
+            pending: std::collections::VecDeque::new(),
+            max_pending: DEFAULT_MAX_PENDING_CHECKS,
+        }
+    }
+
+    /// Binds `group` to the producer connection `member` (the `TxnListen` registration), superseding any
+    /// prior binding so a reconnecting producer re-points the route to its NEW connection.
+    fn register_listener(&mut self, group: &[u8], member: u64) {
+        self.group_listener.insert(group.to_vec(), member);
+    }
+
+    /// Records that the still-`Prepared` `txn_id` is owned by the listener `group` (called at prepare),
+    /// so the scan can route the txn's `TxnCheck`. A no-op for an empty group (an unrouted txn).
+    fn set_owner(&mut self, txn_id: &[u8], group: &[u8]) {
+        if !group.is_empty() {
+            self.txn_owner.insert(txn_id.to_vec(), group.to_vec());
+        }
+    }
+
+    /// Drops a resolved txn's owner mapping (called on commit/rollback/terminal-default), so a settled
+    /// txn is never routed again.
+    fn forget_owner(&mut self, txn_id: &[u8]) {
+        self.txn_owner.remove(txn_id);
+    }
+
+    /// The live listener connection for `txn_id`'s owning group, or `None` if the txn has no owning
+    /// group (a listener-less prepare) or no connection currently holds that group (the producer has
+    /// not yet reconnected + re-registered). `None` means "not routable right now" — the scan records
+    /// no attempt and waits for the producer to (re)appear.
+    fn route_for(&self, txn_id: &[u8]) -> Option<u64> {
+        let group = self.txn_owner.get(txn_id)?;
+        self.group_listener.get(group).copied()
+    }
+
+    /// Queues a `TxnCheck` for delivery to `member`, bounded drop-oldest (an over-cap push drops the
+    /// oldest queued check; its txn stays Prepared and is re-checked on a later scan).
+    fn enqueue(&mut self, member: u64, txn_id: &[u8]) {
+        while self.pending.len() >= self.max_pending {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(ReadyCheck {
+            member,
+            txn_id: txn_id.to_vec(),
+        });
+    }
+
+    /// Drains every queued `TxnCheck` for `member` (a producer connection draining on its own pass), in
+    /// oldest-first order, leaving other producers' queued checks in place.
+    fn drain_for(&mut self, member: u64) -> Vec<ReadyCheck> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let mut mine = Vec::new();
+        let mut others = std::collections::VecDeque::with_capacity(self.pending.len());
+        for c in self.pending.drain(..) {
+            if c.member == member {
+                mine.push(c);
+            } else {
+                others.push_back(c);
+            }
+        }
+        self.pending = others;
+        mine
+    }
+
+    /// Removes a disconnected producer connection's listener bindings and queued checks. Its
+    /// `group_listener` entries (those still pointing at THIS member) are cleared so a stale route is
+    /// never used, and its queued checks are dropped (nobody is on that connection to receive them — the
+    /// txns stay Prepared and are re-routed once the producer reconnects + re-registers).
+    fn drop_member(&mut self, member: u64) {
+        self.group_listener.retain(|_, m| *m != member);
+        self.pending.retain(|c| c.member != member);
+    }
+
+    /// Whether the router has any state at all — the scan's hot-path no-op gate combined with the book
+    /// being empty (a broker with no in-doubt txns and no listeners does ZERO work).
+    fn is_idle(&self) -> bool {
+        self.group_listener.is_empty() && self.txn_owner.is_empty() && self.pending.is_empty()
+    }
+}
+
 /// The build version string for the metric registry's `ironbus_build_info` (#97), the crate
 /// version baked in at compile time.
 fn crate_version() -> &'static str {
@@ -2433,6 +2568,13 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// with NO total-byte cap (a half message / op-marker must never be shed — a prepared half message
     /// is an undelivered durable payload, and a resolution is the durable record of the commit/rollback).
     txn_config: LogConfig,
+    /// The broker-side back-check ROUTER (V2-M8, #640 part 2): the in-memory routing + delivery state
+    /// that turns the durable back-check schedule into a `TxnCheck` pushed to the right (re)connected
+    /// producer's listener. EMPTY until a producer both runs transactions and registers a listener, so a
+    /// non-back-checking broker pays nothing. The DURABLE half of the back-check (the schedule + attempt
+    /// count) lives in the txn store's [`ironbus_core::txn::BackCheckBook`]; this is only the (lost-on-
+    /// restart, rebuilt-by-re-registration) routing.
+    txn_back_check: TxnBackCheck,
     /// The per-STREAM default message TTL (V2-M4, #549): a record reached on the poll path whose
     /// EFFECTIVE TTL (the lower of this and the record's own per-message TTL) has passed against the
     /// WALL-clock seam (anchored to the record's durable producer `timestamp_ms`) is EXPIRED — skipped
@@ -2774,6 +2916,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 log.clock_clone(),
                 txn_config,
                 ironbus_core::txn::TxnConfig::default(),
+                ironbus_core::txn::BackCheckConfig::default(),
             )?)
         } else {
             None
@@ -2849,6 +2992,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // non-transactional broker keeps this `None`, so the produce/consume hot path is unchanged.
             txn,
             txn_config,
+            // The back-check router (#640 part 2): empty until a producer registers a transaction
+            // listener, so a non-back-checking broker pays nothing. The durable schedule it drives lives
+            // in the txn store; this routing is rebuilt by the producers' re-registration after a
+            // restart (a reconnecting producer re-sends `TxnListen`).
+            txn_back_check: TxnBackCheck::new(),
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
@@ -3914,6 +4062,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 self.log.clock_clone(),
                 self.txn_config,
                 ironbus_core::txn::TxnConfig::default(),
+                ironbus_core::txn::BackCheckConfig::default(),
             )
             .map_err(EngineError::Storage)?;
             self.txn = Some(store);
@@ -3935,8 +4084,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         txn_id: &[u8],
         stream: &str,
         message: &Append<'_>,
+        listener_group: &[u8],
     ) -> Result<(), EngineError> {
         let now = self.log.now_monotonic();
+        let back_check_timeout = {
+            let store = self.ensure_txn_store()?;
+            store.back_check().config().timeout
+        };
         let store = self.ensure_txn_store()?;
         // Decide FIRST on the pure lifecycle (no IO): a fresh prepare durably buffers; a benign
         // duplicate re-acks without a second half record; a spent/over-cap id is refused.
@@ -3945,19 +4099,38 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .prepare(txn_id, now)
             .map_err(EngineError::Txn)?
         {
-            ironbus_core::txn::PrepareDecision::AlreadyPrepared => Ok(()),
+            ironbus_core::txn::PrepareDecision::AlreadyPrepared => {
+                // A benign duplicate: the half message (and its back-check enrollment) is already
+                // tracked. Refresh the owning listener group in case a re-prepare arrived on a new
+                // connection that registered a different group (the owner follows the latest prepare).
+                self.txn_back_check.set_owner(txn_id, listener_group);
+                Ok(())
+            }
             ironbus_core::txn::PrepareDecision::Prepared => {
                 // Durably append + fsync the half record. If the durable write fails, ROLL BACK the
                 // in-memory prepared state so the table and the durable log stay consistent (the
                 // prepare did not happen), and surface the error.
                 match store.append_half(txn_id, stream, message) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        // Enroll the fresh half message for back-checking: it becomes eligible for its
+                        // first `TxnCheck` once it has been Prepared (undelivered) for the back-check
+                        // timeout. The schedule + count are made durable only when the FIRST attempt is
+                        // recorded (a never-back-checked txn writes no extra record), so a normal
+                        // prepare→commit produces zero back-check IO. Record the owning listener group so
+                        // the scan can route the check to the producer.
+                        store
+                            .back_check_mut()
+                            .enroll(txn_id, now.saturating_add(back_check_timeout));
+                        self.txn_back_check.set_owner(txn_id, listener_group);
+                        Ok(())
+                    }
                     Err(e) => {
                         // The half record is NOT durable: undo the in-memory prepare (mark it rolled
                         // back in memory only — no op record is written, and on reopen there is no half
                         // record either, so the txn is simply absent). We use the table's rollback to
                         // clear the prepared entry; the durable log never saw this txn.
                         let _ = store.table_mut().rollback(txn_id, now);
+                        store.back_check_mut().forget(txn_id);
                         Err(txn_store_error_to_engine(e))
                     }
                 }
@@ -4031,6 +4204,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 store
                     .mark_committed(txn_id, real_offset.get())
                     .map_err(txn_store_error_to_engine)?;
+                // The txn is resolved: drop its back-check bookkeeping (never back-check it again) and
+                // its routing owner. The durable BACK record (if any was written) is superseded by the
+                // committed op-marker on a future replay, so no durable cleanup is needed here.
+                store.back_check_mut().forget(txn_id);
+                self.txn_back_check.forget_owner(txn_id);
                 Ok(real_offset)
             }
         }
@@ -4149,11 +4327,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     pub fn txn_rollback(&mut self, txn_id: &[u8]) -> Result<(), EngineError> {
         let now = self.log.now_monotonic();
         let store = self.ensure_txn_store()?;
-        match store
+        let decision = store
             .table_mut()
             .rollback(txn_id, now)
-            .map_err(EngineError::Txn)?
-        {
+            .map_err(EngineError::Txn)?;
+        match decision {
             // A retried rollback of an already-rolled-back txn: benign no-op (the op-marker is durable).
             ironbus_core::txn::ResolveDecision::AlreadyResolved => Ok(()),
             ironbus_core::txn::ResolveDecision::Resolved => {
@@ -4161,7 +4339,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 // dropped by the store; it never reaches the real stream.
                 store
                     .mark_rolled_back(txn_id)
-                    .map_err(txn_store_error_to_engine)
+                    .map_err(txn_store_error_to_engine)?;
+                // The txn is resolved: drop its back-check bookkeeping (never back-check it again) and
+                // its routing owner. (Same cleanup as the commit path; the rolled-back op-marker
+                // supersedes any durable BACK record on a future replay.)
+                store.back_check_mut().forget(txn_id);
+                self.txn_back_check.forget_owner(txn_id);
+                Ok(())
             }
         }
     }
@@ -4171,6 +4355,166 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn txn_prepared_count(&self) -> usize {
         self.txn.as_ref().map_or(0, TxnStore::prepared_count)
+    }
+
+    /// The count of currently-enrolled (under-back-check) txns (#640 part 2), for observability.
+    /// `0` when no txn store is open.
+    #[must_use]
+    pub fn txn_under_back_check(&self) -> usize {
+        self.txn.as_ref().map_or(0, TxnStore::under_back_check)
+    }
+
+    /// Registers (or re-registers, after a reconnect) producer connection `member` as the live listener
+    /// for transaction `listener_group` (#640 part 2, the `TxnListen` verb). A reconnecting producer
+    /// re-sends this with the SAME group to re-point a back-check route to its NEW connection, so a
+    /// `TxnCheck` for a half message the producer prepared on a now-dead connection reaches its current
+    /// connection. Superseding (not additive): one connection owns a group at a time.
+    pub fn register_txn_listener(&mut self, listener_group: &[u8], member: MemberId) {
+        self.txn_back_check
+            .register_listener(listener_group, member.get());
+    }
+
+    /// Removes a disconnected producer connection's back-check listener bindings and queued `TxnCheck`s
+    /// (#640 part 2). Called from the connection close path alongside [`Engine::drop_l2_confirms`]: a
+    /// stale route is never used, and an in-doubt txn whose listener just vanished stays Prepared and is
+    /// re-routed once the producer reconnects + re-registers (or, after the bounded attempt cap, is
+    /// safely rolled back). A no-op for a connection that never registered a listener.
+    pub fn drop_txn_listener(&mut self, member: MemberId) {
+        self.txn_back_check.drop_member(member.get());
+    }
+
+    /// Drains every queued `TxnCheck` for producer connection `member` (#640 part 2), oldest-first, so
+    /// the connection writes them onto its own pass (the thread-per-connection server only writes a
+    /// connection's socket from that connection's pass — the same cross-thread hand-off as the L2
+    /// confirm drain). Returns `(member, txn_id)` pairs (here just the `txn_id`s, all for `member`). A
+    /// no-op (empty) for a connection with no queued checks.
+    pub fn drain_txn_checks(&mut self, member: MemberId) -> Vec<ReadyCheck> {
+        self.txn_back_check.drain_for(member.get())
+    }
+
+    /// The back-check SCAN TICK (#640 part 2): the cheap periodic task that finds every in-doubt
+    /// half message DUE for a back-check, pushes a `TxnCheck` to the (re)connected producer's listener,
+    /// records the attempt DURABLY, and — after the bounded attempt cap — applies the SAFE TERMINAL
+    /// default (rollback/discard, never delivering a message whose outcome is unknowable). Returns the
+    /// number of `TxnCheck`s queued this pass (for tests/observability).
+    ///
+    /// CHEAP-WHEN-UNUSED: returns immediately with ZERO work when no txn store is open OR the back-check
+    /// book is empty (no in-doubt txns) — no lock, no alloc, no syscall. It rides the engine's existing
+    /// maintenance tick (the produce/poll seam), so it adds no new timer. BOUNDED: the book's `due`
+    /// query is capped at the global per-pass batch (no storm), and each due txn respects its durable
+    /// per-txn next-eligible schedule.
+    ///
+    /// The terminal default is driven through the SAME idempotent [`Engine::txn_rollback`] path as a
+    /// producer-driven rollback, so it inherits part 1's `AlreadyResolved` rule: if the producer's
+    /// `TxnCheckResult` lands in the same window, whichever resolve wins is terminal and the other is a
+    /// benign duplicate / refused flip — never a double-resolve.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the durable attempt record or the terminal-default rollback.
+    pub fn txn_back_check_tick(&mut self) -> Result<usize, EngineError>
+    where
+        F: Clone,
+    {
+        // HOT-PATH NO-OP: no txn store, or no in-doubt txns AND no router state, means nothing to do.
+        let Some(store) = self.txn.as_ref() else {
+            return Ok(0);
+        };
+        if store.back_check().is_empty() && self.txn_back_check.is_idle() {
+            return Ok(0);
+        }
+        let now = self.log.now_monotonic();
+        // The pure schedule decides which txns are DUE (bounded by the global batch cap — no storm).
+        let due = self
+            .txn
+            .as_ref()
+            .map(|s| s.back_check().due(now))
+            .unwrap_or_default();
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let mut issued = 0;
+        for txn_id in due {
+            // Defensive: a txn that resolved between the `due` scan and here is no longer Prepared; skip
+            // it (its book entry is already forgotten, so `due` won't return it again).
+            let still_prepared = self.txn.as_ref().is_some_and(|s| {
+                matches!(
+                    s.table().state(&txn_id),
+                    Some(ironbus_core::txn::TxnState::Prepared)
+                )
+            });
+            if !still_prepared {
+                continue;
+            }
+            // Record the attempt DURABLY first (the attempt count is the terminal-default gate; it must
+            // survive a restart). A crash after this but before the push simply re-checks the txn on the
+            // next scan — a safe at-least-once back-check whose resolution is idempotent.
+            let outcome = {
+                let store = self.ensure_txn_store()?;
+                let outcome = store.back_check_mut().record_attempt(&txn_id, now);
+                let (attempts, next_eligible) =
+                    store.back_check().bookkeeping(&txn_id).unwrap_or((0, now));
+                store
+                    .append_back_check(&txn_id, attempts, next_eligible)
+                    .map_err(txn_store_error_to_engine)?;
+                outcome
+            };
+            match outcome {
+                ironbus_core::txn::AttemptOutcome::TerminalDefault => {
+                    // The bounded attempt cap is reached with no resolution: apply the SAFE terminal
+                    // default — ROLLBACK (discard, never deliver a message whose outcome is unknowable).
+                    // Through the part-1 idempotent path, so a late producer `Commit` afterward is a
+                    // REFUSED flip (never a double-resolve). `txn_rollback` forgets the book + owner.
+                    self.txn_rollback(&txn_id)?;
+                }
+                ironbus_core::txn::AttemptOutcome::Rescheduled => {
+                    // Attempts remain: route a `TxnCheck` to the producer's live listener, if one is
+                    // currently registered for the txn's owning group. If not routable right now (the
+                    // producer has not yet reconnected + re-registered), the attempt was still recorded
+                    // (so the bounded cap still advances toward the terminal default) and the txn waits.
+                    if let Some(member) = self.txn_back_check.route_for(&txn_id) {
+                        self.txn_back_check.enqueue(member, &txn_id);
+                        issued += 1;
+                    }
+                }
+            }
+        }
+        Ok(issued)
+    }
+
+    /// Resolves an in-doubt transaction from a producer's `TxnCheckResult` back-check answer (#640
+    /// part 2): a `Commit` drives the SAME idempotent [`Engine::txn_commit`] path (the half message
+    /// becomes visible EXACTLY ONCE), a `Rollback` the SAME [`Engine::txn_rollback`] path (discarded,
+    /// never delivered), and an `Unknown` is a no-op (the back-check reschedules and the bounded attempt
+    /// cap eventually applies the terminal default). The back-check NEVER introduces a new commit path,
+    /// so part 1's exactly-once + `AlreadyResolved` guarantees are inherited: a `Commit` for a txn the
+    /// terminal default already rolled back is a REFUSED flip (returned as the typed error), a duplicate
+    /// `Commit` is a benign no-op returning the recorded offset, and a result for an unknown/never-seen
+    /// txn is a benign no-op.
+    ///
+    /// # Errors
+    /// [`EngineError::Txn`] for a conflicting flip (a `Commit` after a rollback or vice-versa — the
+    /// outcome is immutable), or a storage error from the resolve.
+    pub fn resolve_txn_check(
+        &mut self,
+        txn_id: &[u8],
+        decision: ironbus_proto::message::TxnCheckDecision,
+    ) -> Result<(), EngineError>
+    where
+        F: Clone,
+    {
+        use ironbus_proto::message::TxnCheckDecision;
+        // A result for a txn that is no longer Prepared (already resolved by a racing terminal default,
+        // a producer-driven resolve, or never seen) is a benign no-op for Commit/Rollback ONLY when it
+        // matches; the part-1 path itself enforces the AlreadyResolved rule, so we route straight
+        // through it and let it decide (idempotent duplicate vs refused flip vs fresh resolve).
+        match decision {
+            TxnCheckDecision::Commit => self.txn_commit(txn_id).map(|_offset| ()),
+            TxnCheckDecision::Rollback => self.txn_rollback(txn_id),
+            // The producer cannot decide yet: do nothing. The book already rescheduled this txn on the
+            // attempt that pushed the check, and the bounded attempt cap will eventually apply the
+            // terminal default if the producer never settles.
+            TxnCheckDecision::Unknown => Ok(()),
+        }
     }
 
     /// CREATE-OR-ENSURE the named stream `stream` WITHOUT producing to it (#588, M2-I10): the
@@ -15978,7 +16322,7 @@ mod tests {
         // THE INVISIBILITY INVARIANT: a Prepared-but-uncommitted half message is NEVER returned by the
         // consume path; it appears in the target stream ONLY after commit.
         let mut e = open(config(10, 5));
-        e.txn_prepare(b"tx1", "", &txn_half(b"half")).unwrap();
+        e.txn_prepare(b"tx1", "", &txn_half(b"half"), b"").unwrap();
         assert_eq!(e.txn_prepared_count(), 1);
         // The consumer sees NOTHING (the half message lives in txn/, not the real stream).
         assert!(
@@ -16001,7 +16345,8 @@ mod tests {
     fn a_rolled_back_half_message_is_never_delivered() {
         // After rollback the half message NEVER appears in the real stream.
         let mut e = open(config(10, 5));
-        e.txn_prepare(b"tx1", "", &txn_half(b"secret")).unwrap();
+        e.txn_prepare(b"tx1", "", &txn_half(b"secret"), b"")
+            .unwrap();
         e.txn_rollback(b"tx1").unwrap();
         assert_eq!(e.txn_prepared_count(), 0);
         assert!(
@@ -16022,7 +16367,7 @@ mod tests {
         // committed record lands at its own offset after the earlier normal produces.
         let mut e = open(config(10, 5));
         assert_eq!(produce(&mut e, b"n0"), Offset::new(0));
-        e.txn_prepare(b"tx1", "", &txn_half(b"txn")).unwrap();
+        e.txn_prepare(b"tx1", "", &txn_half(b"txn"), b"").unwrap();
         assert_eq!(produce(&mut e, b"n1"), Offset::new(1));
         // So far only the two normal produces are visible.
         // (Peek without acking is awkward; instead assert the txn commit lands at offset 2.)
@@ -16042,7 +16387,7 @@ mod tests {
     fn recommit_is_idempotent_returning_the_same_offset() {
         // A retried commit of an already-committed txn returns the SAME offset and appends nothing.
         let mut e = open(config(10, 5));
-        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        e.txn_prepare(b"tx1", "", &txn_half(b"v"), b"").unwrap();
         let off1 = e.txn_commit(b"tx1").unwrap();
         let off2 = e.txn_commit(b"tx1").unwrap();
         let off3 = e.txn_commit(b"tx1").unwrap();
@@ -16056,11 +16401,11 @@ mod tests {
     fn commit_after_rollback_and_rollback_after_commit_are_refused() {
         let mut e = open(config(10, 5));
         // commit-after-rollback is refused, never flipped.
-        e.txn_prepare(b"a", "", &txn_half(b"a")).unwrap();
+        e.txn_prepare(b"a", "", &txn_half(b"a"), b"").unwrap();
         e.txn_rollback(b"a").unwrap();
         assert!(matches!(e.txn_commit(b"a"), Err(EngineError::Txn(_))));
         // rollback-after-commit is refused too.
-        e.txn_prepare(b"b", "", &txn_half(b"b")).unwrap();
+        e.txn_prepare(b"b", "", &txn_half(b"b"), b"").unwrap();
         e.txn_commit(b"b").unwrap();
         assert!(matches!(e.txn_rollback(b"b"), Err(EngineError::Txn(_))));
         // Only b's committed record is visible (a was rolled back).
@@ -16071,7 +16416,7 @@ mod tests {
     fn an_unknown_commit_or_rollback_is_rejected() {
         let mut e = open(config(10, 5));
         // Open the txn store first (so a real store exists), then resolve a ghost.
-        e.txn_prepare(b"real", "", &txn_half(b"r")).unwrap();
+        e.txn_prepare(b"real", "", &txn_half(b"r"), b"").unwrap();
         assert!(matches!(e.txn_commit(b"ghost"), Err(EngineError::Txn(_))));
         assert!(matches!(e.txn_rollback(b"ghost"), Err(EngineError::Txn(_))));
     }
@@ -16083,7 +16428,7 @@ mod tests {
         let fs = InMemoryFs::new();
         {
             let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
-            e.txn_prepare(b"tx1", "", &txn_half(b"half")).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"half"), b"").unwrap();
             // CRASH: no commit/rollback.
         }
         let mut reopened = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
@@ -16115,7 +16460,8 @@ mod tests {
         let fs = InMemoryFs::new();
         {
             let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
-            e.txn_prepare(b"tx1", "", &txn_half(b"committed")).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"committed"), b"")
+                .unwrap();
             e.txn_commit(b"tx1").unwrap();
             // CLEAN shutdown after the durable commit.
         }
@@ -16152,7 +16498,7 @@ mod tests {
         let committed_off;
         {
             let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
-            e.txn_prepare(b"tx1", "", &txn_half(b"once")).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"once"), b"").unwrap();
             committed_off = e.txn_commit(b"tx1").unwrap();
         }
         // Reopen: the producer-seq high-water for the txn id is restored from producer-seq.ckpt.
@@ -16201,7 +16547,7 @@ mod tests {
         let probe = faultfs.inner().clone();
         {
             let mut e = Engine::open(faultfs, ManualClock::new(), config(10, 5)).unwrap();
-            e.txn_prepare(b"tx1", "", &txn_half(b"once")).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"once"), b"").unwrap();
             // The buffered half (durably fsync'd at prepare) is what a redrive re-appends. Pull it
             // exactly as `txn_commit` does, then run the commit ordering by hand so we can inject the
             // fault precisely BETWEEN A2 and A3.
@@ -16271,9 +16617,9 @@ mod tests {
     #[test]
     fn re_prepare_of_a_prepared_id_is_a_benign_duplicate() {
         let mut e = open(config(10, 5));
-        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        e.txn_prepare(b"tx1", "", &txn_half(b"v"), b"").unwrap();
         // A retried prepare is a benign no-op: no second half record buffered.
-        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        e.txn_prepare(b"tx1", "", &txn_half(b"v"), b"").unwrap();
         assert_eq!(e.txn_prepared_count(), 1);
         // Commit still delivers exactly one record.
         e.txn_commit(b"tx1").unwrap();
@@ -16298,10 +16644,273 @@ mod tests {
             "normal produce/consume never materializes txn/"
         );
         // Only the first prepare creates it.
-        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        e.txn_prepare(b"tx1", "", &txn_half(b"v"), b"").unwrap();
         assert!(
             ironbus_storage::txn::TxnStore::<InMemoryFs, ManualClock>::dir_exists(&fs).unwrap(),
             "the first prepare materializes txn/"
         );
+    }
+
+    // ---- the broker BACK-CHECK (#640 part 2) ----
+
+    /// The default back-check timeout in nanoseconds, so a test can advance the clock past it.
+    const BC_TIMEOUT: u64 = ironbus_core::txn::DEFAULT_BACK_CHECK_TIMEOUT_NANOS;
+
+    /// Drain-and-ack every visible default-group record, generic over the clock so the back-check tests
+    /// (which use an `Arc<ManualClock>` engine to advance the monotonic clock) can assert visibility.
+    fn drain_visible_generic<C: Clock + Clone + 'static>(
+        e: &mut Engine<InMemoryFs, C>,
+    ) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    seen.push(d.record.payload.to_vec());
+                    e.ack(&d.token);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn the_back_check_scan_is_a_no_op_when_no_txn_is_in_doubt() {
+        // BYTE-IDENTICAL-WHEN-UNUSED: the scan does ZERO work on a broker with no in-doubt txns. With no
+        // txn store at all it returns 0; even after a prepare-then-commit (no in-doubt txn left) it is a
+        // no-op.
+        let mut e = open(config(10, 5));
+        assert_eq!(e.txn_back_check_tick().unwrap(), 0, "no txn store: no-op");
+        e.txn_prepare(b"tx1", "", &txn_half(b"v"), b"svc").unwrap();
+        e.txn_commit(b"tx1").unwrap();
+        assert_eq!(e.txn_under_back_check(), 0);
+        assert_eq!(
+            e.txn_back_check_tick().unwrap(),
+            0,
+            "no in-doubt txn: scan is a no-op"
+        );
+    }
+
+    #[test]
+    fn a_prepared_half_is_not_back_checked_before_the_timeout() {
+        // The scan respects the back-check timeout: a freshly-prepared half message (well within a
+        // normal local-transaction window) is NOT back-checked.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        e.register_txn_listener(b"svc", MemberId::new(7));
+        e.txn_prepare(b"tx1", "", &txn_half(b"v"), b"svc").unwrap();
+        // Just under the timeout: nothing due, no check issued.
+        clock.advance_monotonic_nanos(BC_TIMEOUT - 1);
+        assert_eq!(e.txn_back_check_tick().unwrap(), 0, "not due yet");
+        assert!(e.drain_txn_checks(MemberId::new(7)).is_empty());
+    }
+
+    #[test]
+    fn the_headline_crash_reconnect_back_check_commit_delivers_exactly_once() {
+        // THE HEADLINE: a producer PREPAREs a half message under listener group "svc", then DISCONNECTS
+        // before commit (simulated crash) — the listener for "svc" is dropped. It RECONNECTS as a NEW
+        // connection and re-registers the SAME group. The back-check scan finds the in-doubt half, routes
+        // a TxnCheck to the reconnected listener, and the producer answers Commit → the half message is
+        // committed EXACTLY ONCE via the part-1 path.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        // The original (soon-to-crash) connection: member 1 registers the listener and prepares.
+        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.txn_prepare(b"tx1", "", &txn_half(b"order-42"), b"svc")
+            .unwrap();
+        assert_eq!(e.txn_under_back_check(), 1);
+        // CRASH: the original connection disconnects before resolving — its listener route is dropped.
+        e.drop_txn_listener(MemberId::new(1));
+        // Time passes past the back-check timeout. A scan now finds the in-doubt half, but the producer
+        // has NOT reconnected yet, so there is no live route: the attempt is recorded (the bounded cap
+        // advances) but no TxnCheck is delivered.
+        clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
+        assert_eq!(
+            e.txn_back_check_tick().unwrap(),
+            0,
+            "no live listener yet: nothing routed"
+        );
+        // The producer RECONNECTS as a NEW connection (member 2) and re-registers the SAME group.
+        e.register_txn_listener(b"svc", MemberId::new(2));
+        // The next scan (after the retry cadence) routes a TxnCheck to the reconnected listener.
+        clock.advance_monotonic_nanos(ironbus_core::txn::DEFAULT_BACK_CHECK_RETRY_NANOS + 1);
+        assert_eq!(
+            e.txn_back_check_tick().unwrap(),
+            1,
+            "the reconnected listener is back-checked"
+        );
+        let checks = e.drain_txn_checks(MemberId::new(2));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].txn_id, b"tx1");
+        // The producer's listener answers Commit → committed exactly once via the part-1 path.
+        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Commit)
+            .unwrap();
+        assert_eq!(e.txn_prepared_count(), 0);
+        assert_eq!(e.txn_under_back_check(), 0);
+        // The half message is now VISIBLE exactly once.
+        assert_eq!(drain_visible_generic(&mut e), vec![b"order-42".to_vec()]);
+        // A duplicate Commit result (a retried answer) is a benign no-op (idempotent), never a second
+        // delivery.
+        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Commit)
+            .unwrap();
+        assert!(
+            drain_visible_generic(&mut e).is_empty(),
+            "no second delivery"
+        );
+    }
+
+    #[test]
+    fn the_back_check_rollback_answer_discards_the_half_never_delivered() {
+        // The sibling of the headline: the reconnected listener answers Rollback → the half message is
+        // discarded and never delivered.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.txn_prepare(b"tx1", "", &txn_half(b"abort-me"), b"svc")
+            .unwrap();
+        clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
+        assert_eq!(e.txn_back_check_tick().unwrap(), 1);
+        let checks = e.drain_txn_checks(MemberId::new(1));
+        assert_eq!(checks[0].txn_id, b"tx1");
+        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Rollback)
+            .unwrap();
+        assert_eq!(e.txn_prepared_count(), 0);
+        assert!(
+            drain_visible_generic(&mut e).is_empty(),
+            "a rolled-back half is never delivered"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_producer_is_terminally_rolled_back_after_the_attempt_cap() {
+        // THE SAFE TERMINAL DEFAULT: a producer that never reconnects (no listener ever re-registered)
+        // is back-checked up to the attempt cap, then the half message is SAFELY rolled back (discarded,
+        // never delivered) — never a message whose outcome is unknowable is delivered.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        // No listener is ever registered (the producer crashed and never came back), but the half owns a
+        // group, so it is enrolled and the bounded attempt cap still advances on each scan.
+        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.txn_prepare(b"tx1", "", &txn_half(b"orphan"), b"svc")
+            .unwrap();
+        e.drop_txn_listener(MemberId::new(1)); // crash: no live listener
+        let max = ironbus_core::txn::DEFAULT_MAX_BACK_CHECK_ATTEMPTS;
+        // Run one scan per retry window up to the cap. Each records an attempt (no route, so no check
+        // delivered); the LAST one fires the terminal default (rollback).
+        clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
+        for _ in 0..max {
+            e.txn_back_check_tick().unwrap();
+            clock.advance_monotonic_nanos(ironbus_core::txn::DEFAULT_BACK_CHECK_RETRY_NANOS + 1);
+        }
+        // The half message has been terminally rolled back: no longer prepared, never delivered.
+        assert_eq!(e.txn_prepared_count(), 0, "terminally resolved");
+        assert_eq!(e.txn_under_back_check(), 0);
+        assert!(
+            drain_visible_generic(&mut e).is_empty(),
+            "the unknowable half is never delivered"
+        );
+    }
+
+    #[test]
+    fn a_commit_answer_after_the_terminal_rollback_is_refused_not_flipped() {
+        // IDEMPOTENCY/SAFETY: if the terminal default (rollback) already fired, a LATE producer Commit
+        // answer is REFUSED (the part-1 AlreadyResolved rule), never a flip, never a double-resolve.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.txn_prepare(b"tx1", "", &txn_half(b"late"), b"svc")
+            .unwrap();
+        e.drop_txn_listener(MemberId::new(1));
+        // Drive the scan to the terminal rollback.
+        let max = ironbus_core::txn::DEFAULT_MAX_BACK_CHECK_ATTEMPTS;
+        clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
+        for _ in 0..max {
+            e.txn_back_check_tick().unwrap();
+            clock.advance_monotonic_nanos(ironbus_core::txn::DEFAULT_BACK_CHECK_RETRY_NANOS + 1);
+        }
+        assert_eq!(e.txn_prepared_count(), 0, "terminally rolled back");
+        // A late Commit answer is REFUSED (the outcome is immutable), surfaced as a typed error.
+        let err = e
+            .resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Commit)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Txn(ironbus_core::txn::TxnError::AlreadyResolved {
+                    outcome: ironbus_core::txn::TxnOutcome::RolledBack
+                })
+            ),
+            "a commit after the terminal rollback is refused, not flipped: {err:?}"
+        );
+        // Still never delivered.
+        assert!(drain_visible_generic(&mut e).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_answer_reschedules_and_does_not_resolve() {
+        // An Unknown back-check answer leaves the half Prepared (the producer cannot decide yet); the
+        // scan reschedules and the bounded cap eventually applies the terminal default.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.txn_prepare(b"tx1", "", &txn_half(b"pending"), b"svc")
+            .unwrap();
+        clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
+        e.txn_back_check_tick().unwrap();
+        let checks = e.drain_txn_checks(MemberId::new(1));
+        assert_eq!(checks[0].txn_id, b"tx1");
+        // The producer answers Unknown: the half stays Prepared (not resolved), still invisible.
+        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Unknown)
+            .unwrap();
+        assert_eq!(e.txn_prepared_count(), 1, "still in-doubt after Unknown");
+        assert!(
+            matches!(e.poll(0).unwrap(), Poll::Idle),
+            "still invisible under back-check"
+        );
+    }
+
+    #[test]
+    fn the_back_check_schedule_resumes_after_a_restart() {
+        // DURABILITY: a prepared half with one recorded back-check attempt replays after a restart with
+        // its attempt count preserved and is immediately eligible, so the scan resumes (and reaches the
+        // terminal default in the remaining attempts).
+        let fs = InMemoryFs::new();
+        {
+            let clock = std::sync::Arc::new(ManualClock::new());
+            let mut e = Engine::open(fs.clone(), clock.clone(), config(10, 5)).unwrap();
+            e.register_txn_listener(b"svc", MemberId::new(1));
+            e.txn_prepare(b"tx1", "", &txn_half(b"survive"), b"svc")
+                .unwrap();
+            e.drop_txn_listener(MemberId::new(1));
+            // One scan records one attempt durably (no route, so no check delivered).
+            clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
+            e.txn_back_check_tick().unwrap();
+            assert_eq!(e.txn_under_back_check(), 1);
+        }
+        // Reopen the SAME fs (with an advanceable Arc clock): the half is still Prepared and still under
+        // back-check with its attempt count replayed.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(fs, clock.clone(), config(10, 5)).unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        assert_eq!(
+            e.txn_under_back_check(),
+            1,
+            "the back-check enrollment survived the restart"
+        );
+        // It is immediately eligible (rebased to 0), and the REMAINING attempts (one was already recorded
+        // before the restart, count carried across) still drive it to the terminal rollback (no listener
+        // ever re-registered). Advance the clock between scans so each is due past the retry cadence.
+        let max = ironbus_core::txn::DEFAULT_MAX_BACK_CHECK_ATTEMPTS;
+        for _ in 0..max {
+            e.txn_back_check_tick().unwrap();
+            clock.advance_monotonic_nanos(ironbus_core::txn::DEFAULT_BACK_CHECK_RETRY_NANOS + 1);
+        }
+        assert_eq!(
+            e.txn_prepared_count(),
+            0,
+            "the resumed scan reached the terminal default"
+        );
+        assert!(drain_visible_generic(&mut e).is_empty());
     }
 }

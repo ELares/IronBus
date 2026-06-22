@@ -472,6 +472,16 @@ where
     if session.produced_l2() {
         let _ = engine.with(move |e| e.drop_l2_confirms(member_id));
     }
+    // Drop this connection's back-check listener bindings + queued `TxnCheck`s (#640 part 2): a producer
+    // that registered a transaction listener then disconnected leaves a stale route, so the engine clears
+    // its `group -> member` bindings and any undrained checks. The in-doubt half messages it owned stay
+    // Prepared and are re-routed once the producer reconnects + re-registers (or, after the bounded
+    // attempt cap, safely rolled back). GATED on `registered_txn_listener` so a non-back-checking
+    // connection never routes this through the actor. This is the back-check twin of the L2-confirm
+    // "producer disconnect" cleanup above.
+    if session.registered_txn_listener() {
+        let _ = engine.with(move |e| e.drop_txn_listener(member_id));
+    }
     // Drop any released-but-undrained CLUSTER produce-acks for this connection (#719): a producer that
     // parked a `C2-fsync` ack, had it quorum-released into its outbox, then disconnected before draining
     // it leaves nothing to flush, so the gate's outbox entry is cleared rather than leaked. Off-actor (a
