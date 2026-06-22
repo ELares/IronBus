@@ -9,6 +9,21 @@ the same workload under the SAME durability semantics on the SAME hardware.** Nu
 reported as-measured; ties are ties; where the two systems are not at the same durability
 tier it is stated explicitly.
 
+## Bottom line
+
+Holding the *guarantee* constant on both ends, IronBus is the clear winner:
+
+| | Ingestion | Consumption |
+|---|---|---|
+| **At-most-once** (q0, both actually deliver) | **IronBus ~1.85×** (1.185M vs 641k) | **IronBus ~1.6×** (1.036M vs 641k) |
+| **Durable, power-loss-safe** (q1) | **IronBus ~161×** (55k vs 343) | **IronBus ~2.3×** (234k vs 101k) |
+
+The only leg NATS leads is *page-cache* durable produce (88k vs 55k) — i.e. NATS JetStream's
+default, which is **not** power-loss-safe (it loses acked data on a brownout). Held to IronBus's
+actual durability guarantee, NATS does 343/s. The widely-quoted "NATS wins at-most-once" only
+holds when NATS Core has **no subscriber and discards every message**; once it must deliver, it
+does ~641k/s and IronBus wins ingest and consume both.
+
 ## Rig
 
 - **Instance:** AWS `t4g.small` (2 vCPU Graviton2, ~1.8 GiB RAM), Ubuntu 24.04, root EBS
@@ -28,14 +43,15 @@ tier it is stated explicitly.
 |---|---:|---:|---|
 | **Durable, power-loss-safe** — IB group-commit `fdatasync` vs NATS JS `sync=always` | **~55,400** | ~343 | **IronBus ~161×** |
 | Durable, page-cache (NOT power-loss-safe) — IB `--no-fsync` vs NATS JS default interval-sync | ~55,000 | ~88,000 | NATS ~1.6× |
-| At-most-once (q0) — IB QoS-0 memory (**retains**) vs NATS Core pub (**drops**, no subscriber) | ~1,156,000 | ~1,650,000 | NATS ~1.4× raw rate |
+| **At-most-once (q0), DELIVERED** — IB QoS-0 ingest vs NATS Core pub→sub end-to-end (a live subscriber, so the broker does real fan-out instead of discarding) | **~1,185,000** | ~641,000 | **IronBus ~1.85×** |
+| (reference) at-most-once with NO subscriber — NATS Core *discards* every message | ~1,156,000 | ~1,650,000 | NATS faster, but delivers/retains **nothing** (not a useful-ingestion comparison) |
 
 ### Consumption
 
 | Tier (matched) | IronBus | NATS | Result |
 |---|---:|---:|---|
 | **Durable** — IB Tier-S streaming consumer vs NATS JS durable consume | **~234,000** | ~101,000 | **IronBus ~2.3×** |
-| (memory, IB only) IB Tier-S over memory | ~900,000 | — | — |
+| **At-most-once delivery** — IB Tier-S over memory vs NATS Core subscriber receive (pub→sub e2e) | **~1,036,000** | ~641,000 | **IronBus ~1.6×** |
 
 ## What the numbers mean (honestly)
 
@@ -53,17 +69,26 @@ tier it is stated explicitly.
   durable consume ~102k/s. (IronBus's Tier-W per-message-lease work-queue is a different,
   slower tool — ~7k/s — and is not the streaming-consume head-to-head.)
 
-**Where NATS leads, it is by doing less or giving up durability:**
+- **At-most-once, delivered — IronBus ~1.85× ingest, ~1.6× consume.** This one needs care,
+  because the naive setup is *unfair to IronBus*. `nats bench pub` with **no subscriber** makes
+  NATS Core *discard* every message (a pure socket drain, ~1.65M/s) while IronBus QoS-0 *stores*
+  every message — comparing real work against a no-op. Put a **live subscriber** on NATS Core so
+  it must actually route+deliver (the only way an at-most-once message is *useful*), and NATS
+  Core's end-to-end rate collapses to **~641k/s** on the 2-core box. IronBus ingests at ~1.185M/s
+  (all retained) and its Tier-S consumer drains at ~1.036M/s — both well above NATS's coupled
+  641k. IronBus's **decoupled** store-and-forward (the producer never waits on a consumer) beats
+  NATS Core's **coupled** real-time fan-out on this hardware, on *both* the ingest and the consume
+  side. The "NATS wins at-most-once" line only holds if you count messages NATS threw away.
+
+**The single place NATS leads, and it is by giving up durability:**
 
 - *Page-cache durable produce* (NATS ~1.6×): both sides not power-loss-safe. IronBus is
   **CPU-bound** here, not disk-bound (`--no-fsync` == `fdatasync`, both ~55k), doing strictly
-  more per message than NATS — payload compression, and a single-writer-actor submit/ack
-  handoff per message (profile: ~10% inter-thread channel signalling, ~6.6% lz4, ~3.7%
-  per-message alloc). See *Follow-ups*.
-- *At-most-once* (NATS Core ~1.6×): NATS Core with no subscriber **drops** every message
-  (pure socket drain); IronBus QoS-0 **retains** each message in its log for consumers. The
-  raw send rate favours the broker that stores nothing; IronBus delivers ingested, readable
-  data at ~1.0M/s.
+  more per message than NATS — payload compression, a single-writer-actor submit/ack handoff per
+  message (profile: ~10% inter-thread channel signalling, ~6.6% lz4, ~3.7% per-message alloc),
+  and a two-thread `produce_stream` client. NATS JS's 88k is **not** power-loss-safe (interval
+  sync); held to IronBus's guarantee it does 343/s (see the 161× row). So this is the
+  *not-power-loss-safe* durable tier — fast but loses acked data on a brownout. See *Follow-ups*.
 
 ## Changes shipped from this study (both ends of the QoS-0 path)
 
