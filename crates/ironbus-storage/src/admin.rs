@@ -1133,20 +1133,16 @@ fn decode_manifest(payload: &[u8]) -> Result<DecodedManifest, BackupError> {
     let range_line = lines
         .next()
         .ok_or_else(|| BackupError::InvalidManifest("missing range line".to_string()))?;
+    // `range <earliest> <head> cursors <n> dlq <n>` — 7 space-delimited tokens.
     let rp: Vec<&str> = range_line.split(' ').collect();
     let bad_range = || BackupError::InvalidManifest("malformed range line".to_string());
-    if rp.len() != 6
-        || rp[0] != "range"
-        || rp[2].is_empty()
-        || rp[3] != "cursors"
-        || rp[5].is_empty()
-    {
+    if rp.len() != 7 || rp[0] != "range" || rp[3] != "cursors" || rp[5] != "dlq" {
         return Err(bad_range());
     }
     let earliest_retained: u64 = rp[1].parse().map_err(|_| bad_range())?;
     let durable_head: u64 = rp[2].parse().map_err(|_| bad_range())?;
     let cursors: usize = rp[4].parse().map_err(|_| bad_range())?;
-    let dlq_records: usize = rp[5].parse().map_err(|_| bad_range())?;
+    let dlq_records: usize = rp[6].parse().map_err(|_| bad_range())?;
 
     // File-count line: `files <n>`.
     let files_line = lines
@@ -2026,5 +2022,269 @@ mod tests {
         assert!(purge_stream(&fs, "bad name").is_err());
         // The root log is untouched after the refusals.
         assert_eq!(stream_summary(&fs, "").unwrap().records, 4);
+    }
+
+    // --- backup / restore (#607) ---
+
+    /// Reads back every cursor's committed offset as a sorted `(group, committed)` map, for comparing a
+    /// source dir and its restored copy.
+    fn cursor_map(fs: &InMemoryFs) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = inspect_cursors(fs.clone())
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|c| (c.group, c.committed))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The complete sorted list of `(rel_path, bytes)` across a data dir's whole tree (root + subdirs),
+    /// excluding the LOCK file, so two dirs can be compared byte-for-byte. Reuses the snapshot walker.
+    fn tree_image(fs: &InMemoryFs) -> Vec<(String, Vec<u8>)> {
+        let mut v = Vec::new();
+        collect_tree(fs, "", &mut v).unwrap();
+        v.sort();
+        v
+    }
+
+    /// Builds a rich source data dir: a main log, named-stream logs, several work-group cursors (one
+    /// reset to mid-log), and a populated DLQ — so a round-trip exercises every artifact class.
+    fn rich_source(main: u64, poison: u64) -> InMemoryFs {
+        let fs = dir_with_dlq(main, poison);
+        // A couple of named streams (the `streams/<hex>/` subtree).
+        create_stream(&fs, ManualClock::new(), cfg(), "orders").unwrap();
+        create_stream(&fs, ManualClock::new(), cfg(), "events").unwrap();
+        // Several cursors, including the default group and a mid-log reset (an in-range cursor).
+        let (_, fs) = reset_consumer(fs, "", ResetTarget::Offset(1)).unwrap();
+        let (_, fs) = reset_consumer(fs, "g1", ResetTarget::Offset(main.min(2))).unwrap();
+        let (_, fs) = reset_consumer(fs, "g2", ResetTarget::Latest).unwrap();
+        fs
+    }
+
+    #[test]
+    fn snapshot_then_restore_round_trips_the_whole_data_dir_byte_for_byte() {
+        let src = rich_source(6, 3);
+        let src_tree = tree_image(&src);
+        let src_cursors = cursor_map(&src);
+        let src_main = main_records(&src);
+        let src_dlq = read_dlq_entries(&src).unwrap().len();
+
+        // Backup into a fresh tree, then restore into a fresh (empty) data dir.
+        let backup = InMemoryFs::new();
+        let bout = snapshot_data_dir(&src, &backup).unwrap();
+        assert!(bout.files > 0);
+        assert_eq!(bout.cursors, src_cursors.len());
+        assert_eq!(bout.dlq_records, src_dlq);
+
+        let restored = InMemoryFs::new();
+        let rout = restore_data_dir(&backup, &restored, false).unwrap();
+        assert_eq!(rout.files, bout.files);
+        assert_eq!(rout.bytes, bout.bytes);
+        assert_eq!(rout.durable_head, bout.durable_head);
+        assert_eq!(rout.cursors, bout.cursors);
+        assert_eq!(rout.dlq_records, bout.dlq_records);
+
+        // FAITHFUL: the restored tree is byte-for-byte the source, and the high-level views match.
+        assert_eq!(tree_image(&restored), src_tree, "byte-faithful tree");
+        assert_eq!(cursor_map(&restored), src_cursors, "cursors match");
+        assert_eq!(
+            read_dlq_entries(&restored).unwrap().len(),
+            src_dlq,
+            "DLQ matches"
+        );
+        assert_eq!(
+            main_records(&restored).len(),
+            src_main.len(),
+            "main log records match"
+        );
+    }
+
+    #[test]
+    fn restored_dir_is_point_consistent_every_cursor_within_the_durable_range() {
+        // The consistency oracle (the same range check `ironbus verify` runs): after a restore, every
+        // cursor is within [earliest_retained, durable_head] and the DLQ depth is intact — by
+        // construction, since the source was captured at one quiescent point.
+        let src = rich_source(8, 2);
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+        let restored = InMemoryFs::new();
+        restore_data_dir(&backup, &restored, false).unwrap();
+
+        let reader = OfflineReader::open(restored.clone()).unwrap();
+        let earliest = reader.earliest_retained().get();
+        let head = reader.durable_head().get();
+        drop(reader);
+        for (group, committed) in cursor_map(&restored) {
+            assert!(
+                committed >= earliest && committed <= head,
+                "cursor {group:?} committed {committed} must be within [{earliest}, {head}]"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_refuses_a_non_empty_target_without_force_then_overwrites_with_force() {
+        let src = rich_source(4, 1);
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+
+        // A target that already holds a (different) data dir: restore without force is refused.
+        let target = log_with(99);
+        let before = tree_image(&target);
+        match restore_data_dir(&backup, &target, false).unwrap_err() {
+            BackupError::TargetNotEmpty(n) => assert!(n > 0),
+            other => panic!("expected TargetNotEmpty, got {other:?}"),
+        }
+        // The refused restore wrote NOTHING (the target is byte-for-byte unchanged).
+        assert_eq!(tree_image(&target), before, "a refused restore is a no-op");
+
+        // With --force the target is cleared and replaced by exactly the backup's tree.
+        restore_data_dir(&backup, &target, true).unwrap();
+        let src_tree = {
+            let fresh = InMemoryFs::new();
+            restore_data_dir(&backup, &fresh, false).unwrap();
+            tree_image(&fresh)
+        };
+        assert_eq!(
+            tree_image(&target),
+            src_tree,
+            "force overwrote with the backup"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_corrupt_truncated_or_wrong_version_backup_fail_closed() {
+        let src = rich_source(5, 2);
+
+        // (a) A flipped byte in a captured file fails the CRC check, with the target untouched.
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+        let data = backup.subdir(BACKUP_DATA_SUBDIR).unwrap();
+        let a_seg = data
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.starts_with("seg-"))
+            .unwrap();
+        let f = data.open(&a_seg).unwrap();
+        let mut b = vec![0u8; usize::try_from(f.len().unwrap()).unwrap()];
+        f.read_exact_at(&mut b, 0).unwrap();
+        b[0] ^= 0xff;
+        f.write_all_at(&b, 0).unwrap();
+        let target = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup, &target, false).unwrap_err(),
+            BackupError::CorruptBackup(_)
+        ));
+        assert!(
+            non_lock_entries(&target).unwrap().is_empty(),
+            "no partial restore"
+        );
+
+        // (b) A missing captured file is a corrupt backup.
+        let backup2 = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup2).unwrap();
+        let data2 = backup2.subdir(BACKUP_DATA_SUBDIR).unwrap();
+        let some = data2
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.starts_with("seg-"))
+            .unwrap();
+        data2.remove(&some).unwrap();
+        let t2 = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup2, &t2, false).unwrap_err(),
+            BackupError::CorruptBackup(_)
+        ));
+        assert!(non_lock_entries(&t2).unwrap().is_empty());
+
+        // (c) A missing manifest is an invalid backup.
+        let backup3 = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup3).unwrap();
+        backup3.remove(BACKUP_MANIFEST_FILE).unwrap();
+        let t3 = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup3, &t3, false).unwrap_err(),
+            BackupError::InvalidManifest(_)
+        ));
+
+        // (d) A future format version is refused fail-closed.
+        let backup4 = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup4).unwrap();
+        let mf = backup4.open(BACKUP_MANIFEST_FILE).unwrap();
+        let mut mb = vec![0u8; usize::try_from(mf.len().unwrap()).unwrap()];
+        mf.read_exact_at(&mut mb, 0).unwrap();
+        // Rewrite the version field (the second whitespace-delimited token of line 1) to a future value.
+        let text = String::from_utf8(mb).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        lines[0] = format!("{BACKUP_MAGIC} {}", BACKUP_FORMAT_VERSION + 1);
+        let rewritten = format!("{}\n", lines.join("\n")).into_bytes();
+        mf.set_len(0).unwrap();
+        mf.write_all_at(&rewritten, 0).unwrap();
+        let t4 = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup4, &t4, false).unwrap_err(),
+            BackupError::IncompatibleVersion { found, supported }
+                if found == BACKUP_FORMAT_VERSION + 1 && supported == BACKUP_FORMAT_VERSION
+        ));
+    }
+
+    #[test]
+    fn snapshot_excludes_the_lock_file_and_an_empty_dir_round_trips() {
+        // A LOCK file at the root (the CLI's advisory lock) is NOT captured: a restored dir carries no
+        // foreign lock token.
+        let src = log_with(3);
+        src.create_new("LOCK").unwrap();
+        src.sync_dir().unwrap();
+        let backup = InMemoryFs::new();
+        let out = snapshot_data_dir(&src, &backup).unwrap();
+        let data = backup.subdir(BACKUP_DATA_SUBDIR).unwrap();
+        assert!(
+            !data.exists("LOCK").unwrap(),
+            "LOCK is excluded from the backup"
+        );
+        let restored = InMemoryFs::new();
+        restore_data_dir(&backup, &restored, false).unwrap();
+        assert!(
+            !restored.exists("LOCK").unwrap(),
+            "no LOCK in the restored dir"
+        );
+        assert_eq!(out.files, restored.list().unwrap().len());
+
+        // A brand-new (never-opened) data dir backs up and restores cleanly (an empty log is a valid
+        // consistent point: range 0..0, no cursors, no DLQ).
+        let empty_src = InMemoryFs::new();
+        let empty_backup = InMemoryFs::new();
+        let eout = snapshot_data_dir(&empty_src, &empty_backup).unwrap();
+        assert_eq!(
+            (eout.durable_head, eout.cursors, eout.dlq_records),
+            (0, 0, 0)
+        );
+        let empty_restored = InMemoryFs::new();
+        restore_data_dir(&empty_backup, &empty_restored, false).unwrap();
+        // The restored empty dir opens as an empty log.
+        let r = OfflineReader::open(empty_restored).unwrap();
+        assert_eq!(r.durable_head().get(), 0);
+    }
+
+    #[test]
+    fn a_redrive_after_restore_continues_correctly_from_the_restored_state() {
+        // Proves the restored DLQ + log are usable: a redrive of the restored dir re-injects exactly
+        // the captured poison records onto the restored log, as it would have on the source.
+        let src = dir_with_dlq(4, 3);
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+        let restored = InMemoryFs::new();
+        restore_data_dir(&backup, &restored, false).unwrap();
+
+        let before = main_records(&restored).len() as u64;
+        let (outcome, restored) = redrive_dlq(restored, ManualClock::new(), cfg()).unwrap();
+        assert_eq!(
+            outcome.redriven, 3,
+            "the restored DLQ redrives its 3 records"
+        );
+        assert_eq!(main_records(&restored).len() as u64, before + 3);
     }
 }
