@@ -7834,18 +7834,27 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     match drain_outcome {
         DrainOutcome::Completed(r) => {
             r.map_err(|e| CliError::Internal(format!("flushing cursors on shutdown: {e}")))?;
+            // The drain completed: the actor processed the Shutdown and is exiting. Drop our handle
+            // and join it deterministically (the worker that issued the drain also dropped its clone),
+            // so the process leaves no live thread behind on a clean stop — the historical teardown.
+            drop(shared);
+            let _ = actor.join();
+            Ok(())
         }
-        DrainOutcome::ActorGone => {
-            return Err(CliError::Internal(
-                "the append actor exited before shutdown".to_string(),
-            ));
-        }
+        DrainOutcome::ActorGone => Err(CliError::Internal(
+            "the append actor exited before shutdown".to_string(),
+        )),
         DrainOutcome::TimedOut => {
-            // The drain exceeded `--drain-timeout-ms`: log it and force-exit. Durability across this
-            // is NOT compromised — every ACKED record was fsynced before its ack (I2), so the timeout
-            // only means the FINAL cursor checkpoint may not have completed (a restart could redeliver
-            // up to `--checkpoint-interval` of already-acked messages, the at-least-once contract),
-            // never that an acked record is lost. We exit 0 (a bounded, deliberate stop), not an error.
+            // The drain exceeded `--drain-timeout-ms`: FORCE-EXIT now. Durability across this is NOT
+            // compromised — every ACKED record was fsynced before its ack (I2), so the timeout only
+            // means the FINAL cursor checkpoint may not have completed (a restart could redeliver up to
+            // `--checkpoint-interval` of already-acked messages, the at-least-once contract), never
+            // that an acked record is lost. We deliberately do NOT `drop(shared)` + `actor.join()`
+            // here: the drain worker is still blocked in the actor's flush+checkpoint, so joining would
+            // wait for the very drain the timeout just abandoned, defeating the bound. The OS reaps the
+            // still-running actor + worker threads on process exit; the durable log is consistent at
+            // every fsync boundary, so an abandoned in-flight checkpoint is exactly the recoverable
+            // state a `kill -9` would leave. Exit 0 (a bounded, deliberate stop), not an error.
             let _ = writeln!(
                 std::io::stderr(),
                 "WARN: graceful drain exceeded --drain-timeout-ms ({} ms); forcing exit. Every \
@@ -7853,11 +7862,9 @@ fn run_broker<F: Filesystem + Clone + 'static>(
                  --checkpoint-interval of already-acked messages (the at-least-once contract).",
                 config.drain_timeout_ms
             );
+            Ok(())
         }
     }
-    drop(shared);
-    let _ = actor.join();
-    Ok(())
 }
 
 /// The result of the bounded graceful-shutdown drain (#637): the drain either completed (with the
