@@ -898,7 +898,7 @@ impl Session {
                 // Emit the FAILED authn outcome to the audit stream (#635): the mechanism and the
                 // `<unknown>` subject (a failed lookup never echoes attacker-supplied bytes), never the
                 // presented credential. The wire still sees only the uniform Authorization Violation.
-                self.emit_audit(crate::audit::AuditEvent::AuthOutcome {
+                self.emit_audit(&crate::audit::AuditEvent::AuthOutcome {
                     identity: crate::audit::UNKNOWN_IDENTITY.to_string(),
                     mechanism,
                     outcome: crate::audit::Outcome::Failure,
@@ -910,13 +910,13 @@ impl Session {
             // for the connection lifetime. The NAME is a safe handle; no credential is retained.
             if let crate::auth::AuthOutcome::Authenticated { identity, scopes } = &outcome {
                 self.scopes = *scopes;
-                self.identity_name = identity.clone();
+                self.identity_name.clone_from(identity);
             }
             self.authenticated = true;
             // Emit the SUCCESSFUL authn outcome to the audit stream (#635): the resolved identity NAME,
             // the mechanism, success — never the credential. Emitted AFTER the scopes are pinned, so a
             // success event always reflects a fully-authenticated connection.
-            self.emit_audit(crate::audit::AuditEvent::AuthOutcome {
+            self.emit_audit(&crate::audit::AuditEvent::AuthOutcome {
                 identity: self.identity_name.clone(),
                 mechanism,
                 outcome: crate::audit::Outcome::Success,
@@ -1053,7 +1053,7 @@ impl Session {
             // Emit the SCOPE DENIAL audit event (#635): the pinned identity NAME, the required scope,
             // and the verb. The wire still sees only the uniform Authorization Violation (no oracle);
             // the audit event, on the trusted side, distinguishes the denial for the operator.
-            self.emit_audit(crate::audit::AuditEvent::AuthzDenial {
+            self.emit_audit(&crate::audit::AuditEvent::AuthzDenial {
                 identity: self.identity_name.clone(),
                 scope: scope.as_str(),
                 verb,
@@ -1069,9 +1069,9 @@ impl Session {
     /// zero-cost over the `Null` sink, so this is cheap on both the no-emitter and no-sink paths. The
     /// event carries only safe handles (the identity NAME, the mechanism/scope/verb tags), never a
     /// credential — the type forecloses a leak.
-    fn emit_audit(&self, event: crate::audit::AuditEvent) {
+    fn emit_audit(&self, event: &crate::audit::AuditEvent) {
         if let Some(audit) = self.audit.as_ref() {
-            audit.emit(&event);
+            audit.emit(event);
         }
     }
 
@@ -1120,7 +1120,7 @@ impl Session {
             // Emit the SCOPE DENIAL audit event (#635) for the direct `Pub` path (the pipelined loop
             // calls `handle_pub` directly, bypassing `dispatch`/`require_scope`, so the audit emission
             // lives here too). Identity NAME + scope + verb, never a credential.
-            self.emit_audit(crate::audit::AuditEvent::AuthzDenial {
+            self.emit_audit(&crate::audit::AuditEvent::AuthzDenial {
                 identity: self.identity_name.clone(),
                 scope: crate::auth::Scope::Publish.as_str(),
                 verb: "Pub",
@@ -10491,26 +10491,29 @@ mod tests {
 
     // --- The security AUDIT-EVENT stream (#635, V2-M7) wired through the session. ---
 
+    /// A `Write` over a shared `Vec<u8>` for the audit-capture helper. At module scope (not inside
+    /// `capturing_audit`) so it does not trip the items-after-statements lint.
+    struct AuditCaptureBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for AuditCaptureBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A capturing audit emitter over a shared `Vec<u8>` so a test reads back exactly what was emitted,
     /// plus a `ManualClock` so the wall-clock stamp is deterministic.
     fn capturing_audit() -> (crate::audit::AuditEmitter, Arc<std::sync::Mutex<Vec<u8>>>) {
         use ironbus_core::clock::ManualClock;
         let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let buf_clone = Arc::clone(&buf);
-        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(data);
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let clock = Arc::new(ManualClock::at_unix_millis(1_700_000_000_123))
             as Arc<dyn ironbus_core::clock::Clock>;
         let emitter = crate::audit::AuditEmitter::new(
-            crate::audit::AuditSink::writer(Box::new(SharedBuf(buf_clone))),
+            crate::audit::AuditSink::writer(Box::new(AuditCaptureBuf(buf_clone))),
             clock,
         );
         (emitter, buf)
@@ -10529,12 +10532,16 @@ mod tests {
         let mut s =
             Session::with_member_id_and_auth(MemberId::new(0), auth, None).with_audit(audit);
         let mut out = Vec::new();
-        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Info);
 
         let text = audit_text(&buf);
         assert!(text.contains("event=authn_outcome"), "{text}");
-        assert!(text.contains("identity=\"id\""), "the resolved name: {text}");
+        assert!(
+            text.contains("identity=\"id\""),
+            "the resolved name: {text}"
+        );
         assert!(text.contains("mechanism=bearer"), "{text}");
         assert!(text.contains("outcome=success"), "{text}");
         // The load-bearing no-leak property: the presented token never appears in the audit stream.
@@ -10581,7 +10588,8 @@ mod tests {
         let mut s =
             Session::with_member_id_and_auth(MemberId::new(0), auth, None).with_audit(audit);
         let mut out = Vec::new();
-        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
         out.clear();
         // Clear the buffer's success event so the assertion targets the denial only.
         buf.lock().unwrap().clear();
@@ -10622,7 +10630,8 @@ mod tests {
         let mut s =
             Session::with_member_id_and_auth(MemberId::new(0), auth, None).with_audit(audit);
         let mut out = Vec::new();
-        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
         buf.lock().unwrap().clear();
 
         let _ = s
@@ -10643,7 +10652,8 @@ mod tests {
         let auth = bearer_auth(token, &[Scope::Publish]);
         let mut s = Session::with_member_id_and_auth(MemberId::new(0), auth, None); // no .with_audit
         let mut out = Vec::new();
-        s.process(&e, &connect_with_bearer(token), &mut out).unwrap();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Info);
         assert!(s.authenticated && s.audit.is_none());
     }

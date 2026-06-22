@@ -1975,7 +1975,10 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             parsed.leaf_hub_serve.as_deref(),
             &parsed.transport,
         )?;
-        writeln!(out, "ok: serve config is valid (--check-only; broker not started)")?;
+        writeln!(
+            out,
+            "ok: serve config is valid (--check-only; broker not started)"
+        )?;
         return Ok(());
     }
     finish_serve(
@@ -2020,7 +2023,11 @@ fn run_config(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             // Parse the serve flags EXACTLY as `serve` does (flag > env > `--config` file > default),
             // so what is validated is what would run. A `--check-only` mixed in is harmless (already a
             // dry run), so tolerate and ignore it.
-            let rest: Vec<String> = rest.iter().filter(|a| *a != "--check-only").cloned().collect();
+            let rest: Vec<String> = rest
+                .iter()
+                .filter(|a| *a != "--check-only")
+                .cloned()
+                .collect();
             let env = |name: &str| std::env::var(name).ok();
             let parsed = parse_serve_flags_with_env(&rest, &env)?;
             validate_serve_invocation(
@@ -4100,13 +4107,13 @@ fn finish_serve(
 /// `cmd_serve`, and both `serve --check-only` and `config validate` call it INSTEAD of `cmd_serve`, so
 /// the three paths can never diverge. It has NO side effect — no directory is created, no lock is
 /// taken, no listener is bound, no engine is opened, no secret file is READ (only `stat`ted for the
-/// StrictModes permission check) — so it is safe to run as a pure check.
+/// `StrictModes` permission check) — so it is safe to run as a pure check.
 ///
 /// It validates, in order: the storage/cluster/geo/leaf/leaf-hub interplay (each durable plane requires
 /// `--storage disk`), the storage-conditional `--data-dir` rule (required for disk, absent for memory),
 /// the tuning-range checks ([`validate_serve_config`]), and — on Unix, where `serve` actually runs —
 /// the fail-closed bind invariant for both the wire `--addr` and the health `--health-addr`, plus the
-/// StrictModes owner-only permission check over every configured secret-bearing file (the auth-config
+/// `StrictModes` owner-only permission check over every configured secret-bearing file (the auth-config
 /// table and the TLS private key). On a non-Unix host the bind/secret checks are skipped (serve is
 /// Unix-only there), so `config validate` still validates the platform-independent config everywhere.
 ///
@@ -5177,7 +5184,8 @@ fn build_audit_emitter(
     config: &ServeConfig,
 ) -> Result<ironbus_server::audit::AuditEmitter, CliError> {
     use ironbus_server::audit::{AuditEmitter, AuditSink};
-    let clock = std::sync::Arc::new(SystemClock::new()) as std::sync::Arc<dyn ironbus_core::clock::Clock>;
+    let clock =
+        std::sync::Arc::new(SystemClock::new()) as std::sync::Arc<dyn ironbus_core::clock::Clock>;
     let Some(sink_ref) = config.audit_log.as_deref() else {
         return Ok(AuditEmitter::disabled(clock));
     };
@@ -7899,9 +7907,10 @@ fn drain_with_timeout<F: Filesystem + Clone + 'static>(
     }
     match rx.recv_timeout(std::time::Duration::from_millis(drain_timeout_ms)) {
         Ok(Ok(r)) => DrainOutcome::Completed(r),
-        Ok(Err(())) => DrainOutcome::ActorGone,
+        // The worker reported the actor was already gone, OR its end disconnected without a report
+        // (the actor exited before sending) — both are "no drain to wait on", the gone case.
+        Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => DrainOutcome::ActorGone,
         Err(RecvTimeoutError::Timeout) => DrainOutcome::TimedOut,
-        Err(RecvTimeoutError::Disconnected) => DrainOutcome::ActorGone,
     }
 }
 
@@ -13697,7 +13706,11 @@ mod tests {
     fn config_validate_rejects_a_missing_data_dir_for_disk_storage() {
         // The data-dir rule is part of the validator, so `config validate` catches it (exit 1).
         let mut buf = Vec::new();
-        let e = run(&argv(&["config", "validate", "--addr", "127.0.0.1:0"]), &mut buf).unwrap_err();
+        let e = run(
+            &argv(&["config", "validate", "--addr", "127.0.0.1:0"]),
+            &mut buf,
+        )
+        .unwrap_err();
         assert_eq!(e.exit_code(), EXIT_USAGE);
         match e {
             CliError::Usage(m) => assert!(m.contains("--data-dir"), "{m}"),

@@ -290,17 +290,17 @@ impl AuditEmitter {
     /// Emits one structured audit event (#635). With [`AuditSink::Null`] this still bumps the sequence
     /// (so a later active sink continues the count) but does NO formatting and NO IO — the zero-cost
     /// no-sink path. With a writer sink it renders ONE line `event=<type> seq=<n> ts_ms=<ms> <fields>`
-    /// under the sink's mutex (so concurrent emitters never interleave) and returns the sequence used.
+    /// under the sink's mutex (so concurrent emitters never interleave).
     ///
     /// The sequence is sourced from the atomic counter, NOT the clock (it survives a wall-clock jump);
     /// the `ts_ms` wall-clock stamp is recorded for SIEM correlation but is explicitly not trusted for
-    /// ordering.
-    pub fn emit(&self, event: &AuditEvent) -> u64 {
+    /// ordering. The method is side-effecting (it writes the event); it returns nothing.
+    pub fn emit(&self, event: &AuditEvent) {
         // The sequence is ALWAYS advanced, even for the Null sink, so enabling a sink later does not
         // reset or collide the count. A single relaxed fetch_add: the only cost on the no-sink path.
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let AuditSink::Writer(writer) = &self.sink else {
-            return seq; // Null sink: no formatting, no IO.
+            return; // Null sink: no formatting, no IO.
         };
         let ts_ms = self.clock.now_unix_millis();
         let mut line = String::with_capacity(96);
@@ -321,7 +321,6 @@ impl AuditEmitter {
             let _ = w.write_all(line.as_bytes());
             let _ = w.flush();
         }
-        seq
     }
 }
 
@@ -345,26 +344,25 @@ mod tests {
     use super::*;
     use ironbus_core::clock::ManualClock;
 
-    /// A writer sink over a shared `Vec<u8>` so a test can read back exactly what was written.
+    /// A `Write` over a shared `Vec<u8>` so a test can read back exactly what was written. Defined at
+    /// module scope (not inside `capturing`) so it does not trip the items-after-statements lint.
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A capturing emitter over a shared `Vec<u8>` so a test can read back exactly what was written.
     fn capturing() -> (AuditEmitter, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let buf_clone = Arc::clone(&buf);
-        // A Write impl over the shared buffer.
-        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-        impl Write for SharedBuf {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(data);
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let clock = Arc::new(ManualClock::at_unix_millis(1_700_000_000_000)) as Arc<dyn Clock>;
-        let emitter = AuditEmitter::new(
-            AuditSink::writer(Box::new(SharedBuf(buf_clone))),
-            clock,
-        );
+        let emitter = AuditEmitter::new(AuditSink::writer(Box::new(SharedBuf(buf_clone))), clock);
         (emitter, buf)
     }
 
@@ -403,7 +401,10 @@ mod tests {
 
         // The common envelope is present on every line, and the sequence is monotonic 0..5.
         for (i, line) in lines.iter().enumerate() {
-            assert!(line.contains(&format!("seq={i}")), "seq on line {i}: {line}");
+            assert!(
+                line.contains(&format!("seq={i}")),
+                "seq on line {i}: {line}"
+            );
             assert!(line.contains("ts_ms=1700000000000"), "wall clock: {line}");
         }
         assert!(lines[0].starts_with("event=authn_outcome"));
@@ -450,24 +451,37 @@ mod tests {
     }
 
     #[test]
-    fn null_sink_writes_nothing_but_still_advances_the_sequence() {
-        // The zero-cost no-sink path: with the Null sink, emit() does no IO but still bumps the
-        // sequence, so enabling a sink later continues the count rather than colliding at 0.
+    fn null_sink_writes_nothing() {
+        // The zero-cost no-sink path: with the Null sink, emit() does no IO at all (the sequence is
+        // still bumped internally, but there is nothing to observe and nothing written).
         let clock = Arc::new(ManualClock::at_unix_millis(1)) as Arc<dyn Clock>;
         let emitter = AuditEmitter::disabled(clock);
         assert!(!emitter.sink.is_active());
-        assert_eq!(
+        emitter.emit(&AuditEvent::ConfigChange {
+            summary: "x".to_string(),
+        });
+        emitter.emit(&AuditEvent::ConfigChange {
+            summary: "y".to_string(),
+        });
+        // No panic, no IO; the disabled emitter is inert.
+    }
+
+    #[test]
+    fn the_sequence_advances_monotonically_across_emits() {
+        // The common-envelope sequence increments by one per event and never collides: emit three
+        // events through a writer sink and read back seq=0, seq=1, seq=2 in order.
+        let (emitter, buf) = capturing();
+        for _ in 0..3 {
             emitter.emit(&AuditEvent::ConfigChange {
-                summary: "x".to_string()
-            }),
-            0
-        );
-        assert_eq!(
-            emitter.emit(&AuditEvent::ConfigChange {
-                summary: "y".to_string()
-            }),
-            1
-        );
+                summary: "s".to_string(),
+            });
+        }
+        let text = rendered(&buf);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for (i, line) in lines.iter().enumerate() {
+            assert!(line.contains(&format!("seq={i}")), "seq {i}: {line}");
+        }
     }
 
     #[test]

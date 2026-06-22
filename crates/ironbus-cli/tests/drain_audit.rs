@@ -135,13 +135,17 @@ fn http_get(addr: &str, path: &str) -> String {
     panic!("health endpoint {addr} did not answer GET {path} in time");
 }
 
+/// The number of acked records produced before the SIGTERM stop; all must survive the graceful drain.
+const N: usize = 8;
+
 /// Sends SIGTERM to a child process (the orchestrated stop signal).
 fn sigterm(child: &Child) {
+    let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
     // SAFETY: kill(2) takes a pid and a signal; the pid is this child's, owned for the test's
     // lifetime by the guard, and SIGTERM is a standard signal. It only requests termination.
     #[allow(unsafe_code)]
     unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        libc::kill(pid, libc::SIGTERM);
     }
 }
 
@@ -164,7 +168,6 @@ fn sigterm_flips_readyz_to_503_then_drains_clean_with_no_acked_loss() {
 
     // Produce a batch; each `pub` returns its durable offset only after the covering fsync (an ack
     // means durable, I2). These are the records that must NOT be lost across the SIGTERM stop.
-    const N: usize = 8;
     for i in 0..N {
         let (out, code) = run(&["pub", "--addr", &wire, &format!("rec-{i}")]);
         assert_eq!(code, 0, "pub {i} exit code");
@@ -281,8 +284,14 @@ fn audit_log_routes_the_config_change_event_to_stderr_and_to_a_file_owner_only()
             "the startup config_change audit event reached the stderr sink: {captured}"
         );
         // The structured envelope is present: a sequence and a wall-clock stamp.
-        assert!(captured.contains("seq=0"), "the audit envelope sequence: {captured}");
-        assert!(captured.contains("ts_ms="), "the audit envelope wall clock: {captured}");
+        assert!(
+            captured.contains("seq=0"),
+            "the audit envelope sequence: {captured}"
+        );
+        assert!(
+            captured.contains("ts_ms="),
+            "the audit envelope wall clock: {captured}"
+        );
     }
 
     // --- Sink 2: a file (@path), created owner-only. ---
@@ -319,7 +328,9 @@ struct StderrCapture(std::sync::mpsc::Receiver<String>);
 
 impl StderrCapture {
     fn join(self) -> String {
-        self.0.recv_timeout(Duration::from_secs(10)).unwrap_or_default()
+        self.0
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_default()
     }
 }
 
