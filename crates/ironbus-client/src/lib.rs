@@ -31,10 +31,11 @@ use ironbus_proto::message::{
     decode_not_leader, decode_produce_confirm, decode_pub_ack, decode_stream_info_response,
     decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub,
     encode_pub_to, encode_stream_commit, encode_stream_declare, encode_stream_fetch,
-    encode_stream_info, encode_sub, encode_sub_to, produce_confirm_status, AckBody, AckLevel,
-    AckOp, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody,
-    PubToBody, StreamCommitBody, StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody,
-    SubToBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    encode_stream_info, encode_sub, encode_sub_to, encode_txn_prepare, encode_txn_resolve,
+    produce_confirm_status, AckBody, AckLevel, AckOp, BodyError, ConnectBody, ConsumeTier,
+    CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody, StreamCommitBody,
+    StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody, TxnPrepareBody,
+    TxnResolveBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -730,6 +731,28 @@ pub struct StreamSummary {
     pub last_offset: Option<u64>,
 }
 
+/// A transaction id minted by [`Client::prepare`] (or supplied via [`Client::prepare_with_id`]) for
+/// the transactional half-message 2PC (#640, V2-M8). It names the prepared half message for a later
+/// [`Client::commit`] / [`Client::rollback`]. It is an opaque byte string (a UUID, a snowflake, or the
+/// client's `addr+counter` default); the producer keeps it across its local transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TxnId(Vec<u8>);
+
+impl TxnId {
+    /// Wraps an explicit producer-supplied transaction id (a UUID, a snowflake, a content hash). The
+    /// id must be non-empty and at most 256 bytes (the wire cap); the server rejects an over-long id.
+    #[must_use]
+    pub fn new(id: impl Into<Vec<u8>>) -> TxnId {
+        TxnId(id.into())
+    }
+
+    /// The transaction id bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// A connected IronBus client over one TCP connection.
 // Each bool records a DISTINCT server-CONFIRMED wire capability for this connection (gap-marker /
 // streaming / deliver-batch / streams), each set from its `Info` echo bit — protocol negotiation
@@ -783,6 +806,11 @@ pub struct Client {
     /// stays tiny; entries are removed on the matching call. Empty for any connection that never uses
     /// `produce_confirmed`.
     confirm_cache: Vec<(u64, ConfirmOutcome)>,
+    /// A per-connection monotonic counter used to mint a UNIQUE [`TxnId`] for each [`Client::prepare`]
+    /// (#640, V2-M8). Combined with the connection's local socket address (a per-connection seed) it
+    /// yields a transaction id unique across this producer's transactions; the producer may also supply
+    /// its own id via [`Client::prepare_with_id`]. Starts at 0; bumped per `prepare`.
+    next_txn_seq: u64,
 }
 
 impl Client {
@@ -819,6 +847,7 @@ impl Client {
             streams_enabled: false,
             negotiated_default_tier: None,
             confirm_cache: Vec::new(),
+            next_txn_seq: 0,
         };
         // The #292 handshake: send a versioned Connect body carrying any requested credit (an
         // all-absent body when the caller requested nothing, which the server reads as "use my
@@ -2421,6 +2450,142 @@ impl Client {
             }
             (other, _) => Err(ClientError::Unexpected(other)),
         }
+    }
+
+    // ---- transactional half-message 2PC (#640, V2-M8) ----
+
+    /// PREPAREs a transactional half message (#640): durably buffers `message` for a freshly-minted
+    /// [`TxnId`] targeting `stream` (empty = the default stream), INVISIBLE to consumers, and returns
+    /// the id. The producer then runs its local transaction and calls [`Client::commit`] (the half
+    /// message becomes visible) or [`Client::rollback`] (it is discarded). The id is unique to this
+    /// connection (its local address + a per-connection counter); to supply your OWN id (a UUID, a
+    /// snowflake) use [`Client::prepare_with_id`].
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the prepare (too many prepared, a spent
+    /// id), [`ClientError::Body`] on an over-large field, or a frame/connection error.
+    pub fn prepare(&mut self, stream: &str, message: &PubBody<'_>) -> Result<TxnId, ClientError> {
+        let txn = self.mint_txn_id();
+        self.prepare_with_id(&txn, stream, message)?;
+        Ok(txn)
+    }
+
+    /// Like [`Client::prepare`] but with a producer-SUPPLIED `txn` id (a UUID, a snowflake, a content
+    /// hash) instead of a minted one — the idempotency anchor for a producer that derives its
+    /// transaction id from its own local transaction. Re-preparing a still-prepared id is a benign
+    /// no-op server-side; preparing a resolved (spent) id is refused.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the prepare (a spent id, too many
+    /// prepared, an over-long id), [`ClientError::Body`] on an over-large field, or a frame/connection
+    /// error.
+    pub fn prepare_with_id(
+        &mut self,
+        txn: &TxnId,
+        stream: &str,
+        message: &PubBody<'_>,
+    ) -> Result<(), ClientError> {
+        // The half message is always at-least-once server-ack; the wire-only fire-and-forget bit is
+        // cleared so a half message is never a QoS-0 drop (it must be durably buffered to commit).
+        let durable = PubBody {
+            fire_and_forget: false,
+            ..*message
+        };
+        let mut pub_body = Vec::new();
+        encode_pub(&durable, &mut pub_body).map_err(ClientError::Body)?;
+        let mut body = Vec::new();
+        encode_txn_prepare(
+            &TxnPrepareBody {
+                txn_id: txn.as_bytes(),
+                stream_id: stream.as_bytes(),
+                pub_body: &pub_body,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::TxnPrepare, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// COMMITs the prepared half message named by `txn` (#640): the broker appends the buffered payload
+    /// to the real target stream (it becomes VISIBLE to consumers) and returns the committed offset.
+    /// IDEMPOTENT: a retried commit of an already-committed txn returns the same offset (never an
+    /// error); a commit of an already-rolled-back txn is a [`ClientError::Server`] rejection (the
+    /// outcome is never flipped).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] for an unknown / already-rolled-back txn, [`ClientError::Body`]
+    /// on an over-large field, [`ClientError::BadResponse`] on a malformed reply, or a frame/connection
+    /// error.
+    pub fn commit(&mut self, txn: &TxnId) -> Result<u64, ClientError> {
+        let mut body = Vec::new();
+        encode_txn_resolve(
+            &TxnResolveBody {
+                txn_id: txn.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::TxnCommit, &body)?;
+        match self.read_frame()? {
+            (FrameType::PubAck, body) => {
+                let ack = decode_pub_ack(&body)
+                    .map_err(|_| ClientError::BadResponse("txn-commit reply was not an offset"))?;
+                Ok(ack.offset)
+            }
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// ROLLs BACK the prepared half message named by `txn` (#640): the broker discards the buffered
+    /// payload — it is never appended to the real stream, never delivered. IDEMPOTENT: a retried
+    /// rollback is a benign success; a rollback of an already-committed txn is a [`ClientError::Server`]
+    /// rejection (never flipped).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] for an unknown / already-committed txn, [`ClientError::Body`] on
+    /// an over-large field, or a frame/connection error.
+    pub fn rollback(&mut self, txn: &TxnId) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_txn_resolve(
+            &TxnResolveBody {
+                txn_id: txn.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::TxnRollback, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Mints a UNIQUE transaction id for this connection (#640): the local socket address (a
+    /// per-connection seed) plus a monotonic per-connection counter, so two `prepare`s on this
+    /// connection — and on different connections (distinct local addresses) — never collide. Bounded
+    /// well under the 256-byte wire cap.
+    fn mint_txn_id(&mut self) -> TxnId {
+        let seq = self.next_txn_seq;
+        self.next_txn_seq = self.next_txn_seq.wrapping_add(1);
+        // The local address is a stable per-connection seed; pair it with the monotonic counter.
+        let seed = self
+            .stream
+            .local_addr()
+            .map_or_else(|_| "txn".to_string(), |a| a.to_string());
+        TxnId(format!("{seed}#{seq}").into_bytes())
     }
 
     /// Subscribes this connection's consume path to a NAMED stream's work-group (#588, M2-I10): the
@@ -6666,6 +6831,97 @@ mod tests {
         assert_eq!(messages[0].offset, 0);
         assert_eq!(messages[0].payload.as_slice(), b"single-node");
         drop(c);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    // ---- transactional half-message 2PC client API (#640, V2-M8) ----
+
+    fn txn_pub(payload: &'static [u8]) -> PubBody<'static> {
+        PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload,
+        }
+    }
+
+    #[test]
+    fn txn_prepare_commit_delivers_only_after_commit_against_a_real_server() {
+        // End-to-end over the real wire: a prepared half message is INVISIBLE to a fetch until commit,
+        // then it appears exactly once.
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect(addr).unwrap();
+        let txn = producer.prepare("", &txn_pub(b"half")).unwrap();
+
+        // A separate consumer connection sees NOTHING while the txn is only prepared.
+        let mut consumer = Client::connect(addr).unwrap();
+        assert!(
+            consumer.fetch(10).unwrap().messages.is_empty(),
+            "a prepared-but-uncommitted half message is invisible"
+        );
+
+        // Commit returns the committed offset.
+        let offset = producer.commit(&txn).unwrap();
+        assert_eq!(offset, 0);
+        // A retried commit is idempotent (same offset, no double-append).
+        assert_eq!(producer.commit(&txn).unwrap(), 0);
+
+        // Now the consumer sees the committed record exactly once.
+        let messages = consumer.fetch(10).unwrap().messages;
+        assert_eq!(
+            messages.len(),
+            1,
+            "the committed half message is delivered exactly once"
+        );
+        assert_eq!(messages[0].payload.as_slice(), b"half");
+
+        drop(producer);
+        drop(consumer);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn txn_rollback_never_delivers_against_a_real_server() {
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect(addr).unwrap();
+        let txn = producer.prepare("", &txn_pub(b"secret")).unwrap();
+        producer.rollback(&txn).unwrap();
+        // A retried rollback is a benign success.
+        producer.rollback(&txn).unwrap();
+        // commit-after-rollback is refused (Server error), never flipped.
+        assert!(matches!(producer.commit(&txn), Err(ClientError::Server(_))));
+
+        let mut consumer = Client::connect(addr).unwrap();
+        assert!(
+            consumer.fetch(10).unwrap().messages.is_empty(),
+            "a rolled-back half message is never delivered"
+        );
+
+        drop(producer);
+        drop(consumer);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn txn_prepare_with_a_producer_supplied_id_round_trips() {
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect(addr).unwrap();
+        let txn = TxnId::new(b"my-own-uuid-1234".to_vec());
+        producer.prepare_with_id(&txn, "", &txn_pub(b"v")).unwrap();
+        // Re-preparing the same id is a benign no-op server-side.
+        producer.prepare_with_id(&txn, "", &txn_pub(b"v")).unwrap();
+        let offset = producer.commit(&txn).unwrap();
+        assert_eq!(offset, 0);
+        let mut consumer = Client::connect(addr).unwrap();
+        assert_eq!(consumer.fetch(10).unwrap().messages.len(), 1);
+        drop(producer);
+        drop(consumer);
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
