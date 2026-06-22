@@ -85,8 +85,18 @@ mod dict_cmd;
 mod completion;
 /// Named connection profiles (server + auth + TLS + data-dir), `kubectl config`-style (#581).
 mod context;
+/// The interactive fuzzy stream/group picker (TTY-only, scriptable-safe) (#583).
+mod fuzzy;
 /// The uniform `--json` envelope + frozen exit-code contract (V2-M6, #579).
 mod json_envelope;
+/// A bounded, dependency-free HTTP GET for the health server's text endpoints (#589, #592).
+mod metrics_fetch;
+/// A tiny Prometheus text-exposition reader for the `report` views (#589).
+mod prom;
+/// The `report` operator views over `/metrics` (#589).
+mod report;
+/// The `server` health-probe verbs (Nagios-style `check`, plus info/healthz/ready) (#592).
+mod server_check;
 
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
@@ -796,6 +806,10 @@ USAGE:
     ironbus repair --data-dir <dir> [--apply --force] [--json]
     ironbus top   (--addr <host:port> | --health-addr <host:port> | --data-dir <dir>)
                   [--interval <secs>] [--once] [--json] [--no-color]
+    ironbus report (groups | streams | storage | recovery | connections)
+                  [--addr <host:port> | --health-addr <host:port>] [--filter <name>]
+    ironbus server (info | healthz | ready | check)
+                  [--addr <host:port> | --health-addr <host:port>]
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
                   [--fetch-batch <n>] [--group <name>] [--no-fsync] [--pubwindow <n>] [--stream] [--json]
@@ -993,6 +1007,24 @@ Notes:
     `ironbus top | cat` and a CI run produce clean text. --json emits a single versioned
     ironbus.cli.top.v1 object (the mode is tagged, so a script tells live from offline). The refresh
     SLEEPS between polls and never busy-spins. Offline mode is Unix-only in v1 (the on-disk store).
+    report is a strictly READ-ONLY operator report built from ONE GET /metrics against the broker's
+    health server: groups (per-work-group committed/lag/in-flight/consumed), streams (per-stream
+    produced throughput), storage (segments, durable bytes, disk-free, RAM headroom, write-amp;
+    a -1 disk/RAM sentinel renders as `unavailable`, never a misleading zero), recovery (recovery
+    runs, truncated/skipped bytes and records, quarantine, and the per-reason loss breakdown), and
+    connections (the ironbus_connections_* lifecycle + the pre-auth rejection reasons). The address
+    resolves flag > current-context > default. With the global --json it is the ironbus.cli.v1
+    envelope; otherwise a clean table. --filter <name> narrows the groups/streams view to one name;
+    with NO --filter on an interactive TTY, those two subjects offer a fuzzy picker over the live
+    names (a non-TTY / --json / explicit --filter run skips the picker and stays scriptable). It
+    never mutates the broker and never reads a metric it did not request.
+    server probes the broker's existing health server (READ-ONLY): info (version + uptime from
+    /metrics), healthz (liveness, GET /healthz), ready (readiness, GET /readyz), and check, a
+    Nagios-style one-line probe with a FROZEN exit code — IRONBUS OK (live AND ready, exit 0),
+    IRONBUS CRITICAL (reachable but not ready/not live, exit 3 = the ran-to-completion degraded
+    finding), IRONBUS UNREACHABLE (health server down, exit 5), or IRONBUS UNKNOWN (a malformed
+    response, exit 70). healthz and ready map to the broker's DISTINCT liveness vs readiness
+    endpoints (the server already ships the split). The address resolves flag > context > default.
     bench is a load generator that reports throughput, p50/p99/p999 latency, fsync cost, and
     bytes/op over the real wire and produce path. By DEFAULT it is PRODUCTION-SAFE: it spawns its
     own ISOLATED broker over a fresh ironbus-bench-<random> data directory and reads through a fresh
@@ -1194,6 +1226,8 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "verify" => run_verify(rest, out),
         "repair" => run_repair(rest, out),
         "top" => top::run_top(rest, out),
+        "report" => report::run_report(rest, out),
+        "server" => server_check::run_server(rest, out),
         "bench" => run_bench(rest, out),
         "upgrade" => run_upgrade(rest, out),
         "rollback" => run_rollback(rest, out),
