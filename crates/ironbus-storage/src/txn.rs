@@ -567,19 +567,23 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
                 }
             }
         }
-        // Apply the back-check bookkeeping to the book for every txn that is STILL Prepared after the
-        // half/op settle (a BACK record whose txn resolved was already removed from `restored_attempts`
-        // by its OP record). The schedule is rebased to "eligible now" (the live monotonic now is read
-        // by the engine, which re-enrolls on open; here, with no live clock, we use 0 as the
-        // replay-stable floor so the engine's first scan after open finds it due — the engine clamps
-        // against its real `now`). The attempt count is preserved EXACTLY.
-        for (txn_id, attempts) in restored_attempts {
-            if matches!(self.table.state(&txn_id), Some(TxnState::Prepared)) {
-                // next_eligible = 0: immediately eligible on the engine's first post-open scan (which
-                // passes a real monotonic `now`); the preserved attempt count drives the terminal
-                // default exactly as before the restart.
-                self.back_check.restore(&txn_id, attempts, 0);
-            }
+        // RE-ENROLL every still-`Prepared` txn into the back-check book, driven off the lifecycle table's
+        // `all_prepared()` — NOT the BACK records (#640 part 2, BLOCKER 2 fix). The old loop iterated
+        // `restored_attempts` (only txns that had a durable BACK record, written on the FIRST back-check
+        // attempt), so a txn that was prepared then survived a restart WITHIN the first timeout window
+        // (no attempt yet, so no BACK record) was Prepared but NOT in the book — never scanned, never
+        // back-checked, never terminal-defaulted: stuck Prepared (invisible, undelivered) FOREVER, the
+        // exact orphan this feature exists to clean up. Driving off `all_prepared()` re-enrolls THAT txn
+        // too. The preserved attempt count comes from its BACK record if it had one (the terminal-default
+        // gate, kept EXACTLY); a txn with no BACK record enrolls FRESH at 0 attempts. `restore` is
+        // idempotent (last write wins on the same id), so there is no double-enroll, and a resolved txn
+        // is absent from `all_prepared()` so it is never re-enrolled. The schedule is rebased to "eligible
+        // now" via `next_eligible = 0` (the persisted absolute monotonic instant is meaningless after a
+        // reboot — the monotonic origin resets), so the engine's first post-open scan (which passes a real
+        // monotonic `now` and clamps against it) finds every recovered in-doubt txn promptly due.
+        for (txn_id, _prepared_at) in self.table.all_prepared() {
+            let attempts = restored_attempts.get(&txn_id).copied().unwrap_or(0);
+            self.back_check.restore(&txn_id, attempts, 0);
         }
         Ok(())
     }
@@ -1178,5 +1182,39 @@ mod tests {
         // No back-check bookkeeping survives for the resolved txn.
         assert_eq!(reopened.under_back_check(), 0);
         assert!(reopened.back_check().bookkeeping(b"tx1").is_none());
+    }
+
+    #[test]
+    fn a_prepared_txn_with_no_back_record_is_re_enrolled_on_replay() {
+        // BLOCKER 2: a txn prepared then left in-doubt across a restart WITHIN the first timeout window
+        // (no back-check attempt fired, so NO durable BACK record) must STILL be re-enrolled into the
+        // book on replay — driven off `all_prepared()`, not the BACK records. Before the fix the replay
+        // rebuilt the book only from BACK records, so this txn would be Prepared but NOT under back-check
+        // (orphaned forever). It must re-enroll FRESH at 0 attempts and be immediately due.
+        let fs = InMemoryFs::new();
+        {
+            let mut s = back_store(&fs);
+            s.table_mut().prepare(b"tx1", 1).unwrap();
+            s.append_half(b"tx1", "orders", &half(b"p")).unwrap();
+            // Enroll in memory only (as `txn_prepare` does) — but NEVER record_attempt, so NO BACK
+            // record is appended. This is the prepare-then-restart-before-first-attempt orphan.
+            s.back_check_mut().enroll(b"tx1", 0);
+            assert_eq!(s.under_back_check(), 1);
+        }
+        // Reopen: the half is still Prepared AND re-enrolled fresh at 0 attempts, immediately due — the
+        // scan will back-check it and, unanswered, terminal-default it. Never stuck.
+        let reopened = back_store(&fs);
+        assert_eq!(reopened.table().state(b"tx1"), Some(TxnState::Prepared));
+        assert_eq!(
+            reopened.under_back_check(),
+            1,
+            "the no-BACK-record prepared txn was re-enrolled off all_prepared(), not orphaned"
+        );
+        assert_eq!(
+            reopened.back_check().bookkeeping(b"tx1"),
+            Some((0, 0)),
+            "re-enrolled fresh at 0 attempts, immediately eligible"
+        );
+        assert_eq!(reopened.back_check().due(0), vec![b"tx1".to_vec()]);
     }
 }
