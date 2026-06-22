@@ -358,24 +358,26 @@ and the SBOM/deny gating), not the version numbers, which the lockfile owns.
 
 ---
 
-## Specified but not implemented (honest status)
+## Implementation status (honest)
 
-None of the following exists in the binary today. Do not assume any of it. There is no
-auth and no TLS yet, so there is no secret to source, no audit event to emit, and no
-crypto crate in the shipped graph.
+The auth identity table (#106/#631), the redacting newtype, the fail-closed `StrictModes`
+secret-file check, and the structured security audit-event stream (#635/V2-M7) are now
+**in the binary**; TLS transport (#107), at-rest encryption (#108), and ENV-reference secret
+sourcing remain specified-only. Do not assume the latter.
 
 | Item | Status | Owner |
 | --- | --- | --- |
-| Secret sourcing from file / env reference, never inline | Specified, not implemented | #109, #14 |
-| Fail-closed StrictModes secret-file permission check at boot (mode `& 0o077`, wrong-owner); non-POSIX skip-with-notice | Specified, not implemented | #109 |
-| The redacting newtype (fixed `Debug`/`Display` placeholder, single accessor, no `Serialize`) over all secret types | Specified, not implemented | #109 |
-| The redaction unit test (known sentinel never appears in any log / error / #15 dump) | Specified, not implemented | #109 |
-| Zeroization of secret material after use (best-effort, `Drop`/`zeroize`) | Specified, not implemented | #109 |
-| The one security-event emitter (takes the name, never the credential) | Specified, not implemented | #109, #16 |
-| The structured, secret-free audit-event schema (sequence + wall clock) exported via #16 | Specified, not implemented | #109, #16 |
-| The frozen security-event set test | Specified, not implemented | #109, #16 |
-| #15 diagnostics redacting stored credentials (the new credential path) | Specified, not implemented | #109, #15 |
-| The crypto dependency surface (rustls + AEAD + argon2 + sha2 + subtle + zeroize) in the SBOM and under cargo-deny | Specified; the SBOM/deny machinery exists (#17), the crypto crates land with #106/#107/#108 | #109, #17, #106, #107, #108 |
+| Secret sourcing from a FILE reference, never inline (auth-config table, TLS key, password file) | **Implemented** | #109, #14, #635 |
+| Secret sourcing from an ENV-variable reference | Specified, not implemented | #109, #14 |
+| Fail-closed `StrictModes` secret-file permission check at boot (mode `& 0o077`, wrong-owner) | **Implemented** (Unix; non-POSIX skip-with-notice still specified-only) | #109, #635 |
+| The redacting newtype (fixed `Debug`/`Display` placeholder, single accessor, no `Serialize`) over all secret types | **Implemented** (`ironbus_server::auth::Secret`) | #109, #631 |
+| The redaction unit test (known sentinel never appears in any log / error / #15 dump) | **Implemented** (the `Secret` redaction test; the audit no-leak tests) | #109, #635 |
+| Zeroization of secret material after use (best-effort, `Drop`/`zeroize`) | **Implemented** (`Secret` zeroes on drop) | #109, #631 |
+| The one security-event emitter (takes the name, never the credential) | **Implemented** (`ironbus_server::audit::AuditEmitter`) | #109, #635 |
+| The structured, secret-free audit-event schema (sequence + wall clock) | **Implemented** as a structured log STREAM (`--audit-log stderr` / `@file`); a `/metrics` counter family (the #16 alternative transport) is still additive/future | #109, #635, #16 |
+| The frozen security-event set test | **Implemented** (`audit::tests::the_event_set_is_frozen`) | #109, #635 |
+| #15 diagnostics redacting stored credentials (the new credential path) | **Implemented by construction** (credentials held in the redacting newtype; no diagnostic reaches past it) | #109, #15 |
+| The crypto dependency surface (rustls + AEAD + argon2 + sha2 + subtle + zeroize) in the SBOM and under cargo-deny | argon2/sha2/subtle/zeroize **shipped** (#631); rustls + AEAD land with #107/#108 | #109, #17, #106, #107, #108 |
 
 ---
 
