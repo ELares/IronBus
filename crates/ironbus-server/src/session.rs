@@ -40,12 +40,13 @@ use ironbus_proto::message::{
     decode_ack, decode_bind_subject, decode_connect, decode_cumulative_ack, decode_fetch,
     decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit, decode_stream_declare,
     decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
-    encode_dead_letter, encode_deliver, encode_deliver_batch, encode_gap_marker, encode_info,
-    encode_not_leader, encode_produce_confirm, encode_pub_ack, encode_stream_info_response,
-    encode_truncated, gap_reason, parse_connect_auth, produce_confirm_status, pub_ack_level,
-    AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody,
-    GapMarkerBody, InfoBody, NotLeaderBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody,
-    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    decode_txn_prepare, decode_txn_resolve, encode_dead_letter, encode_deliver,
+    encode_deliver_batch, encode_gap_marker, encode_info, encode_not_leader,
+    encode_produce_confirm, encode_pub_ack, encode_stream_info_response, encode_truncated,
+    gap_reason, parse_connect_auth, produce_confirm_status, pub_ack_level, AckLevel, AckOp,
+    ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody,
+    InfoBody, NotLeaderBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody, TruncatedBody,
+    DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -809,6 +810,23 @@ impl Session {
             Some(FrameType::SubSubject) => {
                 self.require_scope(crate::auth::Scope::Subscribe, "SubSubject", out)?;
                 self.handle_sub_subject(engine, body, out).map(|()| false)
+            }
+            // The TRANSACTIONAL half-message verbs (#640, V2-M8): a producer-side 2PC. Prepare/commit/
+            // rollback all PRODUCE (or resolve a produce), so they require the `publish` scope, exactly
+            // like Pub/PubTo. None advances a COMMITTED CONSUMER cursor (a commit appends to the real
+            // stream, which is a produce, not a consumer-cursor commit), so each returns `false` (no
+            // interval checkpoint). They route through the single-writer engine via `engine.with`.
+            Some(FrameType::TxnPrepare) => {
+                self.require_scope(crate::auth::Scope::Publish, "TxnPrepare", out)?;
+                self.handle_txn_prepare(engine, body, out).map(|()| false)
+            }
+            Some(FrameType::TxnCommit) => {
+                self.require_scope(crate::auth::Scope::Publish, "TxnCommit", out)?;
+                self.handle_txn_commit(engine, body, out).map(|()| false)
+            }
+            Some(FrameType::TxnRollback) => {
+                self.require_scope(crate::auth::Scope::Publish, "TxnRollback", out)?;
+                self.handle_txn_rollback(engine, body, out).map(|()| false)
             }
             Some(FrameType::Unsub) => {
                 self.require_scope(crate::auth::Scope::Subscribe, "Unsub", out)?;
@@ -3013,6 +3031,177 @@ impl Session {
         }
     }
 
+    /// Handles a `TxnPrepare` (#640, V2-M8): durably buffer a transactional HALF (prepared) message
+    /// targeting a real stream, INVISIBLE to consumers, and ack. The half message survives a restart
+    /// as `Prepared` until a `TxnCommit`/`TxnRollback` resolves it. The body carries the txn id + the
+    /// target stream + the verbatim `PubBody` payload. Replies a body-less `Ok` on a durable prepare,
+    /// or `Err` on a malformed body / over-long id / too-many-prepared. Routes through the single-writer
+    /// engine via `engine.with`; never panics, fail-closed at the boundary.
+    fn handle_txn_prepare<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(decoded) = decode_txn_prepare(body) else {
+            reply_err(out, "malformed txn-prepare body");
+            return Ok(());
+        };
+        // The txn-id wire cap is enforced by the decoder (cap-before-alloc); an empty id is refused
+        // here (a half message needs a stable identity to commit/rollback against).
+        if decoded.txn_id.is_empty() {
+            reply_err(out, "txn_id must not be empty");
+            return Ok(());
+        }
+        let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
+            reply_err(out, "stream id must be valid UTF-8");
+            return Ok(());
+        };
+        let Ok(msg) = decode_pub(decoded.pub_body) else {
+            reply_err(out, "malformed pub body");
+            return Ok(());
+        };
+        // Build the OWNED half message (the wire body borrows the connection buffer, which the closure
+        // cannot hold). The wire-only PUB flags (dedup/fire-and-forget bits) are masked off so only the
+        // real stored content flags reach the durable half record.
+        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        let stream = stream.to_string();
+        let timestamp_ms = msg.timestamp_ms;
+        let flags = msg.flags & !PUB_WIRE_ONLY_FLAGS;
+        let key = Bytes::copy_from_slice(msg.key);
+        let headers = Bytes::copy_from_slice(msg.headers);
+        let payload = Bytes::copy_from_slice(msg.payload);
+        let outcome = engine.with(move |e| {
+            let view = Append {
+                timestamp_ms,
+                flags: RecordFlags::from_bits(flags),
+                key: &key,
+                headers: &headers,
+                payload: &payload,
+            };
+            e.txn_prepare(&txn_id, &stream, &view)
+        })?;
+        match outcome {
+            Ok(()) => {
+                reply(out, FrameType::Ok, &[]);
+                Ok(())
+            }
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a `TxnCommit` (#640, V2-M8): commit the prepared half message named by `txn_id`. The
+    /// broker appends the buffered payload to the real target stream (it becomes VISIBLE) and writes
+    /// the committed op-marker, then replies a `PubAck` carrying the committed offset. Idempotent: a
+    /// retried commit returns the original offset; a commit of an already-rolled-back txn is an `Err`.
+    /// Routes through the single-writer engine; fail-closed at the boundary, never panics.
+    fn handle_txn_commit<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(decoded) = decode_txn_resolve(body) else {
+            reply_err(out, "malformed txn-commit body");
+            return Ok(());
+        };
+        if decoded.txn_id.is_empty() {
+            reply_err(out, "txn_id must not be empty");
+            return Ok(());
+        }
+        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        let outcome = engine.with(move |e| e.txn_commit(&txn_id))?;
+        match outcome {
+            Ok(offset) => {
+                let mut ack_body = Vec::new();
+                encode_pub_ack(
+                    &PubAckBody {
+                        offset: offset.get(),
+                    },
+                    &mut ack_body,
+                );
+                reply(out, FrameType::PubAck, &ack_body);
+                Ok(())
+            }
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a `TxnRollback` (#640, V2-M8): roll back the prepared half message named by `txn_id`.
+    /// The broker writes a rolled-back op-marker; the buffered payload is DISCARDED and never appended
+    /// to the real stream (never delivered). Replies a body-less `Ok`. Idempotent: a retried rollback
+    /// is a benign success; a rollback of an already-committed txn is an `Err`. Routes through the
+    /// single-writer engine; fail-closed at the boundary, never panics.
+    fn handle_txn_rollback<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(decoded) = decode_txn_resolve(body) else {
+            reply_err(out, "malformed txn-rollback body");
+            return Ok(());
+        };
+        if decoded.txn_id.is_empty() {
+            reply_err(out, "txn_id must not be empty");
+            return Ok(());
+        }
+        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        let outcome = engine.with(move |e| e.txn_rollback(&txn_id))?;
+        match outcome {
+            Ok(()) => {
+                reply(out, FrameType::Ok, &[]);
+                Ok(())
+            }
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
     /// Handles a `SubTo` (#588, M2-I10): subscribe to a NAMED stream's per-stream work-group. Binds
     /// BOTH `self.stream` (the named stream) and `self.subscription` (the work-group within it), so
     /// this connection's subsequent `Flow`/`Ack` route to that stream's OWN competing work-group via
@@ -3941,7 +4130,8 @@ mod tests {
     use ironbus_core::lease::LeaseConfig;
     use ironbus_core::types::RecordFlags;
     use ironbus_proto::message::{
-        decode_deliver, decode_pub_ack, encode_ack, encode_pub, AckBody, PubBody, PubDedup,
+        decode_deliver, decode_pub_ack, encode_ack, encode_pub, encode_txn_prepare,
+        encode_txn_resolve, AckBody, PubBody, PubDedup, TxnPrepareBody, TxnResolveBody,
         PUB_FLAG_ACK_LEVEL_SHIFT, PUB_FLAG_FIRE_AND_FORGET,
     };
     use ironbus_storage::fs::InMemoryFs;
@@ -10660,5 +10850,172 @@ mod tests {
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Info);
         assert!(s.authenticated && s.audit.is_none());
+    }
+
+    // ---- transactional half-message 2PC over the wire (#640, V2-M8) ----
+
+    /// Builds a `TxnPrepare` frame for `txn_id` targeting the default stream with `payload`.
+    fn txn_prepare_frame(txn_id: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload,
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        let mut body = Vec::new();
+        encode_txn_prepare(
+            &TxnPrepareBody {
+                txn_id,
+                stream_id: b"",
+                pub_body: &pub_body,
+            },
+            &mut body,
+        )
+        .unwrap();
+        frame(FrameType::TxnPrepare, &body)
+    }
+
+    fn txn_resolve_frame(ty: FrameType, txn_id: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_txn_resolve(&TxnResolveBody { txn_id }, &mut body).unwrap();
+        frame(ty, &body)
+    }
+
+    #[test]
+    fn txn_prepare_is_invisible_then_commit_delivers_over_the_wire() {
+        // The end-to-end INVISIBILITY invariant over the real consume path: a prepared half message is
+        // NEVER delivered by Flow/Deliver; it appears ONLY after commit.
+        let e = DirectEngine::new(engine());
+        // Producer connection prepares + commits.
+        let mut prod = Session::with_member_id(MemberId::new(1));
+        let mut out = Vec::new();
+        prod.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        prod.process(&e, &txn_prepare_frame(b"tx1", b"half"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "prepare is acked Ok");
+
+        // A consumer Flow sees NOTHING (the half message is invisible).
+        let mut cons = connect_and_sub(&e, MemberId::new(2), b"");
+        out.clear();
+        cons.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            delivered_payloads(&out).is_empty(),
+            "a prepared-but-uncommitted half message is never delivered"
+        );
+
+        // Commit: the producer gets a PubAck with the committed offset.
+        out.clear();
+        prod.process(
+            &e,
+            &txn_resolve_frame(FrameType::TxnCommit, b"tx1"),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, ack) = one_response(&out);
+        assert_eq!(ty, FrameType::PubAck, "commit replies a PubAck");
+        assert_eq!(decode_pub_ack(&ack).unwrap().offset, 0);
+
+        // Now the consumer Flow delivers the committed record exactly once.
+        out.clear();
+        cons.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"half".to_vec()],
+            "the committed half message becomes visible exactly once"
+        );
+    }
+
+    #[test]
+    fn txn_rollback_over_the_wire_never_delivers() {
+        let e = DirectEngine::new(engine());
+        let mut prod = Session::with_member_id(MemberId::new(1));
+        let mut out = Vec::new();
+        prod.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        prod.process(&e, &txn_prepare_frame(b"tx1", b"secret"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        out.clear();
+        prod.process(
+            &e,
+            &txn_resolve_frame(FrameType::TxnRollback, b"tx1"),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "rollback is acked Ok");
+
+        // A consumer never sees the rolled-back payload.
+        let mut cons = connect_and_sub(&e, MemberId::new(2), b"");
+        out.clear();
+        cons.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            delivered_payloads(&out).is_empty(),
+            "a rolled-back half message is never delivered"
+        );
+    }
+
+    #[test]
+    fn txn_commit_after_rollback_over_the_wire_is_an_error() {
+        let e = DirectEngine::new(engine());
+        let mut prod = Session::with_member_id(MemberId::new(1));
+        let mut out = Vec::new();
+        prod.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        prod.process(&e, &txn_prepare_frame(b"tx1", b"v"), &mut out)
+            .unwrap();
+        out.clear();
+        prod.process(
+            &e,
+            &txn_resolve_frame(FrameType::TxnRollback, b"tx1"),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        // commit-after-rollback is refused, never flipped: an Err frame, never a PubAck.
+        prod.process(
+            &e,
+            &txn_resolve_frame(FrameType::TxnCommit, b"tx1"),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "commit-after-rollback is an Err, never a PubAck"
+        );
+    }
+
+    #[test]
+    fn txn_malformed_and_empty_id_are_rejected_over_the_wire() {
+        let e = DirectEngine::new(engine());
+        let mut prod = Session::with_member_id(MemberId::new(1));
+        let mut out = Vec::new();
+        prod.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        // A malformed (empty) prepare body is an Err, not a panic.
+        out.clear();
+        prod.process(&e, &frame(FrameType::TxnPrepare, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Err);
+        // An empty txn id is refused.
+        out.clear();
+        prod.process(&e, &txn_resolve_frame(FrameType::TxnCommit, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Err);
     }
 }
