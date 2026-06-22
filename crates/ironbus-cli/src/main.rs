@@ -5175,7 +5175,6 @@ fn build_preauth_config(
 #[cfg(unix)]
 fn build_audit_emitter(
     config: &ServeConfig,
-    out: &mut impl Write,
 ) -> Result<ironbus_server::audit::AuditEmitter, CliError> {
     use ironbus_server::audit::{AuditEmitter, AuditSink};
     let clock = std::sync::Arc::new(SystemClock::new()) as std::sync::Arc<dyn ironbus_core::clock::Clock>;
@@ -5183,11 +5182,14 @@ fn build_audit_emitter(
         return Ok(AuditEmitter::disabled(clock));
     };
     let sink = if sink_ref == "stderr" {
-        writeln!(
-            out,
+        // The diagnostic announcement goes to STDERR (the log stream), not stdout: stdout is the
+        // startup-protocol stream a supervisor reads then stops reading, so a write to it can SIGPIPE
+        // (the same reason the materialized-config line goes to stderr). Best-effort, ignore errors.
+        let _ = writeln!(
+            std::io::stderr(),
             "ironbus security audit events -> stderr (auth outcomes, scope denials, config changes; \
              identity names only, never credentials)"
-        )?;
+        );
         AuditSink::writer(Box::new(std::io::stderr()))
     } else if let Some(path) = sink_ref.strip_prefix('@') {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -5206,11 +5208,11 @@ fn build_audit_emitter(
                 "cannot set owner-only permissions on --audit-log file `{path}`: {e}"
             ))
         })?;
-        writeln!(
-            out,
+        let _ = writeln!(
+            std::io::stderr(),
             "ironbus security audit events -> {path} (0600; auth outcomes, scope denials, config \
              changes; identity names only, never credentials)"
-        )?;
+        );
         AuditSink::writer(Box::new(file))
     } else {
         return Err(CliError::Usage(format!(
@@ -7690,7 +7692,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // emitter (zero-cost). The clock is the broker's wall+monotonic seam (for the audit envelope's
     // wall-clock stamp). A startup CONFIG-CHANGE event records that the broker materialized its config
     // (secret-free summary), so the audit trail begins at boot.
-    let audit = build_audit_emitter(config, out)?;
+    let audit = build_audit_emitter(config)?;
     audit.emit(&ironbus_server::audit::AuditEvent::ConfigChange {
         summary: "startup".to_string(),
     });
