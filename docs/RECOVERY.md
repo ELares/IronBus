@@ -779,3 +779,88 @@ choose it (`crates/ironbus-client/src/lib.rs`):
   on the per-connection mint.
 
 For transactions that span a reconnect, prefer `prepare_with_id` with a stable id.
+
+### 9.4 The broker back-check: resolving a producer-crashed in-doubt txn (#640 part 2)
+
+Part 1 leaves one hole: if a producer sends a half message (`prepare`) then
+CRASHES before `commit`/`rollback`, the half message is stuck `Prepared`
+(invisible, undelivered) forever. The **back-check** closes it. The broker
+periodically scans for `Prepared` half messages older than a timeout and asks the
+producer "what is the state of transaction X?"; the producer's registered
+transaction-state listener answers `Commit` / `Rollback` / `Unknown`, and the
+broker resolves accordingly. If the producer is unreachable after a bounded number
+of attempts, the broker applies a SAFE TERMINAL default. The engine code is
+`Engine::txn_back_check_tick` / `resolve_txn_check` / `register_txn_listener` and
+the `TxnBackCheck` router in `crates/ironbus-server/src/engine.rs`; the pure
+schedule is `ironbus_core::txn::BackCheckBook`; the durable bookkeeping is the
+`TXNB` op-record + `TxnStore::append_back_check` in
+`crates/ironbus-storage/src/txn.rs`.
+
+**The scan loop.** A cheap periodic task (riding the producer's serve passes, the
+same per-pass seam as the Level-2 `ProduceConfirm` drain, gated on the connection
+having registered a listener) queries `BackCheckBook::due(now)` — every enrolled
+`Prepared` txn whose next-eligible instant has passed, capped at a global per-pass
+batch (no storm). For each due txn it records the attempt durably FIRST, then
+pushes a `TxnCheck` to the producer's live listener; after the bounded
+`max_back_check_attempts` with no resolution it applies the SAFE TERMINAL default
+= **Rollback/discard** (never deliver a message whose outcome is unknowable). The
+scan is a no-op (zero work) when no txn is in-doubt, so a broker that does not use
+transactions is byte-for-byte unchanged.
+
+**The new frames + tags.** `TxnCheck` (tag 47, broker→producer, "state of txn X?",
+reusing the frozen `TxnResolveBody` shape), `TxnCheckResult` (tag 48,
+producer→broker, `txn_id` + a `Commit`/`Rollback`/`Unknown` decision byte), and
+`TxnListen` (tag 49, producer→broker, the listener-group registration). All
+version-tagged, length-framed, cap-before-alloc, and pinned by byte-freeze
+snapshot tests. An unrecognized decision byte folds to the SAFE `Unknown`.
+
+**Durable bookkeeping + recovery.** The back-check schedule + attempt count are
+persisted as a new `TXNB` op-record (CRC32C'd, version-tagged, frozen) so they
+SURVIVE a broker restart. On replay the attempt count is restored EXACTLY (it is
+the terminal-default gate), while the `next_eligible` instant is REBASED against
+the live monotonic clock — a persisted absolute monotonic instant is meaningless
+across a reboot (the monotonic origin resets), so a recovered txn is promptly
+re-eligible with its count preserved and the scan resumes. A `TXNB` record whose
+txn later resolved is superseded by the commit/rolled-back op-marker on replay
+(never re-enrolled).
+
+**Routing to the (re)connected producer.** The broker only writes a producer's
+socket from that producer's own pass (thread-per-connection), so the back-check
+push rides the producer's listener loop exactly like the L2 confirm drain. The
+per-connection `MemberId` changes across a reconnect, so routing is keyed by a
+STABLE producer-chosen listener GROUP: a producer registers it via `TxnListen`
+(re-registering after a reconnect re-points the route to its new connection); each
+half message records its owning group at `prepare`; the scan routes a `TxnCheck`
+to whatever connection currently holds that group's listener. THE HEADLINE CASE:
+a producer prepares, disconnects before resolve (crash), reconnects and
+re-registers its listener, the scan back-checks it, the listener replies `Commit`
+→ the half is committed EXACTLY ONCE via the part-1 path (proven by
+`the_headline_crash_reconnect_back_check_commit_delivers_exactly_once` in
+`engine.rs` and `the_headline_back_check_resolves_a_crashed_producers_half_over_the_wire`
+end-to-end in `ironbus-client`).
+
+**Resolution reuses part 1 (the inherited exactly-once + immutability).** A
+back-check `Commit` goes through the SAME idempotent `Engine::txn_commit` path
+(default-stream exactly-once preserved); a `Rollback` through the same
+`txn_rollback`; the back-check NEVER introduces a new commit path. So part 1's
+`AlreadyResolved` rule covers every race:
+
+| Race | Outcome |
+|---|---|
+| producer answers `Commit` twice | the second is a benign idempotent no-op (returns the recorded offset); no second delivery |
+| producer answers `Commit` AFTER the terminal `Rollback` already fired | REFUSED (`AlreadyResolved { RolledBack }`) — never a flip, never a double-resolve |
+| a duplicate `TxnCheckResult` | a no-op (the txn is already resolved/forgotten) |
+| the producer never returns | after `max_back_check_attempts` → terminal `Rollback` (discarded, never delivered) |
+
+**The terminal-default safety net + its limits.** The terminal default is
+ALWAYS `Rollback` (discard), never `Commit`: a half message whose outcome is
+unknowable is never delivered. It fires through the same idempotent `txn_rollback`,
+so a producer's later `Commit` is the refused-flip above, not a double-resolve. A
+half message prepared by a producer that NEVER registered a listener is not
+routable (the broker cannot reach it), but is still enrolled — the bounded attempt
+cap still advances on each scan and the terminal `Rollback` still safely discards
+it, so a listener-less producer's crashed half is never stuck forever (it is just
+never given the chance to commit it, which is the correct conservative default).
+The routing GROUP is the unit of identity: two producers that (mis)register the
+SAME group share a listener route, so a deployment must give each producer a
+distinct stable group (e.g. its durable producer id).
