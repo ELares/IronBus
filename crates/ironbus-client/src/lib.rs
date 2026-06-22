@@ -4551,9 +4551,10 @@ mod tests {
             6,
             "all 5 coalesced records plus the at-least-once one are durable"
         );
-        for (i, m) in messages.iter().take(5).enumerate() {
-            assert_eq!(m.offset, i as u64);
-            assert_eq!(m.payload, vec![b'a' + i as u8]);
+        for i in 0u8..5 {
+            let m = &messages[usize::from(i)];
+            assert_eq!(m.offset, u64::from(i));
+            assert_eq!(m.payload, vec![b'a' + i]);
         }
         assert_eq!(messages[5].payload, b"alo");
         shutdown.store(true, Ordering::Release);
