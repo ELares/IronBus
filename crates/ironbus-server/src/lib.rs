@@ -2,6 +2,7 @@
 //! IronBus broker server.
 
 pub mod actor;
+pub mod audit;
 pub mod auth;
 pub mod clock;
 pub mod cluster;

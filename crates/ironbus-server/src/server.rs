@@ -130,6 +130,7 @@ where
         auth,
         connz,
         None,
+        None,
     )
 }
 
@@ -170,6 +171,48 @@ where
         auth,
         connz,
         preauth,
+        None,
+    )
+}
+
+/// Serves connections exactly like [`serve_with_auth_connz_preauth`], plus the OPTIONAL security
+/// AUDIT-EVENT stream (#635, V2-M7): when `audit` is `Some(_)`, every connection's `Connect` handshake
+/// emits the auth OUTCOME (success/failure) and every scope-gated verb a connection lacks emits a
+/// DENIAL through the shared emitter, carrying the identity NAME and the mechanism/scope/verb tags,
+/// NEVER a credential. The SAME emitter is cloned per connection so the audit sequence is one monotonic
+/// space. When `None` (or an emitter over the `Null` sink), the accept path is byte-for-byte the
+/// historical one. The broker bootstrap builds the single emitter and shares it here.
+///
+/// # Errors
+/// Propagates a fatal listener error, exactly like [`serve`].
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub fn serve_with_auth_connz_preauth_audit<F, C>(
+    listener: &TcpListener,
+    engine: &EngineHandle<F, C>,
+    shutdown: &AtomicBool,
+    max_connections: usize,
+    clock: &C,
+    progress: &crate::liveness::LivenessBeacon,
+    auth: Option<Arc<AuthConfig>>,
+    connz: &Arc<ConnectionMetrics>,
+    preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
+    audit: Option<crate::audit::AuditEmitter>,
+) -> std::io::Result<()>
+where
+    F: Filesystem + Clone + 'static,
+    C: Clock + Clone + 'static,
+{
+    serve_inner(
+        listener,
+        engine,
+        shutdown,
+        max_connections,
+        clock,
+        progress,
+        auth,
+        connz,
+        preauth,
+        audit,
     )
 }
 
@@ -213,6 +256,7 @@ where
         auth,
         &Arc::new(ConnectionMetrics::new()),
         None,
+        None,
     )
 }
 
@@ -232,6 +276,7 @@ fn serve_inner<F, C>(
     auth: Option<Arc<AuthConfig>>,
     connz: &Arc<ConnectionMetrics>,
     preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
+    audit: Option<crate::audit::AuditEmitter>,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -308,6 +353,10 @@ where
                 // A cheap `Arc` clone of the pre-auth `DoS` guard (#633), so the session can report its
                 // auth outcome (failure -> per-IP lockout; success -> clear the IP's failed window).
                 let preauth_for_conn = preauth.clone();
+                // A cheap `Clone` of the shared audit emitter (#635), so the session emits the auth
+                // OUTCOME and any scope DENIAL through it (carrying the identity NAME, never a
+                // credential). `None` is the no-audit serve path (byte-for-byte historical).
+                let audit_for_conn = audit.clone();
                 std::thread::spawn(move || {
                     // The guard decrements the cap slot AND records the connz close on return OR a
                     // panic unwind, so a panicking handler can never leak a slot nor miss a close.
@@ -329,6 +378,7 @@ where
                         &connz,
                         preauth_for_conn,
                         peer_ip,
+                        audit_for_conn,
                     );
                 });
             }
@@ -359,6 +409,7 @@ fn handle_connection<F, C>(
     connz: &Arc<ConnectionMetrics>,
     preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
     peer_ip: std::net::IpAddr,
+    audit: Option<crate::audit::AuditEmitter>,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -384,6 +435,12 @@ where
     // success clears the IP's window). A no-op when no `DoS` defense is configured.
     if let Some(guard) = preauth {
         session = session.with_preauth(guard, peer_ip);
+    }
+    // Attach the security audit emitter (#635) so the `Connect` handshake emits the auth OUTCOME and
+    // every scope-gated verb emits a DENIAL through it (identity NAME only, never a credential). A
+    // no-op when no audit sink is configured (the byte-for-byte historical path).
+    if let Some(emitter) = audit {
+        session = session.with_audit(emitter);
     }
     // The read/dispatch loop, run to completion so the cleanup below ALWAYS executes on exit:
     // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
@@ -897,6 +954,7 @@ mod tests {
                     &connz,
                     None,
                     peer.ip(),
+                    None,
                 )
             }
         });

@@ -142,6 +142,54 @@ where
     C: Clock + Clone + 'static,
     E: EngineAccess<F, C>,
 {
+    // The legacy entry point has no DRAINING readiness gate (#637): pass a never-set flag, so `/readyz`
+    // behaves exactly as before (200 while the writer is healthy, 503 only on a frozen writer / gone
+    // actor). The drain-aware bootstrap uses `serve_health_connz_draining`.
+    let never_draining = AtomicBool::new(false);
+    serve_health_connz_draining(
+        listener,
+        engine,
+        shutdown,
+        &never_draining,
+        admin_enabled,
+        progress,
+        liveness_window_nanos,
+        clock,
+        connz,
+        data_dir,
+    )
+}
+
+/// Serves the health endpoints exactly like [`serve_health_connz`], plus the SIGTERM-DRAIN READINESS
+/// GATE (#637, V2-M7): when `draining` is set, `GET /readyz` answers `503` immediately ("draining"),
+/// BEFORE consulting the engine, so an orchestrator stops routing new work to this broker the moment a
+/// stop signal arrives — while the health server KEEPS SERVING (so the 503 is observable, not a refused
+/// connection). This is the "stop accepting before stop serving" ordering: the broker flips `draining`
+/// first, then drains in-flight work bounded by the drain timeout. `GET /healthz` (liveness) is
+/// UNAFFECTED by draining — a draining broker is still live and answers 200 — so an orchestrator
+/// distinguishes "not-ready, drain me" from "dead, restart me". With `draining` never set this is
+/// byte-for-byte [`serve_health_connz`].
+///
+/// # Errors
+/// Returns an IO error only from configuring the listener; per-connection IO errors are contained.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_health_connz_draining<F, C, E>(
+    listener: &TcpListener,
+    engine: &E,
+    shutdown: &AtomicBool,
+    draining: &AtomicBool,
+    admin_enabled: bool,
+    progress: &LivenessBeacon,
+    liveness_window_nanos: u64,
+    clock: &C,
+    connz: &Arc<ConnectionMetrics>,
+    data_dir: Option<&Path>,
+) -> std::io::Result<()>
+where
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+{
     // Own the data-dir path once for the loop's lifetime (the per-request handler borrows it).
     let data_dir = data_dir.map(Path::to_path_buf);
     listener.set_nonblocking(true)?;
@@ -152,6 +200,7 @@ where
                 let _ = handle(
                     stream,
                     engine,
+                    draining,
                     admin_enabled,
                     progress,
                     liveness_window_nanos,
@@ -174,6 +223,7 @@ where
 fn handle<F, C, E>(
     mut stream: TcpStream,
     engine: &E,
+    draining: &AtomicBool,
     admin_enabled: bool,
     progress: &LivenessBeacon,
     liveness_window_nanos: u64,
@@ -241,12 +291,21 @@ where
             }
         }
         "/readyz" => {
-            // Read the writer-health flag through the actor (the single owner). If the actor is gone
-            // (a shutdown drain), the broker is not ready: surface 503 rather than hang.
-            match engine.with(|e| e.is_healthy()) {
-                Ok(true) => respond(&mut stream, 200, "OK", "ready"),
-                Ok(false) => respond(&mut stream, 503, "Service Unavailable", "writer frozen"),
-                Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
+            // The SIGTERM-DRAIN readiness gate (#637), checked FIRST, before consulting the engine: a
+            // broker that received a stop signal flips `draining` and immediately answers 503 here, so
+            // an orchestrator stops routing new work to it BEFORE the drain begins — the "stop
+            // accepting before stop serving" ordering. The engine is still healthy at this instant
+            // (the drain has not started), so the 503 must come from the gate, not the engine check.
+            if draining.load(Ordering::Acquire) {
+                respond(&mut stream, 503, "Service Unavailable", "draining")
+            } else {
+                // Read the writer-health flag through the actor (the single owner). If the actor is
+                // gone (a shutdown drain), the broker is not ready: surface 503 rather than hang.
+                match engine.with(|e| e.is_healthy()) {
+                    Ok(true) => respond(&mut stream, 200, "OK", "ready"),
+                    Ok(false) => respond(&mut stream, 503, "Service Unavailable", "writer frozen"),
+                    Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
+                }
             }
         }
         "/metrics" => match metrics_snapshot(engine, connz, data_dir) {
@@ -2092,6 +2151,69 @@ mod tests {
         // A query string is stripped.
         let q = request(addr, "GET /healthz?probe=1 HTTP/1.1\r\n\r\n");
         assert!(q.starts_with("HTTP/1.1 200 OK"), "{q}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn readyz_flips_to_503_when_draining_while_healthz_stays_200_and_the_engine_is_still_healthy() {
+        // The #637 SIGTERM-drain readiness gate: a broker that received a stop signal flips `draining`
+        // and `/readyz` answers 503 ("draining") IMMEDIATELY, even though the engine writer is still
+        // perfectly healthy (the drain has not begun) — the "stop accepting before stop serving"
+        // ordering. `/healthz` (liveness) is UNAFFECTED: a draining broker is still live (200), so an
+        // orchestrator distinguishes "drain me" from "restart me".
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), test_eng_cfg()).unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let draining = Arc::clone(&draining);
+            let shared = Arc::clone(&shared);
+            move || {
+                serve_health_connz_draining(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    &draining,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                    &Arc::new(ConnectionMetrics::new()),
+                    None,
+                )
+                .unwrap();
+            }
+        });
+
+        // Before draining: /readyz is ready (the engine is healthy).
+        let r = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "ready before drain: {r}");
+        assert!(r.ends_with("ready"), "{r}");
+
+        // Flip draining (what the SIGTERM path does FIRST, before the actor drain).
+        draining.store(true, Ordering::Release);
+
+        // /readyz now sheds 503 "draining" — and the engine is STILL healthy, proving the 503 comes
+        // from the readiness gate, not a frozen writer or a gone actor.
+        let r2 = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(
+            r2.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "draining is 503: {r2}"
+        );
+        assert!(r2.ends_with("draining"), "the drain reason: {r2}");
+        assert!(
+            shared.with(|e| e.is_healthy()).unwrap(),
+            "the engine writer is still healthy during the readiness flip (drain not yet started)"
+        );
+
+        // /healthz is UNAFFECTED by draining: a draining broker is still live (200).
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "live while draining: {h}");
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
