@@ -37,6 +37,7 @@
 use crate::checkpoint::Checkpoint;
 use crate::dlq::{read_dlq_entries, DlqEntry};
 use crate::fs::Filesystem;
+use crate::io::RandomAccessFile;
 use crate::layout::STREAMS_SUBDIR;
 use crate::log::{Append, Log, LogConfig};
 use crate::naming::{
@@ -828,6 +829,637 @@ pub fn purge_stream<F: Filesystem + Clone>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Point-consistent backup / restore (V2-M6 #607): a single snapshot of the
+// data dir — the log + the consumer cursors + the DLQ together — captured at
+// ONE logical point (the broker STOPPED, the CLI holding the exclusive lock),
+// and a fail-closed restore that materializes a data dir a restored verify
+// passes. Reuses the broker-stopped, data-dir-owned safety boundary as the
+// other offline admin ops (the CLI holds the exclusive lock around these).
+// ---------------------------------------------------------------------------
+
+/// The name of the manifest file at the root of a backup directory tree. It records the backup
+/// FORMAT version, a CRC32C + length of every captured file, and the captured durable offsets, so a
+/// restore can validate the backup is complete and uncorrupted before materializing a byte of it.
+/// Deliberately NOT a `seg-*.log`/`cursor*.ckpt`/`layout.meta` name, so it is inert to log recovery.
+pub const BACKUP_MANIFEST_FILE: &str = "MANIFEST";
+
+/// The subdirectory of a backup tree that holds the faithful copy of the source data directory. The
+/// manifest sits at the backup root; the captured tree lives under here, so the manifest and the data
+/// never share a namespace (a manifest can never be mistaken for a captured file, or vice versa).
+pub const BACKUP_DATA_SUBDIR: &str = "data";
+
+/// The magic prefix of the manifest payload (IronBus `BacKuP`), distinguishing a real IronBus backup
+/// manifest from an unrelated file a foreign tool might leave: a restore refuses a `MANIFEST` whose
+/// payload does not start with this, fail-closed, rather than materializing an arbitrary tree.
+const BACKUP_MAGIC: &str = "IBBKP";
+
+/// The backup FORMAT version this build writes and understands. It versions the BACKUP artifact
+/// layout (the manifest grammar + the `data/` tree), distinct from both the per-segment
+/// `FORMAT_VERSION` and the data-dir `LAYOUT_VERSION` it captures. A restore of a backup whose format
+/// version is GREATER than this is refused fail-closed (a newer backup is never half-interpreted by an
+/// older binary), exactly as an unknown layout marker is refused.
+pub const BACKUP_FORMAT_VERSION: u32 = 1;
+
+/// The CLI-layer single-broker lock file (`LOCK`, #89): an `flock(2)` advisory lock the broker/CLI
+/// holds, NOT storage state. It is EXCLUDED from a backup (capturing it would let a restore carry a
+/// foreign lock token into a fresh dir) and is never required for `verify`/recovery, so its absence
+/// from a restored dir is correct. Named here so the snapshot skips exactly it at the data-dir root.
+const LOCK_FILE_NAME: &str = "LOCK";
+
+/// A failure of a backup or restore operation (#607), kept typed so the CLI maps it onto the frozen
+/// exit-code scheme. Distinct from [`AdminError`] because restore adds validation-failure cases
+/// (a corrupt, incomplete, or wrong-version backup) that are neither an out-of-range reset nor a
+/// plain storage fault: they are fail-closed REJECTIONS of an untrustworthy backup.
+#[derive(Debug)]
+pub enum BackupError {
+    /// The backup's `MANIFEST` is absent, unreadable, or not a well-formed IronBus backup manifest
+    /// (wrong magic or malformed grammar). The backup is rejected fail-closed; nothing is restored.
+    /// Carries a human reason.
+    InvalidManifest(String),
+    /// The backup declares a FORMAT version this build does not understand (greater than
+    /// [`BACKUP_FORMAT_VERSION`]). Refused fail-closed — a newer backup is never half-interpreted by
+    /// an older binary. Carries the found version and the supported version.
+    IncompatibleVersion {
+        /// The backup-format version found in the manifest.
+        found: u32,
+        /// The backup-format version this build supports (the maximum it can restore).
+        supported: u32,
+    },
+    /// A captured file is missing from the backup tree, or its bytes do not match the manifest's
+    /// CRC32C/length (a truncated or corrupted backup). Refused fail-closed BEFORE any byte is
+    /// written to the target dir, so a corrupt backup never yields a partial restore. Carries the
+    /// offending relative path and a reason.
+    CorruptBackup(String),
+    /// The target data directory is NON-EMPTY and `--force` was not given, so the restore refuses to
+    /// clobber it. Carries the count of existing entries so the CLI can report what it would have
+    /// overwritten.
+    TargetNotEmpty(usize),
+    /// A storage/IO error reading the source dir, reading the backup, or writing the target. Carries
+    /// the underlying [`StorageError`] so the CLI classifies it exactly as the other offline verbs do.
+    Storage(StorageError),
+}
+
+impl core::fmt::Display for BackupError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BackupError::InvalidManifest(m) => write!(f, "invalid backup manifest: {m}"),
+            BackupError::IncompatibleVersion { found, supported } => write!(
+                f,
+                "backup format version {found} is newer than this build supports ({supported})"
+            ),
+            BackupError::CorruptBackup(m) => write!(f, "corrupt or incomplete backup: {m}"),
+            BackupError::TargetNotEmpty(n) => write!(
+                f,
+                "target data directory is not empty ({n} existing entr{}); pass --force to overwrite",
+                if *n == 1 { "y" } else { "ies" }
+            ),
+            BackupError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BackupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BackupError::Storage(e) => Some(e),
+            BackupError::InvalidManifest(_)
+            | BackupError::IncompatibleVersion { .. }
+            | BackupError::CorruptBackup(_)
+            | BackupError::TargetNotEmpty(_) => None,
+        }
+    }
+}
+
+impl From<StorageError> for BackupError {
+    fn from(e: StorageError) -> BackupError {
+        BackupError::Storage(e)
+    }
+}
+
+/// A convenience: lift a bare `io::Error` into a [`BackupError::Storage`] wrapping [`StorageError::Io`].
+fn io_err(e: std::io::Error) -> BackupError {
+    BackupError::Storage(StorageError::Io(e))
+}
+
+/// One captured file recorded in the manifest: its path RELATIVE to the captured `data/` root (with
+/// `/` separators, so a nested `dlq/seg-...log` is one entry), the CRC32C of its bytes, and its byte
+/// length. The restore re-reads each file from the backup and checks both against this before writing
+/// anything to the target, so a truncated or bit-rotted backup is rejected fail-closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupFileEntry {
+    /// The file's path relative to the captured `data/` root, `/`-separated (e.g. `seg-0000…0.log`
+    /// or `dlq/seg-0000…0.log`). Path-safe by construction: every component is a real on-disk name.
+    pub rel_path: String,
+    /// The CRC32C of the file's bytes, the integrity check the restore re-computes and compares.
+    pub crc32c: u32,
+    /// The file's length in bytes, checked alongside the CRC (a length mismatch is a truncation).
+    pub len: u64,
+}
+
+/// The outcome of a successful [`snapshot_data_dir`]: how many files (and bytes) were captured, and
+/// the durable offsets recorded for the consistency self-check, so the CLI reports exactly what the
+/// point-consistent snapshot covered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupOutcome {
+    /// The number of files captured across the whole tree (root + every subdir).
+    pub files: usize,
+    /// The total bytes captured (the sum of every file's length).
+    pub bytes: u64,
+    /// The durable head of the default-stream log at capture time (the high end of the durable range).
+    pub durable_head: u64,
+    /// The earliest retained offset of the default-stream log at capture time.
+    pub earliest_retained: u64,
+    /// The number of consumer cursor checkpoints captured (one per work-group with durable state).
+    pub cursors: usize,
+    /// The number of durable DLQ records captured (the DLQ depth at the snapshot point).
+    pub dlq_records: usize,
+}
+
+/// The outcome of a successful [`restore_data_dir`]: how many files (and bytes) were materialized,
+/// plus the durable offsets the manifest recorded (so the CLI can report the restored point and a
+/// caller can cross-check it against a post-restore `verify`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// The number of files materialized into the target data dir.
+    pub files: usize,
+    /// The total bytes materialized.
+    pub bytes: u64,
+    /// The durable head the manifest recorded at capture time (the restored log head).
+    pub durable_head: u64,
+    /// The earliest retained offset the manifest recorded at capture time.
+    pub earliest_retained: u64,
+    /// The number of consumer cursors the manifest recorded.
+    pub cursors: usize,
+    /// The number of DLQ records the manifest recorded.
+    pub dlq_records: usize,
+}
+
+/// Recursively lists every file in a filesystem subtree as `(rel_path, bytes)` pairs, `/`-separated
+/// relative to the subtree root, skipping the CLI `LOCK` file AT THE ROOT ONLY (a deeper `LOCK` is a
+/// real captured byte, though no IronBus subtree writes one). Deterministic: files then subdirs, each
+/// in the backend's sorted order, so two snapshots of the same bytes produce byte-identical manifests.
+///
+/// This is the heart of the FAITHFUL round trip: it copies EVERY file the data dir holds — segments,
+/// cursor checkpoints, `counters.ckpt`, `layout.meta`, the `dlq-redrive.ckpt` watermark, the `dlq/`
+/// subtree, any `streams/<hex>/` subtree, the `quarantine/` forensic store — by enumeration, so the
+/// backup is the data dir's committed content with no per-artifact special-casing to drift.
+fn collect_tree<F: Filesystem>(
+    fs: &F,
+    prefix: &str,
+    out: &mut Vec<(String, Vec<u8>)>,
+) -> Result<(), BackupError> {
+    let at_root = prefix.is_empty();
+    for name in fs.list().map_err(io_err)? {
+        // The CLI lock is transient, not storage state, and a restored dir must not carry a foreign
+        // lock token: skip it at the root (the only place the broker/CLI writes it).
+        if at_root && name == LOCK_FILE_NAME {
+            continue;
+        }
+        let file = fs.open(&name).map_err(io_err)?;
+        let len = usize::try_from(file.len().map_err(io_err)?).map_err(|_| {
+            BackupError::Storage(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file too large to capture in one buffer",
+            )))
+        })?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact_at(&mut bytes, 0).map_err(io_err)?;
+        let rel = if at_root {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        out.push((rel, bytes));
+    }
+    for dir in fs.list_subdirs().map_err(io_err)? {
+        let child = fs.subdir(&dir).map_err(io_err)?;
+        let child_prefix = if at_root {
+            dir.clone()
+        } else {
+            format!("{prefix}/{dir}")
+        };
+        collect_tree(&child, &child_prefix, out)?;
+    }
+    Ok(())
+}
+
+/// Captures the consistency self-check fields (the durable range, the cursor count, the DLQ depth)
+/// from a STOPPED data dir, the same read-only reads `verify` performs. Because the broker is stopped
+/// and the caller holds the exclusive lock, these are settled values: the snapshot they describe is a
+/// single consistent point (no cursor can be past this head, no DLQ entry can dangle). Returns the
+/// four fields; on a freshly-empty or unopenable-as-a-log dir the durable range is `(0, 0)` (an empty
+/// log is a valid point).
+fn capture_consistency_fields<F: Filesystem + Clone>(
+    fs: &F,
+) -> Result<(u64, u64, usize, usize), BackupError> {
+    // The default-stream durable range, read-only. An empty/fresh dir opens as an empty log (range
+    // 0..0); a structurally-corrupt dir surfaces its typed error here, refusing to back up a dir that
+    // does not even open (fail-closed: a backup of an unreadable dir would be useless).
+    let reader = OfflineReader::open(fs.clone())?;
+    let earliest_retained = reader.earliest_retained().get();
+    let durable_head = reader.durable_head().get();
+    drop(reader);
+    let cursors = cursor_checkpoint_names(fs).map_err(io_err)?.len();
+    let dlq_records = read_dlq_entries(fs)?.len();
+    Ok((earliest_retained, durable_head, cursors, dlq_records))
+}
+
+/// Serializes the manifest payload: a magic + version header, the captured durable offsets / cursor /
+/// DLQ counts (the consistency self-check), then one line per captured file (`crc32c len rel_path`).
+/// A line-oriented, std-only grammar (no serde, no new dep) whose every field is ASCII; the `rel_path`
+/// is the last field so a `/` in it (a nested file) is unambiguous (the first two fields never contain
+/// a space). The reader splits the first two fields off and takes the rest verbatim as the path.
+fn encode_manifest(
+    files: &[BackupFileEntry],
+    earliest_retained: u64,
+    durable_head: u64,
+    cursors: usize,
+    dlq_records: usize,
+) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    // Header: magic + format version, then the self-check fields. A writeln into a String is infallible.
+    let _ = writeln!(s, "{BACKUP_MAGIC} {BACKUP_FORMAT_VERSION}");
+    let _ = writeln!(
+        s,
+        "range {earliest_retained} {durable_head} cursors {cursors} dlq {dlq_records}"
+    );
+    let _ = writeln!(s, "files {}", files.len());
+    for e in files {
+        // `crc len rel_path`: the two numeric fields are space-free, so the path (which may contain a
+        // `/`) is the unambiguous remainder of the line. A path never contains a newline (a filesystem
+        // name component cannot), so one entry is exactly one line.
+        let _ = writeln!(s, "{} {} {}", e.crc32c, e.len, e.rel_path);
+    }
+    s.into_bytes()
+}
+
+/// The decoded manifest: the format version, the four self-check fields, and the per-file entries.
+struct DecodedManifest {
+    version: u32,
+    earliest_retained: u64,
+    durable_head: u64,
+    cursors: usize,
+    dlq_records: usize,
+    files: Vec<BackupFileEntry>,
+}
+
+/// Parses a manifest payload, returning a typed [`BackupError`] for anything that is not a well-formed
+/// IronBus backup manifest (wrong magic, a malformed header, a bad file line, or a file-count
+/// mismatch). It does NOT yet check the format version against this build's support — the caller does
+/// that — so this is a pure grammar check that fail-closes on any structural problem.
+fn decode_manifest(payload: &[u8]) -> Result<DecodedManifest, BackupError> {
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| BackupError::InvalidManifest("manifest is not valid UTF-8".to_string()))?;
+    let mut lines = text.lines();
+
+    // Header line: `IBBKP <version>`.
+    let header = lines
+        .next()
+        .ok_or_else(|| BackupError::InvalidManifest("empty manifest".to_string()))?;
+    let mut hp = header.split(' ');
+    if hp.next() != Some(BACKUP_MAGIC) {
+        return Err(BackupError::InvalidManifest(
+            "missing IronBus backup magic".to_string(),
+        ));
+    }
+    let version: u32 = hp
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| BackupError::InvalidManifest("malformed format version".to_string()))?;
+
+    // Self-check line: `range <earliest> <head> cursors <n> dlq <n>`.
+    let range_line = lines
+        .next()
+        .ok_or_else(|| BackupError::InvalidManifest("missing range line".to_string()))?;
+    // `range <earliest> <head> cursors <n> dlq <n>` — 7 space-delimited tokens.
+    let rp: Vec<&str> = range_line.split(' ').collect();
+    let bad_range = || BackupError::InvalidManifest("malformed range line".to_string());
+    if rp.len() != 7 || rp[0] != "range" || rp[3] != "cursors" || rp[5] != "dlq" {
+        return Err(bad_range());
+    }
+    let earliest_retained: u64 = rp[1].parse().map_err(|_| bad_range())?;
+    let durable_head: u64 = rp[2].parse().map_err(|_| bad_range())?;
+    let cursors: usize = rp[4].parse().map_err(|_| bad_range())?;
+    let dlq_records: usize = rp[6].parse().map_err(|_| bad_range())?;
+
+    // File-count line: `files <n>`.
+    let files_line = lines
+        .next()
+        .ok_or_else(|| BackupError::InvalidManifest("missing files line".to_string()))?;
+    let declared: usize = files_line
+        .strip_prefix("files ")
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| BackupError::InvalidManifest("malformed files line".to_string()))?;
+
+    // One entry per remaining line: `<crc> <len> <rel_path>`.
+    let mut files = Vec::with_capacity(declared);
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, ' ');
+        let crc32c: u32 = parts
+            .next()
+            .and_then(|c| c.parse().ok())
+            .ok_or_else(|| BackupError::InvalidManifest("malformed file CRC".to_string()))?;
+        let len: u64 = parts
+            .next()
+            .and_then(|l| l.parse().ok())
+            .ok_or_else(|| BackupError::InvalidManifest("malformed file length".to_string()))?;
+        let rel_path = parts
+            .next()
+            .ok_or_else(|| BackupError::InvalidManifest("missing file path".to_string()))?
+            .to_string();
+        files.push(BackupFileEntry {
+            rel_path,
+            crc32c,
+            len,
+        });
+    }
+    if files.len() != declared {
+        return Err(BackupError::InvalidManifest(format!(
+            "manifest declares {declared} files but lists {}",
+            files.len()
+        )));
+    }
+    Ok(DecodedManifest {
+        version,
+        earliest_retained,
+        durable_head,
+        cursors,
+        dlq_records,
+        files,
+    })
+}
+
+/// Writes `bytes` to a fresh file `name` under `fs`, creating it, fsyncing its content, and fsyncing
+/// the directory so the new entry is crash-durable — the same write-then-dir-sync discipline the
+/// segment/checkpoint writers use. `create_new` is used so a restore can never silently clobber a file
+/// (the caller has already proven the target is empty or forced an explicit clear).
+fn write_durable_file<F: Filesystem>(fs: &F, name: &str, bytes: &[u8]) -> Result<(), BackupError> {
+    let file = fs.create_new(name).map_err(io_err)?;
+    if !bytes.is_empty() {
+        file.write_all_at(bytes, 0).map_err(io_err)?;
+    }
+    file.sync_all().map_err(io_err)?;
+    fs.sync_dir().map_err(io_err)?;
+    Ok(())
+}
+
+/// Walks a `/`-separated relative path to its parent directory filesystem, creating each intermediate
+/// subdir on the way (mirroring the source tree's shape under the backup or restore root), and returns
+/// `(parent_fs, leaf_name)`. A single-component path returns `(root.clone(), path)`. Every component is
+/// a real on-disk name, so `subdir` (which rejects `.`/`..`/`/`) is safe.
+fn descend_to_parent<F: Filesystem + Clone>(
+    root: &F,
+    rel_path: &str,
+) -> Result<(F, String), BackupError> {
+    let mut components: Vec<&str> = rel_path.split('/').collect();
+    let leaf = components
+        .pop()
+        .ok_or_else(|| BackupError::CorruptBackup(format!("empty path {rel_path:?}")))?
+        .to_string();
+    let mut cur = root.clone();
+    for comp in components {
+        cur = cur.subdir(comp).map_err(io_err)?;
+    }
+    Ok((cur, leaf))
+}
+
+/// Takes a POINT-CONSISTENT snapshot of a STOPPED broker's data directory (#607): the log + the
+/// consumer cursors + the DLQ (and every other durable artifact) captured together at ONE logical
+/// point. The broker MUST be STOPPED and the caller MUST hold the exclusive data-dir lock — that is
+/// what makes the on-disk state a consistent point (the writer's checkpoints are settled), so the
+/// capture reads all artifacts under one quiescent image and a restore of it cannot reintroduce
+/// divergence (a cursor past the head, a dangling DLQ ref).
+///
+/// `src` is the data-dir filesystem; `dst` is the (empty) backup-tree filesystem. The backup is a
+/// DIRECTORY TREE (no tar, no new dep): the source tree is copied verbatim under `dst`'s
+/// [`BACKUP_DATA_SUBDIR`] (`data/`), and a [`BACKUP_MANIFEST_FILE`] (`MANIFEST`) at `dst`'s root
+/// records the format version, a CRC32C + length of every captured file, and the captured durable
+/// offsets / cursor / DLQ counts (the consistency self-check a restore re-validates). The CLI `LOCK`
+/// file is excluded (it is a transient advisory lock, not storage state).
+///
+/// # Errors
+/// [`BackupError::Storage`] for an IO fault or a structurally-unreadable source (a dir that does not
+/// even open as a log is refused — a backup of an unreadable dir is useless).
+pub fn snapshot_data_dir<S, D>(src: &S, dst: &D) -> Result<BackupOutcome, BackupError>
+where
+    S: Filesystem + Clone,
+    D: Filesystem + Clone,
+{
+    // The consistency self-check fields, read under the quiescent (stopped + locked) image. These also
+    // validate the source opens as a log: a corrupt source is refused here before anything is written.
+    let (earliest_retained, durable_head, cursors, dlq_records) = capture_consistency_fields(src)?;
+
+    // Enumerate every file in the source tree (root + subdirs), reading its bytes. Excludes the LOCK
+    // file at the root. This is the faithful copy: every committed artifact, by enumeration.
+    let mut captured: Vec<(String, Vec<u8>)> = Vec::new();
+    collect_tree(src, "", &mut captured)?;
+
+    // Materialize the `data/` subtree under the backup root, computing each file's CRC32C + length for
+    // the manifest as we write it. `subdir` creates `data/` on first use.
+    let data_root = dst.subdir(BACKUP_DATA_SUBDIR).map_err(io_err)?;
+    let mut entries = Vec::with_capacity(captured.len());
+    let mut total_bytes = 0u64;
+    for (rel, bytes) in &captured {
+        let (parent, leaf) = descend_to_parent(&data_root, rel)?;
+        write_durable_file(&parent, &leaf, bytes)?;
+        entries.push(BackupFileEntry {
+            rel_path: rel.clone(),
+            crc32c: crc32c::crc32c(bytes),
+            len: bytes.len() as u64,
+        });
+        total_bytes += bytes.len() as u64;
+    }
+
+    // Write the manifest LAST (after every captured file is durable), so a crash mid-backup leaves a
+    // backup with no manifest — which a restore rejects as invalid (fail-closed), never a manifest
+    // that promises files not yet on disk.
+    let manifest = encode_manifest(
+        &entries,
+        earliest_retained,
+        durable_head,
+        cursors,
+        dlq_records,
+    );
+    write_durable_file(dst, BACKUP_MANIFEST_FILE, &manifest)?;
+
+    Ok(BackupOutcome {
+        files: entries.len(),
+        bytes: total_bytes,
+        durable_head,
+        earliest_retained,
+        cursors,
+        dlq_records,
+    })
+}
+
+/// Validates a backup and MATERIALIZES a data directory from it (#607), fail-closed. The backup is
+/// validated WHOLE before a single byte is written to `dst`: the manifest must be a well-formed
+/// IronBus backup manifest of a supported format version, and EVERY listed file must be present in the
+/// backup with bytes whose CRC32C + length match the manifest. A corrupt, truncated, incomplete, or
+/// wrong-version backup is REJECTED (a typed [`BackupError`]) with NOTHING written, so a restore is
+/// never partial.
+///
+/// `backup` is the backup-tree filesystem; `dst` is the target data-dir filesystem. The target must be
+/// EMPTY unless `force` is set: a restore refuses to clobber a non-empty data dir without an explicit
+/// `--force` ([`BackupError::TargetNotEmpty`]). With `force`, an existing target is CLEARED first (its
+/// files and subtrees removed) so the restored tree is exactly the backup's, never a merge.
+///
+/// After this returns the target holds a byte-faithful copy of the captured data dir, so it PASSES
+/// `verify` (point-consistent: every cursor ≤ the log head, every DLQ entry resolvable) and a broker
+/// resumes from the restored cursors exactly as it would from the source.
+///
+/// # Errors
+/// [`BackupError::InvalidManifest`] / [`BackupError::IncompatibleVersion`] / [`BackupError::CorruptBackup`]
+/// for an untrustworthy backup (fail-closed, nothing written); [`BackupError::TargetNotEmpty`] if the
+/// target is non-empty without `force`; [`BackupError::Storage`] for an IO fault.
+pub fn restore_data_dir<B, D>(
+    backup: &B,
+    dst: &D,
+    force: bool,
+) -> Result<RestoreOutcome, BackupError>
+where
+    B: Filesystem + Clone,
+    D: Filesystem + Clone,
+{
+    // 1) Read + validate the manifest. A missing/unreadable/foreign manifest is refused fail-closed.
+    if !backup.exists(BACKUP_MANIFEST_FILE).map_err(io_err)? {
+        return Err(BackupError::InvalidManifest(
+            "no MANIFEST at the backup root".to_string(),
+        ));
+    }
+    let manifest_file = backup.open(BACKUP_MANIFEST_FILE).map_err(io_err)?;
+    let mlen = usize::try_from(manifest_file.len().map_err(io_err)?)
+        .map_err(|_| BackupError::InvalidManifest("manifest too large".to_string()))?;
+    let mut mbytes = vec![0u8; mlen];
+    manifest_file
+        .read_exact_at(&mut mbytes, 0)
+        .map_err(io_err)?;
+    let manifest = decode_manifest(&mbytes)?;
+    if manifest.version > BACKUP_FORMAT_VERSION {
+        return Err(BackupError::IncompatibleVersion {
+            found: manifest.version,
+            supported: BACKUP_FORMAT_VERSION,
+        });
+    }
+
+    // 2) Re-read every captured file from the backup tree and check its CRC32C + length against the
+    //    manifest. This is done WHOLE, into memory, BEFORE any write to the target, so a corrupt or
+    //    truncated backup is rejected with the target untouched (fail-closed: never a partial restore).
+    let data_root = if backup.subdir_exists(BACKUP_DATA_SUBDIR).map_err(io_err)? {
+        backup.subdir(BACKUP_DATA_SUBDIR).map_err(io_err)?
+    } else if manifest.files.is_empty() {
+        // A manifest of an empty data dir lists no files; the `data/` subdir may be absent. Use the
+        // backup root as a (file-less) data root: the loop below runs zero times.
+        backup.clone()
+    } else {
+        return Err(BackupError::CorruptBackup(
+            "manifest lists files but the backup has no data/ subtree".to_string(),
+        ));
+    };
+    let mut validated: Vec<(String, Vec<u8>)> = Vec::with_capacity(manifest.files.len());
+    let mut total_bytes = 0u64;
+    for entry in &manifest.files {
+        let (parent, leaf) = descend_to_parent(&data_root, &entry.rel_path)?;
+        if !parent.exists(&leaf).map_err(io_err)? {
+            return Err(BackupError::CorruptBackup(format!(
+                "file {} listed in the manifest is missing from the backup",
+                entry.rel_path
+            )));
+        }
+        let file = parent.open(&leaf).map_err(io_err)?;
+        let actual_len = file.len().map_err(io_err)?;
+        if actual_len != entry.len {
+            return Err(BackupError::CorruptBackup(format!(
+                "file {} has length {actual_len}, manifest says {}",
+                entry.rel_path, entry.len
+            )));
+        }
+        let mut bytes = vec![
+            0u8;
+            usize::try_from(actual_len).map_err(|_| io_err(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "file too large")
+            ))?
+        ];
+        file.read_exact_at(&mut bytes, 0).map_err(io_err)?;
+        let actual_crc = crc32c::crc32c(&bytes);
+        if actual_crc != entry.crc32c {
+            return Err(BackupError::CorruptBackup(format!(
+                "file {} failed CRC check (got {actual_crc:#010x}, manifest {:#010x})",
+                entry.rel_path, entry.crc32c
+            )));
+        }
+        total_bytes += actual_len;
+        validated.push((entry.rel_path.clone(), bytes));
+    }
+
+    // 3) Guard the target: it must be EMPTY unless `force`. The LOCK file (which the CLI created when
+    //    it took the restore lock on the target) does NOT count as content. With `force`, clear the
+    //    target so the restored tree is exactly the backup's.
+    let existing = non_lock_entries(dst)?;
+    if !existing.is_empty() {
+        if !force {
+            return Err(BackupError::TargetNotEmpty(existing.len()));
+        }
+        clear_dir(dst)?;
+    }
+
+    // 4) Materialize the validated bytes into the target. Every file is fsynced and its directory
+    //    dir-synced, so the restored dir is crash-durable. Because every byte was validated in step 2,
+    //    this phase only writes known-good content.
+    for (rel, bytes) in &validated {
+        let (parent, leaf) = descend_to_parent(dst, rel)?;
+        write_durable_file(&parent, &leaf, bytes)?;
+    }
+
+    Ok(RestoreOutcome {
+        files: validated.len(),
+        bytes: total_bytes,
+        durable_head: manifest.durable_head,
+        earliest_retained: manifest.earliest_retained,
+        cursors: manifest.cursors,
+        dlq_records: manifest.dlq_records,
+    })
+}
+
+/// Lists a data dir's entries (files + subdirs) at the ROOT, EXCLUDING the CLI `LOCK` file — the
+/// content a restore's emptiness check considers. The lock is the CLI's own advisory-lock file (it
+/// holds the restore lock on the target), not data; an otherwise-empty dir that holds only `LOCK` is
+/// "empty" for the purpose of a clobber check.
+fn non_lock_entries<F: Filesystem>(fs: &F) -> Result<Vec<String>, BackupError> {
+    let mut out: Vec<String> = fs
+        .list()
+        .map_err(io_err)?
+        .into_iter()
+        .filter(|n| n != LOCK_FILE_NAME)
+        .collect();
+    out.extend(fs.list_subdirs().map_err(io_err)?);
+    Ok(out)
+}
+
+/// Recursively removes every file and subtree under `fs`, EXCEPT the root `LOCK` file (the CLI's own
+/// restore lock, which must stay held). Used by `--force` to clear a non-empty target so the restored
+/// tree is exactly the backup's, never a merge of old and new. Subdir contents are removed first, then
+/// the (now-empty) subdir's files; the directory entry is dir-synced so the clear is crash-durable.
+fn clear_dir<F: Filesystem + Clone>(fs: &F) -> Result<(), BackupError> {
+    for dir in fs.list_subdirs().map_err(io_err)? {
+        let child = fs.subdir(&dir).map_err(io_err)?;
+        clear_dir(&child)?;
+    }
+    for name in fs.list().map_err(io_err)? {
+        if name == LOCK_FILE_NAME {
+            continue;
+        }
+        fs.remove(&name).map_err(io_err)?;
+    }
+    fs.sync_dir().map_err(io_err)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,5 +2022,269 @@ mod tests {
         assert!(purge_stream(&fs, "bad name").is_err());
         // The root log is untouched after the refusals.
         assert_eq!(stream_summary(&fs, "").unwrap().records, 4);
+    }
+
+    // --- backup / restore (#607) ---
+
+    /// Reads back every cursor's committed offset as a sorted `(group, committed)` map, for comparing a
+    /// source dir and its restored copy.
+    fn cursor_map(fs: &InMemoryFs) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = inspect_cursors(fs.clone())
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|c| (c.group, c.committed))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The complete sorted list of `(rel_path, bytes)` across a data dir's whole tree (root + subdirs),
+    /// excluding the LOCK file, so two dirs can be compared byte-for-byte. Reuses the snapshot walker.
+    fn tree_image(fs: &InMemoryFs) -> Vec<(String, Vec<u8>)> {
+        let mut v = Vec::new();
+        collect_tree(fs, "", &mut v).unwrap();
+        v.sort();
+        v
+    }
+
+    /// Builds a rich source data dir: a main log, named-stream logs, several work-group cursors (one
+    /// reset to mid-log), and a populated DLQ — so a round-trip exercises every artifact class.
+    fn rich_source(main: u64, poison: u64) -> InMemoryFs {
+        let fs = dir_with_dlq(main, poison);
+        // A couple of named streams (the `streams/<hex>/` subtree).
+        create_stream(&fs, ManualClock::new(), cfg(), "orders").unwrap();
+        create_stream(&fs, ManualClock::new(), cfg(), "events").unwrap();
+        // Several cursors, including the default group and a mid-log reset (an in-range cursor).
+        let (_, fs) = reset_consumer(fs, "", ResetTarget::Offset(1)).unwrap();
+        let (_, fs) = reset_consumer(fs, "g1", ResetTarget::Offset(main.min(2))).unwrap();
+        let (_, fs) = reset_consumer(fs, "g2", ResetTarget::Latest).unwrap();
+        fs
+    }
+
+    #[test]
+    fn snapshot_then_restore_round_trips_the_whole_data_dir_byte_for_byte() {
+        let src = rich_source(6, 3);
+        let src_tree = tree_image(&src);
+        let src_cursors = cursor_map(&src);
+        let src_main = main_records(&src);
+        let src_dlq = read_dlq_entries(&src).unwrap().len();
+
+        // Backup into a fresh tree, then restore into a fresh (empty) data dir.
+        let backup = InMemoryFs::new();
+        let bout = snapshot_data_dir(&src, &backup).unwrap();
+        assert!(bout.files > 0);
+        assert_eq!(bout.cursors, src_cursors.len());
+        assert_eq!(bout.dlq_records, src_dlq);
+
+        let restored = InMemoryFs::new();
+        let rout = restore_data_dir(&backup, &restored, false).unwrap();
+        assert_eq!(rout.files, bout.files);
+        assert_eq!(rout.bytes, bout.bytes);
+        assert_eq!(rout.durable_head, bout.durable_head);
+        assert_eq!(rout.cursors, bout.cursors);
+        assert_eq!(rout.dlq_records, bout.dlq_records);
+
+        // FAITHFUL: the restored tree is byte-for-byte the source, and the high-level views match.
+        assert_eq!(tree_image(&restored), src_tree, "byte-faithful tree");
+        assert_eq!(cursor_map(&restored), src_cursors, "cursors match");
+        assert_eq!(
+            read_dlq_entries(&restored).unwrap().len(),
+            src_dlq,
+            "DLQ matches"
+        );
+        assert_eq!(
+            main_records(&restored).len(),
+            src_main.len(),
+            "main log records match"
+        );
+    }
+
+    #[test]
+    fn restored_dir_is_point_consistent_every_cursor_within_the_durable_range() {
+        // The consistency oracle (the same range check `ironbus verify` runs): after a restore, every
+        // cursor is within [earliest_retained, durable_head] and the DLQ depth is intact — by
+        // construction, since the source was captured at one quiescent point.
+        let src = rich_source(8, 2);
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+        let restored = InMemoryFs::new();
+        restore_data_dir(&backup, &restored, false).unwrap();
+
+        let reader = OfflineReader::open(restored.clone()).unwrap();
+        let earliest = reader.earliest_retained().get();
+        let head = reader.durable_head().get();
+        drop(reader);
+        for (group, committed) in cursor_map(&restored) {
+            assert!(
+                committed >= earliest && committed <= head,
+                "cursor {group:?} committed {committed} must be within [{earliest}, {head}]"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_refuses_a_non_empty_target_without_force_then_overwrites_with_force() {
+        let src = rich_source(4, 1);
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+
+        // A target that already holds a (different) data dir: restore without force is refused.
+        let target = log_with(99);
+        let before = tree_image(&target);
+        match restore_data_dir(&backup, &target, false).unwrap_err() {
+            BackupError::TargetNotEmpty(n) => assert!(n > 0),
+            other => panic!("expected TargetNotEmpty, got {other:?}"),
+        }
+        // The refused restore wrote NOTHING (the target is byte-for-byte unchanged).
+        assert_eq!(tree_image(&target), before, "a refused restore is a no-op");
+
+        // With --force the target is cleared and replaced by exactly the backup's tree.
+        restore_data_dir(&backup, &target, true).unwrap();
+        let src_tree = {
+            let fresh = InMemoryFs::new();
+            restore_data_dir(&backup, &fresh, false).unwrap();
+            tree_image(&fresh)
+        };
+        assert_eq!(
+            tree_image(&target),
+            src_tree,
+            "force overwrote with the backup"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_corrupt_truncated_or_wrong_version_backup_fail_closed() {
+        let src = rich_source(5, 2);
+
+        // (a) A flipped byte in a captured file fails the CRC check, with the target untouched.
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+        let data = backup.subdir(BACKUP_DATA_SUBDIR).unwrap();
+        let a_seg = data
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.starts_with("seg-"))
+            .unwrap();
+        let f = data.open(&a_seg).unwrap();
+        let mut b = vec![0u8; usize::try_from(f.len().unwrap()).unwrap()];
+        f.read_exact_at(&mut b, 0).unwrap();
+        b[0] ^= 0xff;
+        f.write_all_at(&b, 0).unwrap();
+        let target = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup, &target, false).unwrap_err(),
+            BackupError::CorruptBackup(_)
+        ));
+        assert!(
+            non_lock_entries(&target).unwrap().is_empty(),
+            "no partial restore"
+        );
+
+        // (b) A missing captured file is a corrupt backup.
+        let backup2 = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup2).unwrap();
+        let data2 = backup2.subdir(BACKUP_DATA_SUBDIR).unwrap();
+        let some = data2
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.starts_with("seg-"))
+            .unwrap();
+        data2.remove(&some).unwrap();
+        let t2 = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup2, &t2, false).unwrap_err(),
+            BackupError::CorruptBackup(_)
+        ));
+        assert!(non_lock_entries(&t2).unwrap().is_empty());
+
+        // (c) A missing manifest is an invalid backup.
+        let backup3 = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup3).unwrap();
+        backup3.remove(BACKUP_MANIFEST_FILE).unwrap();
+        let t3 = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup3, &t3, false).unwrap_err(),
+            BackupError::InvalidManifest(_)
+        ));
+
+        // (d) A future format version is refused fail-closed.
+        let backup4 = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup4).unwrap();
+        let mf = backup4.open(BACKUP_MANIFEST_FILE).unwrap();
+        let mut mb = vec![0u8; usize::try_from(mf.len().unwrap()).unwrap()];
+        mf.read_exact_at(&mut mb, 0).unwrap();
+        // Rewrite the version field (the second whitespace-delimited token of line 1) to a future value.
+        let text = String::from_utf8(mb).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        lines[0] = format!("{BACKUP_MAGIC} {}", BACKUP_FORMAT_VERSION + 1);
+        let rewritten = format!("{}\n", lines.join("\n")).into_bytes();
+        mf.set_len(0).unwrap();
+        mf.write_all_at(&rewritten, 0).unwrap();
+        let t4 = InMemoryFs::new();
+        assert!(matches!(
+            restore_data_dir(&backup4, &t4, false).unwrap_err(),
+            BackupError::IncompatibleVersion { found, supported }
+                if found == BACKUP_FORMAT_VERSION + 1 && supported == BACKUP_FORMAT_VERSION
+        ));
+    }
+
+    #[test]
+    fn snapshot_excludes_the_lock_file_and_an_empty_dir_round_trips() {
+        // A LOCK file at the root (the CLI's advisory lock) is NOT captured: a restored dir carries no
+        // foreign lock token.
+        let src = log_with(3);
+        src.create_new("LOCK").unwrap();
+        src.sync_dir().unwrap();
+        let backup = InMemoryFs::new();
+        let out = snapshot_data_dir(&src, &backup).unwrap();
+        let data = backup.subdir(BACKUP_DATA_SUBDIR).unwrap();
+        assert!(
+            !data.exists("LOCK").unwrap(),
+            "LOCK is excluded from the backup"
+        );
+        let restored = InMemoryFs::new();
+        restore_data_dir(&backup, &restored, false).unwrap();
+        assert!(
+            !restored.exists("LOCK").unwrap(),
+            "no LOCK in the restored dir"
+        );
+        assert_eq!(out.files, restored.list().unwrap().len());
+
+        // A brand-new (never-opened) data dir backs up and restores cleanly (an empty log is a valid
+        // consistent point: range 0..0, no cursors, no DLQ).
+        let empty_src = InMemoryFs::new();
+        let empty_backup = InMemoryFs::new();
+        let eout = snapshot_data_dir(&empty_src, &empty_backup).unwrap();
+        assert_eq!(
+            (eout.durable_head, eout.cursors, eout.dlq_records),
+            (0, 0, 0)
+        );
+        let empty_restored = InMemoryFs::new();
+        restore_data_dir(&empty_backup, &empty_restored, false).unwrap();
+        // The restored empty dir opens as an empty log.
+        let r = OfflineReader::open(empty_restored).unwrap();
+        assert_eq!(r.durable_head().get(), 0);
+    }
+
+    #[test]
+    fn a_redrive_after_restore_continues_correctly_from_the_restored_state() {
+        // Proves the restored DLQ + log are usable: a redrive of the restored dir re-injects exactly
+        // the captured poison records onto the restored log, as it would have on the source.
+        let src = dir_with_dlq(4, 3);
+        let backup = InMemoryFs::new();
+        snapshot_data_dir(&src, &backup).unwrap();
+        let restored = InMemoryFs::new();
+        restore_data_dir(&backup, &restored, false).unwrap();
+
+        let before = main_records(&restored).len() as u64;
+        let (outcome, restored) = redrive_dlq(restored, ManualClock::new(), cfg()).unwrap();
+        assert_eq!(
+            outcome.redriven, 3,
+            "the restored DLQ redrives its 3 records"
+        );
+        assert_eq!(main_records(&restored).len() as u64, before + 3);
     }
 }

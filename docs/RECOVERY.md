@@ -631,3 +631,50 @@ The **NATS contrast**: at step 2 NATS has no `fsck` to run (the only recovery pa
 restore-from-backup); at step 4 its in-place recovery is a silent, unbounded
 truncate-and-drop with no quarantine forensics; at step 6 it has no corruption metric
 to alert on. IronBus's recovery is a command, a bounded envelope, and a metric.
+
+### 8.5 Backup and restore: a point-consistent snapshot (#607)
+
+`verify`/`repair` recover a damaged dir IN PLACE; `backup`/`restore` capture and
+re-materialize a WHOLE dir. Both are OFFLINE store tools (stopped broker, exclusive
+lock), and a RESTORED dir passes `verify` (section 8.1) — `verify` is the consistency
+oracle for a restore exactly as it is for a repair.
+
+- **`ironbus backup --data-dir <dir> --out <backup> [--json]`** — a **point-consistent**
+  snapshot of the log + the consumer cursors + the DLQ (and every other durable
+  artifact: `counters.ckpt`, `layout.meta`, the `dlq-redrive.ckpt` watermark, any
+  `streams/<name>/` subtree, the `quarantine/` store) captured at ONE logical point. It
+  takes the **EXCLUSIVE data-dir lock** first (exit **5** if a broker is running — a
+  running broker's data dir is not a consistent point), and because the broker is
+  stopped and the lock is held, the on-disk checkpoints are SETTLED: capturing all three
+  artifacts under that quiescent image yields a snapshot a restore cannot make divergent
+  (no cursor past the head, no DLQ entry referencing a record the log no longer has). The
+  backup is a **directory tree** (no tar dependency): a `MANIFEST` at the backup root
+  (format version + a CRC32C/length of every captured file + the captured durable offsets
+  / cursor / DLQ counts, the consistency self-check) plus a `data/` subtree that is a
+  faithful copy of the data dir captured by recursive ENUMERATION (so there is no
+  per-artifact special case to drift). The CLI `LOCK` file is EXCLUDED (a transient
+  advisory lock, not storage state). The manifest is written LAST, so a crash mid-backup
+  leaves a backup with no manifest — which a restore rejects (fail-closed), never one that
+  promises files not on disk. `--json` emits a single `ironbus.cli.backup.v1` object.
+
+- **`ironbus restore --from <backup> --data-dir <dir> [--force] [--json]`** — validate the
+  backup and materialize the target, **fail-closed**. The backup is validated WHOLE before
+  a single byte is written: the `MANIFEST` must be a well-formed IronBus backup manifest of
+  a SUPPORTED format version (a future version is refused, exactly as a future layout marker
+  is, section 1.1), and EVERY listed file must be present with bytes whose CRC32C + length
+  match the manifest. A corrupt, truncated, incomplete, or wrong-version backup is REJECTED
+  (nonzero exit) with **NOTHING written to the target** — never a partial restore. It
+  **REFUSES to clobber a NON-EMPTY `--data-dir` without `--force`** (with `--force` the
+  target is cleared first, so the restored tree is exactly the backup's, never a merge), and
+  it takes the exclusive lock on the target (exit 5 if a broker holds it). After a restore
+  the target holds a byte-faithful copy of the captured dir, so it **passes `verify`** (every
+  cursor ≤ the log head, every DLQ entry resolvable) and a broker resumes from the restored
+  cursors exactly as it would from the source. `--json` emits `ironbus.cli.restore.v1`.
+
+The point-consistency argument, restated: a backup is consistent BY CONSTRUCTION because it
+is taken at a single quiescent point (stopped broker + exclusive lock + settled checkpoints),
+and `verify` is the proof — a round trip (fill → backup → restore to a fresh dir → `verify`)
+is clean, with the restored cursors/DLQ/log-head equal to the source. The **NATS contrast**:
+a NATS snapshot has no offline whole-store consistency proof of cursors-vs-log-vs-DLQ; here
+the manifest self-check plus the `verify` oracle make "this backup restores to a consistent
+dir" a checkable property, not a hope.

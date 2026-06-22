@@ -818,6 +818,8 @@ USAGE:
     ironbus scrub --data-dir <dir> [--json]
     ironbus verify --data-dir <dir> [--json]
     ironbus repair --data-dir <dir> [--apply --force] [--json]
+    ironbus backup  --data-dir <dir> --out <backup-dir> [--json]
+    ironbus restore --from <backup-dir> --data-dir <dir> [--force] [--json]
     ironbus top   (--addr <host:port> | --health-addr <host:port> | --data-dir <dir>)
                   [--interval <secs>] [--once] [--json] [--no-color]
     ironbus report (groups | streams | storage | recovery | connections)
@@ -1023,6 +1025,18 @@ Notes:
     recoverable than recovery already would, it preserves every committed record, and it preserves
     the forensic bytes (copy-then-drop into the capped quarantine, never a delete). The bounded loss
     is REPORTED (the LossReport, human or --json ironbus.cli.repair.v1).
+    backup takes a POINT-CONSISTENT snapshot of a STOPPED broker's --data-dir into --out: the log,
+    the consumer cursors, and the DLQ together, at ONE logical point. It takes the EXCLUSIVE data-dir
+    lock first (exit 5 if a broker is running, since a running broker's data dir is not a consistent
+    point) and captures all artifacts under that quiescent image. The backup is a DIRECTORY TREE: a
+    MANIFEST (format version + a CRC32C/length of every captured file + the captured durable offsets,
+    a consistency self-check) plus a data/ copy of the data dir; the CLI LOCK file is excluded. Human
+    or --json ironbus.cli.backup.v1. restore validates a --from backup WHOLE (manifest version +
+    every file's CRC) and materializes a --data-dir from it. A corrupt, truncated, or wrong-version
+    backup is REJECTED fail-closed (nonzero exit, NOTHING written — never a partial restore). It
+    REFUSES to clobber a NON-EMPTY --data-dir without --force. A restored dir PASSES verify (every
+    cursor <= the log head, every DLQ entry resolvable) and a broker resumes from the restored
+    cursors. Human or --json ironbus.cli.restore.v1. See docs/RECOVERY.md.
     top is a strictly READ-ONLY status view with two explicit modes. LIVE
     (--addr/--health-addr <host:port>) polls the broker's read-only /admin v1 JSON every --interval
     seconds (default 1, minimum 1) and renders the #16 counters: durable head, per-group lag and
@@ -1260,6 +1274,8 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "scrub" => run_scrub(rest, out),
         "verify" => run_verify(rest, out),
         "repair" => run_repair(rest, out),
+        "backup" => run_backup(rest, out),
+        "restore" => run_restore(rest, out),
         "top" => top::run_top(rest, out),
         "report" => report::run_report(rest, out),
         "server" => server_check::run_server(rest, out),
@@ -11245,6 +11261,308 @@ fn cmd_admin_dlq_redrive(
 }
 
 // ---------------------------------------------------------------------------
+// backup / restore (#607): a point-consistent snapshot of the log + cursors +
+// DLQ, and a fail-closed restore. Offline data-dir ops reusing the
+// broker-stopped, exclusive-lock discipline. The flag parsers are
+// cross-platform; the data-dir mutation is Unix-gated (the on-disk storage and
+// the `flock(2)` lock are POSIX), with non-unix stubs of IDENTICAL signatures.
+// ---------------------------------------------------------------------------
+
+/// The `--json` result schema version of `backup` (`ironbus.cli.backup.vN`, `docs/CLI_CONTRACT.md`).
+/// Append-only: an additive field is no bump; a rename/removal bumps.
+#[cfg(unix)]
+const BACKUP_SCHEMA_VERSION: u32 = 1;
+/// The `--json` result schema version of `restore` (`ironbus.cli.restore.vN`). Same bump rule.
+#[cfg(unix)]
+const RESTORE_SCHEMA_VERSION: u32 = 1;
+
+/// Parses and runs `backup` (#607): the OFFLINE point-consistent snapshot. It captures a STOPPED
+/// broker's `--data-dir` (the log + the consumer cursors + the DLQ, and every other durable artifact)
+/// into a backup directory tree at `--out`, under the same exclusive data-dir lock `serve` holds, so
+/// the on-disk state is a single consistent point and the backup can never race a live writer.
+///
+/// # Errors
+/// [`CliError::Usage`] for a bad flag or a missing `--data-dir`/`--out`; [`CliError::NotFound`] (exit
+/// 2) if the data dir is absent; [`CliError::Unreachable`] (exit 5) if a broker holds the lock;
+/// [`CliError::Corrupt`] (exit 4) if the source chain is unreadable; [`CliError::Internal`] (exit 70)
+/// on an IO fault.
+fn run_backup(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut backup_out: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--out" => backup_out = Some(take_value("--out", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for backup")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "backup takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir = data_dir
+        .ok_or_else(|| CliError::Usage("backup requires `--data-dir <dir>`".to_string()))?;
+    let backup_out = backup_out
+        .ok_or_else(|| CliError::Usage("backup requires `--out <backup-dir>`".to_string()))?;
+    cmd_backup(Path::new(&data_dir), Path::new(&backup_out), json, out)
+}
+
+/// Parses and runs `restore` (#607): the OFFLINE fail-closed restore. It validates a `--from` backup
+/// WHOLE (the manifest version + every file's CRC32C/length) and materializes a `--data-dir` from it,
+/// under the exclusive lock on the target. A corrupt/incomplete/wrong-version backup is rejected with
+/// nothing written; a non-empty target is refused without `--force`.
+///
+/// # Errors
+/// [`CliError::Usage`] for a bad flag, a missing `--from`/`--data-dir`, an untrustworthy backup, or a
+/// non-empty target without `--force`; [`CliError::NotFound`] (exit 2) if the backup is absent;
+/// [`CliError::Unreachable`] (exit 5) if a broker holds the target's lock; [`CliError::Internal`]
+/// (exit 70) on an IO fault.
+fn run_restore(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut from: Option<String> = None;
+    let mut data_dir: Option<String> = None;
+    let mut force = false;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" => from = Some(take_value("--from", args, &mut i)?),
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--force" | "--yes" => {
+                force = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for restore"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "restore takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let from =
+        from.ok_or_else(|| CliError::Usage("restore requires `--from <backup-dir>`".to_string()))?;
+    let data_dir = data_dir
+        .ok_or_else(|| CliError::Usage("restore requires `--data-dir <dir>`".to_string()))?;
+    cmd_restore(Path::new(&from), Path::new(&data_dir), force, json, out)
+}
+
+/// Maps a storage [`ironbus_storage::admin::BackupError`] onto the frozen CLI exit-code scheme: a
+/// fail-closed validation rejection (invalid/corrupt/wrong-version backup) or a non-empty target is a
+/// USAGE error (exit 1, the operator handed a bad backup or an unforced clobber), and a storage fault
+/// is classified exactly as the read-only offline verbs classify it (missing dir -> 2, corrupt chain
+/// -> 4, IO fault -> 70).
+#[cfg(unix)]
+fn map_backup_err(data_dir: &Path, e: ironbus_storage::admin::BackupError) -> CliError {
+    use ironbus_storage::admin::BackupError;
+    match e {
+        BackupError::InvalidManifest(_)
+        | BackupError::IncompatibleVersion { .. }
+        | BackupError::CorruptBackup(_)
+        | BackupError::TargetNotEmpty(_) => CliError::Usage(e.to_string()),
+        BackupError::Storage(s) => map_offline_err(data_dir, &s),
+    }
+}
+
+/// Runs `backup` (#607): take the EXCLUSIVE data-dir lock on the SOURCE (exit 5 if a broker is
+/// running — a running broker's data dir is not a consistent point), prepare the `--out` directory,
+/// and snapshot the source into it via [`ironbus_storage::admin::snapshot_data_dir`]. Because the
+/// broker is stopped and the lock is held, the captured log + cursors + DLQ are one consistent point.
+#[cfg(unix)]
+fn cmd_backup(
+    data_dir: &Path,
+    backup_out: &Path,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // Take the SOURCE lock FIRST so a running broker blocks the backup (exit 5) before any read: a
+    // live writer's data dir is not a consistent point.
+    let _lock = lock_stopped_broker(data_dir, "back up")?;
+    // Prepare the destination directory (create at 0700 if absent, reject a non-directory / unwritable
+    // path) so the snapshot writes into a real, owner-only directory.
+    dirlock::prepare_data_dir(backup_out).map_err(|e| map_dir_error(&e))?;
+    let src = StdFs::new(data_dir.to_path_buf());
+    let dst = StdFs::new(backup_out.to_path_buf());
+    let outcome = ironbus_storage::admin::snapshot_data_dir(&src, &dst)
+        .map_err(|e| map_backup_err(data_dir, e))?;
+    write_backup_result(data_dir, backup_out, &outcome, json, out)
+}
+
+/// Writes the `backup` result: the human line or the versioned `ironbus.cli.backup.v1` `--json`
+/// object (exit 0 on success).
+#[cfg(unix)]
+fn write_backup_result(
+    data_dir: &Path,
+    backup_out: &Path,
+    outcome: &ironbus_storage::admin::BackupOutcome,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.backup.v{BACKUP_SCHEMA_VERSION}\",\"data_dir\":\"{}\",\"out\":\"{}\",\"files\":{},\"bytes\":{},\"durable_head\":{},\"earliest_retained\":{},\"cursors\":{},\"dlq_records\":{},\"ok\":true,\"exit_code\":0}}",
+            escape_json(&data_dir.display().to_string()),
+            escape_json(&backup_out.display().to_string()),
+            outcome.files,
+            outcome.bytes,
+            outcome.durable_head,
+            outcome.earliest_retained,
+            outcome.cursors,
+            outcome.dlq_records,
+        )?;
+    } else {
+        writeln!(
+            out,
+            "backup: captured {} file(s) ({} byte(s)) from {} to {} (durable range [{}, {}], {} cursor(s), {} DLQ record(s))",
+            outcome.files,
+            outcome.bytes,
+            data_dir.display(),
+            backup_out.display(),
+            outcome.earliest_retained,
+            outcome.durable_head,
+            outcome.cursors,
+            outcome.dlq_records,
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs `restore` (#607): validate the `--from` backup and materialize the `--data-dir` from it,
+/// fail-closed. It takes the EXCLUSIVE lock on the TARGET (exit 5 if a broker holds it — never restore
+/// under a live broker), then calls [`ironbus_storage::admin::restore_data_dir`], which validates the
+/// whole backup (manifest version + every file's CRC) BEFORE writing a byte and refuses a non-empty
+/// target without `--force`. After this the target PASSES `verify`.
+#[cfg(unix)]
+fn cmd_restore(
+    from: &Path,
+    data_dir: &Path,
+    force: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // The backup must exist (a missing --from is not-found, exit 2). The backup itself is validated by
+    // the storage op; here we only surface a missing path early with the right exit code.
+    if !from.exists() {
+        return Err(CliError::NotFound(format!(
+            "no backup at {}",
+            from.display()
+        )));
+    }
+    // Prepare + lock the TARGET data dir (create at 0700 if absent). The lock blocks a running broker
+    // from being restored over (exit 5); the prepare makes the target a real, writable directory.
+    let _lock = lock_stopped_broker_create(data_dir, "restore into")?;
+    let backup_fs = StdFs::new(from.to_path_buf());
+    let dst = StdFs::new(data_dir.to_path_buf());
+    let outcome = ironbus_storage::admin::restore_data_dir(&backup_fs, &dst, force)
+        .map_err(|e| map_backup_err(from, e))?;
+    write_restore_result(from, data_dir, &outcome, json, out)
+}
+
+/// Like [`lock_stopped_broker`] but for a target that may not yet exist: it PREPARES (creates at 0700)
+/// the data dir before locking, so a restore can materialize into a fresh path. A running broker on an
+/// EXISTING target still blocks with exit 5 (the lock), so a restore never clobbers a live broker.
+#[cfg(unix)]
+fn lock_stopped_broker_create(data_dir: &Path, verb: &str) -> Result<dirlock::DirLock, CliError> {
+    dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
+    dirlock::DirLock::acquire(data_dir).map_err(|e| match e {
+        dirlock::DirError::AlreadyLocked(_) => CliError::Unreachable(format!(
+            "cannot {verb} {}: a broker holds its exclusive lock (stop the broker first)",
+            data_dir.display()
+        )),
+        other => map_dir_error(&other),
+    })
+}
+
+/// Writes the `restore` result: the human line or the versioned `ironbus.cli.restore.v1` `--json`
+/// object (exit 0 on success).
+#[cfg(unix)]
+fn write_restore_result(
+    from: &Path,
+    data_dir: &Path,
+    outcome: &ironbus_storage::admin::RestoreOutcome,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.restore.v{RESTORE_SCHEMA_VERSION}\",\"from\":\"{}\",\"data_dir\":\"{}\",\"files\":{},\"bytes\":{},\"durable_head\":{},\"earliest_retained\":{},\"cursors\":{},\"dlq_records\":{},\"ok\":true,\"exit_code\":0}}",
+            escape_json(&from.display().to_string()),
+            escape_json(&data_dir.display().to_string()),
+            outcome.files,
+            outcome.bytes,
+            outcome.durable_head,
+            outcome.earliest_retained,
+            outcome.cursors,
+            outcome.dlq_records,
+        )?;
+    } else {
+        writeln!(
+            out,
+            "restore: materialized {} file(s) ({} byte(s)) from {} into {} (durable range [{}, {}], {} cursor(s), {} DLQ record(s))",
+            outcome.files,
+            outcome.bytes,
+            from.display(),
+            data_dir.display(),
+            outcome.earliest_retained,
+            outcome.durable_head,
+            outcome.cursors,
+            outcome.dlq_records,
+        )?;
+    }
+    Ok(())
+}
+
+/// `backup` requires Unix in v1 (the on-disk storage and the exclusive `flock(2)` lock are POSIX),
+/// like `verify`/`repair`. The stub consumes every parameter so the Windows `-D warnings` build stays
+/// clean (the recurring #288/#99 footgun: identical signatures to the Unix handler).
+#[cfg(not(unix))]
+fn cmd_backup(
+    data_dir: &Path,
+    backup_out: &Path,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, backup_out, json, out);
+    Err(CliError::Internal(
+        "ironbus backup requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
+}
+
+/// `restore` requires Unix in v1, for the same reason as `backup`. The stub consumes every parameter
+/// and mirrors the Unix signature exactly.
+#[cfg(not(unix))]
+fn cmd_restore(
+    from: &Path,
+    data_dir: &Path,
+    force: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (from, data_dir, force, json, out);
+    Err(CliError::Internal(
+        "ironbus restore requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // group / stream / dlq management cmd handlers (#586, #595). Unix-only (data-dir
 // ops), with non-unix stubs of IDENTICAL signatures (the recurring windows
 // footgun: a cfg(unix)-only fn called from shared code breaks the windows build).
@@ -13049,6 +13367,242 @@ mod tests {
         );
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- backup / restore (#607) ---
+
+    /// A scratch path under the temp dir, removed first so a prior run never taints the case.
+    #[cfg(unix)]
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "ironbus-cli-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_then_restore_round_trips_and_the_restored_dir_passes_verify() {
+        // A real data dir with records + a reset cursor, backed up and restored into a fresh dir; the
+        // restored dir must pass `verify` clean (point-consistent) and round-trip the cursor.
+        let src = make_data_dir("backup-src", 12);
+        let (_o, rc) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            src.to_str().unwrap(),
+            "--group",
+            "g",
+            "--to",
+            "5",
+        ]);
+        assert_eq!(rc, 0);
+
+        let backup = scratch_path("backup-out");
+        let (bout, bcode) = run_admin_verb(&[
+            "backup",
+            "--data-dir",
+            src.to_str().unwrap(),
+            "--out",
+            backup.to_str().unwrap(),
+            "--json",
+        ]);
+        assert_eq!(bcode, 0, "backup succeeded: {bout}");
+        assert!(
+            bout.contains("\"schema\":\"ironbus.cli.backup.v1\""),
+            "{bout}"
+        );
+        // The engine's default cursor plus the reset group "g" cursor: 2 captured.
+        assert!(
+            bout.contains("\"cursors\":2"),
+            "captured both cursors: {bout}"
+        );
+        assert!(
+            bout.contains("\"durable_head\":12"),
+            "captured the head: {bout}"
+        );
+
+        let restored = scratch_path("restore-dst");
+        let (rout, rcode) = run_admin_verb(&[
+            "restore",
+            "--from",
+            backup.to_str().unwrap(),
+            "--data-dir",
+            restored.to_str().unwrap(),
+            "--json",
+        ]);
+        assert_eq!(rcode, 0, "restore succeeded: {rout}");
+        assert!(
+            rout.contains("\"schema\":\"ironbus.cli.restore.v1\""),
+            "{rout}"
+        );
+
+        // The restored dir passes verify CLEAN (the consistency oracle: no cursor past the head, no
+        // dangling DLQ ref, every segment CRC-valid).
+        let (vout, vcode) = run_admin_verb(&["verify", "--data-dir", restored.to_str().unwrap()]);
+        assert_eq!(vcode, 0, "restored dir is verify-clean: {vout}");
+        assert!(vout.contains("is clean"), "{vout}");
+
+        // The restored cursor matches the source.
+        assert_eq!(read_committed_offset(&restored, "g"), Some(5));
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&backup);
+        let _ = std::fs::remove_dir_all(&restored);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_refuses_a_running_broker_with_exit_5() {
+        // A broker holds the exclusive lock on the source: backup must fail fast with exit 5 (a
+        // running broker's data dir is not a consistent point) and write no backup.
+        let src = make_data_dir("backup-locked", 4);
+        dirlock::prepare_data_dir(&src).unwrap();
+        let held = dirlock::DirLock::acquire(&src).unwrap();
+        let backup = scratch_path("backup-locked-out");
+        let (out, code) = run_admin_verb(&[
+            "backup",
+            "--data-dir",
+            src.to_str().unwrap(),
+            "--out",
+            backup.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code, EXIT_UNREACHABLE,
+            "a running broker blocks backup: {out}"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&backup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_non_empty_target_without_force_then_succeeds_with_force() {
+        let src = make_data_dir("restore-clobber-src", 6);
+        let backup = scratch_path("restore-clobber-backup");
+        let (_o, bc) = run_admin_verb(&[
+            "backup",
+            "--data-dir",
+            src.to_str().unwrap(),
+            "--out",
+            backup.to_str().unwrap(),
+        ]);
+        assert_eq!(bc, 0);
+
+        // The target already holds a DIFFERENT data dir.
+        let target = make_data_dir("restore-clobber-target", 99);
+        let (out, code) = run_admin_verb(&[
+            "restore",
+            "--from",
+            backup.to_str().unwrap(),
+            "--data-dir",
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code, EXIT_USAGE,
+            "a non-empty target without --force is refused: {out}"
+        );
+
+        // With --force it succeeds and the target passes verify.
+        let (out2, code2) = run_admin_verb(&[
+            "restore",
+            "--from",
+            backup.to_str().unwrap(),
+            "--data-dir",
+            target.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_eq!(code2, 0, "force overwrote the target: {out2}");
+        let (_v, vc) = run_admin_verb(&["verify", "--data-dir", target.to_str().unwrap()]);
+        assert_eq!(vc, 0, "the force-restored target is verify-clean");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&backup);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_a_corrupt_backup_fail_closed_no_partial_dir() {
+        use ironbus_storage::fs::Filesystem;
+        use ironbus_storage::io::RandomAccessFile;
+        let src = make_data_dir("restore-corrupt-src", 5);
+        let backup = scratch_path("restore-corrupt-backup");
+        let (_o, bc) = run_admin_verb(&[
+            "backup",
+            "--data-dir",
+            src.to_str().unwrap(),
+            "--out",
+            backup.to_str().unwrap(),
+        ]);
+        assert_eq!(bc, 0);
+
+        // Flip a byte in a captured segment so its CRC no longer matches the manifest.
+        let data = StdFs::new(backup.join("data"));
+        let seg = data
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.starts_with("seg-"))
+            .unwrap();
+        let f = data.open(&seg).unwrap();
+        let mut b = vec![0u8; usize::try_from(f.len().unwrap()).unwrap()];
+        f.read_exact_at(&mut b, 0).unwrap();
+        b[0] ^= 0xff;
+        f.write_all_at(&b, 0).unwrap();
+        f.sync_all().unwrap();
+
+        let target = scratch_path("restore-corrupt-target");
+        let (out, code) = run_admin_verb(&[
+            "restore",
+            "--from",
+            backup.to_str().unwrap(),
+            "--data-dir",
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_USAGE, "a corrupt backup is rejected: {out}");
+        // NO partial restore: the target holds no segment (only the lock file the restore lock created,
+        // if any). It must NOT contain a restored segment.
+        let target_fs = StdFs::new(target.clone());
+        let has_seg = target_fs
+            .list()
+            .is_ok_and(|l| l.iter().any(|n| n.starts_with("seg-")));
+        assert!(!has_seg, "a rejected restore left no partial data");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&backup);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_and_restore_require_their_flags() {
+        let (_o, c1) = run_admin_verb(&["backup", "--data-dir", "/tmp/whatever"]);
+        assert_eq!(c1, EXIT_USAGE, "backup requires --out");
+        let (_o, c2) = run_admin_verb(&["restore", "--data-dir", "/tmp/whatever"]);
+        assert_eq!(c2, EXIT_USAGE, "restore requires --from");
+        let (_o, c3) = run_admin_verb(&["restore", "--from", "/tmp/whatever"]);
+        assert_eq!(c3, EXIT_USAGE, "restore requires --data-dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_from_a_missing_backup_is_not_found() {
+        let backup = scratch_path("restore-absent-backup"); // never created
+        let target = scratch_path("restore-absent-target");
+        let (_o, code) = run_admin_verb(&[
+            "restore",
+            "--from",
+            backup.to_str().unwrap(),
+            "--data-dir",
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_NOT_FOUND, "a missing backup is not-found");
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     #[cfg(unix)]
