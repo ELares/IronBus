@@ -37,10 +37,15 @@
 use crate::checkpoint::Checkpoint;
 use crate::dlq::{read_dlq_entries, DlqEntry};
 use crate::fs::Filesystem;
+use crate::layout::STREAMS_SUBDIR;
 use crate::log::{Append, Log, LogConfig};
-use crate::naming::{cursor_checkpoint_name, cursor_checkpoint_names};
+use crate::naming::{
+    cursor_checkpoint_name, cursor_checkpoint_names, is_valid_stream_name,
+    parse_stream_subdir_name, stream_subdir_name,
+};
 use crate::offline::OfflineReader;
 use crate::segment::StorageError;
+use crate::streamset::{StreamId, StreamSet};
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::types::{Offset, RecordFlags};
@@ -497,6 +502,332 @@ fn write_redrive_watermark<F: Filesystem>(fs: &F, watermark: u64) -> Result<(), 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Group + stream lifecycle management (#586): the offline subset of the nats-CLI
+// `consumer`/`stream` management verbs an operator runs against a STOPPED broker's
+// data directory. Every op reuses the same broker-stopped, data-dir-owned safety
+// boundary as `reset_consumer`/`redrive_dlq` (the CLI holds the exclusive lock).
+// ---------------------------------------------------------------------------
+
+/// The outcome of dropping a work-group's durable state offline (#586, `group purge`/`group rm`):
+/// whether a cursor checkpoint was actually removed, so the CLI reports "removed" vs "no such
+/// group" (the not-found path is the caller's, mapped to exit 2). `purge` and `rm` perform the SAME
+/// durable mutation today — a work-group's only durable footprint is its cursor checkpoint — so they
+/// share this outcome; they differ only in the CLI's wording/intent (`purge` = drop progress, `rm` =
+/// forget the group), and a future per-group durable attribute would extend `rm` without changing
+/// `purge`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupDropOutcome {
+    /// `true` when a durable cursor checkpoint existed and was removed; `false` when the group had no
+    /// durable footprint (the caller surfaces this as not-found so a typo is never a silent success).
+    pub existed: bool,
+}
+
+/// Removes a work-group's durable cursor checkpoint from a STOPPED broker's data directory (#586,
+/// `group purge`/`group rm`). The broker must be STOPPED and the caller holds the exclusive data-dir
+/// lock, exactly as [`reset_consumer`]. The group name is validated against the broker's rule FIRST
+/// (an invalid name is refused before any IO), so this never deletes a foreign file.
+///
+/// The cursor checkpoint (`cursor.ckpt` for the default group, `cursor-<hex(name)>.ckpt` for a named
+/// one) is a work-group's ONLY durable footprint today, so removing it is the complete drop: the
+/// broker's next start sees no cursor for the group and treats it as fresh (it resumes from the
+/// log's earliest retained offset on first poll, exactly as a never-seen group). The removal is
+/// directory-fsynced so it is crash-durable (a power loss after this returns never resurrects the
+/// cursor). `existed == false` means there was nothing to remove (the group had no durable cursor);
+/// the caller decides whether that is not-found.
+///
+/// # Errors
+/// [`AdminError::InvalidGroup`] for a name the broker would never resume; [`AdminError::Storage`]
+/// for an IO fault removing the checkpoint or fsyncing the directory.
+pub fn drop_group<F: Filesystem>(fs: &F, group: &str) -> Result<GroupDropOutcome, AdminError> {
+    // Reject a name the broker would never resume BEFORE any IO, so a drop never targets a foreign
+    // file (the empty default group is always valid). This mirrors `reset_consumer`'s ordering.
+    validate_group(group)?;
+    let name = cursor_checkpoint_name(group);
+    if !fs.exists(&name).map_err(StorageError::Io)? {
+        return Ok(GroupDropOutcome { existed: false });
+    }
+    fs.remove(&name).map_err(StorageError::Io)?;
+    // Make the removal crash-durable: a power loss after this returns must not resurrect the cursor
+    // (the same fsync-the-directory discipline a create uses, applied to a remove).
+    fs.sync_dir().map_err(StorageError::Io)?;
+    Ok(GroupDropOutcome { existed: true })
+}
+
+/// One named work-group's lag against the durable log (#586, `group info`/`group ls`): its committed
+/// offset and the durable range, so the CLI renders the lag (`durable_head - committed`) and whether
+/// the cursor is valid (in range). This is the lag-oriented twin of [`CursorStatus`] (which carries
+/// only the in-range bit); it is built from the SAME read-only [`inspect_cursors`] pass plus the
+/// durable head, so the two never disagree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupLag {
+    /// The work-group name (the empty string is the default group).
+    pub group: String,
+    /// The durable committed offset the cursor decoded to (the next offset the group would deliver).
+    pub committed: u64,
+    /// `true` when `committed` is within `[earliest_retained, durable_head]`; `false` is a cursor-vs-log
+    /// mismatch (a reaped-out-from-under or past-the-head cursor) the broker would clamp on next start.
+    pub in_range: bool,
+    /// The number of durable records the group has not yet committed (`durable_head - committed`),
+    /// saturating at 0 for an out-of-range-ahead cursor so the lag is never a wild underflow.
+    pub lag: u64,
+}
+
+/// Lists every work-group's lag against the durable log READ-ONLY (#586, `group ls`/`group info`),
+/// reusing [`inspect_cursors`] for the per-group committed offset + in-range bit and the durable
+/// head for the lag. It MUTATES NOTHING (the inspect pass is the read-only verify twin of
+/// [`reset_consumer`]). Takes the filesystem BY VALUE (mirroring [`inspect_cursors`]) and returns it.
+///
+/// # Errors
+/// [`StorageError`] for a missing/corrupt data directory or an IO fault (the same classification the
+/// other offline readers use).
+pub fn list_group_lag<F: Filesystem>(fs: F) -> Result<(Vec<GroupLag>, F), StorageError> {
+    // The durable head the lag is measured against, learned read-only. `inspect_cursors` validates
+    // the chain and hands the filesystem back, so the two passes see one consistent durable image.
+    let reader = OfflineReader::open(fs)?;
+    let head = reader.durable_head().get();
+    let fs = reader.into_filesystem();
+
+    let (statuses, fs) = inspect_cursors(fs)?;
+    let lags = statuses
+        .into_iter()
+        .map(|c| GroupLag {
+            lag: head.saturating_sub(c.committed),
+            group: c.group,
+            committed: c.committed,
+            in_range: c.in_range,
+        })
+        .collect();
+    Ok((lags, fs))
+}
+
+/// One stream's durable summary (#586, `stream ls`/`stream info`): its name (the empty string is the
+/// default stream — today's root log), the durable range it spans, the record count, and whether its
+/// recovery reported any loss. Built from the SAME per-stream [`OfflineReader`] the read-only verbs
+/// use, so a stream summary and a per-stream verify never disagree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamSummary {
+    /// The stream name: `""` for the default stream (the root log), else the named-stream name.
+    pub stream: String,
+    /// The oldest retained offset (the low end of the durable range).
+    pub earliest_retained: u64,
+    /// The durable head (the offset just past the last durable record).
+    pub durable_head: u64,
+    /// The number of durable records the stream retains (`durable_head - earliest_retained`).
+    pub records: u64,
+    /// `true` when the stream's recovery reported one or more loss spans (a torn/corrupt active
+    /// tail). A clean stream is `false`. This is a read-only signal; the summary never repairs.
+    pub has_loss: bool,
+}
+
+/// Opens a read-only [`OfflineReader`] over ONE stream's log: the data-dir root for the default
+/// stream `""`, or `streams/<hex(name)>/` for a named one. The default-vs-named split mirrors
+/// [`StreamSet::open`] exactly, so the offline summary reads the same bytes the broker recovers.
+///
+/// For a NAMED stream the subdir is probed with `subdir_exists` FIRST and a `NotFound` IO error is
+/// returned if it is absent — `subdir` would otherwise CREATE the directory on demand, turning a
+/// `stream info ghost` into a silent "empty stream" (and materializing a phantom). Probing keeps a
+/// summary of a non-existent stream a clean not-found (exit 2) without any side effect.
+fn open_stream_reader<F: Filesystem + Clone>(
+    fs: &F,
+    stream: &str,
+) -> Result<OfflineReader<F>, StorageError> {
+    if stream.is_empty() {
+        OfflineReader::open(fs.clone())
+    } else {
+        OfflineReader::open(open_named_stream_subdir(fs, stream)?)
+    }
+}
+
+/// Opens a NAMED stream's `streams/<hex(name)>/` directory filesystem, probing for it WITHOUT
+/// creating it: an absent `streams/` or an absent stream subdir is a clean `NotFound` IO error, NOT
+/// a silently-materialized empty stream. Shared by the read-only summary path and the destructive
+/// purge path so both fail-close identically on a non-existent stream. The default stream `""` is
+/// the root log and never lives under `streams/`; callers handle it separately.
+fn open_named_stream_subdir<F: Filesystem + Clone>(
+    fs: &F,
+    stream: &str,
+) -> Result<F, StorageError> {
+    let absent = || {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no stream {stream:?}"),
+        ))
+    };
+    if !fs.subdir_exists(STREAMS_SUBDIR).map_err(StorageError::Io)? {
+        return Err(absent());
+    }
+    let streams_root = fs.subdir(STREAMS_SUBDIR).map_err(StorageError::Io)?;
+    let dir = stream_subdir_name(stream);
+    if !streams_root.subdir_exists(&dir).map_err(StorageError::Io)? {
+        return Err(absent());
+    }
+    streams_root.subdir(&dir).map_err(StorageError::Io)
+}
+
+/// Summarizes one stream's durable state READ-ONLY (#586, `stream info`): opens the stream's log via
+/// [`open_stream_reader`] and reports its range, record count, and loss bit, MUTATING NOTHING. The
+/// default stream `""` summarizes the root log; a named stream summarizes `streams/<hex(name)>/`.
+///
+/// # Errors
+/// [`StorageError`] for a missing/corrupt stream log or an IO fault (the same classification the
+/// other offline readers use). A NAMED stream whose subdir does not exist surfaces as the
+/// reader's not-found (the CLI maps it to exit 2).
+pub fn stream_summary<F: Filesystem + Clone>(
+    fs: &F,
+    stream: &str,
+) -> Result<StreamSummary, StorageError> {
+    let reader = open_stream_reader(fs, stream)?;
+    let earliest_retained = reader.earliest_retained().get();
+    let durable_head = reader.durable_head().get();
+    Ok(StreamSummary {
+        stream: stream.to_string(),
+        earliest_retained,
+        durable_head,
+        records: durable_head.saturating_sub(earliest_retained),
+        has_loss: !reader.loss_report().is_empty(),
+    })
+}
+
+/// Lists every stream's durable summary READ-ONLY (#586, `stream ls`): the DEFAULT stream `""`
+/// (always present — it is the root log) plus every NAMED stream under `streams/`, each summarized by
+/// [`stream_summary`]. MUTATES NOTHING. A foreign directory under `streams/` (one whose name is not a
+/// canonical hex-encoded stream name) is SKIPPED, exactly as [`StreamSet::open`] skips it. The
+/// summaries are sorted default-first then by name (the deterministic `StreamId` order).
+///
+/// # Errors
+/// [`StorageError`] for a missing/corrupt data directory, a corrupt stream log, or an IO fault.
+pub fn list_streams<F: Filesystem + Clone>(fs: &F) -> Result<Vec<StreamSummary>, StorageError> {
+    // The default stream is always present (the root log); summarize it first.
+    let mut out = vec![stream_summary(fs, "")?];
+
+    // Each NAMED stream already on disk under `streams/`, probed WITHOUT creating the subtree (so a
+    // single-log dir is never grown), enumerated and parsed exactly as `StreamSet::open` does.
+    if fs.subdir_exists(STREAMS_SUBDIR).map_err(StorageError::Io)? {
+        let streams_fs = fs.subdir(STREAMS_SUBDIR).map_err(StorageError::Io)?;
+        let mut names: Vec<String> = streams_fs
+            .list_subdirs()
+            .map_err(StorageError::Io)?
+            .iter()
+            .filter_map(|dir| parse_stream_subdir_name(dir))
+            .collect();
+        // Deterministic by name (the default is already first); a foreign dir was filtered above.
+        names.sort();
+        for name in names {
+            out.push(stream_summary(fs, &name)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Creates a NAMED stream's durable log under `streams/<hex(name)>/` (#586, `stream create`), so a
+/// subject-addressed or id-routed publish has a log to land in once the broker starts. Reuses
+/// [`StreamSet::declare`] (declare-on-first-use, the EXACT path the engine's declare-on-produce and
+/// declare-on-bind take), so the created stream is byte-identical to one the broker would create.
+/// The broker must be STOPPED and the caller holds the exclusive data-dir lock. Returns `true` when
+/// the stream was newly created, `false` when it already existed (idempotent).
+///
+/// The DEFAULT stream `""` cannot be "created": it is the root log and always exists, so passing it
+/// is an [`AdminError::InvalidGroup`]-shaped name rejection here via [`StreamId::named`] (the empty
+/// name is not a valid NAMED stream).
+///
+/// # Errors
+/// [`StorageError`] for an invalid name (surfaced through the stream-id validation as an IO
+/// `InvalidInput`) or an IO fault creating the subdir/segment. The CLI validates the name up front
+/// for a clean usage error, so a bad name never reaches here in practice.
+pub fn create_stream<F: Filesystem + Clone, C: Clock + Clone>(
+    fs: &F,
+    clock: C,
+    config: LogConfig,
+    stream: &str,
+) -> Result<bool, StorageError> {
+    let id = StreamId::named(stream).map_err(|_| {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid stream name {stream:?}"),
+        ))
+    })?;
+    // Open the whole stream set (recovering the default + any existing named streams), then declare
+    // the target. `declare` is idempotent and materializes `streams/<hex>/` on first use, exactly as
+    // the broker does. The set is dropped after; only the durable directory persists.
+    let (mut set, _recoveries) = StreamSet::open(fs, clock, config)?;
+    set.declare(&id)
+}
+
+/// The outcome of a DESTRUCTIVE offline stream op (#586, `stream purge`/`stream rm`): how many
+/// durable records were dropped and how many segment files were removed, so the CLI reports exactly
+/// what was destroyed. `purge` empties the stream (drops its records, keeping the stream's directory
+/// so it stays a declared, ready stream); `rm` does the same removal of records (a named stream's
+/// only durable content is its segments), and the CLI's `rm` wording reflects forgetting the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamPurgeOutcome {
+    /// The number of durable records the stream held before the purge (`durable_head -
+    /// earliest_retained`), i.e. how many records this op dropped.
+    pub records: u64,
+    /// The number of segment files removed from the stream's log.
+    pub segments_removed: u64,
+}
+
+/// Drops every durable record of a NAMED stream by removing its segment files (#586, `stream
+/// purge`/`stream rm`), under the exclusive data-dir lock on a STOPPED broker. DESTRUCTIVE: the
+/// records are gone after this (the caller gates it behind an explicit `--force`/`--yes` and a
+/// count-of-what-will-be-deleted message). Returns the record + segment counts so the CLI reports
+/// exactly what was destroyed.
+///
+/// The op opens the stream's log read-only FIRST (via [`open_stream_reader`]) to learn the record
+/// count and the segment ids — this also VALIDATES the chain, so a corrupt stream surfaces the same
+/// typed error the read-only verbs return BEFORE any deletion (fail-closed: a stream that does not
+/// open cleanly is never half-deleted). Then each segment file is removed and the directory is
+/// fsynced ONCE, so the empty stream is crash-durable. The stream's `streams/<hex>/` directory is
+/// PRESERVED (an empty directory), so the stream stays declared and ready to receive again — exactly
+/// the `purge` semantics (empty, not forgotten). The DEFAULT stream `""` cannot be purged here (it is
+/// the root log shared with the default group's durable state); the caller refuses it up front.
+///
+/// # Errors
+/// [`StorageError`] for an invalid name, a missing/corrupt stream log (fail-closed: refused before
+/// any deletion), or an IO fault removing a segment or fsyncing.
+pub fn purge_stream<F: Filesystem + Clone>(
+    fs: &F,
+    stream: &str,
+) -> Result<StreamPurgeOutcome, StorageError> {
+    // Refuse an invalid name and the default stream BEFORE any IO (the default stream is not a
+    // `streams/` child and shares the root log; purging it is out of scope for this op).
+    if !is_valid_stream_name(stream) {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid stream name {stream:?}"),
+        )));
+    }
+    // Probe + open the stream subdir WITHOUT creating it: a missing stream is a not-found
+    // (fail-closed), never a phantom empty stream materialized as a side effect of a destructive op.
+    // Then open the stream's log read-only FIRST: this validates the chain (a corrupt stream is
+    // refused here, before any deletion — fail-closed) and yields the record count + segment ids.
+    let dir_fs = open_named_stream_subdir(fs, stream)?;
+    let reader = OfflineReader::open(dir_fs)?;
+    let records = reader
+        .durable_head()
+        .get()
+        .saturating_sub(reader.earliest_retained().get());
+    let segment_ids: Vec<u64> = reader.segment_ids().to_vec();
+    let dir_fs = reader.into_filesystem();
+
+    // Remove each segment file, then fsync the directory ONCE so the now-empty stream is crash-durable.
+    let mut segments_removed = 0u64;
+    for id in &segment_ids {
+        dir_fs
+            .remove(&crate::naming::segment_file_name(*id))
+            .map_err(StorageError::Io)?;
+        segments_removed += 1;
+    }
+    if segments_removed > 0 {
+        dir_fs.sync_dir().map_err(StorageError::Io)?;
+    }
+    Ok(StreamPurgeOutcome {
+        records,
+        segments_removed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,5 +1222,173 @@ mod tests {
                 .scan()
                 .unwrap();
         }
+    }
+
+    // --- group + stream management (#586) ---
+
+    /// Declares a named stream on `fs` and appends `n` records to it, returning the filesystem. Uses
+    /// the real `StreamSet` declare+append path, so the on-disk shape is exactly the broker's.
+    fn fs_with_named_stream(fs: InMemoryFs, stream: &str, n: u64) -> InMemoryFs {
+        let (mut set, _) = StreamSet::open(&fs, ManualClock::new(), cfg()).unwrap();
+        let id = StreamId::named(stream).unwrap();
+        set.declare(&id).unwrap();
+        let log = set.get_mut(&id).unwrap();
+        for i in 0..n {
+            log.append(&Append {
+                timestamp_ms: i,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[u8::try_from(i % 256).unwrap(); 8],
+            })
+            .unwrap();
+        }
+        log.sync().unwrap();
+        fs
+    }
+
+    #[test]
+    fn drop_group_removes_an_existing_cursor_and_reports_existed() {
+        // A group with a durable cursor: drop_group removes the checkpoint and reports existed=true;
+        // a re-drop reports existed=false (idempotent, the not-found signal the CLI maps to exit 2).
+        let fs = log_with(10);
+        let (_, fs) = reset_consumer(fs, "orders", ResetTarget::Offset(4)).unwrap();
+        assert!(fs.exists(&cursor_checkpoint_name("orders")).unwrap());
+
+        let first = drop_group(&fs, "orders").unwrap();
+        assert!(first.existed, "an existing cursor is removed");
+        assert!(
+            !fs.exists(&cursor_checkpoint_name("orders")).unwrap(),
+            "the cursor file is gone after a drop"
+        );
+
+        let second = drop_group(&fs, "orders").unwrap();
+        assert!(!second.existed, "a re-drop is not-found (idempotent)");
+    }
+
+    #[test]
+    fn drop_group_on_a_never_seen_group_reports_not_existed() {
+        let fs = log_with(3);
+        let outcome = drop_group(&fs, "ghost").unwrap();
+        assert!(!outcome.existed, "no durable footprint -> not-found");
+        assert!(!fs.exists(&cursor_checkpoint_name("ghost")).unwrap());
+    }
+
+    #[test]
+    fn drop_group_rejects_an_invalid_name_before_any_io() {
+        let fs = log_with(3);
+        match drop_group(&fs, "bad name").unwrap_err() {
+            AdminError::InvalidGroup(n) => assert_eq!(n, "bad name"),
+            other => panic!("expected InvalidGroup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_group_lag_reports_committed_in_range_and_lag() {
+        // Two groups at different offsets over a log with durable head 10; lag = head - committed.
+        let fs = log_with(10);
+        let (_, fs) = reset_consumer(fs, "fast", ResetTarget::Offset(8)).unwrap();
+        let (_, fs) = reset_consumer(fs, "slow", ResetTarget::Offset(2)).unwrap();
+        let (lags, _fs) = list_group_lag(fs).unwrap();
+        let fast = lags.iter().find(|g| g.group == "fast").unwrap();
+        let slow = lags.iter().find(|g| g.group == "slow").unwrap();
+        assert_eq!((fast.committed, fast.lag, fast.in_range), (8, 2, true));
+        assert_eq!((slow.committed, slow.lag, slow.in_range), (2, 8, true));
+    }
+
+    #[test]
+    fn list_streams_reports_the_default_and_named_streams() {
+        // The default stream is always present (the root log); a named stream is summarized too.
+        let fs = log_with(6); // root log: 6 records
+        let fs = fs_with_named_stream(fs, "orders", 4);
+        let summaries = list_streams(&fs).unwrap();
+        let default = summaries.iter().find(|s| s.stream.is_empty()).unwrap();
+        let orders = summaries.iter().find(|s| s.stream == "orders").unwrap();
+        assert_eq!(default.records, 6, "the root log holds 6 records");
+        assert!(!default.has_loss);
+        assert_eq!(orders.records, 4, "the named stream holds 4 records");
+        assert!(!orders.has_loss);
+        // The default stream sorts first (the deterministic StreamId order).
+        assert!(summaries[0].stream.is_empty());
+    }
+
+    #[test]
+    fn stream_summary_of_a_missing_named_stream_is_not_found_without_materializing_it() {
+        // A `stream info ghost` over a dir with no such stream is a clean not-found, and it must NOT
+        // create a phantom `streams/<hex(ghost)>/` as a side effect (the probe-before-open contract).
+        let fs = log_with(3);
+        let err = stream_summary(&fs, "ghost").unwrap_err();
+        match err {
+            StorageError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected a not-found IO error, got {other:?}"),
+        }
+        // No phantom stream materialized.
+        assert!(
+            !fs.subdir_exists(STREAMS_SUBDIR).unwrap(),
+            "a not-found summary never creates the streams/ subtree"
+        );
+    }
+
+    #[test]
+    fn create_stream_materializes_a_named_stream_idempotently() {
+        let fs = log_with(2);
+        let created = create_stream(&fs, ManualClock::new(), cfg(), "events").unwrap();
+        assert!(created, "the stream is newly created");
+        assert!(fs.subdir_exists(STREAMS_SUBDIR).unwrap());
+        // It now appears in the listing as an empty stream.
+        let summaries = list_streams(&fs).unwrap();
+        let events = summaries.iter().find(|s| s.stream == "events").unwrap();
+        assert_eq!(events.records, 0);
+        // A re-create is idempotent (returns false, no error).
+        let again = create_stream(&fs, ManualClock::new(), cfg(), "events").unwrap();
+        assert!(!again, "a re-create is idempotent");
+    }
+
+    #[test]
+    fn create_stream_rejects_the_default_and_invalid_names() {
+        let fs = log_with(1);
+        // The empty (default) name is not a valid NAMED stream.
+        assert!(create_stream(&fs, ManualClock::new(), cfg(), "").is_err());
+        // A non-graphic name is rejected.
+        assert!(create_stream(&fs, ManualClock::new(), cfg(), "bad name").is_err());
+    }
+
+    #[test]
+    fn purge_stream_drops_every_record_and_reports_the_counts() {
+        let fs = log_with(2);
+        let fs = fs_with_named_stream(fs, "orders", 5);
+        // Before: the stream holds 5 records.
+        assert_eq!(stream_summary(&fs, "orders").unwrap().records, 5);
+
+        let outcome = purge_stream(&fs, "orders").unwrap();
+        assert_eq!(outcome.records, 5, "5 records were dropped");
+        assert!(
+            outcome.segments_removed >= 1,
+            "at least one segment removed"
+        );
+
+        // After: the stream's directory is preserved (still declared) but empty.
+        let after = stream_summary(&fs, "orders").unwrap();
+        assert_eq!(after.records, 0, "the stream is empty after a purge");
+        assert!(
+            fs.subdir(STREAMS_SUBDIR)
+                .unwrap()
+                .subdir_exists(&stream_subdir_name("orders"))
+                .unwrap(),
+            "the stream directory is preserved (purge empties, it does not forget)"
+        );
+        // The root log is untouched (blast-radius isolation).
+        assert_eq!(stream_summary(&fs, "").unwrap().records, 2);
+    }
+
+    #[test]
+    fn purge_stream_refuses_the_default_and_invalid_names() {
+        let fs = log_with(4);
+        // The default stream cannot be purged here (it is the root log).
+        assert!(purge_stream(&fs, "").is_err());
+        // An invalid name is refused before any IO.
+        assert!(purge_stream(&fs, "bad name").is_err());
+        // The root log is untouched after the refusals.
+        assert_eq!(stream_summary(&fs, "").unwrap().records, 4);
     }
 }
