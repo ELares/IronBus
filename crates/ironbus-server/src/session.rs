@@ -40,13 +40,14 @@ use ironbus_proto::message::{
     decode_ack, decode_bind_subject, decode_connect, decode_cumulative_ack, decode_fetch,
     decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit, decode_stream_declare,
     decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
-    decode_txn_prepare, decode_txn_resolve, encode_dead_letter, encode_deliver,
-    encode_deliver_batch, encode_gap_marker, encode_info, encode_not_leader,
-    encode_produce_confirm, encode_pub_ack, encode_stream_info_response, encode_truncated,
-    gap_reason, parse_connect_auth, produce_confirm_status, pub_ack_level, AckLevel, AckOp,
-    ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody,
-    InfoBody, NotLeaderBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody, TruncatedBody,
-    DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    decode_txn_check_result, decode_txn_listen, decode_txn_prepare, decode_txn_resolve,
+    encode_dead_letter, encode_deliver, encode_deliver_batch, encode_gap_marker, encode_info,
+    encode_not_leader, encode_produce_confirm, encode_pub_ack, encode_stream_info_response,
+    encode_truncated, encode_txn_resolve, gap_reason, parse_connect_auth, produce_confirm_status,
+    pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader,
+    DeliverBody, GapMarkerBody, InfoBody, NotLeaderBody, ProduceConfirmBody, PubAckBody,
+    StreamInfoResponseBody, TruncatedBody, TxnResolveBody, DEAD_LETTER_MAX_DELIVER,
+    PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -363,6 +364,15 @@ pub struct Session {
     /// connection that did not. `false` by default, so an L0/L1-only connection is byte-for-byte
     /// unchanged.
     produced_l2: bool,
+    /// The transaction-LISTENER group this connection registered (#640 part 2, via `TxnListen`), or
+    /// `None` if it never registered one. When `Some`, the connection has opted into back-checking: it
+    /// drives the periodic back-check scan and drains any `TxnCheck`s the broker routed to it on its own
+    /// pass — exactly the `produced_l2` discipline, so a connection that never registers a listener
+    /// never touches the back-check path and is byte-for-byte unchanged (a ping-only/consumer connection
+    /// answers a `Ping` without the scan). It is ALSO the group every `TxnPrepare` on this connection
+    /// records as the half message's back-check owner, so the broker can route a `TxnCheck` to this
+    /// producer's listener even after a reconnect. `None` by default.
+    txn_listener_group: Option<Vec<u8>>,
     /// The per-connection, generation-guarded subject-resolve cache (#585, M2-I9): caches a literal
     /// subject's single-home resolution (the bound [`StreamId`]) so a hot publisher to the same subject
     /// routes in O(1) — a hash lookup, no trie walk — after the first publish. It is consulted INSIDE
@@ -524,6 +534,16 @@ impl Session {
         self.produced_l2
     }
 
+    /// Whether this connection registered a transaction-state LISTENER (#640 part 2, via `TxnListen`).
+    /// The per-pass back-check scan + `TxnCheck` drain are GATED on this, so a connection that never
+    /// registers a listener never touches the back-check path (byte-for-byte unchanged). The
+    /// connection-cleanup path also consults it so only a back-checking connection routes the listener
+    /// cleanup through the actor.
+    #[must_use]
+    pub fn registered_txn_listener(&self) -> bool {
+        self.txn_listener_group.is_some()
+    }
+
     /// Processes the complete frames at the front of `input`, dispatching each to the engine (via
     /// the append actor `engine`) and appending response frames to `out`. Returns a [`Progress`]:
     /// the number of input bytes consumed, plus the `needed` hint, the minimum TOTAL input length
@@ -671,6 +691,18 @@ impl Session {
         if self.produced_l2 {
             drain_produce_confirms(engine, member_id, out);
         }
+        // Drive the back-check scan + drain any routed `TxnCheck`s for THIS producer connection (#640
+        // part 2), so a producer that registered a transaction listener (and is interleaving Pings via
+        // its `transact`/listener loop) (a) advances the periodic in-doubt-txn scan and (b) receives any
+        // `TxnCheck` the broker routed to its group on its own pass — the only place the
+        // thread-per-connection server may write this socket, exactly like the L2 confirm drain above.
+        // GATED on `registered_txn_listener`: a connection that never registered a listener never runs
+        // the scan or the drain, so a ping-only/consumer/non-transactional connection is byte-for-byte
+        // unchanged (no actor round-trip for the scan). The scan itself is a no-op when there are no
+        // in-doubt txns, so even a back-checking broker with nothing prepared pays ~nothing.
+        if self.registered_txn_listener() {
+            drive_back_check(engine, member_id, out);
+        }
         match result {
             Err(e) => Err(e),
             Ok(progress) => drained.map(|()| progress),
@@ -683,6 +715,7 @@ impl Session {
     /// stalled produce fsync cannot block it, #177); a produce advances the durable head but not a
     /// COMMITTED cursor. An `Ack`/`Flow`/`Unsub` returns `true` (an ack commits, a flow can commit
     /// past a dead-letter, an unsub may evict a caught-up group).
+    #[allow(clippy::too_many_lines)] // one match arm per wire verb; splitting it would obscure the dispatch
     fn dispatch<
         F: Filesystem + Clone + 'static,
         C: Clock + Clone + 'static,
@@ -827,6 +860,20 @@ impl Session {
             Some(FrameType::TxnRollback) => {
                 self.require_scope(crate::auth::Scope::Publish, "TxnRollback", out)?;
                 self.handle_txn_rollback(engine, body, out).map(|()| false)
+            }
+            // The BACK-CHECK verbs (#640 part 2): TxnListen registers this connection as the listener
+            // for a group (so the broker can route a TxnCheck to it), and TxnCheckResult answers a
+            // broker back-check (resolving an in-doubt half message through the part-1 path). Both are
+            // producer-side, so they require the `publish` scope. Neither advances a committed consumer
+            // cursor, so each returns `false`.
+            Some(FrameType::TxnListen) => {
+                self.require_scope(crate::auth::Scope::Publish, "TxnListen", out)?;
+                self.handle_txn_listen(engine, body, out).map(|()| false)
+            }
+            Some(FrameType::TxnCheckResult) => {
+                self.require_scope(crate::auth::Scope::Publish, "TxnCheckResult", out)?;
+                self.handle_txn_check_result(engine, body, out)
+                    .map(|()| false)
             }
             Some(FrameType::Unsub) => {
                 self.require_scope(crate::auth::Scope::Subscribe, "Unsub", out)?;
@@ -3079,6 +3126,11 @@ impl Session {
         let key = Bytes::copy_from_slice(msg.key);
         let headers = Bytes::copy_from_slice(msg.headers);
         let payload = Bytes::copy_from_slice(msg.payload);
+        // The half message's back-check OWNER is this connection's registered listener group (#640
+        // part 2), so the broker can route a `TxnCheck` to this producer's listener even after a
+        // reconnect. Empty when the connection never registered a listener — such a half message is not
+        // back-check-routable, but the bounded attempt cap still rolls it back safely if it is crashed.
+        let listener_group = self.txn_listener_group.clone().unwrap_or_default();
         let outcome = engine.with(move |e| {
             let view = Append {
                 timestamp_ms,
@@ -3087,7 +3139,7 @@ impl Session {
                 headers: &headers,
                 payload: &payload,
             };
-            e.txn_prepare(&txn_id, &stream, &view)
+            e.txn_prepare(&txn_id, &stream, &view, &listener_group)
         })?;
         match outcome {
             Ok(()) => {
@@ -3196,6 +3248,111 @@ impl Session {
                 Err(SessionError::EngineFatal(e))
             }
             Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a `TxnListen` (#640 part 2, V2-M8): register THIS connection as the live transaction-state
+    /// listener for a stable `group`, so the broker can ROUTE a `TxnCheck` for an in-doubt half message
+    /// owned by the group to this connection — even after the original preparing connection crashed and
+    /// this NEW connection re-registered the same group (the crash-and-reconnect route). It also opts the
+    /// connection into the per-pass back-check scan + drain (so its `transact`/listener loop drives the
+    /// resolution), and binds the group every subsequent `TxnPrepare` on this connection records as the
+    /// half message's back-check owner. Replies a body-less `Ok`. Idempotent: re-registering the same (or
+    /// a new) group supersedes the binding. Routes through the single-writer engine; fail-closed at the
+    /// boundary, never panics.
+    fn handle_txn_listen<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(decoded) = decode_txn_listen(body) else {
+            reply_err(out, "malformed txn-listen body");
+            return Ok(());
+        };
+        // A listener group must have a stable identity to route against; an empty group is refused (it
+        // could not distinguish two producers and would not survive as a routable owner on prepare).
+        if decoded.group.is_empty() {
+            reply_err(out, "listener group must not be empty");
+            return Ok(());
+        }
+        let group = decoded.group.to_vec();
+        // Bind the group to this connection in the engine's back-check router (superseding any prior
+        // binding), and remember it on the session so future prepares record it as the half message
+        // owner and the per-pass scan/drain is enabled for this connection.
+        let member_id = self.member_id;
+        let group_for_engine = group.clone();
+        engine.with(move |e| e.register_txn_listener(&group_for_engine, member_id))?;
+        self.txn_listener_group = Some(group);
+        reply(out, FrameType::Ok, &[]);
+        Ok(())
+    }
+
+    /// Handles a `TxnCheckResult` (#640 part 2, V2-M8): the producer's listener's answer to a broker
+    /// `TxnCheck`. A `Commit` drives the SAME idempotent `TxnCommit` path (the half message becomes
+    /// visible EXACTLY ONCE), a `Rollback` the SAME `TxnRollback` path (discarded, never delivered), and
+    /// an `Unknown` is a no-op (the back-check reschedules; the bounded attempt cap eventually applies
+    /// the terminal default). Replies a body-less `Ok` on a clean resolve (or a benign duplicate /
+    /// no-op), or an `Err` for a conflicting flip (a `Commit` of an already-rolled-back txn, or
+    /// vice-versa — the part-1 `AlreadyResolved` rule). The back-check NEVER introduces a new commit
+    /// path, so part 1's exactly-once guarantee is inherited. Routes through the single-writer engine;
+    /// fail-closed at the boundary, never panics.
+    fn handle_txn_check_result<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(decoded) = decode_txn_check_result(body) else {
+            reply_err(out, "malformed txn-check-result body");
+            return Ok(());
+        };
+        if decoded.txn_id.is_empty() {
+            reply_err(out, "txn_id must not be empty");
+            return Ok(());
+        }
+        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        let decision = decoded.decision;
+        // OWNERSHIP (#640 part 2, BLOCKER 1): pass THIS connection's registered listener group so the
+        // engine can verify the answerer OWNS the txn's group before resolving an in-doubt half message.
+        // EMPTY when the connection never registered a `TxnListen` listener — which the engine treats as
+        // "does not own", so a forged `TxnCheckResult` from a non-owner is REFUSED (a typed `Err`, not a
+        // flip and not a connection close), leaving the txn Prepared so its real owner can still answer.
+        let answering_group = self.txn_listener_group.clone().unwrap_or_default();
+        let outcome =
+            engine.with(move |e| e.resolve_txn_check(&txn_id, decision, &answering_group))?;
+        match outcome {
+            Ok(()) => {
+                reply(out, FrameType::Ok, &[]);
+                Ok(())
+            }
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            Err(e) => {
+                // A conflicting flip (a Commit after the terminal default already rolled it back, or a
+                // racing producer-driven resolve) is refused by the part-1 path — surfaced as an Err, not
+                // a flip. The producer's listener treats this as "already settled", which is correct.
                 reply_err(out, &e.to_string());
                 Ok(())
             }
@@ -3882,6 +4039,49 @@ fn drain_produce_confirms<
     };
     for confirm in ready {
         write_produce_confirm(&confirm, out);
+    }
+}
+
+/// Writes one `TxnCheck` frame (#640 part 2) asking the producer's listener about an in-doubt
+/// transaction. Reuses the frozen [`encode_txn_resolve`] codec (the same `txn_id`-only body shape as
+/// `TxnCommit`/`TxnRollback`), so the wire body cannot drift from the proto definition.
+fn write_txn_check(txn_id: &[u8], out: &mut Vec<u8>) {
+    let mut body = Vec::new();
+    // The encode only fails for a txn id over the u16 wire cap, which the lifecycle bounds to 256, so
+    // this is infallible in practice; on the unreachable error we simply emit no frame (the txn is
+    // re-checked on a later scan).
+    if encode_txn_resolve(&TxnResolveBody { txn_id }, &mut body).is_ok() {
+        reply(out, FrameType::TxnCheck, &body);
+    }
+}
+
+/// Drives the broker back-check for a producer connection that registered a transaction listener (#640
+/// part 2): runs ONE periodic scan tick (find in-doubt txns due for a back-check, push a `TxnCheck`,
+/// record the attempt durably, apply the terminal default after the bounded attempt cap), then drains
+/// every `TxnCheck` the broker routed to THIS connection onto the wire, FIFO. The scan + drain both run
+/// through the single-writer engine; a gone actor is a no-op. The scan is a no-op when there are no
+/// in-doubt txns, so a back-checking connection on an idle broker pays ~nothing. A storage error in the
+/// scan is swallowed here (the connection is mid-pass and the next scan retries); it never desyncs the
+/// wire because no partial frame is written on the scan path.
+fn drive_back_check<
+    F: Filesystem + Clone + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+>(
+    engine: &E,
+    member_id: MemberId,
+    out: &mut Vec<u8>,
+) {
+    // Run one scan tick (single-writer). A gone actor or a storage error both mean "skip this pass".
+    let _ = engine.with(move |e| {
+        let _ = e.txn_back_check_tick();
+    });
+    // Drain the `TxnCheck`s routed to this connection and write them onto its own pass.
+    let Ok(checks) = engine.with(move |e| e.drain_txn_checks(member_id)) else {
+        return; // a gone actor: the connection is ending, nothing to deliver
+    };
+    for check in checks {
+        write_txn_check(&check.txn_id, out);
     }
 }
 

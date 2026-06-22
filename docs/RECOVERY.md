@@ -779,3 +779,158 @@ choose it (`crates/ironbus-client/src/lib.rs`):
   on the per-connection mint.
 
 For transactions that span a reconnect, prefer `prepare_with_id` with a stable id.
+
+### 9.4 The broker back-check: resolving a producer-crashed in-doubt txn (#640 part 2)
+
+Part 1 leaves one hole: if a producer sends a half message (`prepare`) then
+CRASHES before `commit`/`rollback`, the half message is stuck `Prepared`
+(invisible, undelivered) forever. The **back-check** closes it. The broker
+periodically scans for `Prepared` half messages older than a timeout and asks the
+producer "what is the state of transaction X?"; the producer's registered
+transaction-state listener answers `Commit` / `Rollback` / `Unknown`, and the
+broker resolves accordingly. If the producer is unreachable after a bounded number
+of attempts, the broker applies a SAFE TERMINAL default. The engine code is
+`Engine::txn_back_check_tick` / `resolve_txn_check` / `register_txn_listener` and
+the `TxnBackCheck` router in `crates/ironbus-server/src/engine.rs`; the pure
+schedule is `ironbus_core::txn::BackCheckBook`; the durable bookkeeping is the
+`TXNB` op-record + `TxnStore::append_back_check` in
+`crates/ironbus-storage/src/txn.rs`.
+
+**The scan loop.** A cheap periodic task (riding the producer's serve passes, the
+same per-pass seam as the Level-2 `ProduceConfirm` drain, gated on the connection
+having registered a listener) queries `BackCheckBook::due(now)` — every enrolled
+`Prepared` txn whose next-eligible instant has passed, capped at a global per-pass
+batch (no storm). For each due txn it records the attempt durably FIRST, then
+pushes a `TxnCheck` to the producer's live listener; after the bounded
+`max_back_check_attempts` with no resolution it applies the SAFE TERMINAL default
+= **Rollback/discard** (never deliver a message whose outcome is unknowable). The
+scan is a no-op (zero work) when no txn is in-doubt, so a broker that does not use
+transactions is byte-for-byte unchanged.
+
+**The new frames + tags.** `TxnCheck` (tag 47, broker→producer, "state of txn X?",
+reusing the frozen `TxnResolveBody` shape), `TxnCheckResult` (tag 48,
+producer→broker, `txn_id` + a `Commit`/`Rollback`/`Unknown` decision byte), and
+`TxnListen` (tag 49, producer→broker, the listener-group registration). All
+version-tagged, length-framed, cap-before-alloc, and pinned by byte-freeze
+snapshot tests. An unrecognized decision byte folds to the SAFE `Unknown`.
+
+**Durable bookkeeping + recovery.** The back-check schedule + attempt count are
+persisted as a new `TXNB` op-record (CRC32C'd, version-tagged, frozen) so they
+SURVIVE a broker restart. On replay the attempt count is restored EXACTLY (it is
+the terminal-default gate), while the `next_eligible` instant is REBASED against
+the live monotonic clock — a persisted absolute monotonic instant is meaningless
+across a reboot (the monotonic origin resets), so a recovered txn is promptly
+re-eligible with its count preserved and the scan resumes. A `TXNB` record whose
+txn later resolved is superseded by the commit/rolled-back op-marker on replay
+(never re-enrolled).
+
+**Re-enroll on open — no orphan across a restart-before-first-attempt.** The
+`TXNB` record is written only on the FIRST back-check ATTEMPT, so a txn that was
+`prepare`d and then survived a restart WITHIN the first timeout window (no attempt
+fired yet, no `TXNB` record) would, if the book were rebuilt only from `TXNB`
+records, come back `Prepared` but NOT enrolled — never scanned, never
+back-checked, never terminal-defaulted: stuck `Prepared` (invisible, undelivered)
+FOREVER, the exact orphan this feature exists to clean up. So replay RE-ENROLLS
+**every** still-`Prepared` txn into the back-check book, driven off the lifecycle
+table's `all_prepared()` (NOT the `TXNB` records): a txn that had a `TXNB` record
+keeps its persisted attempt count exactly; a txn with none enrolls FRESH at 0
+attempts. The re-enroll is idempotent (a resolved txn is absent from
+`all_prepared()`, so it is never re-enrolled) and runs only when there ARE prepared
+txns on open, so a non-transactional broker is byte-for-byte unchanged. The code is
+the `all_prepared()`-driven loop in `TxnStore::replay`
+(`crates/ironbus-storage/src/txn.rs`), proven by
+`a_prepared_txn_with_no_back_record_is_re_enrolled_on_replay` (storage) and
+`a_prepare_then_restart_before_any_attempt_is_re_enrolled_and_terminal_defaults`
+(engine, end-to-end through the terminal default).
+
+**The concrete commit-loss window (the DEFAULT schedule).** A producer that does
+not answer a back-check — i.e. does not reconnect and re-register its listener in
+time — within roughly `timeout + (max_attempts − 1) × retry` will have its
+commit-intent half message terminal-**ROLLED BACK** (discarded, never delivered,
+all-or-nothing — never torn). At the production defaults (`timeout` 30 s, `retry`
+15 s, `max_attempts` 5) that window is ≈ 30 + 4×15 = **90 s**: after ~90 s of an
+unanswered in-doubt txn, the broker safely discards it. Discard is the safe default
+— the broker NEVER delivers a message whose outcome it cannot confirm. **Operators
+with long local transactions** (a producer that may legitimately take longer than
+this to commit/recover) MUST raise `timeout` / `max_attempts` (and/or `retry`) via
+`Engine::set_back_check_config` so a slow-but-alive producer is not rolled back out
+from under a commit it was about to make.
+
+**Routing to the (re)connected producer.** The broker only writes a producer's
+socket from that producer's own pass (thread-per-connection), so the back-check
+push rides the producer's listener loop exactly like the L2 confirm drain. The
+per-connection `MemberId` changes across a reconnect, so routing is keyed by a
+STABLE producer-chosen listener GROUP: a producer registers it via `TxnListen`
+(re-registering after a reconnect re-points the route to its new connection); each
+half message records its owning group at `prepare`; the scan routes a `TxnCheck`
+to whatever connection currently holds that group's listener. THE HEADLINE CASE:
+a producer prepares, disconnects before resolve (crash), reconnects and
+re-registers its listener, the scan back-checks it, the listener replies `Commit`
+→ the half is committed EXACTLY ONCE via the part-1 path (proven by
+`the_headline_crash_reconnect_back_check_commit_delivers_exactly_once` in
+`engine.rs` and `the_headline_back_check_resolves_a_crashed_producers_half_over_the_wire`
+end-to-end in `ironbus-client`).
+
+**Resolution reuses part 1 (the inherited exactly-once + immutability).** A
+back-check `Commit` goes through the SAME idempotent `Engine::txn_commit` path
+(default-stream exactly-once preserved); a `Rollback` through the same
+`txn_rollback`; the back-check NEVER introduces a new commit path. So part 1's
+`AlreadyResolved` rule covers every race:
+
+| Race | Outcome |
+|---|---|
+| producer answers `Commit` twice | the second is a benign idempotent no-op (returns the recorded offset); no second delivery |
+| producer answers `Commit` AFTER the terminal `Rollback` already fired | REFUSED (`AlreadyResolved { RolledBack }`) — never a flip, never a double-resolve |
+| a duplicate `TxnCheckResult` | a no-op (the txn is already resolved/forgotten) |
+| the producer never returns | after `max_back_check_attempts` → terminal `Rollback` (discarded, never delivered) |
+
+**The terminal-default safety net + its limits.** The terminal default is
+ALWAYS `Rollback` (discard), never `Commit`: a half message whose outcome is
+unknowable is never delivered. It fires through the same idempotent `txn_rollback`,
+so a producer's later `Commit` is the refused-flip above, not a double-resolve. A
+half message prepared by a producer that NEVER registered a listener is not
+routable (the broker cannot reach it), but is still enrolled — the bounded attempt
+cap still advances on each scan and the terminal `Rollback` still safely discards
+it, so a listener-less producer's crashed half is never stuck forever (it is just
+never given the chance to commit it, which is the correct conservative default).
+The routing GROUP is the unit of identity: two producers that (mis)register the
+SAME group share a listener route, so a deployment must give each producer a
+distinct stable group (e.g. its durable producer id).
+
+**Ownership of a back-check answer (the resolve gate).** A `TxnCheckResult` answer
+may resolve an in-doubt (`Prepared`) txn ONLY when the answering connection OWNS
+the txn's listener group: it must have a REGISTERED listener (a non-empty group via
+`TxnListen`) AND that group must EQUAL the group recorded as the txn's owner at
+`prepare`. Otherwise the answer is REFUSED (`ERR_TXN_CHECK_UNAUTHORIZED`,
+`EngineError::TxnCheckUnauthorized`) and the txn is left exactly as it was —
+`Prepared`, on its back-check schedule — so a LEGITIMATE owner's answer can still
+arrive; the answering connection is NOT torn down (it is a typed refusal, never a
+flip, never a panic). Without this gate, ANY `Publish` connection could
+commit/discard ANY producer's in-doubt txn with one forged
+`TxnCheckResult{txn_id, decision}` — a cross-producer data-integrity hole. The
+headline reconnect case is unaffected: a producer that prepared under group "B",
+crashed, reconnected and re-registered `TxnListen{group:"B"}` answers for its own
+txn → owner "B" == its group "B" → ALLOWED; a different connection (group "A" or
+none) answering for "B"'s txn → REFUSED. A txn that is already resolved (or was
+never seen) has nothing in-doubt to protect, so it bypasses the gate straight into
+the part-1 idempotent path (a duplicate answer is a benign no-op, a flip is the
+inherited `AlreadyResolved` refusal). The gate is a pure in-memory map lookup
+keyed off the already-recorded `txn_owner`, so it adds NO hot-path cost to
+non-transactional traffic. Code: `Engine::resolve_txn_check` in
+`crates/ironbus-server/src/engine.rs` (gated on `TxnBackCheck::owner_group`), proven
+by `a_forged_back_check_answer_from_a_non_owner_is_refused_and_leaves_the_txn_prepared`
+and `the_owner_group_can_resolve_its_own_back_checked_txn`.
+
+**The listener group is capability-bearing (the auth-layer residual).** The
+group-MATCH gate above proves OWNERSHIP, not IDENTITY: a malicious client that
+already KNOWS a victim's group name could register that group via `TxnListen` and
+then answer (hijack) for the victim's txns. This is the SAME class as "any client
+on a no-auth broker can do anything" — the broker's transport, not the back-check,
+is the trust boundary. So the listener group must be treated as a **capability**:
+when auth is enabled, a deployment SHOULD bind the listener group to the
+authenticated principal (reject a `TxnListen` for a group the principal is not
+entitled to), and the standing requirement that **two producers must never share a
+group** (each uses a distinct stable group, e.g. its durable producer id) is what
+keeps ownership unambiguous. The group-MATCH gate is the in-scope fix here; binding
+the group to an authenticated principal is the auth-layer follow-up, out of scope
+for the no-auth back-check core.

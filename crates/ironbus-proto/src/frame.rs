@@ -451,6 +451,46 @@ pub enum FrameType {
     /// unchanged. Body: a [`crate::message::TxnResolveBody`] (the same shape as `TxnCommit`: a
     /// `txn_id` u16-length name in a version/length-framed block).
     TxnRollback,
+    /// Broker → producer TRANSACTIONAL BACK-CHECK (#640 part 2, V2-M8, wire tag 47). The broker pushes
+    /// this UNSOLICITED to a producer whose half message has been `Prepared` (durably buffered,
+    /// invisible) for longer than the back-check timeout WITHOUT a `TxnCommit`/`TxnRollback` — the
+    /// producer is presumed to have CRASHED between prepare and resolve. It asks "what is the state of
+    /// transaction `txn_id`?"; the producer's registered transaction-state listener answers with a
+    /// [`FrameType::TxnCheckResult`] (`Commit`/`Rollback`/`Unknown`). This is the server→producer
+    /// async-PUSH mechanism modeled on the Level-2 [`FrameType::ProduceConfirm`] (tag 22): the broker
+    /// only writes a producer's socket from that producer's own pass, so the producer's listener loop
+    /// drives passes (interleaving `Ping`s, exactly like `produce_confirmed`) and drains this frame. It
+    /// is a NEW append-only tag a non-back-checking client never sees; tags 1-46 are byte-for-byte
+    /// unchanged. Body: a [`crate::message::TxnResolveBody`] (the same shape as `TxnCommit`: a `txn_id`
+    /// u16-length name in a version/length-framed block).
+    TxnCheck,
+    /// Producer → broker TRANSACTIONAL BACK-CHECK RESULT (#640 part 2, V2-M8, wire tag 48). The
+    /// producer's transaction-state listener answers a [`FrameType::TxnCheck`]: it reports the
+    /// transaction's resolution (`Commit`/`Rollback`/`Unknown`). A `Commit` drives the broker through
+    /// the SAME idempotent [`FrameType::TxnCommit`] path (the half message becomes visible exactly
+    /// once); a `Rollback` through the SAME `TxnRollback` path (discarded, never delivered); an
+    /// `Unknown` means "I cannot decide yet" — the back-check schedules a later retry, and after a
+    /// bounded number of attempts the broker applies the SAFE TERMINAL default (Rollback/discard, never
+    /// delivering a message whose outcome is unknowable). IDEMPOTENT/SAFE: a result that arrives after
+    /// the txn already resolved (e.g. the producer answered `Commit` after the terminal Rollback fired,
+    /// or a duplicate result) is refused/no-op by the part-1 `AlreadyResolved` rule — never a flip,
+    /// never a double-resolve. A NEW append-only tag a non-back-checking client never sends; tags 1-47
+    /// are byte-for-byte unchanged. Body: a [`crate::message::TxnCheckResultBody`] (`body_version: u8`,
+    /// `field_len: u16` over `txn_id` u16-length name then a `decision: u8`).
+    TxnCheckResult,
+    /// Producer → broker TRANSACTION-LISTENER REGISTRATION (#640 part 2, V2-M8, wire tag 49). A
+    /// producer that runs transactions registers (or re-registers, after a reconnect) the STABLE
+    /// listener GROUP its transaction-state listener answers for, so the broker can ROUTE a
+    /// [`FrameType::TxnCheck`] for an in-doubt half message to whatever connection currently holds that
+    /// group's listener — even a DIFFERENT connection than the one that prepared the half message (the
+    /// crash-and-reconnect case). The group is a producer-chosen stable byte string (e.g. its durable
+    /// producer id); the half message records its owning group at prepare time, and this frame binds the
+    /// group to THIS connection (superseding any prior binding, so a reconnect re-points the route). The
+    /// SUCCESS reply is a body-less [`FrameType::Ok`]; a malformed/over-long group is an
+    /// [`FrameType::Err`]. A NEW append-only tag a non-transactional client never sends; tags 1-48 are
+    /// byte-for-byte unchanged. Body: a [`crate::message::TxnListenBody`] (`body_version: u8`,
+    /// `field_len: u16` over a `group` u16-length name).
+    TxnListen,
 }
 
 impl FrameType {
@@ -504,6 +544,9 @@ impl FrameType {
             FrameType::TxnPrepare => 44,
             FrameType::TxnCommit => 45,
             FrameType::TxnRollback => 46,
+            FrameType::TxnCheck => 47,
+            FrameType::TxnCheckResult => 48,
+            FrameType::TxnListen => 49,
         }
     }
 
@@ -558,6 +601,9 @@ impl FrameType {
             44 => FrameType::TxnPrepare,
             45 => FrameType::TxnCommit,
             46 => FrameType::TxnRollback,
+            47 => FrameType::TxnCheck,
+            48 => FrameType::TxnCheckResult,
+            49 => FrameType::TxnListen,
             _ => return None,
         })
     }
@@ -801,6 +847,9 @@ mod tests {
         assert_eq!(FrameType::TxnPrepare.as_u8(), 44);
         assert_eq!(FrameType::TxnCommit.as_u8(), 45);
         assert_eq!(FrameType::TxnRollback.as_u8(), 46);
+        assert_eq!(FrameType::TxnCheck.as_u8(), 47);
+        assert_eq!(FrameType::TxnCheckResult.as_u8(), 48);
+        assert_eq!(FrameType::TxnListen.as_u8(), 49);
     }
 
     #[test]
@@ -820,8 +869,9 @@ mod tests {
         // cross-cluster MirrorPull (#623, V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through
         // (#625, V2-C7-I3); 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read
         // dirty-tier CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs
-        // TxnPrepare/TxnCommit/TxnRollback (#640, V2-M8); 47 is now the next-free (still unknown) tag,
-        // so it frames but is not known.
+        // TxnPrepare/TxnCommit/TxnRollback (#640, V2-M8); 47-49 are the back-check verbs
+        // TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is now the next-free (still unknown) tag, so it
+        // frames but is not known.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -835,7 +885,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
         assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
         assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
-        assert_eq!(FrameType::from_u8(47), None);
+        assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
+        assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
+        assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
+        assert_eq!(FrameType::from_u8(50), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -879,8 +932,9 @@ mod tests {
         // divergence-query (#599); 39 is the cluster SegmentFingerprints divergence-advertisement
         // (#611); 40 is the cross-cluster MirrorPull (#623); 41 is the edge leaf-spoke LeafPush (#625);
         // 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read dirty-tier
-        // CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs (#640); 47 is
-        // the next-free (still unknown) tag.
+        // CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs (#640); 47-48
+        // are the back-check verbs TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is the
+        // next-free (still unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -894,7 +948,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
         assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
         assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
-        assert_eq!(FrameType::from_u8(47), None);
+        assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
+        assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
+        assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
+        assert_eq!(FrameType::from_u8(50), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -941,18 +998,51 @@ mod tests {
         // TxnRollback (46) take the next FREE tags after the follower-read CommittedHwQuery confirm
         // (43). Pinned here so a future reorder breaks a test, not a deployed protocol. They are
         // ADDITIVE: tags 1-43 are byte-for-byte unchanged, and a non-transactional client never sends
-        // them; 47 is the next-free (still unknown) tag.
+        // them; 47-49 are the back-check verbs (#640 part 2), 50 is the next-free (still unknown) tag.
         assert_eq!(FrameType::TxnPrepare.as_u8(), 44);
         assert_eq!(FrameType::TxnCommit.as_u8(), 45);
         assert_eq!(FrameType::TxnRollback.as_u8(), 46);
         assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
         assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
         assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
-        assert_eq!(FrameType::from_u8(47), None);
+        assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
         for ty in [
             FrameType::TxnPrepare,
             FrameType::TxnCommit,
             FrameType::TxnRollback,
+        ] {
+            let mut buf = Vec::new();
+            encode_frame(ty, b"\x01\x02", &mut buf).unwrap();
+            match decode_frame(&buf).unwrap() {
+                FrameDecode::Frame { type_tag, body, .. } => {
+                    assert_eq!(FrameType::from_u8(type_tag), Some(ty));
+                    assert_eq!(body, b"\x01\x02");
+                }
+                FrameDecode::Incomplete { .. } => panic!("complete"),
+            }
+        }
+    }
+
+    #[test]
+    fn txn_back_check_tags_are_the_next_free_tags_after_txn_rollback() {
+        // #640 part 2 (V2-M8): the broker back-check verbs TxnCheck (47, broker→producer),
+        // TxnCheckResult (48, producer→broker), and TxnListen (49, the producer's listener-group
+        // registration) take the next FREE tags after the part-1 transactional half-message verbs
+        // (44-46). Pinned here so a future reorder breaks a test, not a deployed protocol. They are
+        // ADDITIVE: tags 1-46 are byte-for-byte unchanged, and a client that never registers a
+        // transaction-state listener never sees or sends them; 50 is the next-free (still unknown) tag,
+        // so it frames but is not a known type.
+        assert_eq!(FrameType::TxnCheck.as_u8(), 47);
+        assert_eq!(FrameType::TxnCheckResult.as_u8(), 48);
+        assert_eq!(FrameType::TxnListen.as_u8(), 49);
+        assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
+        assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
+        assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
+        assert_eq!(FrameType::from_u8(50), None);
+        for ty in [
+            FrameType::TxnCheck,
+            FrameType::TxnCheckResult,
+            FrameType::TxnListen,
         ] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x01\x02", &mut buf).unwrap();
@@ -1021,7 +1111,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
         assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
         assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
-        assert_eq!(FrameType::from_u8(47), None);
+        assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
+        assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
+        assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
+        assert_eq!(FrameType::from_u8(50), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -1067,7 +1160,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(44), Some(FrameType::TxnPrepare));
         assert_eq!(FrameType::from_u8(45), Some(FrameType::TxnCommit));
         assert_eq!(FrameType::from_u8(46), Some(FrameType::TxnRollback));
-        assert_eq!(FrameType::from_u8(47), None);
+        assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
+        assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
+        assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
+        assert_eq!(FrameType::from_u8(50), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -1262,7 +1358,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 47u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 50u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

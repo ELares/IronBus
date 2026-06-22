@@ -29,13 +29,14 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
     decode_not_leader, decode_produce_confirm, decode_pub_ack, decode_stream_info_response,
-    decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub,
-    encode_pub_to, encode_stream_commit, encode_stream_declare, encode_stream_fetch,
-    encode_stream_info, encode_sub, encode_sub_to, encode_txn_prepare, encode_txn_resolve,
-    produce_confirm_status, AckBody, AckLevel, AckOp, BodyError, ConnectBody, ConsumeTier,
-    CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody, StreamCommitBody,
-    StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody, TxnPrepareBody,
-    TxnResolveBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    decode_truncated, decode_txn_resolve, encode_ack, encode_connect, encode_cumulative_ack,
+    encode_fetch, encode_pub, encode_pub_to, encode_stream_commit, encode_stream_declare,
+    encode_stream_fetch, encode_stream_info, encode_sub, encode_sub_to, encode_txn_check_result,
+    encode_txn_listen, encode_txn_prepare, encode_txn_resolve, produce_confirm_status, AckBody,
+    AckLevel, AckOp, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody,
+    FetchBody, PubBody, PubToBody, StreamCommitBody, StreamDeclareBody, StreamFetchBody,
+    StreamInfoBody, SubBody, SubToBody, TxnCheckDecision, TxnCheckResultBody, TxnListenBody,
+    TxnPrepareBody, TxnResolveBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -58,6 +59,11 @@ pub enum ClientError {
     UnknownFrameType(u8),
     /// The response had the expected type but a malformed shape for the request.
     BadResponse(&'static str),
+    /// The producer's LOCAL transaction failed inside [`Client::transact`] (#640 part 2): the half
+    /// message was ROLLED BACK (discarded, never delivered) and the local transaction's error message is
+    /// carried here. The broker side is consistent (the half message is gone); this surfaces the local
+    /// failure to the caller after the clean rollback.
+    LocalTransaction(String),
     /// The connection closed before a complete response arrived.
     Closed,
     /// The server REDIRECTED a produce: the node this client is connected to holds a clustered replica
@@ -117,6 +123,12 @@ impl core::fmt::Display for ClientError {
                 write!(f, "unknown response frame type tag {tag}")
             }
             ClientError::BadResponse(why) => write!(f, "malformed response: {why}"),
+            ClientError::LocalTransaction(m) => {
+                write!(
+                    f,
+                    "local transaction failed (half message rolled back): {m}"
+                )
+            }
             ClientError::Closed => write!(f, "connection closed mid-response"),
             ClientError::Decompress { source, offset, .. } => {
                 write!(
@@ -750,6 +762,36 @@ impl TxnId {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+/// A producer's transaction-state listener's answer to a broker back-check (#640 part 2): the
+/// resolution the broker should apply to an in-doubt half message. Returned by the `check_transaction`
+/// callback a producer passes to [`Client::transact`] / [`Client::register_transaction_listener`]. The
+/// client-facing mirror of the wire [`TxnCheckDecision`] (the proto type), so a caller never depends on
+/// the proto crate directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxnDecision {
+    /// The producer's local transaction COMMITTED: the broker should commit the half message (it
+    /// becomes visible), exactly once, via the part-1 path.
+    Commit,
+    /// The producer's local transaction ROLLED BACK (or never committed): the broker should discard the
+    /// half message (never delivered).
+    Rollback,
+    /// The producer CANNOT decide yet (its local state is still in-doubt): the broker reschedules a
+    /// later back-check and, after the bounded attempt cap, applies the SAFE terminal default
+    /// (rollback/discard).
+    Unknown,
+}
+
+impl TxnDecision {
+    /// Maps to the wire [`TxnCheckDecision`].
+    fn to_wire(self) -> TxnCheckDecision {
+        match self {
+            TxnDecision::Commit => TxnCheckDecision::Commit,
+            TxnDecision::Rollback => TxnCheckDecision::Rollback,
+            TxnDecision::Unknown => TxnCheckDecision::Unknown,
+        }
     }
 }
 
@@ -2597,6 +2639,148 @@ impl Client {
         TxnId(format!("{seed}#{seq}").into_bytes())
     }
 
+    /// Registers this connection as the transaction-state LISTENER for the stable `group` (#640
+    /// part 2, the `TxnListen` verb): the broker binds the group to this connection so a back-check
+    /// [`crate::FrameType::TxnCheck`] for an in-doubt half message this producer prepared (under this
+    /// group) is routed here — even after a CRASH and reconnect (the producer reconnects and calls this
+    /// again with the SAME group to re-point the route). After registering, the producer prepares its
+    /// transactions on this connection (their half messages record the group as owner) and drives the
+    /// back-check by calling [`Client::transact`] (or [`Client::run_transaction_listener`]) so an
+    /// inbound `TxnCheck` is answered. A stable, producer-chosen group (e.g. the producer's durable id)
+    /// is what makes the route survive a reconnect; an EMPTY group is rejected by the broker.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the broker rejects the registration (an empty group, or the
+    /// `publish` scope is missing), [`ClientError::Body`] on an over-large group, or a frame/connection
+    /// error.
+    pub fn register_transaction_listener(&mut self, group: &[u8]) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_txn_listen(&TxnListenBody { group }, &mut body).map_err(ClientError::Body)?;
+        self.send(FrameType::TxnListen, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Answers one inbound `TxnCheck` (#640 part 2): decode the txn id, run the producer's
+    /// `check_transaction` callback to decide the resolution, and reply a `TxnCheckResult`. The broker
+    /// then resolves the in-doubt half message through the part-1 idempotent path (a `Commit` commits it
+    /// exactly once, a `Rollback` discards it, an `Unknown` reschedules). Used by the listener loop.
+    fn answer_txn_check<L: FnMut(&[u8]) -> TxnDecision>(
+        &mut self,
+        check_body: &[u8],
+        listener: &mut L,
+    ) -> Result<(), ClientError> {
+        let decoded = decode_txn_resolve(check_body)
+            .map_err(|_| ClientError::BadResponse("malformed txn-check body"))?;
+        let decision = listener(decoded.txn_id).to_wire();
+        let mut body = Vec::new();
+        encode_txn_check_result(
+            &TxnCheckResultBody {
+                txn_id: decoded.txn_id,
+                decision,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::TxnCheckResult, &body)?;
+        Ok(())
+    }
+
+    /// Runs the producer's transaction-state listener for up to `timeout` (#640 part 2): it DRIVES
+    /// broker passes by interleaving lightweight `Ping`s (exactly like [`Client::produce_confirmed`]),
+    /// and for every inbound `TxnCheck` it runs `check_transaction(txn_id)` and replies the answer — so
+    /// the broker's back-check resolves this producer's in-doubt half messages (e.g. ones it prepared
+    /// before a crash, now recovered after this reconnect). Returns the number of `TxnCheck`s answered.
+    ///
+    /// A producer that crashed mid-transaction reconnects, calls
+    /// [`Client::register_transaction_listener`] with its stable group, then calls this to settle any
+    /// in-doubt transactions. The callback should consult the producer's OWN durable local-transaction
+    /// state for `txn_id` and return [`TxnDecision::Commit`] / [`TxnDecision::Rollback`], or
+    /// [`TxnDecision::Unknown`] if it cannot yet decide (the broker retries, then safely rolls back).
+    ///
+    /// # Errors
+    /// A frame/connection error, or [`ClientError::Server`] if a `Ping` is answered with an `Err`.
+    pub fn run_transaction_listener<L: FnMut(&[u8]) -> TxnDecision>(
+        &mut self,
+        mut check_transaction: L,
+        timeout: Duration,
+    ) -> Result<usize, ClientError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut answered = 0;
+        loop {
+            // Drive a broker pass: a Ping makes the connection do a `process` pass, which runs the
+            // back-check scan and flushes any TxnChecks routed to this connection alongside the Pong.
+            self.send(FrameType::Ping, &[])?;
+            loop {
+                match self.read_frame_or_timeout()? {
+                    Some((FrameType::TxnCheck, body)) => {
+                        self.answer_txn_check(&body, &mut check_transaction)?;
+                        answered += 1;
+                    }
+                    // Round-ending cases (stop reading, re-check the deadline, re-Ping): a read timeout
+                    // with no frame, or the Pong flush boundary (every routed check precedes or
+                    // accompanies it in the same flush).
+                    None | Some((FrameType::Pong, _)) => break,
+                    Some((FrameType::Err, body)) => {
+                        return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+                    }
+                    // A stray frame (e.g. an Ok reply to a TxnCheckResult, or another frame on a mixed
+                    // connection) is not what this loop is for: ignore it and keep draining the round.
+                    Some(_) => {}
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(answered);
+            }
+        }
+    }
+
+    /// Runs a full local transaction with the broker 2PC (#640 part 2): PREPARE a half message,
+    /// run `local_txn_fn`, then COMMIT if it succeeded or ROLLBACK if it failed (or panicked-as-`Err`).
+    /// This is the ergonomic transactional path: the half message is invisible until the local
+    /// transaction commits, and if this producer CRASHES between prepare and resolve, the broker's
+    /// back-check later asks this producer's registered listener
+    /// ([`Client::register_transaction_listener`] + [`Client::run_transaction_listener`]) to settle the
+    /// in-doubt transaction — so no half message is ever stuck, lost, or double-delivered.
+    ///
+    /// `txn` is the producer-supplied STABLE transaction id (use a UUID / snowflake / content hash so
+    /// it survives a reconnect — the listener answers a back-check by THIS id). `local_txn_fn` runs the
+    /// producer's own local transaction and returns `Ok(())` to commit or `Err(_)` to roll back; its
+    /// error is propagated after the rollback. Returns the committed offset on a commit.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::LocalTransaction`] (wrapping the `local_txn_fn` error) after a successful
+    /// rollback, [`ClientError::Server`] / a frame error from the prepare/commit/rollback, or
+    /// [`ClientError::Body`] on an over-large field.
+    pub fn transact<T: FnOnce() -> Result<(), E>, E: std::fmt::Display>(
+        &mut self,
+        txn: &TxnId,
+        stream: &str,
+        message: &PubBody<'_>,
+        local_txn_fn: T,
+    ) -> Result<u64, ClientError> {
+        // PREPARE the half message (durable, invisible) under the stable id.
+        self.prepare_with_id(txn, stream, message)?;
+        // Run the producer's local transaction.
+        match local_txn_fn() {
+            Ok(()) => {
+                // The local transaction committed: make the half message visible (exactly once).
+                self.commit(txn)
+            }
+            Err(e) => {
+                // The local transaction failed: discard the half message. Propagate the original error
+                // after the rollback (a rollback failure supersedes it — the connection is in trouble).
+                self.rollback(txn)?;
+                Err(ClientError::LocalTransaction(e.to_string()))
+            }
+        }
+    }
+
     /// Subscribes this connection's consume path to a NAMED stream's work-group (#588, M2-I10): the
     /// `SubTo` verb, the stream-addressed twin of [`Client::subscribe`]. Subsequent [`Client::fetch`] /
     /// [`Client::flow`] and [`Client::ack`] consume from and commit to THAT stream's own competing
@@ -3241,6 +3425,79 @@ mod tests {
             },
         )
         .unwrap();
+        spawn_serving(engine)
+    }
+
+    /// Like [`start_server_with`] but configures a SHORT back-check schedule (#640 part 2) so an
+    /// over-the-wire test can drive the broker back-check WITHOUT waiting out the production 30 s
+    /// timeout: a 0-nanosecond timeout (a Prepared half is immediately eligible) and a 1-attempt cap (the
+    /// terminal default fires on the first attempt), with a roomy default credit. The server runs on the
+    /// real `SystemClock`, so the schedule is driven by the producer's own listener-loop passes.
+    fn start_server_with_back_check(
+        timeout: u64,
+        max_attempts: u32,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let mut engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
+                compression: ironbus_core::compress::Codec::None,
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
+            },
+        )
+        .unwrap();
+        engine.set_back_check_config(ironbus_core::txn::BackCheckConfig {
+            timeout,
+            retry: 1, // floored to 1; with a real clock every scan pass is past the 1 ns retry
+            max_attempts,
+            batch: 256,
+        });
+        spawn_serving(engine)
+    }
+
+    /// Spawns the append actor over `engine` and the wire serve loop on a fresh ephemeral port,
+    /// returning the bound address, the shutdown flag, and the serve thread handle (shared by the
+    /// `start_server_*` helpers).
+    fn spawn_serving(
+        engine: Engine<InMemoryFs, SystemClock>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
         // The engine is owned by the append actor (#177); the wire server reaches it through the
         // handle. The actor join handle is detached (these client tests drive the broker only over the
         // wire and never inspect the engine): when the server thread drops its handle on stop, the
@@ -6930,6 +7187,133 @@ mod tests {
         let mut consumer = Client::connect(addr).unwrap();
         assert_eq!(consumer.fetch(10).unwrap().messages.len(), 1);
         drop(producer);
+        drop(consumer);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn transact_commits_a_successful_local_transaction_and_rolls_back_a_failed_one() {
+        // #640 part 2: the `transact` runner — a successful local transaction commits the half message
+        // (visible), a failed one rolls it back (never delivered, the local error surfaced).
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect(addr).unwrap();
+        // A successful local transaction: commit -> visible.
+        let ok_txn = TxnId::new(b"txn-ok".to_vec());
+        let off = producer
+            .transact(&ok_txn, "", &txn_pub(b"committed"), || Ok::<(), String>(()))
+            .unwrap();
+        assert_eq!(off, 0);
+        // A failed local transaction: rollback -> never delivered, the error surfaces.
+        let bad_txn = TxnId::new(b"txn-bad".to_vec());
+        let err = producer
+            .transact(&bad_txn, "", &txn_pub(b"discarded"), || {
+                Err::<(), String>("local failure".to_string())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::LocalTransaction(m) if m.contains("local failure")),
+            "a failed local transaction rolls back and surfaces the error"
+        );
+        // Only the committed record is visible.
+        let mut consumer = Client::connect(addr).unwrap();
+        let messages = consumer.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 1, "only the committed half is delivered");
+        assert_eq!(messages[0].payload, b"committed");
+        drop(producer);
+        drop(consumer);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_headline_back_check_resolves_a_crashed_producers_half_over_the_wire() {
+        // THE HEADLINE over the REAL wire: producer A registers a listener (group "svc"), prepares a half
+        // message with a STABLE id, then DISCONNECTS before resolving (a crash). Producer B reconnects,
+        // re-registers the SAME group, and runs its transaction-state listener; the broker's back-check
+        // routes a TxnCheck to it, the listener answers Commit, and the half message is committed exactly
+        // once — a consumer then sees it. A 0-timeout back-check makes the half immediately eligible so
+        // the test does not wait out the production window.
+        let (addr, shutdown, handle) = start_server_with_back_check(0, 5);
+        let txn_id = b"order-stable-uuid".to_vec();
+        // Producer A: register the listener, prepare, then "crash" (drop the connection without
+        // resolving).
+        {
+            let mut a = Client::connect(addr).unwrap();
+            a.register_transaction_listener(b"svc").unwrap();
+            a.prepare_with_id(&TxnId::new(txn_id.clone()), "", &txn_pub(b"order-42"))
+                .unwrap();
+            // CRASH: drop A without commit/rollback. Its half message is now in-doubt.
+        }
+        // Producer B: the SAME producer reconnecting. Re-register the SAME group, then run the listener
+        // loop, which answers the broker's back-check for the in-doubt txn with Commit.
+        let mut b = Client::connect(addr).unwrap();
+        b.register_transaction_listener(b"svc").unwrap();
+        let answered = b
+            .run_transaction_listener(
+                |id| {
+                    // The producer's durable local state says this transaction committed.
+                    if id == txn_id.as_slice() {
+                        TxnDecision::Commit
+                    } else {
+                        TxnDecision::Unknown
+                    }
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(answered >= 1, "the back-check was answered at least once");
+        // The half message is now committed exactly once: a consumer sees it.
+        let mut consumer = Client::connect(addr).unwrap();
+        let mut delivered = Vec::new();
+        for _ in 0..20 {
+            let messages = consumer.fetch(10).unwrap().messages;
+            for m in messages {
+                delivered.push(m.payload.clone());
+                consumer.ack(m.offset, m.generation).unwrap();
+            }
+            if !delivered.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            delivered,
+            vec![b"order-42".to_vec()],
+            "the crashed producer's half is committed exactly once by the back-check"
+        );
+        drop(b);
+        drop(consumer);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_back_check_rollback_answer_never_delivers_over_the_wire() {
+        // The sibling of the headline: the reconnected listener answers Rollback -> the in-doubt half is
+        // discarded and never delivered.
+        let (addr, shutdown, handle) = start_server_with_back_check(0, 5);
+        let txn_id = b"abort-stable-uuid".to_vec();
+        {
+            let mut a = Client::connect(addr).unwrap();
+            a.register_transaction_listener(b"svc").unwrap();
+            a.prepare_with_id(&TxnId::new(txn_id.clone()), "", &txn_pub(b"secret"))
+                .unwrap();
+        }
+        let mut b = Client::connect(addr).unwrap();
+        b.register_transaction_listener(b"svc").unwrap();
+        b.run_transaction_listener(|_id| TxnDecision::Rollback, Duration::from_secs(5))
+            .unwrap();
+        // The half is discarded: a consumer sees nothing even after a few fetch attempts.
+        let mut consumer = Client::connect(addr).unwrap();
+        for _ in 0..10 {
+            assert!(
+                consumer.fetch(10).unwrap().messages.is_empty(),
+                "a rolled-back half is never delivered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(b);
         drop(consumer);
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();

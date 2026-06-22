@@ -2574,6 +2574,177 @@ pub fn decode_txn_resolve(body: &[u8]) -> Result<TxnResolveBody<'_>, BodyError> 
     Ok(TxnResolveBody { txn_id })
 }
 
+/// The producer's answer to a broker `TxnCheck` back-check (#640 part 2): the in-doubt transaction's
+/// resolution, as decided by the producer's registered transaction-state listener. The `TxnCheck`
+/// frame itself (broker→producer) reuses the [`TxnResolveBody`] shape (just the `txn_id`), so it has
+/// no dedicated body type — only the RESULT carries the extra `decision` byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxnCheckDecision {
+    /// The producer's local transaction COMMITTED: the broker should commit the half message (it
+    /// becomes visible), via the SAME idempotent commit path as a producer-driven `TxnCommit`. Wire
+    /// byte `0`.
+    Commit,
+    /// The producer's local transaction ROLLED BACK (or never committed): the broker should roll back
+    /// the half message (discarded, never delivered), via the SAME idempotent rollback path. Wire byte
+    /// `1`.
+    Rollback,
+    /// The producer CANNOT decide yet (its local transaction state is still in-doubt, e.g. its own
+    /// downstream commit has not resolved): the broker schedules a later back-check retry, and after a
+    /// bounded number of attempts applies the SAFE TERMINAL default (rollback/discard). Wire byte `2`.
+    Unknown,
+}
+
+impl TxnCheckDecision {
+    /// The raw wire byte this decision encodes to (`0` = Commit, `1` = Rollback, `2` = Unknown).
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            TxnCheckDecision::Commit => 0,
+            TxnCheckDecision::Rollback => 1,
+            TxnCheckDecision::Unknown => 2,
+        }
+    }
+
+    /// Folds a raw wire byte into a [`TxnCheckDecision`]: `0` = Commit, `1` = Rollback, and EVERYTHING
+    /// else — `2` (the explicit Unknown encoding) and any reserved future value — folds to the SAFE
+    /// `Unknown` (the broker then retries and eventually applies the terminal default), so the field
+    /// can grow without a wire break and an unrecognized decision never forces a commit/rollback the
+    /// producer did not intend.
+    #[must_use]
+    pub fn from_u8(raw: u8) -> TxnCheckDecision {
+        match raw {
+            0 => TxnCheckDecision::Commit,
+            1 => TxnCheckDecision::Rollback,
+            _ => TxnCheckDecision::Unknown,
+        }
+    }
+}
+
+/// A producer's TRANSACTIONAL BACK-CHECK RESULT (the `TxnCheckResult` frame body, tag 48, #640 part 2):
+/// it names the `txn_id` the broker back-checked and the listener's [`TxnCheckDecision`]. The broker
+/// resolves the in-doubt half message accordingly (a `Commit`/`Rollback` reuses the part-1 idempotent
+/// path; an `Unknown` reschedules), so a producer that crashed between prepare and resolve, then
+/// reconnected and re-registered its listener, settles the transaction exactly once.
+///
+/// Layout (version+length framed, forward-compatible): `body_version: u8`
+/// ([`STREAM_WIRE_BODY_VERSION`]), `field_len: u16` (the length of the v1 block), then the v1 block:
+/// `txn_id: u16-len + bytes`, `decision: u8`. Bytes past `field_len` (a future version's appended
+/// fields) are TOLERATED and ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxnCheckResultBody<'a> {
+    /// The transaction id the back-check named (capped at [`MAX_TXN_ID_LEN`]).
+    pub txn_id: &'a [u8],
+    /// The listener's decision for this transaction.
+    pub decision: TxnCheckDecision,
+}
+
+/// Encodes a `TxnCheckResult` body onto the end of `out` (#640 part 2): the version byte, the
+/// field-block length over the `txn_id` + the `decision` byte, then the `txn_id` and the decision.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the txn id (or its framed block) exceeds the `u16` wire
+/// limit.
+pub fn encode_txn_check_result(
+    req: &TxnCheckResultBody<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.txn_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    // The block is the u16-len-prefixed txn id (2 + txn_id) plus the 1-byte decision.
+    let field_len =
+        u16::try_from(2 + req.txn_id.len() + 1).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.txn_id);
+    out.push(req.decision.as_u8());
+    Ok(())
+}
+
+/// Decodes a `TxnCheckResult` body (#640 part 2) into its `txn_id` + `decision`, cap-before-alloc and
+/// panic-free. A body too short for its declared block, or a txn id over [`MAX_TXN_ID_LEN`], is a typed
+/// [`BodyError`] (fail-closed). An unrecognized decision byte folds to the SAFE
+/// [`TxnCheckDecision::Unknown`] (never a forced commit). An EMPTY body is NOT valid
+/// ([`BodyError::Truncated`]).
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_txn_check_result(body: &[u8]) -> Result<TxnCheckResultBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let txn_id = read_txn_id(&mut fr)?;
+    let decision = TxnCheckDecision::from_u8(fr.u8()?);
+    Ok(TxnCheckResultBody { txn_id, decision })
+}
+
+/// The hard cap on a transaction-listener GROUP byte length the proto codecs enforce at the wire
+/// boundary (#640 part 2): the group is a producer-chosen stable routing key (e.g. its durable
+/// producer id), so this fails a hostile/oversized group closed at decode time BEFORE it crosses into
+/// the server. Sized identically to [`MAX_TXN_ID_LEN`] (256), generous for any real producer identity.
+pub const MAX_TXN_LISTEN_GROUP_LEN: usize = MAX_TXN_ID_LEN;
+
+/// A producer's TRANSACTION-LISTENER REGISTRATION (the `TxnListen` frame body, tag 49, #640 part 2):
+/// the stable listener GROUP this connection's transaction-state listener answers for. The broker binds
+/// the group to this connection so a [`crate::frame::FrameType::TxnCheck`] for an in-doubt half message
+/// owned by the group is routed to this connection — even after the original preparing connection
+/// crashed and a NEW connection re-registered the same group (the crash-and-reconnect route).
+///
+/// Layout (version+length framed, forward-compatible): `body_version: u8`
+/// ([`STREAM_WIRE_BODY_VERSION`]), `field_len: u16` (the length of the v1 block), then the v1 block:
+/// `group: u16-len + bytes`. Bytes past `field_len` (a future version's appended fields) are TOLERATED
+/// and ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxnListenBody<'a> {
+    /// The stable listener group to bind to this connection (capped at [`MAX_TXN_LISTEN_GROUP_LEN`]).
+    pub group: &'a [u8],
+}
+
+/// Encodes a `TxnListen` body onto the end of `out` (#640 part 2): the version byte, the field-block
+/// length over the `group`, then the `group`.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the group exceeds the `u16` wire limit.
+pub fn encode_txn_listen(req: &TxnListenBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&group_len.to_le_bytes());
+    out.extend_from_slice(req.group);
+    Ok(())
+}
+
+/// Decodes a `TxnListen` body (#640 part 2) into its `group`, cap-before-alloc and panic-free. A body
+/// too short for its declared block, or a group over [`MAX_TXN_LISTEN_GROUP_LEN`], is a typed
+/// [`BodyError`] (fail-closed). An EMPTY body is NOT valid ([`BodyError::Truncated`]); an empty GROUP
+/// inside a well-formed body IS valid (the broker rejects an empty group at the verb boundary).
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap group, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_txn_listen(body: &[u8]) -> Result<TxnListenBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let group_len = fr.u16()? as usize;
+    if group_len > MAX_TXN_LISTEN_GROUP_LEN {
+        return Err(BodyError::BadLength);
+    }
+    let group = fr.take(group_len)?;
+    Ok(TxnListenBody { group })
+}
+
 // ===================================================================================
 // SUBJECT-ADDRESSED WIRE BODIES (#585, V2-M2-I9): the subject->stream binding + subject-addressed
 // pub/sub verbs that complete the SUBJECTS story — BindSubject (tag 34), PubSubject (tag 35), SubSubject
@@ -4978,6 +5149,148 @@ mod tests {
             buf, expected,
             "the v1 TxnResolve body wire format is frozen"
         );
+    }
+
+    #[test]
+    fn txn_check_result_round_trips_id_and_every_decision() {
+        // #640 part 2: TxnCheckResult carries the txn id + the listener's decision, round-tripping for
+        // every decision variant.
+        for decision in [
+            TxnCheckDecision::Commit,
+            TxnCheckDecision::Rollback,
+            TxnCheckDecision::Unknown,
+        ] {
+            for txn in [b"tx-1".as_slice(), b"a-very-distinct-uuid-1234"] {
+                let mut buf = Vec::new();
+                encode_txn_check_result(
+                    &TxnCheckResultBody {
+                        txn_id: txn,
+                        decision,
+                    },
+                    &mut buf,
+                )
+                .unwrap();
+                assert_eq!(buf[0], STREAM_WIRE_BODY_VERSION);
+                let decoded = decode_txn_check_result(&buf).unwrap();
+                assert_eq!(decoded.txn_id, txn);
+                assert_eq!(decoded.decision, decision);
+            }
+        }
+    }
+
+    #[test]
+    fn txn_check_result_decision_byte_is_safe_under_an_unknown_value() {
+        // An empty body is truncated (no version byte).
+        assert_eq!(decode_txn_check_result(&[]), Err(BodyError::Truncated));
+        // A wrong body version fails closed.
+        let mut buf = Vec::new();
+        encode_txn_check_result(
+            &TxnCheckResultBody {
+                txn_id: b"t",
+                decision: TxnCheckDecision::Commit,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        buf[0] = STREAM_WIRE_BODY_VERSION + 1;
+        assert!(matches!(
+            decode_txn_check_result(&buf),
+            Err(BodyError::BadHandshakeVersion { .. })
+        ));
+        // A RESERVED future decision byte folds to the SAFE Unknown (never a forced commit): mutate the
+        // last byte (the decision) of a fresh Commit body to 0x09 and decode.
+        let mut buf2 = Vec::new();
+        encode_txn_check_result(
+            &TxnCheckResultBody {
+                txn_id: b"t",
+                decision: TxnCheckDecision::Commit,
+            },
+            &mut buf2,
+        )
+        .unwrap();
+        let last = buf2.len() - 1;
+        buf2[last] = 0x09; // an unrecognized future decision
+        assert_eq!(
+            decode_txn_check_result(&buf2).unwrap().decision,
+            TxnCheckDecision::Unknown,
+            "an unknown decision byte folds to the safe Unknown, never a forced commit"
+        );
+    }
+
+    #[test]
+    fn the_txn_check_result_body_is_byte_frozen() {
+        // #640 part 2: pin the EXACT bytes a v1 TxnCheckResult body produces, so an accidental
+        // wire-format drift breaks a test here, not a deployed back-check. Layout: version,
+        // field_len(u16 LE over the block), txn_id(u16-len + bytes), decision(u8).
+        let mut buf = Vec::new();
+        encode_txn_check_result(
+            &TxnCheckResultBody {
+                txn_id: b"tx",
+                decision: TxnCheckDecision::Rollback,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.push(1); // STREAM_WIRE_BODY_VERSION
+                          // field_len = 2 (id-len field) + 2 (id bytes) + 1 (decision) = 5.
+        expected.extend_from_slice(&5u16.to_le_bytes());
+        expected.extend_from_slice(&2u16.to_le_bytes()); // txn_id len
+        expected.extend_from_slice(b"tx");
+        expected.push(1); // decision = Rollback
+        assert_eq!(
+            buf, expected,
+            "the v1 TxnCheckResult body wire format is frozen"
+        );
+    }
+
+    #[test]
+    fn txn_listen_round_trips_the_group() {
+        // #640 part 2: TxnListen carries the listener group, round-tripping (including an empty group,
+        // which the codec accepts and the verb boundary rejects).
+        for group in [b"".as_slice(), b"prod-payments-svc", b"a-uuid-1234"] {
+            let mut buf = Vec::new();
+            encode_txn_listen(&TxnListenBody { group }, &mut buf).unwrap();
+            assert_eq!(buf[0], STREAM_WIRE_BODY_VERSION);
+            assert_eq!(decode_txn_listen(&buf).unwrap().group, group);
+        }
+    }
+
+    #[test]
+    fn txn_listen_rejects_malformed_and_oversized_input() {
+        // An empty body is truncated (no version byte).
+        assert_eq!(decode_txn_listen(&[]), Err(BodyError::Truncated));
+        // A wrong body version fails closed.
+        let mut buf = Vec::new();
+        encode_txn_listen(&TxnListenBody { group: b"g" }, &mut buf).unwrap();
+        buf[0] = STREAM_WIRE_BODY_VERSION + 1;
+        assert!(matches!(
+            decode_txn_listen(&buf),
+            Err(BodyError::BadHandshakeVersion { .. })
+        ));
+        // An over-cap group is rejected by the inner cap check (cap-before-alloc).
+        let over = u16::try_from(MAX_TXN_LISTEN_GROUP_LEN + 1).unwrap();
+        let mut bad = Vec::new();
+        bad.push(STREAM_WIRE_BODY_VERSION);
+        let field_len = 2u16 + over;
+        bad.extend_from_slice(&field_len.to_le_bytes());
+        bad.extend_from_slice(&over.to_le_bytes());
+        bad.extend_from_slice(&vec![0u8; over as usize]);
+        assert_eq!(decode_txn_listen(&bad), Err(BodyError::BadLength));
+    }
+
+    #[test]
+    fn the_txn_listen_body_is_byte_frozen() {
+        // #640 part 2: pin the EXACT bytes a v1 TxnListen body produces. Layout: version,
+        // field_len(u16 LE), group(u16-len + bytes).
+        let mut buf = Vec::new();
+        encode_txn_listen(&TxnListenBody { group: b"svc" }, &mut buf).unwrap();
+        let mut expected = Vec::new();
+        expected.push(1); // STREAM_WIRE_BODY_VERSION
+        expected.extend_from_slice(&5u16.to_le_bytes()); // field_len = 2 (len field) + 3 (group bytes)
+        expected.extend_from_slice(&3u16.to_le_bytes()); // group len
+        expected.extend_from_slice(b"svc");
+        assert_eq!(buf, expected, "the v1 TxnListen body wire format is frozen");
     }
 
     #[test]

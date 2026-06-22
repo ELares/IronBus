@@ -562,6 +562,267 @@ impl TxnTable {
     }
 }
 
+// ===================================================================================
+// THE BACK-CHECK BOOK (V2-M8, #640 part 2): the PURE, IO-free per-Prepared-txn back-check
+// schedule + attempt count. When a producer prepares a half message then CRASHES before
+// commit/rollback, the half message is stuck Prepared (invisible, undelivered) forever. The
+// broker's back-check resolves it: it periodically asks the producer "what is the state of txn X?"
+// and resolves on the answer; after a bounded number of unanswered attempts it applies the SAFE
+// TERMINAL default (rollback/discard — never deliver a message whose outcome is unknowable).
+//
+// THIS structure owns only the SCHEDULING bookkeeping (per-txn attempt count + next-eligible
+// instant) and the pure DECISIONS over it (which txns are due, when to give up). It reads NO clock
+// (the caller injects every `now`), holds NO payload, and does NO IO; the durable persistence of the
+// bookkeeping (so the schedule + count survive a broker restart) lives in `ironbus-storage`, and the
+// actual TxnCheck push + resolution live in `ironbus-server`. It is EMPTY until a txn is enrolled, so
+// a non-transactional broker pays nothing.
+// ===================================================================================
+
+/// The default back-check TIMEOUT: a Prepared half message unresolved for at least this long
+/// (monotonic) is eligible for its FIRST back-check (#640 part 2). The broker enrolls a fresh prepare
+/// with a first-eligible instant of `prepared_at + back_check_timeout`, so a normal commit/rollback
+/// that lands inside the window is never back-checked at all. Thirty seconds is comfortably above a
+/// real local-transaction latency yet finite, so a genuinely crashed producer's half message is
+/// resolved promptly. Expressed in the same monotonic unit the lifecycle's `now` uses.
+pub const DEFAULT_BACK_CHECK_TIMEOUT_NANOS: u64 = 30 * 1_000_000_000;
+
+/// The default delay between successive back-check ATTEMPTS for one txn (#640 part 2): after an
+/// attempt that does not resolve (the producer is unreachable, or answered `Unknown`), the txn's
+/// next-eligible instant advances by this much, so the broker does not hammer a single in-doubt txn.
+/// Combined with the global rate cap, this bounds the back-check load (no storm). Fifteen seconds.
+pub const DEFAULT_BACK_CHECK_RETRY_NANOS: u64 = 15 * 1_000_000_000;
+
+/// The default cap on back-check ATTEMPTS before the broker gives up and applies the SAFE TERMINAL
+/// default (rollback/discard) (#640 part 2). After this many attempts have been recorded for a txn
+/// with no resolution, the next [`BackCheckBook::record_attempt`] reports the terminal default is due.
+/// Five attempts over the retry cadence is a generous bounded window for a producer to reconnect and
+/// re-register its listener before the half message is safely discarded.
+pub const DEFAULT_MAX_BACK_CHECK_ATTEMPTS: u32 = 5;
+
+/// The default cap on how many `TxnCheck`s the scan issues in ONE pass (#640 part 2): a global rate cap
+/// so a backlog of due in-doubt txns is back-checked in bounded batches rather than a single storm of
+/// pushes. The remaining due txns wait for the next scan pass.
+pub const DEFAULT_BACK_CHECK_BATCH: usize = 256;
+
+/// Tunables for a [`BackCheckBook`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackCheckConfig {
+    /// How long (monotonic) a half message stays Prepared before its FIRST back-check is eligible.
+    /// `0` makes a fresh prepare immediately eligible (used in deterministic tests).
+    pub timeout: u64,
+    /// The delay (monotonic) added to a txn's next-eligible instant after an unresolved attempt.
+    /// Floored to 1 by [`BackCheckBook::new`] so a txn always advances (no busy-loop on one txn).
+    pub retry: u64,
+    /// The cap on back-check ATTEMPTS before the terminal default fires. Floored to 1 by
+    /// [`BackCheckBook::new`].
+    pub max_attempts: u32,
+    /// The cap on `TxnCheck`s issued in one scan pass (the global rate cap). Floored to 1 by
+    /// [`BackCheckBook::new`].
+    pub batch: usize,
+}
+
+impl Default for BackCheckConfig {
+    fn default() -> BackCheckConfig {
+        BackCheckConfig {
+            timeout: DEFAULT_BACK_CHECK_TIMEOUT_NANOS,
+            retry: DEFAULT_BACK_CHECK_RETRY_NANOS,
+            max_attempts: DEFAULT_MAX_BACK_CHECK_ATTEMPTS,
+            batch: DEFAULT_BACK_CHECK_BATCH,
+        }
+    }
+}
+
+/// What recording a back-check attempt for a txn decided (the pure terminal-default gate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// The attempt was recorded and the txn rescheduled for a later retry: more attempts remain
+    /// before the terminal default. The caller has pushed (or will push) a `TxnCheck` and waits for
+    /// the producer's `TxnCheckResult`.
+    Rescheduled,
+    /// This attempt reached the attempt cap with no resolution: the caller MUST now apply the SAFE
+    /// TERMINAL default (rollback/discard) for this txn via the part-1 idempotent `txn_rollback` path.
+    /// The txn is left enrolled until the caller's rollback calls [`BackCheckBook::forget`] (so the
+    /// terminal default is driven by the same resolve path as a producer-driven rollback, inheriting
+    /// the `AlreadyResolved` idempotency).
+    TerminalDefault,
+}
+
+/// One enrolled txn's back-check bookkeeping: how many attempts have been made and when it is next
+/// eligible for a (first or retry) back-check. No payload, no clock — pure schedule state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackCheckEntry {
+    /// The number of back-check attempts recorded so far (0 before the first push).
+    attempts: u32,
+    /// The monotonic instant at or after which this txn is next eligible for a back-check.
+    next_eligible: u64,
+}
+
+/// The PURE, IO-free back-check schedule + attempt-count book for the broker's in-doubt-transaction
+/// resolver (V2-M8, #640 part 2). It tracks, per still-`Prepared` txn, how many `TxnCheck`s have been
+/// issued and when the txn is next eligible, and answers the two scan questions — "which txns are due
+/// now?" ([`BackCheckBook::due`]) and "has this txn exhausted its attempts?"
+/// ([`BackCheckBook::record_attempt`]) — without reading a clock (the caller injects `now`) or doing
+/// any IO (the durable persistence of the bookkeeping lives in `ironbus-storage`).
+///
+/// EMPTY until a txn is [`BackCheckBook::enroll`]ed, so a broker no producer ever runs a transaction
+/// on pays nothing: the scan's [`BackCheckBook::due`] is an O(1) "is the book empty?" no-op. Bounded
+/// by the same `max_prepared` cap as the unresolved set (the engine enrolls exactly the
+/// still-`Prepared` txns), so it never grows without bound.
+#[derive(Clone, Debug)]
+pub struct BackCheckBook {
+    config: BackCheckConfig,
+    /// Every enrolled (still-`Prepared`, under-back-check) txn's bookkeeping, keyed by `txn_id`.
+    entries: HashMap<Vec<u8>, BackCheckEntry>,
+}
+
+impl BackCheckBook {
+    /// A fresh, empty book with `config`. The `retry`, `max_attempts`, and `batch` are floored to 1.
+    #[must_use]
+    pub fn new(config: BackCheckConfig) -> BackCheckBook {
+        BackCheckBook {
+            config: BackCheckConfig {
+                timeout: config.timeout,
+                retry: config.retry.max(1),
+                max_attempts: config.max_attempts.max(1),
+                batch: config.batch.max(1),
+            },
+            entries: HashMap::new(),
+        }
+    }
+
+    /// The active config (with the floors applied).
+    #[must_use]
+    pub fn config(&self) -> BackCheckConfig {
+        self.config
+    }
+
+    /// Replaces the config (re-applying the floors), leaving the enrolled entries untouched. The
+    /// schedule decisions for already-enrolled txns use the NEW config from here on (a longer/shorter
+    /// retry, a different attempt cap). Used to set a deployment's back-check tunables (and by tests to
+    /// pick a short, deterministic timeout); a per-txn entry's recorded `next_eligible`/`attempts` are
+    /// not rewritten — only future `due`/`record_attempt` decisions adopt the new config.
+    pub fn set_config(&mut self, config: BackCheckConfig) {
+        self.config = BackCheckConfig {
+            timeout: config.timeout,
+            retry: config.retry.max(1),
+            max_attempts: config.max_attempts.max(1),
+            batch: config.batch.max(1),
+        };
+    }
+
+    /// The number of currently-enrolled (under-back-check) txns.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no txn is enrolled — the scan's hot-path no-op gate (a broker with no in-doubt txns
+    /// does ZERO back-check work).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// This txn's current `(attempts, next_eligible)` bookkeeping, or `None` if not enrolled. For the
+    /// durable snapshot, observability, and tests.
+    #[must_use]
+    pub fn bookkeeping(&self, txn_id: &[u8]) -> Option<(u32, u64)> {
+        self.entries
+            .get(txn_id)
+            .map(|e| (e.attempts, e.next_eligible))
+    }
+
+    /// Enrolls a still-`Prepared` txn for back-checking with a `first_eligible` instant (the engine
+    /// passes `prepared_at + config.timeout`), idempotently: a re-enroll of an already-tracked txn is a
+    /// NO-OP that preserves its existing attempt count + schedule (so a duplicate enroll — e.g. a
+    /// re-prepare, or a second scan before the first resolves — never resets the back-check progress).
+    /// The first push will happen once `now >= first_eligible`.
+    pub fn enroll(&mut self, txn_id: &[u8], first_eligible: u64) {
+        self.entries
+            .entry(txn_id.to_vec())
+            .or_insert(BackCheckEntry {
+                attempts: 0,
+                next_eligible: first_eligible,
+            });
+    }
+
+    /// Removes a txn from the book — called when it RESOLVES (a producer commit/rollback, a back-check
+    /// resolution, or the terminal default), so a resolved txn is never back-checked again. Idempotent:
+    /// forgetting an untracked txn is a no-op. Returns whether an entry was removed.
+    pub fn forget(&mut self, txn_id: &[u8]) -> bool {
+        self.entries.remove(txn_id).is_some()
+    }
+
+    /// Restores one txn's back-check bookkeeping from a durable replay (the storage layer's back-check
+    /// op-record replay at open), so the attempt count + schedule SURVIVE a broker restart and the scan
+    /// resumes exactly where it left off. Trusted recovered state: it never errors and is not bounded
+    /// (the durable log is authoritative). A later restore for the same id supersedes an earlier one
+    /// (the op-records replay in durable order, newest last).
+    pub fn restore(&mut self, txn_id: &[u8], attempts: u32, next_eligible: u64) {
+        self.entries.insert(
+            txn_id.to_vec(),
+            BackCheckEntry {
+                attempts,
+                next_eligible,
+            },
+        );
+    }
+
+    /// Every enrolled txn whose `next_eligible` is at or before `now`, in ascending `(next_eligible,
+    /// txn_id)` order, capped at the configured `batch` (the global rate cap so a backlog is
+    /// back-checked in bounded passes, never a storm). O(1) when the book is empty (the scan's
+    /// no-in-doubt-txns hot path). For each returned txn the caller issues a `TxnCheck` and then calls
+    /// [`BackCheckBook::record_attempt`].
+    ///
+    /// This does a single bounded pass to find the due txns; the book is keyed by `txn_id` (not a
+    /// secondary by-time index) because the enrolled set is the bounded unresolved set
+    /// (`max_prepared`), so a per-pass scan over it is already O(unresolved) and the batch cap bounds
+    /// the RESULT — keeping the structure simple (one map) without a second index to keep in lockstep.
+    #[must_use]
+    pub fn due(&self, now: u64) -> Vec<Vec<u8>> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        let mut due: Vec<(&u64, &Vec<u8>)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.next_eligible <= now)
+            .map(|(id, e)| (&e.next_eligible, id))
+            .collect();
+        // Oldest-eligible first, then by id for a deterministic, stable order (so a backlog is drained
+        // FIFO-ish by schedule and the batch cap takes the most-overdue txns first).
+        due.sort_unstable();
+        due.into_iter()
+            .take(self.config.batch)
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+
+    /// Records that a back-check attempt was issued for `txn_id` at `now`, bumping its attempt count
+    /// and rescheduling it `config.retry` later, and reports whether the attempt cap is now reached.
+    ///
+    /// - [`AttemptOutcome::Rescheduled`]: attempts remain; the caller waits for the producer's
+    ///   `TxnCheckResult` (or the next eligible retry). The txn stays enrolled.
+    /// - [`AttemptOutcome::TerminalDefault`]: this attempt reached `config.max_attempts` with no
+    ///   resolution; the caller MUST apply the SAFE terminal default (rollback/discard) for this txn
+    ///   via the part-1 idempotent `txn_rollback` path, then [`BackCheckBook::forget`] it.
+    ///
+    /// A no-op (`Rescheduled`) for an untracked txn (it resolved between the `due` scan and here — a
+    /// benign race), so the caller never issues a terminal default against a forgotten txn.
+    pub fn record_attempt(&mut self, txn_id: &[u8], now: u64) -> AttemptOutcome {
+        let Some(entry) = self.entries.get_mut(txn_id) else {
+            return AttemptOutcome::Rescheduled;
+        };
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.next_eligible = now.saturating_add(self.config.retry);
+        if entry.attempts >= self.config.max_attempts {
+            AttemptOutcome::TerminalDefault
+        } else {
+            AttemptOutcome::Rescheduled
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,5 +1142,184 @@ mod tests {
             assert!(t.resolved_tombstone_count() <= max);
         }
         assert_eq!(t.resolved_tombstone_count(), max);
+    }
+
+    // ---- the back-check book (#640 part 2) ----
+
+    fn book() -> BackCheckBook {
+        // A deterministic book: a small retry/timeout and a 3-attempt cap for compact tests.
+        BackCheckBook::new(BackCheckConfig {
+            timeout: 100,
+            retry: 50,
+            max_attempts: 3,
+            batch: 256,
+        })
+    }
+
+    #[test]
+    fn an_empty_book_is_a_no_op_scan() {
+        // The byte-identical-when-unused property: a broker with no in-doubt txns does ZERO back-check
+        // work (an empty book's `due` returns nothing without touching a clock or allocating a scan).
+        let b = book();
+        assert!(b.is_empty());
+        assert_eq!(b.len(), 0);
+        assert!(b.due(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn a_txn_is_not_due_until_its_first_eligible_instant() {
+        let mut b = book();
+        // Enrolled at prepared_at(10) + timeout(100) = first eligible 110.
+        b.enroll(b"tx1", 110);
+        assert_eq!(b.len(), 1);
+        // Before the first-eligible instant: not due.
+        assert!(b.due(109).is_empty());
+        // At/after it: due.
+        assert_eq!(b.due(110), vec![b"tx1".to_vec()]);
+        assert_eq!(b.due(200), vec![b"tx1".to_vec()]);
+        assert_eq!(b.bookkeeping(b"tx1"), Some((0, 110)));
+    }
+
+    #[test]
+    fn enroll_is_idempotent_and_preserves_progress() {
+        let mut b = book();
+        b.enroll(b"tx1", 110);
+        // One attempt advances the schedule + count.
+        assert_eq!(b.record_attempt(b"tx1", 120), AttemptOutcome::Rescheduled);
+        assert_eq!(b.bookkeeping(b"tx1"), Some((1, 170)));
+        // A re-enroll (a re-prepare, or a second scan) must NOT reset the attempt count or schedule.
+        b.enroll(b"tx1", 999);
+        assert_eq!(
+            b.bookkeeping(b"tx1"),
+            Some((1, 170)),
+            "re-enroll preserved progress, did not reset it"
+        );
+    }
+
+    #[test]
+    fn record_attempt_bumps_count_reschedules_and_fires_terminal_at_the_cap() {
+        let mut b = book(); // max_attempts = 3
+        b.enroll(b"tx1", 110);
+        // Attempt 1 at 110: count 1, next eligible 110 + retry(50) = 160.
+        assert_eq!(b.record_attempt(b"tx1", 110), AttemptOutcome::Rescheduled);
+        assert_eq!(b.bookkeeping(b"tx1"), Some((1, 160)));
+        // Not due before 160; due at 160 (the retry schedule is respected — no storm).
+        assert!(b.due(159).is_empty());
+        assert_eq!(b.due(160), vec![b"tx1".to_vec()]);
+        // Attempt 2 at 160: count 2, still rescheduled.
+        assert_eq!(b.record_attempt(b"tx1", 160), AttemptOutcome::Rescheduled);
+        assert_eq!(b.bookkeeping(b"tx1"), Some((2, 210)));
+        // Attempt 3 at 210 reaches the cap: the SAFE terminal default is due.
+        assert_eq!(
+            b.record_attempt(b"tx1", 210),
+            AttemptOutcome::TerminalDefault
+        );
+        // The caller now rolls back + forgets it.
+        assert!(b.forget(b"tx1"));
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn forget_removes_a_resolved_txn_so_it_is_never_back_checked_again() {
+        let mut b = book();
+        b.enroll(b"tx1", 110);
+        assert!(b.forget(b"tx1"));
+        // Forgetting again is a benign no-op.
+        assert!(!b.forget(b"tx1"));
+        assert!(b.due(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn record_attempt_on_a_forgotten_txn_is_a_benign_reschedule_not_a_terminal() {
+        // The benign race: a txn resolves (and is forgotten) between the `due` scan and `record_attempt`
+        // — the attempt must NOT report a terminal default against a txn that is already gone.
+        let mut b = book();
+        assert_eq!(
+            b.record_attempt(b"ghost", 100),
+            AttemptOutcome::Rescheduled,
+            "an untracked txn never fires the terminal default"
+        );
+    }
+
+    #[test]
+    fn due_returns_oldest_eligible_first_and_respects_the_batch_cap() {
+        let mut b = BackCheckBook::new(BackCheckConfig {
+            timeout: 0,
+            retry: 10,
+            max_attempts: 5,
+            batch: 2, // a tiny global rate cap
+        });
+        // Three txns all eligible, with distinct next-eligible instants.
+        b.enroll(b"a", 30);
+        b.enroll(b"b", 10);
+        b.enroll(b"c", 20);
+        // At now=100 all three are due, but the batch cap returns only the two OLDEST-eligible (b, c).
+        let due = b.due(100);
+        assert_eq!(due, vec![b"b".to_vec(), b"c".to_vec()]);
+        // A txn whose eligible instant is in the future is excluded.
+        b.enroll(b"future", 1_000);
+        let due2 = b.due(100);
+        assert_eq!(due2.len(), 2, "still capped, future txn excluded");
+        assert!(!due2.contains(&b"future".to_vec()));
+    }
+
+    #[test]
+    fn restore_rebuilds_the_attempt_count_and_schedule_across_a_restart() {
+        // Durability seam: the storage layer replays a back-check op-record into the book so the count +
+        // schedule survive a restart and the scan resumes.
+        let mut b = book();
+        b.restore(b"tx1", 2, 210);
+        assert_eq!(b.bookkeeping(b"tx1"), Some((2, 210)));
+        // The next attempt (at the cap) fires the terminal default exactly as if the attempts had been
+        // recorded live before the restart.
+        assert_eq!(b.due(210), vec![b"tx1".to_vec()]);
+        assert_eq!(
+            b.record_attempt(b"tx1", 210),
+            AttemptOutcome::TerminalDefault
+        );
+    }
+
+    #[test]
+    fn the_book_floors_its_caps_to_one() {
+        let b = BackCheckBook::new(BackCheckConfig {
+            timeout: 0,
+            retry: 0,
+            max_attempts: 0,
+            batch: 0,
+        });
+        assert_eq!(b.config().retry, 1);
+        assert_eq!(b.config().max_attempts, 1);
+        assert_eq!(b.config().batch, 1);
+    }
+
+    #[test]
+    fn set_config_replaces_tunables_and_re_floors() {
+        let mut b = book();
+        b.set_config(BackCheckConfig {
+            timeout: 5,
+            retry: 0,        // re-floored to 1
+            max_attempts: 0, // re-floored to 1
+            batch: 0,        // re-floored to 1
+        });
+        assert_eq!(b.config().timeout, 5);
+        assert_eq!(b.config().retry, 1);
+        assert_eq!(b.config().max_attempts, 1);
+        assert_eq!(b.config().batch, 1);
+        // A new attempt uses the new (1-attempt) cap immediately.
+        b.enroll(b"tx1", 0);
+        assert_eq!(b.record_attempt(b"tx1", 0), AttemptOutcome::TerminalDefault);
+    }
+
+    #[test]
+    fn a_single_attempt_cap_fires_terminal_on_the_first_attempt() {
+        // With max_attempts floored to 1, the first attempt already exhausts the budget.
+        let mut b = BackCheckBook::new(BackCheckConfig {
+            timeout: 0,
+            retry: 10,
+            max_attempts: 1,
+            batch: 8,
+        });
+        b.enroll(b"tx1", 0);
+        assert_eq!(b.record_attempt(b"tx1", 0), AttemptOutcome::TerminalDefault);
     }
 }
