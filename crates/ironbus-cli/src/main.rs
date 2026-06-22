@@ -13570,7 +13570,7 @@ mod tests {
         let target_fs = StdFs::new(target.clone());
         let has_seg = target_fs
             .list()
-            .map_or(false, |l| l.iter().any(|n| n.starts_with("seg-")));
+            .is_ok_and(|l| l.iter().any(|n| n.starts_with("seg-")));
         assert!(!has_seg, "a rejected restore left no partial data");
 
         let _ = std::fs::remove_dir_all(&src);
