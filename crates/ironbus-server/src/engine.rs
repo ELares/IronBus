@@ -16183,6 +16183,92 @@ mod tests {
     }
 
     #[test]
+    fn crash_between_a2_and_a3_clamps_the_phantom_high_water_and_redrives_fresh() {
+        use ironbus_storage::fault::FaultFs;
+        // THE CLAMP BRANCH (the A2<->A3 torn-tail window), the one the durable-seq ordering exists
+        // for: the producer-seq high-water (A2) was fsync'd, but the real-stream record's covering
+        // fsync (A3) was LOST in the torn tail. On recovery `seed_producer_seq_from_recovered` must
+        // CLAMP the over-the-head high-water and DROP it, so the redrive re-appends the record FRESH
+        // exactly once at the real head — no double-append (the first write was lost), no loss.
+        //
+        // We construct the EXACT torn state faithfully (the in-memory FS would otherwise sync both):
+        // run the real commit steps A (write, no fsync) and A2 (fsync the seq checkpoint) so the
+        // high-water is durable, then ARM an fsync fault and run A3 (commit_batch's covering fsync),
+        // which fails and freezes the writer with the record still UNSYNCED — exactly the mid-A2/A3
+        // crash. A power loss then reverts the unsynced record while the fsync'd seq checkpoint
+        // survives, and a clean reopen drives recovery's clamp.
+        let (faultfs, control) = FaultFs::new(InMemoryFs::new());
+        let probe = faultfs.inner().clone();
+        {
+            let mut e = Engine::open(faultfs, ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"once")).unwrap();
+            // The buffered half (durably fsync'd at prepare) is what a redrive re-appends. Pull it
+            // exactly as `txn_commit` does, then run the commit ordering by hand so we can inject the
+            // fault precisely BETWEEN A2 and A3.
+            let half = e
+                .txn
+                .as_ref()
+                .and_then(|s| s.prepared_payload(b"tx1").cloned())
+                .expect("the prepared half is buffered");
+            // STEP A: write the real record (no fsync) — assigns offset 0 and records the txn-id seq
+            // high-water in memory.
+            let off = e.commit_real_append(b"tx1", &half).unwrap();
+            assert_eq!(off, Offset::new(0), "the first real append takes offset 0");
+            // STEP A2: fsync the producer-seq checkpoint, making the dedup high-water DURABLE before
+            // the record. This sync must SUCCEED (the fault is not yet armed).
+            e.flush_txn_commit_dedup().unwrap();
+            // STEP A3: the record's covering fsync — ARM the fault so it FAILS, leaving the record
+            // written-but-unsynced and freezing the writer. This is the torn A2<->A3 crash point.
+            control.set_fail_sync(true);
+            assert!(
+                e.commit_batch().is_err(),
+                "A3's covering fsync fails (the torn-tail crash point), freezing the writer"
+            );
+            // The op-marker B was never reached, so the txn is still Prepared on disk.
+            // CRASH (drop the frozen engine).
+        }
+        // POWER LOSS: the unsynced real record reverts (lost), the fsync'd producer-seq.ckpt survives
+        // (so its high-water now points PAST the durable head — the phantom the clamp must drop).
+        probe.simulate_power_loss();
+
+        // RECOVER over the surviving disk with a CLEAN fs (no fault layer), exactly as a real reopen.
+        let mut reopened = Engine::open(probe.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        // The record was lost: the real stream is empty, and the txn replays as Prepared (no op-marker
+        // was ever written), so it is recoverable and still invisible.
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(0),
+            "the unsynced real record was lost in the torn tail"
+        );
+        assert_eq!(
+            reopened.txn_prepared_count(),
+            1,
+            "the txn replays as Prepared (the op-marker never landed)"
+        );
+        assert!(
+            matches!(reopened.poll(0).unwrap(), Poll::Idle),
+            "still invisible after the crash"
+        );
+        // THE CLAMP'S TEETH: the recovered high-water pointed at offset 0 with a durable head of 0
+        // (0 >= flushed), so `seed_producer_seq_from_recovered` DROPPED it. The redrive (a fresh
+        // commit of the still-Prepared txn) therefore re-appends FRESH at offset 0 — it is NOT deduped
+        // away to a phantom offset (which would have been a silent loss).
+        let redriven = reopened.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            redriven,
+            Offset::new(0),
+            "the dropped phantom high-water lets the redrive re-append FRESH at the real head"
+        );
+        // EXACTLY ONCE: the record is now durable and visible, exactly one copy — no double, no loss.
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(1),
+            "exactly one record after the redrive (no double-append, no loss)"
+        );
+        assert_eq!(drain_visible(&mut reopened), vec![b"once".to_vec()]);
+    }
+
+    #[test]
     fn re_prepare_of_a_prepared_id_is_a_benign_duplicate() {
         let mut e = open(config(10, 5));
         e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
