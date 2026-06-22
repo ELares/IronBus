@@ -13226,6 +13226,488 @@ mod tests {
         let _ = out;
     }
 
+    // --- group / stream / dlq management verbs (#586, #595) ---
+
+    /// Establishes a durable cursor for `group` at offset `to` in `dir` (via the offline reset), so
+    /// the group verbs have a real group to inspect/drop. Asserts the reset succeeded.
+    #[cfg(unix)]
+    fn seed_group(dir: &std::path::Path, group: &str, to: &str) {
+        let (out, code) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            group,
+            "--to",
+            to,
+        ]);
+        assert_eq!(code, 0, "seed_group reset failed: {out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_ls_and_info_report_committed_lag_and_in_range() {
+        let dir = make_data_dir("mgmt-group-ls", 10); // durable head 10
+        seed_group(&dir, "orders", "7");
+        // ls: human + JSON both carry the group's committed/lag/in-range.
+        let (out, code) = run_admin_verb(&["group", "ls", "--data-dir", dir.to_str().unwrap()]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("orders"), "{out}");
+        assert!(out.contains("committed=7"), "{out}");
+        assert!(out.contains("lag=3"), "head 10 - committed 7 = 3: {out}");
+
+        let (j, jc) =
+            run_admin_verb(&["group", "ls", "--data-dir", dir.to_str().unwrap(), "--json"]);
+        assert_eq!(jc, 0, "{j}");
+        assert!(j.contains("\"schema\":\"ironbus.cli.group-ls.v1\""), "{j}");
+        assert!(j.contains("\"committed\":7"), "{j}");
+        assert!(j.contains("\"lag\":3"), "{j}");
+        assert!(j.contains("\"in_range\":true"), "{j}");
+
+        // info names one group; a missing group is not-found (exit 2).
+        let (i, ic) = run_admin_verb(&[
+            "group",
+            "info",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(ic, 0, "{i}");
+        assert!(i.contains("committed=7"), "{i}");
+        let (_g, gc) = run_admin_verb(&[
+            "group",
+            "info",
+            "ghost",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(gc, EXIT_NOT_FOUND, "a missing group is not-found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_reset_is_an_alias_for_admin_consumer_reset() {
+        let dir = make_data_dir("mgmt-group-reset", 8);
+        let (out, code) = run_admin_verb(&[
+            "group",
+            "reset",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--to",
+            "5",
+        ]);
+        assert_eq!(code, 0, "{out}");
+        // The cursor the broker resumes from is exactly 5 (the same rewrite admin consumer-reset does).
+        assert_eq!(read_committed_offset(&dir, "orders"), Some(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_purge_without_force_refuses_and_deletes_nothing() {
+        let dir = make_data_dir("mgmt-group-purge-noforce", 6);
+        seed_group(&dir, "orders", "3");
+        let (out, code) = run_admin_verb(&[
+            "group",
+            "purge",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_USAGE, "refused without --force: {out}");
+        assert!(out.contains("--force") || out.is_empty(), "{out}");
+        // The cursor still exists (nothing was deleted).
+        assert_eq!(
+            read_committed_offset(&dir, "orders"),
+            Some(3),
+            "a refused purge deletes nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_rm_with_force_drops_the_cursor_then_is_not_found() {
+        let dir = make_data_dir("mgmt-group-rm", 6);
+        seed_group(&dir, "orders", "4");
+        let (out, code) = run_admin_verb(&[
+            "group",
+            "rm",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            read_committed_offset(&dir, "orders"),
+            None,
+            "the cursor is gone after rm --force"
+        );
+        // A second rm is now not-found (exit 2), never a silent success.
+        let (_o2, code2) = run_admin_verb(&[
+            "group",
+            "rm",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_eq!(
+            code2, EXIT_NOT_FOUND,
+            "a re-rm of a gone group is not-found"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs the CLI with the GLOBAL `--json` envelope active (the `main`/`main_json` path), capturing
+    /// the one envelope and the exit code, for the destructive-safety-under-json assertions. Mirrors
+    /// `main_json`: strip the leading global `--json`, capture `run`'s output, wrap it in the frozen
+    /// success/error envelope.
+    #[cfg(unix)]
+    fn run_global_json(args: &[&str]) -> (String, u8) {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let (rest, json) = json_envelope::strip_global_json(&owned);
+        assert!(json, "the test passed a leading global --json");
+        let mut captured: Vec<u8> = Vec::new();
+        match run(&rest, &mut captured) {
+            Ok(()) => {
+                let text = String::from_utf8_lossy(&captured);
+                (json_envelope::success_envelope(&text), 0)
+            }
+            Err(e) => (json_envelope::error_envelope(&e), e.exit_code()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_drop_under_json_requires_force_and_is_fail_closed() {
+        // Under the global --json the destructive op still REFUSES without --force (no interactive
+        // prompt). The frozen error envelope carries the usage kind and the frozen exit code.
+        let dir = make_data_dir("mgmt-group-json-force", 5);
+        seed_group(&dir, "g", "2");
+        let (out, code) = run_global_json(&[
+            "--json",
+            "group",
+            "purge",
+            "g",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_USAGE, "{out}");
+        assert!(out.contains("\"ok\":false"), "{out}");
+        assert!(out.contains("\"kind\":\"usage\""), "{out}");
+        assert_eq!(read_committed_offset(&dir, "g"), Some(2), "nothing deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_ls_info_create_round_trip() {
+        let dir = make_data_dir("mgmt-stream-ls", 4); // default stream: 4 records
+                                                      // ls shows the default stream.
+        let (out, code) = run_admin_verb(&["stream", "ls", "--data-dir", dir.to_str().unwrap()]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("(default)"), "{out}");
+        assert!(out.contains("records=4"), "{out}");
+
+        // create a named stream, then it appears in ls + info (empty).
+        let (c, cc) = run_admin_verb(&[
+            "stream",
+            "create",
+            "events",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(cc, 0, "{c}");
+        let (j, jc) = run_admin_verb(&[
+            "stream",
+            "info",
+            "events",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--json",
+        ]);
+        assert_eq!(jc, 0, "{j}");
+        assert!(
+            j.contains("\"schema\":\"ironbus.cli.stream-info.v1\""),
+            "{j}"
+        );
+        assert!(j.contains("\"stream\":\"events\""), "{j}");
+        assert!(j.contains("\"records\":0"), "{j}");
+
+        // A missing named stream is not-found (exit 2).
+        let (_g, gc) = run_admin_verb(&[
+            "stream",
+            "info",
+            "ghost",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(gc, EXIT_NOT_FOUND, "a missing stream is not-found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_create_is_idempotent_and_rejects_invalid_names() {
+        let dir = make_data_dir("mgmt-stream-create", 1);
+        let (_a, ca) = run_admin_verb(&[
+            "stream",
+            "create",
+            "events",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(ca, 0);
+        // A re-create is a clean no-op (exit 0).
+        let (b, cb) = run_admin_verb(&[
+            "stream",
+            "create",
+            "events",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(cb, 0, "{b}");
+        assert!(b.contains("already exists"), "{b}");
+        // The empty (default) name is a usage error (the default stream cannot be created).
+        let (_e, ce) =
+            run_admin_verb(&["stream", "create", "", "--data-dir", dir.to_str().unwrap()]);
+        assert_eq!(ce, EXIT_USAGE, "the default stream cannot be created");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_bind_validates_the_subject_and_declares_the_target() {
+        let dir = make_data_dir("mgmt-stream-bind", 2);
+        // A valid subject declares the named target stream (created on first bind).
+        let (out, code) = run_admin_verb(&[
+            "stream",
+            "bind",
+            "order.>",
+            "events",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains("route is applied at broker runtime") || out.contains("not persisted"),
+            "{out}"
+        );
+        // The target stream now exists.
+        let (_i, ic) = run_admin_verb(&[
+            "stream",
+            "info",
+            "events",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(ic, 0, "the bind target stream was declared");
+        // A malformed subject is a usage error (exit 1), declaring nothing new.
+        let (_b, bc) = run_admin_verb(&[
+            "stream",
+            "bind",
+            "bad..pattern",
+            "other",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(bc, EXIT_USAGE, "a malformed subject is a usage error");
+        let (_o, oc) = run_admin_verb(&[
+            "stream",
+            "info",
+            "other",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            oc, EXIT_NOT_FOUND,
+            "a rejected bind never declared the target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_purge_without_force_refuses_and_with_force_empties() {
+        let dir = make_data_dir("mgmt-stream-purge", 2);
+        // Build a named stream WITH records by binding+producing through a real engine is overkill;
+        // here create empties it. To get records into a named stream we declare then append via the
+        // storage API directly (the same path the broker uses).
+        seed_named_stream_records(&dir, "orders", 5);
+        assert_eq!(named_stream_records(&dir, "orders"), 5);
+
+        // Without --force: refused (exit 1), deletes nothing, and the refusal message names the
+        // count-of-what-would-be-deleted (asserted via the global --json error envelope, which carries
+        // the message; `run_admin_verb` returns only stdout, and the refusal is a typed error).
+        let (out, code) = run_admin_verb(&[
+            "stream",
+            "purge",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_USAGE, "{out}");
+        assert_eq!(named_stream_records(&dir, "orders"), 5, "nothing deleted");
+        let (env, ec) = run_global_json(&[
+            "--json",
+            "stream",
+            "purge",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+        assert_eq!(ec, EXIT_USAGE, "{env}");
+        assert!(env.contains("5 record"), "names the count: {env}");
+        assert!(env.contains("\"kind\":\"usage\""), "{env}");
+        assert_eq!(
+            named_stream_records(&dir, "orders"),
+            5,
+            "still nothing deleted"
+        );
+
+        // With --force: the records are dropped.
+        let (o2, c2) = run_admin_verb(&[
+            "stream",
+            "purge",
+            "orders",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_eq!(c2, 0, "{o2}");
+        assert_eq!(named_stream_records(&dir, "orders"), 0, "records dropped");
+
+        // The default stream cannot be purged here (usage error).
+        let (_d, dc) = run_admin_verb(&[
+            "stream",
+            "purge",
+            "",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_eq!(dc, EXIT_USAGE, "the default stream cannot be purged");
+        // A missing stream with --force is not-found (exit 2).
+        let (_m, mc) = run_admin_verb(&[
+            "stream",
+            "rm",
+            "ghost",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_eq!(mc, EXIT_NOT_FOUND, "a missing stream is not-found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Declares a named stream in `dir` and appends `n` records to it, via the storage `StreamSet`
+    /// (the same path the broker uses), so the stream purge test has records to drop.
+    #[cfg(unix)]
+    fn seed_named_stream_records(dir: &std::path::Path, stream: &str, n: u64) {
+        use ironbus_storage::streamset::{StreamId, StreamSet};
+        let fs = StdFs::new(dir.to_path_buf());
+        let (mut set, _) = StreamSet::open(&fs, SystemClock::new(), LogConfig::default()).unwrap();
+        let id = StreamId::named(stream).unwrap();
+        set.declare(&id).unwrap();
+        let log = set.get_mut(&id).unwrap();
+        for i in 0..n {
+            log.append(&Append {
+                timestamp_ms: 1000 + i,
+                flags: RecordFlags::EMPTY,
+                key: b"k",
+                headers: b"",
+                payload: format!("r-{i}").as_bytes(),
+            })
+            .unwrap();
+        }
+        log.sync().unwrap();
+    }
+
+    /// Reads back a named stream's durable record count, proving a purge dropped (or kept) records.
+    #[cfg(unix)]
+    fn named_stream_records(dir: &std::path::Path, stream: &str) -> u64 {
+        let fs = StdFs::new(dir.to_path_buf());
+        match ironbus_storage::admin::stream_summary(&fs, stream) {
+            Ok(s) => s.records,
+            Err(_) => 0,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dlq_ls_peek_redrive_round_trip() {
+        // Seed a DLQ with poison records, then ls counts them, peek shows them, redrive re-injects.
+        // `seed_dlq` (the existing helper) seeds 4 poison records for group "orders".
+        let dir = make_data_dir("mgmt-dlq", 3);
+        seed_dlq(&dir, 4);
+
+        let (ls, lc) = run_admin_verb(&["dlq", "ls", "--data-dir", dir.to_str().unwrap()]);
+        assert_eq!(lc, 0, "{ls}");
+        assert!(ls.contains("4 dead-letter record"), "{ls}");
+        let (lj, ljc) =
+            run_admin_verb(&["dlq", "ls", "--data-dir", dir.to_str().unwrap(), "--json"]);
+        assert_eq!(ljc, 0, "{lj}");
+        assert!(lj.contains("\"schema\":\"ironbus.cli.dlq-ls.v1\""), "{lj}");
+        assert!(lj.contains("\"records\":4"), "{lj}");
+
+        // peek (read-only) shows the records, honoring --limit.
+        let (pk, pc) = run_admin_verb(&[
+            "dlq",
+            "peek",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--limit",
+            "2",
+        ]);
+        assert_eq!(pc, 0, "{pk}");
+        assert_eq!(pk.lines().count(), 2, "peek --limit 2 shows 2 lines: {pk}");
+
+        // redrive re-injects the poison records onto the main log (a feature NATS lacks).
+        let (rd, rc) = run_admin_verb(&["dlq", "redrive", "--data-dir", dir.to_str().unwrap()]);
+        assert_eq!(rc, 0, "{rd}");
+        assert!(rd.contains("re-injected 4 of 4"), "{rd}");
+        // A re-run is idempotent (re-injects nothing).
+        let (rd2, rc2) = run_admin_verb(&["dlq", "redrive", "--data-dir", dir.to_str().unwrap()]);
+        assert_eq!(rc2, 0, "{rd2}");
+        assert!(rd2.contains("re-injected 0 of 4"), "idempotent: {rd2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn management_verbs_refuse_a_running_broker_with_exit_5() {
+        // The MUTATING management verbs take the exclusive data-dir lock, so a running broker (here a
+        // held lock, exactly as `admin_consumer_reset_refuses_a_running_broker` simulates it) blocks
+        // them (exit 5) and they change nothing. (Read-only ls/info take no lock.)
+        let dir = make_data_dir("mgmt-lock", 4);
+        seed_group(&dir, "orders", "2");
+        dirlock::prepare_data_dir(&dir).unwrap();
+        let held = dirlock::DirLock::acquire(&dir).unwrap();
+
+        for verb in [
+            vec!["group", "rm", "orders", "--force"],
+            vec!["stream", "create", "events"],
+            vec!["dlq", "redrive"],
+        ] {
+            let mut args = verb.clone();
+            args.extend(["--data-dir", dir.to_str().unwrap()]);
+            let (out, code) = run_admin_verb(&args);
+            assert_eq!(
+                code, EXIT_UNREACHABLE,
+                "a held lock blocks `{verb:?}` (exit 5): {out}"
+            );
+        }
+        // The cursor is untouched (a blocked rm changed nothing).
+        assert_eq!(read_committed_offset(&dir, "orders"), Some(2));
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn serve_with_an_empty_broadcast_group_is_a_clean_usage_error() {
