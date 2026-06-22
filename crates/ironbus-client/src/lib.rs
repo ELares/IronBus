@@ -1623,6 +1623,24 @@ impl Client {
         Ok(())
     }
 
+    /// Opens a COALESCING at-most-once (QoS-0) producer over this client: the batched companion to the
+    /// per-call [`Client::produce_fire_and_forget`]. It frames each fire-and-forget publish into a wire
+    /// buffer and writes that buffer to the socket with ONE `write_all` only at [`STREAM_FLUSH_BYTES`]
+    /// boundaries (or on an explicit [`FireForgetProducer::flush`]), turning a tight per-message send
+    /// loop's thousands of tiny per-publish socket writes into a handful of large ones — the same
+    /// syscall coalescing a core pub/sub client performs — without changing the wire bytes the broker
+    /// sees. For a single producer that wants maximum at-most-once send throughput. No reply is ever
+    /// read (a fire-and-forget `Pub` is unacked by contract). Call [`FireForgetProducer::flush`] after
+    /// the last publish to push the final partial batch.
+    #[must_use]
+    pub fn fire_and_forget_producer(&mut self) -> FireForgetProducer<'_> {
+        FireForgetProducer {
+            client: self,
+            wire: Vec::with_capacity(STREAM_FLUSH_BYTES + 1024),
+            body: Vec::new(),
+        }
+    }
+
     /// Opens an AUTO-PIPELINING durable producer (#508) over this client with the default in-flight
     /// window ([`DEFAULT_PIPELINE_WINDOW`]): the ergonomic high-throughput companion to the awaited
     /// [`Client::produce`], for a SINGLE producer that wants its publishes durable (at-least-once,
@@ -3169,6 +3187,70 @@ pub struct PipelinedProducer<'a> {
     /// The coalesced wire bytes for every buffered publish, written with one syscall on flush. The
     /// publishes are already framed (`encode_frame`), so a flush is a single `write_all`.
     wire: Vec<u8>,
+}
+
+/// A COALESCING at-most-once (QoS-0) producer: the batched companion to [`Client::produce_fire_and_forget`],
+/// opened by [`Client::fire_and_forget_producer`]. Each [`send`](FireForgetProducer::send) frames one
+/// fire-and-forget `Pub` into a shared wire buffer and writes the buffer to the socket with ONE
+/// `write_all` only when it reaches [`STREAM_FLUSH_BYTES`] (or on an explicit
+/// [`flush`](FireForgetProducer::flush)), instead of one `write_all` syscall per publish. For a tight
+/// single-producer at-most-once loop this collapses thousands of tiny per-message socket writes into a
+/// handful of large ones — the same coalescing a core pub/sub client (e.g. NATS) does — lifting QoS-0
+/// send throughput several-fold without changing the wire bytes the broker decodes.
+///
+/// No reply is read (a fire-and-forget `Pub` is unacked by contract), so there is no flow-control
+/// window: it pushes as fast as the socket drains, and TCP backpressure is the only pacing. The
+/// buffered (not-yet-flushed) tail is not on the broker yet; this is at-most-once either way (the
+/// broker may itself drop a send under its fire-and-forget token bucket), so a lost tail on a
+/// mid-stream IO error is consistent with the no-guarantee contract. Call
+/// [`flush`](FireForgetProducer::flush) after the last [`send`](FireForgetProducer::send) to push the
+/// final partial batch.
+#[derive(Debug)]
+pub struct FireForgetProducer<'a> {
+    client: &'a mut Client,
+    /// The coalesced wire bytes for the buffered publishes, written with one `write_all` on flush.
+    wire: Vec<u8>,
+    /// Scratch reused to encode each publish body before it is framed into `wire`.
+    body: Vec<u8>,
+}
+
+impl FireForgetProducer<'_> {
+    /// Buffers one AT-MOST-ONCE (QoS-0) publish, flushing the coalesced buffer to the socket with one
+    /// `write_all` when it reaches [`STREAM_FLUSH_BYTES`]. The publish's `fire_and_forget` field is
+    /// forced SET on the wire (the method's contract), exactly like [`Client::produce_fire_and_forget`].
+    /// No reply is read; the caller's input buffers are free to reuse on return.
+    ///
+    /// # Errors
+    /// [`ClientError::Body`] / [`ClientError::Frame`] on an encode failure, or an IO error on the
+    /// triggered flush `write_all`. On an IO error the connection state is undefined (drop the
+    /// [`Client`]).
+    pub fn send(&mut self, message: &PubBody<'_>) -> Result<(), ClientError> {
+        self.body.clear();
+        let faf = PubBody {
+            fire_and_forget: true,
+            ..*message
+        };
+        encode_pub(&faf, &mut self.body).map_err(ClientError::Body)?;
+        encode_frame(FrameType::Pub, &self.body, &mut self.wire).map_err(ClientError::Frame)?;
+        if self.wire.len() >= STREAM_FLUSH_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Writes any buffered-but-unflushed publishes to the socket with one `write_all`; a no-op when the
+    /// buffer is empty. Call this after the last [`send`](FireForgetProducer::send) so the final partial
+    /// batch reaches the broker.
+    ///
+    /// # Errors
+    /// An IO error on the `write_all` (the connection state is then undefined).
+    pub fn flush(&mut self) -> Result<(), ClientError> {
+        if !self.wire.is_empty() {
+            self.client.stream.write_all(&self.wire)?;
+            self.wire.clear();
+        }
+        Ok(())
+    }
 }
 
 impl PipelinedProducer<'_> {

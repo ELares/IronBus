@@ -571,16 +571,25 @@ fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliErro
     };
     let mut produced: u64 = 0;
     let started = Instant::now();
+    // COALESCING at-most-once producer (#11 fast path): each publish is framed into the producer's wire
+    // buffer and flushed to the socket with ONE `write_all` at 32 KiB boundaries, instead of one write
+    // syscall per message — the same coalescing a core pub client (e.g. NATS `nats bench pub`) performs.
+    // This is what makes the QoS-0 send rate a fair head-to-head with a coalescing core pub rather than
+    // a self-handicapped syscall-per-message loop.
+    let mut producer = pub_client.fire_and_forget_producer();
     while !should_stop(&cfg.bound, produced, started) {
-        // No reply is read (the broker sends no PubAck for a fire-and-forget produce), so this
-        // returns as soon as the frame is written; TCP backpressure is the only pacing when the
-        // broker falls behind. An IO/encode error is still fatal and mapped to the frozen codes.
-        pub_client
-            .produce_fire_and_forget(&body)
+        // No reply is read (the broker sends no PubAck for a fire-and-forget produce); TCP backpressure
+        // is the only pacing when the broker falls behind. An IO/encode error is fatal (frozen codes).
+        producer
+            .send(&body)
             .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
         produced += 1;
         pace(cfg.target_rate_hz, produced, started);
     }
+    // Push the final partial batch before stopping the clock so every counted message is on the wire.
+    producer
+        .flush()
+        .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
     let elapsed = started.elapsed();
     // At-most-once: no ack and no read-back, so no latency and no durable-write cost to attribute
     // (the broker may even have shed sends under its token bucket). fsync is forced not-measured.
