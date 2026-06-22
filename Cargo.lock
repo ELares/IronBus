@@ -901,6 +901,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironbus-client-async"
+version = "0.0.0"
+dependencies = [
+ "ironbus-client",
+ "ironbus-core",
+ "ironbus-proto",
+ "ironbus-server",
+ "ironbus-storage",
+ "tokio",
+]
+
+[[package]]
 name = "ironbus-core"
 version = "0.0.0"
 dependencies = [

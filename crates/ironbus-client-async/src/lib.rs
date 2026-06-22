@@ -64,9 +64,9 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
     decode_not_leader, decode_pub_ack, encode_ack, encode_connect, encode_cumulative_ack,
-    encode_fetch, encode_pub, encode_sub, encode_txn_prepare, encode_txn_resolve, AckBody, AckLevel,
-    AckOp, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody, SubBody,
-    TxnPrepareBody, TxnResolveBody,
+    encode_fetch, encode_pub, encode_sub, encode_txn_prepare, encode_txn_resolve, AckBody,
+    AckLevel, AckOp, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody,
+    SubBody, TxnPrepareBody, TxnResolveBody,
 };
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -113,13 +113,22 @@ fn not_leader_error(body: &[u8]) -> ClientError {
 /// failure is recorded in `poison` (carrying the record's offset/generation for an ack/nack-skip); the
 /// rest of the batch is still drained before the error surfaces. This is a verbatim port of the sync
 /// helper — the decode/decompress logic is IO-free and identical.
-fn ingest_delivery(d: &DeliverBody<'_>, messages: &mut Vec<Message>, poison: &mut Option<ClientError>) {
+fn ingest_delivery(
+    d: &DeliverBody<'_>,
+    messages: &mut Vec<Message>,
+    poison: &mut Option<ClientError>,
+) {
     if poison.is_some() {
         return;
     }
     let flags = RecordFlags::from_bits(d.flags);
     let (flags, payload) = if flags.contains(RecordFlags::COMPRESSED) {
-        match decompress_payload(flags, d.payload, &NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES) {
+        match decompress_payload(
+            flags,
+            d.payload,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        ) {
             Ok(payload) => (d.flags & !RecordFlags::COMPRESSED.bits(), payload),
             Err(source) => {
                 *poison = Some(ClientError::Decompress {
@@ -576,7 +585,9 @@ impl AsyncClient {
         match self.read_frame().await? {
             (FrameType::AckStatus, body) => match body.as_slice() {
                 [status] => Ok(*status == 1),
-                _ => Err(ClientError::BadResponse("ack reply was not a one-byte status")),
+                _ => Err(ClientError::BadResponse(
+                    "ack reply was not a one-byte status",
+                )),
             },
             (FrameType::Err, body) => {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
