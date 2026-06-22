@@ -339,6 +339,20 @@ enum Command<F: Filesystem, C: Clock> {
         /// fire-and-forget admission and the no-ack disposition apply).
         append: OwnedAppend,
     },
+    /// A BATCH of LEVEL-0 (no-ack / fire-and-forget) produces submitted as ONE channel send (#11 fast
+    /// path): the session accumulates the Level-0 produces decoded from one socket read and hands them
+    /// over in a single `Command` instead of one send per message, cutting the per-message
+    /// session->actor channel-send + waker-notify cost that caps the QoS-0 ingest rate. The actor
+    /// appends each IN ORDER with the SAME admission + no-reply disposition as [`Command::ProduceNoReply`]
+    /// (every append joins the pending batch and is covered by the one `commit_batch`); the per-append
+    /// byte-cap shed (#476) already ran at the connection thread (counted in `fire_and_forget_shed`)
+    /// when the batch was built, so each append here is one the gate did not fast-reject. Order is
+    /// preserved because the session flushes this batch BEFORE any later Level-1 produce or non-produce
+    /// job, so the actor still observes the connection's single total order.
+    ProduceNoReplyBatch {
+        /// The owned Level-0 produce payloads, in connection order.
+        appends: Vec<OwnedAppend>,
+    },
     /// Run an engine job (an ack, a flow/poll batch, a subscribe, a checkpoint), then it replies itself.
     Run(Job<F, C>),
     /// Graceful shutdown: flush the pending batch, checkpoint every group, then exit the actor loop.
@@ -570,6 +584,39 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
             .map_err(|_| ActorGone)
     }
 
+    /// Submits a BATCH of LEVEL-0 (no-ack) produces as ONE channel send (#11 fast path): the coalesced
+    /// twin of [`EngineHandle::produce_no_reply`]. Each append runs the SAME O(1) connection-thread
+    /// byte-cap fast-reject (#476) the per-message path does — an at-or-over-cap append is dropped here
+    /// and counted on the L0 shed counter (never silent) — and only the admitted appends are sent, IN
+    /// ORDER, in one `Command::ProduceNoReplyBatch`. If every append sheds, NOTHING is sent (no empty
+    /// command). The actor appends each exactly as it would a per-message `ProduceNoReply`, so the
+    /// single total order and the no-ack disposition are unchanged; the only difference is one channel
+    /// send + one waker notify for the whole batch instead of one per message.
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the actor exited before the batch could be enqueued. (A per-append SHED
+    /// is NOT an error: the L0 produce is dropped, counted, and the rest of the batch still sends.)
+    pub fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
+        let mut admitted: Vec<OwnedAppend> = Vec::with_capacity(appends.len());
+        for append in appends {
+            // SAME fast-reject as `produce_no_reply`, per append: when the gate is SURE the actor would
+            // shed it, drop it here (the L0 producer accepts loss) and count it on the L0 shed counter
+            // (folded into `fire_and_forget_shed`, not `produce_rejected`), so a dropped L0 is never
+            // silent. The gate never false-rejects, so an admitted append is one the actor would accept.
+            if self.cap_gate.would_shed() {
+                self.cap_gate.record_l0_shed();
+            } else {
+                admitted.push(append);
+            }
+        }
+        if admitted.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(Command::ProduceNoReplyBatch { appends: admitted })
+            .map_err(|_| ActorGone)
+    }
+
     /// Runs `job` on the owned engine and AWAITS its result. Used for every engine operation that is
     /// not a group-committed produce: acks, the flow/poll fetch, subscribe/unsubscribe, the
     /// interval/close-path checkpoint. The actor flushes any pending produce batch (one fsync) BEFORE
@@ -674,6 +721,22 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
     /// an error (it is a counted fire-and-forget drop), so a shed still returns `Ok`.
     fn produce_no_reply(&self, append: OwnedAppend) -> Result<(), ActorGone> {
         let _ = self.produce(append)?;
+        Ok(())
+    }
+
+    /// Submits a BATCH of LEVEL-0 (no-ack) produces as ONE handoff (#11 fast path): the coalesced twin
+    /// of [`EngineAccess::produce_no_reply`], so the session hands the actor a whole socket-read's worth
+    /// of Level-0 produces with one channel send instead of one per message. The default produces each
+    /// in order via [`EngineAccess::produce_no_reply`], which is exact for the direct (same-thread) test
+    /// engines (no channel to coalesce). [`EngineHandle`] overrides it with the real single
+    /// `Command::ProduceNoReplyBatch` send.
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the engine is no longer reachable. A per-append cap-shed is NOT an error.
+    fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
+        for append in appends {
+            self.produce_no_reply(append)?;
+        }
         Ok(())
     }
 
@@ -806,6 +869,13 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         // The REAL no-reply L0 submit (#495): the cap pre-check, then a `Command::ProduceNoReply` send
         // with NO reply channel, NO park, NO fsync-wait — the NATS-Core-speed path.
         EngineHandle::produce_no_reply(self, append)
+    }
+
+    fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
+        // The REAL batched no-reply submit (#11 fast path): per-append cap pre-check, then ONE
+        // `Command::ProduceNoReplyBatch` send — one channel send + one waker notify for the whole
+        // socket-read's worth of Level-0 produces instead of one per message.
+        EngineHandle::produce_no_reply_batch(self, appends)
     }
 
     fn with<R, J>(&self, job: J) -> Result<R, ActorGone>
@@ -1234,7 +1304,14 @@ fn gather_commands<F, C>(
 {
     let produces = commands
         .iter()
-        .filter(|c| matches!(c, Command::Produce { .. } | Command::ProduceNoReply { .. }))
+        .filter(|c| {
+            matches!(
+                c,
+                Command::Produce { .. }
+                    | Command::ProduceNoReply { .. }
+                    | Command::ProduceNoReplyBatch { .. }
+            )
+        })
         .count();
     if produces < 2 {
         return;
@@ -1306,6 +1383,17 @@ where
                 // just parks `None` so `flush_pending` sends nothing for it.
                 Command::ProduceNoReply { append } => {
                     process_produce(&mut engine, &mut pending, &append, None);
+                }
+                // A BATCH of Level-0 produces (#11 fast path): append each IN ORDER with the SAME no-reply
+                // disposition as `ProduceNoReply` above (one `process_produce` per append, `None` reply),
+                // all joining the same pending batch under the one covering `commit_batch`. Purely a
+                // CHANNEL-SEND coalescing — the per-append append/admission work is byte-identical to the
+                // per-message arm; only the session->actor handoff was batched, so the single total order
+                // and I2 for other records are untouched.
+                Command::ProduceNoReplyBatch { appends } => {
+                    for append in &appends {
+                        process_produce(&mut engine, &mut pending, append, None);
+                    }
                 }
                 // A non-produce job must observe a consistent durable head and keep the total durable
                 // order, so flush the parked produces (one fsync) BEFORE it runs.
