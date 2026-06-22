@@ -472,6 +472,61 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
     }
 }
 
+/// The OWASP-recommended Argon2id EDGE profile (#631, `docs/AUTHENTICATION.md`): memory cost m = 19
+/// MiB (in KiB units, the `argon2` crate's unit), time cost t = 2, parallelism p = 1. These are the
+/// parameters the `ironbus server passwd` minting path stamps into the PHC string; the broker only
+/// VERIFIES, so it reads the m/t/p back out of each stored PHC string (rotation can mix profiles).
+const ARGON2ID_EDGE_M_COST_KIB: u32 = 19 * 1024;
+const ARGON2ID_EDGE_T_COST: u32 = 2;
+const ARGON2ID_EDGE_P_COST: u32 = 1;
+
+/// The salt length in bytes for a minted Argon2id PHC string (#631): 16 bytes (128 bits) of OS CSPRNG
+/// randomness, the `RustCrypto` / OWASP default. Per-credential, stored self-describing in the PHC string.
+const ARGON2ID_SALT_LEN: usize = 16;
+
+/// Mints a fresh Argon2id PHC string for `password` at the OWASP edge profile (#631), for the
+/// `ironbus server passwd` operator tool. The salt is 16 bytes of OS CSPRNG randomness (per
+/// credential), and the returned PHC string is SELF-DESCRIBING (it carries its own m/t/p and salt), so
+/// the broker can later verify against it with no out-of-band parameters. This is the ONLY place the
+/// broker codebase HASHES a password for storage; the verify path ([`AuthConfig::authenticate_password`])
+/// reads the parameters back out of the stored string.
+///
+/// The plaintext `password` is borrowed and never retained, logged, or echoed here; the caller owns
+/// reading it securely and zeroizing its buffer. The output is a HASH (a secret-at-rest the operator
+/// writes to the `0o600` identity table), never the plaintext.
+///
+/// # Errors
+/// A string naming the failure if the OS CSPRNG read fails or the hasher rejects the parameters
+/// (neither happens with the fixed edge profile in practice; surfaced rather than panicked so the CLI
+/// reports a clean error).
+pub fn mint_password_phc(password: &[u8]) -> Result<String, String> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    // 16 bytes of OS CSPRNG randomness for the per-credential salt. getrandom reads the OS CSPRNG
+    // (`getrandom(2)` on Linux/musl), so the salt is cryptographically random, not derived from a
+    // seedable PRNG.
+    let mut salt_bytes = [0u8; ARGON2ID_SALT_LEN];
+    getrandom::getrandom(&mut salt_bytes)
+        .map_err(|e| format!("could not read the OS CSPRNG for a password salt: {e}"))?;
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|e| format!("could not encode the password salt: {e}"))?;
+
+    let params = Params::new(
+        ARGON2ID_EDGE_M_COST_KIB,
+        ARGON2ID_EDGE_T_COST,
+        ARGON2ID_EDGE_P_COST,
+        None,
+    )
+    .map_err(|e| format!("invalid Argon2id parameters: {e}"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let phc = argon2
+        .hash_password(password, &salt)
+        .map_err(|e| format!("could not hash the password: {e}"))?
+        .to_string();
+    Ok(phc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +762,48 @@ mod tests {
         assert!(parse_token_digest_hex("not-hex").is_err());
         assert!(parse_token_digest_hex(&"zz".repeat(32)).is_err());
         assert!(parse_token_digest_hex(&"ab".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn mint_password_phc_round_trips_through_the_verify_path_and_salts_uniquely() {
+        // The `ironbus server passwd` minting path (#631): a minted PHC verifies the right password and
+        // rejects the wrong one, AND a freshly minted hash for the SAME password is DIFFERENT each time
+        // (a fresh random salt), so two operators setting the same password never collide on the hash.
+        let phc1 = mint_password_phc(b"correct horse battery staple").unwrap();
+        let phc2 = mint_password_phc(b"correct horse battery staple").unwrap();
+        assert_ne!(phc1, phc2, "each mint must use a fresh random salt");
+        // It is a self-describing Argon2id PHC string carrying the edge profile.
+        assert!(phc1.starts_with("$argon2id$"), "minted: {phc1}");
+        assert!(
+            phc1.contains("m=19456"),
+            "edge m=19 MiB (19456 KiB): {phc1}"
+        );
+        assert!(
+            phc1.contains("t=2") && phc1.contains("p=1"),
+            "edge t/p: {phc1}"
+        );
+
+        // Wire the minted hash into an identity and verify through the SAME path the broker uses.
+        let mut cfg = AuthConfig::new();
+        cfg.add_identity(Identity {
+            name: "human".to_string(),
+            scopes: ScopeSet::from_scopes(&[Scope::Subscribe]),
+            credential: CredentialSet::Password {
+                username: "bob".to_string(),
+                phc_hashes: vec![Secret::new(phc1.into_bytes())],
+            },
+        });
+        // The right password authenticates.
+        let good = AuthCredential {
+            mechanism: WireMechanism::Password,
+            material: pack_password_material(b"bob", b"correct horse battery staple").unwrap(),
+        };
+        assert!(cfg.authenticate(&good, None).is_ok());
+        // The wrong password is the uniform violation.
+        let bad = AuthCredential {
+            mechanism: WireMechanism::Password,
+            material: pack_password_material(b"bob", b"wrong").unwrap(),
+        };
+        assert_eq!(cfg.authenticate(&bad, None).unwrap_err(), AuthError);
     }
 }

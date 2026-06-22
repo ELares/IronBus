@@ -386,8 +386,31 @@ None of the following exists in the binary today. Do not assume any of it.
 | Additive credential-set rotation (no expiry timer) | Specified, not implemented | #106 |
 | Uniform Authorization Violation `Err` (no oracle) | Specified, not implemented | #106 |
 | TLS 1.3 transport that carries the credential on a non-loopback bind | Specified | #107 |
-| Failed-auth backoff and per-source pre-auth DoS defenses | Specified | #107 |
-| Secret-file fail-closed permissions; security audit events | Specified | #109 |
+| Failed-auth lockout and per-source pre-auth DoS defenses (per-IP rate limit, half-open cap, lockout) | **IMPLEMENTED** (#633) | #633 |
+| Secret-file fail-closed permissions; security audit events | Secret-file perms IMPLEMENTED; audit events specified | #109 |
+
+## The `ironbus passwd` minting tool (#631)
+
+The operator mints and rotates username+password credentials with the
+`ironbus passwd` verb (Unix only — it relies on POSIX owner-only `0o600`
+permissions for the credential table):
+
+```
+ironbus passwd --auth-config <path> --user <name> [--scopes publish,subscribe,admin]
+               [--password-file <path>] [--remove]
+```
+
+- The password is read by **reference** — from `--password-file <path>` (a secret
+  file, itself fail-closed `0o600`-checked) or from **stdin** when no file is given
+  — never from a CLI flag or an environment variable (the [SECRETS.md](SECRETS.md)
+  rule), and is **never echoed, logged, or placed on the command line.**
+- It writes the **Argon2id PHC hash** (the OWASP edge profile m = 19 MiB, t = 2,
+  p = 1, with a per-credential 128-bit OS-CSPRNG salt) to the identity table, never
+  the plaintext. The output file is written owner-only `0o600`.
+- It **upserts**: re-running `passwd` for an existing user replaces that user's
+  password + scopes; `--remove` deletes the identity. Every other identity in the
+  table (token / mTLS / other passwords) is preserved verbatim. Rotation is the
+  two-deploy additive-set flow above (add the new hash, deploy, then remove the old).
 
 ---
 

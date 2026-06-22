@@ -593,18 +593,31 @@ throughput series array and its overflow ledger too (signed off below).
 ### Connection signals — "connz" (#572)
 
 ```
-ironbus_connections_total{state="accepted|closed|refused|authenticated"}   connection lifecycle counts by state
-ironbus_connections_open                                                   connections currently live (accepted - closed)
+ironbus_connections_total{state="accepted|closed|refused|authenticated"}                connection lifecycle counts by state
+ironbus_connections_open                                                                connections currently live (accepted - closed)
+ironbus_connections_rejected_total{reason="rate_limited|half_open_cap|locked_out|auth_failed"}  pre-auth DoS rejections by reason (#633)
 ```
 
-A single labeled counter family plus an unlabeled gauge. The `state` label is a
-fixed four-value enum — **never** a per-connection-id / per-peer label (which the
-cardinality firewall forbids). The signals are a set of shared lock-free atomics
-recorded **off the engine lock** by the wire accept loop (accept/refuse), the
-connection slot's drop guard (close), and the session's authed-flip; the scrape
-reads a snapshot off-lock. A connection accept/close/auth is normal lifecycle and a
-refuse is a cap signal — **none** is a resilience SHED, so the labeled `_total` is
-pinned only in the `(name, type)` contract, not the resilience-counter taxonomy.
+A single labeled lifecycle counter family plus an unlabeled gauge, and the pre-auth
+DoS rejection family (#633). Both label keys are **fixed enums** (`state` is
+four-valued; `reason` is four-valued) — **never** a per-connection-id / per-peer /
+per-IP label (which the cardinality firewall forbids). The signals are a set of
+shared lock-free atomics recorded **off the engine lock** by the wire accept loop
+(accept/refuse/reject), the connection slot's drop guard (close), and the session's
+authed-flip; the scrape reads a snapshot off-lock. A connection accept/close/auth is
+normal lifecycle, a refuse is a cap signal, and a `rejected_total{reason}` is a
+DoS-shed signal — **none** is a resilience SHED of a record, so the labeled `_total`s
+are pinned only in the `(name, type)` contract, not the resilience-counter taxonomy.
+
+The `reason` values: `rate_limited` (the per-source-IP connect token bucket was
+empty), `half_open_cap` (the global accepted-but-not-yet-authenticated cap was full),
+`locked_out` (the source IP was in its failed-auth cooldown), and `auth_failed` (an
+authentication attempt failed). All four defenses are O(1)-bounded and clock-injected
+(the per-IP limiter state is a bounded map with least-recently-seen eviction, so its
+memory is O(cap), not O(distinct IPs); the half-open count is one atomic), and they
+are checked at accept time **before** any handler thread or broker work. They are
+zero on a broker with no DoS defense configured; see
+[AUTHENTICATION.md](AUTHENTICATION.md) and the serve `--preauth-*` flags.
 
 ### Disk-free + durable-storage telemetry (#573)
 

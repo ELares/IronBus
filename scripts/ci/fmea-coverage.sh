@@ -68,6 +68,7 @@ F21|counters lost on crash&&counter_checkpoint_repair_total
 F22|Sequence gap&&sequence_gap
 F23|segment chain gap&&corrupt_segment_header
 F24|interleaving bug&&loom
+F25|Pre-auth credential-guessing&&auth_failure_lockout
 '
 
 if [ ! -f "$FMEA_FILE" ]; then

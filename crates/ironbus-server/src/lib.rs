@@ -12,6 +12,7 @@ pub mod health;
 pub mod liveness;
 pub mod metrics;
 pub mod obs;
+pub mod preauth;
 pub mod produce_gate;
 pub mod registry;
 pub mod rss;

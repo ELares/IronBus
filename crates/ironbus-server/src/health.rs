@@ -1134,6 +1134,25 @@ fn connz_metric_lines(connz: ConnectionMetricsSnapshot) -> String {
         authenticated = connz.authenticated,
         open = connz.currently_open,
     );
+    // The pre-auth DoS REJECTION family (#633): one LABELED counter
+    // `ironbus_connections_rejected_total{reason}` whose `reason` label is a FIXED four-value enum
+    // (rate_limited|half_open_cap|locked_out|auth_failed — NOT a per-IP / per-connection value, which
+    // is exactly the unbounded label the #576 cardinality firewall forbids), so the family is bounded
+    // BY CONSTRUCTION (`reason` is already an allowlisted bounded key). All four samples of the one
+    // family are CONTIGUOUS. A no-DoS broker reports the honest zeros — the series exist and report 0.
+    let _ = write!(
+        s,
+        "# HELP ironbus_connections_rejected_total Connections rejected by a pre-auth DoS defense by reason (#633); the `reason` label is one of rate_limited|half_open_cap|locked_out|auth_failed (rate_limited = the per-source-IP connect token bucket was empty; half_open_cap = the global accepted-but-not-yet-authenticated cap was full; locked_out = the source IP was in its failed-auth cooldown; auth_failed = an authentication attempt failed). 0 on a broker with no DoS defense configured.\n\
+         # TYPE ironbus_connections_rejected_total counter\n\
+         ironbus_connections_rejected_total{{reason=\"rate_limited\"}} {rate_limited}\n\
+         ironbus_connections_rejected_total{{reason=\"half_open_cap\"}} {half_open_cap}\n\
+         ironbus_connections_rejected_total{{reason=\"locked_out\"}} {locked_out}\n\
+         ironbus_connections_rejected_total{{reason=\"auth_failed\"}} {auth_failed}\n",
+        rate_limited = connz.rejected_rate_limited,
+        half_open_cap = connz.rejected_half_open_cap,
+        locked_out = connz.rejected_locked_out,
+        auth_failed = connz.rejected_auth_failed,
+    );
     s
 }
 
@@ -4279,6 +4298,14 @@ mod tests {
         // `ironbus_cluster_ack_total{level}`); the open gauge carries no `_total`.
         ("ironbus_connections_total", "counter"),
         ("ironbus_connections_open", "gauge"),
+        // Pre-auth DoS rejections (#633): one LABELED counter family
+        // `ironbus_connections_rejected_total{reason}` whose `reason` label is a fixed four-value enum
+        // (rate_limited|half_open_cap|locked_out|auth_failed — never a per-IP/per-connection value), so
+        // the cardinality is bounded by construction (`reason` is an allowlisted firewall key). A
+        // pre-auth rejection is a DoS-shed signal, not a resilience SHED of a record, so the labeled
+        // `_total` is pinned ONLY here (its labeled sample lines are excluded from the unlabeled-`_total`
+        // resilience-taxonomy test by construction, exactly like `ironbus_connections_total{state}`).
+        ("ironbus_connections_rejected_total", "counter"),
         // Disk-free + durable-storage telemetry (#573): the free bytes on the log's filesystem, the
         // on-disk record footprint it is measured against, and the segment-file count. All GAUGES.
         ("ironbus_disk_free_bytes", "gauge"),
