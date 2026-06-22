@@ -1879,12 +1879,19 @@ const DEFAULT_AUTH_FAILURE_LOCKOUT: u32 = 5;
 /// The per-source-IP burst the rate limiter allows above the sustained `--preauth-rate-per-ip` (#633):
 /// a small multiple of the rate, so a legitimate client's reconnect storm (e.g. after a broker
 /// restart) is absorbed without throttling, while a flood is still capped at the sustained rate.
+/// `#[cfg(unix)]`: consumed only by `build_preauth_config`, which is unix-only (`serve` is unix-only),
+/// so a non-unix `-D warnings` build would flag it as `never used` — the recurring #288/#99 footgun.
+#[cfg(unix)]
 const DEFAULT_PREAUTH_BURST_MULT: u32 = 4;
 /// The failed-auth lockout WINDOW (#633): the threshold count is over this rolling window. Generous
 /// because IronBus connections are long-lived; an honest client never makes this many failed connects.
+/// `#[cfg(unix)]` for the same reason as `DEFAULT_PREAUTH_BURST_MULT`.
+#[cfg(unix)]
 const DEFAULT_LOCKOUT_WINDOW_MS: u64 = 60_000;
 /// The failed-auth lockout COOLDOWN (#633): once locked out, a source IP's new connections are refused
 /// for this long. Long enough to blunt online guessing, short enough to self-heal a fat-fingered op.
+/// `#[cfg(unix)]` for the same reason as `DEFAULT_PREAUTH_BURST_MULT`.
+#[cfg(unix)]
 const DEFAULT_LOCKOUT_COOLDOWN_MS: u64 = 300_000;
 
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
