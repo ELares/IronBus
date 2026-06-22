@@ -4950,14 +4950,17 @@ mod tests {
         .unwrap();
         let mut expected = Vec::new();
         expected.push(1); // STREAM_WIRE_BODY_VERSION
-        // field_len = (2 + txn_id"tx") + (2 + stream_id"orders") = 4 + 8 = 12.
+                          // field_len = (2 + txn_id"tx") + (2 + stream_id"orders") = 4 + 8 = 12.
         expected.extend_from_slice(&12u16.to_le_bytes());
         expected.extend_from_slice(&2u16.to_le_bytes()); // txn_id len
         expected.extend_from_slice(b"tx");
         expected.extend_from_slice(&6u16.to_le_bytes()); // stream_id len
         expected.extend_from_slice(b"orders");
         expected.extend_from_slice(b"OPAQUE-PUB-BODY"); // the verbatim pub_body tail
-        assert_eq!(buf, expected, "the v1 TxnPrepare body wire format is frozen");
+        assert_eq!(
+            buf, expected,
+            "the v1 TxnPrepare body wire format is frozen"
+        );
     }
 
     #[test]
@@ -4971,7 +4974,10 @@ mod tests {
         expected.extend_from_slice(&4u16.to_le_bytes()); // field_len = 2 (id-len field) + 2 (id bytes)
         expected.extend_from_slice(&2u16.to_le_bytes()); // txn_id len
         expected.extend_from_slice(b"tx");
-        assert_eq!(buf, expected, "the v1 TxnResolve body wire format is frozen");
+        assert_eq!(
+            buf, expected,
+            "the v1 TxnResolve body wire format is frozen"
+        );
     }
 
     #[test]
