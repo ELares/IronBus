@@ -2683,6 +2683,68 @@ pub fn decode_txn_check_result(body: &[u8]) -> Result<TxnCheckResultBody<'_>, Bo
     Ok(TxnCheckResultBody { txn_id, decision })
 }
 
+/// The hard cap on a transaction-listener GROUP byte length the proto codecs enforce at the wire
+/// boundary (#640 part 2): the group is a producer-chosen stable routing key (e.g. its durable
+/// producer id), so this fails a hostile/oversized group closed at decode time BEFORE it crosses into
+/// the server. Sized identically to [`MAX_TXN_ID_LEN`] (256), generous for any real producer identity.
+pub const MAX_TXN_LISTEN_GROUP_LEN: usize = MAX_TXN_ID_LEN;
+
+/// A producer's TRANSACTION-LISTENER REGISTRATION (the `TxnListen` frame body, tag 49, #640 part 2):
+/// the stable listener GROUP this connection's transaction-state listener answers for. The broker binds
+/// the group to this connection so a [`crate::frame::FrameType::TxnCheck`] for an in-doubt half message
+/// owned by the group is routed to this connection — even after the original preparing connection
+/// crashed and a NEW connection re-registered the same group (the crash-and-reconnect route).
+///
+/// Layout (version+length framed, forward-compatible): `body_version: u8`
+/// ([`STREAM_WIRE_BODY_VERSION`]), `field_len: u16` (the length of the v1 block), then the v1 block:
+/// `group: u16-len + bytes`. Bytes past `field_len` (a future version's appended fields) are TOLERATED
+/// and ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxnListenBody<'a> {
+    /// The stable listener group to bind to this connection (capped at [`MAX_TXN_LISTEN_GROUP_LEN`]).
+    pub group: &'a [u8],
+}
+
+/// Encodes a `TxnListen` body onto the end of `out` (#640 part 2): the version byte, the field-block
+/// length over the `group`, then the `group`.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the group exceeds the `u16` wire limit.
+pub fn encode_txn_listen(req: &TxnListenBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&group_len.to_le_bytes());
+    out.extend_from_slice(req.group);
+    Ok(())
+}
+
+/// Decodes a `TxnListen` body (#640 part 2) into its `group`, cap-before-alloc and panic-free. A body
+/// too short for its declared block, or a group over [`MAX_TXN_LISTEN_GROUP_LEN`], is a typed
+/// [`BodyError`] (fail-closed). An EMPTY body is NOT valid ([`BodyError::Truncated`]); an empty GROUP
+/// inside a well-formed body IS valid (the broker rejects an empty group at the verb boundary).
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap group, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_txn_listen(body: &[u8]) -> Result<TxnListenBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let group_len = fr.u16()? as usize;
+    if group_len > MAX_TXN_LISTEN_GROUP_LEN {
+        return Err(BodyError::BadLength);
+    }
+    let group = fr.take(group_len)?;
+    Ok(TxnListenBody { group })
+}
+
 // ===================================================================================
 // SUBJECT-ADDRESSED WIRE BODIES (#585, V2-M2-I9): the subject->stream binding + subject-addressed
 // pub/sub verbs that complete the SUBJECTS story — BindSubject (tag 34), PubSubject (tag 35), SubSubject
@@ -5180,6 +5242,55 @@ mod tests {
             buf, expected,
             "the v1 TxnCheckResult body wire format is frozen"
         );
+    }
+
+    #[test]
+    fn txn_listen_round_trips_the_group() {
+        // #640 part 2: TxnListen carries the listener group, round-tripping (including an empty group,
+        // which the codec accepts and the verb boundary rejects).
+        for group in [b"".as_slice(), b"prod-payments-svc", b"a-uuid-1234"] {
+            let mut buf = Vec::new();
+            encode_txn_listen(&TxnListenBody { group }, &mut buf).unwrap();
+            assert_eq!(buf[0], STREAM_WIRE_BODY_VERSION);
+            assert_eq!(decode_txn_listen(&buf).unwrap().group, group);
+        }
+    }
+
+    #[test]
+    fn txn_listen_rejects_malformed_and_oversized_input() {
+        // An empty body is truncated (no version byte).
+        assert_eq!(decode_txn_listen(&[]), Err(BodyError::Truncated));
+        // A wrong body version fails closed.
+        let mut buf = Vec::new();
+        encode_txn_listen(&TxnListenBody { group: b"g" }, &mut buf).unwrap();
+        buf[0] = STREAM_WIRE_BODY_VERSION + 1;
+        assert!(matches!(
+            decode_txn_listen(&buf),
+            Err(BodyError::BadHandshakeVersion { .. })
+        ));
+        // An over-cap group is rejected by the inner cap check (cap-before-alloc).
+        let over = u16::try_from(MAX_TXN_LISTEN_GROUP_LEN + 1).unwrap();
+        let mut bad = Vec::new();
+        bad.push(STREAM_WIRE_BODY_VERSION);
+        let field_len = 2u16 + over;
+        bad.extend_from_slice(&field_len.to_le_bytes());
+        bad.extend_from_slice(&over.to_le_bytes());
+        bad.extend_from_slice(&vec![0u8; over as usize]);
+        assert_eq!(decode_txn_listen(&bad), Err(BodyError::BadLength));
+    }
+
+    #[test]
+    fn the_txn_listen_body_is_byte_frozen() {
+        // #640 part 2: pin the EXACT bytes a v1 TxnListen body produces. Layout: version,
+        // field_len(u16 LE), group(u16-len + bytes).
+        let mut buf = Vec::new();
+        encode_txn_listen(&TxnListenBody { group: b"svc" }, &mut buf).unwrap();
+        let mut expected = Vec::new();
+        expected.push(1); // STREAM_WIRE_BODY_VERSION
+        expected.extend_from_slice(&5u16.to_le_bytes()); // field_len = 2 (len field) + 3 (group bytes)
+        expected.extend_from_slice(&3u16.to_le_bytes()); // group len
+        expected.extend_from_slice(b"svc");
+        assert_eq!(buf, expected, "the v1 TxnListen body wire format is frozen");
     }
 
     #[test]
