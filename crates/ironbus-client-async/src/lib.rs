@@ -65,10 +65,11 @@ use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
     decode_not_leader, decode_pub_ack, decode_stream_info_response, encode_ack, encode_connect,
     encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_to, encode_stream_commit,
-    encode_stream_declare, encode_stream_fetch, encode_stream_info, encode_sub, encode_txn_prepare,
-    encode_txn_resolve, AckBody, AckLevel, AckOp, ConnectBody, ConsumeTier, CumulativeAckBody,
-    DeliverBody, FetchBody, PubBody, PubToBody, StreamCommitBody, StreamDeclareBody,
-    StreamFetchBody, StreamInfoBody, SubBody, TxnPrepareBody, TxnResolveBody,
+    encode_stream_declare, encode_stream_fetch, encode_stream_info, encode_sub, encode_sub_to,
+    encode_txn_prepare, encode_txn_resolve, AckBody, AckLevel, AckOp, ConnectBody, ConsumeTier,
+    CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody, StreamCommitBody,
+    StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody, TxnPrepareBody,
+    TxnResolveBody,
 };
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1012,6 +1013,38 @@ impl AsyncClient {
                     .map_err(|_| ClientError::BadResponse("publish-to reply was not an offset"))?;
                 Ok(ack.offset)
             }
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Subscribes this connection's consume path to a NAMED stream's work-group (#588): the `SubTo`
+    /// verb, the stream-addressed twin of [`AsyncClient::subscribe`]. The async port of
+    /// [`ironbus_client::Client::subscribe_to`]. Subsequent [`AsyncClient::fetch`] and
+    /// [`AsyncClient::ack`] consume from and commit to THAT stream's own competing work-group
+    /// (independent per stream). The stream must already exist (declare or publish to it first); an EMPTY
+    /// `stream` targets the default stream (equivalent to [`AsyncClient::subscribe`]). Requires the
+    /// stream-addressing capability (see [`AsyncClient::declare_stream`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the subscription (capability not negotiated,
+    /// an unknown stream, or a malformed name), [`ClientError::Body`] on an over-large field, or a
+    /// frame/connection error.
+    pub async fn subscribe_to(&mut self, stream: &str, group: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::SubTo, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::Ok, _) => Ok(()),
             (FrameType::Err, body) => {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
             }
