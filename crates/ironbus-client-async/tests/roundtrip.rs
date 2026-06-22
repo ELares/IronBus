@@ -7,8 +7,8 @@
 //! a BLOCKING std thread; the async client connects to it over loopback via `tokio::net::TcpStream`.
 //! This proves the async client speaks the same wire as the broker, end to end.
 
-use ironbus_client_async::proto::PubBody;
-use ironbus_client_async::AsyncClient;
+use ironbus_client_async::proto::{ConsumeTier, PubBody};
+use ironbus_client_async::{AsyncClient, ClientConfig, StreamConsumerConfig};
 use ironbus_core::clock::Clock;
 use ironbus_core::delivery::DeliveryConfig;
 use ironbus_core::lease::LeaseConfig;
@@ -246,6 +246,280 @@ async fn async_coalescing_faf_producer_flushes_and_leaves_no_desync() {
     assert_eq!(fetched.messages.len(), 3, "all three records are delivered");
     assert_eq!(fetched.messages[2].payload, b"awaited-2");
 
+    shutdown.store(true, Ordering::Release);
+    handle.join().unwrap();
+}
+
+/// A `ClientConfig` that advertises the stream-addressing capability (#588), so the server confirms
+/// `streams_enabled()` and the stream-addressed verbs are accepted.
+fn config_understanding_streams() -> ClientConfig {
+    ClientConfig {
+        understands_streams: true,
+        ..ClientConfig::default()
+    }
+}
+
+/// A `ClientConfig` that negotiates Tier-S (#543 / #550): advertises streaming + `DeliverBatch` and
+/// requests the streaming connection default, so a SUB auto-marks its group streaming server-side — the
+/// wiring the durable [`AsyncStreamingConsumer`] rides on.
+fn config_streaming() -> ClientConfig {
+    ClientConfig {
+        understands_streaming: true,
+        default_consume_tier: Some(ConsumeTier::Streaming),
+        understands_deliver_batch: true,
+        ..ClientConfig::default()
+    }
+}
+
+/// The LOAD-BEARING producer path for the gateway migration: `produce_window` writes a window of N
+/// publishes with one coalesced write and drains N `PubAck`s FIFO, returning the offsets in input order.
+/// This proves the pipelined durable producer is wire-compatible end to end against the real broker:
+/// the window's offsets are `0..N` in order, and every record fetches back in the same order.
+#[tokio::test]
+async fn async_produce_window_returns_fifo_offsets_against_a_real_server() {
+    let (addr, shutdown, handle) = start_server();
+
+    let mut c = AsyncClient::connect(addr).await.unwrap();
+
+    // A window of five durable publishes in ONE pipelined batch.
+    let payloads: [&[u8]; 5] = [b"w0", b"w1", b"w2", b"w3", b"w4"];
+    let window: Vec<PubBody<'_>> = payloads
+        .iter()
+        .map(|p| PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        })
+        .collect();
+
+    let acks = c.produce_window(&window).await.unwrap();
+    assert_eq!(acks.len(), 5, "one ack per windowed publish");
+    let offsets: Vec<u64> = acks.iter().map(|a| a.offset).collect();
+    assert_eq!(
+        offsets,
+        vec![0, 1, 2, 3, 4],
+        "the window's acks are FIFO: the Nth ack belongs to the Nth publish"
+    );
+    assert!(
+        acks.iter().all(|a| !a.duplicate),
+        "no dedup blocks set, so no slot is a duplicate"
+    );
+
+    // An empty window never touches the wire and leaves the connection framed.
+    assert!(
+        c.produce_window(&[]).await.unwrap().is_empty(),
+        "an empty window is a no-op empty vec"
+    );
+
+    // Every windowed record is durable and fetches back in order.
+    c.subscribe("workers").await.unwrap();
+    let fetched = c.fetch(10).await.unwrap();
+    assert_eq!(fetched.messages.len(), 5, "all five records are delivered");
+    for (i, payload) in payloads.iter().enumerate() {
+        assert_eq!(fetched.messages[i].payload, *payload);
+        assert_eq!(fetched.messages[i].offset, i as u64);
+    }
+
+    shutdown.store(true, Ordering::Release);
+    handle.join().unwrap();
+}
+
+/// The stream-addressed verbs end to end (#588): a streams-capable async client DECLARES a named
+/// stream, queries its `stream_info`, PUBLISHES to it by id (offset 0), and consumes the record back
+/// via the named stream's own work-group (`subscribe_to` + `fetch` + `ack`). Proves `declare_stream` /
+/// `stream_info` / `publish_to` are wire-compatible with the broker.
+#[tokio::test]
+async fn async_stream_addressed_declare_publish_consume_round_trip() {
+    let (addr, shutdown, handle) = start_server();
+
+    let mut c = AsyncClient::connect_with(addr, &config_understanding_streams())
+        .await
+        .unwrap();
+    assert!(
+        c.streams_enabled(),
+        "the server confirms stream addressing for a client that advertised it"
+    );
+
+    // A query before declare: the named stream does not exist yet.
+    let (exists, _head) = c.stream_info("s").await.unwrap();
+    assert!(!exists, "an undeclared named stream does not exist");
+
+    // Declare it (idempotent), then a re-declare is still Ok.
+    c.declare_stream("s").await.unwrap();
+    c.declare_stream("s").await.unwrap();
+    let (exists, head) = c.stream_info("s").await.unwrap();
+    assert!(exists, "the declared named stream now exists");
+    assert_eq!(head, 0, "a freshly declared stream has an empty head");
+
+    // Publish to the NAMED stream by id: the first record lands at the stream's OWN offset 0.
+    let off = c
+        .publish_to(
+            "s",
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"stream-record",
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        off, 0,
+        "the named stream has its own offset space starting at 0"
+    );
+
+    let (_exists, head) = c.stream_info("s").await.unwrap();
+    assert_eq!(head, 1, "the named stream's durable head advanced by one");
+
+    // Subscribe to the named stream's work-group and consume + ack the record via that group.
+    c.subscribe_to("s", "g").await.unwrap();
+    let fetched = c.fetch(10).await.unwrap();
+    assert_eq!(
+        fetched.messages.len(),
+        1,
+        "the named-stream record is delivered"
+    );
+    assert_eq!(
+        fetched.messages[0].payload, b"stream-record",
+        "the named-stream payload round-trips byte-for-byte"
+    );
+    assert_eq!(fetched.messages[0].offset, 0);
+    assert!(
+        c.ack(fetched.messages[0].offset, fetched.messages[0].generation)
+            .await
+            .unwrap(),
+        "the named-stream record acks"
+    );
+
+    shutdown.store(true, Ordering::Release);
+    handle.join().unwrap();
+}
+
+/// The DURABLE Tier-S streaming consume path end to end (#544 / #550): produce a prefix to the default
+/// stream, then consume it with the batched-default [`AsyncStreamingConsumer`] (windowed `stream_fetch`
+/// + PERIODIC cumulative `stream_commit`, the consumer-managed-offset NATS-pull contract). The payloads
+/// match in order and the commit advances; a FRESH streaming consumer resuming from the committed offset
+/// sees NOTHING, proving the periodic cumulative commit durably advanced the cursor. This is the path a
+/// JetStream-pull-style durable named-stream consumer reuses.
+#[tokio::test]
+async fn async_streaming_consumer_durably_consumes_and_commits_against_a_real_server() {
+    let (addr, shutdown, handle) = start_server();
+
+    // Produce a durable prefix of 10 records to the default stream.
+    {
+        let mut p = AsyncClient::connect(addr).await.unwrap();
+        for i in 0..10u64 {
+            p.produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: &[(i & 0xff) as u8],
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    // A Tier-S consumer subscribed to a streaming group consumes in windows of 4 with a commit cadence
+    // of 2 (commit after windows 2 and 3 — periodic, NOT per record). Read-ahead off keeps the assertions
+    // on committed/next offsets deterministic.
+    let mut c = AsyncClient::connect_with(addr, &config_streaming())
+        .await
+        .unwrap();
+    assert!(
+        c.streaming_enabled(),
+        "the server confirmed the streaming tier"
+    );
+    c.subscribe("s").await.unwrap();
+
+    let cfg = StreamConsumerConfig {
+        max_records: 4,
+        max_bytes: 0,
+        commit_every_batches: 2,
+        start_offset: 0,
+        read_ahead: false,
+    };
+
+    let mut seen = Vec::new();
+    {
+        let mut consumer = c.streaming_consumer_with("s", &cfg);
+
+        let b0 = consumer.next_batch().await.unwrap();
+        assert_eq!(
+            b0.messages.len(),
+            4,
+            "window one is a full batch, not one record"
+        );
+        assert_eq!(b0.messages[0].offset, 0);
+        for m in &b0.messages {
+            seen.push(m.offset);
+        }
+        assert_eq!(
+            consumer.committed_offset(),
+            0,
+            "no commit after one window (cadence 2)"
+        );
+        assert_eq!(consumer.next_offset(), 4);
+
+        let b1 = consumer.next_batch().await.unwrap();
+        assert_eq!(b1.messages.len(), 4);
+        for m in &b1.messages {
+            seen.push(m.offset);
+        }
+        // The cadence (2) is reached: the cumulative commit covers offsets [0, 8).
+        assert_eq!(
+            consumer.committed_offset(),
+            8,
+            "periodic commit after two windows"
+        );
+
+        let b2 = consumer.next_batch().await.unwrap();
+        assert_eq!(b2.messages.len(), 2, "the short tail window");
+        for m in &b2.messages {
+            seen.push(m.offset);
+        }
+        assert_eq!(consumer.next_offset(), 10);
+
+        // Drained: an empty window flushes the final commit so the whole prefix is durable.
+        let b3 = consumer.next_batch().await.unwrap();
+        assert!(b3.is_empty(), "the stream has drained to its head");
+        assert_eq!(
+            consumer.committed_offset(),
+            10,
+            "the drain flushed the final commit"
+        );
+    }
+    assert_eq!(
+        seen,
+        (0..10).collect::<Vec<u64>>(),
+        "all ten records were delivered in order"
+    );
+    drop(c);
+
+    // A fresh streaming consumer resuming from the committed offset sees nothing: the periodic
+    // cumulative commit durably advanced the group cursor past every record (no per-record ack needed).
+    let mut c2 = AsyncClient::connect_with(addr, &config_streaming())
+        .await
+        .unwrap();
+    c2.subscribe("s").await.unwrap();
+    let resumed = c2.stream_fetch(10, 16, 0).await.unwrap();
+    assert!(
+        resumed.messages.is_empty(),
+        "everything below offset 10 was durably committed"
+    );
+
+    drop(c2);
     shutdown.store(true, Ordering::Release);
     handle.join().unwrap();
 }

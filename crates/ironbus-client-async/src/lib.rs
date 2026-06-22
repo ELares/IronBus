@@ -63,10 +63,13 @@ use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
-    decode_not_leader, decode_pub_ack, encode_ack, encode_connect, encode_cumulative_ack,
-    encode_fetch, encode_pub, encode_sub, encode_txn_prepare, encode_txn_resolve, AckBody,
-    AckLevel, AckOp, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody,
-    SubBody, TxnPrepareBody, TxnResolveBody,
+    decode_not_leader, decode_pub_ack, decode_stream_info_response, encode_ack, encode_connect,
+    encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_to, encode_stream_commit,
+    encode_stream_declare, encode_stream_fetch, encode_stream_info, encode_sub, encode_sub_to,
+    encode_txn_prepare, encode_txn_resolve, AckBody, AckLevel, AckOp, ConnectBody, ConsumeTier,
+    CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody, StreamCommitBody,
+    StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody, TxnPrepareBody,
+    TxnResolveBody,
 };
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -77,7 +80,9 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 // directly. They are the SYNC client's types, shared unchanged — the wire contract is identical.
 #[doc(no_inline)]
 pub use ironbus_client::{
-    ClientConfig, ClientError, DeadLetter, Fetch, Gap, Message, ProduceAck, Truncation, TxnId,
+    ClientConfig, ClientError, DeadLetter, Fetch, Gap, Message, ProduceAck, StreamBatch,
+    StreamConsumerConfig, Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES,
+    DEFAULT_STREAM_FETCH_RECORDS,
 };
 
 /// The proto body/codec types a caller constructs to drive [`AsyncClient`] (e.g. [`PubBody`]),
@@ -104,6 +109,55 @@ fn not_leader_error(body: &[u8]) -> ClientError {
         }
     });
     ClientError::NotLeader { leader_hint }
+}
+
+/// One produce reply, classified by [`classify_pub_reply`]: the single decode point the pipelined
+/// [`AsyncClient::produce_window`] drain shares, mirroring the sync client's `PubReply`. The decode is
+/// IO-free; only the surrounding `read_frame` awaits.
+#[derive(Debug)]
+enum PubReply {
+    Acked(u64),
+    Duplicate(u64),
+    ServerErr(String),
+    Pong,
+    /// A cluster `NotLeader` redirect (#735): the produce landed on a non-leader replica and was NOT
+    /// appended/acked; the leader's CLIENT-address hint (or `None` when unknown).
+    NotLeader(Option<String>),
+}
+
+/// Classifies one produce reply frame into a [`PubReply`]. A verbatim port of the sync client's
+/// `classify_pub_reply` — the decode/match logic is IO-free and identical; only the caller's
+/// `read_frame` awaits.
+fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientError> {
+    match ty {
+        FrameType::PubAck => {
+            let ack = decode_pub_ack(body).map_err(|_| {
+                ClientError::BadResponse("produce reply was not an eight-byte offset")
+            })?;
+            Ok(PubReply::Acked(ack.offset))
+        }
+        FrameType::PubAckDuplicate => {
+            let ack = decode_pub_ack(body).map_err(|_| {
+                ClientError::BadResponse("dedup-hit reply was not an eight-byte offset")
+            })?;
+            Ok(PubReply::Duplicate(ack.offset))
+        }
+        FrameType::Err => Ok(PubReply::ServerErr(String::from_utf8_lossy(body).into())),
+        FrameType::Pong => Ok(PubReply::Pong),
+        // A cluster NotLeader redirect (#735): decode the leader hint (an empty hint -> `None`). The
+        // produce was NOT appended/acked here; the caller reconnects/retries to the leader.
+        FrameType::NotLeader => {
+            let redirect = decode_not_leader(body)
+                .map_err(|_| ClientError::BadResponse("malformed NotLeader redirect body"))?;
+            let hint = if redirect.leader_hint.is_empty() {
+                None
+            } else {
+                Some(redirect.leader_hint.to_string())
+            };
+            Ok(PubReply::NotLeader(hint))
+        }
+        other => Err(ClientError::Unexpected(other)),
+    }
 }
 
 /// Ingests one decoded delivery into the fetch result, applying the SAME transparent broker-side
@@ -433,6 +487,86 @@ impl AsyncClient {
         encode_pub(&faf, &mut body).map_err(ClientError::Body)?;
         self.send(FrameType::Pub, &body).await?;
         Ok(())
+    }
+
+    /// Produces a WINDOW of messages PIPELINED (#450): every `Pub` frame is written before any ack is
+    /// awaited, so the broker's group commit covers the whole window with ONE `fdatasync` instead of one
+    /// per message. The async port of [`ironbus_client::Client::produce_window`]. The replies are FIFO in
+    /// frame order, the per-connection wire contract, so the Nth returned ack belongs to the Nth message.
+    /// Every ack keeps the unchanged at-least-once meaning: the record is fsynced-durable before the ack
+    /// exists. Pipelining changes WHEN the client awaits, never what an ack means.
+    ///
+    /// Per-message `dedup` blocks are honored exactly as in [`AsyncClient::produce_dedup`] (a dedup hit
+    /// returns `duplicate = true` for that slot). The `fire_and_forget` field is forced clear on every
+    /// message: a QoS-0 produce has no reply and would desynchronize the FIFO window; use
+    /// [`AsyncClient::produce_fire_and_forget`] for that path.
+    ///
+    /// Keep the window BOUNDED (within the consumer/produce credit): an unbounded write-all-then-drain
+    /// can deadlock against the socket buffers, exactly as the sync method cautions.
+    ///
+    /// On a server `Err` reply mid-window, the REMAINING replies are still drained (one reply per message
+    /// is the contract, so the connection stays usable for the next call) and the FIRST error returns; a
+    /// `NotLeader` redirect is surfaced the same way (the produces did NOT land). An IO error or an
+    /// unexpected frame type aborts immediately: the stream itself is broken and the connection should be
+    /// dropped. An empty window returns an empty vec without touching the wire.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, an over-large field, an unexpected frame, or the first
+    /// server error (or `NotLeader` redirect) in the window.
+    pub async fn produce_window(
+        &mut self,
+        messages: &[PubBody<'_>],
+    ) -> Result<Vec<ProduceAck>, ClientError> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Phase 1: encode the WHOLE window into ONE buffer and write it with ONE syscall — what puts all
+        // N produces in front of the actor's drain loop as one group-commit batch (#450). The
+        // `fire_and_forget` bit is forced clear so a QoS-0 produce never desynchronizes the FIFO window.
+        let mut body = Vec::new();
+        let mut wire = Vec::with_capacity(messages.len() * 64);
+        for message in messages {
+            body.clear();
+            let at_least_once = PubBody {
+                fire_and_forget: false,
+                ..*message
+            };
+            encode_pub(&at_least_once, &mut body).map_err(ClientError::Body)?;
+            encode_frame(FrameType::Pub, &body, &mut wire).map_err(ClientError::Frame)?;
+        }
+        self.stream.write_all(&wire).await?;
+        // Phase 2: drain exactly one reply per message, FIFO. A server Err (or NotLeader redirect)
+        // consumes its slot and is remembered; the drain continues so the connection is not desynchronized.
+        let mut acks = Vec::with_capacity(messages.len());
+        let mut first_err: Option<ClientError> = None;
+        for _ in 0..messages.len() {
+            let (ty, body) = self.read_frame().await?;
+            match classify_pub_reply(ty, &body)? {
+                PubReply::Acked(offset) => acks.push(ProduceAck {
+                    offset,
+                    duplicate: false,
+                }),
+                PubReply::Duplicate(offset) => acks.push(ProduceAck {
+                    offset,
+                    duplicate: true,
+                }),
+                PubReply::ServerErr(msg) => {
+                    if first_err.is_none() {
+                        first_err = Some(ClientError::Server(msg));
+                    }
+                }
+                PubReply::NotLeader(leader_hint) => {
+                    if first_err.is_none() {
+                        first_err = Some(ClientError::NotLeader { leader_hint });
+                    }
+                }
+                PubReply::Pong => return Err(ClientError::Unexpected(FrameType::Pong)),
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(acks),
+        }
     }
 
     /// Fetches up to `max` messages. Returns the delivered messages (possibly fewer, or none).
@@ -771,6 +905,305 @@ impl AsyncClient {
         self.read_fetch_response(limit).await
     }
 
+    // ---- stream-addressed wire verbs (#588) ----
+
+    /// CREATE-OR-ENSURE a NAMED stream by id (#588): the `StreamDeclare` verb. The async port of
+    /// [`ironbus_client::Client::declare_stream`]. Idempotent — re-declaring an existing stream is a
+    /// no-op success — and the broker materializes the stream's independent log on the first declare.
+    /// Requires the connection to have negotiated stream addressing
+    /// ([`ClientConfig::understands_streams`] AND the server confirming it, observable via
+    /// [`AsyncClient::streams_enabled`]); a server that did not negotiate it replies an `Err`. The
+    /// default stream (the empty name) is always present and need not be declared.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the declare (capability not negotiated, or
+    /// a malformed/over-long name), [`ClientError::Body`] on an over-large field, or a frame/connection
+    /// error.
+    pub async fn declare_stream(&mut self, stream: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_stream_declare(
+            &StreamDeclareBody {
+                stream_id: stream.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::StreamDeclare, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Queries a NAMED stream's existence and durable head (#588): the `StreamInfo` verb. The async port
+    /// of [`ironbus_client::Client::stream_info`]. Returns `(exists, head)` — `exists = true` and the
+    /// stream's durable head offset when the stream is open, or `(false, 0)` when it does not exist. The
+    /// default stream (the empty name) always reports `exists = true`. Requires the stream-addressing
+    /// capability (see [`AsyncClient::declare_stream`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the query (capability not negotiated, or a
+    /// malformed name), [`ClientError::Body`] on an over-large field, [`ClientError::BadResponse`] on a
+    /// malformed reply, or a frame/connection error.
+    pub async fn stream_info(&mut self, stream: &str) -> Result<(bool, u64), ClientError> {
+        let mut body = Vec::new();
+        encode_stream_info(
+            &StreamInfoBody {
+                stream_id: stream.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::StreamInfo, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::StreamInfo, body) => {
+                let resp = decode_stream_info_response(&body)
+                    .map_err(|_| ClientError::BadResponse("malformed stream-info response"))?;
+                Ok((resp.exists, resp.head))
+            }
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Publishes a message to a NAMED stream by id (#588): the `PubTo` verb, the stream-addressed twin
+    /// of [`AsyncClient::produce`]. The async port of [`ironbus_client::Client::publish_to`]. The publish
+    /// body is the SAME [`PubBody`] the default-stream produce carries, prefixed with the target stream
+    /// id, so the broker appends it to that named stream's own log and replies a `PubAck` with the
+    /// assigned offset (ack-implies-durable per stream). An EMPTY `stream` targets the default stream
+    /// (equivalent to [`AsyncClient::produce`]). The publish is at-least-once (server-ack, Level 1).
+    /// Requires the stream-addressing capability (see [`AsyncClient::declare_stream`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the publish (capability not negotiated, a
+    /// malformed name, or a non-server-ack level), [`ClientError::Body`] on an over-large field,
+    /// [`ClientError::BadResponse`] on a malformed ack, or a frame/connection error.
+    pub async fn publish_to(
+        &mut self,
+        stream: &str,
+        message: &PubBody<'_>,
+    ) -> Result<u64, ClientError> {
+        // Force at-least-once server-ack (Level 1) on the carried body: the named-stream path accepts
+        // only that level this phase, mirroring the sync `publish_to` exactly. An old caller never set a
+        // level bit, so this is a no-op for them and a guard against a mismatched method/wire for everyone.
+        let at_least_once = PubBody {
+            fire_and_forget: false,
+            ..*message
+        };
+        let mut pub_body = Vec::new();
+        encode_pub(&at_least_once, &mut pub_body).map_err(ClientError::Body)?;
+        let mut body = Vec::new();
+        encode_pub_to(
+            &PubToBody {
+                stream_id: stream.as_bytes(),
+                pub_body: &pub_body,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::PubTo, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::PubAck, body) => {
+                let ack = decode_pub_ack(&body)
+                    .map_err(|_| ClientError::BadResponse("publish-to reply was not an offset"))?;
+                Ok(ack.offset)
+            }
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Subscribes this connection's consume path to a NAMED stream's work-group (#588): the `SubTo`
+    /// verb, the stream-addressed twin of [`AsyncClient::subscribe`]. The async port of
+    /// [`ironbus_client::Client::subscribe_to`]. Subsequent [`AsyncClient::fetch`] and
+    /// [`AsyncClient::ack`] consume from and commit to THAT stream's own competing work-group
+    /// (independent per stream). The stream must already exist (declare or publish to it first); an EMPTY
+    /// `stream` targets the default stream (equivalent to [`AsyncClient::subscribe`]). Requires the
+    /// stream-addressing capability (see [`AsyncClient::declare_stream`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the subscription (capability not negotiated,
+    /// an unknown stream, or a malformed name), [`ClientError::Body`] on an over-large field, or a
+    /// frame/connection error.
+    pub async fn subscribe_to(&mut self, stream: &str, group: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::SubTo, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    // ---- durable Tier-S streaming consume (#544 / #550) ----
+
+    /// Writes ONE `StreamFetch` request (Tier-S) WITHOUT reading its response: the low-level write half
+    /// of [`AsyncClient::stream_fetch`], pulled out so an [`AsyncStreamingConsumer`] can PIPELINE the
+    /// next window's request ahead of processing the current batch (the bounded read-ahead). The matching
+    /// response is drained by [`AsyncClient::read_stream_fetch_response`]. The async port of the sync
+    /// client's `send_stream_fetch`.
+    ///
+    /// Returns the client-side `limit` (the frame cap the matching read must honor): `max_records`
+    /// capped at the negotiated per-consumer credit (#292) when the server advertised one, exactly as
+    /// the per-record and batch-pull fetches cap.
+    async fn send_stream_fetch(
+        &mut self,
+        start_offset: u64,
+        max_records: u32,
+        max_bytes: u64,
+    ) -> Result<usize, ClientError> {
+        let max_records = match self.negotiated_credit {
+            Some(credit) => max_records.min(credit),
+            None => max_records,
+        };
+        let mut body = Vec::new();
+        encode_stream_fetch(
+            &StreamFetchBody {
+                start_offset,
+                max_records,
+                max_bytes,
+            },
+            &mut body,
+        );
+        self.send(FrameType::StreamFetch, &body).await?;
+        Ok(usize::try_from(max_records).unwrap_or(usize::MAX))
+    }
+
+    /// Reads the response to a previously-sent `StreamFetch` (the read half of
+    /// [`AsyncClient::stream_fetch`]). The Tier-S delivery response is byte-for-byte a
+    /// [`AsyncClient::fetch`] response past the request frame — a run of `Deliver` (or one raw-framed
+    /// `DeliverBatch`) frames plus any advisories, terminated by exactly one `FlowEnd` — so it shares
+    /// [`AsyncClient::read_fetch_response`] verbatim (including the transparent deliver-path
+    /// decompression). The async port of the sync client's `read_stream_fetch_response`.
+    async fn read_stream_fetch_response(&mut self, limit: usize) -> Result<Fetch, ClientError> {
+        self.read_fetch_response(limit).await
+    }
+
+    /// STREAMING (Tier-S, #544 / #550) consumer-managed-offset fetch: serves a CONTIGUOUS batch of
+    /// records `[start_offset, ...)` off the durable prefix, bounded by `max_records` and `max_bytes`,
+    /// with NO lease, NO generation fence, and NO per-record cursor write. The async port of
+    /// [`ironbus_client::Client::stream_fetch`]. The consumer NAMES its own `start_offset` (normally its
+    /// last committed offset) and advances durability separately via a PERIODIC
+    /// [`AsyncClient::stream_commit`] — the Kafka / NATS-pull contract.
+    ///
+    /// AT-LEAST-ONCE holds BY CONSTRUCTION: because the consumer drives the offset, a crash or reconnect
+    /// simply re-fetches from its last committed offset and the uncommitted span redelivers. The returned
+    /// messages carry `generation = 0` (there is no fence on this path) and MUST be settled by offset via
+    /// [`AsyncClient::stream_commit`], never by [`AsyncClient::ack`].
+    ///
+    /// The connection MUST have negotiated Tier-S ([`ClientConfig::understands_streaming`], confirmed by
+    /// [`AsyncClient::streaming_enabled`]) and be subscribed to a streaming group; otherwise the server
+    /// rejects the verb with a [`ClientError::Server`]. The ergonomic batched-default loop is
+    /// [`AsyncClient::streaming_consumer`]; reach for this raw method only for precise, hand-driven control.
+    ///
+    /// - `start_offset`: the inclusive offset to begin the contiguous read at.
+    /// - `max_records`: the most records to return, capped at the negotiated per-consumer credit (#292)
+    ///   when the server advertised one.
+    /// - `max_bytes`: the byte budget (`0` = unbounded by bytes; the record count and the durable prefix
+    ///   still bind). The server applies the floor-of-one.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error (e.g. the group is not streaming, or the
+    /// connection did not negotiate Tier-S), or a server that streams more frames than the cap.
+    pub async fn stream_fetch(
+        &mut self,
+        start_offset: u64,
+        max_records: u32,
+        max_bytes: u64,
+    ) -> Result<Fetch, ClientError> {
+        let limit = self
+            .send_stream_fetch(start_offset, max_records, max_bytes)
+            .await?;
+        self.read_stream_fetch_response(limit).await
+    }
+
+    /// STREAMING (Tier-S, #544 / #550) periodic CUMULATIVE COMMIT: advances the streaming group's
+    /// committed cursor up to the EXCLUSIVE offset `up_to`. The async port of
+    /// [`ironbus_client::Client::stream_commit`]. This is the durability point of the
+    /// consumer-managed-offset model: a [`AsyncClient::stream_fetch`] never advances the cursor, so
+    /// retention is pinned only by this commit, and a crash redelivers everything fetched-but-not-yet-
+    /// committed (the at-least-once window).
+    ///
+    /// Commit PERIODICALLY (once per N batches or T milliseconds), NOT per record. A re-commit at or
+    /// below the current commit is an idempotent no-op success; the server HARD-REJECTS the verb on a
+    /// group that is not streaming. An empty `group` selects the default group.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the verb (the group is not a streaming
+    /// consumer, or `up_to` is outside the retained window), or a frame or connection error.
+    pub async fn stream_commit(&mut self, group: &str, up_to: u64) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_stream_commit(
+            &StreamCommitBody {
+                up_to,
+                group: group.as_bytes(),
+            },
+            &mut body,
+        );
+        self.send(FrameType::StreamCommit, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Opens the ERGONOMIC batched-default streaming consumer (Tier-S, #550): the high-throughput
+    /// companion to the raw [`AsyncClient::stream_fetch`] / [`AsyncClient::stream_commit`] pair, and the
+    /// recommended way to durably consume a streaming group. The async port of
+    /// [`ironbus_client::Client::streaming_consumer`]. The handle's [`AsyncStreamingConsumer::next_batch`]
+    /// loop FETCHES A WINDOW at a time, commits the offset PERIODICALLY and cumulatively rather than per
+    /// record, and PREFETCHES the next window while the caller processes the current batch — the Kafka /
+    /// NATS-pull ergonomic default.
+    ///
+    /// The connection MUST have negotiated Tier-S and be subscribed to the streaming `group` (the handle
+    /// commits to that group name) before the first batch.
+    #[must_use]
+    pub fn streaming_consumer<'a>(&'a mut self, group: &str) -> AsyncStreamingConsumer<'a> {
+        self.streaming_consumer_with(group, &StreamConsumerConfig::default())
+    }
+
+    /// Opens the batched-default streaming consumer (Tier-S, #550) with an explicit
+    /// [`StreamConsumerConfig`]: the window size, the periodic-commit cadence, the starting offset, and
+    /// whether read-ahead is on. The async port of [`ironbus_client::Client::streaming_consumer_with`].
+    /// See [`AsyncClient::streaming_consumer`] for the default-config entry point and the full contract.
+    #[must_use]
+    pub fn streaming_consumer_with<'a>(
+        &'a mut self,
+        group: &str,
+        config: &StreamConsumerConfig,
+    ) -> AsyncStreamingConsumer<'a> {
+        AsyncStreamingConsumer {
+            client: self,
+            group: group.to_string(),
+            config: config.clone(),
+            next_offset: config.start_offset,
+            committed: config.start_offset,
+            batches_since_commit: 0,
+            prefetch: None,
+            stashed: None,
+        }
+    }
+
     /// PREPAREs a transactional half-message on `stream` (a NAMED stream id; empty selects the default),
     /// returning a connection-minted [`TxnId`] for a later [`AsyncClient::commit`] /
     /// [`AsyncClient::rollback`]. The async port of [`ironbus_client::Client::prepare`].
@@ -982,5 +1415,202 @@ impl AsyncFireForgetProducer<'_> {
         self.client.stream.write_all(&self.wire).await?;
         self.wire.clear();
         Ok(())
+    }
+}
+
+/// The ERGONOMIC batched-default streaming consumer (Tier-S, #550), opened by
+/// [`AsyncClient::streaming_consumer`] / [`AsyncClient::streaming_consumer_with`]: the async twin of the
+/// sync client's [`ironbus_client::StreamConsumerConfig`]-driven `StreamingConsumer`. Per
+/// [`AsyncStreamingConsumer::next_batch`] it fetches a WINDOW (one [`AsyncClient::stream_fetch`]),
+/// commits the cumulative offset PERIODICALLY ([`AsyncClient::stream_commit`]) rather than per record,
+/// and (by default) PREFETCHES the next window while the caller processes the current one.
+///
+/// # Bounded read-ahead
+///
+/// When [`StreamConsumerConfig::read_ahead`] is on (the default), the handle pipelines the NEXT window's
+/// `StreamFetch` the instant it has read the current batch off the wire, so at most ONE window is
+/// outstanding ahead of the caller, bounded by the same `max_records` / `max_bytes` budget — the
+/// outstanding memory is at most two windows and never an unbounded buffer.
+///
+/// # At-least-once preserved
+///
+/// The handle commits only offsets it has HANDED to the caller and whose window the commit cadence has
+/// reached; a prefetched-but-not-yet-returned window is never committed. A crash redelivers every
+/// fetched-but-uncommitted record and loses nothing — the consumer-managed at-least-once contract.
+///
+/// # Errors and connection state
+///
+/// An IO error, a server error (e.g. the group is not streaming), or an unexpected frame leaves the
+/// connection state undefined: drop the underlying [`AsyncClient`]. A verbatim port of the sync
+/// `StreamingConsumer`'s FIFO discipline — the single-connection commit-on-a-clean-wire rule (drain any
+/// outstanding prefetch into the stash before a `StreamCommit`) holds identically, since the wire
+/// contract is unchanged and only the IO awaits.
+#[derive(Debug)]
+pub struct AsyncStreamingConsumer<'a> {
+    client: &'a mut AsyncClient,
+    /// The streaming group this handle commits to (the `StreamCommit` group name).
+    group: String,
+    /// The window size, commit cadence, and read-ahead policy.
+    config: StreamConsumerConfig,
+    /// The next offset to fetch from: advanced by the count of records each window delivers (the
+    /// consumer's own cursor, what a reconnect would resume from).
+    next_offset: u64,
+    /// The highest offset the handle has COMMITTED up to (exclusive). Starts at `start_offset`.
+    committed: u64,
+    /// How many windows have been fetched since the last commit; when it reaches `commit_every_batches`
+    /// the handle commits up to `next_offset` and resets this to `0`.
+    batches_since_commit: u32,
+    /// The BOUNDED read-ahead slot: `Some(limit)` when a next-window `StreamFetch` has been pipelined and
+    /// its response is not yet drained (the `limit` is the frame cap that read must honor); `None` when
+    /// no prefetch is outstanding. At most one is ever held, which bounds the read-ahead.
+    prefetch: Option<usize>,
+    /// A drained-but-not-yet-returned read-ahead window, held when [`AsyncStreamingConsumer::commit_now`]
+    /// had to clear the wire (a `StreamCommit` is a request/reply that cannot run with a prefetch response
+    /// unread on the FIFO). The next [`AsyncStreamingConsumer::next_batch`] returns this BEFORE issuing a
+    /// new fetch, so no record is lost and the at-most-one-window-ahead bound still holds.
+    stashed: Option<Fetch>,
+}
+
+impl AsyncStreamingConsumer<'_> {
+    /// The effective per-window record cap (the configured `max_records`, floored at `1` so the consumer
+    /// always makes progress). The actual pull is additionally capped at the negotiated per-consumer
+    /// credit inside [`AsyncClient::stream_fetch`].
+    fn window_records(&self) -> u32 {
+        self.config.max_records.max(1)
+    }
+
+    /// The effective commit cadence (the configured `commit_every_batches`, floored at `1`).
+    fn commit_cadence(&self) -> u32 {
+        self.config.commit_every_batches.max(1)
+    }
+
+    /// Fetches the NEXT window of streaming records (Tier-S, #550) and advances the consumer's cursor,
+    /// committing the cumulative offset PERIODICALLY (per [`StreamConsumerConfig::commit_every_batches`])
+    /// and (by default) PREFETCHING the window after this one. Returns the batch's messages and any
+    /// advisories; an EMPTY batch ([`StreamBatch::is_empty`]) means the stream has drained to its durable
+    /// head. The async port of the sync `StreamingConsumer::next_batch`.
+    ///
+    /// The caller processes the returned `messages` and then calls `next_batch` again; it does NOT ack
+    /// them individually (the handle commits cumulatively by offset). To force a commit at a precise
+    /// processed-up-to point, call [`AsyncStreamingConsumer::commit_now`] between batches.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error (the group is not streaming, or Tier-S
+    /// was not negotiated), or a malformed/over-cap response. On error the connection state is undefined;
+    /// drop the [`AsyncClient`].
+    pub async fn next_batch(&mut self) -> Result<StreamBatch, ClientError> {
+        let start = self.next_offset;
+        // Read this window, in priority order: (1) a window a precise `commit_now` already drained and
+        // stashed; (2) a pipelined read-ahead response outstanding on the wire; (3) a fresh awaited fetch.
+        // All three yield the SAME contiguous run starting at `start` — the read-ahead only moves WHEN the
+        // request was written, never WHICH records come back. A verbatim port of the sync next_batch.
+        let fetch = if let Some(stashed) = self.stashed.take() {
+            stashed
+        } else if let Some(limit) = self.prefetch.take() {
+            self.client.read_stream_fetch_response(limit).await?
+        } else {
+            self.client
+                .stream_fetch(start, self.window_records(), self.config.max_bytes)
+                .await?
+        };
+        let delivered = u64::try_from(fetch.messages.len()).unwrap_or(u64::MAX);
+        self.next_offset = self.next_offset.saturating_add(delivered);
+
+        // Periodic cumulative commit FIRST, before any read-ahead is in flight. A `StreamCommit` is a
+        // request/REPLY round-trip on this single FIFO connection: committing while a pipelined prefetch
+        // response sat unread would make the commit's `read_frame` consume the prefetch's delivery instead
+        // of the commit's `Ok`. Doing the commit on a CLEAN wire (no prefetch outstanding — the slot was
+        // `take`n above) keeps the FIFO unambiguous. An empty window does not tick the cadence (no new
+        // ground) but still flushes any pending progress so a drained stream durably checkpoints.
+        if delivered > 0 {
+            self.batches_since_commit = self.batches_since_commit.saturating_add(1);
+            if self.batches_since_commit >= self.commit_cadence() {
+                self.commit_now().await?;
+            }
+        } else {
+            self.commit_now().await?;
+        }
+
+        // Bounded read-ahead: with the commit's round-trip settled, pipeline the NEXT window's request so
+        // its response arrives while the caller processes this batch. Only when a non-empty window came
+        // back, and only ONE is ever outstanding (`self.prefetch` holds at most one slot), which bounds it.
+        if self.config.read_ahead && delivered > 0 {
+            let limit = self
+                .client
+                .send_stream_fetch(
+                    self.next_offset,
+                    self.window_records(),
+                    self.config.max_bytes,
+                )
+                .await?;
+            self.prefetch = Some(limit);
+        }
+
+        Ok(StreamBatch {
+            messages: fetch.messages,
+            dead_letters: fetch.dead_letters,
+            truncations: fetch.truncations,
+            gaps: fetch.gaps,
+        })
+    }
+
+    /// Commits the cumulative offset NOW, up to the consumer's current cursor (every record handed to the
+    /// caller so far): the precise-commit hook over the handle's periodic auto-commit. Idempotent — a
+    /// no-op when nothing new has been fetched since the last commit. The async port of the sync
+    /// `StreamingConsumer::commit_now`.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the commit (the group is not streaming, or
+    /// the offset is outside the retained window), or a frame or connection error.
+    pub async fn commit_now(&mut self) -> Result<(), ClientError> {
+        // A `StreamCommit` is a request/reply round-trip on this single FIFO connection, so it cannot run
+        // with a read-ahead response unread (the commit's `read_frame` would consume the prefetched
+        // delivery). DRAIN any outstanding prefetch into the stash first, clearing the wire WITHOUT losing
+        // the records: the next `next_batch` returns the stash. The prefetched window is NOT part of
+        // `[committed, next_offset)` (the caller has not been handed it), so committing up to `next_offset`
+        // after draining stays correct.
+        if let Some(limit) = self.prefetch.take() {
+            self.stashed = Some(self.client.read_stream_fetch_response(limit).await?);
+        }
+        if self.next_offset <= self.committed {
+            return Ok(());
+        }
+        self.client
+            .stream_commit(&self.group, self.next_offset)
+            .await?;
+        self.committed = self.next_offset;
+        self.batches_since_commit = 0;
+        Ok(())
+    }
+
+    /// Drains any outstanding read-ahead response and COMMITS the consumer's cursor, returning the final
+    /// committed offset (exclusive). Call this before dropping the handle so a pending periodic commit is
+    /// flushed and a pipelined prefetch is not left half-read on the wire. The async port of the sync
+    /// `StreamingConsumer::finish`. After this the connection is clean for the next request.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a malformed response while draining
+    /// the prefetch or committing.
+    pub async fn finish(mut self) -> Result<u64, ClientError> {
+        // `commit_now` drains any outstanding read-ahead response into the stash (leaving the wire framed)
+        // and commits up to the consumer's cursor. The stashed window's records are NOT committed (the
+        // caller never processed them), so they redeliver on the next run — the at-least-once contract.
+        self.commit_now().await?;
+        Ok(self.committed)
+    }
+
+    /// The offset the handle will fetch from next (the consumer's cursor, exclusive of everything already
+    /// delivered). A reconnect would resume from the last COMMITTED offset, not this.
+    #[must_use]
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    /// The highest offset committed so far (exclusive): the durable checkpoint a crash would resume from.
+    /// Everything in `[committed_offset(), next_offset())` is the at-least-once window that redelivers on
+    /// a crash.
+    #[must_use]
+    pub fn committed_offset(&self) -> u64 {
+        self.committed
     }
 }
