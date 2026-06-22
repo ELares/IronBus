@@ -805,6 +805,13 @@ USAGE:
     ironbus admin --health-addr <host:port>
     ironbus admin consumer-reset --data-dir <dir> --group <name> --to <offset|earliest|latest> [--json]
     ironbus admin dlq-redrive --data-dir <dir> [--json]
+    ironbus group (ls | info <name>) --data-dir <dir> [--json]
+    ironbus group reset <name> --data-dir <dir> --to <offset|earliest|latest> [--json]
+    ironbus group (purge | rm) <name> --data-dir <dir> --force [--json]
+    ironbus stream (ls | info <name> | create <name>) --data-dir <dir> [--json]
+    ironbus stream bind <subject> <stream> --data-dir <dir> [--json]
+    ironbus stream (purge | rm) <name> --data-dir <dir> --force [--json]
+    ironbus dlq (ls | peek [--limit <n>] | redrive) --data-dir <dir> [--json]
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
                   [--raw] [--require-dict]
@@ -954,6 +961,23 @@ Notes:
     re-run after a completed redrive re-injects nothing). The MUTATING WIRE admin verbs (the same
     actions on a LIVE broker) and force-reap (reaping stuck leases on a running broker) need
     connection-scoped auth and are deferred to the authed admin surface (#380/#106).
+    group and stream are OFFLINE management verbs (#586) over a STOPPED broker's --data-dir, taking
+    the same exclusive lock (refuse with exit 5 if a broker is running). group ls/info report each
+    work-group's committed offset, lag, and whether its cursor is in range; group reset is the same
+    cursor rewrite as admin consumer-reset (a convenience alias). group purge/rm DROP a group's
+    durable cursor (a missing group is not-found, exit 2). stream ls/info report each stream's
+    durable range, record count, and recovery loss bit (the default stream is the root log);
+    stream create declares a named stream's log; stream bind declares the binding's target stream
+    offline and explains that the subject->stream ROUTE itself is applied at broker runtime over the
+    wire (BindSubject, admin scope) and is not persisted in the data directory. stream purge/rm are
+    DESTRUCTIVE: they drop a named stream's records (the default stream cannot be purged here).
+    Every DESTRUCTIVE verb (group/stream purge|rm) REQUIRES an explicit --force (or --yes): without
+    it the verb REFUSES and deletes nothing (exit 1), after printing how many records/cursors it
+    would remove; under --json the flag is mandatory (there is no interactive prompt). A purge/rm of
+    a non-existent group/stream is not-found (exit 2), never a silent success.
+    dlq ls counts the dead-letter records and summarizes them by stream/group; dlq peek is the same
+    read-only dead-letter view as dump --dlq (with --limit); dlq redrive is the same crash-safe,
+    idempotent re-injection as admin dlq-redrive (a feature NATS lacks).
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
@@ -1228,6 +1252,9 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "config" => run_config(rest, out),
         "passwd" => run_passwd(rest, out),
         "admin" => run_admin(rest, out),
+        "group" => run_group(rest, out),
+        "stream" => run_stream(rest, out),
+        "dlq" => run_dlq(rest, out),
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
         "scrub" => run_scrub(rest, out),
@@ -9183,6 +9210,272 @@ fn run_admin_dlq_redrive(args: &[String], out: &mut impl Write) -> Result<(), Cl
     cmd_admin_dlq_redrive(Path::new(&data_dir), json, out)
 }
 
+// ---------------------------------------------------------------------------
+// group / stream / dlq management verbs (#586, #595): the rich-CLI lifecycle
+// surface (ls/info/reset/purge/rm, create/bind, dlq ls/peek/redrive). Every
+// verb is an OFFLINE data-dir op reusing the broker-stopped admin discipline;
+// the flag parsers are cross-platform, the data-dir mutation Unix-gated.
+// ---------------------------------------------------------------------------
+
+/// A parsed `--data-dir`/`--json`/`--force` triple plus the verb's positional argument(s), shared by
+/// the new management verbs so each parser is a thin grammar over one common option set. `--force`
+/// (aliased `--yes`) is only meaningful for the destructive verbs; a non-destructive verb rejects it.
+struct MgmtArgs {
+    /// The required `--data-dir <dir>` (every management verb is offline).
+    data_dir: String,
+    /// Whether the per-command `--json` machine-readable result was requested.
+    json: bool,
+    /// Whether the destructive-op confirmation `--force` / `--yes` was given.
+    force: bool,
+}
+
+/// Parses the shared `--data-dir`/`--json`/`--force` options for a management verb that takes a fixed
+/// number of leading POSITIONAL arguments (`positionals`, e.g. a group/stream name). Returns the
+/// positionals (in order) plus the parsed options. A missing `--data-dir`, a wrong positional count,
+/// or an unknown flag is a usage error naming the verb. `allow_force` rejects `--force` on a
+/// non-destructive verb so a stray `--force` is never silently ignored.
+fn parse_mgmt_args(
+    verb: &str,
+    args: &[String],
+    positionals: usize,
+    allow_force: bool,
+) -> Result<(Vec<String>, MgmtArgs), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut json = false;
+    let mut force = false;
+    let mut pos: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--force" | "--yes" if allow_force => {
+                force = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for {verb}")));
+            }
+            other => {
+                pos.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    if pos.len() != positionals {
+        return Err(CliError::Usage(format!(
+            "{verb} takes {positionals} positional argument(s), got {}",
+            pos.len()
+        )));
+    }
+    let data_dir =
+        data_dir.ok_or_else(|| CliError::Usage(format!("{verb} requires `--data-dir <dir>`")))?;
+    Ok((
+        pos,
+        MgmtArgs {
+            data_dir,
+            json,
+            force,
+        },
+    ))
+}
+
+/// Dispatches the `group` verb (#586): `ls`/`info`/`reset`/`purge`/`rm`. Each reuses the offline
+/// admin storage ops over a STOPPED broker's data dir. `reset` is a convenience alias for
+/// `admin consumer-reset`.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing/unknown subcommand or flag; the per-verb cmd handlers map the
+/// storage errors onto the frozen offline exit codes.
+fn run_group(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let (sub, rest) = args.split_first().ok_or_else(|| {
+        CliError::Usage("group needs a subcommand (ls|info|reset|purge|rm)".to_string())
+    })?;
+    match sub.as_str() {
+        "ls" => {
+            let (_pos, m) = parse_mgmt_args("group ls", rest, 0, false)?;
+            cmd_group_ls(Path::new(&m.data_dir), m.json, out)
+        }
+        "info" => {
+            let (pos, m) = parse_mgmt_args("group info", rest, 1, false)?;
+            cmd_group_info(Path::new(&m.data_dir), &pos[0], m.json, out)
+        }
+        "reset" => run_group_reset(rest, out),
+        "purge" => {
+            let (pos, m) = parse_mgmt_args("group purge", rest, 1, true)?;
+            cmd_group_drop(
+                Path::new(&m.data_dir),
+                &pos[0],
+                "purge",
+                m.force,
+                m.json,
+                out,
+            )
+        }
+        "rm" => {
+            let (pos, m) = parse_mgmt_args("group rm", rest, 1, true)?;
+            cmd_group_drop(Path::new(&m.data_dir), &pos[0], "rm", m.force, m.json, out)
+        }
+        other => Err(CliError::Usage(format!(
+            "unknown group subcommand `{other}` (expected ls|info|reset|purge|rm)"
+        ))),
+    }
+}
+
+/// Parses `group reset <name> --data-dir <dir> --to <...>`: the convenience alias for
+/// `admin consumer-reset`, sharing its exact cursor-rewrite cmd handler so the two never diverge.
+fn run_group_reset(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut json = false;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--to" => to = Some(take_value("--to", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for group reset"
+                )));
+            }
+            other if name.is_none() => {
+                name = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "group reset takes one positional <name>, got an extra `{other}`"
+                )));
+            }
+        }
+    }
+    let name = name.ok_or_else(|| {
+        CliError::Usage(
+            "group reset requires a <name> (use \"\" for the default group)".to_string(),
+        )
+    })?;
+    let data_dir = data_dir
+        .ok_or_else(|| CliError::Usage("group reset requires `--data-dir <dir>`".to_string()))?;
+    let to = to.ok_or_else(|| {
+        CliError::Usage("group reset requires `--to <offset|earliest|latest>`".to_string())
+    })?;
+    let target = parse_reset_target(&to)?;
+    // Reuse the exact offline consumer-reset cmd handler (broker-stopped lock + cursor rewrite).
+    cmd_admin_consumer_reset(Path::new(&data_dir), &name, target, json, out)
+}
+
+/// Dispatches the `stream` verb (#586): `ls`/`info`/`create`/`bind`/`purge`/`rm`.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing/unknown subcommand or flag.
+fn run_stream(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let (sub, rest) = args.split_first().ok_or_else(|| {
+        CliError::Usage("stream needs a subcommand (ls|info|create|bind|purge|rm)".to_string())
+    })?;
+    match sub.as_str() {
+        "ls" => {
+            let (_pos, m) = parse_mgmt_args("stream ls", rest, 0, false)?;
+            cmd_stream_ls(Path::new(&m.data_dir), m.json, out)
+        }
+        "info" => {
+            let (pos, m) = parse_mgmt_args("stream info", rest, 1, false)?;
+            cmd_stream_info(Path::new(&m.data_dir), &pos[0], m.json, out)
+        }
+        "create" => {
+            let (pos, m) = parse_mgmt_args("stream create", rest, 1, false)?;
+            cmd_stream_create(Path::new(&m.data_dir), &pos[0], m.json, out)
+        }
+        "bind" => {
+            let (pos, m) = parse_mgmt_args("stream bind", rest, 2, false)?;
+            cmd_stream_bind(Path::new(&m.data_dir), &pos[0], &pos[1], m.json, out)
+        }
+        "purge" => {
+            let (pos, m) = parse_mgmt_args("stream purge", rest, 1, true)?;
+            cmd_stream_purge(
+                Path::new(&m.data_dir),
+                &pos[0],
+                "purge",
+                m.force,
+                m.json,
+                out,
+            )
+        }
+        "rm" => {
+            let (pos, m) = parse_mgmt_args("stream rm", rest, 1, true)?;
+            cmd_stream_purge(Path::new(&m.data_dir), &pos[0], "rm", m.force, m.json, out)
+        }
+        other => Err(CliError::Usage(format!(
+            "unknown stream subcommand `{other}` (expected ls|info|create|bind|purge|rm)"
+        ))),
+    }
+}
+
+/// Dispatches the `dlq` verb (#595): `ls`/`peek`/`redrive`. `peek` reuses the `dump --dlq` reader and
+/// `redrive` reuses the `admin dlq-redrive` cmd handler, so the dead-letter surface is one
+/// implementation across the three entry points.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing/unknown subcommand or flag.
+fn run_dlq(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let (sub, rest) = args
+        .split_first()
+        .ok_or_else(|| CliError::Usage("dlq needs a subcommand (ls|peek|redrive)".to_string()))?;
+    match sub.as_str() {
+        "ls" => {
+            let (_pos, m) = parse_mgmt_args("dlq ls", rest, 0, false)?;
+            cmd_dlq_ls(Path::new(&m.data_dir), m.json, out)
+        }
+        "peek" => run_dlq_peek(rest, out),
+        "redrive" => {
+            let (_pos, m) = parse_mgmt_args("dlq redrive", rest, 0, false)?;
+            cmd_admin_dlq_redrive(Path::new(&m.data_dir), m.json, out)
+        }
+        other => Err(CliError::Usage(format!(
+            "unknown dlq subcommand `{other}` (expected ls|peek|redrive)"
+        ))),
+    }
+}
+
+/// Parses `dlq peek --data-dir <dir> [--limit <n>] [--json]`: the read-only dead-letter view, reusing
+/// the exact `dump --dlq` reader cmd handler.
+fn run_dlq_peek(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut limit: Option<u64> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--limit" => limit = Some(take_number("--limit", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for dlq peek"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "dlq peek takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir = data_dir
+        .ok_or_else(|| CliError::Usage("dlq peek requires `--data-dir <dir>`".to_string()))?;
+    cmd_inspect_dlq(Path::new(&data_dir), limit, json, out)
+}
+
 /// Fetches and renders the `/admin` v1 view (#15, #99). Kept apart from [`run_admin`] (the flag
 /// parser) so the fetch-parse-render pipeline is callable directly.
 fn cmd_admin(health_addr: &str, out: &mut impl Write) -> Result<(), CliError> {
@@ -10948,6 +11241,624 @@ fn cmd_admin_dlq_redrive(
     Err(CliError::Internal(
         "ironbus admin dlq-redrive requires a Unix host in v1: on-disk storage is Unix-only"
             .to_string(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// group / stream / dlq management cmd handlers (#586, #595). Unix-only (data-dir
+// ops), with non-unix stubs of IDENTICAL signatures (the recurring windows
+// footgun: a cfg(unix)-only fn called from shared code breaks the windows build).
+// ---------------------------------------------------------------------------
+
+/// The `--json` result schema versions for the new management verbs (`ironbus.cli.<verb>.vN`,
+/// `docs/CLI_CONTRACT.md`). Append-only: an additive field is no bump; a rename/removal bumps.
+#[cfg(unix)]
+const GROUP_LS_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const GROUP_INFO_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const GROUP_DROP_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const STREAM_LS_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const STREAM_INFO_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const STREAM_CREATE_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const STREAM_BIND_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const STREAM_PURGE_SCHEMA_VERSION: u32 = 1;
+#[cfg(unix)]
+const DLQ_LS_SCHEMA_VERSION: u32 = 1;
+
+/// Maps a storage [`StorageError`] from a management op onto the frozen offline exit-code scheme,
+/// reusing [`map_offline_err`] (missing dir/stream -> 2, corrupt chain -> 4, IO fault -> 70). The
+/// management ops surface a missing named stream as an `io::ErrorKind::NotFound`, which
+/// [`map_offline_err`] already classifies as exit 2.
+#[cfg(unix)]
+fn map_mgmt_storage_err(data_dir: &Path, e: &StorageError) -> CliError {
+    map_offline_err(data_dir, e)
+}
+
+/// Maps a management [`ironbus_storage::admin::AdminError`] (today only `drop_group`'s) onto the
+/// frozen exit codes: an invalid group name is a usage error (1), a storage fault the offline scheme.
+#[cfg(unix)]
+fn map_mgmt_admin_err(data_dir: &Path, e: ironbus_storage::admin::AdminError) -> CliError {
+    map_admin_err(data_dir, e)
+}
+
+/// Runs `group ls` (#586): lists every work-group's committed offset, lag, and in-range bit READ-ONLY
+/// over a STOPPED broker's data dir, via [`ironbus_storage::admin::list_group_lag`]. No lock is taken
+/// (it never mutates), matching the read-only offline verbs (`verify`/`dump`).
+#[cfg(unix)]
+fn cmd_group_ls(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let (lags, _fs) = ironbus_storage::admin::list_group_lag(StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+    if json {
+        write!(
+            out,
+            "{{\"schema\":\"ironbus.cli.group-ls.v{GROUP_LS_SCHEMA_VERSION}\",\"groups\":["
+        )?;
+        for (i, g) in lags.iter().enumerate() {
+            if i > 0 {
+                write!(out, ",")?;
+            }
+            write!(
+                out,
+                "{{\"group\":\"{}\",\"committed\":{},\"lag\":{},\"in_range\":{}}}",
+                escape_json(&g.group),
+                g.committed,
+                g.lag,
+                g.in_range,
+            )?;
+        }
+        writeln!(
+            out,
+            "],\"count\":{},\"ok\":true,\"exit_code\":0}}",
+            lags.len()
+        )?;
+    } else if lags.is_empty() {
+        writeln!(out, "no work-groups (no durable cursor checkpoints)")?;
+    } else {
+        for g in &lags {
+            let label = if g.group.is_empty() {
+                "(default)".to_string()
+            } else {
+                format!("{:?}", g.group)
+            };
+            let range = if g.in_range {
+                "in-range"
+            } else {
+                "OUT-OF-RANGE"
+            };
+            writeln!(
+                out,
+                "group {label} committed={} lag={} ({range})",
+                g.committed, g.lag,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs `group info <name>` (#586): one work-group's committed offset, lag, and in-range bit. A group
+/// with no durable cursor is NOT-FOUND (exit 2), so a typo is never a silent empty success.
+#[cfg(unix)]
+fn cmd_group_info(
+    data_dir: &Path,
+    group: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let (lags, _fs) = ironbus_storage::admin::list_group_lag(StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+    let g = lags.iter().find(|g| g.group == group).ok_or_else(|| {
+        let label = if group.is_empty() {
+            "(default)".to_string()
+        } else {
+            format!("{group:?}")
+        };
+        CliError::NotFound(format!(
+            "no work-group {label} (no durable cursor checkpoint)"
+        ))
+    })?;
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.group-info.v{GROUP_INFO_SCHEMA_VERSION}\",\"group\":\"{}\",\"committed\":{},\"lag\":{},\"in_range\":{},\"ok\":true,\"exit_code\":0}}",
+            escape_json(&g.group),
+            g.committed,
+            g.lag,
+            g.in_range,
+        )?;
+    } else {
+        let label = if g.group.is_empty() {
+            "(default)".to_string()
+        } else {
+            format!("{:?}", g.group)
+        };
+        let range = if g.in_range {
+            "in-range"
+        } else {
+            "OUT-OF-RANGE"
+        };
+        writeln!(
+            out,
+            "group {label} committed={} lag={} ({range})",
+            g.committed, g.lag,
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs `group purge`/`group rm` (#586): DROP a work-group's durable cursor checkpoint, under the
+/// exclusive data-dir lock on a STOPPED broker. DESTRUCTIVE, so it is gated on an explicit `--force`
+/// (refused otherwise, deleting nothing) and a missing group is NOT-FOUND (exit 2). `verb` is the
+/// wording (`purge`/`rm`); the durable mutation is identical (a group's only footprint is its cursor).
+#[cfg(unix)]
+fn cmd_group_drop(
+    data_dir: &Path,
+    group: &str,
+    verb: &str,
+    force: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let label = if group.is_empty() {
+        "(default)".to_string()
+    } else {
+        format!("{group:?}")
+    };
+    // Fail-closed: a destructive op REFUSES without --force, deleting nothing (exit 1). Under --json
+    // the flag is mandatory (there is no interactive prompt to fall back on).
+    if !force {
+        return Err(CliError::Usage(format!(
+            "group {verb} {label} would DROP the group's durable cursor: pass --force (or --yes) to confirm \
+             (nothing was deleted)"
+        )));
+    }
+    // Take the lock FIRST so a running broker blocks us (exit 5) before any read or write.
+    let _lock = lock_stopped_broker(data_dir, &format!("{verb} the group of"))?;
+    let outcome = ironbus_storage::admin::drop_group(&StdFs::new(data_dir.to_path_buf()), group)
+        .map_err(|e| map_mgmt_admin_err(data_dir, e))?;
+    if !outcome.existed {
+        // A missing group is not-found (exit 2): a purge/rm of a non-existent group is never a silent
+        // success (the count-of-what-was-deleted contract — there was nothing to delete).
+        return Err(CliError::NotFound(format!(
+            "no work-group {label} (no durable cursor checkpoint to {verb})"
+        )));
+    }
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.group-{verb}.v{GROUP_DROP_SCHEMA_VERSION}\",\"group\":\"{}\",\"removed\":true,\"ok\":true,\"exit_code\":0}}",
+            escape_json(group),
+        )?;
+    } else {
+        writeln!(
+            out,
+            "group {verb}: removed the durable cursor of group {label}"
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs `stream ls` (#586): lists every stream's durable range, record count, and loss bit READ-ONLY
+/// (the default stream `""` is the root log), via [`ironbus_storage::admin::list_streams`].
+#[cfg(unix)]
+fn cmd_stream_ls(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let summaries = ironbus_storage::admin::list_streams(&StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+    if json {
+        write!(
+            out,
+            "{{\"schema\":\"ironbus.cli.stream-ls.v{STREAM_LS_SCHEMA_VERSION}\",\"streams\":["
+        )?;
+        for (i, s) in summaries.iter().enumerate() {
+            if i > 0 {
+                write!(out, ",")?;
+            }
+            write_stream_summary_fields(s, out)?;
+        }
+        writeln!(
+            out,
+            "],\"count\":{},\"ok\":true,\"exit_code\":0}}",
+            summaries.len()
+        )?;
+    } else {
+        for s in &summaries {
+            write_stream_summary_human(s, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs `stream info <name>` (#586): one stream's durable summary. A missing NAMED stream is
+/// NOT-FOUND (exit 2) without materializing a phantom directory (the storage op probes first).
+#[cfg(unix)]
+fn cmd_stream_info(
+    data_dir: &Path,
+    stream: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let s = ironbus_storage::admin::stream_summary(&StdFs::new(data_dir.to_path_buf()), stream)
+        .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+    if json {
+        write!(
+            out,
+            "{{\"schema\":\"ironbus.cli.stream-info.v{STREAM_INFO_SCHEMA_VERSION}\","
+        )?;
+        write_stream_summary_fields_inner(&s, out)?;
+        writeln!(out, ",\"ok\":true,\"exit_code\":0}}")?;
+    } else {
+        write_stream_summary_human(&s, out)?;
+    }
+    Ok(())
+}
+
+/// Writes a stream summary as a `{...}` JSON object (for the `stream ls` array).
+#[cfg(unix)]
+fn write_stream_summary_fields(
+    s: &ironbus_storage::admin::StreamSummary,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    write!(out, "{{")?;
+    write_stream_summary_fields_inner(s, out)?;
+    write!(out, "}}")?;
+    Ok(())
+}
+
+/// Writes a stream summary's INNER fields (no surrounding braces), shared by `stream ls` (wrapped in
+/// `{...}`) and `stream info` (folded into the result object), so the two render identical fields.
+#[cfg(unix)]
+fn write_stream_summary_fields_inner(
+    s: &ironbus_storage::admin::StreamSummary,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    write!(
+        out,
+        "\"stream\":\"{}\",\"earliest_retained\":{},\"durable_head\":{},\"records\":{},\"has_loss\":{}",
+        escape_json(&s.stream),
+        s.earliest_retained,
+        s.durable_head,
+        s.records,
+        s.has_loss,
+    )?;
+    Ok(())
+}
+
+/// Writes a stream summary as a human line.
+#[cfg(unix)]
+fn write_stream_summary_human(
+    s: &ironbus_storage::admin::StreamSummary,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let label = if s.stream.is_empty() {
+        "(default)".to_string()
+    } else {
+        format!("{:?}", s.stream)
+    };
+    let loss = if s.has_loss { " LOSS" } else { "" };
+    writeln!(
+        out,
+        "stream {label} records={} range=[{}, {}){loss}",
+        s.records, s.earliest_retained, s.durable_head,
+    )?;
+    Ok(())
+}
+
+/// Runs `stream create <name>` (#586): declares a NAMED stream's durable log under the exclusive
+/// data-dir lock on a STOPPED broker, via [`ironbus_storage::admin::create_stream`] (idempotent). An
+/// invalid name (incl. the empty default) is a usage error (exit 1), validated up front.
+#[cfg(unix)]
+fn cmd_stream_create(
+    data_dir: &Path,
+    stream: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // Validate the name up front for a clean usage error (the storage op would surface it as an
+    // InvalidInput IO error otherwise). The empty name is the default stream (always exists).
+    if !ironbus_storage::naming::is_valid_stream_name(stream) {
+        return Err(CliError::Usage(format!(
+            "stream create needs a valid NAMED stream name (1 to 128 graphic-ASCII bytes), got {stream:?} \
+             (the default stream \"\" always exists and cannot be created)"
+        )));
+    }
+    let _lock = lock_stopped_broker(data_dir, "create a stream in")?;
+    let created = ironbus_storage::admin::create_stream(
+        &StdFs::new(data_dir.to_path_buf()),
+        SystemClock::new(),
+        LogConfig::default(),
+        stream,
+    )
+    .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.stream-create.v{STREAM_CREATE_SCHEMA_VERSION}\",\"stream\":\"{}\",\"created\":{created},\"ok\":true,\"exit_code\":0}}",
+            escape_json(stream),
+        )?;
+    } else if created {
+        writeln!(out, "stream create: created stream {stream:?}")?;
+    } else {
+        writeln!(
+            out,
+            "stream create: stream {stream:?} already exists (no change)"
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs `stream bind <subject> <stream>` (#586): declares the binding's TARGET stream offline (the
+/// durable half — a subject-addressed publish needs a log to land in, exactly the engine's
+/// declare-on-bind) and explains that the subject->stream ROUTE itself is registered at broker
+/// runtime over the wire (the `BindSubject` admin-scope frame) and is NOT persisted in the data
+/// directory. So this verb makes the stream READY; it does not (and cannot, offline) install the
+/// route. The subject is VALIDATED up front so a malformed pattern is a clean usage error.
+#[cfg(unix)]
+fn cmd_stream_bind(
+    data_dir: &Path,
+    subject: &str,
+    stream: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // Validate the subject pattern up front (fail-closed), exactly as the engine's bind_subject does,
+    // so a malformed pattern never declares a stream.
+    ironbus_core::subject::SubjectPattern::parse(subject)
+        .map_err(|e| CliError::Usage(format!("invalid subject pattern {subject:?}: {e}")))?;
+    // Binding TO the default stream "" is legitimate and declare-free (the root log always exists);
+    // a named target stream is declared (created on first use), exactly as declare-on-bind.
+    let declared = if stream.is_empty() {
+        false
+    } else {
+        if !ironbus_storage::naming::is_valid_stream_name(stream) {
+            return Err(CliError::Usage(format!(
+                "stream bind needs a valid target stream name (1 to 128 graphic-ASCII bytes) or \"\" \
+                 for the default stream, got {stream:?}"
+            )));
+        }
+        let _lock = lock_stopped_broker(data_dir, "declare the bind target stream in")?;
+        ironbus_storage::admin::create_stream(
+            &StdFs::new(data_dir.to_path_buf()),
+            SystemClock::new(),
+            LogConfig::default(),
+            stream,
+        )
+        .map_err(|e| map_mgmt_storage_err(data_dir, &e))?
+    };
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.stream-bind.v{STREAM_BIND_SCHEMA_VERSION}\",\"subject\":\"{}\",\"stream\":\"{}\",\"target_declared\":{declared},\"route_persisted\":false,\"ok\":true,\"exit_code\":0}}",
+            escape_json(subject),
+            escape_json(stream),
+        )?;
+    } else {
+        let target = if stream.is_empty() {
+            "(default)".to_string()
+        } else {
+            format!("{stream:?}")
+        };
+        if declared {
+            writeln!(
+                out,
+                "stream bind: declared target stream {target} for subject {subject:?}"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "stream bind: target stream {target} already exists for subject {subject:?}"
+            )?;
+        }
+        writeln!(
+            out,
+            "note: the subject->stream route is applied at broker runtime over the wire (BindSubject, \
+             admin scope); it is not persisted in the data directory. This verb only ensured the target \
+             stream's log exists.",
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs `stream purge`/`stream rm` (#586): DROP a NAMED stream's records, under the exclusive
+/// data-dir lock on a STOPPED broker. DESTRUCTIVE, so it is gated on an explicit `--force` (refused
+/// otherwise, deleting nothing) and a missing stream is NOT-FOUND (exit 2). The default stream `""`
+/// cannot be purged here. `verb` is the wording (`purge`/`rm`); the durable mutation is identical (a
+/// named stream's only durable content is its records).
+#[cfg(unix)]
+fn cmd_stream_purge(
+    data_dir: &Path,
+    stream: &str,
+    verb: &str,
+    force: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // The default stream is the root log; refuse it here up front (it is never a streams/ child).
+    if stream.is_empty() {
+        return Err(CliError::Usage(format!(
+            "stream {verb} cannot target the default stream \"\" (it is the root log); name a stream"
+        )));
+    }
+    if !ironbus_storage::naming::is_valid_stream_name(stream) {
+        return Err(CliError::Usage(format!(
+            "stream {verb} needs a valid NAMED stream name (1 to 128 graphic-ASCII bytes), got {stream:?}"
+        )));
+    }
+    // Fail-closed: REFUSE without --force, deleting nothing (exit 1). To make the count-of-what-would-
+    // be-deleted message honest without mutating, peek the stream's record count read-only first; a
+    // missing stream is still not-found here (so a typo with --force absent is exit 2, not a fake
+    // count). Under --json the flag is mandatory (no prompt).
+    if !force {
+        let s = ironbus_storage::admin::stream_summary(&StdFs::new(data_dir.to_path_buf()), stream)
+            .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+        return Err(CliError::Usage(format!(
+            "stream {verb} {stream:?} would DROP {} record(s): pass --force (or --yes) to confirm \
+             (nothing was deleted)",
+            s.records,
+        )));
+    }
+    // --force given: take the lock and perform the destructive purge. The storage op opens the stream
+    // read-only FIRST (validating the chain), so a corrupt/missing stream is refused before deletion.
+    let _lock = lock_stopped_broker(data_dir, &format!("{verb} the stream in"))?;
+    let outcome = ironbus_storage::admin::purge_stream(&StdFs::new(data_dir.to_path_buf()), stream)
+        .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.stream-{verb}.v{STREAM_PURGE_SCHEMA_VERSION}\",\"stream\":\"{}\",\"records_dropped\":{},\"segments_removed\":{},\"ok\":true,\"exit_code\":0}}",
+            escape_json(stream),
+            outcome.records,
+            outcome.segments_removed,
+        )?;
+    } else {
+        writeln!(
+            out,
+            "stream {verb}: dropped {} record(s) from stream {stream:?} ({} segment file(s) removed)",
+            outcome.records, outcome.segments_removed,
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs `dlq ls` (#595): counts the durable dead-letter records and summarizes them by source stream
+/// and group READ-ONLY, reusing the `dump --dlq` reader (`read_dlq_entries`). An absent/empty DLQ is a
+/// clean zero (not an error). A missing DATA directory is still not-found (exit 2).
+#[cfg(unix)]
+fn cmd_dlq_ls(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    if !data_dir.is_dir() {
+        return Err(CliError::NotFound(format!(
+            "no data directory at {}",
+            data_dir.display()
+        )));
+    }
+    let entries = read_dlq_entries(&StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_mgmt_storage_err(data_dir, &e))?;
+    // Tally per-group counts deterministically (a BTreeMap keeps the JSON/human order stable).
+    let mut per_group: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for e in &entries {
+        *per_group.entry(e.group.clone()).or_insert(0) += 1;
+    }
+    let total = entries.len() as u64;
+    if json {
+        write!(
+            out,
+            "{{\"schema\":\"ironbus.cli.dlq-ls.v{DLQ_LS_SCHEMA_VERSION}\",\"records\":{total},\"by_group\":["
+        )?;
+        for (i, (g, n)) in per_group.iter().enumerate() {
+            if i > 0 {
+                write!(out, ",")?;
+            }
+            write!(out, "{{\"group\":\"{}\",\"records\":{n}}}", escape_json(g))?;
+        }
+        writeln!(out, "],\"ok\":true,\"exit_code\":0}}")?;
+    } else if total == 0 {
+        writeln!(out, "dlq: 0 dead-letter record(s)")?;
+    } else {
+        writeln!(out, "dlq: {total} dead-letter record(s)")?;
+        for (g, n) in &per_group {
+            let label = if g.is_empty() {
+                "(default)".to_string()
+            } else {
+                format!("{g:?}")
+            };
+            writeln!(out, "  group {label}: {n} record(s)")?;
+        }
+    }
+    Ok(())
+}
+
+/// `group`/`stream`/`dlq-ls` management verbs require Unix in v1 (the on-disk storage and the
+/// exclusive `flock(2)` lock are POSIX), like the other offline verbs. Each stub consumes every
+/// parameter and has the IDENTICAL signature to its Unix twin so a non-unix build links cleanly.
+#[cfg(not(unix))]
+fn cmd_group_ls(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (data_dir, json, out);
+    Err(mgmt_unix_only("group ls"))
+}
+#[cfg(not(unix))]
+fn cmd_group_info(
+    data_dir: &Path,
+    group: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, group, json, out);
+    Err(mgmt_unix_only("group info"))
+}
+#[cfg(not(unix))]
+fn cmd_group_drop(
+    data_dir: &Path,
+    group: &str,
+    verb: &str,
+    force: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, group, verb, force, json, out);
+    Err(mgmt_unix_only("group purge/rm"))
+}
+#[cfg(not(unix))]
+fn cmd_stream_ls(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (data_dir, json, out);
+    Err(mgmt_unix_only("stream ls"))
+}
+#[cfg(not(unix))]
+fn cmd_stream_info(
+    data_dir: &Path,
+    stream: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, stream, json, out);
+    Err(mgmt_unix_only("stream info"))
+}
+#[cfg(not(unix))]
+fn cmd_stream_create(
+    data_dir: &Path,
+    stream: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, stream, json, out);
+    Err(mgmt_unix_only("stream create"))
+}
+#[cfg(not(unix))]
+fn cmd_stream_bind(
+    data_dir: &Path,
+    subject: &str,
+    stream: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, subject, stream, json, out);
+    Err(mgmt_unix_only("stream bind"))
+}
+#[cfg(not(unix))]
+fn cmd_stream_purge(
+    data_dir: &Path,
+    stream: &str,
+    verb: &str,
+    force: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, stream, verb, force, json, out);
+    Err(mgmt_unix_only("stream purge/rm"))
+}
+#[cfg(not(unix))]
+fn cmd_dlq_ls(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (data_dir, json, out);
+    Err(mgmt_unix_only("dlq ls"))
+}
+/// The shared non-unix error for a management verb (on-disk storage is Unix-only in v1).
+#[cfg(not(unix))]
+fn mgmt_unix_only(verb: &str) -> CliError {
+    CliError::Internal(format!(
+        "ironbus {verb} requires a Unix host in v1: on-disk storage is Unix-only"
     ))
 }
 
