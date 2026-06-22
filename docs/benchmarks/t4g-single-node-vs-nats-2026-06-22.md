@@ -28,7 +28,7 @@ tier it is stated explicitly.
 |---|---:|---:|---|
 | **Durable, power-loss-safe** — IB group-commit `fdatasync` vs NATS JS `sync=always` | **~55,400** | ~343 | **IronBus ~161×** |
 | Durable, page-cache (NOT power-loss-safe) — IB `--no-fsync` vs NATS JS default interval-sync | ~55,000 | ~88,000 | NATS ~1.6× |
-| At-most-once (q0) — IB QoS-0 memory (**retains**) vs NATS Core pub (**drops**, no subscriber) | ~1,011,000 | ~1,650,000 | NATS ~1.6× raw rate |
+| At-most-once (q0) — IB QoS-0 memory (**retains**) vs NATS Core pub (**drops**, no subscriber) | ~1,156,000 | ~1,650,000 | NATS ~1.4× raw rate |
 
 ### Consumption
 
@@ -65,25 +65,41 @@ tier it is stated explicitly.
   raw send rate favours the broker that stores nothing; IronBus delivers ingested, readable
   data at ~1.0M/s.
 
-## Change shipped from this study
+## Changes shipped from this study (both ends of the QoS-0 path)
 
 - **`FireForgetProducer` — a coalescing QoS-0 producer** (`ironbus-client`): at-most-once
   produce previously did one `write_all` syscall per message; it now frames into a wire
-  buffer and writes once per 32 KiB — the same coalescing a core pub client does. **+60% on
-  at-most-once produce (≈640k → ≈1.015M msgs/s)** with no change to the wire bytes the broker
-  sees. (`Client::fire_and_forget_producer`; the bench QoS-0 leg uses it.)
+  buffer and writes once per 32 KiB — the same coalescing a core pub client does. **+58% on
+  at-most-once produce (≈640k → ≈1.015M msgs/s)**, no change to the wire bytes the broker sees.
+- **Batched Level-0 actor submission** (`ironbus-server`): the broker side previously did one
+  session→actor channel send + waker notify per QoS-0 message; the session now accumulates a
+  socket-read's worth of Level-0 produces and hands them to the single-writer actor as ONE
+  `Command::ProduceNoReplyBatch`, appended in order under the same group commit (the batch is
+  flushed before any Level-1 produce or non-produce job, so the total order is preserved).
+  **A further +14% (≈1.015M → ≈1.156M msgs/s)**; 904 server tests + the golden-path acceptance
+  pass unchanged.
+
+Together these took at-most-once produce **+80% over the per-message baseline (≈640k → ≈1.156M)**
+— and it STILL trails NATS Core's ≈1.65M. That is the point: two real optimizations cannot make
+a broker that *stores* every message out-throughput a router that *discards* it (NATS Core with
+no subscriber does no server-side work). The at-most-once raw-rate gap is structural, not a
+missing optimization.
 
 ## Follow-ups (the page-cache durable-produce gap)
 
 The durable-produce CPU is distributed, not a single hotspot, so closing the page-cache gap
 is a deeper change than this study warranted:
 
-- **Batched actor submission.** Today each durable publish is submitted to the single-writer
-  actor over a channel and waited on individually (`ProduceSubmission::wait` + `SyncWaker`
-  ≈ 10% self-time). Submitting a whole pipelined window as one actor message (one wake per
-  batch) would cut that handoff and the per-message `OwnedAppend` alloc/free.
-- These are the meaningful levers for matching NATS's page-cache throughput; they do not
-  affect the durability guarantee and would *widen* the already-decisive power-loss-safe win.
+- **Batched Level-1 (durable) actor submission.** The Level-0 (no-ack) batching above is
+  shipped; the at-least-once path still submits each durable publish to the actor over a channel
+  and waits on it individually (`ProduceSubmission::wait` + `SyncWaker` ≈ 10% self-time).
+  Batching a whole pipelined window into one actor message — with the parked PubAcks aligned to
+  the batch's offsets — would cut that handoff and the per-message `OwnedAppend` alloc/free. It is
+  riskier than the L0 batch (the ack-ordering contract) and, on its own, would only narrow
+  ~55k→~61k (the durable gap is multi-front: channel + lz4 + alloc + the client `produce_stream`
+  reader-thread flow control), so it does NOT by itself reach NATS's 88k page-cache rate on 2
+  cores. It does not affect the durability guarantee and would *widen* the already-decisive
+  power-loss-safe win.
 
 ## Reproduce
 
