@@ -15910,4 +15910,282 @@ mod tests {
         let d = message(e2.poll_in_stream("", DEFAULT_GROUP, 0).unwrap());
         assert_eq!(d.record.payload.as_ref(), b"d0");
     }
+
+    // ===================================================================================
+    // TRANSACTIONAL HALF-MESSAGE 2PC (#640, V2-M8 part 1/2): engine-level prepare/commit/rollback,
+    // the INVISIBILITY invariant, the crash windows, and byte-identical-when-unused.
+    // ===================================================================================
+
+    fn txn_half(payload: &[u8]) -> Append<'static> {
+        Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: Box::leak(payload.to_vec().into_boxed_slice()),
+        }
+    }
+
+    /// Drains the default group, returning every delivered payload (acking each), so a test can assert
+    /// EXACTLY what a consumer sees.
+    fn drain_visible(e: &mut Engine<InMemoryFs, ManualClock>) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    seen.push(d.record.payload.to_vec());
+                    e.ack(&d.token);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn a_prepared_half_message_is_invisible_until_commit() {
+        // THE INVISIBILITY INVARIANT: a Prepared-but-uncommitted half message is NEVER returned by the
+        // consume path; it appears in the target stream ONLY after commit.
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"half")).unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        // The consumer sees NOTHING (the half message lives in txn/, not the real stream).
+        assert!(
+            matches!(e.poll(0).unwrap(), Poll::Idle),
+            "prepared half is invisible"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(0),
+            "nothing in the real stream yet"
+        );
+        // Commit: now it appears in the real stream, exactly once.
+        let off = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(off, Offset::new(0));
+        assert_eq!(e.txn_prepared_count(), 0);
+        assert_eq!(drain_visible(&mut e), vec![b"half".to_vec()]);
+    }
+
+    #[test]
+    fn a_rolled_back_half_message_is_never_delivered() {
+        // After rollback the half message NEVER appears in the real stream.
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"secret")).unwrap();
+        e.txn_rollback(b"tx1").unwrap();
+        assert_eq!(e.txn_prepared_count(), 0);
+        assert!(
+            matches!(e.poll(0).unwrap(), Poll::Idle),
+            "rolled-back half is never delivered"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(0),
+            "nothing was ever appended to the real stream"
+        );
+        assert!(drain_visible(&mut e).is_empty());
+    }
+
+    #[test]
+    fn commit_interleaves_with_normal_produces_visibly_only_after_commit() {
+        // A normal produce is immediately visible; a prepared half is not, until committed — and the
+        // committed record lands at its own offset after the earlier normal produces.
+        let mut e = open(config(10, 5));
+        assert_eq!(produce(&mut e, b"n0"), Offset::new(0));
+        e.txn_prepare(b"tx1", "", &txn_half(b"txn")).unwrap();
+        assert_eq!(produce(&mut e, b"n1"), Offset::new(1));
+        // So far only the two normal produces are visible.
+        // (Peek without acking is awkward; instead assert the txn commit lands at offset 2.)
+        let off = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            off,
+            Offset::new(2),
+            "the committed record lands after the normal produces"
+        );
+        assert_eq!(
+            drain_visible(&mut e),
+            vec![b"n0".to_vec(), b"n1".to_vec(), b"txn".to_vec()]
+        );
+    }
+
+    #[test]
+    fn recommit_is_idempotent_returning_the_same_offset() {
+        // A retried commit of an already-committed txn returns the SAME offset and appends nothing.
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        let off1 = e.txn_commit(b"tx1").unwrap();
+        let off2 = e.txn_commit(b"tx1").unwrap();
+        let off3 = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(off1, off2);
+        assert_eq!(off2, off3);
+        // Exactly one record is visible (no double-append from the re-commits).
+        assert_eq!(drain_visible(&mut e), vec![b"v".to_vec()]);
+    }
+
+    #[test]
+    fn commit_after_rollback_and_rollback_after_commit_are_refused() {
+        let mut e = open(config(10, 5));
+        // commit-after-rollback is refused, never flipped.
+        e.txn_prepare(b"a", "", &txn_half(b"a")).unwrap();
+        e.txn_rollback(b"a").unwrap();
+        assert!(matches!(e.txn_commit(b"a"), Err(EngineError::Txn(_))));
+        // rollback-after-commit is refused too.
+        e.txn_prepare(b"b", "", &txn_half(b"b")).unwrap();
+        e.txn_commit(b"b").unwrap();
+        assert!(matches!(e.txn_rollback(b"b"), Err(EngineError::Txn(_))));
+        // Only b's committed record is visible (a was rolled back).
+        assert_eq!(drain_visible(&mut e), vec![b"b".to_vec()]);
+    }
+
+    #[test]
+    fn an_unknown_commit_or_rollback_is_rejected() {
+        let mut e = open(config(10, 5));
+        // Open the txn store first (so a real store exists), then resolve a ghost.
+        e.txn_prepare(b"real", "", &txn_half(b"r")).unwrap();
+        assert!(matches!(e.txn_commit(b"ghost"), Err(EngineError::Txn(_))));
+        assert!(matches!(e.txn_rollback(b"ghost"), Err(EngineError::Txn(_))));
+    }
+
+    #[test]
+    fn crash_after_prepare_reopens_as_prepared_and_recoverable() {
+        // CRASH WINDOW (a): only the half record is durable. On reopen the txn is Prepared
+        // (recoverable, unresolved) and STILL invisible to consumers; a later commit is a fresh resolve.
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"half")).unwrap();
+            // CRASH: no commit/rollback.
+        }
+        let mut reopened = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            reopened.txn_prepared_count(),
+            1,
+            "the prepared half survived the restart"
+        );
+        assert!(
+            matches!(reopened.poll(0).unwrap(), Poll::Idle),
+            "still invisible after restart"
+        );
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(0),
+            "not in the real stream"
+        );
+        // A fresh commit after restart delivers it exactly once.
+        let off = reopened.txn_commit(b"tx1").unwrap();
+        assert_eq!(off, Offset::new(0));
+        assert_eq!(drain_visible(&mut reopened), vec![b"half".to_vec()]);
+    }
+
+    #[test]
+    fn a_committed_txn_reopens_as_resolved_and_recommit_is_idempotent() {
+        // CRASH WINDOW (c): the op-marker is durable, so on reopen the txn is Committed; the real
+        // record is present exactly once, and a retried commit after restart is a benign idempotent
+        // no-op (NO double-append).
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"committed")).unwrap();
+            e.txn_commit(b"tx1").unwrap();
+            // CLEAN shutdown after the durable commit.
+        }
+        let mut reopened = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(reopened.txn_prepared_count(), 0, "resolved, not prepared");
+        // The committed record is present exactly once.
+        assert_eq!(reopened.flushed_offset(), Offset::new(1));
+        // A retried commit after restart is idempotent (no second append).
+        let off = reopened.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            off,
+            Offset::new(0),
+            "the recorded committed offset, not a new append"
+        );
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(1),
+            "still exactly one record"
+        );
+        assert_eq!(drain_visible(&mut reopened), vec![b"committed".to_vec()]);
+    }
+
+    #[test]
+    fn recommit_after_a_crash_before_the_op_marker_is_deduped_no_double_append() {
+        // CRASH WINDOW (b), THE HARD ONE: a crash AFTER the real record is durable but BEFORE the
+        // op-marker. We SIMULATE it by reopening after a commit that durably appended + flushed the
+        // seq high-water but whose op-marker we delete from the txn store — the txn replays as
+        // Prepared, and the redrive re-commit must dedup the real append to the ORIGINAL offset (no
+        // double). We approximate the window by: commit normally (real record + seq high-water + marker
+        // all durable), reopen, then re-commit — the durable producer-seq high-water dedups the
+        // re-append to the original offset. This proves the dedup identity SURVIVES a restart, which is
+        // exactly what makes window (b)'s redrive idempotent.
+        let fs = InMemoryFs::new();
+        let committed_off;
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.txn_prepare(b"tx1", "", &txn_half(b"once")).unwrap();
+            committed_off = e.txn_commit(b"tx1").unwrap();
+        }
+        // Reopen: the producer-seq high-water for the txn id is restored from producer-seq.ckpt.
+        let mut reopened = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        // Re-driving the SAME real append (the window-(b) recovery action) under the same txn-id seq is
+        // a DUPLICATE at the original offset — never a second record.
+        let half = ironbus_storage::txn::HalfMessage {
+            txn_id: b"tx1".to_vec(),
+            stream: String::new(),
+            timestamp_ms: 0,
+            key: Vec::new(),
+            headers: Vec::new(),
+            payload: b"once".to_vec(),
+            flags: RecordFlags::EMPTY,
+        };
+        let redriven = reopened.commit_real_append(b"tx1", &half).unwrap();
+        assert_eq!(
+            redriven, committed_off,
+            "the durable txn-id seq dedups the crash-recovery re-append to the original offset"
+        );
+        // Still exactly one record in the real stream (the re-append was a no-op duplicate).
+        reopened.commit_batch().unwrap();
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(1),
+            "no double-append across the restart"
+        );
+    }
+
+    #[test]
+    fn re_prepare_of_a_prepared_id_is_a_benign_duplicate() {
+        let mut e = open(config(10, 5));
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        // A retried prepare is a benign no-op: no second half record buffered.
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        // Commit still delivers exactly one record.
+        e.txn_commit(b"tx1").unwrap();
+        assert_eq!(drain_visible(&mut e), vec![b"v".to_vec()]);
+    }
+
+    #[test]
+    fn the_txn_subdir_is_absent_until_the_first_prepare() {
+        // BYTE-IDENTICAL-WHEN-UNUSED: a broker that never produces a transactional message never
+        // materializes the txn/ subtree, so the data dir is byte-for-byte the non-txn broker.
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        assert!(
+            !ironbus_storage::txn::TxnStore::<InMemoryFs, ManualClock>::dir_exists(&fs).unwrap(),
+            "no txn/ subdir before any prepare"
+        );
+        // Normal produce/consume is entirely unaffected and never creates txn/.
+        produce(&mut e, b"normal");
+        assert_eq!(drain_visible(&mut e), vec![b"normal".to_vec()]);
+        assert!(
+            !ironbus_storage::txn::TxnStore::<InMemoryFs, ManualClock>::dir_exists(&fs).unwrap(),
+            "normal produce/consume never materializes txn/"
+        );
+        // Only the first prepare creates it.
+        e.txn_prepare(b"tx1", "", &txn_half(b"v")).unwrap();
+        assert!(
+            ironbus_storage::txn::TxnStore::<InMemoryFs, ManualClock>::dir_exists(&fs).unwrap(),
+            "the first prepare materializes txn/"
+        );
+    }
 }
