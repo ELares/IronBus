@@ -174,6 +174,12 @@ impl ErrorCode {
     /// too many prepared, or an over-long id. Maps [`EngineError::Txn`].
     pub const ERR_TXN: ErrorCode = ErrorCode("ERR_TXN");
 
+    /// A back-check answer (`TxnCheckResult`, #640 part 2) was REFUSED on ownership: the answering
+    /// connection does not own the in-doubt txn's listener group (it registered no listener, or a
+    /// different group), so it may not resolve it. The txn is left Prepared on its back-check schedule.
+    /// Maps [`EngineError::TxnCheckUnauthorized`].
+    pub const ERR_TXN_CHECK_UNAUTHORIZED: ErrorCode = ErrorCode("ERR_TXN_CHECK_UNAUTHORIZED");
+
     /// Maps an [`EngineError`] to its stable code. The single source of truth the conformance
     /// vectors and any wire error-code scheme share. A storage error is split into the two named
     /// outcomes ([`Self::ERR_AT_CAPACITY`] for the byte-cap shed) plus the residual
@@ -199,6 +205,7 @@ impl ErrorCode {
             EngineError::MissingRecord { .. } => Self::ERR_MISSING_RECORD,
             EngineError::ZeroMaxInFlight => Self::ERR_ZERO_MAX_IN_FLIGHT,
             EngineError::Txn(_) => Self::ERR_TXN,
+            EngineError::TxnCheckUnauthorized => Self::ERR_TXN_CHECK_UNAUTHORIZED,
             EngineError::Storage(_) if error.is_at_capacity() => Self::ERR_AT_CAPACITY,
             EngineError::Storage(_) => Self::ERR_STORAGE,
         }
@@ -246,6 +253,10 @@ mod tests {
         );
         assert_eq!(ErrorCode::DUPLICATE.as_str(), "DUPLICATE");
         assert_eq!(ErrorCode::OK.as_str(), "OK");
+        assert_eq!(
+            ErrorCode::ERR_TXN_CHECK_UNAUTHORIZED.as_str(),
+            "ERR_TXN_CHECK_UNAUTHORIZED"
+        );
     }
 
     #[test]
@@ -349,6 +360,10 @@ mod tests {
                     cap: 32,
                 }),
                 ErrorCode::ERR_AT_CAPACITY,
+            ),
+            (
+                EngineError::TxnCheckUnauthorized,
+                ErrorCode::ERR_TXN_CHECK_UNAUTHORIZED,
             ),
             (
                 EngineError::Storage(StorageError::WriterFrozen),

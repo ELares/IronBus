@@ -680,6 +680,15 @@ pub enum EngineError {
     /// txn id. Carries the typed [`ironbus_core::txn::TxnError`] reason. Fail-closed at the boundary;
     /// the half message's durable state is never corrupted by a rejected verb.
     Txn(ironbus_core::txn::TxnError),
+    /// A back-check answer (`TxnCheckResult`, #640 part 2) was REFUSED on OWNERSHIP: the answering
+    /// `Publish` connection does not own the txn's listener group, so it may not resolve it. This fires
+    /// when the connection registered NO txn listener, or its registered group does not EQUAL the group
+    /// that owns the in-doubt txn (recorded at `prepare`). The txn is left exactly as it was —
+    /// `Prepared` and on its back-check schedule — so a LEGITIMATE owner's answer can still arrive; the
+    /// connection is NOT errored (it is a typed refusal, never a flip, never a panic). This closes the
+    /// forged-cross-producer-resolution hole: a connection cannot commit/discard another producer's
+    /// in-doubt txn with a forged `TxnCheckResult{txn_id, decision}`.
+    TxnCheckUnauthorized,
 }
 
 impl core::fmt::Display for EngineError {
@@ -749,6 +758,11 @@ impl core::fmt::Display for EngineError {
                  resolve to exactly one stream; overlap fan-out is opt-in)"
             ),
             EngineError::Txn(e) => write!(f, "transaction error: {e}"),
+            EngineError::TxnCheckUnauthorized => write!(
+                f,
+                "back-check answer refused: the connection does not own this transaction's listener \
+                 group (it registered no listener, or a different group), so it may not resolve it"
+            ),
         }
     }
 }
@@ -1726,6 +1740,15 @@ impl TxnBackCheck {
     fn route_for(&self, txn_id: &[u8]) -> Option<u64> {
         let group = self.txn_owner.get(txn_id)?;
         self.group_listener.get(group).copied()
+    }
+
+    /// The listener GROUP that owns `txn_id` (recorded at prepare), or `None` if the txn has no owning
+    /// group (a listener-less prepare) or was never seen. This is the back-check OWNERSHIP authority:
+    /// `resolve_txn_check` requires an answering connection's registered group to EQUAL this, so a
+    /// `Publish` connection cannot resolve another producer's in-doubt txn with a forged answer
+    /// (`route_for` reads the same map for OUTBOUND routing; this is the INBOUND authorization read).
+    fn owner_group(&self, txn_id: &[u8]) -> Option<&[u8]> {
+        self.txn_owner.get(txn_id).map(Vec::as_slice)
     }
 
     /// Queues a `TxnCheck` for delivery to `member`, bounded drop-oldest (an over-cap push drops the
@@ -4512,18 +4535,62 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// `Commit` is a benign no-op returning the recorded offset, and a result for an unknown/never-seen
     /// txn is a benign no-op.
     ///
+    /// OWNERSHIP (#640 part 2, BLOCKER 1): `answering_group` is the answering connection's registered
+    /// `TxnListen` group (EMPTY when the connection never registered a listener). A back-check answer may
+    /// resolve an in-doubt (`Prepared`) txn ONLY when the answering connection OWNS the txn's listener
+    /// group — i.e. it registered a listener (a non-empty group) AND that group EQUALS the group recorded
+    /// as the txn's owner at `prepare`. Otherwise the answer is REFUSED ([`EngineError::TxnCheckUnauthorized`]):
+    /// the txn is left exactly as it was (`Prepared`, on its back-check schedule), so a LEGITIMATE
+    /// owner's answer can still arrive, and the connection is not errored. This closes the forged
+    /// cross-producer resolution hole — a `Publish` connection cannot commit/discard another producer's
+    /// in-doubt txn. A txn that is NOT currently `Prepared` (already resolved, or never seen) has nothing
+    /// in-doubt to protect, so it falls straight through to the part-1 idempotent path (a duplicate
+    /// answer is a benign no-op, a flip is the inherited `AlreadyResolved` refusal) — the ownership gate
+    /// adds NO change to those already-settled paths. The headline reconnect case still passes: the
+    /// producer prepared under group "B", reconnected, re-registered `TxnListen{group:"B"}`, so owner "B"
+    /// == its answering group "B" → ALLOWED.
+    ///
+    /// SECURITY RESIDUAL (documented in `docs/RECOVERY.md` §9): the listener group is capability-bearing
+    /// — a malicious client that knows a victim's group name could register that group and answer for it,
+    /// the same class as "any client on a no-auth broker can do anything". When auth is enabled the group
+    /// should be bound to the authenticated principal; "two producers must not share a group" remains a
+    /// requirement. The group-MATCH gate here is the in-scope fix; the hijack residual is an auth-layer
+    /// concern.
+    ///
     /// # Errors
-    /// [`EngineError::Txn`] for a conflicting flip (a `Commit` after a rollback or vice-versa — the
-    /// outcome is immutable), or a storage error from the resolve.
+    /// [`EngineError::TxnCheckUnauthorized`] when the answering connection does not own an in-doubt txn's
+    /// group (refused, never resolved); [`EngineError::Txn`] for a conflicting flip (a `Commit` after a
+    /// rollback or vice-versa — the outcome is immutable); or a storage error from the resolve.
     pub fn resolve_txn_check(
         &mut self,
         txn_id: &[u8],
         decision: ironbus_proto::message::TxnCheckDecision,
+        answering_group: &[u8],
     ) -> Result<(), EngineError>
     where
         F: Clone,
     {
         use ironbus_proto::message::TxnCheckDecision;
+        // OWNERSHIP GATE (BLOCKER 1): only an in-doubt (`Prepared`) txn carries forgery exposure — its
+        // resolution is still pending. Require the answering connection to OWN its listener group before
+        // resolving such a txn: (a) a registered listener (a non-empty answering group), AND (b) the
+        // txn's recorded owner group EQUALS it. A listener-less in-doubt txn (owner `None`) matches no
+        // non-empty answering group, so it too is refused here (its only resolvers are the producer's own
+        // direct commit/rollback verbs or the terminal default — never a back-check answer). A REFUSAL
+        // leaves the txn untouched on its schedule so a legitimate owner can still answer.
+        let still_prepared = self.txn.as_ref().is_some_and(|s| {
+            matches!(
+                s.table().state(txn_id),
+                Some(ironbus_core::txn::TxnState::Prepared)
+            )
+        });
+        if still_prepared {
+            let owns = !answering_group.is_empty()
+                && self.txn_back_check.owner_group(txn_id) == Some(answering_group);
+            if !owns {
+                return Err(EngineError::TxnCheckUnauthorized);
+            }
+        }
         // A result for a txn that is no longer Prepared (already resolved by a racing terminal default,
         // a producer-driven resolve, or never seen) is a benign no-op for Commit/Rollback ONLY when it
         // matches; the part-1 path itself enforces the AlreadyResolved rule, so we route straight
@@ -16764,17 +16831,27 @@ mod tests {
         let checks = e.drain_txn_checks(MemberId::new(2));
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].txn_id, b"tx1");
-        // The producer's listener answers Commit → committed exactly once via the part-1 path.
-        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Commit)
-            .unwrap();
+        // The producer's listener answers Commit → committed exactly once via the part-1 path. The
+        // answering connection OWNS the txn's group ("svc"), so the ownership gate allows it.
+        e.resolve_txn_check(
+            b"tx1",
+            ironbus_proto::message::TxnCheckDecision::Commit,
+            b"svc",
+        )
+        .unwrap();
         assert_eq!(e.txn_prepared_count(), 0);
         assert_eq!(e.txn_under_back_check(), 0);
         // The half message is now VISIBLE exactly once.
         assert_eq!(drain_visible_generic(&mut e), vec![b"order-42".to_vec()]);
         // A duplicate Commit result (a retried answer) is a benign no-op (idempotent), never a second
-        // delivery.
-        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Commit)
-            .unwrap();
+        // delivery. The txn is no longer Prepared, so the ownership gate is bypassed and the part-1
+        // idempotent path returns the recorded offset.
+        e.resolve_txn_check(
+            b"tx1",
+            ironbus_proto::message::TxnCheckDecision::Commit,
+            b"svc",
+        )
+        .unwrap();
         assert!(
             drain_visible_generic(&mut e).is_empty(),
             "no second delivery"
@@ -16794,8 +16871,13 @@ mod tests {
         assert_eq!(e.txn_back_check_tick().unwrap(), 1);
         let checks = e.drain_txn_checks(MemberId::new(1));
         assert_eq!(checks[0].txn_id, b"tx1");
-        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Rollback)
-            .unwrap();
+        // The owner ("svc") answers Rollback → discarded; the ownership gate allows the owner.
+        e.resolve_txn_check(
+            b"tx1",
+            ironbus_proto::message::TxnCheckDecision::Rollback,
+            b"svc",
+        )
+        .unwrap();
         assert_eq!(e.txn_prepared_count(), 0);
         assert!(
             drain_visible_generic(&mut e).is_empty(),
@@ -16851,9 +16933,15 @@ mod tests {
             clock.advance_monotonic_nanos(ironbus_core::txn::DEFAULT_BACK_CHECK_RETRY_NANOS + 1);
         }
         assert_eq!(e.txn_prepared_count(), 0, "terminally rolled back");
-        // A late Commit answer is REFUSED (the outcome is immutable), surfaced as a typed error.
+        // A late Commit answer is REFUSED (the outcome is immutable), surfaced as a typed error. The txn
+        // is no longer Prepared, so the ownership gate is bypassed and the part-1 AlreadyResolved refusal
+        // (not an unauthorized refusal) is what surfaces — proving the gate does not mask the flip rule.
         let err = e
-            .resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Commit)
+            .resolve_txn_check(
+                b"tx1",
+                ironbus_proto::message::TxnCheckDecision::Commit,
+                b"svc",
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -16881,9 +16969,14 @@ mod tests {
         e.txn_back_check_tick().unwrap();
         let checks = e.drain_txn_checks(MemberId::new(1));
         assert_eq!(checks[0].txn_id, b"tx1");
-        // The producer answers Unknown: the half stays Prepared (not resolved), still invisible.
-        e.resolve_txn_check(b"tx1", ironbus_proto::message::TxnCheckDecision::Unknown)
-            .unwrap();
+        // The producer answers Unknown: the half stays Prepared (not resolved), still invisible. The
+        // owner ("svc") answers, so the ownership gate allows it; Unknown is a no-op regardless.
+        e.resolve_txn_check(
+            b"tx1",
+            ironbus_proto::message::TxnCheckDecision::Unknown,
+            b"svc",
+        )
+        .unwrap();
         assert_eq!(e.txn_prepared_count(), 1, "still in-doubt after Unknown");
         assert!(
             matches!(e.poll(0).unwrap(), Poll::Idle),
@@ -16922,6 +17015,158 @@ mod tests {
         // It is immediately eligible (rebased to 0), and the REMAINING attempts (one was already recorded
         // before the restart, count carried across) still drive it to the terminal rollback (no listener
         // ever re-registered). Advance the clock between scans so each is due past the retry cadence.
+        // ATTEMPT COUNT PRESERVED: one attempt was recorded before the restart, so only `max - 1` more
+        // scans are needed to reach the terminal default. If the count had RESET to 0 on replay, the txn
+        // would still be Prepared after `max - 1` scans — so this exact bound proves the count survived.
+        let max = ironbus_core::txn::DEFAULT_MAX_BACK_CHECK_ATTEMPTS;
+        for _ in 0..(max - 1) {
+            e.txn_back_check_tick().unwrap();
+            clock.advance_monotonic_nanos(ironbus_core::txn::DEFAULT_BACK_CHECK_RETRY_NANOS + 1);
+        }
+        assert_eq!(
+            e.txn_prepared_count(),
+            0,
+            "the resumed scan reached the terminal default in the REMAINING attempts (count preserved)"
+        );
+        assert!(drain_visible_generic(&mut e).is_empty());
+    }
+
+    #[test]
+    fn a_forged_back_check_answer_from_a_non_owner_is_refused_and_leaves_the_txn_prepared() {
+        // BLOCKER 1 (a): a `Publish` connection that does NOT own a txn's listener group CANNOT resolve
+        // it. A forged `TxnCheckResult{tx1, Commit}` answered with the WRONG group (or no group) is
+        // REFUSED with the typed `TxnCheckUnauthorized`, the txn stays Prepared + invisible, and a later
+        // LEGITIMATE owner answer still commits it exactly once.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        // The legitimate producer registers group "victim" and prepares under it.
+        e.register_txn_listener(b"victim", MemberId::new(1));
+        e.txn_prepare(b"tx1", "", &txn_half(b"funds"), b"victim")
+            .unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+
+        // FORGERY 1: an attacker connection registered a DIFFERENT group "attacker" and forges a Commit
+        // for the victim's txn. Refused: the answering group does not own tx1.
+        let err = e
+            .resolve_txn_check(
+                b"tx1",
+                ironbus_proto::message::TxnCheckDecision::Commit,
+                b"attacker",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::TxnCheckUnauthorized),
+            "a non-owner group is refused: {err:?}"
+        );
+        // FORGERY 2: a connection with NO registered listener (empty group) forges a Rollback. Refused.
+        let err = e
+            .resolve_txn_check(
+                b"tx1",
+                ironbus_proto::message::TxnCheckDecision::Rollback,
+                b"",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::TxnCheckUnauthorized),
+            "a listener-less connection is refused: {err:?}"
+        );
+        // The txn is UNTOUCHED by either forgery: still Prepared, still invisible, still under back-check.
+        assert_eq!(
+            e.txn_prepared_count(),
+            1,
+            "forged answers did not resolve it"
+        );
+        assert!(
+            matches!(e.poll(0).unwrap(), Poll::Idle),
+            "still invisible after the forged answers"
+        );
+
+        // The LEGITIMATE owner ("victim") answers Commit → it commits exactly once via the part-1 path.
+        e.resolve_txn_check(
+            b"tx1",
+            ironbus_proto::message::TxnCheckDecision::Commit,
+            b"victim",
+        )
+        .unwrap();
+        assert_eq!(e.txn_prepared_count(), 0);
+        assert_eq!(
+            drain_visible_generic(&mut e),
+            vec![b"funds".to_vec()],
+            "the owner's commit delivers exactly once after the forgeries were refused"
+        );
+    }
+
+    #[test]
+    fn the_owner_group_can_resolve_its_own_back_checked_txn() {
+        // BLOCKER 1 (b): the legitimate owner group CAN resolve — commit makes the half visible exactly
+        // once; rollback discards a second txn. (The headline reconnect case is covered separately by
+        // `the_headline_crash_reconnect_back_check_commit_delivers_exactly_once`.)
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock.clone());
+        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.txn_prepare(b"commit-me", "", &txn_half(b"yes"), b"svc")
+            .unwrap();
+        e.txn_prepare(b"abort-me", "", &txn_half(b"no"), b"svc")
+            .unwrap();
+        // Owner commits the first and rolls back the second.
+        e.resolve_txn_check(
+            b"commit-me",
+            ironbus_proto::message::TxnCheckDecision::Commit,
+            b"svc",
+        )
+        .unwrap();
+        e.resolve_txn_check(
+            b"abort-me",
+            ironbus_proto::message::TxnCheckDecision::Rollback,
+            b"svc",
+        )
+        .unwrap();
+        assert_eq!(e.txn_prepared_count(), 0, "both resolved by the owner");
+        assert_eq!(
+            drain_visible_generic(&mut e),
+            vec![b"yes".to_vec()],
+            "only the committed half is delivered, exactly once"
+        );
+    }
+
+    #[test]
+    fn a_prepare_then_restart_before_any_attempt_is_re_enrolled_and_terminal_defaults() {
+        // BLOCKER 2: prepare → broker RESTART within the first timeout window (NO back-check attempt yet,
+        // so NO durable BACK record) must NOT orphan the half forever. On reopen the still-Prepared txn is
+        // RE-ENROLLED into the back-check book (driven off all_prepared(), not the BACK records), so the
+        // scan finds it and, unanswered, terminal-defaults to Rollback after the cap — never stuck.
+        let fs = InMemoryFs::new();
+        {
+            let clock = std::sync::Arc::new(ManualClock::new());
+            let mut e = Engine::open(fs.clone(), clock.clone(), config(10, 5)).unwrap();
+            e.register_txn_listener(b"svc", MemberId::new(1));
+            e.txn_prepare(b"tx1", "", &txn_half(b"orphan"), b"svc")
+                .unwrap();
+            // CRASH IMMEDIATELY: no clock advance, no scan, so NO back-check attempt and NO BACK record.
+            assert_eq!(
+                e.txn_under_back_check(),
+                1,
+                "enrolled in memory only (no BACK record yet)"
+            );
+        }
+        // Reopen: BEFORE this fix the book rebuilt only from BACK records, so this txn (which never had
+        // one) would be Prepared but NOT under back-check — orphaned forever. After the fix it is
+        // re-enrolled fresh at 0 attempts and immediately eligible.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(fs, clock.clone(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.txn_prepared_count(),
+            1,
+            "the half survived the restart, still Prepared"
+        );
+        assert_eq!(
+            e.txn_under_back_check(),
+            1,
+            "the orphan was RE-ENROLLED on open (driven off all_prepared, not the BACK records)"
+        );
+        // The scan now back-checks it; unanswered (no listener re-registered), it terminal-defaults to
+        // Rollback after the FULL attempt cap (fresh 0 attempts), and is never stuck Prepared.
+        clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
         let max = ironbus_core::txn::DEFAULT_MAX_BACK_CHECK_ATTEMPTS;
         for _ in 0..max {
             e.txn_back_check_tick().unwrap();
@@ -16930,8 +17175,11 @@ mod tests {
         assert_eq!(
             e.txn_prepared_count(),
             0,
-            "the resumed scan reached the terminal default"
+            "the re-enrolled orphan reached the terminal default — never stuck forever"
         );
-        assert!(drain_visible_generic(&mut e).is_empty());
+        assert!(
+            drain_visible_generic(&mut e).is_empty(),
+            "the orphan was discarded, never delivered"
+        );
     }
 }

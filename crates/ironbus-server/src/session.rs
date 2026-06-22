@@ -3332,7 +3332,14 @@ impl Session {
         }
         let txn_id = Bytes::copy_from_slice(decoded.txn_id);
         let decision = decoded.decision;
-        let outcome = engine.with(move |e| e.resolve_txn_check(&txn_id, decision))?;
+        // OWNERSHIP (#640 part 2, BLOCKER 1): pass THIS connection's registered listener group so the
+        // engine can verify the answerer OWNS the txn's group before resolving an in-doubt half message.
+        // EMPTY when the connection never registered a `TxnListen` listener — which the engine treats as
+        // "does not own", so a forged `TxnCheckResult` from a non-owner is REFUSED (a typed `Err`, not a
+        // flip and not a connection close), leaving the txn Prepared so its real owner can still answer.
+        let answering_group = self.txn_listener_group.clone().unwrap_or_default();
+        let outcome =
+            engine.with(move |e| e.resolve_txn_check(&txn_id, decision, &answering_group))?;
         match outcome {
             Ok(()) => {
                 reply(out, FrameType::Ok, &[]);
