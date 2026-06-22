@@ -20,11 +20,30 @@
 //! (an echo of the effective bounds), and `resilience` (the last-skip-offset, the integrity-freeze
 //! flag, and the skip totals), plus a broker summary and the DLQ state. Every value comes from an
 //! existing read-only engine accessor, so #15 can render segments, consumers, lag, and
-//! last-skip-offset from THIS JSON ALONE without ever parsing a metric name. The schema version is
-//! PINNED in the `Accept` header: a consumer that requires the exact shape sends `Accept:
-//! application/vnd.ironbus.admin.v1+json`; an `Accept` that explicitly names a DIFFERENT IronBus-
-//! admin version is `406 Not Acceptable`, while an absent or wildcard `Accept` (a plain `curl`)
-//! takes the current `v1`.
+//! last-skip-offset from THIS JSON ALONE without ever parsing a metric name.
+//!
+//! `/admin` v2 (#577) is ADDITIVE on top of v1: the same body plus three new bounded objects an
+//! operator can read without the Prometheus scrape — `connections` (the aggregate connz signals:
+//! open / accepted / closed / refused / authenticated plus the `rejected{reason}` pre-auth-`DoS`
+//! breakdown, a BOUNDED aggregate, never an unbounded per-connection list, #572/#633), `storage`
+//! (the on-disk footprint: segment count and bytes, the filesystem free bytes, and the RAM
+//! headroom / RSS-vs-cap, #573/#574), and `recovery` (the flagship corruption-recovery counters:
+//! recovery runs by outcome, torn-tail repairs, and corruption repairs by artifact, #575). Every
+//! v2 field is read from the SAME read-only accessors `/metrics` uses (the engine ones under one
+//! lock, the connz / disk-free / RSS ones off-lock exactly as the metrics scrape does), so the two
+//! surfaces agree by construction and the v2 body can never mutate engine state.
+//!
+//! The schema version is PINNED in the `Accept` header: a consumer that requires the exact v1 shape
+//! sends `Accept: application/vnd.ironbus.admin.v1+json` (it gets the UNCHANGED v1 body); one that
+//! requires v2 sends `application/vnd.ironbus.admin.v2+json`. An `Accept` that explicitly names a
+//! DIFFERENT (unknown) IronBus-admin version is `406 Not Acceptable`, while an absent or wildcard
+//! `Accept` (a plain `curl`) takes the NEWEST version (`v2`), so a future bump is the only way a
+//! curl default ever changes shape and an existing v1 pin is never broken.
+//!
+//! The liveness/readiness split this milestone confirms is ALREADY in place: `/healthz` is liveness
+//! (the accept-loop watchdog, #95) and `/readyz` is readiness (the engine-lock writer-health check
+//! plus the #637 SIGTERM-drain gate), two independent routes — `/admin` adds no third health
+//! signal, it is pure read-only introspection.
 //!
 //! It is OFF by default and enabled only when the operator passes `serve --enable-admin`; when
 //! disabled it is `404`, exactly like an unknown path. It shares `/metrics`'s trust model and bind
@@ -316,14 +335,34 @@ where
         // from an unknown path (a 404), so the surface is invisible unless the operator turned it
         // on. The non-GET case was already rejected with 405 above, so this is GET-only.
         "/admin" if admin_enabled => {
-            // The schema version is PINNED in the `Accept` header (#99): an absent or wildcard
-            // Accept (a plain `curl`) takes the current `v1`; an Accept that explicitly names a
-            // DIFFERENT IronBus-admin version is `406 Not Acceptable`, so a future `v2` consumer
-            // cannot silently misread a `v1` body. A non-admin media type (e.g. `text/html`) is
-            // tolerated and served `v1`, matching how `/metrics` ignores Accept.
+            // The schema version is PINNED in the `Accept` header (#99/#577): an absent or wildcard
+            // Accept (a plain `curl`) takes the NEWEST version (`v2`); an explicit `v1` pin gets the
+            // UNCHANGED v1 body; an explicit `v2` pin gets the v2 body; an Accept that explicitly
+            // names a DIFFERENT (unknown) IronBus-admin version is `406 Not Acceptable`, so a
+            // future-version consumer cannot silently misread an older body. A non-admin media type
+            // (e.g. `text/html`) is tolerated and served the newest version, matching how `/metrics`
+            // ignores Accept. The v1 and v2 bodies share ONE off-lock-augmented snapshot (the v1
+            // renderer simply ignores the v2-only fields), so a v1 request stays byte-for-byte v1.
             match admin_accept_decision(&accept) {
-                AcceptDecision::ServeV1 => match admin_snapshot(engine) {
-                    Ok(snapshot) => respond_json(&mut stream, 200, "OK", &admin_body(&snapshot)),
+                AcceptDecision::ServeV1 => match admin_snapshot(engine, connz, data_dir) {
+                    // v1 keeps its historical generic `application/json` Content-Type so a v1 pin is
+                    // byte-for-byte the prior response (header AND body); only the body schema is the
+                    // contract, but holding the header steady too keeps a v1 consumer untouched.
+                    Ok(snapshot) => {
+                        respond_json(&mut stream, 200, "OK", &admin_body(&snapshot), "application/json")
+                    }
+                    Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
+                },
+                AcceptDecision::ServeV2 => match admin_snapshot(engine, connz, data_dir) {
+                    // v2 labels the response with the versioned media type so a client can confirm
+                    // which representation it received without parsing the body's `schema_version`.
+                    Ok(snapshot) => respond_json(
+                        &mut stream,
+                        200,
+                        "OK",
+                        &admin_body_v2(&snapshot),
+                        ADMIN_MEDIA_TYPE_V2,
+                    ),
                     Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
                 },
                 AcceptDecision::UnsupportedVersion => respond_json(
@@ -331,7 +370,10 @@ where
                     406,
                     "Not Acceptable",
                     "{\"error\":\"unsupported admin schema version\",\
-                     \"supported\":\"application/vnd.ironbus.admin.v1+json\"}",
+                     \"supported\":[\
+                     \"application/vnd.ironbus.admin.v1+json\",\
+                     \"application/vnd.ironbus.admin.v2+json\"]}",
+                    "application/json",
                 ),
             }
         }
@@ -414,54 +456,73 @@ fn parse_accept_header(header_section: &str) -> String {
     accepts.join(",")
 }
 
-/// The outcome of negotiating the `/admin` schema version against the `Accept` header (#99).
+/// The outcome of negotiating the `/admin` schema version against the `Accept` header (#99/#577).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcceptDecision {
-    /// Serve the current `v1` body (the Accept was absent, a wildcard, a non-admin type, or
-    /// explicitly named `v1`).
+    /// Serve the UNCHANGED `v1` body: the Accept explicitly pinned `v1` (alone or alongside another
+    /// version it also accepts). A v1 pin always wins for v1 so an existing consumer is never broken.
     ServeV1,
-    /// The Accept explicitly named an IronBus-admin version other than `v1`: `406 Not Acceptable`.
+    /// Serve the `v2` body: the Accept was absent, a wildcard, a non-admin type, or explicitly pinned
+    /// `v2`. `v2` is the NEWEST version, so an unpinned client (a plain `curl`) takes it.
+    ServeV2,
+    /// The Accept explicitly named an IronBus-admin version that is neither `v1` nor `v2` (an unknown
+    /// future/unsupported version): `406 Not Acceptable`, so a consumer never silently misreads.
     UnsupportedVersion,
 }
 
-/// The media type that pins the current `/admin` schema version (#99). A consumer that requires the
-/// exact schema sends `Accept: application/vnd.ironbus.admin.v1+json`; a future incompatible shape
-/// bumps the `v1` and this constant together with [`ADMIN_SCHEMA_VERSION`].
+/// The media type that pins the `/admin` v1 schema (#99). A consumer that requires the exact v1 shape
+/// sends `Accept: application/vnd.ironbus.admin.v1+json`; v1 is FROZEN, so this is permanent.
 const ADMIN_MEDIA_TYPE_V1: &str = "application/vnd.ironbus.admin.v1+json";
 
+/// The media type that pins the `/admin` v2 schema (#577): the NEWEST version, served to an unpinned
+/// client. A future incompatible shape adds a `v3` constant alongside (it never mutates this one).
+const ADMIN_MEDIA_TYPE_V2: &str = "application/vnd.ironbus.admin.v2+json";
+
 /// The vendor-prefix that identifies ANY IronBus-admin media type, used to detect an Accept that
-/// names a DIFFERENT admin version (which we must reject rather than silently serve `v1`).
+/// names a DIFFERENT admin version (which we must reject rather than silently serve a mismatched body).
 const ADMIN_MEDIA_TYPE_PREFIX: &str = "application/vnd.ironbus.admin.";
 
-/// Decides whether to serve `v1` or reject as an unsupported version, given the (lower-cased)
-/// `Accept` value. The rule (#99): serve `v1` when the client did not pin a specific admin version
-/// (absent Accept, `*/*`, `application/json`, or an explicit `v1`); reject only when the client
-/// explicitly asked for an IronBus-admin media type whose version is NOT `v1`, so a `v2`-only
-/// consumer never misreads a `v1` body.
+/// Negotiates the `/admin` schema version from the (lower-cased) `Accept` value (#99/#577). The rule:
+/// an explicit `v1` pin serves the UNCHANGED v1 body (it wins even when offered alongside another
+/// version, so an existing consumer is never broken); an explicit `v2` pin serves v2; an absent
+/// Accept, a wildcard (`*/*`), or a non-admin type (`application/json`, `text/html`) takes the NEWEST
+/// version (v2), exactly as `/metrics` ignores Accept; only an Accept that explicitly names an
+/// IronBus-admin media type that is neither v1 nor v2 is rejected (`406`), so a future-version-only
+/// consumer never silently misreads an older body. v1 is checked before v2 so a multi-type Accept
+/// that lists both resolves to v1 (the back-compat-safe choice for a client that accepts either).
 fn admin_accept_decision(accept: &str) -> AcceptDecision {
     if accept.is_empty() {
-        return AcceptDecision::ServeV1;
+        return AcceptDecision::ServeV2;
     }
-    // The client named at least one IronBus-admin media type. If ANY of them is exactly the v1 type,
-    // serve v1. If it named admin types but NONE is v1, it pinned a different version: reject.
-    let mut named_admin_type = false;
+    // Scan the offered media types once. A v1 pin wins outright (back-compat). Otherwise remember
+    // whether v2 or some OTHER admin version was named, and decide after the scan: v2 beats an
+    // unknown admin version, and a named-but-unknown admin version with no v1/v2 offer is a 406.
+    let mut named_v2 = false;
+    let mut named_other_admin = false;
     for media in accept.split(',') {
         // A media-range may carry parameters (`;q=...`); the type is the part before the first `;`.
         let media = media.split(';').next().unwrap_or(media).trim();
         if media == ADMIN_MEDIA_TYPE_V1 {
             return AcceptDecision::ServeV1;
         }
-        if media.starts_with(ADMIN_MEDIA_TYPE_PREFIX) {
-            named_admin_type = true;
+        if media == ADMIN_MEDIA_TYPE_V2 {
+            named_v2 = true;
+        } else if media.starts_with(ADMIN_MEDIA_TYPE_PREFIX) {
+            named_other_admin = true;
         }
     }
-    if named_admin_type {
+    if named_v2 {
+        // An explicit v2 pin (possibly alongside an unknown version it also accepts): serve v2.
+        AcceptDecision::ServeV2
+    } else if named_other_admin {
+        // The client pinned an IronBus-admin version that is neither v1 nor v2: reject rather than
+        // serve a mismatched body.
         AcceptDecision::UnsupportedVersion
     } else {
-        // No admin media type was named (e.g. `*/*`, `application/json`, `text/html`): serve v1,
-        // exactly as `/metrics` ignores Accept. The version is still pinnable by a consumer that
-        // wants it via the explicit v1 type above.
-        AcceptDecision::ServeV1
+        // No admin media type was named (e.g. `*/*`, `application/json`, `text/html`): take the
+        // newest version (v2), exactly as `/metrics` ignores Accept. A consumer that needs a specific
+        // version pins it via the explicit media types above.
+        AcceptDecision::ServeV2
     }
 }
 
@@ -573,19 +634,26 @@ where
     Ok(snapshot)
 }
 
-/// Captures the read-only introspection state (#99) in ONE actor job, so every field is from the
-/// same instant. Every value comes from an existing read-only accessor; this cannot mutate the
-/// engine and carries no secret material.
+/// Captures the read-only introspection state (#99/#577) in ONE actor job, so every ENGINE field is
+/// from the same instant, then fills the OFF-LOCK fields (connz, disk-free, RSS) exactly as
+/// [`metrics_snapshot`] does — a process-level / shared-atomic read, not engine state, so it never
+/// runs inside the actor job. Every value comes from an existing read-only accessor; this cannot
+/// mutate the engine and carries no secret material. The v1 renderer ignores the off-lock fields, so
+/// a v1 request is unaffected by their presence.
 ///
 /// # Errors
 /// Returns [`ActorGone`](crate::actor::ActorGone) if the actor exited before the read.
-fn admin_snapshot<F, C, E>(engine: &E) -> Result<AdminSnapshot, crate::actor::ActorGone>
+fn admin_snapshot<F, C, E>(
+    engine: &E,
+    connz: &ConnectionMetrics,
+    data_dir: Option<&Path>,
+) -> Result<AdminSnapshot, crate::actor::ActorGone>
 where
     F: Filesystem + 'static,
     C: Clock + Clone + 'static,
     E: EngineAccess<F, C>,
 {
-    engine.with(|g| AdminSnapshot {
+    let mut snapshot = engine.with(|g| AdminSnapshot {
         healthy: g.is_healthy(),
         flushed: g.flushed_offset().get(),
         committed: g.committed_offset().get(),
@@ -603,7 +671,27 @@ where
         counters: g.counters(),
         groups: g.group_consumer_stats(),
         config: g.config_snapshot(),
-    })
+        // The configured RAM ceiling (#574), read under the lock so the storage object's headroom is
+        // measured against the same instant; the RSS / disk-free / connz are off-lock placeholders
+        // filled below, exactly as `metrics_snapshot` defers them.
+        ram_ceiling_bytes: g.ram_ceiling_bytes(),
+        connz: ConnectionMetricsSnapshot::default(),
+        disk_free: crate::rss::UNAVAILABLE,
+        rss: None,
+    })?;
+    // Read the OFF-LOCK fields exactly as `metrics_snapshot` does (#572/#573/#574): connz is a shared
+    // off-engine atomic set, disk-free a process-level `df`, RSS a process-level `/proc`/`ps` read —
+    // none is engine state, so keeping them off the lock avoids a `df`/`ps`/atomic read inside the
+    // actor job. The defaults above are the not-yet-read placeholders (the same honest zero / `-1`
+    // sentinels `/metrics` uses on the legacy path).
+    snapshot.connz = connz.snapshot();
+    snapshot.disk_free = data_dir
+        .and_then(crate::rss::disk_free_bytes)
+        .map_or(crate::rss::UNAVAILABLE, |free| {
+            i64::try_from(free).unwrap_or(i64::MAX)
+        });
+    snapshot.rss = crate::rss::current_rss_bytes();
+    Ok(snapshot)
 }
 
 /// The edge-resource metric inputs (#118), read from the engine under the same lock as the rest of
@@ -1731,9 +1819,11 @@ fn fsync_histogram_lines(fsync: &LatencyHistogram) -> String {
     s
 }
 
-/// A consistent snapshot of the read-only introspection state (#99), read under one engine lock so
-/// every field is from the same instant. Every value comes from an existing read-only engine
-/// accessor; nothing here can mutate the engine, and no secret material is carried.
+/// A consistent snapshot of the read-only introspection state (#99/#577). The ENGINE fields are read
+/// under one engine lock so they are all from the same instant; the v2-only OFF-LOCK fields (connz,
+/// disk-free, RSS) are filled afterward from process-level / shared-atomic reads, exactly as the
+/// `/metrics` snapshot defers them (they are not engine state). Every value comes from an existing
+/// read-only accessor; nothing here can mutate the engine, and no secret material is carried.
 struct AdminSnapshot {
     healthy: bool,
     flushed: u64,
@@ -1750,11 +1840,32 @@ struct AdminSnapshot {
     /// Per-work-group consumer position, the default group `""` included.
     groups: Vec<GroupConsumerStat>,
     config: EngineConfigSnapshot,
+    // ── v2-only fields (#577) ─────────────────────────────────────────────────────────────────────
+    // Read alongside the engine fields but consumed ONLY by `admin_body_v2`; the v1 renderer ignores
+    // them, so a v1 request is byte-for-byte unchanged.
+    /// The configured RAM ceiling in bytes (`0` = unset), read under the engine lock; the v2 storage
+    /// object's RAM headroom / RSS-vs-cap is derived from it and [`Self::rss`] (#574).
+    ram_ceiling_bytes: u64,
+    /// The connection-signal ("connz") snapshot (#572/#633): the BOUNDED aggregate the v2
+    /// `connections` object renders. Read OFF-LOCK from the shared connz atomics, the at-rest all-zero
+    /// block on the legacy un-shared path.
+    connz: ConnectionMetricsSnapshot,
+    /// The FREE bytes on the filesystem the durable log lives on (#573), or the `-1` unavailable
+    /// sentinel (in-memory broker / `df` unavailable / legacy path). Read OFF-LOCK.
+    disk_free: i64,
+    /// This process's resident-set size in bytes (#118/#574), or `None` when it cannot be read on this
+    /// platform. Read OFF-LOCK; the v2 storage object's RAM headroom degrades to the `-1` sentinel
+    /// when it is `None`.
+    rss: Option<u64>,
 }
 
-/// The schema version of the `/admin` JSON body (#99). Pinned so a consumer can detect a
-/// breaking shape change; a future incompatible change bumps it.
+/// The schema version of the `/admin` v1 JSON body (#99). FROZEN: pinned so a consumer can detect a
+/// breaking shape change. v1 never changes; a new shape is a new version (`ADMIN_SCHEMA_VERSION_V2`).
 const ADMIN_SCHEMA_VERSION: u32 = 1;
+
+/// The schema version of the `/admin` v2 JSON body (#577): the v1 fields PLUS the `connections`,
+/// `storage`, and `recovery` objects. Pinned so a consumer can detect the version it received.
+const ADMIN_SCHEMA_VERSION_V2: u32 = 2;
 
 /// Renders the `/admin` JSON snapshot (#99): a structured, read-only view of operational state.
 /// Hand-rendered (no serde dependency, matching the hand-rendered Prometheus text) and strictly a
@@ -1779,6 +1890,156 @@ fn admin_body(snapshot: &AdminSnapshot) -> String {
     admin_config_section(&mut s, &snapshot.config);
     s.push('}');
     s
+}
+
+/// Renders the `/admin` v2 JSON snapshot (#577): the FULL v1 body (every v1 field, byte-for-byte the
+/// same renderers, only `schema_version` bumped to 2) PLUS three new bounded objects an operator can
+/// read without the Prometheus scrape — `connections`, `storage`, and `recovery`. Hand-rendered (no
+/// serde) and strictly a projection of [`AdminSnapshot`], so it can never mutate engine state.
+///
+/// v2 is purely ADDITIVE: a consumer that ignores the three new keys reads it as v1, and the v1-only
+/// renderers ([`admin_broker_section`] … [`admin_config_section`]) are shared verbatim, so the v1 and
+/// v2 bodies can never drift in their common fields. The three additions each come from the SAME
+/// read-only accessors `/metrics` exposes (the connz aggregate, the storage footprint, the recovery
+/// counters), so the two surfaces agree by construction, and each is a FIXED-shape object (no
+/// unbounded per-connection / per-segment list), keeping the body low-cardinality.
+fn admin_body_v2(snapshot: &AdminSnapshot) -> String {
+    let mut s = String::new();
+    let _ = write!(s, "{{\"schema_version\":{ADMIN_SCHEMA_VERSION_V2},");
+    // The v1 fields, rendered by the SAME functions v1 uses (only the schema_version differs above),
+    // so the shared fields are guaranteed identical between the two versions.
+    admin_broker_section(&mut s, snapshot);
+    admin_segments_section(&mut s, snapshot);
+    admin_consumers_section(&mut s, snapshot);
+    admin_resilience_section(&mut s, snapshot);
+    admin_dlq_section(&mut s, snapshot);
+    admin_config_section(&mut s, &snapshot.config);
+    // The v2 additions, each a fixed-shape bounded object.
+    s.push(',');
+    admin_connections_section(&mut s, snapshot);
+    admin_storage_section(&mut s, snapshot);
+    admin_recovery_section(&mut s, snapshot);
+    s.push('}');
+    s
+}
+
+/// Appends the v2 `"connections":{...}` object (#577): the BOUNDED aggregate of the connz signals
+/// (#572/#633), so an operator reads the connection picture without the Prometheus scrape. It is a
+/// FIXED-shape object — `open` (the live gauge), the `accepted`/`closed`/`refused`/`authenticated`
+/// lifetime totals, and a nested `rejected{reason}` object with the four pre-auth-`DoS` reason
+/// counters — never an unbounded per-connection or per-peer list (a connection id / source IP is
+/// exactly the unbounded label the #576 cardinality firewall forbids), so the cardinality is bounded
+/// by construction regardless of how many connections the broker has served. Every field mirrors a
+/// `ironbus_connections_*` series, so `/admin` v2 and `/metrics` agree.
+fn admin_connections_section(s: &mut String, snapshot: &AdminSnapshot) {
+    let c = &snapshot.connz;
+    let _ = write!(
+        s,
+        "\"connections\":{{\
+            \"open\":{open},\
+            \"accepted\":{accepted},\
+            \"closed\":{closed},\
+            \"refused\":{refused},\
+            \"authenticated\":{authenticated},\
+            \"rejected\":{{\
+                \"rate_limited\":{rate_limited},\
+                \"half_open_cap\":{half_open_cap},\
+                \"locked_out\":{locked_out},\
+                \"auth_failed\":{auth_failed}\
+            }}\
+        }},",
+        open = c.currently_open,
+        accepted = c.accepted,
+        closed = c.closed,
+        refused = c.refused,
+        authenticated = c.authenticated,
+        rate_limited = c.rejected_rate_limited,
+        half_open_cap = c.rejected_half_open_cap,
+        locked_out = c.rejected_locked_out,
+        auth_failed = c.rejected_auth_failed,
+    );
+}
+
+/// Appends the v2 `"storage":{...}` object (#577): the on-disk footprint and the RAM headroom, so an
+/// operator reads the storage picture without the scrape. `segment_count` and `durable_record_bytes`
+/// are the on-disk log footprint (#573); `disk_free_bytes` is the free space on the filesystem the
+/// durable log lives on, or the `-1` unavailable sentinel for an in-memory broker / a platform where
+/// `df` is unavailable (#573). The RAM block mirrors the `/metrics` edge gauges (#118/#574):
+/// `ram_ceiling_bytes` is the configured ceiling (`0` = unset); `rss_bytes` is the live resident-set
+/// size or the `-1` sentinel when it cannot be read; `ram_headroom_bytes` is `ceiling - rss` (or `-1`
+/// when no ceiling is set or RSS is unavailable); and `rss_over_cap_ratio_permille` is the RSS-vs-cap
+/// ratio in per-mille (`0`–`1000`, or `-1` unavailable). Every field reuses the SAME `crate::rss`
+/// helpers `/metrics` uses, so the sentinel conventions and the two surfaces agree.
+fn admin_storage_section(s: &mut String, snapshot: &AdminSnapshot) {
+    // `-1` (the `crate::rss::UNAVAILABLE` / `RSS_UNAVAILABLE` sentinel) when RSS cannot be read on
+    // this platform, matching the `/metrics` `ironbus_*` RAM gauges; otherwise the live RSS in bytes.
+    let rss_bytes = snapshot
+        .rss
+        .map_or(crate::rss::RSS_UNAVAILABLE, |b| {
+            i64::try_from(b).unwrap_or(i64::MAX)
+        });
+    let _ = write!(
+        s,
+        "\"storage\":{{\
+            \"segment_count\":{segment_count},\
+            \"durable_record_bytes\":{durable_record_bytes},\
+            \"disk_free_bytes\":{disk_free},\
+            \"ram_ceiling_bytes\":{ram_ceiling_bytes},\
+            \"rss_bytes\":{rss_bytes},\
+            \"ram_headroom_bytes\":{ram_headroom_bytes},\
+            \"rss_over_cap_ratio_permille\":{rss_over_cap_ratio_permille}\
+        }},",
+        segment_count = snapshot.segment_count,
+        durable_record_bytes = snapshot.durable_record_bytes,
+        disk_free = snapshot.disk_free,
+        ram_ceiling_bytes = snapshot.ram_ceiling_bytes,
+        rss_bytes = rss_bytes,
+        ram_headroom_bytes =
+            crate::rss::ram_headroom_bytes(snapshot.ram_ceiling_bytes, snapshot.rss),
+        rss_over_cap_ratio_permille =
+            crate::rss::rss_over_cap_ratio_permille(snapshot.ram_ceiling_bytes, snapshot.rss),
+    );
+}
+
+/// Appends the v2 `"recovery":{...}` object (#577): the flagship corruption-recovery counters NATS
+/// has no analogue for (#575), so an operator reads the recovery picture without the scrape.
+/// `runs_by_outcome` is a fixed-shape object keyed by the four bounded `RecoveryOutcome` labels (one
+/// increment per broker open into the outcome bucket the run classified into); `torn_tail_repairs` is
+/// the count of torn/unsynced tails truncated to the longest valid prefix (a power-loss repair, NOT
+/// data loss); `corruption_repairs_by_artifact` is a fixed-shape object keyed by the three bounded
+/// `RecoveryArtifact` labels (corruption spans quarantined-and-dropped, by the on-disk artifact).
+/// Every field mirrors a `ironbus_recovery_runs_total` / `ironbus_torn_tail_repairs_total` /
+/// `ironbus_corruption_repairs_total` series, with the SAME frozen label vocabularies, so the JSON
+/// keys stay bounded and `/admin` v2 agrees with `/metrics` by construction.
+fn admin_recovery_section(s: &mut String, snapshot: &AdminSnapshot) {
+    let recovery = &snapshot.counters.recovery;
+    s.push_str("\"recovery\":{\"runs_by_outcome\":{");
+    for (i, (outcome, runs)) in RecoveryOutcome::ALL
+        .iter()
+        .zip(recovery.runs_by_outcome.iter())
+        .enumerate()
+    {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "\"{}\":{runs}", outcome.metric_label());
+    }
+    let _ = write!(
+        s,
+        "}},\"torn_tail_repairs\":{},\"corruption_repairs_by_artifact\":{{",
+        recovery.torn_tail_repairs,
+    );
+    for (i, (artifact, repairs)) in RecoveryArtifact::ALL
+        .iter()
+        .zip(recovery.corruption_repairs_by_artifact.iter())
+        .enumerate()
+    {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "\"{}\":{repairs}", artifact.metric_label());
+    }
+    s.push_str("}}");
 }
 
 /// Appends the `"segments":{...}` sub-resource (#99): the durable-log SPAN #15 renders, derived from
@@ -2003,18 +2264,24 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::
     respond_with(stream, code, reason, "text/plain; charset=utf-8", body)
 }
 
-/// Like [`respond`] but with the `application/json` content type, for the `/admin` endpoint (#99).
+/// Like [`respond`] but with a JSON `Content-Type`, for the `/admin` endpoint (#99/#577). The
+/// `media_type` is the SCHEMA-PINNED admin media type the negotiated version selected (so a v1
+/// response is labeled `application/vnd.ironbus.admin.v1+json` and a v2 response `...v2+json`, while
+/// the 406 error body is a plain `application/json`); `; charset=utf-8` is appended here so each
+/// call site passes only the bare media type. Every spelling starts with `application/`, so the
+/// existing `Content-Type: application/json` substring checks still match a JSON response.
 fn respond_json(
     stream: &mut TcpStream,
     code: u16,
     reason: &str,
     body: &str,
+    media_type: &str,
 ) -> std::io::Result<()> {
     respond_with(
         stream,
         code,
         reason,
-        "application/json; charset=utf-8",
+        &format!("{media_type}; charset=utf-8"),
         body,
     )
 }
