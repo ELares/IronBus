@@ -42,6 +42,16 @@ flag and code does.
 | `repair` | offline (reads `--data-dir`) | Unix only in v1 | Default the same read-only plan as `scrub`; `--apply` quarantines and truncates under the exclusive lock (recovery made explicit). |
 | `admin consumer-reset` | OFFLINE MUTATING (reads + rewrites `--data-dir`) | Unix only in v1 | Rewrite a work-group's durable cursor checkpoint to `--to <offset\|earliest\|latest>`, clamped to the durable range, under the exclusive lock (broker stopped). An out-of-range explicit offset is rejected. (#299) |
 | `admin dlq-redrive` | OFFLINE MUTATING (reads + rewrites `--data-dir`) | Unix only in v1 | Re-inject the dead-lettered records from the durable DLQ sink back onto the main log, crash-safely and idempotently, under the exclusive lock (broker stopped). (#299) |
+| `group ls` / `group info <name>` | OFFLINE read-only (reads `--data-dir`) | Unix only in v1 | List every work-group's committed offset, lag, and in-range bit / one group's. A missing group is not-found (exit 2). No lock (read-only). (#586) |
+| `group reset <name> --to <…>` | OFFLINE MUTATING | Unix only in v1 | Convenience alias for `admin consumer-reset` (the identical cursor rewrite). (#586) |
+| `group purge <name>` / `group rm <name>` | OFFLINE MUTATING | Unix only in v1 | DROP a work-group's durable cursor. DESTRUCTIVE: requires `--force` (or `--yes`); a missing group is not-found (exit 2). Under the exclusive lock. (#586) |
+| `stream ls` / `stream info <name>` | OFFLINE read-only | Unix only in v1 | List every stream's durable range, record count, and recovery loss bit / one stream's (the default stream is the root log). A missing named stream is not-found (exit 2). No lock. (#586) |
+| `stream create <name>` | OFFLINE MUTATING | Unix only in v1 | Declare a named stream's durable log (idempotent). Under the exclusive lock. (#586) |
+| `stream bind <subject> <stream>` | OFFLINE MUTATING (declares the target) | Unix only in v1 | Declare the binding's target stream offline; the subject→stream ROUTE itself is applied at broker runtime over the wire (`BindSubject`, admin scope) and is NOT persisted in the data directory. (#586) |
+| `stream purge <name>` / `stream rm <name>` | OFFLINE MUTATING | Unix only in v1 | DROP a named stream's records. DESTRUCTIVE: requires `--force`; the default stream cannot be purged here; a missing stream is not-found (exit 2). Under the exclusive lock. (#586) |
+| `dlq ls` | OFFLINE read-only | Unix only in v1 | Count the durable dead-letter records and summarize by group. No lock. (#595) |
+| `dlq peek [--limit n]` | OFFLINE read-only | Unix only in v1 | Read-only dead-letter view (the same reader as `dump --dlq`). No lock. (#595) |
+| `dlq redrive` | OFFLINE MUTATING | Unix only in v1 | Re-inject the dead-letter records onto the main log (the same crash-safe, idempotent op as `admin dlq-redrive`; a feature NATS lacks). Under the exclusive lock. (#595) |
 | `top` | LIVE (polls `/admin`) any; OFFLINE (reads `--data-dir`) Unix only in v1 | Strictly read-only status view. LIVE polls the broker's `/admin` v1 JSON; OFFLINE renders only the file-derived panels behind a mandatory banner. |
 | `help` / `--help` / `-h` | neither | any | Print the usage banner. |
 | `version` / `--version` / `-V` | neither | any | Print a single `ironbus <version>` line. |

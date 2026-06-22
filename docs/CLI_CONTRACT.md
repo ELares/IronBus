@@ -325,6 +325,34 @@ watermark on entry. The crash-safe ordering (records fsynced, THEN the watermark
 the at-least-once re-redrive on a crash before the watermark advance are described in
 [`CLI.md`](CLI.md).
 
+#### `group` / `stream` / `dlq` management verbs (offline; #586, #595)
+
+The rich-CLI lifecycle verbs each carry their own versioned result object; the DESTRUCTIVE ones
+(`group`/`stream` `purge`/`rm`) are fail-closed — without `--force`/`--yes` they REFUSE with a
+usage error (exit 1, deleting nothing) whose message names the count-of-what-would-be-deleted, and
+under `--json` the flag is mandatory (no interactive prompt). A missing group/stream is not-found
+(exit 2), never a silent success. The read-only `ls`/`info`/`peek` verbs take no lock; the mutating
+verbs take the same exclusive data-dir lock as `admin consumer-reset` (exit 5 if a broker is running).
+
+```json
+{"schema":"ironbus.cli.group-ls.v1","groups":[{"group":"<name>","committed":7,"lag":3,"in_range":true}],"count":1,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.group-info.v1","group":"<name>","committed":7,"lag":3,"in_range":true,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.group-rm.v1","group":"<name>","removed":true,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.stream-ls.v1","streams":[{"stream":"","earliest_retained":0,"durable_head":4,"records":4,"has_loss":false}],"count":1,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.stream-info.v1","stream":"<name>","earliest_retained":0,"durable_head":0,"records":0,"has_loss":false,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.stream-create.v1","stream":"<name>","created":true,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.stream-bind.v1","subject":"order.>","stream":"<name>","target_declared":true,"route_persisted":false,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.stream-rm.v1","stream":"<name>","records_dropped":5,"segments_removed":1,"ok":true,"exit_code":0}
+{"schema":"ironbus.cli.dlq-ls.v1","records":4,"by_group":[{"group":"<name>","records":4}],"ok":true,"exit_code":0}
+```
+
+`group reset` reuses `ironbus.cli.admin-consumer-reset.v1`; `dlq peek` reuses the `dump --dlq`
+record stream; `dlq redrive` reuses `ironbus.cli.admin-dlq-redrive.v1`. The `group-purge`/
+`stream-purge` schemas are byte-identical to their `-rm` twins (the durable mutation is the same).
+`stream bind`'s `route_persisted` is always `false`: the subject→stream route is applied at broker
+runtime over the wire (`BindSubject`, admin scope) and is not stored in the data directory, so the
+verb only declares the target stream's log (`target_declared`).
+
 #### The error/result object (every command; emitted on a non-zero exit)
 
 The terminal object on ANY non-zero exit path (except usage exit `1`, see 1.2). It is the
