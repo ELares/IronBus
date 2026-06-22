@@ -40,6 +40,8 @@ flag and code does.
 | `dump` | offline (reads `--data-dir`) | Unix only in v1 | Stream every durable record (or, with `--dlq`, the dead-letter sink). |
 | `scrub` | offline (reads `--data-dir`) | Unix only in v1 | Strictly read-only full integrity scan: report every corruption / torn-tail / checksum issue (the plan). Never writes. |
 | `repair` | offline (reads `--data-dir`) | Unix only in v1 | Default the same read-only plan as `scrub`; `--apply` quarantines and truncates under the exclusive lock (recovery made explicit). |
+| `backup` | OFFLINE (reads `--data-dir`, writes `--out`) | Unix only in v1 | Point-consistent snapshot of the log + cursors + DLQ into a backup directory tree (`MANIFEST` + `data/` copy + per-file CRC32C), under the exclusive lock on the source (exit 5 if a broker is running). (#607) |
+| `restore` | OFFLINE (reads `--from`, writes `--data-dir`) | Unix only in v1 | Validate a backup WHOLE (version + every file's CRC) and materialize a data dir from it, fail-closed. Refuses a corrupt/wrong-version backup (nothing written) and a non-empty target without `--force`. A restored dir passes `verify`. (#607) |
 | `admin consumer-reset` | OFFLINE MUTATING (reads + rewrites `--data-dir`) | Unix only in v1 | Rewrite a work-group's durable cursor checkpoint to `--to <offset\|earliest\|latest>`, clamped to the durable range, under the exclusive lock (broker stopped). An out-of-range explicit offset is rejected. (#299) |
 | `admin dlq-redrive` | OFFLINE MUTATING (reads + rewrites `--data-dir`) | Unix only in v1 | Re-inject the dead-lettered records from the durable DLQ sink back onto the main log, crash-safely and idempotently, under the exclusive lock (broker stopped). (#299) |
 | `group ls` / `group info <name>` | OFFLINE read-only (reads `--data-dir`) | Unix only in v1 | List every work-group's committed offset, lag, and in-range bit / one group's. A missing group is not-found (exit 2). No lock (read-only). (#586) |
@@ -68,14 +70,14 @@ anywhere.
   `--addr` (default `127.0.0.1:7777`, loopback only). `pub` and `sub` connect to a
   running broker; `serve` IS the broker. If the broker cannot be reached, an online verb
   exits 5 (unreachable).
-- **Offline** verbs (`peek`, `dump`, `scrub`, `repair`) decode the on-disk data directory
-  directly with NO server running, via the storage crate's `OfflineReader` (and, for
+- **Offline** verbs (`peek`, `dump`, `scrub`, `repair`, `backup`, `restore`) decode the on-disk
+  data directory directly with NO server running, via the storage crate's `OfflineReader` (and, for
   `repair --apply`, `Log::open`). They read only up to the durable high-water mark and stop
   at the first torn or bad-CRC record (the same boundary recovery uses), marking, never
-  hiding, any tail they skipped. `peek`/`dump`/`scrub` never mutate the directory; only
-  `repair --apply` writes, and only under the exclusive data-dir lock. There is no online
-  fallback for the offline verbs: they are pure offline readers (or, for `repair --apply`,
-  an offline recovery).
+  hiding, any tail they skipped. `peek`/`dump`/`scrub`/`backup` never mutate the source directory;
+  `repair --apply` and `restore` write, and only under the exclusive data-dir lock. There is no online
+  fallback for the offline verbs: they are pure offline readers (or, for `repair --apply` / `restore`,
+  an offline recovery / materialization).
 - **Dual-mode**: `top` is BOTH. Its LIVE mode is an `/admin` HTTP client (any platform); its
   OFFLINE mode is a pure file-derived reader (Unix only in v1). Which mode runs is chosen by the
   flag (`--addr`/`--health-addr` vs `--data-dir`), and a mandatory banner names the active mode so
@@ -651,6 +653,63 @@ object plus an `applied` boolean:
 
 ```json
 {"schema":"ironbus.cli.repair.v1","data_dir":"<dir>","segments":<n>,"skipped_spans":<k>,"data_loss_spans":<d>,"data_loss_bytes":<db>,"torn_tail_bytes":<tb>,"applied":<bool>,"events":[...],"ok":<bool>,"exit_code":<code>}
+```
+
+## `backup` / `restore` (offline; Unix only in v1)
+
+A **point-consistent** snapshot of a stopped broker's data directory — the log + the consumer
+cursors + the DLQ together — and a fail-closed restore. Both are OFFLINE store tools; a RESTORED
+dir passes `verify` (the consistency oracle). See `docs/RECOVERY.md` §8.5 for the full model.
+
+### `backup`
+
+Captures `--data-dir` into a backup directory tree at `--out`.
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--data-dir <dir>` | path | required | The (stopped) broker data directory to snapshot. |
+| `--out <backup-dir>` | path | required | The backup directory tree to write (created at `0700` if absent). |
+| `--json` | flag | off | Emit the versioned `ironbus.cli.backup.v1` object instead of the human line. |
+
+`backup` takes the **EXCLUSIVE data-dir lock** on the source FIRST — if a broker is running it
+FAILS FAST with exit `5` (a running broker's data dir is not a consistent point), touching nothing.
+With the broker stopped and the lock held, the on-disk checkpoints are settled, so it captures the
+log + cursors + DLQ (and every other durable artifact) under one quiescent image. The backup is a
+**directory tree** (no tar dependency): a `MANIFEST` at the backup root (format version + a
+CRC32C/length of every captured file + the captured durable offsets / cursor / DLQ counts, a
+consistency self-check) and a `data/` subtree that is a faithful, recursively-enumerated copy of the
+data dir. The CLI `LOCK` file is excluded. The manifest is written LAST, so a crash mid-backup leaves
+a backup a restore rejects (no manifest), never one promising files not on disk.
+
+The human line reports the captured file/byte counts, the durable range, and the cursor/DLQ counts.
+The `--json` form:
+
+```json
+{"schema":"ironbus.cli.backup.v1","data_dir":"<dir>","out":"<backup-dir>","files":<n>,"bytes":<b>,"durable_head":<h>,"earliest_retained":<e>,"cursors":<c>,"dlq_records":<d>,"ok":true,"exit_code":0}
+```
+
+### `restore`
+
+Validates a `--from` backup and materializes a `--data-dir` from it, fail-closed.
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--from <backup-dir>` | path | required | The backup directory tree to restore from (a missing path is not-found, exit 2). |
+| `--data-dir <dir>` | path | required | The target data directory to materialize (created at `0700` if absent). |
+| `--force` (alias `--yes`) | flag | off | Overwrite a NON-EMPTY target (cleared first, so the restored tree is exactly the backup's). Without it, a non-empty target is REFUSED (exit 1). |
+| `--json` | flag | off | Emit the versioned `ironbus.cli.restore.v1` object instead of the human line. |
+
+`restore` validates the backup WHOLE before writing a byte: the `MANIFEST` must be a well-formed
+IronBus backup manifest of a SUPPORTED format version (a future version is refused, exit 1), and EVERY
+listed file must be present with bytes whose CRC32C + length match the manifest. A corrupt, truncated,
+incomplete, or wrong-version backup is REJECTED with **NOTHING written to the target** — never a
+partial restore. It REFUSES to clobber a NON-EMPTY `--data-dir` without `--force`, and takes the
+exclusive lock on the target (exit 5 if a broker holds it). After a restore the target is a
+byte-faithful copy of the captured dir, so it **passes `verify`** (every cursor ≤ the log head, every
+DLQ entry resolvable) and a broker resumes from the restored cursors. The `--json` form:
+
+```json
+{"schema":"ironbus.cli.restore.v1","from":"<backup-dir>","data_dir":"<dir>","files":<n>,"bytes":<b>,"durable_head":<h>,"earliest_retained":<e>,"cursors":<c>,"dlq_records":<d>,"ok":true,"exit_code":0}
 ```
 
 ## `admin consumer-reset` / `admin dlq-redrive` (offline MUTATING; Unix only in v1)
