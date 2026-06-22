@@ -4932,6 +4932,49 @@ mod tests {
     }
 
     #[test]
+    fn the_txn_prepare_body_is_byte_frozen() {
+        // #640: pin the EXACT bytes a v1 TxnPrepare body produces, so an accidental wire-format drift
+        // breaks a test here, not a deployed producer — the frame-body twin of the TXNH/TXNO on-disk
+        // byte-freeze. The pub_body is carried VERBATIM (an opaque tail), so a fixed literal pins the
+        // framing independently of the PubBody codec. Layout: version, field_len(u16 LE over the
+        // block), txn_id(u16-len + bytes), stream_id(u16-len + bytes), then the verbatim pub_body.
+        let mut buf = Vec::new();
+        encode_txn_prepare(
+            &TxnPrepareBody {
+                txn_id: b"tx",
+                stream_id: b"orders",
+                pub_body: b"OPAQUE-PUB-BODY",
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.push(1); // STREAM_WIRE_BODY_VERSION
+        // field_len = (2 + txn_id"tx") + (2 + stream_id"orders") = 4 + 8 = 12.
+        expected.extend_from_slice(&12u16.to_le_bytes());
+        expected.extend_from_slice(&2u16.to_le_bytes()); // txn_id len
+        expected.extend_from_slice(b"tx");
+        expected.extend_from_slice(&6u16.to_le_bytes()); // stream_id len
+        expected.extend_from_slice(b"orders");
+        expected.extend_from_slice(b"OPAQUE-PUB-BODY"); // the verbatim pub_body tail
+        assert_eq!(buf, expected, "the v1 TxnPrepare body wire format is frozen");
+    }
+
+    #[test]
+    fn the_txn_resolve_body_is_byte_frozen() {
+        // #640: pin the EXACT bytes a v1 TxnCommit / TxnRollback body produces (both share the
+        // TxnResolveBody shape). Layout: version, field_len(u16 LE), txn_id(u16-len + bytes).
+        let mut buf = Vec::new();
+        encode_txn_resolve(&TxnResolveBody { txn_id: b"tx" }, &mut buf).unwrap();
+        let mut expected = Vec::new();
+        expected.push(1); // STREAM_WIRE_BODY_VERSION
+        expected.extend_from_slice(&4u16.to_le_bytes()); // field_len = 2 (id-len field) + 2 (id bytes)
+        expected.extend_from_slice(&2u16.to_le_bytes()); // txn_id len
+        expected.extend_from_slice(b"tx");
+        assert_eq!(buf, expected, "the v1 TxnResolve body wire format is frozen");
+    }
+
+    #[test]
     fn sub_to_round_trips_stream_id_and_group() {
         // #588: SubTo carries both a stream id and a work-group name, each round-tripping; empty
         // stream id (default stream) and empty group (default group) both round-trip.
