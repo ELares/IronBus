@@ -2573,7 +2573,7 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// holding every poison record for later inspection. Opened LAZILY on the first dead-letter
     /// (so a broker that never dead-letters never creates the subdirectory), or eagerly by
     /// [`Engine::open`] when the subdirectory already exists, so the per-group dead-lettered
-    /// high-water mark (the idempotency key) is rebuilt before the first poison redelivers.
+    /// offset set (the idempotency key) is rebuilt before the first poison redelivers.
     dlq: Option<DlqSink<F, C>>,
     /// The [`LogConfig`] the DLQ sink's log is opened with: the same segment sizing as the main
     /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
@@ -2909,7 +2909,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .as_deref()
             .unwrap_or(DLQ_SUBDIR)
             .to_string();
-        // Eagerly open (recovering its high-water mark) the dead-letter sink IF its subdirectory
+        // Eagerly open (recovering its dead-lettered offset set) the dead-letter sink IF its subdirectory
         // already exists from a prior run, so the idempotency key is present before the first poison
         // redelivers after a crash. A fresh data directory has no sink subdir yet, so the sink stays
         // unopened (lazy) and the no-dead-letter path never creates it.
@@ -3209,7 +3209,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// Whether the dead-letter sink's `subdir` already exists, so a prior run dead-lettered at least
     /// one message there. `subdir` is the configured dead-letter EXCHANGE target (#551), or the
     /// default `dlq/`. Used by [`Engine::open`] to decide whether to eagerly open the sink (rebuilding
-    /// the idempotency high-water mark) versus deferring to the lazy open on the first dead-letter.
+    /// the idempotency offset set) versus deferring to the lazy open on the first dead-letter.
     /// This is a non-creating probe ([`Filesystem::subdir_exists`]), so `Engine::open` on a fresh
     /// data directory never materializes the sink subdirectory.
     fn dlq_dir_exists(log: &Log<F, C>, subdir: &str) -> bool {
@@ -6547,11 +6547,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         })
     }
 
-    /// Lazily opens (recovering its per-group high-water mark) the durable DLQ sink on first use,
-    /// returning a mutable borrow. The sink is created on the first dead-letter, so a broker that
+    /// Lazily opens (recovering its per-group dead-lettered offset set) the durable DLQ sink on first
+    /// use, returning a mutable borrow. The sink is created on the first dead-letter, so a broker that
     /// never dead-letters never creates the `dlq/` subdirectory (the no-poison path never touches
     /// it). After a restart that already has a `dlq/` directory, [`Engine::open`] eagerly opens it
-    /// so the high-water mark is present before the first poison redelivers.
+    /// so the dead-lettered offset set is present before the first poison redelivers.
     fn dlq_sink(&mut self) -> Result<&mut DlqSink<F, C>, EngineError> {
         if self.dlq.is_none() {
             // Route to the configured dead-letter EXCHANGE subdir (#551) when set, else the default
@@ -6600,8 +6600,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// recording [`DeadLetterReason::TtlExpired`], then commits the source group's cursor past it and
     /// returns [`Poll::Parked`]. The ordering and idempotency are identical to [`Engine::dead_letter_in`]
     /// (APPEND+FSYNC the reason-carrying dead-letter record BEFORE the cursor commit; a redelivered
-    /// re-expired message is a no-op append at or below the per-group high-water mark), so an expiry is
-    /// a fully reported, exactly-once event. Used only when [`Engine::dead_letters_expired`] holds.
+    /// re-expired message whose EXACT source offset is already in the per-group dead-lettered set is a
+    /// no-op append, #800), so an expiry is a fully reported, exactly-once event. Used only when
+    /// [`Engine::dead_letters_expired`] holds.
     fn expire_dead_letter_in(
         &mut self,
         group: &str,
@@ -12626,8 +12627,8 @@ mod tests {
         // The crash window: the DLQ append+fsync is durable, but the source-cursor commit's
         // durability has NOT yet landed (it is only in memory, the checkpoint interval is high).
         // A power loss reverts the un-checkpointed source cursor (the poison redelivers) while the
-        // fsynced DLQ record survives. On reopen the per-group high-water mark, rebuilt from the
-        // durable DLQ, suppresses the duplicate append: EXACTLY ONE DLQ entry, and no loss.
+        // fsynced DLQ record survives. On reopen the per-group exact dead-lettered offset set, rebuilt
+        // from the durable DLQ, suppresses the duplicate append: EXACTLY ONE DLQ entry, and no loss.
         let clock = std::sync::Arc::new(ManualClock::new());
         let (faultfs, _control) = FaultFs::new(InMemoryFs::new());
         // Keep a probe to the underlying in-memory disk to drive the power loss and read the DLQ.

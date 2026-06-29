@@ -338,8 +338,8 @@ impl<F: Filesystem, C: Clock> std::fmt::Debug for DlqSink<F, C> {
 
 impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// Opens (recovering, or creating fresh) the dead-letter sink rooted at the `dlq/`
-    /// subdirectory of `parent_fs`, rebuilding the per-group dead-lettered high-water mark by
-    /// scanning the durable DLQ records. The subdirectory is created on demand by
+    /// subdirectory of `parent_fs`, rebuilding the per-group exact set of dead-lettered source
+    /// offsets by scanning the durable DLQ records. The subdirectory is created on demand by
     /// [`Filesystem::subdir`].
     ///
     /// # Errors
@@ -353,7 +353,7 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// of `parent_fs` — the dead-letter EXCHANGE target (#551). [`DlqSink::open`] is this with the
     /// default [`DLQ_SUBDIR`], so the existing fixed-DLQ behavior is byte-identical; a configured DLX
     /// names a different `subdir` to route dead letters to a separate sink. The on-disk format and
-    /// the idempotent high-water-mark rebuild are identical for every target.
+    /// the idempotent exact-offset-set rebuild are identical for every target.
     ///
     /// # Errors
     /// Propagates a storage error from creating the subdirectory, opening the DLQ log, or scanning
@@ -451,10 +451,10 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     }
 
     /// Appends one poison record to the sink and makes it durable (fsync) BEFORE returning, then
-    /// advances the in-memory high-water mark. This is the durable half of the crash-atomic move:
-    /// the caller appends-and-fsyncs HERE first, and only then commits the source group's cursor
-    /// past the message, so a crash between the two leaves the source uncommitted and the record
-    /// already durable in the DLQ; on reopen the high-water mark (rebuilt from this very record)
+    /// adds the source offset to the in-memory dead-lettered set. This is the durable half of the
+    /// crash-atomic move: the caller appends-and-fsyncs HERE first, and only then commits the source
+    /// group's cursor past the message, so a crash between the two leaves the source uncommitted and
+    /// the record already durable in the DLQ; on reopen the exact set (rebuilt from this very record)
     /// suppresses the duplicate append.
     ///
     /// The original record's `key`, `payload`, and `timestamp_ms` are preserved verbatim; the
@@ -465,7 +465,7 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// Returns [`StorageError::SegmentFull`] if the metadata could not be framed (an original
     /// header or group name longer than `u16::MAX`, unreachable from the wire), or a storage error
     /// from the append or its durability barrier. On any error nothing is recorded as
-    /// dead-lettered (the high-water mark and count do not move), so the caller MUST NOT commit the
+    /// dead-lettered (the offset set and count do not move), so the caller MUST NOT commit the
     /// source cursor: the move did not happen.
     pub fn append_poison(
         &mut self,
@@ -490,8 +490,8 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// default fixed-DLQ max-deliver path, so that path stays byte-identical.
     ///
     /// The crash-safety contract (append-and-fsync the dead-letter record HERE before the caller
-    /// commits the source cursor) and the idempotent per-group high-water mark are identical to
-    /// `append_poison`.
+    /// commits the source cursor) and the idempotent per-group dead-lettered offset set are identical
+    /// to `append_poison`.
     ///
     /// # Errors
     /// Same as [`append_poison`](Self::append_poison).
@@ -509,7 +509,8 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     }
 
     /// Appends one dead-letter record (with its already-encoded metadata `headers` blob) to the sink,
-    /// fsyncs it BEFORE returning, and advances the per-group high-water mark + record count. This is
+    /// fsyncs it BEFORE returning, and adds the source offset to the per-group set + bumps the record
+    /// count. This is
     /// the shared durable core of [`append_poison`](Self::append_poison) and
     /// [`append_dead_letter`](Self::append_dead_letter); the only difference between them is the v1 vs
     /// v2 metadata encoding, computed by the caller.
@@ -717,7 +718,7 @@ mod tests {
         assert_eq!(sink.records(), 1);
         assert_eq!(sink.highest_for_group("orders"), Some(7));
 
-        // Reopen the sink: the high-water mark and count come back from the durable records alone.
+        // Reopen the sink: the dead-lettered offset set and count come back from the durable records alone.
         let reopened = DlqSink::open(&fs, ManualClock::new(), config()).unwrap();
         assert_eq!(reopened.records(), 1);
         assert_eq!(reopened.highest_for_group("orders"), Some(7));
