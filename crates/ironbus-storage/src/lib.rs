@@ -14,15 +14,6 @@ pub mod fault;
 pub mod fs;
 pub mod invariants;
 pub mod io;
-/// A [`KvBucket`](kv::KvBucket): a KV store as a key-compacted log (V2-M5, #556 + #558). A bucket is
-/// a [`Log`](log::Log) with key compaction on (the shipped `--compact` machinery), keyed records
-/// where `value` is the body and `revision` is the log offset, plus a resident compacted head
-/// (`key -> latest value/revision`) that serves an O(1), linearizable `get`. It adds put/get/delete
-/// over the log + a LINEARIZABLE compare-and-swap ([`KvBucket::put_if`](kv::KvBucket::put_if))
-/// serialized through the single writer — linearizable on a single node by construction (the beat
-/// over NATS KV's possibly-stale follower CAS reads). Non-KV streams are unaffected: a bucket only
-/// COMPOSES the existing log + compaction, it adds no new storage primitive.
-pub mod kv;
 /// The data-directory LAYOUT version marker (#562): a small, durable, CRC32C'd `layout.meta` at the
 /// data-dir root that versions the on-disk DIRECTORY structure (where streams/cursors/DLQ live),
 /// distinct from the per-segment `FORMAT_VERSION`. Version 1 is today's layout (root log = default
