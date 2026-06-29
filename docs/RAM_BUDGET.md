@@ -271,7 +271,7 @@ PER opted-in producer with worst-case ids (or `100_000 * (2*32 + ~64) ~= 12 MiB`
 with modest 32-byte ids). This term is therefore SIZED BY the count bound, so an
 edge profile that opts into dedup must either lower `--dedup-max-ids` or rely on
 the time bound to keep the live window small. The refuse-to-boot guard now CHARGES
-this term at the configured caps (`DEDUP_ENTRY_BYTES ~= 640`, #878), so a bounded
+this term at the configured caps (`DEDUP_ENTRY_BYTES ~= 704`, #878), so a bounded
 ceiling refuses unless the dedup caps fit.
 
 **The TOTAL is hard-bounded too.** The `producer_id` is wire-supplied and
@@ -291,7 +291,7 @@ dedup memory is therefore:
 
 ```
 total_dedup <= max_producers * max_ids * (2 * msg_id_len + ~2 * entry overhead)
-             + max_producers * (2 * producer_id_len + ~2 * overhead)
+             + max_producers * (3 * producer_id_len + ~2 * overhead)
 ```
 
 At the SHIPPED defaults with the worst-case 256-byte ids, the absolute ceiling is
@@ -482,11 +482,10 @@ single-`Vec` `EphemeralFile`/`EphemeralFs` backend (#492): ONE byte image per fi
 no `live`+`durable` copy, and an O(1) no-op `sync_*`, so the true production
 retained set is **~1x** `max_total_bytes`. The 2x `live`+`durable` byte image now
 exists ONLY in the `InMemoryFile` crash-recovery SIMULATION (the deterministic
-power-loss models), which production never runs. The boot guard nonetheless still
-charges `2 * max_total_bytes` (`IN_MEMORY_STORE_IMAGES = 2`) — a deliberately
-CONSERVATIVE over-charge it has not been retuned down to the ephemeral 1x — and
-refuses a ceiling below that floor, so a config the guard accepts has roughly double
-the store headroom it provably needs. Memory mode already refuses an unlimited (`0`)
+power-loss models), which production never runs. Post-#492 the boot guard charges
+`1 * max_total_bytes` (`IN_MEMORY_STORE_IMAGES = 1`) — matching the single-image
+ephemeral backend, so it no longer over-refuses a valid 1x config on a RAM-tight edge
+box — and refuses a ceiling below that floor. Memory mode already refuses an unlimited (`0`)
 byte cap at boot, so the store term is always finite there. The live framed resident
 bytes are also available programmatically via `Log::resident_bytes_estimate()`
 (#493). Two honesty caveats on `term4mem`:
