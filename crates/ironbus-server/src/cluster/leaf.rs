@@ -1730,7 +1730,7 @@ mod live_leaf_tests {
         )
         .expect("leaf mirror log opens");
         let cursors = OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("geo cursor");
-        MirrorApplier::new(log, cursors)
+        MirrorApplier::new(log, cursors, true)
     }
 
     /// The leaf DIALS the hub (outbound) and pulls one origin into its mirror until caught up to the hub's

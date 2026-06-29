@@ -6899,7 +6899,10 @@ fn spawn_federation_mirror_puller(
             dir.display()
         ))
     })?;
-    let applier = std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(log, cursors)));
+    // A federation mirror has exactly ONE origin, so the #799 next_offset reconciliation is safe.
+    let applier = std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(
+        log, cursors, true,
+    )));
     let origin = mirrored.origin.clone();
     let key = origin.cursor_key();
     let local = mirrored.local_stream.clone();
@@ -6959,8 +6962,15 @@ fn spawn_geo_plane(
         let cursors = OriginCursorStore::open(&StdFs::new(dir.clone()))
             .map_err(|e| CliError::Internal(format!("open geo cursor {}: {e}", dir.display())))?;
         // The applier is shared across this stream's origins (a source fans N origins into ONE log), so
-        // the single-writer invariant holds across the per-origin threads via the mutex.
-        let applier = std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(log, cursors)));
+        // the single-writer invariant holds across the per-origin threads via the mutex. It is
+        // single-origin (the #799 next_offset reconciliation is safe) iff this stream has exactly one
+        // origin (a MIRROR, or a single-origin SOURCE); a multi-origin fan-in is not.
+        let single_origin = stream.mode.origins().len() == 1;
+        let applier = std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(
+            log,
+            cursors,
+            single_origin,
+        )));
 
         for origin in stream.mode.origins() {
             let applier = std::sync::Arc::clone(&applier);
@@ -7134,8 +7144,10 @@ fn spawn_leaf_plane(
             let cursors = OriginCursorStore::open(&StdFs::new(dir.clone())).map_err(|e| {
                 CliError::Internal(format!("open leaf mirror cursor {}: {e}", dir.display()))
             })?;
-            let applier =
-                std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(log, cursors)));
+            // The hub is the leaf's ONE origin, so the #799 next_offset reconciliation is safe.
+            let applier = std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(
+                log, cursors, true,
+            )));
             // The hub is the leaf's ONE origin (the read bridge IS a geo mirror); dial it outbound.
             let origin = GeoOrigin {
                 addr: leaf.hub_addr.clone(),

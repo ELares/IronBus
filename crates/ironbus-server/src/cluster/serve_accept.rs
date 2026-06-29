@@ -642,7 +642,7 @@ mod tests {
         .expect("mirror log opens");
         let cursors =
             OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("cursor store");
-        MirrorApplier::new(log, cursors)
+        MirrorApplier::new(log, cursors, true)
     }
 
     /// A `serve_plane`-only config (a geo / federation origin) over `origin`'s read plane.

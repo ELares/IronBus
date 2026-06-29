@@ -518,7 +518,10 @@ impl<'a, F: Filesystem> OriginServer<'a, F> {
 /// The outcome of applying one pull response: how many records were applied and the cursor + HW after.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ApplyOutcome {
-    /// How many records this response durably applied to the local log.
+    /// How many records this response newly APPENDED to the local log. After the #799 crash-window
+    /// reconciliation this EXCLUDES frames the response carried but the single-origin applier already
+    /// held durably (skipped, not re-appended), so a pure re-pull of already-applied data reports `0`
+    /// applied even though `cursor` advances — progress is keyed off `cursor`/`record_count`, not this.
     pub applied: u64,
     /// The puller's resume cursor AFTER this apply: the next origin offset to pull FROM.
     pub cursor: u64,
@@ -547,10 +550,13 @@ pub const GEO_CURSOR_PAYLOAD: usize = 4096;
 /// prior durable slot (never a torn cursor), and a torn / missing file recovers as "no cursors" — every
 /// origin resumes from offset 0, the safe degrade (a fresh mirror re-pulls from the origin's start; the
 /// [`NonContiguous`](GeoError::NonContiguous) guard + the local log's own `next_offset` make a re-pull of
-/// already-applied data a recognized no-op for a single-origin mirror). For a single-origin MIRROR the
-/// cursor also EQUALS the local log's `next_offset` (the mirror applies from origin 0 in order), so the
-/// cursor is doubly-anchored; for a SOURCE the local offset differs from each origin's, so the persisted
-/// cursor is the authority.
+/// already-applied data a recognized no-op for a single-origin mirror). For a single-origin applier (a
+/// MIRROR, or a single-origin SOURCE) the cursor also EQUALS the local log's `next_offset` (it applies
+/// from origin 0 in order), so the cursor is doubly-anchored and [`MirrorApplier::apply_pull_response`]
+/// ENFORCES it (#799): a re-pull below `next_offset` is skipped, so a crash between the record sync and
+/// the cursor commit cannot double-apply. For a MULTI-origin SOURCE the local offset differs from each
+/// origin's (interleaved fan-in), so the persisted cursor is the only authority and that crash window
+/// can still re-apply a batch (tracked separately).
 pub struct OriginCursorStore<F: Filesystem> {
     checkpoint: SlotCheckpoint<F::File, GEO_CURSOR_PAYLOAD>,
     /// The in-memory view of `(origin_key -> applied_origin_offset)`, loaded on open and updated on each
@@ -729,13 +735,37 @@ fn decode_cursor_payload(bytes: &[u8]) -> Result<BTreeMap<String, u64>, GeoError
 pub struct MirrorApplier<F: Filesystem, C: Clock> {
     log: Log<F, C>,
     cursors: OriginCursorStore<F>,
+    /// Whether this applier's local log is fed by EXACTLY ONE origin AND BY NOTHING ELSE (no local
+    /// produces), so the local offset equals that origin's offset 1:1 (a MIRROR, or a single-origin
+    /// SOURCE). When true, the local log's own `next_offset` is an INDEPENDENT durable anchor for
+    /// already-applied data, which closes the crash window between the record sync and the cursor commit
+    /// (#799): a re-pull of already-synced records is recognized and SKIPPED rather than double-applied.
+    ///
+    /// SAFETY INVARIANT: this is sound ONLY because the geo applier log (`<data_dir>/geo/<hex>`) is
+    /// written EXCLUSIVELY by [`MirrorApplier::apply_pull_response`] (the per-origin puller threads) —
+    /// never by a local client produce (those go to the engine's own `StreamSet`, a DIFFERENT log). If a
+    /// local write ever reached THIS log, `next_offset` would exceed the origin's offset and the skip
+    /// would silently DROP genuinely-new origin records (a never-SKIP / data-loss violation), so the
+    /// flag must stay false for any applier whose log can take a non-origin write.
+    ///
+    /// A MULTI-origin source fans N origins into one interleaved log, so `next_offset` (the fan-in
+    /// total) is NOT any single origin's offset and cannot anchor it; that path keeps trusting the
+    /// per-origin cursor alone.
+    single_origin: bool,
 }
 
 impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
     /// Wrap a freshly-opened (or recovered) local log + its durable cursor store as a geo applier.
+    /// `single_origin` is true when the local log is fed by exactly one origin (a MIRROR, or a SOURCE
+    /// with a single origin) — see [`MirrorApplier::single_origin`] for why it gates the #799
+    /// crash-window reconciliation.
     #[must_use]
-    pub fn new(log: Log<F, C>, cursors: OriginCursorStore<F>) -> Self {
-        Self { log, cursors }
+    pub fn new(log: Log<F, C>, cursors: OriginCursorStore<F>, single_origin: bool) -> Self {
+        Self {
+            log,
+            cursors,
+            single_origin,
+        }
     }
 
     /// Borrow the local log (e.g. to read its applied records, or to compare its on-disk bytes against
@@ -774,11 +804,15 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
     /// of records applied.
     ///
     /// The order is load-bearing: the records are synced to the local log BEFORE the cursor is committed,
-    /// so a crash after the sync but before the cursor commit RE-PULLS the same origin span — which is
-    /// idempotent because the [`NonContiguous`](GeoError::NonContiguous) guard drops a response that does
-    /// not continue the cursor, and for a single-origin mirror the local `next_offset == cursor`, so a
-    /// re-pulled span is recognized as already-applied. The cursor NEVER advances past durably-synced
-    /// data, so on restart the mirror neither skips nor double-applies.
+    /// so the cursor NEVER advances past durably-synced data (never SKIPS on restart). A crash after the
+    /// sync but before the cursor commit leaves the local log AHEAD of the durable cursor and RE-PULLS
+    /// the already-synced span. For a SINGLE-ORIGIN applier (a MIRROR, or a single-origin SOURCE) that
+    /// re-pull is now an ENFORCED no-op (#799): the local log's own `next_offset` is an independent
+    /// durable anchor, so any frame whose origin offset is below it is SKIPPED rather than re-appended —
+    /// closing the never-DOUBLE-APPLY gap that the `next_offset == cursor` invariant only *claimed* to
+    /// provide. A MULTI-origin source interleaves origins, so `next_offset` is not any single origin's
+    /// offset and cannot anchor it; that path still trusts the per-origin cursor, so a crash in this
+    /// window can re-apply its last batch (tracked separately — the source needs an atomic cursor).
     ///
     /// # Errors
     /// - [`GeoError::NonContiguous`] if the response does not continue this origin's cursor.
@@ -810,23 +844,53 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             });
         }
 
-        // Walk the verbatim frame bytes, RE-VALIDATING and appending one frame at a time. `codec::decode`
-        // is the intact-record predicate (magic, version, header CRC32C, length sanity, body CRC32C,
-        // xxh3) — a typed DecodeError on ANY corruption. Only a passing frame is applied; a failure stops
-        // the walk and is surfaced, so the applier NEVER applies a byte it has not itself validated.
+        // The durable anchor for already-applied data. For a single-origin applier (a MIRROR, or a
+        // SOURCE with one origin) the local log's `next_offset` EQUALS the count of origin records
+        // already durable, so a frame whose origin offset is below it was already synced and must NOT be
+        // re-appended (#799): this closes the crash window between the record sync below and the cursor
+        // commit, where a restart re-pulls from a cursor that lags the durable log. A multi-origin source
+        // has no such positional anchor (its `next_offset` is the fan-in total of interleaved origins),
+        // so it trusts the cursor alone (`durable_anchor == cursor`, never skipping); that residual
+        // window is tracked separately.
+        let durable_anchor = if self.single_origin {
+            // INVARIANT: for a single-origin applier the cursor never RUNS AHEAD of the durable log
+            // head — the load-bearing sync-before-commit order guarantees the records are durable
+            // before the cursor advances past them, so `next_offset >= cursor` always. A cursor ahead
+            // of `next_offset` would mean durable records were LOST (a never-SKIP violation) or a
+            // non-origin write reached this log (the apply-only invariant on `single_origin` broke);
+            // surface it loudly in debug rather than silently anchoring at the (too-high) cursor. The
+            // `max` is the production guard for that impossible case (anchor at the cursor, never skip).
+            debug_assert!(
+                self.log.next_offset().get() >= cursor,
+                "single-origin geo cursor {cursor} is ahead of the durable log head {} — lost \
+                 records or a non-origin write to the applier log",
+                self.log.next_offset().get()
+            );
+            self.log.next_offset().get().max(cursor)
+        } else {
+            cursor
+        };
+
+        // Walk the verbatim frame bytes, RE-VALIDATING one frame at a time. `codec::decode` is the
+        // intact-record predicate (magic, version, header CRC32C, length sanity, body CRC32C, xxh3) — a
+        // typed DecodeError on ANY corruption. A frame already below `durable_anchor` is SKIPPED (the log
+        // already holds it); otherwise the validated frame is appended. A decode failure stops the walk
+        // and is surfaced, so the applier NEVER applies a byte it has not itself validated.
         let mut at = 0usize;
-        let mut applied = 0u64;
+        let mut seen = 0u64; // frames CONSUMED (skipped-as-already-applied + appended) = origin-offset progress
+        let mut applied = 0u64; // frames actually APPENDED this pull
         let bytes = resp.frame_bytes.as_slice();
         while at < bytes.len() {
-            let at_origin_offset = cursor + applied;
+            let at_origin_offset = cursor + seen;
             let (view, frame_len) = match codec::decode(&bytes[at..]) {
                 Ok(decoded) => decoded,
                 Err(reason) => {
                     // Fail closed: apply nothing from this frame onward. Sync the validated prefix, then
-                    // commit the cursor for exactly what was synced, so the next pull resumes cleanly.
+                    // advance the cursor past exactly the frames consumed (newly synced or already
+                    // durable), so the next pull resumes cleanly.
                     self.log.sync()?;
-                    if applied > 0 {
-                        self.cursors.commit(origin_key, cursor + applied)?;
+                    if seen > 0 {
+                        self.cursors.commit(origin_key, cursor + seen)?;
                     }
                     return Err(GeoError::CorruptFrame {
                         at_origin_offset,
@@ -834,6 +898,14 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
                     });
                 }
             };
+            // #799: skip a frame the local log already durably holds (a re-pull after the sync/commit
+            // crash window). Single-origin only — `durable_anchor == cursor` otherwise, so this never fires
+            // and a multi-origin source is byte-for-byte unchanged.
+            if at_origin_offset < durable_anchor {
+                seen += 1;
+                at += frame_len;
+                continue;
+            }
             let append = Append {
                 timestamp_ms: view.timestamp_ms,
                 flags: view.flags,
@@ -843,24 +915,29 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             };
             self.log.append(&append)?;
             applied += 1;
+            seen += 1;
             at += frame_len;
         }
         // Durably commit the applied batch to the local log (one fsync per pull — the group-commit shape).
         self.log.sync()?;
 
-        let actual = u32::try_from(applied).unwrap_or(u32::MAX);
+        // `seen` is the number of frames the response actually carried (skipped + appended), which must
+        // match its claimed count; `applied` (only the newly-appended) may be smaller after a skip.
+        let actual = u32::try_from(seen).unwrap_or(u32::MAX);
         if actual != resp.record_count {
-            // The synced records ARE durable; advance the cursor to match what was synced so the mismatch
+            // The synced records ARE durable; advance the cursor past what was consumed so the mismatch
             // does not strand applied data, then surface the malformed response.
-            self.cursors.commit(origin_key, cursor + applied)?;
+            self.cursors.commit(origin_key, cursor + seen)?;
             return Err(GeoError::RecordCountMismatch {
                 claimed: resp.record_count,
                 actual,
             });
         }
 
-        // Cursor advances ONLY after the records are durably synced (the load-bearing order).
-        let new_cursor = cursor + applied;
+        // Cursor advances ONLY after the records are durably synced (the load-bearing order), past every
+        // frame consumed — so a single-origin mirror's cursor is re-anchored to `next_offset` and the
+        // sync/commit crash window can never leave it lagging the durable log.
+        let new_cursor = cursor + seen;
         self.cursors.commit(origin_key, new_cursor)?;
         Ok(ApplyOutcome {
             applied,
@@ -1338,14 +1415,25 @@ mod tests {
         assert_eq!(store.cursor("a/orders"), 0);
     }
 
-    /// Build an applier over an in-memory log + cursor store sharing ONE fs (so the cursor file lives
-    /// beside the log), returning the applier.
+    /// Build a SINGLE-ORIGIN applier (a MIRROR, or a single-origin SOURCE) over an in-memory log +
+    /// cursor store sharing ONE fs (so the cursor file lives beside the log), returning the applier. The
+    /// `single_origin` flag enables the #799 `next_offset` reconciliation; use [`source_applier`] for a
+    /// multi-origin fan-in.
     fn applier(fs: InMemoryFs) -> MirrorApplier<InMemoryFs, ManualClock> {
         let cursors = OriginCursorStore::open(&fs).unwrap();
         // `fs` is MOVED into the log here (consumed), so the helper takes it by value without tripping
         // the needless-pass-by-value lint; the cursor store already captured its own file handle above.
         let log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
-        MirrorApplier::new(log, cursors)
+        MirrorApplier::new(log, cursors, true)
+    }
+
+    /// Build a MULTI-ORIGIN (fan-in SOURCE) applier: `single_origin` is false, so the #799 `next_offset`
+    /// reconciliation is OFF (a multi-origin log interleaves origins, so `next_offset` is not any single
+    /// origin's offset and cannot anchor it).
+    fn source_applier(fs: InMemoryFs) -> MirrorApplier<InMemoryFs, ManualClock> {
+        let cursors = OriginCursorStore::open(&fs).unwrap();
+        let log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        MirrorApplier::new(log, cursors, false)
     }
 
     /// Serve ONE pull response from the origin's read plane at offset `from` (the sealed prefix; with a
@@ -1498,6 +1586,83 @@ mod tests {
     }
 
     #[test]
+    fn a_re_pull_after_the_sync_before_commit_crash_window_skips_not_double_applies() {
+        // #799: the local record sync and the durable cursor commit are TWO separate fsyncs (records
+        // first). A crash between them leaves the local log AHEAD of the durable cursor. For a
+        // single-origin MIRROR the local log's `next_offset` is an INDEPENDENT durable anchor: a re-pull
+        // that re-serves the already-applied span must SKIP it, never re-append — re-appending would
+        // duplicate the span, grow the log past the origin, and permanently break positional
+        // byte-identity. We construct the post-crash state directly: a local log that already durably
+        // holds the origin's served prefix, but a cursor that lags it.
+        let mut origin = Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            origin.append(&rec(format!("o-{i:02}").as_bytes())).unwrap();
+        }
+        origin.sync().unwrap();
+        let served = plane_served_end(&origin);
+        assert!(
+            served >= 4,
+            "the origin serves a multi-record sealed prefix"
+        );
+
+        // Post-crash MIRROR: the local log holds [0, served) (the records were synced) but the durable
+        // cursor lags at `stale` (the commit never landed). The two live on independent in-memory disks
+        // so the cursor can be set BELOW the log head — exactly what the crash window produces.
+        let key = "origin/";
+        let stale = served - 3;
+        let mut local_log =
+            Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..served {
+            local_log
+                .append(&rec(format!("o-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        local_log.sync().unwrap();
+        assert_eq!(local_log.next_offset().get(), served);
+        let mut cursors = OriginCursorStore::open(&InMemoryFs::new()).unwrap();
+        cursors.commit(key, stale).unwrap();
+        let mut app = MirrorApplier::new(local_log, cursors, true);
+        assert_eq!(
+            app.cursor(key),
+            stale,
+            "the cursor lags the durable log (the crash window)"
+        );
+
+        // Re-pull from the stale cursor to convergence: every re-served frame is already durable in the
+        // local log, so the applier SKIPS them all and NEVER re-appends (loops because one pull serves at
+        // most one sealed segment). Pre-fix every frame at-or-above the stale cursor was re-appended.
+        let mut guard = 0;
+        while app.cursor(key) < served {
+            guard += 1;
+            assert!(guard < 1000, "the re-pull loop did not converge");
+            let resp = origin_pull(&origin, app.cursor(key));
+            let out = app.apply_pull_response(key, &resp).unwrap();
+            assert_eq!(
+                out.applied, 0,
+                "a re-pulled, already-applied frame must never be re-appended (#799)"
+            );
+        }
+
+        // No duplicated span: the log still holds exactly `served` records and the cursor caught up to
+        // the durable head. Byte-identity with the origin's served prefix is intact.
+        assert_eq!(
+            app.log().next_offset().get(),
+            served,
+            "the local log did NOT grow — the already-applied span was not double-applied"
+        );
+        assert_eq!(
+            app.cursor(key),
+            served,
+            "the cursor is re-anchored to the durable log head"
+        );
+        let recs = app.log().read_from(Offset::new(0), 1000).unwrap();
+        assert_eq!(recs.len() as u64, served, "no duplicate records on disk");
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("o-{i:02}").as_bytes());
+        }
+    }
+
+    #[test]
     fn a_non_contiguous_response_is_dropped_fail_closed() {
         let mut app = applier(InMemoryFs::new());
         let resp = MirrorPullResponse {
@@ -1607,7 +1772,7 @@ mod tests {
         let served_b = plane_served_end(&origin_b);
         assert!(served_a > 0 && served_b > 0);
 
-        let mut app = applier(InMemoryFs::new());
+        let mut app = source_applier(InMemoryFs::new());
         let ka = "a/";
         let kb = "b/";
         // Interleave: drain one batch from A, then one from B, round-robin (apply-arrival interleaving),
@@ -1957,7 +2122,22 @@ mod live_geo_tests {
         .expect("mirror log opens");
         let cursors =
             OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("cursor store");
-        MirrorApplier::new(log, cursors)
+        // A MIRROR is single-origin, so the #799 next_offset reconciliation applies.
+        MirrorApplier::new(log, cursors, true)
+    }
+
+    /// A MULTI-origin (fan-in SOURCE) applier over `StdFs`: `single_origin` is false, so the #799
+    /// `next_offset` reconciliation is OFF (the interleaved fan-in log has no per-origin positional anchor).
+    fn open_source(dir: &std::path::Path) -> MirrorApplier<StdFs, ManualClock> {
+        let log = Log::open(
+            StdFs::new(dir.to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .expect("source log opens");
+        let cursors =
+            OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("cursor store");
+        MirrorApplier::new(log, cursors, false)
     }
 
     #[test]
@@ -2079,7 +2259,7 @@ mod live_geo_tests {
         let ka = format!("{addr_a}/");
         let kb = format!("{addr_b}/");
 
-        let mut app = open_mirror(src_dir.path());
+        let mut app = open_source(src_dir.path());
         assert!(wait_until(Duration::from_secs(10), || {
             // Round-robin the two origins into the ONE local source stream (apply-arrival interleaving).
             drain_over_wire(addr_a, &mut app, &ka, "");
