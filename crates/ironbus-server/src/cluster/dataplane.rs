@@ -248,6 +248,18 @@ pub enum DataPlaneFrame {
     CommittedHwResponse(CommittedHwResponseBody),
 }
 
+/// The per-partition cap on parked (quorum-withheld) `C2-fsync` produce acks (#864). A `C2-fsync`
+/// produce to a led partition whose ISR is below `min_isr` (a follower down) cannot be quorum-committed,
+/// so its `PubAck` is withheld; below `min_isr` NOTHING drains. Without a cap a pipelining producer that
+/// does not wait for acks grows the gate's `pending` list AND the seam's `parked` reply-bytes map without
+/// bound — driving a bounded-RAM node to OOM (and, under `panic = "abort"`, an allocation failure aborts
+/// the whole broker). At the cap the produce is FAILED with an explicit not-enough-replicas error (the
+/// honest unavailable-over-unsafe signal the producer can back off on) rather than buffered unboundedly.
+/// `8192` per partition bounds the worst-case parked footprint to a few hundred KiB per led partition
+/// while tolerating a transient follower blip (the backlog drains the moment the quorum advances). A
+/// configurable cap is a tracked follow-up.
+const MAX_PARKED_ACKS_PER_PARTITION: usize = 8192;
+
 /// The `kind` discriminant byte leading a [`FrameType::CommittedHwQuery`] body (#739), so the request
 /// and the response (which SHARE the wire tag 43, like `OffsetForLeaderEpoch`) are never confused.
 const HW_KIND_REQUEST: u8 = 0;
@@ -549,7 +561,12 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
                 plane,
                 epochs,
                 isr,
-                gate: QuorumAckGate::new(),
+                // The per-partition parked-ack backlog cap (#864): under an unsatisfiable ISR (a follower
+                // down, below `min_isr`) nothing drains, so without a cap a pipelining producer grows the
+                // gate's `pending` + the seam's `parked` map without bound — OOM/abort on a bounded-RAM
+                // node. At the cap the gate refuses and the produce is failed with an explicit
+                // not-enough-replicas error rather than buffered unboundedly.
+                gate: QuorumAckGate::with_cap(MAX_PARKED_ACKS_PER_PARTITION),
             },
         );
     }
@@ -712,6 +729,11 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
     /// real serve). Leader-only. The leader has ALREADY locally fsync'd (the I2 ack-after-its-own-fsync
     /// holds); this gate adds the cluster condition.
     ///
+    /// Returns `Ok(true)` if the ack was parked, or `Ok(false)` if the partition's gate is at its
+    /// backlog cap (#864) — an unsatisfiable ISR is withholding the cap's worth of acks and nothing is
+    /// draining. On `Ok(false)` the caller MUST NOT treat the produce as parked: it fails the produce
+    /// with an explicit not-enough-replicas error rather than buffering the reply unboundedly.
+    ///
     /// # Errors
     /// As [`serve_fetch`](Self::serve_fetch) (a produce only lands on a leader partition).
     pub fn park_produce_ack(
@@ -719,12 +741,9 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         partition: u64,
         offset: u64,
         token: AckToken,
-    ) -> Result<(), DataPlaneError> {
+    ) -> Result<bool, DataPlaneError> {
         match self.roles.get_mut(&partition) {
-            Some(PartitionRole::Leader { gate, .. }) => {
-                gate.park(offset, token);
-                Ok(())
-            }
+            Some(PartitionRole::Leader { gate, .. }) => Ok(gate.park(offset, token)),
             Some(PartitionRole::Follower { .. }) => Err(DataPlaneError::WrongRole {
                 partition,
                 needed: "leader",
@@ -1311,6 +1330,13 @@ pub enum AckDisposition {
     /// nothing goes on the wire until [`ProduceAckSeam::on_follower_report`] releases it on quorum
     /// fsync. Below `min_isr` it stays parked — no false ack on the wire (#593).
     Parked,
+    /// The produce was REFUSED because the partition's parked-ack backlog is at its cap (#864): an
+    /// unsatisfiable ISR (below `min_isr`) is already withholding [`MAX_PARKED_ACKS_PER_PARTITION`] acks
+    /// and nothing is draining, so parking another would grow memory unboundedly toward OOM. The caller
+    /// writes an explicit not-enough-replicas error to the producer (the honest unavailable-over-unsafe
+    /// signal it can back off on) — NOT a `PubAck` (the record is durable on the leader but is not
+    /// quorum-fsync'd, so it must not be acked) and NOT a silent withhold.
+    Rejected,
 }
 
 /// The produce-ack SEAM: the one hot-path hookup that threads a REAL produce's wire `PubAck` through
@@ -1457,13 +1483,19 @@ impl<F: Filesystem, C: Clock> ProduceAckSeam<F, C> {
         if !ack_level.ack_implies_quorum_fsync() || !self.controller.is_leader(partition) {
             return Ok(AckDisposition::WriteNow(reply_bytes));
         }
-        // Park the REAL wire bytes keyed by a fresh token (tagged with the owner), then thread that token
-        // through the controller's gate at the appended offset. The leader has ALREADY locally fsync'd
-        // (the I2 ack-after-its-own-fsync); the gate adds the quorum-fsync condition.
+        // Thread a fresh token through the controller's gate at the appended offset FIRST (it is
+        // cap-checked), THEN — only on a successful park — store the REAL wire bytes keyed by that token.
+        // The leader has ALREADY locally fsync'd (the I2 ack-after-its-own-fsync); the gate adds the
+        // quorum-fsync condition. On a FULL backlog (#864) the gate refuses (`Ok(false)`): REJECT this
+        // produce so the caller writes an explicit not-enough-replicas error, and store NOTHING — never
+        // buffer the reply bytes unboundedly while the ISR is below `min_isr`. The `?` still propagates
+        // the (unreachable for a led partition) `WrongRole` / `UnknownPartition` errors unchanged.
         let token = self.next_token;
+        if !self.controller.park_produce_ack(partition, offset, token)? {
+            return Ok(AckDisposition::Rejected);
+        }
         self.next_token = self.next_token.wrapping_add(1);
         self.parked.insert(token, (owner, reply_bytes));
-        self.controller.park_produce_ack(partition, offset, token)?;
         // Re-check the CURRENT quorum-commit: a follower may already have reported past this offset
         // (its report arrived before this produce's local fsync completed), in which case the ack is
         // immediately quorum-committed and we hand the real bytes straight back to write now. Below
@@ -2310,6 +2342,53 @@ mod tests {
             })
             .collect();
         (ProduceAckSeam::new(leader), followers, served_end)
+    }
+
+    #[test]
+    fn a_clustered_c2_fsync_produce_is_rejected_when_the_parked_backlog_hits_the_cap() {
+        // #864: under an unsatisfiable ISR (a follower down, below `min_isr`) NOTHING drains, so a
+        // pipelining producer's parked acks accumulate. The gate caps the per-partition backlog at
+        // `MAX_PARKED_ACKS_PER_PARTITION`; past it the produce is REJECTED (an explicit
+        // not-enough-replicas signal) instead of buffered unboundedly toward OOM. Lead P over {1,2,3}
+        // (min_isr=2) with NO follower reports — the ISR is {leader} < min_isr, so every park stays
+        // withheld and the backlog only grows.
+        const P: u64 = 0;
+        let (mut seam, _followers, _served_end) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 4);
+        assert!(seam.controller().is_leader(P));
+
+        // Park exactly the cap's worth of C2-fsync produces: each is withheld (no quorum to release it).
+        for off in 0..MAX_PARKED_ACKS_PER_PARTITION as u64 {
+            let disposition = seam
+                .on_local_fsynced_ack(ClusterAckLevel::C2Fsync, P, off, wire_pub_ack(off))
+                .unwrap();
+            assert_eq!(
+                disposition,
+                AckDisposition::Parked,
+                "below the cap a clustered C2-fsync produce parks"
+            );
+        }
+        assert_eq!(
+            seam.parked_len(),
+            MAX_PARKED_ACKS_PER_PARTITION,
+            "the backlog filled to exactly the cap"
+        );
+
+        // The NEXT produce overflows the cap: REJECTED, not parked, and it buffers NOTHING — so a
+        // sustained unsatisfiable-ISR flood is bounded at the cap, never unbounded toward OOM.
+        let over = MAX_PARKED_ACKS_PER_PARTITION as u64;
+        let disposition = seam
+            .on_local_fsynced_ack(ClusterAckLevel::C2Fsync, P, over, wire_pub_ack(over))
+            .unwrap();
+        assert_eq!(
+            disposition,
+            AckDisposition::Rejected,
+            "past the cap the produce is rejected (not-enough-replicas), never buffered"
+        );
+        assert_eq!(
+            seam.parked_len(),
+            MAX_PARKED_ACKS_PER_PARTITION,
+            "the rejected produce buffered NOTHING — the backlog stays bounded at the cap"
+        );
     }
 
     #[test]

@@ -4288,6 +4288,15 @@ fn write_pub_reply_gated<
             // plane releases it onto this connection's outbox on quorum-fsync; the session drains it on a
             // later pass. No false ack below min_isr (the gate releases nothing).
             Some(crate::cluster::dataplane::AckDisposition::Parked) => {}
+            // The partition's parked-ack backlog is at its cap (#864): an unsatisfiable ISR is already
+            // withholding the cap's worth of acks and nothing is draining, so the data plane refused to
+            // park another rather than grow memory toward OOM. Reply with an explicit, typed error (the
+            // honest unavailable-over-unsafe signal) so the producer backs off — NEVER a PubAck (the
+            // record is durable on the leader but is NOT quorum-fsync'd, so acking it would be a lie).
+            // The connection stays open; the producer can retry once the ISR recovers.
+            Some(crate::cluster::dataplane::AckDisposition::Rejected) => {
+                reply_err(out, "not enough in-sync replicas to quorum-commit; retry");
+            }
         }
         return Ok(());
     }

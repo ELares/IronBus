@@ -599,7 +599,7 @@ mod gate_wiring_tests {
         // still holds; the CLUSTER gate withholds the wire PubAck until a quorum has FSYNC'd).
         isr.observe_leader_fsync(5);
         for off in 0..5u64 {
-            gate.park(off, off);
+            let _ = gate.park(off, off);
         }
 
         // Only the leader has fsync'd ⇒ quorum-commit (2nd-largest fsync'd frontier of [5,0,0]) = 0 ⇒
@@ -665,7 +665,7 @@ mod gate_wiring_tests {
         fsync_isr.observe_leader_fsync(3);
         pagecache_isr.observe_leader_fsync(3);
         for off in 0..3u64 {
-            gate.park(off, off);
+            let _ = gate.park(off, off);
         }
         // A follower has the records in PAGE CACHE (received frontier 3) but has NOT fsync'd them
         // (fsync'd frontier 0). The fsync gate sees no quorum-fsync; the page-cache gate sees a quorum
@@ -725,7 +725,7 @@ mod gate_wiring_tests {
         );
         let mut gate: QuorumAckGate<u64> = QuorumAckGate::new();
         for off in 0..4u64 {
-            gate.park(off, off);
+            let _ = gate.park(off, off);
         }
         // Before the local fsync nothing is durable ⇒ quorum-commit 0 ⇒ no release.
         assert_eq!(isr.quorum_commit(), Some(0));

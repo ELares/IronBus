@@ -452,6 +452,12 @@ pub struct QuorumAckGate<T> {
     /// releases nothing twice. Starts at 0 (no offset released yet; offset 0's ack releases when
     /// `quorum_commit >= 1`).
     released_through: u64,
+    /// The cap on `pending.len()` (#864): the most acks this gate may withhold before [`park`](Self::park)
+    /// REFUSES a new one. `0` = unlimited (the single-node-shaped / test default). Under an unsatisfiable
+    /// ISR (a follower down, below `min_isr`) nothing drains, so without a cap a pipelining producer grows
+    /// `pending` without bound — OOM/abort. At the cap `park` returns `false` so the caller fails the
+    /// produce with an explicit not-enough-replicas error rather than buffering unboundedly.
+    cap: usize,
 }
 
 impl<T> Default for QuorumAckGate<T> {
@@ -461,23 +467,42 @@ impl<T> Default for QuorumAckGate<T> {
 }
 
 impl<T> QuorumAckGate<T> {
-    /// A fresh gate with no pending acks.
+    /// A fresh gate with no pending acks and NO backlog cap (`0` = unlimited). Used by the
+    /// single-node-shaped path and the gate's own tests; the clustered leader uses
+    /// [`with_cap`](Self::with_cap) to bound the parked backlog (#864).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_cap(0)
+    }
+
+    /// A fresh gate that withholds at most `cap` acks before [`park`](Self::park) refuses (#864); `0` =
+    /// unlimited. The clustered leader sets this so an unsatisfiable ISR cannot grow the parked backlog
+    /// without bound.
+    #[must_use]
+    pub fn with_cap(cap: usize) -> Self {
         Self {
             pending: Vec::new(),
             released_through: 0,
+            cap,
         }
     }
 
-    /// Park a produce's `C2-fsync` ack to be released once its offset is quorum-committed. The leader
-    /// calls this AFTER its own local-fsync (the I2 ack-after-its-own-fsync still holds); the cluster
-    /// gate withholds the wire `PubAck` until the quorum has also fsync'd.
+    /// Park a produce's `C2-fsync` ack to be released once its offset is quorum-committed, returning
+    /// `true` if it was parked and `false` if the gate is at its backlog cap (#864). The leader calls
+    /// this AFTER its own local-fsync (the I2 ack-after-its-own-fsync still holds); the cluster gate
+    /// withholds the wire `PubAck` until the quorum has also fsync'd. On a `false` return the caller MUST
+    /// NOT treat the produce as parked — it fails the produce with an explicit not-enough-replicas error
+    /// rather than buffer the reply unboundedly while the ISR is below `min_isr`.
     ///
     /// Offsets must be parked in non-decreasing order (the produce path assigns offsets monotonically);
     /// this is the produce path's natural order.
-    pub fn park(&mut self, offset: u64, token: T) {
+    #[must_use]
+    pub fn park(&mut self, offset: u64, token: T) -> bool {
+        if self.cap != 0 && self.pending.len() >= self.cap {
+            return false;
+        }
         self.pending.push(PendingAck { offset, token });
+        true
     }
 
     /// The number of acks currently withheld (awaiting quorum-fsync). Zero means every produced ack has
@@ -738,9 +763,9 @@ mod tests {
     fn the_gate_releases_an_ack_only_once_its_offset_is_quorum_committed() {
         let mut gate: QuorumAckGate<u64> = QuorumAckGate::new();
         // Three produces parked at offsets 0, 1, 2 (the token here is just the offset for the test).
-        gate.park(0, 0);
-        gate.park(1, 1);
-        gate.park(2, 2);
+        let _ = gate.park(0, 0);
+        let _ = gate.park(1, 1);
+        let _ = gate.park(2, 2);
         assert_eq!(gate.pending_len(), 3);
 
         // Quorum-commit = 1 → offsets < 1 release → just offset 0.
@@ -760,8 +785,8 @@ mod tests {
     #[test]
     fn the_gate_releases_nothing_when_there_is_no_quorum() {
         let mut gate: QuorumAckGate<u64> = QuorumAckGate::new();
-        gate.park(0, 0);
-        gate.park(1, 1);
+        let _ = gate.park(0, 0);
+        let _ = gate.park(1, 1);
         // No quorum (ISR below min_isr) → quorum_commit is None → NOTHING releases (no-false-ack).
         assert!(gate.release_up_to(None).is_empty());
         assert_eq!(
@@ -769,6 +794,41 @@ mod tests {
             2,
             "the acks stay withheld, never falsely fired"
         );
+    }
+
+    #[test]
+    fn a_capped_gate_refuses_a_park_past_its_backlog_cap() {
+        // #864: a capped gate withholds at most `cap` acks; past it, `park` REFUSES (returns false) so the
+        // caller fails the produce rather than buffering unboundedly while the ISR is below min_isr.
+        let mut gate: QuorumAckGate<u64> = QuorumAckGate::with_cap(2);
+        assert!(gate.park(0, 0), "first park fits under the cap");
+        assert!(gate.park(1, 1), "second park fills the cap");
+        assert!(!gate.park(2, 2), "a third park is REFUSED at the cap");
+        assert_eq!(
+            gate.pending_len(),
+            2,
+            "the refused park allocated nothing past the cap"
+        );
+
+        // Draining below the cap re-admits parks (the backlog recovered when the quorum advanced).
+        assert_eq!(gate.release_up_to(Some(1)), vec![0]);
+        assert_eq!(gate.pending_len(), 1);
+        assert!(
+            gate.park(2, 2),
+            "with a slot freed, a park is admitted again"
+        );
+        assert_eq!(gate.pending_len(), 2);
+    }
+
+    #[test]
+    fn an_uncapped_gate_parks_without_bound() {
+        // `new()` / `with_cap(0)` = unlimited (the single-node-shaped / test default): the cap only
+        // engages for the clustered leader gate built with a non-zero cap.
+        let mut gate: QuorumAckGate<u64> = QuorumAckGate::new();
+        for i in 0..1000u64 {
+            assert!(gate.park(i, i), "an uncapped gate never refuses");
+        }
+        assert_eq!(gate.pending_len(), 1000);
     }
 }
 
@@ -861,7 +921,7 @@ mod cluster_quorum_tests {
         // Park each produce's C2-fsync ack (the leader has fsync'd locally; the CLUSTER gate still
         // withholds the wire PubAck until a quorum has fsync'd).
         for off in 0..5u64 {
-            gate.park(off, off);
+            let _ = gate.park(off, off);
         }
 
         // ---- ONLY the leader has the records: ISR = {leader} (followers at 0, lag 5 < 1024 so they
@@ -947,7 +1007,7 @@ mod cluster_quorum_tests {
         leader_log.sync().unwrap();
         isr.observe_leader_fsync(leader_log.flushed_offset().get());
         for off in 0..10u64 {
-            gate.park(off, off);
+            let _ = gate.park(off, off);
         }
 
         // Both followers are far behind (fsync'd only offset 1, lag 9 >> 3) → BOTH evicted → ISR = 1.
