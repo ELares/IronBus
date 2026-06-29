@@ -679,11 +679,11 @@ const EDGE_TINY_PRESET: ProfilePreset = ProfilePreset {
     // guard lets edge-tiny boot, and a blown-up cap override (e.g. a server-sized --max-connections,
     // or restoring the default dedup caps) is provably refused.
     ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
-    // LOWERED dedup caps (#878): the shipped defaults (4096 * 100_000) imply ~122 GiB of worst-case
-    // dedup windows, which the guard now charges and would refuse under 64 MiB. 64 producers * 512 ids
-    // is ~10 MiB of dedup RAM — bounded for a tiny edge node, leaving comfortable headroom under the
-    // 64 MiB ceiling alongside the ~15 MiB buffer terms and any in-memory store.
-    dedup_max_ids: 512,
+    // LOWERED dedup caps (#878): the shipped defaults (4096 * 100_000) imply ~262 GiB of worst-case
+    // dedup windows (each id stored twice, ~640 B/entry), which the guard now charges and would refuse
+    // under 64 MiB. 64 producers * 256 ids is ~10 MiB of dedup RAM — bounded for a tiny edge node,
+    // leaving comfortable headroom under the 64 MiB ceiling alongside the ~15 MiB buffers and any store.
+    dedup_max_ids: 256,
     dedup_max_producers: 64,
 };
 
@@ -6145,7 +6145,8 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          group_idle_evict_ms={} checkpoint_interval={} max_deliver={} \
          allow_unlimited_deliver={} disk_full_policy={policy} visibility_timeout_ms={} \
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
-         enable_admin={} ram_ceiling_bytes={} durability_level={durability_level} \
+         enable_admin={} ram_ceiling_bytes={} dedup_max_ids={} dedup_max_producers={} \
+         durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
          flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
          commit_gather_us={}",
@@ -6169,6 +6170,8 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.health_liveness_window_ms,
         config.enable_admin,
         config.ram_ceiling_bytes,
+        config.dedup_max_ids,
+        config.dedup_max_producers,
         config.flush_interval_ms,
         config.flush_max_bytes,
         config.async_loss_ack,
@@ -12923,6 +12926,15 @@ mod tests {
         assert_eq!(c.checkpoint_interval, 1024);
         assert_eq!(c.visibility_ms, 30_000);
         assert_eq!(c.max_deliver, 5);
+        // #878: edge-tiny LOWERS the dedup caps so the charged dedup RAM fits its 64 MiB ceiling.
+        assert_eq!(
+            c.dedup_max_ids, 256,
+            "edge-tiny lowers the dedup window depth (#878)"
+        );
+        assert_eq!(
+            c.dedup_max_producers, 64,
+            "edge-tiny lowers the dedup producer cap (#878)"
+        );
     }
 
     #[test]
@@ -12942,6 +12954,10 @@ mod tests {
         assert_eq!(c.checkpoint_interval, DEFAULT_CHECKPOINT_INTERVAL);
         assert_eq!(c.visibility_ms, DEFAULT_VISIBILITY_MS);
         assert_eq!(c.max_deliver, DEFAULT_MAX_DELIVER);
+        // #878: balanced is the default set, so it keeps the shipped default dedup caps (a zero-config
+        // broker is byte-identical; the guard is off so their ~262 GiB worst case is not charged).
+        assert_eq!(c.dedup_max_ids, DEFAULT_DEDUP_MAX_IDS);
+        assert_eq!(c.dedup_max_producers, DEFAULT_DEDUP_MAX_PRODUCERS);
     }
 
     #[test]
@@ -12960,6 +12976,44 @@ mod tests {
         assert_eq!(c.checkpoint_interval, 4096);
         assert_eq!(c.visibility_ms, 30_000);
         assert_eq!(c.max_deliver, 5);
+        // #878: a hub sizes RAM out of band (guard off), so it keeps the shipped default dedup caps.
+        assert_eq!(c.dedup_max_ids, DEFAULT_DEDUP_MAX_IDS);
+        assert_eq!(c.dedup_max_producers, DEFAULT_DEDUP_MAX_PRODUCERS);
+    }
+
+    #[test]
+    fn edge_tiny_with_restored_default_dedup_caps_refuses_to_boot() {
+        // #878 end-to-end through the real parse -> validate path: `--profile edge-tiny` boots, but if
+        // an operator OVERRIDES the lowered caps back to the shipped defaults the ~262 GiB dedup worst
+        // case provably exceeds the 64 MiB ceiling, so validation refuses (exit 1) and names the knob.
+        let boots = parse_serve_flags(&serve_args(&["--profile", "edge-tiny"])).unwrap();
+        assert!(
+            validate_serve_config(&boots.config).is_ok(),
+            "edge-tiny with its lowered dedup caps must boot"
+        );
+        let overridden = parse_serve_flags(&serve_args(&[
+            "--profile",
+            "edge-tiny",
+            "--dedup-max-ids",
+            "100000",
+            "--dedup-max-producers",
+            "4096",
+        ]))
+        .unwrap();
+        assert_eq!(
+            overridden.config.dedup_max_ids, 100_000,
+            "the flag overrides the preset"
+        );
+        assert_eq!(overridden.config.dedup_max_producers, 4096);
+        match validate_serve_config(&overridden.config) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("--ram-ceiling-bytes"), "{m}");
+                assert!(m.contains("refuses to boot"), "{m}");
+            }
+            other => panic!(
+                "default dedup caps under the edge-tiny 64 MiB ceiling must refuse, got {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -16094,7 +16148,7 @@ mod tests {
     fn validate_accepts_edge_tiny_caps_under_the_64_mib_ceiling() {
         // The edge-tiny knobs (32 conns, 256 KiB byte budget, 64 groups, 256 in-flight) under the
         // 64 MiB ceiling, INCLUDING the preset's LOWERED dedup caps (#878): the worst-case
-        // bounded-buffer footprint (~26 MiB, ~10 MiB of which is the dedup term) fits, so the broker
+        // bounded-buffer footprint (~25 MiB, ~10 MiB of which is the dedup term) fits, so the broker
         // boots.
         let cfg = ServeConfig {
             max_connections: 32,
@@ -16104,8 +16158,8 @@ mod tests {
             max_in_flight: 256,
             ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
             // The edge-tiny preset lowers these (#878); with the shipped 4096 * 100_000 defaults the
-            // ~122 GiB dedup term would (correctly) refuse to boot.
-            dedup_max_ids: 512,
+            // ~262 GiB dedup term would (correctly) refuse to boot.
+            dedup_max_ids: 256,
             dedup_max_producers: 64,
             ..validation_config()
         };
@@ -16177,7 +16231,7 @@ mod tests {
             ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
             // The edge-tiny preset LOWERS the dedup caps (#878) so the charged dedup term (~10 MiB)
             // fits its 64 MiB ceiling; the shipped 4096 * 100_000 defaults would refuse.
-            dedup_max_ids: 512,
+            dedup_max_ids: 256,
             dedup_max_producers: 64,
             ..validation_config()
         }
@@ -16236,16 +16290,16 @@ mod tests {
 
     #[test]
     fn the_store_fold_charges_one_image_a_two_image_mutant_over_refuses_here() {
-        // PINS THE MULTIPLIER at the validate level, where the model test alone cannot: the
-        // edge-tiny buffer terms sum to ~15 MiB, so with a 32 MiB store cap the worst case is
-        // ~47 MiB charged at ONE image (fits the 64 MiB ceiling, BOOTS — the correct post-#492
-        // verdict for the single-image EphemeralFile backend) and ~79 MiB charged at TWO
-        // (refuses). The ceiling sits BETWEEN the one-image and two-image floors, so a STALE 2x
-        // mutant (the pre-#492 InMemoryFile live+durable charge) OVER-refuses this exact valid
-        // config and fails here. Companion to the rss model test, which pins the literal 1 in the
-        // formula; this one proves the 1 reaches the real boot verdict with no slack. (The 1 GiB
-        // test above pins the OTHER direction: a fold-removal mutant that charges 0x boots a
-        // config that must refuse, so together they fix the multiplier at exactly 1.)
+        // PINS THE MULTIPLIER at the validate level, where the model test alone cannot: the edge-tiny
+        // buffer terms (~15 MiB) PLUS the #878 dedup term (~10 MiB, edge-tiny's lowered caps) sum to
+        // ~25 MiB, so with a 32 MiB store cap the worst case is ~57 MiB charged at ONE image (fits the
+        // 64 MiB ceiling, BOOTS — the correct post-#492 verdict for the single-image EphemeralFile
+        // backend) and ~89 MiB charged at TWO (refuses). The ceiling sits BETWEEN the one-image and
+        // two-image floors, so a STALE 2x mutant (the pre-#492 InMemoryFile live+durable charge)
+        // OVER-refuses this exact valid config and fails here. Companion to the rss model test, which
+        // pins the literal 1 in the formula; this one proves the 1 reaches the real boot verdict with
+        // no slack. (The 1 GiB test above pins the OTHER direction: a fold-removal mutant that charges
+        // 0x boots a config that must refuse, so together they fix the multiplier at exactly 1.)
         let cfg = ServeConfig {
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
@@ -16263,8 +16317,8 @@ mod tests {
     fn memory_storage_boots_when_the_ceiling_covers_the_store_and_buffers() {
         // The fold's accepting direction: a memory-mode config whose ceiling covers the buffer
         // terms PLUS the store image (1 * max-total-bytes, post-#492) validates and boots. 8 MiB
-        // of cap means 8 MiB of store image; with the ~15 MiB edge-tiny buffer worst case that
-        // sums well under the 64 MiB ceiling.
+        // of cap means 8 MiB of store image; with the ~15 MiB edge-tiny buffer worst case plus the
+        // ~10 MiB #878 dedup term that sums to ~33 MiB, well under the 64 MiB ceiling.
         let cfg = ServeConfig {
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,

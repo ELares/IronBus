@@ -233,17 +233,23 @@ pub const PER_LEASE_BYTES: u64 = 64;
 pub const IN_MEMORY_STORE_IMAGES: u64 = 1;
 
 /// The per-window-entry RAM the opt-in dedup registry charges in the refuse-to-boot proof
-/// (`docs/RAM_BUDGET.md` term 6, #878): one stored `msg_id` (up to
-/// [`MAX_MSG_ID_LEN`](ironbus_core::dedup::MAX_MSG_ID_LEN) = 256 bytes) plus the `Vec`/`HashMap` node
-/// overhead the entry lives in (~2x a small-struct overhead). The doc's worst-case figure is ~320
-/// bytes for a maximal id; the guard charges it per `dedup_max_ids` slot so the proof is an UPPER
-/// bound on the real dedup footprint regardless of the actual id lengths a producer sends.
-pub const DEDUP_ENTRY_BYTES: u64 = ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 2 * 32;
+/// (`docs/RAM_BUDGET.md` term 6, #878). Each remembered id is stored TWICE — once as the `HashMap`
+/// index key and once in the `VecDeque` eviction order (`ProducerWindow` in `ironbus_core::dedup` does
+/// `index.insert(msg_id.to_vec(), …)` AND `order.push_back((msg_id.to_vec(), …))`, two independent heap
+/// copies, no `Arc` sharing) — so the charge is `2 *`
+/// [`MAX_MSG_ID_LEN`](ironbus_core::dedup::MAX_MSG_ID_LEN) (both maximal-id copies) plus the two `Vec`
+/// headers, the index value tuple, and the `HashMap`/`VecDeque` per-slot slack (~128 bytes, generous of
+/// hashbrown's <=7/8 load factor and the deque's power-of-two capacity). The guard charges this per
+/// `dedup_max_ids` slot so the proof is a true UPPER bound on the real dedup footprint regardless of
+/// the actual id lengths a producer sends.
+pub const DEDUP_ENTRY_BYTES: u64 = 2 * ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 128;
 
 /// The per-producer fixed key RAM the dedup proof charges (`docs/RAM_BUDGET.md` term 6, #878): the
-/// stored `producer_id` key for each tracked producer, bounded by the same wire id length cap. This
-/// is the small `max_producers * producer_id_len` keys term (~1 MiB at the shipped default cap).
-pub const DEDUP_PRODUCER_KEY_BYTES: u64 = ironbus_core::dedup::MAX_MSG_ID_LEN as u64;
+/// `producer_id` key, stored TWICE (the `producers` map key and the LRU `BinaryHeap`) plus the
+/// `ProducerWindow` struct headers — `2 *` [`MAX_MSG_ID_LEN`](ironbus_core::dedup::MAX_MSG_ID_LEN) plus
+/// ~128 bytes. This is the small `max_producers`-scaled keys term (~few MiB at the shipped default cap),
+/// dominated by the per-entry term above.
+pub const DEDUP_PRODUCER_KEY_BYTES: u64 = 2 * ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 128;
 
 /// The configuration the refuse-to-boot RAM guard ([`fits_under_ram_ceiling`]) reasons about: the
 /// bounded-buffer knobs from `docs/RAM_BUDGET.md` plus `max_connections` (a server-level cap that
@@ -494,10 +500,10 @@ mod tests {
             // The edge-tiny preset is the DISK backend: the store is file-backed, not charged.
             in_memory_store_bytes: 0,
             // The edge-tiny preset LOWERS the dedup caps (#878) so term 6 is bounded well under the
-            // 64 MiB ceiling: 64 * 512 * ~320 ~= 10 MiB (the shipped 4096 * 100_000 defaults would be
-            // ~122 GiB and refuse here).
+            // 64 MiB ceiling: 64 * 256 * ~640 ~= 10 MiB (the shipped 4096 * 100_000 defaults would be
+            // ~262 GiB and refuse here).
             dedup_max_producers: 64,
-            dedup_max_ids: 512,
+            dedup_max_ids: 256,
         }
     }
 
@@ -732,20 +738,30 @@ mod tests {
                 in_memory_store_bytes: base.in_memory_store_bytes + 1,
                 ..base
             },
-            RamFootprintConfig {
-                dedup_max_producers: base.dedup_max_producers + 1,
-                ..base
-            },
-            RamFootprintConfig {
-                dedup_max_ids: base.dedup_max_ids + 1,
-                ..base
-            },
         ] {
             assert!(
                 worst_case_buffer_bytes(&wider) >= baseline,
                 "widening a cap must not shrink the worst case"
             );
         }
+        // #878: a dedup cap bump must STRICTLY grow the worst case — this PINS that term 6 is actually
+        // summed. A `>= baseline` check would pass even if term 6 were dropped (the mutant would equal
+        // the baseline), so the dedup mutants assert strict `>`. `base` has both dedup caps non-zero, so
+        // each bump's delta (max_producers * ENTRY, or max_ids * ENTRY + KEY) is strictly positive.
+        assert!(
+            worst_case_buffer_bytes(&RamFootprintConfig {
+                dedup_max_producers: base.dedup_max_producers + 1,
+                ..base
+            }) > baseline,
+            "a dedup_max_producers bump must STRICTLY grow the worst case (term 6 is charged)"
+        );
+        assert!(
+            worst_case_buffer_bytes(&RamFootprintConfig {
+                dedup_max_ids: base.dedup_max_ids + 1,
+                ..base
+            }) > baseline,
+            "a dedup_max_ids bump must STRICTLY grow the worst case (term 6 is charged)"
+        );
     }
 
     #[test]

@@ -257,18 +257,22 @@ to 1) AND a monotonic time bound (`--dedup-window-ms`, default **2 min**,
 per-producer worst case is:
 
 ```
-per_producer_dedup <= dedup_max_ids * (msg_id_len + ~2 * (Vec/HashMap entry overhead))
+per_producer_dedup <= dedup_max_ids * (2 * msg_id_len + ~2 * (Vec/HashMap entry overhead))
 ```
 
-Each entry stores a `msg_id` (`Vec<u8>`, bounded by `MAX_MSG_ID_LEN` = **256
+Each entry stores the `msg_id` (`Vec<u8>`, bounded by `MAX_MSG_ID_LEN` = **256
 bytes**, enforced as a typed rejection at the wire boundary in
-`Session::handle_pub`), a `u64` offset, and a `u64` insertion instant, held in
-both the order queue and the lookup map. For a generous estimate at the default
-cap with modest 32-byte ids, that is `100_000 * (32 + ~64) ~= 9-10 MiB` PER
-opted-in producer; with the worst-case 256-byte id it is on the order of
-`100_000 * ~320 ~= 30 MiB`. This term is therefore SIZED BY the count bound, so
-an edge profile that opts into dedup must either lower `--dedup-max-ids` or rely
-on the time bound to keep the live window small.
+`Session::handle_pub`) TWICE — once as the `HashMap` index key and once in the
+order `VecDeque` (two independent heap copies, no `Arc` sharing) — plus a `u64`
+offset and a `u64` insertion instant. So the per-entry worst case is `2 *
+msg_id_len + ~2 * overhead`, i.e. with a maximal 256-byte id about **~640 bytes**.
+For a generous estimate at the default count cap that is `100_000 * ~640 ~= 64 MiB`
+PER opted-in producer with worst-case ids (or `100_000 * (2*32 + ~64) ~= 12 MiB`
+with modest 32-byte ids). This term is therefore SIZED BY the count bound, so an
+edge profile that opts into dedup must either lower `--dedup-max-ids` or rely on
+the time bound to keep the live window small. The refuse-to-boot guard now CHARGES
+this term at the configured caps (`DEDUP_ENTRY_BYTES ~= 640`, #878), so a bounded
+ceiling refuses unless the dedup caps fit.
 
 **The TOTAL is hard-bounded too.** The `producer_id` is wire-supplied and
 attacker-chosen, so the NUMBER of distinct producer windows is NOT bounded by
@@ -286,18 +290,19 @@ rejection), so a single id cannot be the 64 KiB wire field maximum. The TOTAL
 dedup memory is therefore:
 
 ```
-total_dedup <= max_producers * max_ids * (msg_id_len + ~2 * entry overhead)
-             + max_producers * producer_id_len
+total_dedup <= max_producers * max_ids * (2 * msg_id_len + ~2 * entry overhead)
+             + max_producers * (2 * producer_id_len + ~2 * overhead)
 ```
 
 At the SHIPPED defaults with the worst-case 256-byte ids, the absolute ceiling is
-`4_096 * 100_000 * ~320 bytes ~= 122 GiB` (plus `4_096 * 256 ~= 1 MiB` of keys),
-which is the honest worst case the count knobs must be lowered against for a
-64 MiB edge node, NOT a steady-state figure. With edge-sized knobs (e.g.
-`--dedup-max-ids 4096`, `--dedup-max-producers 256`, 32-byte ids) the ceiling is
-`256 * 4_096 * ~96 ~= 96 MiB`; lower `--dedup-max-ids` further (e.g. 1024) for
-`~24 MiB`. The point is that the bound is now a CLOSED formula in the three knobs,
-independent of how many distinct `producer_id`s an attacker sends. The structure
+`4_096 * 100_000 * ~640 bytes ~= 262 GiB` (plus a few MiB of keys), which is the
+honest worst case the count knobs must be lowered against for a 64 MiB edge node,
+NOT a steady-state figure — and which the refuse-to-boot guard now CHARGES (#878),
+so the shipped defaults provably refuse any small ceiling. The `edge-tiny` preset
+therefore lowers the caps to `--dedup-max-producers 64` / `--dedup-max-ids 256`
+(`64 * 256 * ~640 ~= 10 MiB`), which fits its 64 MiB ceiling. The point is that the
+bound is a CLOSED formula in the three knobs, independent of how many distinct
+`producer_id`s an attacker sends. The structure
 is pure and IO-free (the monotonic `now` comes through the clock seam), and it
 is SESSION-scoped: lost on broker restart by default, so it never grows across
 restarts.
@@ -359,6 +364,8 @@ ceiling. These are the values you would pass to `serve` (or set via the
 | Max groups | `--max-groups` | `64` | live work-groups |
 | Max in-flight | `--max-in-flight` | `256` | per-group delivery window |
 | Max segment bytes | `--max-segment-bytes` | `8388608` (8 MiB) | DISK per segment (not RSS) |
+| Dedup window depth | `--dedup-max-ids` | `256` | remembered `msg_id`s per producer (term 6) |
+| Dedup producer cap | `--dedup-max-producers` | `64` | concurrently-tracked dedup windows (term 6) |
 
 Assume a representative edge record of ~16 KiB (key + headers + payload). Then:
 
@@ -381,19 +388,26 @@ one-record scratch buffer, <= one ~16 KiB record, is transiently resident).
 **Term 5, fixed overhead.** ~4 MiB (binary resident + runtime + 32 thread
 stacks; estimate).
 
-**Steady-state total:**
+**Term 6, the opt-in dedup windows (#878).** Charged by the guard at the configured
+caps regardless of whether a producer opts in at runtime (the proof is from the
+config): `dedup_max_producers * dedup_max_ids * ~640 bytes = 64 * 256 * ~640 ~= 10
+MiB` (plus a few KiB of producer keys).
+
+**Steady-state total (the bounded-buffer worst case the guard sums):**
 
 ```
 term1 (in-flight)      4 MiB
 term3 (group state)    1 MiB
 term4 (active segment) ~0
 term5 (fixed)         ~4 MiB
+term6 (dedup caps)    ~10 MiB
 ---------------------------
-total                 ~9 MiB   <<  64 MiB ceiling
+total                 ~19 MiB   <<  64 MiB ceiling
 ```
 
-Steady state lands roughly an order of magnitude under the ceiling, leaving
-generous headroom.
+The worst case lands well under the ceiling, leaving generous headroom. (A no-dedup
+workload allocates zero of term 6 at runtime, but the guard still charges the CAP, so
+the caps must fit — they do here.)
 
 ### The worst-case read-buffer caveat
 
@@ -437,7 +451,7 @@ configured caps imply provably exceeds the ceiling. The footprint is a CLOSED
 formula in the config (no live RSS), summing the FIRMLY-BOUNDED terms above:
 
 ```
-worst_case = term1 + term3 + term4mem + term5
+worst_case = term1 + term3 + term4mem + term5 + term6
 
 term1 (per-connection in-flight payloads, the firm RAM bound)
      = max_connections * per_conn_inflight
@@ -446,10 +460,17 @@ term1 (per-connection in-flight payloads, the firm RAM bound)
 term3 (per-group cursor + lease state)
      = max_groups * max_in_flight * PER_LEASE_BYTES (~64 bytes)
 term4mem (the store, ONLY under --storage memory; 0 on disk)
-     = IN_MEMORY_STORE_IMAGES (2) * max_total_bytes
+     = IN_MEMORY_STORE_IMAGES (1, post-#492) * max_total_bytes
 term5 (fixed overhead + one OS-thread stack per connection)
      = FIXED_OVERHEAD_BYTES (~4 MiB)
      + max_connections * PER_CONNECTION_STACK_BYTES (~64 KiB resident)
+term6 (the opt-in per-producer dedup windows, #878)
+     = dedup_max_producers * dedup_max_ids * DEDUP_ENTRY_BYTES (~640 bytes:
+       each id stored TWICE — HashMap key + VecDeque slot — plus headers/slack)
+     + dedup_max_producers * DEDUP_PRODUCER_KEY_BYTES (~640 bytes)
+  producer_id is wire-supplied, so the window COUNT is bounded only by the caps,
+  NOT the connection count; at the shipped 4096 * 100_000 defaults this is ~262 GiB,
+  so a bounded ceiling MUST lower the dedup caps (the edge-tiny preset does).
 ```
 
 THE MEMORY-BACKEND STORE FOLD (#445, refs #443): on DISK the store is term 4 of
@@ -507,10 +528,12 @@ is simultaneously mid-assembly of a near-maximal frame, and is explicitly NOT pa
 of the steady-state budget that sums under 64 MiB; bounding it tightly needs an
 on-the-wire record-size cap (the read-buffer follow-up). Charging it would refuse
 EVERY edge config, including the worked `edge-tiny` one this doc proves fits, so the
-guard sums the firmly-bounded steady-state terms (1, 3, 5) the budget itemizes.
-For the `edge-tiny` profile the worst case is ~15 MiB (8 MiB term1 + ~1 MiB term3 +
-~6 MiB term5), well under 64 MiB, so it boots; a blown-up `--max-connections` (or a
-`0` byte budget) pushes it over and is refused.
+guard sums the firmly-bounded steady-state terms (1, 3, 5, and the config-capped
+term 6, #878) the budget itemizes. For the `edge-tiny` profile the worst case is
+~25 MiB (8 MiB term1 + ~1 MiB term3 + ~6 MiB term5 + ~10 MiB term6 from its LOWERED
+`dedup_max_producers = 64` / `dedup_max_ids = 256` caps), well under 64 MiB, so it
+boots; a blown-up `--max-connections` (or a `0` byte budget, or restoring the default
+dedup caps whose ~262 GiB worst case the guard charges) pushes it over and is refused.
 
 ## What enforces this, and what does not
 
