@@ -92,9 +92,12 @@ is_skipped_host() {
 # a skipped URL is NEVER a failure; the match reason is logged.
 #   - .../issues/N : the ADR template's literal `#N` placeholder
 #     (docs/adr/template.md), meant to be replaced per ADR, not a real issue.
+#   - any URL containing a shell variable (e.g. `http://$addr/healthz` in a usage
+#     snippet, docs/OPERATIONS.md): a fill-in-the-blank token, not a real endpoint.
 is_skipped_url() {
 	case "$1" in
 	*github.com/*/*/issues/N | *github.com/*/*/issues/N/) echo "ADR template placeholder (#N), filled in per ADR"; return 0 ;;
+	*'$'*) echo 'shell-variable placeholder (e.g. $addr) in a usage snippet, not a real endpoint'; return 0 ;;
 	esac
 	return 1
 }
