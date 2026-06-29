@@ -518,7 +518,10 @@ impl<'a, F: Filesystem> OriginServer<'a, F> {
 /// The outcome of applying one pull response: how many records were applied and the cursor + HW after.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ApplyOutcome {
-    /// How many records this response durably applied to the local log.
+    /// How many records this response newly APPENDED to the local log. After the #799 crash-window
+    /// reconciliation this EXCLUDES frames the response carried but the single-origin applier already
+    /// held durably (skipped, not re-appended), so a pure re-pull of already-applied data reports `0`
+    /// applied even though `cursor` advances — progress is keyed off `cursor`/`record_count`, not this.
     pub applied: u64,
     /// The puller's resume cursor AFTER this apply: the next origin offset to pull FROM.
     pub cursor: u64,
@@ -732,13 +735,22 @@ fn decode_cursor_payload(bytes: &[u8]) -> Result<BTreeMap<String, u64>, GeoError
 pub struct MirrorApplier<F: Filesystem, C: Clock> {
     log: Log<F, C>,
     cursors: OriginCursorStore<F>,
-    /// Whether this applier's local log is fed by EXACTLY ONE origin, so the local offset equals that
-    /// origin's offset 1:1 (a MIRROR, or a single-origin SOURCE). When true, the local log's own
-    /// `next_offset` is an INDEPENDENT durable anchor for already-applied data, which closes the
-    /// crash window between the record sync and the cursor commit (#799): a re-pull of already-synced
-    /// records is recognized and SKIPPED rather than double-applied. A MULTI-origin source fans N
-    /// origins into one interleaved log, so `next_offset` (the fan-in total) is NOT any single origin's
-    /// offset and cannot anchor it; that path keeps trusting the per-origin cursor alone.
+    /// Whether this applier's local log is fed by EXACTLY ONE origin AND BY NOTHING ELSE (no local
+    /// produces), so the local offset equals that origin's offset 1:1 (a MIRROR, or a single-origin
+    /// SOURCE). When true, the local log's own `next_offset` is an INDEPENDENT durable anchor for
+    /// already-applied data, which closes the crash window between the record sync and the cursor commit
+    /// (#799): a re-pull of already-synced records is recognized and SKIPPED rather than double-applied.
+    ///
+    /// SAFETY INVARIANT: this is sound ONLY because the geo applier log (`<data_dir>/geo/<hex>`) is
+    /// written EXCLUSIVELY by [`MirrorApplier::apply_pull_response`] (the per-origin puller threads) —
+    /// never by a local client produce (those go to the engine's own `StreamSet`, a DIFFERENT log). If a
+    /// local write ever reached THIS log, `next_offset` would exceed the origin's offset and the skip
+    /// would silently DROP genuinely-new origin records (a never-SKIP / data-loss violation), so the
+    /// flag must stay false for any applier whose log can take a non-origin write.
+    ///
+    /// A MULTI-origin source fans N origins into one interleaved log, so `next_offset` (the fan-in
+    /// total) is NOT any single origin's offset and cannot anchor it; that path keeps trusting the
+    /// per-origin cursor alone.
     single_origin: bool,
 }
 
@@ -841,6 +853,19 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
         // so it trusts the cursor alone (`durable_anchor == cursor`, never skipping); that residual
         // window is tracked separately.
         let durable_anchor = if self.single_origin {
+            // INVARIANT: for a single-origin applier the cursor never RUNS AHEAD of the durable log
+            // head — the load-bearing sync-before-commit order guarantees the records are durable
+            // before the cursor advances past them, so `next_offset >= cursor` always. A cursor ahead
+            // of `next_offset` would mean durable records were LOST (a never-SKIP violation) or a
+            // non-origin write reached this log (the apply-only invariant on `single_origin` broke);
+            // surface it loudly in debug rather than silently anchoring at the (too-high) cursor. The
+            // `max` is the production guard for that impossible case (anchor at the cursor, never skip).
+            debug_assert!(
+                self.log.next_offset().get() >= cursor,
+                "single-origin geo cursor {cursor} is ahead of the durable log head {} — lost \
+                 records or a non-origin write to the applier log",
+                self.log.next_offset().get()
+            );
             self.log.next_offset().get().max(cursor)
         } else {
             cursor
