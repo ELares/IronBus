@@ -315,7 +315,7 @@ Security ([#18](https://github.com/ELares/IronBus/issues/18)) is shaped for devi
 - **TLS 1.3 is the designed transport, but it is NOT yet implemented ([#766](https://github.com/ELares/IronBus/issues/766)): the wire is plaintext today.** No TLS stack is linked, and any `--tls-*` material is reserved and refused at startup (the broker will not boot with it set). Until TLS lands, bind to loopback or run behind an SSH / WireGuard tunnel on a trusted network, with auth enabled. The design intent (TLS 1.3 only, mandatory on non-loopback, the binary carrying its own modern TLS stack so the oldest target still gets 1.3) is tracked in [docs/MISSION.md](docs/MISSION.md) and #766.
 - **Three explicit scopes**: publish, subscribe, admin. Auth **ships today and is enforced**: bearer token or username and password (Argon2id, edge-tuned). The **mTLS** mechanism is wired but inert (it fails closed) until the TLS transport (#766) lands, so it cannot be used yet.
 - **Safe by default**: IronBus refuses to start if a secret-bearing file is group or world readable, and ships bounded pre-auth defenses (half-open connection caps, per-source connection rate limits, failed-auth backoff) so a handshake flood cannot exhaust a small device.
-- Optional **encryption at rest** with AES-256-GCM or ChaCha20-Poly1305, selected by runtime CPU feature detection.
+- **Encryption at rest is designed but NOT yet built** — the same root cause as TLS: no AEAD provider is linked yet. The on-disk format reserves a nonce and an at-rest flag for AES-256-GCM or ChaCha20-Poly1305 (CPU-feature-selected), but data on disk is unencrypted today (#18).
 
 ---
 
