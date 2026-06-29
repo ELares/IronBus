@@ -4239,16 +4239,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 // lifecycle to Committed, so on ANY failure here — including a NON-FATAL shed like
                 // `StorageError::AtCapacity` that leaves the engine alive — the table would wrongly read
                 // Committed over a record that is NOT durable. ROLL BACK the resolve to Prepared (#801),
-                // mirroring `txn_prepare`'s rollback-on-failure, so a same-process retry re-enters this
-                // fresh `Resolved` arm and re-drives the append instead of taking the benign
-                // `AlreadyResolved` arm and fabricating a success offset (`dedup_offset_for`'s head
-                // fallback) for a message that was never written. The buffered payload is untouched (it is
-                // dropped only in `mark_committed`, STEP B), so the retry re-appends it; if STEP A had
-                // already recorded the txn-id seq high-water, the retry's dedup returns the same offset and
-                // just fsyncs the still-buffered record — exactly one durable record either way.
+                // so a same-process retry re-enters this fresh `Resolved` arm and re-drives the append
+                // instead of taking the benign `AlreadyResolved` arm and fabricating a success offset
+                // (`dedup_offset_for`'s head fallback) for a message that was never written. (Same spirit
+                // as `txn_prepare`'s undo-the-in-memory-effect-of-a-failed-durable-step, but to the
+                // RE-DRIVABLE `Prepared` state, NOT `txn_prepare`'s spent `RolledBack` tombstone.) The
+                // buffered payload is untouched (it is dropped only in `mark_committed`, STEP B), so the
+                // retry re-appends it; if STEP A had already recorded the txn-id seq high-water, the
+                // retry's dedup returns the same offset and just fsyncs the still-buffered record — exactly
+                // one durable record either way.
                 let real_offset = match self.commit_durable_steps(txn_id, &half) {
                     Ok(offset) => offset,
                     Err(e) => {
+                        // The txn store is GUARANTEED open here — `commit()` at the top of this method
+                        // read it to get the decision — so `ensure_txn_store` cannot fail; the `if let`
+                        // is a borrow-free way to take the handle, not error-swallowing (a silent no-op
+                        // would reinstate the #801 leak, which the just-read store rules out).
                         if let Ok(store) = self.ensure_txn_store() {
                             store.table_mut().revert_resolved_to_prepared(txn_id, now);
                         }
@@ -16631,6 +16637,78 @@ mod tests {
             drain_visible(&mut e),
             vec![vec![0xab; 16], vec![0xab; 16]],
             "the un-committed half message never became visible — no poison/phantom delivery"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_sheds_after_the_real_append_re_drives_to_exactly_one_record_on_retry() {
+        // #801 positive path: STEP A (the real append) SUCCEEDS and records the txn-id seq high-water,
+        // then STEP A2 (the dedup-seq checkpoint write) FAILS non-fatally. The resolve is rolled back to
+        // Prepared, and after the condition CLEARS a same-process retry re-drives — its `commit_real_append`
+        // dedups against the seq high-water recorded in attempt 1, so it returns the SAME offset and just
+        // re-fsyncs the still-buffered record: EXACTLY ONE durable record at the returned offset, visible
+        // once, never a double-append and never a fabricated success.
+        use ironbus_storage::fault::FaultFs;
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+
+        // A first txn commits cleanly: this materializes the main-log segment AND the producer-seq
+        // checkpoint file, so the faulted commit below fails on the checkpoint WRITE (STEP A2), not on a
+        // first-time file create.
+        e.txn_prepare(b"tx0", "", &txn_half(b"zero"), b"").unwrap();
+        assert_eq!(e.txn_commit(b"tx0").unwrap(), Offset::new(0));
+
+        // Prepare the txn under test, then arm a write fault: STEP A buffers the record (no write) and
+        // records the seq, STEP A2's checkpoint write_all_at then fails.
+        e.txn_prepare(b"tx1", "", &txn_half(b"one"), b"").unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        control.set_fail_write(true);
+        let err = e.txn_commit(b"tx1").unwrap_err();
+        assert!(
+            !err.is_fatal(),
+            "the checkpoint-write shed is non-fatal, got {err:?}"
+        );
+        assert!(
+            e.is_healthy(),
+            "the engine stays live after the non-fatal shed"
+        );
+        assert_eq!(
+            e.txn_prepared_count(),
+            1,
+            "the failed commit rolled the resolve back to Prepared, not Committed"
+        );
+
+        // Clear the condition and RETRY: the re-drive dedups to the same offset and commits exactly one
+        // durable record.
+        control.set_fail_write(false);
+        let off = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            off,
+            Offset::new(1),
+            "the re-drive commits at the dense next offset"
+        );
+        assert_eq!(e.txn_prepared_count(), 0, "the txn is now resolved");
+
+        // Idempotent re-commit returns the same offset and appends nothing.
+        assert_eq!(e.txn_commit(b"tx1").unwrap(), Offset::new(1));
+
+        // Exactly the two committed records are visible, in order, with no duplicate of tx1.
+        // (Inline drain: the shared `drain_visible` helper is typed for the in-memory FS only.)
+        let mut seen = Vec::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    seen.push(d.record.payload.to_vec());
+                    e.ack(&d.token);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![b"zero".to_vec(), b"one".to_vec()],
+            "exactly one durable record per committed txn — no double-append, no loss"
         );
     }
 

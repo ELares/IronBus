@@ -441,20 +441,27 @@ impl TxnTable {
 
     /// Reverts a txn THIS process just freshly resolved (a [`ResolveDecision::Resolved`] returned by
     /// [`TxnTable::commit`]/[`TxnTable::rollback`]) back to `Prepared`, so the caller can UNDO an
-    /// in-memory resolve whose durable commit steps then FAILED (#801). Mirrors how
-    /// `Engine::txn_prepare` rolls back its in-memory prepare on a durable-append failure: the table is
-    /// kept consistent with what is actually durable, so a same-process retry re-enters the fresh
+    /// in-memory resolve whose durable commit steps then FAILED (#801): the table is kept consistent
+    /// with what is actually durable, so a same-process retry re-enters the fresh
     /// [`ResolveDecision::Resolved`] arm and re-drives the real append — instead of taking the benign
     /// [`ResolveDecision::AlreadyResolved`] arm and fabricating a success offset for a record that was
     /// never written.
+    ///
+    /// This is the SAME spirit as `Engine::txn_prepare`'s rollback on a durable-append failure (undo
+    /// the in-memory effect of a step whose durable IO failed) but the OPPOSITE terminal state, so do
+    /// not conflate them: `txn_prepare` calls [`TxnTable::rollback`], which moves the txn to a
+    /// `Resolved(RolledBack)` tombstone — SPENT, a later commit is refused; this restores `Prepared` —
+    /// RE-DRIVABLE, so the still-buffered payload can be committed on retry.
     ///
     /// The restored `Prepared` entry is re-aged at `now` (the original prepare instant was consumed by
     /// the resolve, which left the prepared set + age index); this only re-bases the txn's back-check
     /// schedule, which is moot for a txn being actively re-committed. Re-adding to the prepared set is
     /// within the [`TxnConfig::max_prepared`] cap because the resolve being undone just freed this id's
-    /// own slot. A no-op if `txn_id` is not a resolved tombstone (nothing to revert), so a double
-    /// revert or a revert of an already-redriven txn is harmless. The stale resolved-LRU entry left
-    /// behind is lazily invalidated like any evicted tombstone.
+    /// own slot (if that resolve had evicted ANOTHER group's tombstone under the cap, the revert does
+    /// not restore it — benign, since tombstone eviction is always safe by design). A no-op if `txn_id`
+    /// is not a resolved tombstone (nothing to revert), so a double revert or a revert of an
+    /// already-redriven txn is harmless. The stale resolved-LRU entry left behind is lazily invalidated
+    /// like any evicted tombstone.
     pub fn revert_resolved_to_prepared(&mut self, txn_id: &[u8], now: u64) {
         if self.resolved.remove(txn_id).is_some() {
             self.prepared.insert(
