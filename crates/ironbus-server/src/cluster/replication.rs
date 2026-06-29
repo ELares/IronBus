@@ -67,6 +67,7 @@
 
 use std::io::{self, Read, Write};
 
+use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::{self, DecodeError};
 use ironbus_core::epoch_cache::{
@@ -174,8 +175,13 @@ pub struct FetchResponseBody {
     /// How many complete CRC-framed records `frame_bytes` carries.
     pub record_count: u32,
     /// The contiguous CRC-framed on-disk record frames, one after another in the frozen on-disk
-    /// layout — the leader's bytes VERBATIM (untrusted on the follower until re-validated).
-    pub frame_bytes: Vec<u8>,
+    /// layout — the leader's bytes VERBATIM (untrusted on the follower until re-validated). A
+    /// refcounted [`Bytes`] (#810): the leader's `serve_fetch` hands back the zero-copy [`RawByteRun`]
+    /// slice with a refcount BUMP (`clone`), not a `to_vec` copy, so fanning the same committed range
+    /// out to K followers is K cheap clones of one shared buffer instead of K full-payload copies. The
+    /// wire encoding is unchanged (the bytes serialize identically); on the follower, `decode` owns its
+    /// copy.
+    pub frame_bytes: Bytes,
 }
 
 impl FetchResponseBody {
@@ -225,7 +231,9 @@ impl FetchResponseBody {
             high_watermark,
             first_offset,
             record_count,
-            frame_bytes: body[FETCH_RESPONSE_HEADER_LEN..].to_vec(),
+            // The follower OWNS its copy of the verbatim run (it re-validates and then appends it); this
+            // is the one unavoidable copy out of the borrowed wire buffer, unchanged by #810.
+            frame_bytes: Bytes::copy_from_slice(&body[FETCH_RESPONSE_HEADER_LEN..]),
         })
     }
 }
@@ -535,7 +543,8 @@ impl<'a, F: Filesystem, C: Clock> ReplicationLeader<'a, F, C> {
             high_watermark: hw.get(),
             first_offset: run.first_offset.get(),
             record_count: u32::try_from(run.record_count).unwrap_or(u32::MAX),
-            frame_bytes: run.bytes.to_vec(),
+            // #810: a refcount BUMP of the zero-copy storage slice, not a full-payload `to_vec` copy.
+            frame_bytes: run.bytes.clone(),
         })
     }
 
@@ -655,7 +664,8 @@ impl<'a, F: Filesystem> ReadPlaneLeader<'a, F> {
             high_watermark: hw,
             first_offset: sealed.run.first_offset.get(),
             record_count: u32::try_from(sealed.run.record_count).unwrap_or(u32::MAX),
-            frame_bytes: sealed.run.bytes.to_vec(),
+            // #810: a refcount BUMP of the zero-copy storage slice, not a full-payload `to_vec` copy.
+            frame_bytes: sealed.run.bytes.clone(),
         })
     }
 
@@ -821,7 +831,7 @@ impl<F: Filesystem, C: Clock> Follower<F, C> {
         // and is surfaced, so a follower NEVER appends a byte it has not itself validated.
         let mut cursor = 0usize;
         let mut appended = 0u64;
-        let bytes = resp.frame_bytes.as_slice();
+        let bytes: &[u8] = &resp.frame_bytes;
         while cursor < bytes.len() {
             let at_offset = self.log.next_offset().get();
             let (view, frame_len) = match codec::decode(&bytes[cursor..]) {
@@ -1402,9 +1412,12 @@ mod tests {
         let mut tampered = leader.serve_fetch(&req).expect("serve");
         assert_eq!(tampered.first_offset, 3);
         assert!(!tampered.frame_bytes.is_empty());
-        // Flip a byte deep in the body (past the header) so the body CRC32C catches it.
+        // Flip a byte deep in the body (past the header) so the body CRC32C catches it. `frame_bytes`
+        // is an immutable `Bytes` (#810), so rebuild it with the one flipped byte.
         let flip_at = tampered.frame_bytes.len() / 2;
-        tampered.frame_bytes[flip_at] ^= 0xFF;
+        let mut corrupt = tampered.frame_bytes.to_vec();
+        corrupt[flip_at] ^= 0xFF;
+        tampered.frame_bytes = Bytes::from(corrupt);
 
         let err = follower
             .apply_fetch_response(&tampered)
@@ -1447,8 +1460,11 @@ mod tests {
         let mut follower = Follower::new(open_log(InMemoryFs::new(), small_config()));
         let req = follower.fetch_request(3, u32::MAX);
         let mut resp = leader.serve_fetch(&req).expect("serve");
-        // Corrupt a byte at the very front (inside the first frame's header).
-        resp.frame_bytes[2] ^= 0x01;
+        // Corrupt a byte at the very front (inside the first frame's header). `frame_bytes` is an
+        // immutable `Bytes` (#810), so rebuild it with the one flipped byte.
+        let mut corrupt = resp.frame_bytes.to_vec();
+        corrupt[2] ^= 0x01;
+        resp.frame_bytes = Bytes::from(corrupt);
 
         let err = follower
             .apply_fetch_response(&resp)
@@ -1630,7 +1646,7 @@ mod tests {
             high_watermark: 77,
             first_offset: 12,
             record_count: 2,
-            frame_bytes: vec![1, 2, 3, 4, 5],
+            frame_bytes: Bytes::from_static(&[1, 2, 3, 4, 5]),
         };
         assert_eq!(FetchResponseBody::decode(&resp.encode()).unwrap(), resp);
     }
