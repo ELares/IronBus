@@ -1679,7 +1679,7 @@ mod tests {
                 high_watermark: 25,
                 first_offset: 7,
                 record_count: 3,
-                frame_bytes: vec![1, 2, 3, 4, 5],
+                frame_bytes: bytes::Bytes::from_static(&[1, 2, 3, 4, 5]),
             }),
             DataPlaneFrame::AckReplicated(AckReplicatedBody {
                 follower_id: 2,
