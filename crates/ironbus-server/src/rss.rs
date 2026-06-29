@@ -236,20 +236,24 @@ pub const IN_MEMORY_STORE_IMAGES: u64 = 1;
 /// (`docs/RAM_BUDGET.md` term 6, #878). Each remembered id is stored TWICE — once as the `HashMap`
 /// index key and once in the `VecDeque` eviction order (`ProducerWindow` in `ironbus_core::dedup` does
 /// `index.insert(msg_id.to_vec(), …)` AND `order.push_back((msg_id.to_vec(), …))`, two independent heap
-/// copies, no `Arc` sharing) — so the charge is `2 *`
-/// [`MAX_MSG_ID_LEN`](ironbus_core::dedup::MAX_MSG_ID_LEN) (both maximal-id copies) plus the two `Vec`
-/// headers, the index value tuple, and the `HashMap`/`VecDeque` per-slot slack (~128 bytes, generous of
-/// hashbrown's <=7/8 load factor and the deque's power-of-two capacity). The guard charges this per
-/// `dedup_max_ids` slot so the proof is a true UPPER bound on the real dedup footprint regardless of
-/// the actual id lengths a producer sends.
-pub const DEDUP_ENTRY_BYTES: u64 = 2 * ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 128;
+/// copies, no `Arc` sharing). The charge is `2 *`
+/// [`MAX_MSG_ID_LEN`](ironbus_core::dedup::MAX_MSG_ID_LEN) (both maximal-id copies, 512 B) plus 192 B of
+/// header + capacity slack, which is a true UPPER bound on the real worst case (~658 B for a maximal
+/// id): the `HashMap` buckets (key `Vec` 24 + value tuple 16 + control ≈ 41 B/bucket, up to ~2x at
+/// hashbrown's <=7/8 load factor ≈ 82 B/entry) PLUS the `VecDeque` slots (32 B each, and because
+/// `record` pushes BEFORE `evict_overflow` a power-of-two `dedup_max_ids` momentarily holds `max_ids+1`
+/// and never shrinks the doubled capacity ≈ 64 B/entry). The guard charges this per `dedup_max_ids`
+/// slot, so the proof holds regardless of the actual id lengths a producer sends.
+pub const DEDUP_ENTRY_BYTES: u64 = 2 * ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 192;
 
 /// The per-producer fixed key RAM the dedup proof charges (`docs/RAM_BUDGET.md` term 6, #878): the
-/// `producer_id` key, stored TWICE (the `producers` map key and the LRU `BinaryHeap`) plus the
-/// `ProducerWindow` struct headers — `2 *` [`MAX_MSG_ID_LEN`](ironbus_core::dedup::MAX_MSG_ID_LEN) plus
-/// ~128 bytes. This is the small `max_producers`-scaled keys term (~few MiB at the shipped default cap),
-/// dominated by the per-entry term above.
-pub const DEDUP_PRODUCER_KEY_BYTES: u64 = 2 * ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 128;
+/// `producer_id` key is stored up to THREE times — the `producers` map key plus the approximate-LRU
+/// `BinaryHeap`, which rebuilds at 2x so it can hold two copies of a key — plus the empty
+/// `ProducerWindow` struct + collection headers. `3 *`
+/// [`MAX_MSG_ID_LEN`](ironbus_core::dedup::MAX_MSG_ID_LEN) (768 B) plus 384 B of headers/slack upper-
+/// bounds the real ~1100 B. This is the small `max_producers`-scaled keys term (~few MiB at the shipped
+/// default cap, ~tens of KiB at edge-tiny), dominated by the per-entry term above.
+pub const DEDUP_PRODUCER_KEY_BYTES: u64 = 3 * ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 384;
 
 /// The configuration the refuse-to-boot RAM guard ([`fits_under_ram_ceiling`]) reasons about: the
 /// bounded-buffer knobs from `docs/RAM_BUDGET.md` plus `max_connections` (a server-level cap that
@@ -333,7 +337,7 @@ pub struct RamFootprintConfig {
 ///   spraying distinct `producer_id`+`msg_id` grows this without a per-connection limit. It costs
 ///   nothing until a producer opts in, but the guard's proof is "the CAPS cannot exceed the ceiling",
 ///   so the configured caps are charged exactly as `consumer_credit` is (which also costs nothing
-///   until a consumer connects). At the shipped defaults (`4096 * 100_000 * ~320 ~= 122 GiB`) this
+///   until a consumer connects). At the shipped defaults (`4096 * 100_000 * ~704 ~= 269 GiB`) this
 ///   refuses any small ceiling, so an edge profile MUST lower `--dedup-max-ids`/`--dedup-max-producers`
 ///   (the `edge-tiny` preset does).
 ///
@@ -500,8 +504,8 @@ mod tests {
             // The edge-tiny preset is the DISK backend: the store is file-backed, not charged.
             in_memory_store_bytes: 0,
             // The edge-tiny preset LOWERS the dedup caps (#878) so term 6 is bounded well under the
-            // 64 MiB ceiling: 64 * 256 * ~640 ~= 10 MiB (the shipped 4096 * 100_000 defaults would be
-            // ~262 GiB and refuse here).
+            // 64 MiB ceiling: 64 * 256 * ~704 ~= 11 MiB (the shipped 4096 * 100_000 defaults would be
+            // ~269 GiB and refuse here).
             dedup_max_producers: 64,
             dedup_max_ids: 256,
         }
@@ -766,7 +770,7 @@ mod tests {
 
     #[test]
     fn the_shipped_default_dedup_caps_are_refused_under_a_tiny_ceiling() {
-        // #878: the shipped-default dedup caps (4096 producers * 100_000 ids) imply ~122 GiB of dedup
+        // #878: the shipped-default dedup caps (4096 producers * 100_000 ids) imply ~269 GiB of dedup
         // windows in the worst case, which CANNOT fit a 64 MiB edge ceiling. Pre-#878 the guard did
         // not charge dedup, so an edge-tiny box booted under 64 MiB yet a publishing client spraying
         // distinct producer_id+msg_id could grow dedup RAM past the ceiling and OOM it. The guard now
@@ -783,7 +787,7 @@ mod tests {
                 // A hard literal floor, not a self-referential bound: 4096 * 100_000 * 256 (just the
                 // msg_id bytes) is already ~100 GiB, far over the 64 MiB ceiling.
                 worst_case_bytes >= 100 * 1024 * 1024 * 1024,
-                "the default dedup caps imply ~122 GiB, got {worst_case_bytes}"
+                "the default dedup caps imply ~269 GiB, got {worst_case_bytes}"
             ),
             other => panic!(
                 "the shipped default dedup caps under a 64 MiB ceiling must be refused, got {other:?}"

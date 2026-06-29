@@ -265,8 +265,8 @@ bytes**, enforced as a typed rejection at the wire boundary in
 `Session::handle_pub`) TWICE — once as the `HashMap` index key and once in the
 order `VecDeque` (two independent heap copies, no `Arc` sharing) — plus a `u64`
 offset and a `u64` insertion instant. So the per-entry worst case is `2 *
-msg_id_len + ~2 * overhead`, i.e. with a maximal 256-byte id about **~640 bytes**.
-For a generous estimate at the default count cap that is `100_000 * ~640 ~= 64 MiB`
+msg_id_len + ~2 * overhead`, i.e. with a maximal 256-byte id about **~704 bytes**.
+For a generous estimate at the default count cap that is `100_000 * ~704 ~= 67 MiB`
 PER opted-in producer with worst-case ids (or `100_000 * (2*32 + ~64) ~= 12 MiB`
 with modest 32-byte ids). This term is therefore SIZED BY the count bound, so an
 edge profile that opts into dedup must either lower `--dedup-max-ids` or rely on
@@ -295,12 +295,12 @@ total_dedup <= max_producers * max_ids * (2 * msg_id_len + ~2 * entry overhead)
 ```
 
 At the SHIPPED defaults with the worst-case 256-byte ids, the absolute ceiling is
-`4_096 * 100_000 * ~640 bytes ~= 262 GiB` (plus a few MiB of keys), which is the
+`4_096 * 100_000 * ~704 bytes ~= 269 GiB` (plus a few MiB of keys), which is the
 honest worst case the count knobs must be lowered against for a 64 MiB edge node,
 NOT a steady-state figure — and which the refuse-to-boot guard now CHARGES (#878),
 so the shipped defaults provably refuse any small ceiling. The `edge-tiny` preset
 therefore lowers the caps to `--dedup-max-producers 64` / `--dedup-max-ids 256`
-(`64 * 256 * ~640 ~= 10 MiB`), which fits its 64 MiB ceiling. The point is that the
+(`64 * 256 * ~704 ~= 11 MiB`), which fits its 64 MiB ceiling. The point is that the
 bound is a CLOSED formula in the three knobs, independent of how many distinct
 `producer_id`s an attacker sends. The structure
 is pure and IO-free (the monotonic `now` comes through the clock seam), and it
@@ -390,7 +390,7 @@ stacks; estimate).
 
 **Term 6, the opt-in dedup windows (#878).** Charged by the guard at the configured
 caps regardless of whether a producer opts in at runtime (the proof is from the
-config): `dedup_max_producers * dedup_max_ids * ~640 bytes = 64 * 256 * ~640 ~= 10
+config): `dedup_max_producers * dedup_max_ids * ~704 bytes = 64 * 256 * ~704 ~= 11
 MiB` (plus a few KiB of producer keys).
 
 **Steady-state total (the bounded-buffer worst case the guard sums):**
@@ -400,9 +400,9 @@ term1 (in-flight)      4 MiB
 term3 (group state)    1 MiB
 term4 (active segment) ~0
 term5 (fixed)         ~4 MiB
-term6 (dedup caps)    ~10 MiB
+term6 (dedup caps)    ~11 MiB
 ---------------------------
-total                 ~19 MiB   <<  64 MiB ceiling
+total                 ~20 MiB   <<  64 MiB ceiling
 ```
 
 The worst case lands well under the ceiling, leaving generous headroom. (A no-dedup
@@ -465,11 +465,11 @@ term5 (fixed overhead + one OS-thread stack per connection)
      = FIXED_OVERHEAD_BYTES (~4 MiB)
      + max_connections * PER_CONNECTION_STACK_BYTES (~64 KiB resident)
 term6 (the opt-in per-producer dedup windows, #878)
-     = dedup_max_producers * dedup_max_ids * DEDUP_ENTRY_BYTES (~640 bytes:
+     = dedup_max_producers * dedup_max_ids * DEDUP_ENTRY_BYTES (~704 bytes:
        each id stored TWICE — HashMap key + VecDeque slot — plus headers/slack)
-     + dedup_max_producers * DEDUP_PRODUCER_KEY_BYTES (~640 bytes)
+     + dedup_max_producers * DEDUP_PRODUCER_KEY_BYTES (~1152 bytes)
   producer_id is wire-supplied, so the window COUNT is bounded only by the caps,
-  NOT the connection count; at the shipped 4096 * 100_000 defaults this is ~262 GiB,
+  NOT the connection count; at the shipped 4096 * 100_000 defaults this is ~269 GiB,
   so a bounded ceiling MUST lower the dedup caps (the edge-tiny preset does).
 ```
 
@@ -530,10 +530,10 @@ on-the-wire record-size cap (the read-buffer follow-up). Charging it would refus
 EVERY edge config, including the worked `edge-tiny` one this doc proves fits, so the
 guard sums the firmly-bounded steady-state terms (1, 3, 5, and the config-capped
 term 6, #878) the budget itemizes. For the `edge-tiny` profile the worst case is
-~25 MiB (8 MiB term1 + ~1 MiB term3 + ~6 MiB term5 + ~10 MiB term6 from its LOWERED
+~26 MiB (8 MiB term1 + ~1 MiB term3 + ~6 MiB term5 + ~11 MiB term6 from its LOWERED
 `dedup_max_producers = 64` / `dedup_max_ids = 256` caps), well under 64 MiB, so it
 boots; a blown-up `--max-connections` (or a `0` byte budget, or restoring the default
-dedup caps whose ~262 GiB worst case the guard charges) pushes it over and is refused.
+dedup caps whose ~269 GiB worst case the guard charges) pushes it over and is refused.
 
 ## What enforces this, and what does not
 
