@@ -396,6 +396,19 @@ pub enum ReplicationError {
         /// The number of segments still divergent against the leader after the resync.
         remaining: usize,
     },
+    /// A resync was asked to repair against a leader whose high-watermark is BELOW the quorum's
+    /// committed high-watermark — i.e. a leader that does not even hold all the committed data this
+    /// resync must restore (#798 review). FAIL CLOSED BEFORE truncating: dropping the divergent
+    /// committed region and re-fetching from a leader that is behind would silently lose committed data
+    /// (the leader can only restore its own shorter prefix, and the post-resync compare would then read
+    /// "clean" against that shorter prefix — a false heal). The caller must supply a complete quorum
+    /// leader. This is the defense-in-depth guard that replaces the removed committed-HW truncate clamp.
+    ResyncLeaderBehind {
+        /// The leader's high-watermark (flushed offset) the resync was handed.
+        leader_hw: u64,
+        /// The quorum's committed high-watermark the resync was required to preserve.
+        committed_hw: u64,
+    },
 }
 
 impl core::fmt::Display for ReplicationError {
@@ -435,6 +448,13 @@ impl core::fmt::Display for ReplicationError {
             ReplicationError::ResyncDidNotConverge { remaining } => write!(
                 f,
                 "resync did not converge: {remaining} segment(s) still divergent from the leader"
+            ),
+            ReplicationError::ResyncLeaderBehind {
+                leader_hw,
+                committed_hw,
+            } => write!(
+                f,
+                "resync leader is behind: leader high-watermark {leader_hw} < quorum committed high-watermark {committed_hw}; refusing to truncate committed data the leader cannot restore"
             ),
         }
     }
