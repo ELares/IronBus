@@ -684,14 +684,22 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
 const DATAPLANE_POLL: Duration = Duration::from_millis(100);
 
 /// The cap on CONCURRENT inbound peer reader threads on the data-plane listener (#865). Each accepted
-/// peer link spawns a detached reader thread (its own ~[`PER_CONNECTION_STACK_BYTES`](crate::rss::PER_CONNECTION_STACK_BYTES)
-/// stack and an fd), and follower-report auth happens only later inside `recv()` — after the thread and
-/// fd already exist. Without a cap, anything on the cluster network (a flood, or a peer holding many idle
-/// links) spawns unbounded threads and exhausts fd/RAM, collapsing the node — asymmetric with the
-/// client-facing server's `max_connections` cap. This mirrors the client default (256): far above any
-/// real cluster's inbound peer-link count (a node's followers), yet a hard bound — at 256 the reader
-/// stacks total ~16 MiB, well within the refuse-to-boot RAM budget even on an edge node. Over the cap an
-/// inbound link is refused (dropped) rather than spawning a thread.
+/// peer link spawns a detached reader thread (its own stack and an fd), and follower-report auth happens
+/// only later inside `recv()` — after the thread and fd already exist. Without a cap, anything on the
+/// cluster network (a flood, or a peer holding many idle links) spawns unbounded threads and exhausts
+/// fd/RAM, collapsing the node — asymmetric with the client-facing server's `max_connections` cap. This
+/// mirrors the client default (256): a hard bound at ~256 × [`PER_CONNECTION_STACK_BYTES`](crate::rss::PER_CONNECTION_STACK_BYTES)
+/// ≈ 16 MiB of touched reader-stack RSS (the project's per-connection RSS estimate; the virtual reservation
+/// is larger — the default thread stack — and, like the client plane's reader stacks, is not charged in the
+/// #115 refuse-to-boot budget). Over the cap an inbound link is refused (dropped) rather than spawning a
+/// thread.
+///
+/// LIMITATION (#865 review, follow-up): a leader's LEGITIMATE inbound links are one per (followed
+/// partition × follower), so a HIGH-partition-fanout leader (e.g. hundreds of partitions × replicas) can
+/// exceed 256 and the cap would then refuse real followers, stalling replication on the refused
+/// partitions. For the edge-first target the fanout is far below 256, so a hard constant is the
+/// first-cut hardening; a configurable cap sized to the legitimate fanout (rather than borrowed from the
+/// client `max_connections` default) is the tracked follow-up.
 const MAX_DATAPLANE_READERS: usize = 256;
 
 /// Releases one concurrent-reader slot on drop (#865), so the [`MAX_DATAPLANE_READERS`] count is
@@ -1074,6 +1082,11 @@ fn run_dataplane_listener<F, C>(
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
 {
+    // Whether we are currently in a saturation episode, so the cap-refusal warning is logged ONCE per
+    // episode rather than once per refused link (#865 review): the cap defends against a sustained
+    // connection flood, and a per-link warn under that flood would itself be an unbounded log-volume
+    // vector. Reset the moment the loop next admits a link (the episode ended).
+    let mut cap_warned = false;
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
@@ -1082,16 +1095,21 @@ fn run_dataplane_listener<F, C>(
                 // load-then-spawn is race-free against the cap — the count can never exceed the cap.
                 // At the cap, REFUSE the link by dropping the stream (it closes) rather than spawning an
                 // unbounded thread; auth happens only later inside `recv()`, so this bounds an
-                // unauthenticated cluster-network flood at the cheapest point. Logged (the flood is
-                // self-limiting — this fires only while saturated, once per refused link).
+                // unauthenticated cluster-network flood at the cheapest point.
                 if active_readers.load(Ordering::Acquire) >= max_readers {
-                    tracing::warn!(
-                        cap = max_readers,
-                        "data plane: inbound peer reader cap reached; refusing a new link"
-                    );
+                    // Log once per saturation episode, not per refused link (see `cap_warned`).
+                    if !cap_warned {
+                        tracing::warn!(
+                            cap = max_readers,
+                            "data plane: inbound peer reader cap reached; refusing new links until a reader exits"
+                        );
+                        cap_warned = true;
+                    }
                     drop(stream);
                     continue;
                 }
+                // Admitting a link: the saturation episode (if any) is over, so a later one warns again.
+                cap_warned = false;
                 // The listener is NON-BLOCKING (so this accept loop can poll the shutdown flag), and on
                 // BSD/macOS an accepted stream INHERITS the listener's `O_NONBLOCK`. A blocking-mode read
                 // timeout (`SO_RCVTIMEO`, set below) is IGNORED on a non-blocking socket: `read` returns
