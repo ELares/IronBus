@@ -1,10 +1,11 @@
 # IronBus mission: the durable log broker — single node or clustered — that beats NATS on every front
 
-> Status: MISSION + ROADMAP. This document states the GOAL and the plan to reach it. It is scrupulously
-> explicit about what is **achieved and measured today** versus what is **v2 target / roadmap, not yet
-> built**. Read the two honesty tables in [§2](#2-honesty-achieved-and-measured-vs-v2-target-not-yet-built)
-> before reading any superlative as a present-tense claim. "Better on every front" and "clustered" are
-> the goal, stated as such — not a description of the shipped binary.
+> Status: MISSION + ROADMAP. This document states the GOAL and tracks progress to it. It is scrupulously
+> explicit, in three tiers: what is **measured today**, what is **shipped and wired (with scope edges)**,
+> and what is **still target**. Read the honesty tables in [§2](#2-honesty-measured-today-shipped-and-wired-and-still-target)
+> before reading any superlative as a present-tense claim. "Better on every front" is the destination;
+> clustering, multi-stream, and the single-consumer consume win have since shipped (§2b), each marked at
+> its true status below.
 
 ---
 
@@ -38,10 +39,11 @@ discipline ([I1–I6](../docs/INVARIANTS.md#shared-invariants-i1-to-i8)) across 
 
 ---
 
-## 2. Honesty: ACHIEVED-AND-MEASURED vs v2 TARGET (not yet built)
+## 2. Honesty: measured today, shipped and wired, and still target
 
-This is the most important section. Nothing in the roadmap below is claimed as shipped. The superlatives
-in §1 are the destination.
+This is the most important section. It splits every capability three ways: a measured win (§2a),
+shipped-and-wired with a stated scope edge (§2b), or still target (§2c). A superlative in §1 is the
+destination until the capability reaches §2a.
 
 ### 2a. Achieved and measured today (single node)
 
@@ -50,25 +52,38 @@ These are real, on-device, measured wins — the foundation the mission builds o
 | Capability | Status | The measured / mechanical fact |
 | --- | --- | --- |
 | Durable produce throughput | **ACHIEVED, measured on-device** | Durable pipelined produce measured at **~80x NATS JetStream at `sync_interval=always`** (matched-durability label) on the reference edge device — `fsync`-before-ack, group-committed. See [docs/PERF_LEDGER.md](../docs/PERF_LEDGER.md#round-5-458-the-half-duplex-window-was-the-leg-4-gap-full-duplex-produce_stream--928ks-all-five-legs-cleared). |
+| Single-consumer durable consume | **ACHIEVED, measured** | The Tier-S streaming consumer (consumer-managed offsets, a resident sparse byte index, zero-copy `DeliverBatch`) measures **~6–8x NATS JetStream pull** across the 20k→200k sweep on t4g.large ([docs/PERF_LEDGER.md](../docs/PERF_LEDGER.md), 2026-06-19). This used to be the one axis we lost; the [V2-M1](#v2-roadmap-the-single-node-milestones) fix landed and the win is now unconditional. |
 | In-memory (RAM) throughput | **ACHIEVED, measured** | In-memory stream measured **~3.3x** NATS JetStream in-memory at matched workload (PERF_LEDGER round 5). |
 | Corruption recovery | **ACHIEVED** | Bounded, reported, fail-closed: longest-valid-prefix recovery, stop-at-first-bad-frame, per-event caps (≤1 segment or 64 MiB, ≤1% of durable bytes), quarantine-by-copy, typed loss report — see [docs/RECOVERY.md](../docs/RECOVERY.md#1-the-recovery-model-ratified) and [I3](../docs/INVARIANTS.md#i3-bounded-reported-loss). NATS truncate-and-drops are unbounded and silent. |
 | Native Prometheus metrics | **ACHIEVED** | `/metrics` is built in (NATS needs a sidecar). |
 | Multi-consumer durable consume | **ACHIEVED** | Competing / key-shared / broadcast work-groups over one ordered log. |
 | Single static binary, kernel-only deps | **ACHIEVED** | One musl binary, broker + CLI, no JVM, no ZooKeeper, no external dependency. |
 
-### 2b. v2 target / roadmap — NOT yet built
+### 2b. Shipped and wired (functionally complete; broader verification in progress)
 
-Everything here is the plan. It is **not** shipped, and is not claimed as a present-tense capability.
+These are built, wired end-to-end (engine → wire frames → CLI) and covered by tests. They do not yet carry the full CI-gated head-to-head benchmark that the §2a rows do, and each has a stated scope edge — but "not built" is no longer true for any of them.
+
+| Capability | Status | What ships, and the scope edge |
+| --- | --- | --- |
+| Multi-stream + subjects + wildcards | **SHIPPED, wired** | N named streams + subject routing + `*` / `>` wildcards are wired end-to-end (`streamset.rs` → engine → `StreamDeclare` / `PubTo` / `SubTo` / `BindSubject` / `PubSubject` frames → the `ironbus stream` CLI); an unbound subject is a typed fail-closed reject. Scope edge: **partitions** are built in storage but not yet wired through the engine ([V2-M2](#v2-roadmap-the-single-node-milestones), #693), and named-stream consume parity (DLQ / key-shared / Tier-S / metrics) is in progress (#681). |
+| Multi-node clustering + replication | **SHIPPED, wired** | A real cluster runs behind `ironbus serve --cluster-id / --cluster-peer`: a KRaft-style metadata Raft group (tikv/raft-rs), per-partition leader-serve + ISR follower-fetch on a data-plane port, the `C2-fsync` quorum-`fdatasync` ack default (the wire `PubAck` is withheld until quorum-fsync), leader-epoch fencing, footer/CRC divergence self-heal, follower reads, and async geo / leaf / federation. [V2-C1 through V2-C7](#v2-roadmap-the-clustering-milestones) are merged. Scope edge: replication today covers the single default log (partition 0); **multi-partition** replication awaits the M2 partition wiring (#693), and the cluster benchmarks are not yet CI-gated (#636, [V2-C8](#v2-roadmap-the-clustering-milestones)). |
+| Reliability: idempotent producer + transactional messaging | **SHIPPED, wired** | Idempotent producer (PID + epoch + sequence; Fresh / Duplicate / Fenced / OutOfOrder), effectively-once proven across restart AND a long offline gap; RocketMQ-style transactional half-messages (`TxnPrepare` through `TxnListen` frames, crash-safe commit + broker back-check) with over-the-wire frame-level tests ([V2-M8](#v2-roadmap-the-single-node-milestones)). |
+| Observability + recovery-as-feature | **SHIPPED, wired** | `ironbus verify` (offline fsck), `repair` (`--apply` under a data-dir lock), `backup` / `restore`, latency histograms (`ironbus_*_seconds_bucket`), and recovery-event counters from the live loss report ([V2-M6](#v2-roadmap-the-single-node-milestones)). Scope edge: OpenTelemetry tracing is the one M6 piece not built (#770). |
+| Security: auth + pre-auth DoS + graceful drain | **SHIPPED, wired** | Three auth mechanisms (bearer token, Argon2id password, mTLS) × three independent scopes, pre-auth DoS defenses (per-IP rate limit, half-open cap, failed-auth lockout), graceful drain + SIGTERM readiness-flip, and a secret-free audit stream, wired into the accept loop ([V2-M7](#v2-roadmap-the-single-node-milestones)). Scope edge: the **mTLS** mechanism is inert (fails closed) until the TLS transport lands — see §2c. |
+
+### 2c. Still target — not built
+
+Genuinely not shipped, marked as such everywhere they appear:
 
 | Roadmap item | Status | Note |
 | --- | --- | --- |
-| Single-consumer durable consume beating NATS | **TARGET (the one axis we lose today)** | Today single-consumer durable consume is **~3–20x slower** than NATS — a design artifact (per-poll full-segment re-scan + reads on the write actor + a work-queue premium on every record), not fundamental. The fix is [V2-M1](#v2-roadmap-the-single-node-milestones). |
-| Multi-stream + subjects + wildcards | **TARGET** | Today IronBus is literally **one log**. Streams/subjects/partitions are [V2-M2](#v2-roadmap-the-single-node-milestones). |
-| Routing richness (TTL / DLX / priorities / delayed) | **TARGET** | [V2-M4]. Not built. |
-| **All clustering / replication** | **TARGET (first-class, but not yet built)** | The entire [cluster roadmap (V2-C1–V2-C8)](#v2-roadmap-the-clustering-milestones) is design + plan. **No multi-node code ships today.** The single node is the only thing that runs now. |
+| Partitions through the engine + multi-partition replication | **TARGET** | The partition math is built in storage but not wired to the engine / wire / CLI; cluster replication covers the default log until it lands. [V2-M2](#v2-roadmap-the-single-node-milestones), #693. |
+| Routing richness — priorities / delayed / request-reply | **TARGET** | Per-message TTL enforcement exists in the engine (operator surface open, #710) and reason-tagged dead-lettering ships; optional priorities (#553), scheduled / delayed messages (#555), and request-reply RPC (#764) are not built. [V2-M4](#v2-roadmap-the-single-node-milestones). |
+| TLS 1.3 + mTLS transport | **TARGET — the wire is plaintext today** | No TLS stack is linked; `--tls-*` material is reserved and **refused at startup** (#766). Until it lands, run on loopback or use `--insecure-plaintext-wire` with auth on a trusted network. [V2-M7](#v2-roadmap-the-single-node-milestones). |
+| Tiered storage | **TARGET (post-1.0)** | Offload cold sealed segments to an object-storage backend behind the cursor abstraction. [V2-M10](#v2-roadmap-the-single-node-milestones), #643. Distinct from an object store (a non-goal). |
+| Clustering benchmarks, CI-gated | **TARGET** | The cluster code ships; the head-to-head-vs-NATS cluster benchmarks are not yet CI-gated, and the t4g 3-node edge-fit run is open (#636). [V2-C8](#v2-roadmap-the-clustering-milestones). |
 
-**Rule:** the safe, simple, single-node path is the default and is real today; everything that makes
-IronBus "better on every front" and "clustered" is the roadmap, marked as such everywhere it appears.
+**Rule:** every capability is marked at its true status — a measured win (§2a), shipped-and-wired with a stated scope edge (§2b), or still target (§2c). A superlative in §1 is the destination, not a present-tense claim, until it reaches §2a.
 
 ---
 
@@ -80,23 +95,27 @@ issues. This is a competitive map, not a claim that the gaps are closed.
 ### Already winning (achieved, measured)
 
 - **Durable produce** — ~80x NATS `sync_interval=always`, pipelined, on-device (PERF_LEDGER round 5).
+- **Single-consumer durable consume** — ~6–8x NATS JetStream pull, the Tier-S streaming tier (PERF_LEDGER 2026-06-19). The axis we used to lose is now an unconditional win.
 - **In-memory RAM** — ~3.3x NATS JetStream in-memory; more memory-efficient.
 - **Corruption recovery** — bounded / reported / fail-closed, vs NATS unbounded / silent / unrecoverable.
 - **Native Prometheus** — built in, vs NATS needing a sidecar.
 - **Multi-consumer consume** — work-groups over one ordered log.
 
-### The one axis we lose today
+### Shipped and wired (feature parity reached; scope edges in §2b)
 
-- **Single-consumer durable consume — ~3–20x slower than NATS.** This is a **design artifact**, not a
-  fundamental limit: a per-poll full-segment re-scan, reads served on the write actor, and a work-queue
-  premium charged on every record. It is fixable, and [V2-M1](#v2-roadmap-the-single-node-milestones)
-  is the P0 that fixes it.
+- **Multi-stream + subjects + wildcards** — wired end-to-end; partitions are the remaining M2 gap (#693).
+- **Multi-node clustering** — metadata Raft + per-partition ISR replication + `C2-fsync` quorum acks + follower reads + divergence self-heal + geo, behind `--cluster-id / --cluster-peer`; default-log replication today, multi-partition (#693) and CI-gated benches (#636) pending.
+- **Reliability** — idempotent producer + transactional messaging (M8), effectively-once across restart + offline gap.
+- **Observability** — verify / repair / backup / restore + latency histograms + recovery counters (M6).
+- **Security** — 3-mechanism auth × 3 scopes + pre-auth DoS + graceful drain (M7); the TLS transport is the gap.
 
-### Feature + cluster gaps (target, not yet built)
+### Still target (not built)
 
-- Topics / subjects / wildcards (we are literally one log) → V2-M2.
-- Routing richness (TTL/DLX/priorities/delayed) → V2-M4.
-- **Clustering / replication** → V2-C1–V2-C8 (first-class, not yet built).
+- Partitions through the engine + multi-partition replication → V2-M2 (#693).
+- Routing priorities / delayed / request-reply → V2-M4 (#553 / #555 / #764).
+- TLS 1.3 + mTLS transport — the wire is plaintext today → V2-M7 (#766).
+- Tiered storage → V2-M10 (#643).
+- CI-gated cluster benchmarks → V2-C8 (#636).
 
 ### Non-goals (deliberately not built)
 
@@ -173,11 +192,16 @@ replicas.
 
 ---
 
-## 6. V2 roadmap (one line each — all of this is TARGET, not shipped)
+## 6. V2 roadmap and status ledger
+
+Each milestone below is one line of SCOPE. Authoritative completion status is in §2 (measured /
+shipped-and-wired / still target): several have shipped — M1 (consume), M2 (streams + subjects + wildcards),
+M6, M7 (auth), M8, and the cluster C1 through C7 — so the bullets describe what each milestone covers, not
+that it is unbuilt.
 
 ### V2 roadmap the single-node milestones
 
-- **V2-M1 — Consume: beat NATS (P0, the one axis we lose).** Resident byte index + lock-free read plane +
+- **V2-M1 — Consume: beat NATS (SHIPPED — now ~6–8x, see §2a).** Resident byte index + lock-free read plane +
   zero-copy delivery + a streaming consumer-managed-offset tier, keeping the lease-rich work-queue tier.
 - **V2-M2 — Multi-stream + subjects + wildcards (P0, biggest feature gap).** N independent logs +
   subject routing + partitions on one node, fail-closed on unbound subjects, flat per-record cost.
@@ -200,8 +224,9 @@ replicas.
 
 ### V2 roadmap the clustering milestones
 
-Clustering is first-class. The full design is in this document's companion analysis; each milestone below
-is one line, and **none of it is built yet**.
+Clustering is first-class. Each milestone below is one line. **V2-C1 through V2-C7 have shipped and are
+wired** (see §2b, behind `--cluster-id / --cluster-peer`); the remaining cluster milestone is V2-C8
+(CI-gating the head-to-head-vs-NATS cluster benchmarks, #636). The default-log scope edge in §2b applies.
 
 - **V2-C1 — Metadata consensus (the one Raft group).** An embedded metadata-Raft (1/3/5 voters) over an
   IronBus log holding membership/placement/leadership-epoch/config; joint-consensus membership + learners
