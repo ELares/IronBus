@@ -242,6 +242,15 @@ const DEFAULT_MAX_MESSAGES: u64 = 0;
 /// endless groups. `0` = unlimited (the cap is off); the default is non-zero (1024).
 const DEFAULT_MAX_GROUPS: usize = ironbus_server::engine::DEFAULT_MAX_GROUPS;
 
+/// The default cap on the number of resident NAMED streams for `serve` (refs #863), aliased to the
+/// engine's [`ironbus_server::engine::DEFAULT_MAX_STREAMS`] so the CLI default and the engine default
+/// are a single source of truth and cannot drift. Each named stream pins its own log: open file
+/// descriptors, an inode/directory entry, and per-stream buffers, so an unauthenticated client that
+/// can name streams could otherwise exhaust fds/inodes/RAM and abort the broker by naming endless
+/// streams. `0` = unlimited (the cap is off); the default is non-zero (1024). The default stream is
+/// never counted against it.
+const DEFAULT_MAX_STREAMS: usize = ironbus_server::engine::DEFAULT_MAX_STREAMS;
+
 /// The default idle window after which an idle, fully-caught-up, lease-free NAMED work-group is
 /// evicted for `serve` (refs #277, #240), in MILLISECONDS, aliased to the engine's
 /// [`ironbus_server::engine::DEFAULT_GROUP_IDLE_EVICT_MS`] so the CLI and engine default are a single
@@ -638,6 +647,10 @@ struct ProfilePreset {
     max_connections: usize,
     /// `backpressure.max_groups` (`--max-groups`).
     max_groups: usize,
+    /// `backpressure.max_streams` (`--max-streams`): the cap on resident NAMED streams (#863).
+    /// `edge-tiny` LOWERS it (a tiny node should pin few logs); `balanced`/`throughput` mirror their
+    /// group budgets. `0` = unlimited.
+    max_streams: usize,
     /// `backpressure.max_in_flight` (`--max-in-flight`).
     max_in_flight: u32,
     /// `backpressure.disk_full_policy` (`--disk-full-policy`).
@@ -669,6 +682,9 @@ const EDGE_TINY_PRESET: ProfilePreset = ProfilePreset {
     consumer_credit_bytes: 256 * 1024,
     max_connections: 32,
     max_groups: 64,
+    // LOWERED named-stream cap (#863): a tiny edge node should pin only a handful of logs (each a
+    // distinct fd/inode/buffer set), so 64 named streams — matching its group budget — is the bound.
+    max_streams: 64,
     max_in_flight: 256,
     disk_full_policy: DiskFullPolicyArg::DropNew,
     checkpoint_interval: 1024,
@@ -698,6 +714,7 @@ const BALANCED_PRESET: ProfilePreset = ProfilePreset {
     consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
     max_connections: DEFAULT_MAX_CONNECTIONS,
     max_groups: DEFAULT_MAX_GROUPS,
+    max_streams: DEFAULT_MAX_STREAMS,
     max_in_flight: DEFAULT_MAX_IN_FLIGHT,
     disk_full_policy: DiskFullPolicyArg::DropNew,
     checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
@@ -722,6 +739,7 @@ const THROUGHPUT_PRESET: ProfilePreset = ProfilePreset {
     consumer_credit_bytes: 64 * 1024 * 1024,
     max_connections: 1024,
     max_groups: 4096,
+    max_streams: 4096,
     max_in_flight: 8192,
     disk_full_policy: DiskFullPolicyArg::DropOldest,
     checkpoint_interval: 4096,
@@ -811,7 +829,7 @@ USAGE:
                   [--consumer-credit <n>] [--consumer-credit-bytes <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
-                  [--max-groups <n>] [--group-idle-evict-ms <ms>]
+                  [--max-groups <n>] [--max-streams <n>] [--group-idle-evict-ms <ms>]
                   [--disk-full-policy <drop-new|drop-oldest>]
                   [--key-shared-group <name>]... [--broadcast-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>] [--enable-admin]
@@ -936,6 +954,10 @@ Notes:
     --max-groups (default 1024, 0 = unlimited) caps the number of live work-groups, including the
     default group, so once the wire can name groups a client cannot exhaust memory by naming
     endless groups. A new named group past the cap is rejected; the default group is never counted.
+    --max-streams (default 1024, 0 = unlimited) caps the number of resident NAMED streams. Each
+    stream pins its own log: an open file descriptor, an inode/directory entry, and per-stream
+    buffers, so once the wire can name streams a client cannot exhaust fds/inodes/RAM by naming
+    endless streams. A new named stream past the cap is rejected; the default stream is never counted.
     --group-idle-evict-ms (default 0 = disabled) evicts an idle NAMED work-group from memory after
     it has been idle this many milliseconds, reclaiming its slot against --max-groups. Only a
     fully-caught-up (committed at the head, no acked-ahead set), lease-free, non-key-shared named
@@ -2177,6 +2199,8 @@ struct ServeFlags {
     /// like `allow_unlimited_deliver`.
     compact: bool,
     max_groups: Option<usize>,
+    /// The resident NAMED-stream cap (#863); `None` falls back to the profile preset. `0` = unlimited.
+    max_streams: Option<usize>,
     group_idle_evict_ms: Option<u64>,
     /// The refuse-to-boot RAM ceiling in bytes (#115); `None` falls back to the profile preset (`0`
     /// = off for `balanced`/`throughput`, 64 MiB for `edge-tiny`). When set, the broker refuses to
@@ -2462,6 +2486,7 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                 f.max_messages = Some(take_number("--max-messages", args, &mut i)?);
             }
             "--max-groups" => f.max_groups = Some(take_number("--max-groups", args, &mut i)?),
+            "--max-streams" => f.max_streams = Some(take_number("--max-streams", args, &mut i)?),
             "--group-idle-evict-ms" => {
                 f.group_idle_evict_ms = Some(take_number("--group-idle-evict-ms", args, &mut i)?);
             }
@@ -2982,6 +3007,7 @@ fn parse_serve_flags_with_env_and_reader(
             // changelog policy), so it resolves from the `--compact` flag / `IRONBUS_COMPACT` env only.
             compact: resolve_bool("--compact", f.compact, env)?,
             max_groups: resolve_number("--max-groups", f.max_groups, env, preset.max_groups)?,
+            max_streams: resolve_number("--max-streams", f.max_streams, env, preset.max_streams)?,
             group_idle_evict_ms: resolve_number(
                 "--group-idle-evict-ms",
                 f.group_idle_evict_ms,
@@ -4683,6 +4709,12 @@ struct ServeConfig {
     /// cannot exhaust memory by naming endless groups. `0` = unlimited (the cap is off); the
     /// default is non-zero (1024). A new named group past the cap is rejected by the engine.
     max_groups: usize,
+    /// The cap on the number of resident NAMED streams (refs #863): each named stream pins its own
+    /// log (an fd, an inode/directory entry, and per-stream buffers), so an unauthenticated client
+    /// that can name streams could otherwise exhaust fds/inodes/RAM and abort the broker. `0` =
+    /// unlimited (the cap is off); the default is non-zero (1024). The default stream is never
+    /// counted. A new named stream past the cap is rejected by the engine.
+    max_streams: usize,
     /// The idle window after which an idle, fully-caught-up, lease-free NAMED work-group is evicted
     /// from memory (refs #277, #240), in MILLISECONDS: the lifecycle reclaim that complements the
     /// `max_groups` cap. `0` = DISABLED (never evict), the default; a non-zero value opts in. The
@@ -4898,6 +4930,7 @@ impl ServeConfig {
             // Key compaction (#337) is OFF by default.
             compact: false,
             max_groups: DEFAULT_MAX_GROUPS,
+            max_streams: DEFAULT_MAX_STREAMS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
@@ -6142,6 +6175,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         "materialized-config profile={} profile_schema_version={} addr={addr} \
          data_dir={data_dir} max_connections={} max_segment_bytes={} max_total_bytes={} \
          consumer_credit={} consumer_credit_bytes={} max_in_flight={} max_groups={} \
+         max_streams={} \
          group_idle_evict_ms={} checkpoint_interval={} max_deliver={} \
          allow_unlimited_deliver={} disk_full_policy={policy} visibility_timeout_ms={} \
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
@@ -6159,6 +6193,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.consumer_credit_bytes,
         config.max_in_flight,
         config.max_groups,
+        config.max_streams,
         config.group_idle_evict_ms,
         config.checkpoint_interval,
         config.max_deliver,
@@ -8762,6 +8797,7 @@ fn cmd_serve(
         // #288/#99 footgun).
         config.compact,
         config.max_groups,
+        config.max_streams,
         config.group_idle_evict_ms,
         // The #115 refuse-to-boot RAM ceiling is read only on the Unix serve path (it wires the
         // engine's ram_ceiling_bytes and drives the boot guard), so the non-Unix stub must consume it
@@ -9005,6 +9041,7 @@ fn open_engine_with<F: Filesystem + Clone>(
             // can name groups. `0` = unlimited (off); the default is non-zero (1024). A new named
             // group past the cap is rejected by the engine before it allocates.
             max_groups: config.max_groups,
+            max_streams: config.max_streams,
             // Idle named-group eviction (refs #277, #240): the lifecycle reclaim that completes the
             // #240 cap. `0` = disabled (off, the default), a non-zero value is the idle window in ms
             // after which a fully-caught-up, lease-free named group is reclaimed. Never deletes a
@@ -12652,6 +12689,7 @@ mod tests {
             // Key compaction (#337) is OFF by default.
             compact: false,
             max_groups: DEFAULT_MAX_GROUPS,
+            max_streams: DEFAULT_MAX_STREAMS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
@@ -13214,6 +13252,11 @@ mod tests {
         assert!(
             line.contains("data_dir=/var/lib/ironbus"),
             "the data dir: {line}"
+        );
+        // The edge-tiny LOWERED named-stream cap (#863) carried through: 64, not the default 1024.
+        assert!(
+            line.contains("max_streams=64"),
+            "the edge-tiny stream cap: {line}"
         );
         // One single line (no embedded newline), so it is one structured log record.
         assert!(!line.contains('\n'), "a single line: {line}");
@@ -14560,6 +14603,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                max_streams: DEFAULT_MAX_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -15506,6 +15550,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                max_streams: DEFAULT_MAX_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -15590,6 +15635,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                max_streams: DEFAULT_MAX_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -16070,6 +16116,7 @@ mod tests {
             // Key compaction (#337) is OFF by default.
             compact: false,
             max_groups: DEFAULT_MAX_GROUPS,
+            max_streams: DEFAULT_MAX_STREAMS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
@@ -16167,6 +16214,7 @@ mod tests {
             consumer_credit: 8,
             consumer_credit_bytes: 256 * 1024,
             max_groups: 64,
+            max_streams: 64,
             max_in_flight: 256,
             ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
             // The edge-tiny preset lowers these (#878); with the shipped 4096 * 100_000 defaults the
@@ -16191,6 +16239,7 @@ mod tests {
             consumer_credit: 8,
             consumer_credit_bytes: 256 * 1024,
             max_groups: 64,
+            max_streams: 64,
             max_in_flight: 256,
             ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
             ..validation_config()
@@ -16239,6 +16288,7 @@ mod tests {
             consumer_credit: 8,
             consumer_credit_bytes: 256 * 1024,
             max_groups: 64,
+            max_streams: 64,
             max_in_flight: 256,
             ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
             // The edge-tiny preset LOWERS the dedup caps (#878) so the charged dedup term (~11 MiB)
@@ -17532,6 +17582,79 @@ mod tests {
         assert!(
             USAGE.contains("--max-groups"),
             "USAGE must document --max-groups"
+        );
+    }
+
+    #[test]
+    fn serve_rejects_a_non_numeric_max_streams() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-streams".to_string(),
+                "many".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-streams"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_a_zero_max_streams_meaning_unlimited() {
+        // `0` = unlimited (the cap is off), matching the `0` = off convention of the other bounds.
+        // An explicit 0 must parse the same as the default, so the only failure is the unrelated
+        // bind path, never EXIT_USAGE.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-ms0-never-served".to_string(),
+                "--max-streams".to_string(),
+                "0".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "an explicit --max-streams 0 (unlimited) parses and validates: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-ms0-never-served");
+    }
+
+    #[test]
+    fn max_streams_resolves_flag_over_preset_over_default() {
+        // The resolution precedence (#863, flag > preset > default): the flag wins; absent the flag
+        // the edge-tiny preset's LOWERED 64 flows through; absent any profile the balanced default.
+        let c = parse_serve_flags(&serve_args(&["--max-streams", "7"]))
+            .unwrap()
+            .config;
+        assert_eq!(c.max_streams, 7, "the flag value wins");
+        let c = parse_serve_flags(&serve_args(&["--profile", "edge-tiny"]))
+            .unwrap()
+            .config;
+        assert_eq!(c.max_streams, 64, "edge-tiny lowers the stream cap");
+        let c = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(
+            c.max_streams, DEFAULT_MAX_STREAMS,
+            "the balanced default (1024)"
+        );
+    }
+
+    #[test]
+    fn usage_lists_the_max_streams_flag() {
+        assert!(
+            USAGE.contains("--max-streams"),
+            "USAGE must document --max-streams"
         );
     }
 
@@ -19088,6 +19211,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                max_streams: DEFAULT_MAX_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -19171,6 +19295,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                max_streams: DEFAULT_MAX_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,

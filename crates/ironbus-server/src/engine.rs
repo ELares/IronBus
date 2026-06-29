@@ -376,6 +376,15 @@ pub struct EngineConfig {
     /// `AckCursor`/`LeaseTable` pairs is a few hundred KiB of state, so the cap is generous for
     /// real use yet still closes the denial-of-service vector.
     pub max_groups: usize,
+    /// The cap on the number of resident NAMED streams (#863): declare-on-first-produce / declare-on-bind
+    /// materializes a permanently-resident `Log` (an fd + `streams/<hex>/` dir + RAM) per distinct stream
+    /// name, with no eviction. Without this cap one client naming N distinct well-formed streams pins N
+    /// fds/inodes/`Log`s until fds (EMFILE), inodes/flash, or RAM are exhausted and the broker aborts
+    /// under `panic=abort`. A NEW named stream past this cap is rejected with
+    /// [`EngineError::TooManyStreams`] BEFORE its `Log` is opened; an already-resident stream and the
+    /// default stream are always allowed (the default does not count). `0` means UNLIMITED, matching the
+    /// other `0` = off bounds; the default is [`DEFAULT_MAX_STREAMS`] (1024), an edge profile lowers it.
+    pub max_streams: usize,
     /// How long a NAMED, NON-default work-group may sit IDLE before it is EVICTED (reclaimed from
     /// memory), in MILLISECONDS (refs #277, #240, #9): the deferred lifecycle half of #240. The cap
     /// (`max_groups`) BOUNDS the number of live groups; this RECLAIMS the idle ones, so a long-lived
@@ -564,6 +573,13 @@ pub enum EngineError {
         /// The cap that was reached.
         max: usize,
     },
+    /// A new NAMED stream could not be materialized: the per-engine resident-stream cap is reached
+    /// (#863). Rejected BEFORE any `Log` is opened, so one client cannot exhaust fds/inodes/RAM by
+    /// naming unbounded distinct streams.
+    TooManyStreams {
+        /// The cap that was reached.
+        max: usize,
+    },
     /// A work-group name was empty, too long, or held a non-graphic-ASCII byte (#240).
     InvalidGroupName,
     /// A cumulative ack (ack-all-up-to-offset) was requested on a competing work-group (#63).
@@ -702,6 +718,9 @@ impl core::fmt::Display for EngineError {
             }
             EngineError::TooManyGroups { max } => {
                 write!(f, "work-group limit {max} reached")
+            }
+            EngineError::TooManyStreams { max } => {
+                write!(f, "named-stream limit {max} reached")
             }
             EngineError::InvalidGroupName => {
                 write!(
@@ -1601,6 +1620,13 @@ pub struct EngineConfigSnapshot {
     pub max_deliver: u32,
     /// The cap on the number of live work-groups, the default included (`0` = unlimited).
     pub max_groups: usize,
+    /// The cap on the number of resident NAMED streams (#863, `0` = unlimited). Declare-on-first-produce
+    /// / declare-on-bind materializes a permanently-resident `Log` (an fd + dir + RAM) per distinct
+    /// stream name; without this cap one client naming N streams exhausts fds/inodes/RAM and aborts the
+    /// broker under `panic=abort`. A NEW named stream past the cap is rejected with
+    /// [`EngineError::TooManyStreams`] BEFORE any `Log` is opened; an already-resident stream and the
+    /// default stream are always allowed. The default stream does not count toward the cap.
+    pub max_streams: usize,
     /// The idle-eviction window for a named group in NANOSECONDS (`0` = disabled).
     pub group_idle_evict_nanos: u64,
     /// The lease visibility timeout in nanoseconds.
@@ -1846,6 +1872,13 @@ pub const DEFAULT_CONSUMER_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
 /// of distinct consumer groups, and 1024 `AckCursor`/`LeaseTable` pairs is a modest, bounded amount
 /// of state. See [`EngineConfig::max_groups`] (where `0` = unlimited).
 pub const DEFAULT_MAX_GROUPS: usize = 1024;
+
+/// The default cap on the number of resident NAMED streams (#863). Like [`DEFAULT_MAX_GROUPS`] this is
+/// a generous-but-FINITE backstop (a server names few streams; the unbounded growth this bounds is the
+/// attack, not the steady state): one client naming unbounded distinct stream names would otherwise pin
+/// an fd + dir + `Log` per name until fds/inodes/RAM are exhausted. `0` = unlimited; an edge profile
+/// lowers it. See [`EngineConfig::max_streams`].
+pub const DEFAULT_MAX_STREAMS: usize = 1024;
 
 /// The default idle window after which a fully-caught-up, lease-free NAMED work-group is evicted
 /// from memory (refs #277, #240), in MILLISECONDS. `0` means DISABLED (never evict), the default:
@@ -2534,6 +2567,10 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// a new NAMED group past this is rejected with [`EngineError::TooManyGroups`] before it is
     /// allocated. `0` means unlimited. See [`EngineConfig::max_groups`].
     max_groups: usize,
+    /// The cap on the number of resident NAMED streams (#863): a new named stream past this is rejected
+    /// with [`EngineError::TooManyStreams`] before its `Log` is opened, bounding the fds/inodes/RAM one
+    /// client can pin. `0` means unlimited. See [`EngineConfig::max_streams`].
+    max_streams: usize,
     /// The idle window in NANOSECONDS after which a fully-caught-up, lease-free NAMED group is
     /// evicted from memory (#277): the configured `group_idle_evict_ms` converted to nanoseconds at
     /// open (the clock seam is in nanoseconds). `0` means DISABLED (never evict). The sweep
@@ -2997,6 +3034,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             },
             disk_full_policy: config.disk_full_policy,
             max_groups: config.max_groups,
+            max_streams: config.max_streams,
             // The idle-eviction window (#277), converted from milliseconds to the clock seam's
             // nanoseconds and saturated rather than overflowed. `0` (disabled) stays 0, so the
             // sweep is a no-op unless an operator opts in.
@@ -3984,6 +4022,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             });
         }
         let id = StreamId::named(stream)?;
+        // #863: cap the resident-stream COUNT before opening a new stream's log (fd/inode/RAM bound).
+        self.check_stream_cap(&id)?;
         // Declare-on-first-produce: open the named stream's independent log under `streams/<hex>/`
         // (idempotent — a no-op if already open) and mirror it in the per-stream consumer state.
         self.streams.declare(&id).map_err(EngineError::Storage)?;
@@ -4684,6 +4724,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Ok(false);
         }
         let id = StreamId::named(stream)?;
+        // #863: cap the resident-stream COUNT before opening a new stream's log (fd/inode/RAM bound).
+        self.check_stream_cap(&id)?;
         let created = self.streams.declare(&id).map_err(EngineError::Storage)?;
         // Mirror the per-stream consumer state so a subsequent consume resolves the same way a
         // produce-declared stream does (idempotent: an existing entry is left untouched).
@@ -4929,6 +4971,33 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.streams.len().saturating_sub(1)
     }
 
+    /// Refuses materializing a NEW named stream once the resident-stream count has reached `max_streams`
+    /// (#863). Called on EVERY declare-on-first-produce / declare-on-bind / explicit declare path BEFORE
+    /// [`StreamSet::declare`] opens the stream's `Log`, so a flood of distinct stream names cannot pin
+    /// unbounded fds/inodes/RAM and abort the broker. An ALREADY-resident stream is always allowed (no
+    /// new resource); `max_streams == 0` disables the cap. The caller passes the NAMED stream id (the
+    /// default stream is materialized at open and never routed through here).
+    ///
+    /// Residency is tested against `self.streams` (the authoritative open-stream map that
+    /// [`named_stream_count`](Self::named_stream_count) also counts), NOT the lazily-populated
+    /// `self.named_streams` consumer-state cache: a stream RECOVERED at open lives in `self.streams`
+    /// but is absent from `named_streams` until first touched. Reading `named_streams` here would count
+    /// a recovered stream against the cap yet treat a produce TO it as "new", so an operator who
+    /// restarted with `max_streams`-or-more on-disk streams could never produce to them again (the
+    /// produce is rejected BEFORE the `or_insert` that would register it — a permanent wedge). Reading
+    /// the same map the count comes from keeps the exemption and the count consistent.
+    fn check_stream_cap(&self, id: &StreamId) -> Result<(), EngineError> {
+        if self.max_streams != 0
+            && self.streams.get(id).is_none()
+            && self.named_stream_count() >= self.max_streams
+        {
+            return Err(EngineError::TooManyStreams {
+                max: self.max_streams,
+            });
+        }
+        Ok(())
+    }
+
     // ===================================================================================
     // SUBJECT->STREAM BINDING + FAIL-CLOSED SINGLE-HOME RESOLUTION (#585, V2-M2-I9).
     //
@@ -4966,6 +5035,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             StreamId::default_stream()
         } else {
             let id = StreamId::named(stream)?;
+            // #863: cap the resident-stream COUNT before opening a new stream's log (fd/inode/RAM bound).
+            self.check_stream_cap(&id)?;
             // Declare-on-bind: the stream must have a log to receive a subject-addressed publish later,
             // exactly as declare-on-first-produce gives the id-routed path one (idempotent).
             self.streams.declare(&id).map_err(EngineError::Storage)?;
@@ -8257,6 +8328,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             consumer_credit_bytes: self.consumer_credit_bytes,
             max_deliver: self.delivery.max_deliver(),
             max_groups: self.max_groups,
+            max_streams: self.max_streams,
             group_idle_evict_nanos: self.group_idle_evict_nanos,
             visibility_nanos: self.lease_config.visibility_nanos,
             hard_cap_nanos: self.lease_config.hard_cap_nanos,
@@ -8299,6 +8371,7 @@ mod tests {
             max_messages: 0,
             disk_full_policy: DiskFullPolicy::DropNew,
             max_groups: DEFAULT_MAX_GROUPS,
+            max_streams: DEFAULT_MAX_STREAMS,
             // Eviction OFF by default in the shared test config (#277); the eviction tests build a
             // config with a non-zero window explicitly so the golden-path tests stay unaffected.
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
@@ -16156,6 +16229,169 @@ mod tests {
             e.poll_in_stream("orders", "g", 0).unwrap(),
             Poll::Idle
         ));
+    }
+
+    // A config with an explicit named-stream cap (#863), so a test exercises the bound without
+    // having to allocate `DEFAULT_MAX_STREAMS` streams.
+    fn config_with_max_streams(max_streams: usize) -> EngineConfig {
+        EngineConfig {
+            max_streams,
+            ..config(10, 5)
+        }
+    }
+
+    #[test]
+    fn a_new_named_stream_past_the_cap_is_rejected_across_every_declare_path() {
+        // The named-stream cap bounds fds/inodes/RAM once a client can name streams (#863). The
+        // default stream is exempt and never counted, so with `max_streams == 2` two NAMED streams
+        // fit; a third is rejected with the typed error and materializes NOTHING — on EVERY path that
+        // opens a stream: declare-on-first-produce, explicit declare, and declare-on-bind.
+        let mut e = open(config_with_max_streams(2));
+        // Fill the cap two different ways: one via first-produce, one via explicit declare.
+        produce_to(&mut e, "s0", b"a");
+        assert!(e.declare_stream("s1").unwrap(), "s1 is newly declared");
+        assert_eq!(e.named_stream_count(), 2, "two named streams fill the cap");
+
+        // Path 1 — produce to a THIRD distinct name is rejected at the cap (produce_to unwraps, so
+        // call the fallible entry point directly).
+        let err = e
+            .produce_in_stream(
+                "s2",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"x",
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::TooManyStreams { max: 2 }),
+            "produce past the cap is rejected, got {err}"
+        );
+        // Path 2 — explicit declare of a third name is rejected.
+        assert!(matches!(
+            e.declare_stream("s3").unwrap_err(),
+            EngineError::TooManyStreams { max: 2 }
+        ));
+        // Path 3 — declare-on-bind of a third name is rejected (and installs no binding).
+        assert!(matches!(
+            e.bind_subject("s4", "sub.>").unwrap_err(),
+            EngineError::TooManyStreams { max: 2 }
+        ));
+
+        // None of the three rejected names materialized: the count did not grow and none exist.
+        assert_eq!(
+            e.named_stream_count(),
+            2,
+            "no rejected stream was allocated"
+        );
+        assert!(
+            !e.stream_exists("s2") && !e.stream_exists("s3") && !e.stream_exists("s4"),
+            "a rejected name must not be opened"
+        );
+
+        // An ALREADY-resident stream is always produceable at the cap (no new resource).
+        assert_eq!(
+            produce_to(&mut e, "s0", b"b"),
+            Offset::new(1),
+            "an existing stream is exempt from the cap"
+        );
+        // The default stream is exempt and works at the cap.
+        assert_eq!(produce_to(&mut e, "", b"d"), Offset::new(0));
+    }
+
+    #[test]
+    fn a_zero_stream_cap_means_unlimited_named_streams() {
+        // `0` = unlimited, matching the `0` = off convention of the other bounds: the `!= 0` guard
+        // short-circuits. Far more than the cap-of-2 sibling test may be created without rejection.
+        let mut e = open(config_with_max_streams(0));
+        for i in 0..16 {
+            produce_to(&mut e, &format!("s{i}"), b"a");
+        }
+        assert_eq!(e.named_stream_count(), 16, "no cap with `0`");
+    }
+
+    #[test]
+    fn lowering_the_stream_cap_still_lets_recovered_streams_be_produced() {
+        // Recovery loads EVERY durable named stream into `self.streams`; the cap gates only NEW stream
+        // creation, never a produce to a stream already on disk. An operator who LOWERS --max-streams
+        // below the on-disk stream count must still produce to the recovered streams: the cap COUNTS
+        // them, so testing residency against the lazily-filled `named_streams` consumer cache (empty
+        // right after recovery) would treat a produce to an existing stream as "new" and wedge it
+        // permanently. This pins that the residency exemption reads the same map as the count.
+        let mut e = open(config_with_max_streams(100));
+        for i in 0..3 {
+            produce_to(&mut e, &format!("s{i}"), b"a");
+        }
+        assert_eq!(e.named_stream_count(), 3);
+        let fs = e.into_filesystem();
+
+        // Reopen under a cap of 2 (BELOW the three recovered streams).
+        let mut e = Engine::open(fs, ManualClock::new(), config_with_max_streams(2)).unwrap();
+        assert_eq!(
+            e.named_stream_count(),
+            3,
+            "all three streams recovered despite the cap of 2"
+        );
+        // Each EXISTING recovered stream is still produceable (not a new resource), even over the cap.
+        for i in 0..3 {
+            assert_eq!(
+                produce_to(&mut e, &format!("s{i}"), b"b"),
+                Offset::new(1),
+                "recovered stream s{i} must stay produceable under a lowered cap"
+            );
+        }
+        // A genuinely NEW stream is still rejected at the lowered cap.
+        assert!(matches!(
+            e.declare_stream("brand-new").unwrap_err(),
+            EngineError::TooManyStreams { max: 2 }
+        ));
+    }
+
+    #[test]
+    fn the_stream_cap_rejects_before_the_filesystem_open_that_would_exhaust_fds() {
+        use ironbus_storage::fault::FaultFs;
+        // The #863 point: the cap must fire BEFORE `StreamSet::declare` opens a `Log` — that open is
+        // exactly the fd/inode-pinning step a flood of stream names abuses to crash the broker. We
+        // prove it by priming a filesystem fault that makes a NEW stream's `Log::open` fail (the
+        // EMFILE / fd-exhaustion analogue) and showing the cap short-circuits before it is reached.
+
+        // PART A — WITH the cap, the (cap+1)th declare returns the typed `TooManyStreams` and NEVER
+        // attempts the fault-primed open, so the broker stays up.
+        let (faultfs, control) = FaultFs::new(InMemoryFs::new());
+        let mut e = Engine::open(faultfs, ManualClock::new(), config_with_max_streams(1)).unwrap();
+        assert!(
+            e.declare_stream("s0").unwrap(),
+            "the first stream opens cleanly under the cap"
+        );
+        // Arm the faults that a fresh stream's `Log::open` would trip (the new segment write and the
+        // directory-publish fsync), modelling the resource exhaustion that an unbounded open hits.
+        control.set_fail_write(true);
+        control.set_fail_sync_dir(true);
+        let err = e.declare_stream("s1").unwrap_err();
+        assert!(
+            matches!(err, EngineError::TooManyStreams { max: 1 }),
+            "the cap must reject the (cap+1)th stream BEFORE any Log::open, got {err:?}"
+        );
+
+        // PART B — discrimination: WITHOUT the cap (`0` = unlimited), the SAME primed fault DOES fire
+        // on the next stream's `Log::open`, surfacing a `Storage` error. This proves the fault is real
+        // and that the cap in Part A is precisely what kept the fd-exhausting open from being tried.
+        let (faultfs, control) = FaultFs::new(InMemoryFs::new());
+        let mut e = Engine::open(faultfs, ManualClock::new(), config_with_max_streams(0)).unwrap();
+        assert!(
+            e.declare_stream("s0").unwrap(),
+            "the first stream opens cleanly with the cap off"
+        );
+        control.set_fail_write(true);
+        control.set_fail_sync_dir(true);
+        let err = e.declare_stream("s1").unwrap_err();
+        assert!(
+            matches!(err, EngineError::Storage(_)),
+            "with the cap off the next Log::open is attempted and the primed fault fires, got {err:?}"
+        );
     }
 
     #[test]

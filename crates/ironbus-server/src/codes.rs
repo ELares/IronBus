@@ -105,6 +105,10 @@ impl ErrorCode {
     /// [`EngineError::TooManyGroups`].
     pub const ERR_TOO_MANY_GROUPS: ErrorCode = ErrorCode("ERR_TOO_MANY_GROUPS");
 
+    /// A new named stream exceeded the per-engine resident-stream cap (#863). Maps
+    /// [`EngineError::TooManyStreams`].
+    pub const ERR_TOO_MANY_STREAMS: ErrorCode = ErrorCode("ERR_TOO_MANY_STREAMS");
+
     /// A work-group name was empty, too long, or non-graphic ASCII (#240). Maps
     /// [`EngineError::InvalidGroupName`].
     pub const ERR_INVALID_GROUP_NAME: ErrorCode = ErrorCode("ERR_INVALID_GROUP_NAME");
@@ -193,6 +197,7 @@ impl ErrorCode {
             EngineError::BroadcastGroupBusy { .. } => Self::ERR_BROADCAST_GROUP_BUSY,
             EngineError::BroadcastGroupNotNamed { .. } => Self::ERR_BROADCAST_GROUP_NOT_NAMED,
             EngineError::TooManyGroups { .. } => Self::ERR_TOO_MANY_GROUPS,
+            EngineError::TooManyStreams { .. } => Self::ERR_TOO_MANY_STREAMS,
             EngineError::InvalidGroupName => Self::ERR_INVALID_GROUP_NAME,
             EngineError::InvalidStreamName { .. } => Self::ERR_INVALID_STREAM_NAME,
             EngineError::MirrorReadOnly { .. } => Self::ERR_MIRROR_READ_ONLY,
