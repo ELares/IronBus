@@ -199,13 +199,17 @@ impl SegmentFingerprint {
 /// A replica's advertised per-segment fingerprints for one partition log, plus its committed
 /// high-watermark (#691) — everything a peer needs to DETECT divergence against this replica without
 /// shipping any record bytes. The fingerprints are in ascending `segment_id` order (the order
-/// [`fingerprint_log`] produces them); `committed_hw` lets the comparer clamp any resync truncation at
-/// or above it, so committed data is never the thing that gets dropped.
+/// [`fingerprint_log`] produces them); `committed_hw` is carried so the resync's leader-behind guard can
+/// refuse a leader that does not even hold all the committed data, and so the re-fetch knows how far to
+/// reach — a divergent committed region is dropped and re-fetched from the clean leader, never silently
+/// lost (#798).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentFingerprints {
     /// The replica's committed high-watermark (its quorum-committed / flushed offset). A divergence in
-    /// a segment fully below this is committed-data corruption the repair must heal from the quorum
-    /// WITHOUT dropping committed data (the truncation is clamped at or above this).
+    /// a segment fully below this is committed-data corruption the repair heals by DROPPING the divergent
+    /// committed region and re-fetching it from the clean quorum leader (#798); [`execute_resync`] refuses
+    /// a leader whose high-watermark is below this and verifies convergence, so committed data is restored
+    /// from the leader, never silently lost (it is NOT clamped above).
     pub committed_hw: u64,
     /// The per-segment fingerprints, ascending by `segment_id`.
     pub fingerprints: Vec<SegmentFingerprint>,
@@ -858,9 +862,11 @@ pub fn plan_resync(
 ///
 /// The follower is the divergent replica's own log wrapped as a [`Follower`]; the leader is a clean
 /// quorum member. The truncate uses the bounded, reported [`Log::truncate_to`](ironbus_storage::log::Log::truncate_to)
-/// (the same primitive C2-I4 uses), so committed data below the clamp is never dropped. The re-fetch
-/// re-validates every frame's CRC on ingest (the C2-I1 fail-closed property), so a divergent replica
-/// never ingests an unvalidated byte and converges to the leader's exact frames.
+/// (the same primitive C2-I4 uses). There is NO committed-HW clamp here (#798): `truncate_to` may be
+/// below the committed HW and the divergent committed region IS dropped and re-fetched from the clean
+/// leader, with the leader-behind guard and the post-resync convergence check as the safety net. The
+/// re-fetch re-validates every frame's CRC on ingest (the C2-I1 fail-closed property), so a divergent
+/// replica never ingests an unvalidated byte and converges to the leader's exact frames.
 ///
 /// # Errors
 /// [`ReplicationError`] if the truncation or the re-fetch fails (the re-fetch fails closed on any
