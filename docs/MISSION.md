@@ -64,8 +64,6 @@ Everything here is the plan. It is **not** shipped, and is not claimed as a pres
 | --- | --- | --- |
 | Single-consumer durable consume beating NATS | **TARGET (the one axis we lose today)** | Today single-consumer durable consume is **~3–20x slower** than NATS — a design artifact (per-poll full-segment re-scan + reads on the write actor + a work-queue premium on every record), not fundamental. The fix is [V2-M1](#v2-roadmap-the-single-node-milestones). |
 | Multi-stream + subjects + wildcards | **TARGET** | Today IronBus is literally **one log**. Streams/subjects/partitions are [V2-M2](#v2-roadmap-the-single-node-milestones). |
-| KV store | **TARGET** | [V2-M5]. Not built. |
-| Object store | **TARGET** | [V2-M9]. Not built. |
 | Routing richness (TTL / DLX / priorities / delayed) | **TARGET** | [V2-M4]. Not built. |
 | **All clustering / replication** | **TARGET (first-class, but not yet built)** | The entire [cluster roadmap (V2-C1–V2-C8)](#v2-roadmap-the-clustering-milestones) is design + plan. **No multi-node code ships today.** The single node is the only thing that runs now. |
 
@@ -97,8 +95,12 @@ issues. This is a competitive map, not a claim that the gaps are closed.
 ### Feature + cluster gaps (target, not yet built)
 
 - Topics / subjects / wildcards (we are literally one log) → V2-M2.
-- KV → V2-M5; object store → V2-M9; routing richness (TTL/DLX/priorities/delayed) → V2-M4.
+- Routing richness (TTL/DLX/priorities/delayed) → V2-M4.
 - **Clustering / replication** → V2-C1–V2-C8 (first-class, not yet built).
+
+### Non-goals (deliberately not built)
+
+- **KV store** and **object store** are non-goals: IronBus stays a pure message bus and does not grow into adjacent datastore categories (a KV store like the NATS JetStream KV, or an object store). These were formerly the V2-M5 and V2-M9 roadmap slots, now retired. Tiered storage (V2-M10) is unaffected: offloading cold sealed log segments to an object-storage backend is core log infrastructure, not an object-store product.
 
 ---
 
@@ -183,15 +185,12 @@ replicas.
   delivery-count so the max-deliver→DLQ rule always fires.
 - **V2-M4 — Routing & queue richness.** Per-message/stream TTL, dead-letter exchanges, optional
   priorities, scheduled/delayed messages.
-- **V2-M5 — KV store.** A bucket over the compacted log, linearizable CAS, snapshot+resumable watch,
-  per-key TTL with bounded tombstone reclamation.
 - **V2-M6 — Observability + rich CLI + recovery-as-feature.** Latency histograms, recovery-event
   counters, an `ironbus verify` offline fsck, a first-class `repair`, backup/restore.
 - **V2-M7 — Security & DoS hardening.** TLS 1.3 fail-closed bind, three-mechanism auth × three scopes,
   pre-auth DoS defenses, graceful drain.
 - **V2-M8 — Reliability semantics.** Idempotent producer (PID + epoch + sequence), effectively-once
   survival across restart + long offline gap.
-- **V2-M9 — Object store.** Chunked objects with per-chunk CRC, range-get via the offset index.
 - **V2-M10 — Tiered storage (post-1.0).** Offload cold sealed segments to object storage behind the
   cursor abstraction.
 - **V2-M11 — (folded into the clustering milestones below).** The thin "replication done right" is
