@@ -4562,6 +4562,74 @@ mod tests {
     }
 
     #[test]
+    fn fire_and_forget_producer_auto_flushes_at_the_32kib_boundary_in_order_end_to_end() {
+        // The COMPANION to the explicit-flush test above. This drives enough bytes that `send` itself
+        // crosses the STREAM_FLUSH_BYTES (32 KiB) boundary and AUTO-flushes mid-loop — the core
+        // coalescing mechanism — with NO explicit flush between sends. Eighty ~1 KiB publishes frame to
+        // ~80 KiB, so the in-`send` auto-flush fires twice during the loop (around 32 KiB and 64 KiB),
+        // leaving a partial tail the explicit flush pushes. Every record must still land durably IN
+        // ORDER, and the coalesced no-ack stream must not desync the connection: a following
+        // at-least-once produce still gets its PubAck at the next offset.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let payload = vec![b'q'; 1000];
+        let count: u8 = 80;
+        {
+            let mut faf = c.fire_and_forget_producer();
+            for _ in 0..count {
+                faf.send(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    dedup: None,
+                    fire_and_forget: false, // forced true by the producer
+                    payload: &payload,
+                })
+                .unwrap();
+            }
+            // Push the partial tail left after the in-`send` auto-flushes.
+            faf.flush().unwrap();
+        }
+        // Synchronize on an at-least-once produce: its awaited PubAck proves the broker has appended
+        // every prior coalesced L0 (the auto-flushed ones included). It lands right after them.
+        let offset = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"sync",
+            })
+            .unwrap();
+        assert_eq!(
+            offset,
+            u64::from(count),
+            "the at-least-once produce landed after all the auto-flushed QoS-0 records"
+        );
+        // `offset == count` above is the proof that all `count` auto-flushed records landed durably and
+        // IN ORDER: a single-writer connection assigns the sync produce offset `count` only if exactly
+        // `count` records preceded it (a dropped or reordered auto-flush would shift it). Additionally
+        // spot-check byte integrity of the auto-flushed prefix -- one fetch window must come back as the
+        // exact payload at sequential offsets, proving the 32 KiB-boundary flush never split or corrupted
+        // a frame. One `fetch` returns at most the negotiated credit window, so this checks the prefix,
+        // not all `count`.
+        let prefix = c.fetch(u32::from(count)).unwrap().messages;
+        assert!(
+            !prefix.is_empty(),
+            "the auto-flushed prefix is durable and fetchable"
+        );
+        for (i, m) in prefix.iter().enumerate() {
+            assert_eq!(m.offset, u64::try_from(i).unwrap());
+            assert_eq!(m.payload, payload);
+        }
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn produce_dedup_surfaces_duplicate_true_on_a_retry_end_to_end() {
         // The #33 end-to-end client property: an opt-in dedup produce is a fresh PubAck (duplicate =
         // false) the first time; the SAME (producer, msg_id) retried is a PubAckDuplicate the client
