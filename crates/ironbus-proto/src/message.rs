@@ -682,6 +682,21 @@ pub struct DeliverBatchHeader {
 /// `generation: u64` + `record_count: u32`.
 const DELIVER_BATCH_V1_FIELD_LEN: u16 = 8 + 8 + 4;
 
+/// The fixed `DeliverBatch` HEADER length in bytes (#541): the version byte + the v1 field-block length +
+/// the v1 block (`first_offset` + `generation` + `record_count`). The record bytes follow verbatim.
+pub const DELIVER_BATCH_HEADER_LEN: usize = 1 + 2 + DELIVER_BATCH_V1_FIELD_LEN as usize;
+
+/// Writes ONLY the fixed [`DELIVER_BATCH_HEADER_LEN`]-byte `DeliverBatch` header onto `out` (the version,
+/// the v1 field-block length, and the v1 block), shared by [`encode_deliver_batch`] and
+/// [`encode_deliver_batch_frame`] so the header layout has a single source of truth.
+fn write_deliver_batch_header(header: &DeliverBatchHeader, out: &mut Vec<u8>) {
+    out.push(DELIVER_BATCH_HEADER_VERSION);
+    out.extend_from_slice(&DELIVER_BATCH_V1_FIELD_LEN.to_le_bytes());
+    out.extend_from_slice(&header.first_offset.to_le_bytes());
+    out.extend_from_slice(&header.generation.to_le_bytes());
+    out.extend_from_slice(&header.record_count.to_le_bytes());
+}
+
 /// Encodes a `DeliverBatch` frame body onto the end of `out` (#541): the header version byte, the v1
 /// field-block length, the v1 block, then the contiguous on-disk record-frame bytes VERBATIM. `record_bytes`
 /// is the concatenation of `header.record_count` complete on-disk frames (e.g. an `ironbus-storage`
@@ -689,12 +704,46 @@ const DELIVER_BATCH_V1_FIELD_LEN: u16 = 8 + 8 + 4;
 /// precedes the variable body, so a future `sendfile(2)` path writes this header then splices the stored
 /// bytes.
 pub fn encode_deliver_batch(header: &DeliverBatchHeader, record_bytes: &[u8], out: &mut Vec<u8>) {
-    out.push(DELIVER_BATCH_HEADER_VERSION);
-    out.extend_from_slice(&DELIVER_BATCH_V1_FIELD_LEN.to_le_bytes());
-    out.extend_from_slice(&header.first_offset.to_le_bytes());
-    out.extend_from_slice(&header.generation.to_le_bytes());
-    out.extend_from_slice(&header.record_count.to_le_bytes());
+    write_deliver_batch_header(header, out);
     out.extend_from_slice(record_bytes);
+}
+
+/// Encodes a COMPLETE `DeliverBatch` FRAME — the `[len:u32][type][header][record_bytes]` envelope —
+/// directly onto `out` in a SINGLE pass over `record_bytes`, with NO intermediate frame-body `Vec` (#812).
+/// This is byte-identical to
+/// `encode_frame(FrameType::DeliverBatch, &{a Vec built by encode_deliver_batch(header, record_bytes)})`,
+/// so the on-wire frame (and each record's end-to-end CRC) is unchanged; it merely DROPS the redundant
+/// full-batch memcpy into a temporary body `Vec` (and that per-batch allocation). On the hot Tier-S
+/// consume path the batch payload is a bounded, zero-copy `Bytes` slice of a sealed segment, so this saves
+/// one ~`max_bytes` memcpy and one allocation per delivered batch.
+///
+/// # Errors
+/// [`FrameError::FrameTooLarge`](crate::frame::FrameError::FrameTooLarge) if the framed length would
+/// exceed [`MAX_FRAME_LEN`](crate::frame::MAX_FRAME_LEN), exactly as [`encode_frame`](crate::frame::encode_frame).
+pub fn encode_deliver_batch_frame(
+    header: &DeliverBatchHeader,
+    record_bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), crate::frame::FrameError> {
+    // The frame length is the type byte + the body (the fixed header + the record bytes), computed in u64
+    // so a huge batch on a 64-bit host cannot overflow before the cap check — exactly as `encode_frame`.
+    let body_len = DELIVER_BATCH_HEADER_LEN as u64 + record_bytes.len() as u64;
+    let frame_len = 1u64 + body_len;
+    if frame_len > u64::from(crate::frame::MAX_FRAME_LEN) {
+        return Err(crate::frame::FrameError::FrameTooLarge { len: frame_len });
+    }
+    // `frame_len <= MAX_FRAME_LEN` (a u32), so this conversion always succeeds.
+    let Ok(frame_len) = u32::try_from(frame_len) else {
+        return Err(crate::frame::FrameError::FrameTooLarge { len: frame_len });
+    };
+    // One reservation up front so the writes below never reallocate mid-frame.
+    out.reserve(4 + 1 + DELIVER_BATCH_HEADER_LEN + record_bytes.len());
+    out.extend_from_slice(&frame_len.to_le_bytes());
+    out.push(crate::frame::FrameType::DeliverBatch.as_u8());
+    write_deliver_batch_header(header, out);
+    // The batch payload is copied EXACTLY ONCE here (the eliminated frame-body Vec held the second copy).
+    out.extend_from_slice(record_bytes);
+    Ok(())
 }
 
 /// Decodes a `DeliverBatch` frame body (#541) into its fixed [`DeliverBatchHeader`] and a BORROWED slice
@@ -3711,6 +3760,70 @@ mod tests {
         let (eh, eb) = decode_deliver_batch(&ebuf).unwrap();
         assert_eq!(eh, empty_header);
         assert!(eb.is_empty());
+    }
+
+    #[test]
+    fn encode_deliver_batch_frame_is_byte_identical_to_the_two_copy_path() {
+        // #812: the single-pass frame encoder must be byte-for-byte identical to the old
+        // `encode_frame(DeliverBatch, &encode_deliver_batch(...))` path — same wire frame, same per-record
+        // CRC — it merely drops the intermediate frame-body Vec and one full-batch memcpy.
+        use crate::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
+        let header = DeliverBatchHeader {
+            first_offset: 0xDEAD_BEEF_0102_0304,
+            generation: 0,
+            record_count: 5,
+        };
+        let record_bytes = b"the-verbatim-on-disk-record-frame-bytes-of-a-sealed-batch";
+
+        // OLD path: build the body Vec, then frame it.
+        let mut body = Vec::new();
+        encode_deliver_batch(&header, record_bytes, &mut body);
+        let mut old_frame = Vec::new();
+        encode_frame(FrameType::DeliverBatch, &body, &mut old_frame).unwrap();
+
+        // NEW path: one pass directly into the buffer.
+        let mut new_frame = Vec::new();
+        encode_deliver_batch_frame(&header, record_bytes, &mut new_frame).unwrap();
+
+        assert_eq!(
+            new_frame, old_frame,
+            "the single-pass frame is byte-identical to the two-copy path"
+        );
+
+        // And it decodes back through the normal frame + body path, unchanged.
+        let FrameDecode::Frame {
+            type_tag,
+            body: decoded_body,
+            consumed,
+        } = decode_frame(&new_frame).unwrap()
+        else {
+            panic!("a complete frame must decode");
+        };
+        assert_eq!(consumed, new_frame.len());
+        assert_eq!(FrameType::from_u8(type_tag), Some(FrameType::DeliverBatch));
+        let (h, rb) = decode_deliver_batch(decoded_body).unwrap();
+        assert_eq!(h, header);
+        assert_eq!(rb, record_bytes);
+
+        // Appending into a NON-EMPTY buffer appends the frame without disturbing the existing bytes.
+        let mut buf = vec![0xAA, 0xBB];
+        encode_deliver_batch_frame(&header, record_bytes, &mut buf).unwrap();
+        assert_eq!(&buf[..2], &[0xAA, 0xBB]);
+        assert_eq!(&buf[2..], new_frame.as_slice());
+
+        // A zero-record batch frames identically too.
+        let empty = DeliverBatchHeader {
+            first_offset: 9,
+            generation: 0,
+            record_count: 0,
+        };
+        let mut old_e = Vec::new();
+        let mut be = Vec::new();
+        encode_deliver_batch(&empty, &[], &mut be);
+        encode_frame(FrameType::DeliverBatch, &be, &mut old_e).unwrap();
+        let mut new_e = Vec::new();
+        encode_deliver_batch_frame(&empty, &[], &mut new_e).unwrap();
+        assert_eq!(new_e, old_e);
     }
 
     #[test]
