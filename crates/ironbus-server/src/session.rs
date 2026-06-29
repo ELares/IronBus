@@ -1328,36 +1328,21 @@ impl Session {
                 return Ok(());
             }
         }
-        // Produce-time COMPRESSED-descriptor SHAPE validation (#438). Bit 0 of the PUB flags is a
-        // REAL stored record flag the wire legally carries (`PUB_WIRE_ONLY_FLAGS` masks only the
-        // wire-only high bits 3..=7, never bit 0): a producer may publish a pre-compressed stored
-        // object, and the engine's write
-        // seam deliberately passes it through untouched (#437, never double-wrapped). The broker
-        // is store-and-forward, so nothing downstream ever parses the bytes: without this gate any
-        // producer could durably ack a record NO reader can decode, and post-#430 every consumer
-        // group of that offset burns max-deliver visibility-timeout cycles of typed
-        // `ClientError::Decompress` failures before the record dead-letters. The check is a
-        // 9-byte header parse, NO decompression (the produce hot path pays no codec CPU; stream
-        // CONTENT stays a read-side concern), against the read-side rules (deliberately STRICTER
-        // than the zstd read side on exactly one degenerate input, the empty-stream claim-0
-        // descriptor; see `validate_descriptor_shape`) and the same
-        // `DEFAULT_MAX_DECOMPRESSED_BYTES` cap every shipped reader and the #437 seam enforce. A
-        // failure is a typed, connection-preserving rejection exactly like the wire-boundary
-        // rejections above (a malformed body, an over-long dedup id); for a fire-and-forget
-        // produce it is a silent drop with NO frame (the QoS-0 no-frame contract, #11) and no
-        // counter, matching the dedup-id-cap precedent (the engine's shed counters meter only
-        // engine-decided load sheds, which this is not). This gate lives at the WIRE boundary
-        // ONLY: the engine's own compressed output and the DLQ redrive's direct `Log::append`
-        // re-injection (`ironbus_storage::admin::redrive_dlq`) never pass through a session, so
-        // neither is affected.
-        if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
-            if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
-                if !fire_and_forget {
-                    drain_parked(engine, member_id, parked, out)?;
-                    reply_err(out, &format!("malformed compressed descriptor: {e}"));
-                }
-                return Ok(());
+        // Produce-time COMPRESSED-descriptor SHAPE validation (#438), shared with the three other
+        // produce verbs (see `compressed_descriptor_rejection`). Bit 0 of the PUB flags is a REAL
+        // stored record flag the wire legally carries (`PUB_WIRE_ONLY_FLAGS` masks only the wire-only
+        // high bits, never bit 0): a producer may publish a pre-compressed stored object and the
+        // engine's write seam passes it through untouched (#437, never double-wrapped), so without
+        // this gate a producer could durably ack a record no reader can decode.
+        if let Some(reason) = compressed_descriptor_rejection(msg.flags, msg.payload) {
+            // A failure is a typed, connection-preserving rejection exactly like the wire-boundary
+            // rejections above; for a fire-and-forget produce it is a silent drop with NO frame (the
+            // QoS-0 no-frame contract, #11) and no counter, matching the dedup-id-cap precedent.
+            if !fire_and_forget {
+                drain_parked(engine, member_id, parked, out)?;
+                reply_err(out, &reason);
             }
+            return Ok(());
         }
         // Hand the produce to the append actor as an OWNED payload (the wire body borrows the
         // connection's input buffer, which the actor cannot hold) and AWAIT its outcome. The reply
@@ -3058,14 +3043,12 @@ impl Session {
                 return Ok(());
             }
         }
-        // Compressed-descriptor SHAPE validation at the wire boundary (#438), same gate as the default
-        // path: a stored compressed object must be decodable by every reader, or a consumer burns
-        // max-deliver cycles on it. A 9-byte header parse, NO decompression.
-        if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
-            if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
-                reply_err(out, &format!("malformed compressed descriptor: {e}"));
-                return Ok(());
-            }
+        // Compressed-descriptor SHAPE validation at the wire boundary (#438), the same shared gate as
+        // the default path (`compressed_descriptor_rejection`): a stored compressed object must be
+        // decodable by every reader, or a consumer burns max-deliver cycles on it.
+        if let Some(reason) = compressed_descriptor_rejection(msg.flags, msg.payload) {
+            reply_err(out, &reason);
+            return Ok(());
         }
         // Build the OWNED append (the wire body borrows the connection buffer, which the closure
         // cannot hold), then route it to the NAMED stream via the engine's id-routed produce in ONE
@@ -3177,6 +3160,15 @@ impl Session {
             reply_err(out, "malformed pub body");
             return Ok(());
         };
+        // Compressed-descriptor SHAPE validation at the wire boundary (#438/#877). This is the FOURTH
+        // produce verb and previously skipped the gate the other three apply: a Publish-scoped producer
+        // could stage and `TxnCommit` a poison compressed record (over-cap claim / unknown codec /
+        // mismatched raw length) that every consumer group then burns max-deliver cycles on. Gate it
+        // BEFORE staging the half message so no poison record is ever prepared, let alone committed.
+        if let Some(reason) = compressed_descriptor_rejection(msg.flags, msg.payload) {
+            reply_err(out, &reason);
+            return Ok(());
+        }
         // Build the OWNED half message (the wire body borrows the connection buffer, which the closure
         // cannot hold). The wire-only PUB flags (dedup/fire-and-forget bits) are masked off so only the
         // real stored content flags reach the durable half record.
@@ -3616,13 +3608,12 @@ impl Session {
                 return Ok(());
             }
         }
-        // Compressed-descriptor SHAPE validation at the wire boundary (#438), same gate as the other
-        // publish paths: a stored compressed object must be decodable by every reader.
-        if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
-            if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
-                reply_err(out, &format!("malformed compressed descriptor: {e}"));
-                return Ok(());
-            }
+        // Compressed-descriptor SHAPE validation at the wire boundary (#438), the same shared gate as
+        // the other publish paths (`compressed_descriptor_rejection`): a stored compressed object must
+        // be decodable by every reader.
+        if let Some(reason) = compressed_descriptor_rejection(msg.flags, msg.payload) {
+            reply_err(out, &reason);
+            return Ok(());
         }
         // Build the OWNED append (the wire body borrows the connection buffer, which the closure cannot
         // hold), then RESOLVE + PRODUCE in ONE actor job: the resolve reads the engine's wait-free
@@ -3978,6 +3969,31 @@ fn resolve_then_produce<F: Filesystem + Clone, C: Clock + Clone>(
         payload: &append.payload,
     };
     engine.produce_in_stream(stream.name(), &view)
+}
+
+/// The #438 compressed-descriptor SHAPE gate, shared by ALL FOUR produce verbs (`handle_pub`,
+/// `handle_pub_to`, `handle_pub_subject`, `handle_txn_prepare`). A COMPRESSED publish must carry a
+/// well-formed, in-cap descriptor BEFORE it is stored, or a producer could durably ack a record no
+/// reader can decode: every consumer group of that offset then burns max-deliver visibility-timeout
+/// redelivery cycles on the poison pill before dead-lettering, and it survives restart — the
+/// resource-amplification `DoS` this gate exists to prevent. The check is a 9-byte header parse, NO
+/// decompression (the produce hot path pays no codec CPU; stream CONTENT stays a read-side concern),
+/// against the read-side rules and the same [`DEFAULT_MAX_DECOMPRESSED_BYTES`] cap every shipped
+/// reader enforces. Returns the one-line, connection-preserving rejection message to reply with, or
+/// `None` to proceed.
+///
+/// Centralizing the gate here is the fix for #877: `handle_txn_prepare` was the one produce verb
+/// that skipped it, so a Publish-scoped producer could stage and commit a poison compressed record
+/// through a tiny `TxnPrepare`/`TxnCommit` pair. One funnel keeps the invariant from drifting on a
+/// single verb again. The gate lives at the WIRE boundary ONLY — the engine's own compressed output
+/// and the DLQ redrive's direct `Log::append` re-injection never pass through a session.
+fn compressed_descriptor_rejection(flags: u8, payload: &[u8]) -> Option<String> {
+    if RecordFlags::from_bits(flags).contains(RecordFlags::COMPRESSED) {
+        if let Err(e) = validate_descriptor_shape(payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
+            return Some(format!("malformed compressed descriptor: {e}"));
+        }
+    }
+    None
 }
 
 /// Encodes a response frame. Bodies here are tiny (<= 8 bytes, or a short literal), well
@@ -11258,6 +11274,94 @@ mod tests {
             one_response(&out).0,
             FrameType::Err,
             "commit-after-rollback is an Err, never a PubAck"
+        );
+    }
+
+    #[test]
+    fn a_compressed_poison_record_is_rejected_at_txn_prepare_not_staged_or_committed() {
+        // #877: `TxnPrepare` is the FOURTH produce verb and previously SKIPPED the #438 compressed-
+        // descriptor shape gate the other three apply. A Publish-scoped producer could therefore stage
+        // and `TxnCommit` a poison compressed record - here an over-cap descriptor claiming
+        // uncompressed_len = u32::MAX - that every consumer group would then burn max-deliver
+        // visibility-timeout cycles on before dead-lettering, and that survives restart. The gate must
+        // reject it AT PREPARE, before any half message is staged, so the commit finds no txn and no
+        // consumer ever sees an undecodable record.
+        let e = DirectEngine::new(engine());
+        let mut prod = Session::with_member_id(MemberId::new(1));
+        let mut out = Vec::new();
+        prod.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+
+        // A COMPRESSED PubBody whose 9-byte descriptor claims u32::MAX decompressed bytes (over the
+        // DEFAULT_MAX_DECOMPRESSED_BYTES cap): codec_id = zstd (a registered codec, so it clears the
+        // codec check and reaches the cap check), dict_id = 0, uncompressed_len = u32::MAX.
+        let mut poison = vec![ironbus_core::compress::CODEC_ID_ZSTD];
+        poison.extend_from_slice(&0u32.to_le_bytes()); // dict_id
+        poison.extend_from_slice(&u32::MAX.to_le_bytes()); // uncompressed_len, over the cap
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: RecordFlags::COMPRESSED.bits(),
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: &poison,
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        let mut body = Vec::new();
+        encode_txn_prepare(
+            &TxnPrepareBody {
+                txn_id: b"tx1",
+                stream_id: b"",
+                pub_body: &pub_body,
+            },
+            &mut body,
+        )
+        .unwrap();
+
+        // Prepare is REJECTED with the shared descriptor reason, never acked Ok.
+        out.clear();
+        prod.process(&e, &frame(FrameType::TxnPrepare, &body), &mut out)
+            .unwrap();
+        let (ty, msg) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "a poison compressed prepare is rejected, never acked Ok"
+        );
+        assert!(
+            String::from_utf8_lossy(&msg).contains("malformed compressed descriptor"),
+            "the rejection names the malformed descriptor, got: {:?}",
+            String::from_utf8_lossy(&msg)
+        );
+
+        // No half message was staged: committing the same txn id finds nothing and is an Err, never a
+        // fabricated PubAck for a record that was never appended.
+        out.clear();
+        prod.process(
+            &e,
+            &txn_resolve_frame(FrameType::TxnCommit, b"tx1"),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "the rejected prepare staged no half message, so commit finds no txn"
+        );
+
+        // And no consumer ever sees an undecodable record.
+        let mut cons = connect_and_sub(&e, MemberId::new(2), b"");
+        out.clear();
+        cons.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            delivered_payloads(&out).is_empty(),
+            "no poison record was committed, so nothing is delivered"
         );
     }
 
