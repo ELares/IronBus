@@ -2573,7 +2573,7 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// holding every poison record for later inspection. Opened LAZILY on the first dead-letter
     /// (so a broker that never dead-letters never creates the subdirectory), or eagerly by
     /// [`Engine::open`] when the subdirectory already exists, so the per-group dead-lettered
-    /// high-water mark (the idempotency key) is rebuilt before the first poison redelivers.
+    /// offset set (the idempotency key) is rebuilt before the first poison redelivers.
     dlq: Option<DlqSink<F, C>>,
     /// The [`LogConfig`] the DLQ sink's log is opened with: the same segment sizing as the main
     /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
@@ -2909,7 +2909,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .as_deref()
             .unwrap_or(DLQ_SUBDIR)
             .to_string();
-        // Eagerly open (recovering its high-water mark) the dead-letter sink IF its subdirectory
+        // Eagerly open (recovering its dead-lettered offset set) the dead-letter sink IF its subdirectory
         // already exists from a prior run, so the idempotency key is present before the first poison
         // redelivers after a crash. A fresh data directory has no sink subdir yet, so the sink stays
         // unopened (lazy) and the no-dead-letter path never creates it.
@@ -3209,7 +3209,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// Whether the dead-letter sink's `subdir` already exists, so a prior run dead-lettered at least
     /// one message there. `subdir` is the configured dead-letter EXCHANGE target (#551), or the
     /// default `dlq/`. Used by [`Engine::open`] to decide whether to eagerly open the sink (rebuilding
-    /// the idempotency high-water mark) versus deferring to the lazy open on the first dead-letter.
+    /// the idempotency offset set) versus deferring to the lazy open on the first dead-letter.
     /// This is a non-creating probe ([`Filesystem::subdir_exists`]), so `Engine::open` on a fresh
     /// data directory never materializes the sink subdirectory.
     fn dlq_dir_exists(log: &Log<F, C>, subdir: &str) -> bool {
@@ -6543,11 +6543,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// The ordering is the crash-safety contract: APPEND the poison record to the durable DLQ sink
     /// and FSYNC it, THEN commit the source cursor. A crash between the two leaves the source
     /// uncommitted (it redelivers and is re-poisoned on the next run) and the DLQ record already
-    /// durable; on reopen the per-group dead-lettered high-water mark, rebuilt from the DLQ itself,
-    /// makes the re-poison a no-op append so the message is committed-past WITHOUT a duplicate DLQ
-    /// write. The reconciliation key is `(group, source_offset, attempt)`: an offset at or below
-    /// the group's high-water mark is already in the sink, so it is committed-past without a second
-    /// append.
+    /// durable; on reopen the per-group EXACT dead-lettered set, rebuilt from the DLQ itself, makes
+    /// the re-poison a no-op append so the message is committed-past WITHOUT a duplicate DLQ write.
+    /// The reconciliation key is the EXACT `(group, source_offset)` (#800): an offset already in the
+    /// group's set is in the sink, so it is committed-past without a second append — but a genuinely
+    /// new lower offset (poison order is not ascending) is appended, never suppressed by a higher one.
     ///
     /// The lease has already been dropped by the caller, so on success the message holds no lease
     /// and never redelivers.
@@ -6558,10 +6558,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         attempt: u32,
         record: OwnedRecord,
     ) -> Result<Poll, EngineError> {
-        // Idempotency: if this (group, source offset) is already durably in the DLQ (at or below
-        // the group's recorded high-water mark), do NOT append a second copy. This is the path a
-        // redelivered-then-re-poisoned message takes after a crash that landed between the DLQ
-        // append and the cursor commit: the sink already has it, so we only commit past it.
+        // Idempotency: if this EXACT (group, source offset) is already durably in the DLQ, do NOT
+        // append a second copy (#800). This is the path a redelivered-then-re-poisoned message takes
+        // after a crash that landed between the DLQ append and the cursor commit: the sink already has
+        // this exact offset, so we only commit past it. A different (e.g. lower) offset is appended.
         let already = self.dlq_sink()?.already_dead_lettered(group, off.get());
         if !already {
             // APPEND to the DLQ and FSYNC, BEFORE committing the source cursor. A storage error
@@ -6591,11 +6591,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         })
     }
 
-    /// Lazily opens (recovering its per-group high-water mark) the durable DLQ sink on first use,
-    /// returning a mutable borrow. The sink is created on the first dead-letter, so a broker that
+    /// Lazily opens (recovering its per-group dead-lettered offset set) the durable DLQ sink on first
+    /// use, returning a mutable borrow. The sink is created on the first dead-letter, so a broker that
     /// never dead-letters never creates the `dlq/` subdirectory (the no-poison path never touches
     /// it). After a restart that already has a `dlq/` directory, [`Engine::open`] eagerly opens it
-    /// so the high-water mark is present before the first poison redelivers.
+    /// so the dead-lettered offset set is present before the first poison redelivers.
     fn dlq_sink(&mut self) -> Result<&mut DlqSink<F, C>, EngineError> {
         if self.dlq.is_none() {
             // Route to the configured dead-letter EXCHANGE subdir (#551) when set, else the default
@@ -6644,8 +6644,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// recording [`DeadLetterReason::TtlExpired`], then commits the source group's cursor past it and
     /// returns [`Poll::Parked`]. The ordering and idempotency are identical to [`Engine::dead_letter_in`]
     /// (APPEND+FSYNC the reason-carrying dead-letter record BEFORE the cursor commit; a redelivered
-    /// re-expired message is a no-op append at or below the per-group high-water mark), so an expiry is
-    /// a fully reported, exactly-once event. Used only when [`Engine::dead_letters_expired`] holds.
+    /// re-expired message whose EXACT source offset is already in the per-group dead-lettered set is a
+    /// no-op append, #800), so an expiry is a fully reported, exactly-once event. Used only when
+    /// [`Engine::dead_letters_expired`] holds.
     fn expire_dead_letter_in(
         &mut self,
         group: &str,
@@ -6653,8 +6654,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         attempt: u32,
         record: OwnedRecord,
     ) -> Result<Poll, EngineError> {
-        // Idempotency: a re-expired message already durably in the exchange (at or below the group's
-        // high-water mark) is committed-past WITHOUT a second append, exactly as the poison path.
+        // Idempotency: a re-expired message whose EXACT source offset is already durably in the
+        // exchange is committed-past WITHOUT a second append, exactly as the poison path (#800).
         let already = self.dlq_sink()?.already_dead_lettered(group, off.get());
         if !already {
             // APPEND the reason-carrying (TtlExpired) dead-letter and FSYNC, BEFORE committing the
@@ -6698,6 +6699,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if group == self.confirm_group {
             self.confirm_registry
                 .terminate(off, ConfirmStatus::DeadLettered);
+        }
+        // #800: the cursor has committed past `off`, so prune the DLQ dedup set below the group's
+        // committed watermark — those source offsets can never redeliver or re-poison, so their
+        // exact-membership entries are no longer needed. This bounds each per-group set by the
+        // in-flight/ahead window. Only when the sink is already open (never lazily create it to prune).
+        if let Some(sink) = self.dlq.as_mut() {
+            sink.prune_below(group, committed);
         }
     }
 
@@ -12523,9 +12531,10 @@ mod tests {
 
     #[test]
     fn re_expiring_the_same_offset_to_the_dlx_does_not_double_write() {
-        // Idempotency for the TTL-DLX move, mirroring the poison idempotency (#551): a re-expired
-        // offset already at/below the group's high-water mark is committed-past WITHOUT a second
-        // append. Drive the move once, then re-run the move helper directly on the same offset.
+        // Idempotency for the TTL-DLX move, mirroring the poison idempotency (#551/#800): re-expiring
+        // the SAME exact source offset writes exactly one DLX record. A LOWER offset (0) is held
+        // leased/uncommitted so the committed watermark stays at 0 and offset 1's exact-membership
+        // entry is not pruned between the two moves.
         let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
         let fs = InMemoryFs::new();
         let probe = fs.clone();
@@ -12535,49 +12544,125 @@ mod tests {
             config_with_dlx_for_expired(1_000, "dlx-expired"),
         )
         .unwrap();
-        let off = produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"once");
+        produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"zero");
+        let off1 = produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"one");
+        // Poll once BEFORE the deadline to materialize the group and LEASE offset 0 (it stays
+        // uncommitted, so the committed watermark stays at 0 and offset 1's entry is not pruned).
+        let _ = e.poll_now().unwrap();
         clock.set_unix_millis(1_000);
-        let record = e.log.read_from(off, 1).unwrap().into_iter().next().unwrap();
-        let _ = e
-            .expire_dead_letter_in(DEFAULT_GROUP, off, 1, record.clone())
+
+        let rec1 = e
+            .log
+            .read_from(off1, 1)
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
-        // A second move of the SAME offset must be a no-op append (idempotent high-water mark).
         let _ = e
-            .expire_dead_letter_in(DEFAULT_GROUP, off, 1, record)
+            .expire_dead_letter_in(DEFAULT_GROUP, off1, 1, rec1)
+            .unwrap();
+        // A second move of the SAME offset must be a no-op append (exact-offset idempotency).
+        let rec1_again = e
+            .log
+            .read_from(off1, 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let _ = e
+            .expire_dead_letter_in(DEFAULT_GROUP, off1, 1, rec1_again)
             .unwrap();
         drop(e);
         let entries = read_dead_letter_entries(&probe, "dlx-expired").unwrap();
         assert_eq!(
             entries.len(),
             1,
-            "re-expiring the same offset writes exactly one DLX record"
+            "re-expiring the same exact offset writes exactly one DLX record"
         );
     }
 
     #[test]
-    fn re_poisoning_the_same_offset_does_not_double_write() {
-        // Idempotency at the API level: dead-lettering the SAME (group, offset) twice (e.g. a
-        // forced re-evaluation) writes exactly one DLQ record. We drive a second dead-letter of an
-        // offset already at the group's high-water mark by re-invoking the internal move directly.
+    fn dead_letter_dedup_is_exact_so_a_lower_offset_after_a_higher_one_is_not_dropped() {
+        // #800: dead-letter idempotency is EXACT-offset membership, NOT a high-water mark. Two poison
+        // messages: the HIGHER source offset (1) crosses max-deliver while the LOWER (0) is still
+        // leased (uncommitted), so the committed watermark stays at 0 and offset 1's dedup entry is
+        // retained. When the lower offset 0 later dead-letters it MUST still be written to the sink —
+        // pre-#800 `0 <= hwm(1)` read as "already present" and dropped it, leaving ZERO durable copies.
+        // Re-poisoning the SAME offset (the legitimate crash-window duplicate) still writes exactly
+        // once. The internal move is invoked directly to construct the lower-still-leased ordering
+        // deterministically, which the in-order poll scan cannot otherwise produce.
         let clock = std::sync::Arc::new(ManualClock::new());
         let fs = InMemoryFs::new();
         let probe = fs.clone();
         let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
-        let off = poison_once(&mut e, &clock, b"p");
-        assert_eq!(e.dlq_records(), 1);
+        for p in [&b"p0"[..], b"p1"] {
+            e.produce(&Append {
+                timestamp_ms: 1,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: p,
+            })
+            .unwrap();
+        }
+        // Poll once to materialize the default group and LEASE offset 0: it stays UNCOMMITTED, so the
+        // committed watermark stays at 0 and offset 1's exact-membership entry is not pruned.
+        let _ = e.poll_now().unwrap();
 
-        // Read the source record back and re-run the dead-letter move for the SAME (group, offset,
-        // attempt). The high-water mark already covers `off`, so no second DLQ write happens.
-        let record = e.log.read_from(off, 1).unwrap().into_iter().next().unwrap();
-        let poll = e.dead_letter_in("", off, 2, record).unwrap();
-        assert!(matches!(poll, Poll::Parked { .. }));
+        // The HIGHER offset 1 dead-letters first (offset 0 is still leased/uncommitted).
+        let rec1 = e
+            .log
+            .read_from(Offset::new(1), 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        e.dead_letter_in("", Offset::new(1), 2, rec1).unwrap();
+        assert_eq!(e.dlq_records(), 1);
+        // Re-poison the SAME offset 1 (the crash-window duplicate): idempotent, still one record.
+        let rec1_again = e
+            .log
+            .read_from(Offset::new(1), 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        e.dead_letter_in("", Offset::new(1), 2, rec1_again).unwrap();
         assert_eq!(
             e.dlq_records(),
             1,
-            "re-poison is idempotent: still one record"
+            "re-poisoning the SAME exact offset writes exactly one record"
         );
+
+        // Now the LOWER offset 0 dead-letters: a genuinely-new source offset that MUST be written,
+        // never suppressed by the higher offset 1 already in the sink (the #800 fix). Pre-fix
+        // `already_dead_lettered("", 0)` returned true (0 <= 1) and this append was skipped.
+        let rec0 = e
+            .log
+            .read_from(Offset::new(0), 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        e.dead_letter_in("", Offset::new(0), 2, rec0).unwrap();
+        assert_eq!(
+            e.dlq_records(),
+            2,
+            "the lower offset is durably written, not dropped (#800)"
+        );
+
         drop(e);
-        assert_eq!(read_dlq_entries(&probe).unwrap().len(), 1);
+        let mut offsets: Vec<u64> = read_dlq_entries(&probe)
+            .unwrap()
+            .iter()
+            .map(|en| en.source_offset)
+            .collect();
+        offsets.sort_unstable();
+        assert_eq!(
+            offsets,
+            vec![0, 1],
+            "BOTH poison offsets are durably in the DLQ"
+        );
     }
 
     #[test]
@@ -12586,8 +12671,8 @@ mod tests {
         // The crash window: the DLQ append+fsync is durable, but the source-cursor commit's
         // durability has NOT yet landed (it is only in memory, the checkpoint interval is high).
         // A power loss reverts the un-checkpointed source cursor (the poison redelivers) while the
-        // fsynced DLQ record survives. On reopen the per-group high-water mark, rebuilt from the
-        // durable DLQ, suppresses the duplicate append: EXACTLY ONE DLQ entry, and no loss.
+        // fsynced DLQ record survives. On reopen the per-group exact dead-lettered offset set, rebuilt
+        // from the durable DLQ, suppresses the duplicate append: EXACTLY ONE DLQ entry, and no loss.
         let clock = std::sync::Arc::new(ManualClock::new());
         let (faultfs, _control) = FaultFs::new(InMemoryFs::new());
         // Keep a probe to the underlying in-memory disk to drive the power loss and read the DLQ.

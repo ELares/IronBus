@@ -21,15 +21,20 @@
 //! exact byte layout). The DLQ record's `timestamp_ms`, `key`, and `payload` are the original's.
 //!
 //! ## Exactly-once across a crash (the idempotency key)
-//! The reconciliation key is `(group, source_offset, attempt)`. The DLQ Log itself is the durable
+//! The reconciliation key is the EXACT `(group, source_offset)`. The DLQ Log itself is the durable
 //! record of what has been dead-lettered: on open, [`DlqSink::open`] scans the DLQ segments and
-//! rebuilds, per group, the HIGHEST source offset already dead-lettered. The engine consults that
-//! high-water mark before appending: a `(group, offset)` already at or below the group's recorded
-//! high-water mark is NOT re-appended (it is already in the sink), so a message that was appended
-//! to the DLQ and then re-poisoned after a crash (because its source cursor commit had not yet
-//! become durable) is committed-past WITHOUT a duplicate DLQ write. There is therefore no separate
-//! sidecar file to keep consistent with the sink: the sink is the single source of truth, and a
-//! reopen reconstructs the high-water mark from it.
+//! rebuilds, per group, the SET of source offsets already dead-lettered. The engine consults that
+//! set before appending: a `(group, offset)` whose EXACT offset is already in the set is NOT
+//! re-appended (it is already in the sink), so a message that was appended to the DLQ and then
+//! re-poisoned after a crash (because its source cursor commit had not yet become durable) is
+//! committed-past WITHOUT a duplicate DLQ write. The membership is EXACT, never `offset <= max`
+//! (#800): poison messages do not cross the max-deliver threshold in ascending order, so a high-water
+//! mark would silently drop a lower offset dead-lettered after a higher one — leaving it in ZERO
+//! durable places, the exact loss the DLQ exists to prevent. Each per-group set is bounded by the
+//! source group's in-flight/ahead window: [`DlqSink::prune_below`] drops offsets below the source
+//! cursor's committed watermark (which can never redeliver or re-poison). There is therefore no
+//! separate sidecar file to keep consistent with the sink: the sink is the single source of truth,
+//! and a reopen reconstructs the exact set from it.
 
 use crate::fs::Filesystem;
 use crate::log::{Append, Log, LogConfig};
@@ -38,7 +43,7 @@ use crate::offline::OfflineReader;
 use crate::segment::{OwnedRecord, SegmentReader, StorageError};
 use ironbus_core::clock::Clock;
 use ironbus_core::types::{Offset, RecordFlags};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The subdirectory of the data directory that holds the DEFAULT dead-letter sink's segments. A
 /// dead-letter EXCHANGE (V2-M4, #551) routes to a CONFIGURABLE subdir instead (the target name), so
@@ -299,14 +304,20 @@ pub fn decode_entry(record: &OwnedRecord) -> Option<DlqEntry> {
     })
 }
 
-/// The durable dead-letter sink: a second segmented [`Log`] plus the per-group high-water mark of
-/// the highest source offset already dead-lettered, for idempotent appends (#63).
+/// The durable dead-letter sink: a second segmented [`Log`] plus the per-group set of source
+/// offsets already dead-lettered, for idempotent appends (#63).
 pub struct DlqSink<F: Filesystem, C: Clock> {
     log: Log<F, C>,
-    /// The highest SOURCE offset already dead-lettered, per consumer group, reconstructed at open
-    /// from the durable DLQ records and advanced on each append. The engine consults this to skip
-    /// a duplicate append for a `(group, source_offset)` already in the sink.
-    highest_source_offset: BTreeMap<String, u64>,
+    /// The EXACT set of SOURCE offsets already dead-lettered, per consumer group, reconstructed at
+    /// open from the durable DLQ records and extended on each append (#800). The engine consults this
+    /// to skip a duplicate append for a `(group, source_offset)` already in the sink. It is EXACT
+    /// membership, NOT a high-water mark: poison messages do NOT cross the max-deliver (or TTL-expiry)
+    /// threshold in ascending source-offset order — a higher offset can be dead-lettered while a lower
+    /// one is still leased — so `offset <= max` would wrongly suppress the lower offset's append,
+    /// dropping it from the sink entirely (zero durable places). Each per-group set is bounded by the
+    /// source group's in-flight/ahead window (`max_in_flight`): [`DlqSink::prune_below`] drops every
+    /// offset below the source cursor's committed watermark, which can never redeliver or re-poison.
+    dead_lettered: BTreeMap<String, BTreeSet<u64>>,
     /// The number of records durably appended to the sink across its lifetime (the DLQ depth at
     /// open plus every append since), for the operator's `ironbus_dlq_records_total` metric.
     records: u64,
@@ -320,15 +331,15 @@ impl<F: Filesystem, C: Clock> std::fmt::Debug for DlqSink<F, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DlqSink")
             .field("records", &self.records)
-            .field("highest_source_offset", &self.highest_source_offset)
+            .field("dead_lettered", &self.dead_lettered)
             .finish_non_exhaustive()
     }
 }
 
 impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// Opens (recovering, or creating fresh) the dead-letter sink rooted at the `dlq/`
-    /// subdirectory of `parent_fs`, rebuilding the per-group dead-lettered high-water mark by
-    /// scanning the durable DLQ records. The subdirectory is created on demand by
+    /// subdirectory of `parent_fs`, rebuilding the per-group exact set of dead-lettered source
+    /// offsets by scanning the durable DLQ records. The subdirectory is created on demand by
     /// [`Filesystem::subdir`].
     ///
     /// # Errors
@@ -342,7 +353,7 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// of `parent_fs` — the dead-letter EXCHANGE target (#551). [`DlqSink::open`] is this with the
     /// default [`DLQ_SUBDIR`], so the existing fixed-DLQ behavior is byte-identical; a configured DLX
     /// names a different `subdir` to route dead letters to a separate sink. The on-disk format and
-    /// the idempotent high-water-mark rebuild are identical for every target.
+    /// the idempotent exact-offset-set rebuild are identical for every target.
     ///
     /// # Errors
     /// Propagates a storage error from creating the subdirectory, opening the DLQ log, or scanning
@@ -357,11 +368,11 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
         let log = Log::open(dlq_fs, clock, config)?;
         let mut sink = DlqSink {
             log,
-            highest_source_offset: BTreeMap::new(),
+            dead_lettered: BTreeMap::new(),
             records: 0,
             subdir: subdir.to_string(),
         };
-        sink.rebuild_high_water_mark()?;
+        sink.rebuild_dead_lettered_set()?;
         Ok(sink)
     }
 
@@ -372,11 +383,13 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     }
 
     /// Scans every durable DLQ record (reusing the recovery decode path) and rebuilds the per-group
-    /// highest dead-lettered source offset plus the total record count. Called once at open; the
+    /// EXACT set of dead-lettered source offsets plus the total record count. Called once at open; the
     /// DLQ is the single durable source of truth for what has been dead-lettered, so this is what
-    /// makes the move idempotent across a crash without a separate sidecar.
-    fn rebuild_high_water_mark(&mut self) -> Result<(), StorageError> {
-        self.highest_source_offset.clear();
+    /// makes the move idempotent across a crash without a separate sidecar — and recovering the exact
+    /// set (not just a max) is what lets a lower offset re-poisoned after a crash be recognized as
+    /// already-present without suppressing a genuinely-new lower offset (#800).
+    fn rebuild_dead_lettered_set(&mut self) -> Result<(), StorageError> {
+        self.dead_lettered.clear();
         self.records = 0;
         let flushed = self.log.flushed_offset().get();
         if flushed == 0 {
@@ -394,34 +407,54 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
                 }
                 if let Some(meta) = decode_dlq_headers(&record.headers) {
                     self.records = self.records.saturating_add(1);
-                    let entry = self
-                        .highest_source_offset
+                    self.dead_lettered
                         .entry(meta.group)
-                        .or_insert(meta.source_offset);
-                    *entry = (*entry).max(meta.source_offset);
+                        .or_default()
+                        .insert(meta.source_offset);
                 }
             }
         }
         Ok(())
     }
 
-    /// Whether `(group, source_offset)` is ALREADY in the durable DLQ: true when `source_offset`
-    /// is at or below the group's recorded high-water mark. The engine calls this to make the move
-    /// idempotent: a redelivered-then-re-poisoned message already in the sink is committed-past
-    /// WITHOUT a second append. Source offsets only ever rise for a group, so the high-water mark
-    /// is a sound dedupe key.
+    /// Whether `(group, source_offset)` is ALREADY in the durable DLQ: true when this EXACT source
+    /// offset is in the group's dead-lettered set. The engine calls this to make the move idempotent:
+    /// a redelivered-then-re-poisoned message already in the sink is committed-past WITHOUT a second
+    /// append. The check is EXACT membership, NOT `offset <= max` (#800): the ONLY legitimate
+    /// duplicate is the SAME source offset re-poisoned after a crash that fsynced the DLQ record but
+    /// not the source cursor, so a lower offset never-yet-dead-lettered must return `false` even when
+    /// a HIGHER one is already recorded — otherwise it would be dropped from the sink entirely.
     #[must_use]
     pub fn already_dead_lettered(&self, group: &str, source_offset: u64) -> bool {
-        self.highest_source_offset
+        self.dead_lettered
             .get(group)
-            .is_some_and(|&hwm| source_offset <= hwm)
+            .is_some_and(|set| set.contains(&source_offset))
+    }
+
+    /// Drops every dead-lettered source offset BELOW `committed` for `group` (#800): once the source
+    /// group's cursor has committed past an offset, that record can never redeliver or re-poison, so
+    /// its exact-membership entry is no longer needed for idempotency. The engine calls this each time
+    /// it advances a group's cursor past a dead-letter, bounding each per-group set by the in-flight/
+    /// ahead window (`max_in_flight`) instead of letting it grow with every dead-letter ever written.
+    /// Pruning against the IN-MEMORY watermark is safe across a crash: the durable DLQ is the source of
+    /// truth and [`DlqSink::rebuild_dead_lettered_set`] restores the exact set on reopen.
+    pub fn prune_below(&mut self, group: &str, committed: u64) {
+        if let Some(set) = self.dead_lettered.get_mut(group) {
+            // Keep only offsets at or above the committed watermark (offsets `< committed` are durably
+            // committed-past). `split_off` returns the `>= committed` tail; the `< committed` head is
+            // dropped with the old set.
+            *set = set.split_off(&committed);
+            if set.is_empty() {
+                self.dead_lettered.remove(group);
+            }
+        }
     }
 
     /// Appends one poison record to the sink and makes it durable (fsync) BEFORE returning, then
-    /// advances the in-memory high-water mark. This is the durable half of the crash-atomic move:
-    /// the caller appends-and-fsyncs HERE first, and only then commits the source group's cursor
-    /// past the message, so a crash between the two leaves the source uncommitted and the record
-    /// already durable in the DLQ; on reopen the high-water mark (rebuilt from this very record)
+    /// adds the source offset to the in-memory dead-lettered set. This is the durable half of the
+    /// crash-atomic move: the caller appends-and-fsyncs HERE first, and only then commits the source
+    /// group's cursor past the message, so a crash between the two leaves the source uncommitted and
+    /// the record already durable in the DLQ; on reopen the exact set (rebuilt from this very record)
     /// suppresses the duplicate append.
     ///
     /// The original record's `key`, `payload`, and `timestamp_ms` are preserved verbatim; the
@@ -432,7 +465,7 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// Returns [`StorageError::SegmentFull`] if the metadata could not be framed (an original
     /// header or group name longer than `u16::MAX`, unreachable from the wire), or a storage error
     /// from the append or its durability barrier. On any error nothing is recorded as
-    /// dead-lettered (the high-water mark and count do not move), so the caller MUST NOT commit the
+    /// dead-lettered (the offset set and count do not move), so the caller MUST NOT commit the
     /// source cursor: the move did not happen.
     pub fn append_poison(
         &mut self,
@@ -457,8 +490,8 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// default fixed-DLQ max-deliver path, so that path stays byte-identical.
     ///
     /// The crash-safety contract (append-and-fsync the dead-letter record HERE before the caller
-    /// commits the source cursor) and the idempotent per-group high-water mark are identical to
-    /// `append_poison`.
+    /// commits the source cursor) and the idempotent per-group dead-lettered offset set are identical
+    /// to `append_poison`.
     ///
     /// # Errors
     /// Same as [`append_poison`](Self::append_poison).
@@ -476,7 +509,8 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     }
 
     /// Appends one dead-letter record (with its already-encoded metadata `headers` blob) to the sink,
-    /// fsyncs it BEFORE returning, and advances the per-group high-water mark + record count. This is
+    /// fsyncs it BEFORE returning, and adds the source offset to the per-group set + bumps the record
+    /// count. This is
     /// the shared durable core of [`append_poison`](Self::append_poison) and
     /// [`append_dead_letter`](Self::append_dead_letter); the only difference between them is the v1 vs
     /// v2 metadata encoding, computed by the caller.
@@ -502,11 +536,10 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
         // ordering is the crash-safety contract. A failed durability barrier freezes the DLQ writer
         // and is surfaced, so the caller does not commit the source past an un-fsynced record.
         self.log.sync()?;
-        let entry = self
-            .highest_source_offset
+        self.dead_lettered
             .entry(group.to_string())
-            .or_insert(source_offset);
-        *entry = (*entry).max(source_offset);
+            .or_default()
+            .insert(source_offset);
         self.records = self.records.saturating_add(1);
         Ok(offset)
     }
@@ -518,11 +551,14 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
         self.records
     }
 
-    /// The highest dead-lettered source offset recorded for `group`, or `None` if the group has
-    /// never had a message dead-lettered. For tests and inspection.
+    /// The highest dead-lettered source offset CURRENTLY tracked for `group` (the max of its
+    /// not-yet-pruned exact set), or `None` if the group has no tracked dead-letters. For tests and
+    /// inspection. Note this reflects the live (pruned) set, not an all-time high-water mark.
     #[must_use]
     pub fn highest_for_group(&self, group: &str) -> Option<u64> {
-        self.highest_source_offset.get(group).copied()
+        self.dead_lettered
+            .get(group)
+            .and_then(|set| set.iter().next_back().copied())
     }
 
     /// Borrows the underlying DLQ log (for inspection and tests).
@@ -682,7 +718,7 @@ mod tests {
         assert_eq!(sink.records(), 1);
         assert_eq!(sink.highest_for_group("orders"), Some(7));
 
-        // Reopen the sink: the high-water mark and count come back from the durable records alone.
+        // Reopen the sink: the dead-lettered offset set and count come back from the durable records alone.
         let reopened = DlqSink::open(&fs, ManualClock::new(), config()).unwrap();
         assert_eq!(reopened.records(), 1);
         assert_eq!(reopened.highest_for_group("orders"), Some(7));
@@ -735,21 +771,48 @@ mod tests {
     }
 
     #[test]
-    fn the_high_water_mark_is_per_group_and_takes_the_maximum() {
+    fn dedup_is_exact_offset_membership_not_a_high_water_mark() {
+        // #800: idempotency is EXACT-offset membership, not `offset <= max`. A lower source offset
+        // that was never dead-lettered must read `false` even after a HIGHER one is recorded — the
+        // poison-message order is not ascending (a higher offset can cross max-deliver while a lower
+        // one is still leased), so a high-water mark would drop the lower offset from the sink.
         let fs = InMemoryFs::new();
         let mut sink = DlqSink::open(&fs, ManualClock::new(), config()).unwrap();
-        sink.append_poison("a", &source_record(2, b"", b"", b"p"), 6)
-            .unwrap();
+        // Dead-letter the HIGHER offset 5 first (the lower offset 2 is still leased upstream).
         sink.append_poison("a", &source_record(5, b"", b"", b"p"), 6)
             .unwrap();
         sink.append_poison("b", &source_record(3, b"", b"", b"p"), 6)
             .unwrap();
-        assert_eq!(sink.highest_for_group("a"), Some(5));
-        assert_eq!(sink.highest_for_group("b"), Some(3));
-        // Idempotency reads against the per-group maximum.
+        // The exact offset 5 is in the sink; the never-dead-lettered lower offset 2 is NOT (pre-#800
+        // this returned `true` because 2 <= 5, silently suppressing offset 2's later append).
         assert!(sink.already_dead_lettered("a", 5));
-        assert!(sink.already_dead_lettered("a", 2));
+        assert!(
+            !sink.already_dead_lettered("a", 2),
+            "a lower never-dead-lettered offset is not suppressed by a higher recorded one"
+        );
         assert!(!sink.already_dead_lettered("a", 6));
         assert!(!sink.already_dead_lettered("b", 4));
+
+        // Now the lower offset 2 reaches dead-letter: it IS appended and becomes exact-present.
+        sink.append_poison("a", &source_record(2, b"", b"", b"p"), 6)
+            .unwrap();
+        assert!(sink.already_dead_lettered("a", 2));
+        assert_eq!(sink.records(), 3);
+        assert_eq!(sink.highest_for_group("a"), Some(5));
+
+        // Pruning below the source cursor's committed watermark bounds the set: once the cursor has
+        // committed past offsets < 3, only offset 5 remains tracked for "a".
+        sink.prune_below("a", 3);
+        assert!(
+            !sink.already_dead_lettered("a", 2),
+            "2 pruned below the watermark"
+        );
+        assert!(
+            sink.already_dead_lettered("a", 5),
+            "5 is still ahead of the watermark"
+        );
+        // Pruning past everything drops the group entry entirely.
+        sink.prune_below("a", 6);
+        assert_eq!(sink.highest_for_group("a"), None);
     }
 }
