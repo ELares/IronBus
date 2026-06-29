@@ -52,6 +52,44 @@ impl Drop for ConnectionSlot {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection for [`spawn_connection_handler`] (#866): the number of UPCOMING handler
+    /// spawns to force-fail (as if the OS refused thread creation, EAGAIN), decremented per forced
+    /// failure. A test arms it on the accept-loop thread to prove the loop SHEDS spawn failures and then
+    /// RECOVERS — a later spawn succeeds and the connection is admitted — without leaking a cap slot.
+    /// Thread-local (not a global), so it only affects the one serve loop a test arms it on and never
+    /// leaks into another concurrently-running test's loop.
+    static FAIL_NEXT_SPAWNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Spawns the per-connection handler on a fresh, NAMED thread, returning the spawn result so the accept
+/// loop can SHED a thread-creation failure gracefully (#866). `std::thread::spawn` PANICS when the OS
+/// refuses thread creation (EAGAIN under a cgroup `pids.max`, `RLIMIT_NPROC`, or stack/address-space
+/// exhaustion on a bounded-RAM edge box), and the release profile's `panic = "abort"` turns that panic
+/// into a whole-process abort — one failed spawn would kill every live connection. `Builder::spawn`
+/// surfaces the failure as an `Err` instead, so the caller drops the connection and keeps serving, the
+/// same bounded shed the at-capacity and transient-accept-error branches already do.
+fn spawn_connection_handler<H>(handler: H) -> std::io::Result<()>
+where
+    H: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    {
+        let remaining = FAIL_NEXT_SPAWNS.with(std::cell::Cell::get);
+        if remaining > 0 {
+            FAIL_NEXT_SPAWNS.with(|c| c.set(remaining - 1));
+            return Err(std::io::Error::other(
+                "forced thread-spawn failure (test fault injection, #866)",
+            ));
+        }
+    }
+    std::thread::Builder::new()
+        .name("ironbus-conn".to_string())
+        .spawn(handler)
+        .map(|_join| ())
+}
+
 /// Serves connections on `listener` until `shutdown` is set, spawning one thread per
 /// connection (up to `max_connections` concurrently; further connections are refused). Each
 /// connection drives a [`Session`] against the shared engine.
@@ -336,20 +374,21 @@ where
                 // session for the auth-outcome callback ONLY; it is NEVER a metric label (the guard keeps
                 // it internal), so the metric surface stays low-cardinality.
                 let peer_ip = addr.ip();
-                // The connection is now live: record the ACCEPT on connz (#572), the accept half the
-                // slot guard's drop matches with a close. Off the engine lock.
-                connz.record_accept();
                 // Each handler gets its own cheap clone of the actor handle (a `SyncSender` clone);
                 // they all fan into the same single actor, preserving the single-writer rule.
                 let engine = engine.clone();
-                let active = Arc::clone(&active);
+                // The cap slot the handler's `ConnectionSlot` releases on its drop (the matching
+                // `fetch_sub` for the admission `fetch_add` above). The loop keeps the original `active`
+                // handle to UNDO the pre-increment if the spawn itself fails (#866).
+                let slot_active = Arc::clone(&active);
                 let member_id = MemberId::new(next_member.fetch_add(1, Ordering::Relaxed));
                 // A cheap `Arc` clone of the shared, immutable auth table (or `None` on a no-auth
                 // broker), so the handler can pin the connection's scope set at `Connect` time.
                 let auth = auth.clone();
-                // A cheap `Arc` clone of the shared connz metric, so the slot guard can record the
-                // close and the session can record the authed-flip (#572).
-                let connz = Arc::clone(connz);
+                // A cheap `Arc` clone of the shared connz metric, so the handler records the ACCEPT (on
+                // start) and its slot guard records the close, and the session records the authed-flip
+                // (#572). The loop keeps the original `connz` handle to record a REFUSAL if the spawn fails.
+                let connz_for_conn = Arc::clone(connz);
                 // A cheap `Arc` clone of the pre-auth `DoS` guard (#633), so the session can report its
                 // auth outcome (failure -> per-IP lockout; success -> clear the IP's failed window).
                 let preauth_for_conn = preauth.clone();
@@ -357,12 +396,23 @@ where
                 // OUTCOME and any scope DENIAL through it (carrying the identity NAME, never a
                 // credential). `None` is the no-audit serve path (byte-for-byte historical).
                 let audit_for_conn = audit.clone();
-                std::thread::spawn(move || {
+                // FALLIBLE spawn (#866): `std::thread::spawn` PANICS on a thread-creation refusal
+                // (EAGAIN), which `panic = "abort"` turns into a whole-broker abort. `Builder::spawn`
+                // surfaces it as an `Err` the loop sheds. The connz ACCEPT is recorded INSIDE the handler
+                // (paired with the slot's close), so a connection that never gets a handler thread is a
+                // pure REFUSAL — exactly like the at-capacity branch — never a phantom accept+close.
+                let spawn_outcome = spawn_connection_handler(move || {
+                    // The connection is now live: record the ACCEPT on connz (#572), the accept half the
+                    // slot guard's drop matches with a close. Recorded HERE (handler start), not at
+                    // admission, so a failed-to-spawn connection is shed as a refusal, never an accept.
+                    // Two atomics with NO panic point before the slot below is constructed, so the accept
+                    // is always paired with the slot's close on every exit (return OR unwind).
+                    connz_for_conn.record_accept();
                     // The guard decrements the cap slot AND records the connz close on return OR a
                     // panic unwind, so a panicking handler can never leak a slot nor miss a close.
                     let _slot = ConnectionSlot {
-                        active,
-                        connz: Arc::clone(&connz),
+                        active: slot_active,
+                        connz: Arc::clone(&connz_for_conn),
                     };
                     // Hold the half-open slot (#633) for the WHOLE handshake window: it is dropped here
                     // when the handler returns (handshake resolved — success, failure, or disconnect),
@@ -375,12 +425,22 @@ where
                         &engine,
                         member_id,
                         auth,
-                        &connz,
+                        &connz_for_conn,
                         preauth_for_conn,
                         peer_ip,
                         audit_for_conn,
                     );
                 });
+                if spawn_outcome.is_err() {
+                    // The OS refused thread creation (EAGAIN under a cgroup `pids.max`, `RLIMIT_NPROC`,
+                    // or stack/address-space exhaustion): #866. The failed closure was dropped, which
+                    // released the half-open slot and closed the stream; `record_accept` never ran (it is
+                    // the closure's first line), so the `ConnectionSlot` was never built either. UNDO the
+                    // admission cap pre-increment and record the REFUSAL — shedding exactly like the
+                    // at-capacity branch — then keep serving, instead of aborting the whole broker.
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    connz.record_refused();
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL);
@@ -762,6 +822,114 @@ mod tests {
             Poll::Message(d) => assert_eq!(d.record.payload.as_ref(), b"net"),
             other => panic!("expected the produced message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_thread_spawn_failure_sheds_the_connection_and_the_broker_keeps_serving() {
+        // #866: `std::thread::spawn` PANICS on a thread-creation refusal (EAGAIN), and the release
+        // profile's `panic = "abort"` would turn that panic into a whole-broker crash. With the fallible
+        // spawn, a spawn failure is SHED like an at-capacity refusal — the broker keeps serving, the cap
+        // slot is NOT leaked, and the live gauge stays balanced. We force the first three handler spawns
+        // to fail (the thread-local fault hook, armed on the accept-loop thread), then prove a fourth
+        // connection still HANDSHAKES — which a leaked cap slot would have refused at the cap — and the
+        // connz counters balance.
+        let (handle, actor) = spawn_inmem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connz = Arc::new(ConnectionMetrics::new());
+        // A cap of 2: if a spawn failure leaked the `active` slot, the third shed would pin `active` at
+        // the cap and the fourth connection could never be admitted. With the slot correctly undone,
+        // every shed frees its slot and the cap never fills.
+        let max_connections = 2;
+        let fail_first = 3u32;
+
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let connz = Arc::clone(&connz);
+            move || {
+                // Arm the fault on THIS (accept-loop) thread: the first `fail_first` handler spawns fail.
+                FAIL_NEXT_SPAWNS.with(|c| c.set(fail_first));
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve_inner(
+                    &listener,
+                    &engine,
+                    &shutdown,
+                    max_connections,
+                    &clock,
+                    &beacon,
+                    None,
+                    &connz,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+        });
+
+        // The first `fail_first` connections each hit the forced spawn failure: the server sheds before
+        // any handler runs, so the client sees EOF (or a reset), never an `Info` frame. Reading to the
+        // close also SYNCHRONIZES — it returns only once the loop has processed (and shed) that
+        // connection, so the next connect is ordered after this one's failure was consumed.
+        for i in 0..fail_first {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut byte = [0u8; 1];
+            match client.read(&mut byte) {
+                // A clean EOF (`Ok(0)`) or a reset (`Err`) both mean the server shed the connection.
+                Ok(0) | Err(_) => {}
+                Ok(n) => {
+                    panic!("spawn failure #{i} should shed, but got {n} byte(s) of handler data")
+                }
+            }
+            drop(client);
+        }
+
+        // The countdown is now exhausted: the next spawn succeeds. If a prior shed had leaked the cap
+        // slot, `active` would be pinned at `max_connections` and THIS connection would be refused at the
+        // cap (EOF, no `Info`). Instead it handshakes — proving every shed freed its slot.
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = Vec::new();
+        client.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(
+            read_one_frame(&mut client, &mut buf).0,
+            FrameType::Info,
+            "after the spawn failures the loop still admits a connection (no leaked cap slot)"
+        );
+        drop(client);
+
+        // Let the fourth connection's close propagate, then shut down and join. A clean join proves the
+        // loop NEVER aborted on a spawn failure (an abort would have killed the test process).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while connz.snapshot().closed < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+
+        let s = connz.snapshot();
+        assert_eq!(
+            s.refused,
+            u64::from(fail_first),
+            "each spawn failure was shed as a refusal: {s:?}"
+        );
+        assert_eq!(
+            s.accepted, 1,
+            "only the post-recovery connection ever reached a handler, so only it was accepted: {s:?}"
+        );
+        assert_eq!(
+            s.currently_open, 0,
+            "the live gauge returned to zero — no accept/close leak: {s:?}"
+        );
+
+        let _ = recover_engine(handle, actor);
     }
 
     #[test]
