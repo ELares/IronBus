@@ -41,7 +41,7 @@ use ironbus_proto::message::{
     decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit, decode_stream_declare,
     decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
     decode_txn_check_result, decode_txn_listen, decode_txn_prepare, decode_txn_resolve,
-    encode_dead_letter, encode_deliver, encode_deliver_batch, encode_gap_marker, encode_info,
+    encode_dead_letter, encode_deliver, encode_deliver_batch_frame, encode_gap_marker, encode_info,
     encode_not_leader, encode_produce_confirm, encode_pub_ack, encode_stream_info_response,
     encode_truncated, encode_txn_resolve, gap_reason, parse_connect_auth, produce_confirm_status,
     pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader,
@@ -2594,9 +2594,13 @@ impl Session {
                         // never truncates a real batch; saturate defensively rather than wrap.
                         record_count: u32::try_from(raw.record_count).unwrap_or(u32::MAX),
                     };
-                    let mut frame_body = Vec::new();
-                    encode_deliver_batch(&header, &raw.bytes, &mut frame_body);
-                    reply(out, FrameType::DeliverBatch, &frame_body);
+                    // Frame the batch DIRECTLY into `out` in one pass (#812): the zero-copy `raw.bytes`
+                    // segment slice is copied exactly once, dropping the redundant full-batch memcpy into a
+                    // temporary `frame_body` Vec and that per-batch allocation. Byte-identical to the old
+                    // `encode_deliver_batch` + `reply` path; matches `reply`'s cap handling (the cap is
+                    // checked before any write, so `out` is unchanged on the unreachable over-cap case).
+                    let result = encode_deliver_batch_frame(&header, &raw.bytes, out);
+                    debug_assert!(result.is_ok(), "DeliverBatch frame exceeded the frame cap");
                     delivered = delivered.saturating_add(header.record_count);
                 }
                 // The ACTIVE-tail remainder (which the raw read does not serve) as ordinary per-record
