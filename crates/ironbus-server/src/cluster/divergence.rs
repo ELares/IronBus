@@ -349,8 +349,10 @@ pub struct DivergenceReport {
     /// The detected divergences, ascending by `segment_id`. Empty when this replica AGREES with the
     /// quorum on every committed segment (a clean cluster — no false positive).
     pub divergences: Vec<DivergenceDetected>,
-    /// The quorum's committed high-watermark (carried through so the resync planner can clamp the
-    /// truncation at or above the committed prefix — committed data is never dropped).
+    /// The quorum's committed high-watermark, carried through for observability and the resync bound
+    /// (how far the re-fetch must reach). It is NOT used to clamp the truncation: #798 drops and
+    /// re-fetches the whole divergent region, committed prefix included, because the clean quorum leader
+    /// restores it and [`execute_resync`] verifies convergence.
     pub quorum_committed_hw: u64,
 }
 
@@ -783,10 +785,19 @@ pub struct ResyncReport {
 pub type ResyncError = DivergenceError;
 
 /// Plans an auto-resync from a [`DivergenceReport`] (#612). The truncation target is the start offset
-/// of the FIRST divergent segment (so every divergent segment is re-fetched), but it is CLAMPED at or
-/// above the committed high-watermark — committed data is NEVER part of the dropped suffix. The plan's
-/// record count is bounded by `bounds`; over the cap this FAILS CLOSED with
-/// [`DivergenceError::ResyncTooLarge`] rather than planning an unbounded repair.
+/// of the FIRST divergent segment, so EVERY divergent segment — including a corrupt or drifted COMMITTED
+/// one — is dropped and re-fetched (#798). The plan's record count is bounded by `bounds`; over the cap
+/// this FAILS CLOSED with [`DivergenceError::ResyncTooLarge`] rather than planning an unbounded repair.
+///
+/// WHY committed data IS dropped here (the #798 fix): a resync ALWAYS has a clean quorum LEADER to
+/// re-fetch from, so dropping the divergent committed region and re-fetching the leader's bytes is
+/// NON-lossy and is the only way to repair committed-prefix corruption/drift — exactly the advertised
+/// C4-I3 case. Clamping the truncation at the committed high-watermark (the previous behaviour) lifted it
+/// ABOVE a corrupt committed segment, so the truncate dropped nothing, the re-fetch was a no-op, and the
+/// corrupt committed bytes stayed live and were served as committed data. The "never drop committed data"
+/// invariant is sound ONLY when there is NO clean source to restore it; in a resync there always is.
+/// [`execute_resync`] re-fingerprints against the leader and FAILS CLOSED if convergence is not reached,
+/// so a plan that would drop nothing can never be reported as a successful heal.
 ///
 /// `first_divergent_offset` is the log offset at which the first divergent segment begins on THIS
 /// replica (the caller derives it from its own segment directory — the fingerprint does not carry a
@@ -797,17 +808,16 @@ pub type ResyncError = DivergenceError;
 pub fn plan_resync(
     report: &DivergenceReport,
     first_divergent_offset: u64,
-    committed_hw: u64,
     log_end: u64,
     bounds: ResyncBounds,
 ) -> Result<Option<ResyncPlan>, DivergenceError> {
     if report.is_clean() {
         return Ok(None);
     }
-    // CLAMP the truncation target at or above the committed high-watermark: committed data (fsync'd on
-    // a quorum, #691) is never dropped. The divergent suffix is only ever the UNcommitted tail plus, in
-    // the corruption case, a corrupt committed segment that is QUARANTINED (not dropped) and re-fetched.
-    let truncate_to = first_divergent_offset.max(committed_hw);
+    // Drop and re-fetch the WHOLE divergent suffix from the first divergent segment — committed region
+    // included (#798). No committed-high-watermark clamp: a resync has a clean leader to restore it, and
+    // `execute_resync`'s post-resync re-fingerprint verifies the result converged.
+    let truncate_to = first_divergent_offset;
     let records_to_refetch = log_end.saturating_sub(truncate_to);
     if bounds.max_records != 0 && records_to_refetch > bounds.max_records {
         return Err(DivergenceError::ResyncTooLarge {
@@ -868,6 +878,22 @@ pub fn execute_resync<F: Filesystem, C: Clock>(
         }
     }
 
+    // 3. POST-RESYNC CONVERGENCE CHECK (#798): re-fingerprint this replica against the leader and FAIL
+    //    CLOSED if it STILL diverges. A resync is only a successful heal if the replica is now
+    //    byte-identical to the clean quorum leader over the committed prefix. Without this check, a plan
+    //    that truncated nothing (the old committed-high-watermark clamp left a corrupt committed segment
+    //    in place) or a leader that served a short prefix would be reported as a successful repair while
+    //    the replica is still divergent — the silent-unhealed-divergence-reported-as-success bug. The
+    //    re-fingerprint is the same READ-ONLY durable-bytes comparison the detection path uses.
+    let follower_fp = fingerprint_log(follower.log()).map_err(resync_fingerprint_err)?;
+    let leader_fp = fingerprint_log(leader_log).map_err(resync_fingerprint_err)?;
+    let post = compare_fingerprints(&follower_fp, &leader_fp);
+    if !post.is_clean() {
+        return Err(ReplicationError::ResyncDidNotConverge {
+            remaining: post.divergences.len(),
+        });
+    }
+
     Ok(ResyncReport {
         truncated_to: truncation.truncated_to,
         records_dropped: truncation.records_dropped,
@@ -875,6 +901,18 @@ pub fn execute_resync<F: Filesystem, C: Clock>(
         quarantined: false,
         quarantined_bytes: 0,
     })
+}
+
+/// Maps a fingerprint read error from the post-resync convergence check (#798) into the resync's
+/// [`ReplicationError`] channel. [`fingerprint_log`] only ever returns [`DivergenceError::Storage`], but
+/// map any other variant to a framed error rather than panicking on a future variant.
+fn resync_fingerprint_err(e: DivergenceError) -> ReplicationError {
+    match e {
+        DivergenceError::Storage(s) => ReplicationError::Storage(s),
+        other => ReplicationError::Frame {
+            what: format!("resync convergence re-fingerprint failed: {other}"),
+        },
+    }
 }
 
 /// The C4-I3 minority-corruption REPAIR (#613): when a divergent segment is locally CORRUPT, COPY its
@@ -1142,13 +1180,11 @@ mod tests {
         assert!(!report.is_clean(), "divergence detected");
 
         // Plan the resync. The first divergent segment begins at the offset of the first record that
-        // differs (record index 3 here). For this test the committed HW on the divergent replica is its
-        // own flushed head; the leader is the source of truth, so truncate to where divergence starts.
-        // We compute the first divergent OFFSET conservatively as the start of the first divergent
-        // segment; here the segments are tiny (256B) so it is a low offset. The clamp keeps it >= a
-        // committed HW we pass as 0 (the divergent suffix is uncommitted-from-the-quorum's-view).
+        // differs (record index 3 here); the leader is the source of truth, so truncate to where the
+        // divergence starts and re-fetch the clean bytes from the leader (#798: no committed-HW clamp —
+        // a resync always has a clean leader to restore whatever it drops).
         let log_end = divergent_log.next_offset().get();
-        let plan = plan_resync(&report, 3, 0, log_end, ResyncBounds::default())
+        let plan = plan_resync(&report, 3, log_end, ResyncBounds::default())
             .expect("plan ok")
             .expect("a plan");
         assert!(plan.records_to_refetch > 0);
@@ -1191,19 +1227,19 @@ mod tests {
         let log_end = divergent_log.next_offset().get();
         // A tiny bound of 1 record forces the fail-closed path (the divergent suffix is > 1 record).
         let bounds = ResyncBounds { max_records: 1 };
-        let err = plan_resync(&report, 2, 0, log_end, bounds).unwrap_err();
+        let err = plan_resync(&report, 2, log_end, bounds).unwrap_err();
         assert!(matches!(err, DivergenceError::ResyncTooLarge { .. }));
     }
 
     // ===== committed data is never dropped =====
 
     #[test]
-    fn committed_data_below_the_hw_is_never_dropped_during_resync() {
-        // The resync truncate target is CLAMPED at or above the committed high-watermark, so a plan can
-        // never drop committed data even if the first divergent offset is computed below the HW. Use a
-        // record set long enough that the divergence lands in a SEALED segment (detectable), then hand
-        // the planner a committed-HW ABOVE the naive first-divergent-offset and prove the clamp lifts the
-        // truncate target to >= the HW (committed data is never part of the dropped suffix).
+    fn a_committed_divergence_below_the_hw_is_dropped_and_refetched_not_clamped() {
+        // #798: a divergence (drift or corruption) that begins BELOW the committed high-watermark must be
+        // dropped and re-fetched from the clean leader, NOT clamped above. The previous behaviour clamped
+        // the truncate target at or above the committed HW, which lifted it ABOVE a committed divergence
+        // so the truncate dropped nothing, the re-fetch was a no-op, and the corrupt/drifted committed
+        // bytes stayed live and were served as committed data — a silent, unhealed divergence.
         let leader = log_with(&[
             b"alpha", b"bravo", b"charlie", b"delta", b"echo", b"foxtrot", b"golf", b"hotel",
             b"india", b"juliet", b"kilo", b"lima",
@@ -1220,17 +1256,77 @@ mod tests {
             "the sealed-segment divergence is detected"
         );
 
+        // The first divergent segment begins at offset 3 — BELOW the leader's committed HW (12). The plan
+        // truncates to exactly that offset (no clamp): committed data IS in the dropped suffix, because the
+        // clean leader will restore it. Pre-#798 the truncate would have clamped to the HW and dropped
+        // nothing.
         let log_end = divergent_log.next_offset().get();
-        // Hand the planner a committed HW of 8 and a (deliberately too-low) first-divergent-offset of 1
-        // BELOW the HW. The clamp MUST lift the truncate target to >= 8 — committed data is never dropped.
-        let committed_hw = 8u64;
-        let plan = plan_resync(&report, 1, committed_hw, log_end, ResyncBounds::default())
-            .expect("plan")
-            .expect("a plan");
+        let first_divergent_offset = 3u64;
+        let plan = plan_resync(
+            &report,
+            first_divergent_offset,
+            log_end,
+            ResyncBounds::default(),
+        )
+        .expect("plan")
+        .expect("a plan");
+        assert_eq!(
+            plan.truncate_to, first_divergent_offset,
+            "the truncate target is the first divergent offset, NOT clamped to the committed HW (#798)"
+        );
+
+        // Execute the resync: the committed divergent region is dropped and re-fetched, and the replica
+        // converges BYTE-IDENTICAL to the leader. execute_resync's post-resync convergence check
+        // (#798) would FAIL CLOSED if the repair had left any divergence.
+        let mut follower = Follower::new(divergent_log);
+        let resync =
+            execute_resync(&mut follower, &leader, &plan, 4, 4096).expect("resync converges");
         assert!(
-            plan.truncate_to >= committed_hw,
-            "the truncate target is clamped at or above the committed HW ({} >= {committed_hw})",
-            plan.truncate_to
+            resync.records_dropped > 0,
+            "the divergent committed region was dropped"
+        );
+        assert!(
+            resync.records_refetched > 0,
+            "clean bytes were re-fetched from the leader"
+        );
+        assert_eq!(
+            dump_segments(follower.log()),
+            dump_segments(&leader),
+            "the committed divergence below the HW is repaired byte-identical (#798)"
+        );
+    }
+
+    #[test]
+    fn a_resync_that_truncates_nothing_fails_closed_instead_of_reporting_a_false_heal() {
+        // #798: the convergence guard. A resync plan that would truncate nothing while the replica is
+        // still divergent (the shape the OLD committed-HW clamp produced for a committed-prefix
+        // corruption) must FAIL CLOSED — never return Ok with quarantined=true while the corrupt bytes
+        // remain live. We hand execute_resync a hand-built plan whose truncate target is the log end (drop
+        // nothing) and assert the post-resync re-fingerprint catches the surviving divergence.
+        let leader = log_with(&[
+            b"alpha", b"bravo", b"charlie", b"delta", b"echo", b"foxtrot", b"golf",
+        ]);
+        let divergent_log = log_with(&[
+            b"alpha", b"bravo", b"ZZZZZ", b"delta", b"echo", b"foxtrot", b"golf",
+        ]);
+        let leader_fp = fingerprint_log(&leader).expect("fp");
+        let divergent_fp = fingerprint_log(&divergent_log).expect("fp");
+        let report = compare_fingerprints(&divergent_fp, &leader_fp);
+        assert!(!report.is_clean(), "the committed divergence is detected");
+
+        let log_end = divergent_log.next_offset().get();
+        // The buggy-clamp shape: truncate_to lifted to the log end, so the truncate drops nothing and the
+        // re-fetch is a no-op — exactly what the pre-#798 clamp produced for a sub-HW divergence.
+        let bad_plan = ResyncPlan {
+            truncate_to: log_end,
+            records_to_refetch: 0,
+        };
+        let mut follower = Follower::new(divergent_log);
+        let err = execute_resync(&mut follower, &leader, &bad_plan, 4, 4096)
+            .expect_err("a resync that drops nothing must fail closed, not report a heal");
+        assert!(
+            matches!(err, ReplicationError::ResyncDidNotConverge { remaining } if remaining > 0),
+            "the surviving divergence is reported, not a false success: {err:?}"
         );
     }
 
@@ -1308,14 +1404,16 @@ mod tests {
         );
 
         // REPAIR: open the forensic quarantine on the minority's data dir, capture the corrupt bytes,
-        // then truncate + re-fetch the clean bytes from the majority. The truncate target is the start
-        // of the corrupt segment (clamped at >= 0 committed-from-quorum's view for this test).
+        // then truncate + re-fetch the clean bytes from the majority. The truncate target is the start of
+        // the corrupt segment (offset 0) — which is COMMITTED data (the leader has 7 committed records),
+        // and #798 drops + re-fetches it from the clean leader rather than clamping above it. The
+        // convergence check inside execute_resync then verifies the repair actually converged.
         let corrupt_source = fs.open(&target).unwrap();
         let mut quarantine = QuarantineStore::open(&fs, 64 * 1024).expect("quarantine opens");
         let bytes_before = quarantine.bytes();
 
         let log_end = minority_log.next_offset().get();
-        let plan = plan_resync(&report, 0, 0, log_end, ResyncBounds::default())
+        let plan = plan_resync(&report, 0, log_end, ResyncBounds::default())
             .expect("plan")
             .expect("a plan");
 

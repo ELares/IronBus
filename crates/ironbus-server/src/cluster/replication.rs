@@ -388,6 +388,14 @@ pub enum ReplicationError {
         /// A human description of the framing fault.
         what: String,
     },
+    /// A resync (truncate + re-fetch) ran but the replica did NOT converge byte-identical to the clean
+    /// quorum leader — the post-resync re-fingerprint still reported divergence (#798). FAIL CLOSED: a
+    /// resync that did not actually repair the divergence (e.g. a plan that truncated nothing, or a
+    /// leader that served a short prefix) is NEVER reported as a successful heal.
+    ResyncDidNotConverge {
+        /// The number of segments still divergent against the leader after the resync.
+        remaining: usize,
+    },
 }
 
 impl core::fmt::Display for ReplicationError {
@@ -424,6 +432,10 @@ impl core::fmt::Display for ReplicationError {
             ReplicationError::Storage(e) => write!(f, "replication local append failed: {e}"),
             ReplicationError::Io(e) => write!(f, "replication peer link IO error: {e}"),
             ReplicationError::Frame { what } => write!(f, "replication peer frame error: {what}"),
+            ReplicationError::ResyncDidNotConverge { remaining } => write!(
+                f,
+                "resync did not converge: {remaining} segment(s) still divergent from the leader"
+            ),
         }
     }
 }
