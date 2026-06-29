@@ -10,7 +10,7 @@
 >
 > **Where this is going:** the v2 mission is for IronBus to be feature-rich and decisively better than NATS on every front, **single node or clustered**, with clustering a first-class goal (not post-1.0). Read **[docs/MISSION.md](docs/MISSION.md)** — it is scrupulously explicit about what is achieved and measured today versus what is v2 target, not yet built.
 
-IronBus is one durable, ordered queue (think a single AWS SQS queue) that lives on the device, survives power loss and corrupt files on its own, and fans out to many consumers. It ships as a single static binary you can drop onto a Raspberry Pi. It takes the best small, composable ideas from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, and SQS, and leaves behind the operational weight and the silent durability footguns that do not survive a battery-less edge node. The single-node durable broker is what runs today; multi-stream, subjects, KV, an object store, and a real multi-node cluster are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)).
+IronBus is one durable, ordered queue (think a single AWS SQS queue) that lives on the device, survives power loss and corrupt files on its own, and fans out to many consumers. It ships as a single static binary you can drop onto a Raspberry Pi. It takes the best small, composable ideas from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, and SQS, and leaves behind the operational weight and the silent durability footguns that do not survive a battery-less edge node. The single-node durable broker is what runs today; multi-stream, subjects, and a real multi-node cluster are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)). A KV store and an object store are non-goals: IronBus stays a pure message bus.
 
 ---
 
@@ -58,9 +58,9 @@ mission is for IronBus to be feature-rich and decisively better than NATS on eve
 cluster degrades to, not the ceiling:
 
 - **One log today; multi-stream, subjects, and a routing fabric are the v2 roadmap.** The shipped binary
-  is one durable ordered log. Multiple streams, subject routing, wildcards, a KV store, and an object
-  store are planned (v2 single-node milestones), not a non-goal. Until they land, multiple independent
-  queues can be run as separate instances.
+  is one durable ordered log. Multiple streams, subject routing, and wildcards are planned (v2
+  single-node milestones), not a non-goal. A KV store and an object store are non-goals: IronBus stays a
+  pure message bus. Until multi-stream lands, multiple independent queues can be run as separate instances.
 - **Single node today; a real cluster is the v2 roadmap, and clustering is first-class.** The shipped
   binary is single-node durable (`fdatasync` before ack). Replication is **not** a non-goal and **not**
   deferred to post-1.0: real multi-node clustering — leader/follower replication with NATS-cluster parity
@@ -72,6 +72,8 @@ cluster degrades to, not the ceiling:
 **IronBus is explicitly NOT (these are durable non-goals):**
 
 - Not exactly-once. At-least-once is the contract, with an optional fire-and-forget fast path. No exactly-once handshake.
+- Not a key/value store. A KV store (the NATS JetStream KV analog) is a different product category; IronBus stays a pure message bus.
+- Not an object store. Chunked object storage is out of scope. (Tiered storage of cold log segments to an object-storage backend is core log infrastructure and stays on the roadmap, which is distinct from being an object store.)
 - Not a Kafka wire-protocol clone, and not a Windows product in v1 (Windows fsync and path semantics differ enough to threaten the durability guarantee).
 
 ---
@@ -271,7 +273,7 @@ A fresh-eyes second pass over every issue resolved over one hundred design quest
 
 | Question | Decision |
 | --- | --- |
-| Logical scope | One durable ordered queue per instance today. Multi-stream, subjects, partitions, KV, and an object store are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)), not a permanent non-goal. |
+| Logical scope | One durable ordered queue per instance today. Multi-stream, subjects, and partitions are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)), not a permanent non-goal. A KV store and an object store are non-goals (IronBus stays a pure message bus). |
 | Delivery contract | At-least-once, pull-based in v1. SQS-style visibility-timeout leases (default 30s, hard cap 5 minutes), persisted redelivery count, default max-deliver 5, then dead-letter queue. |
 | Ordering | Total durable order of the log. Per-group at-least-once, not per-group strict in-order delivery. Exactly-once is a non-goal. |
 | Storage model | Log-is-WAL: a publish is one framed, checksummed, record-aligned append to the active segment, and that append is the durable record. No separate WAL file. The offset index is derived and rebuildable. |
@@ -345,7 +347,7 @@ The v1 design work was grouped into three milestones, and the single-node broker
 - **M1: Architecture Specification.** Vetted specs for every core subsystem: semantics, storage, record format, durability, recovery, corruption skip, consumers, backpressure, protocol, compression, retention, configuration, and the CLI.
 - **M2: Prototype-Ready Design.** The cross-cutting concerns that gate coding: observability, build and distribution, security, performance, edge constraints, verification, governance, and the end-to-end golden-path acceptance scenario.
 
-**Beyond the single node — the v2 mission.** IronBus's goal is to be feature-rich and decisively better than NATS on every front, single node **or clustered**, with clustering a first-class goal rather than a post-1.0 afterthought. The v2 single-node milestones (consume-beats-NATS, multi-stream + subjects, KV, object store, routing richness) and the first-class clustering milestones (metadata consensus, per-partition pull replication, `fsync`'d-on-a-quorum cluster acks, bounded self-healing divergence) are laid out — with an explicit achieved-vs-target honesty split — in **[docs/MISSION.md](docs/MISSION.md)**.
+**Beyond the single node — the v2 mission.** IronBus's goal is to be feature-rich and decisively better than NATS on every front, single node **or clustered**, with clustering a first-class goal rather than a post-1.0 afterthought. The v2 single-node milestones (consume-beats-NATS, multi-stream + subjects, routing richness) and the first-class clustering milestones (metadata consensus, per-partition pull replication, `fsync`'d-on-a-quorum cluster acks, bounded self-healing divergence) are laid out — with an explicit achieved-vs-target honesty split — in **[docs/MISSION.md](docs/MISSION.md)**.
 
 ---
 
