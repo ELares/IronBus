@@ -654,6 +654,9 @@ fn build_config(setup: &Setup) -> EngineConfig {
         max_messages: 0,
         disk_full_policy: policy,
         max_groups: 1024,
+        // Named-stream cap OFF (#863, `0` = unlimited): the conformance vectors assume the
+        // historical unbounded behavior, so the golden bytes are unchanged by the cap.
+        max_streams: 0,
         group_idle_evict_ms: 0,
         ram_ceiling_bytes: 0,
         dedup: DedupConfig {

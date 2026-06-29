@@ -35,6 +35,8 @@ fn config() -> EngineConfig {
         max_messages: 0,
         // The default work-group cap (#240): the determinism image is unchanged by this field.
         max_groups: DEFAULT_MAX_GROUPS,
+        // Named-stream cap OFF (#863, `0` = unlimited): the determinism image is unchanged by the cap.
+        max_streams: 0,
         // Idle named-group eviction OFF (#277), the default: the determinism image is unchanged.
         group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
         ram_ceiling_bytes: 0,
