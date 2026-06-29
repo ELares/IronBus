@@ -264,15 +264,21 @@ where
 
     // Read the request HEAD (request line + headers) under a bounded byte and total-time budget; the
     // outcome is either a parsed head or an already-sent error response (414/408) or a clean close.
-    let (head, request_line_end) = match read_request_head(&mut stream)? {
-        RequestHead::Parsed { head, line_end } => (head, line_end),
+    let head = match read_request_head(&mut stream)? {
+        RequestHead::Parsed { head } => head,
         // Either an error response was already sent (414/408) or the client closed before a full
         // request line; in both cases there is nothing more to answer.
         RequestHead::Responded | RequestHead::Closed => return Ok(()),
     };
 
+    // Split the request line from the header section on the first `\n` of the LOSSY string itself,
+    // never a raw byte index: `from_utf8_lossy` turns each invalid byte into a 3-byte U+FFFD and shifts
+    // every later offset, so indexing the lossy string with a raw-buffer index can land inside a U+FFFD
+    // and panic the whole process (#860). `\n` survives the lossy conversion unchanged, so `split_once`
+    // is char-boundary-safe. The read loop only yields `Parsed` once a `\n` is present, so this splits.
+    let (request_line, header_section) = head.split_once('\n').unwrap_or((head.as_str(), ""));
     // Parse "METHOD PATH VERSION" (a leading CR is trimmed by split_whitespace).
-    let line = head[..request_line_end].trim_end_matches('\r');
+    let line = request_line.trim_end_matches('\r');
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("");
@@ -286,7 +292,7 @@ where
     }
     // The `Accept` header value (lower-cased, all values joined), for the `/admin` version pin (#99).
     // Absent on a plain `curl`, which is fine: an absent or wildcard Accept takes the current version.
-    let accept = parse_accept_header(&head[request_line_end..]);
+    let accept = parse_accept_header(header_section);
     // Drop any query string.
     let path = raw_path.split('?').next().unwrap_or(raw_path);
 
@@ -387,9 +393,10 @@ where
 
 /// The outcome of reading the request head ([`read_request_head`]).
 enum RequestHead {
-    /// The request head was read; `head` is the decoded bytes and `line_end` the byte index of the
-    /// request line's terminating `\n` within it.
-    Parsed { head: String, line_end: usize },
+    /// The request head was read (lossy-decoded). The caller splits it on its own first `\n` rather
+    /// than a raw byte index: `from_utf8_lossy` turns each invalid byte into a 3-byte U+FFFD and shifts
+    /// every later offset, so a raw index can land inside a U+FFFD and panic (#860).
+    Parsed { head: String },
     /// An error response (414/408) was already sent to the client; the caller should return.
     Responded,
     /// The client closed before sending a complete request line; there is nothing to answer.
@@ -413,7 +420,7 @@ fn read_request_head(stream: &mut TcpStream) -> std::io::Result<RequestHead> {
     let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
     let mut buf = vec![0u8; MAX_REQUEST_LINE];
     let mut len = 0;
-    let line_end = loop {
+    loop {
         if len == buf.len() {
             respond(stream, 414, "URI Too Long", "request line too long")?;
             return Ok(RequestHead::Responded);
@@ -435,12 +442,12 @@ fn read_request_head(stream: &mut TcpStream) -> std::io::Result<RequestHead> {
         // Break as soon as the request LINE is complete (its terminating newline). Any header bytes
         // that came along in the same read are already in `buf[..len]` and are parsed by the caller;
         // we do not issue another blocking read for headers, so a request-line-only client never hangs.
-        if let Some(pos) = buf[..len].iter().position(|&b| b == b'\n') {
-            break pos;
+        if buf[..len].contains(&b'\n') {
+            break;
         }
-    };
+    }
     let head = String::from_utf8_lossy(&buf[..len]).into_owned();
-    Ok(RequestHead::Parsed { head, line_end })
+    Ok(RequestHead::Parsed { head })
 }
 
 /// Extracts and lower-cases the `Accept` header value(s) from the header section (everything after
@@ -2420,6 +2427,38 @@ mod tests {
         // A query string is stripped.
         let q = request(addr, "GET /healthz?probe=1 HTTP/1.1\r\n\r\n");
         assert!(q.starts_with("HTTP/1.1 200 OK"), "{q}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_line_with_an_invalid_utf8_byte_does_not_crash_the_broker() {
+        // #860 regression: a request line carrying an invalid-UTF-8 byte must NOT abort the process.
+        // Pre-fix, the raw newline index was used to slice the `from_utf8_lossy` string (where the bad
+        // byte became a 3-byte U+FFFD), landing inside the U+FFFD and panicking; under `panic = "abort"`
+        // that took down the entire broker from one unauthenticated packet. Post-fix the head is split on
+        // its own `\n`, so the request is handled and the broker stays up.
+        let (addr, shutdown, handle, _engine) = start();
+
+        // A 0xFF byte in the request line (not expressible as a &str, so connect and write raw bytes).
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"GET /healthz \xFF\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).unwrap();
+        let resp = String::from_utf8_lossy(&out);
+        assert!(
+            resp.starts_with("HTTP/1.1 "),
+            "expected an HTTP response (no crash), got: {resp:?}"
+        );
+
+        // The broker is still alive: a normal probe on the SAME listener still succeeds.
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            h.starts_with("HTTP/1.1 200 OK"),
+            "broker survived the malformed request and still serves: {h}"
+        );
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
