@@ -576,18 +576,18 @@ fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliErro
     // syscall per message — the same coalescing a core pub client (e.g. NATS `nats bench pub`) performs.
     // This is what makes the QoS-0 send rate a fair head-to-head with a coalescing core pub rather than
     // a self-handicapped syscall-per-message loop.
-    let mut producer = pub_client.fire_and_forget_producer();
+    let mut faf_producer = pub_client.fire_and_forget_producer();
     while !should_stop(&cfg.bound, produced, started) {
         // No reply is read (the broker sends no PubAck for a fire-and-forget produce); TCP backpressure
         // is the only pacing when the broker falls behind. An IO/encode error is fatal (frozen codes).
-        producer
+        faf_producer
             .send(&body)
             .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
         produced += 1;
         pace(cfg.target_rate_hz, produced, started);
     }
     // Push the final partial batch before stopping the clock so every counted message is on the wire.
-    producer
+    faf_producer
         .flush()
         .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
     let elapsed = started.elapsed();

@@ -597,12 +597,29 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     /// Returns [`ActorGone`] if the actor exited before the batch could be enqueued. (A per-append SHED
     /// is NOT an error: the L0 produce is dropped, counted, and the rest of the batch still sends.)
     pub fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
+        if appends.is_empty() {
+            return Ok(());
+        }
+        // FAST PATH — no cap configured (the default): the gate can NEVER shed (`would_shed` is `false`
+        // by construction when `cap == 0`), so EVERY append is admitted. Move the whole batch straight
+        // into the one command WITHOUT the per-append pre-check and WITHOUT a second `admitted`
+        // allocation + element-by-element move. The session already owns exactly this connection's
+        // socket-read worth of Level-0 appends, so on the common uncapped QoS-0 hot path this batch
+        // submit allocates and copies nothing extra (the very allocation this #11 fast path exists to
+        // avoid per message must not be re-introduced per batch).
+        if self.cap_gate.cap() == 0 {
+            return self
+                .tx
+                .send(Command::ProduceNoReplyBatch { appends })
+                .map_err(|_| ActorGone);
+        }
+        // CAPPED PATH: per-append fast-reject, SAME as `produce_no_reply`. The byte-cap snapshot can
+        // advance as the actor drains, so re-sample it per append (a `would_shed` that fires is SURE the
+        // actor would shed; it never false-rejects). Drop at-or-over-cap appends here, count each on the
+        // L0 shed counter (folded into `fire_and_forget_shed`, not `produce_rejected`, never silent), and
+        // send only the admitted ones, IN ORDER, in one command. If every append sheds, send nothing.
         let mut admitted: Vec<OwnedAppend> = Vec::with_capacity(appends.len());
         for append in appends {
-            // SAME fast-reject as `produce_no_reply`, per append: when the gate is SURE the actor would
-            // shed it, drop it here (the L0 producer accepts loss) and count it on the L0 shed counter
-            // (folded into `fire_and_forget_shed`, not `produce_rejected`), so a dropped L0 is never
-            // silent. The gate never false-rejects, so an admitted append is one the actor would accept.
             if self.cap_gate.would_shed() {
                 self.cap_gate.record_l0_shed();
             } else {
