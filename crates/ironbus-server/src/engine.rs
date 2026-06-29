@@ -4235,12 +4235,36 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     .as_ref()
                     .and_then(|s| s.prepared_payload(txn_id).cloned())
                     .ok_or(EngineError::Txn(ironbus_core::txn::TxnError::UnknownTxn))?;
-                let real_offset = self.commit_real_append(txn_id, &half)?; // STEP A (write, no fsync)
-                self.flush_txn_commit_dedup()?; // STEP A2: dedup identity durable before the record
-                self.commit_batch()?; // STEP A3: the real record is now durable
-                                      // STEP B: the commit point. On its failure the in-memory table already says Committed
-                                      // but no marker is durable; a reopen replays as Prepared and re-commits, deduped by the
-                                      // (now-durable, from A2) txn-id seq — safe. We surface the error.
+                // STEP A/A2/A3 make the real record durable. `commit()` above ALREADY moved the in-memory
+                // lifecycle to Committed, so on ANY failure here — including a NON-FATAL shed like
+                // `StorageError::AtCapacity` that leaves the engine alive — the table would wrongly read
+                // Committed over a record that is NOT durable. ROLL BACK the resolve to Prepared (#801),
+                // so a same-process retry re-enters this fresh `Resolved` arm and re-drives the append
+                // instead of taking the benign `AlreadyResolved` arm and fabricating a success offset
+                // (`dedup_offset_for`'s head fallback) for a message that was never written. (Same spirit
+                // as `txn_prepare`'s undo-the-in-memory-effect-of-a-failed-durable-step, but to the
+                // RE-DRIVABLE `Prepared` state, NOT `txn_prepare`'s spent `RolledBack` tombstone.) The
+                // buffered payload is untouched (it is dropped only in `mark_committed`, STEP B), so the
+                // retry re-appends it; if STEP A had already recorded the txn-id seq high-water, the
+                // retry's dedup returns the same offset and just fsyncs the still-buffered record — exactly
+                // one durable record either way.
+                let real_offset = match self.commit_durable_steps(txn_id, &half) {
+                    Ok(offset) => offset,
+                    Err(e) => {
+                        // The txn store is GUARANTEED open here — `commit()` at the top of this method
+                        // read it to get the decision — so `ensure_txn_store` cannot fail; the `if let`
+                        // is a borrow-free way to take the handle, not error-swallowing (a silent no-op
+                        // would reinstate the #801 leak, which the just-read store rules out).
+                        if let Ok(store) = self.ensure_txn_store() {
+                            store.table_mut().revert_resolved_to_prepared(txn_id, now);
+                        }
+                        return Err(e);
+                    }
+                };
+                // STEP B: the commit point. On its failure the in-memory table already says Committed but
+                // no marker is durable; a reopen replays as Prepared and re-commits, deduped by the
+                // (now-durable, from A2) txn-id seq — safe, and a same-process retry takes `AlreadyResolved`
+                // and returns the now-correct durable offset from `dedup_offset_for`. We surface the error.
                 let store = self.ensure_txn_store()?;
                 store
                     .mark_committed(txn_id, real_offset.get())
@@ -4253,6 +4277,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 Ok(real_offset)
             }
         }
+    }
+
+    /// Runs the durable commit steps A/A2/A3 for a freshly-resolved txn (#801): WRITE the buffered
+    /// payload to the real stream (no fsync, deduped by the txn-id seq), FLUSH the dedup seq high-water
+    /// BEFORE the record, then COMMIT-BATCH (fsync) so the record is durable. Returns the assigned real
+    /// offset. Factored out of [`Engine::txn_commit`] so a failure of ANY step is handled atomically —
+    /// the caller rolls the in-memory resolve back to `Prepared` — without duplicating the sequence or
+    /// leaving a step half-applied on the error path.
+    fn commit_durable_steps(
+        &mut self,
+        txn_id: &[u8],
+        half: &ironbus_storage::txn::HalfMessage,
+    ) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
+        let real_offset = self.commit_real_append(txn_id, half)?; // STEP A (write, no fsync)
+        self.flush_txn_commit_dedup()?; // STEP A2: dedup identity durable before the record
+        self.commit_batch()?; // STEP A3: the real record is now durable
+        Ok(real_offset)
     }
 
     /// Appends a committed half message's payload to its real target stream, DEDUPED by the txn id via
@@ -16527,6 +16571,145 @@ mod tests {
         assert_eq!(off2, off3);
         // Exactly one record is visible (no double-append from the re-commits).
         assert_eq!(drain_visible(&mut e), vec![b"v".to_vec()]);
+    }
+
+    #[test]
+    fn a_commit_whose_durable_append_sheds_rolls_back_to_prepared_and_never_fabricates_a_success() {
+        // #801: txn_commit moved the in-memory lifecycle to Committed BEFORE the durable STEP A/A2/A3.
+        // On a NON-FATAL shed there (the byte-cap AtCapacity, which leaves the engine alive) the table
+        // was left Committed over a record that was never written, the buffered payload survived, and a
+        // SAME-PROCESS retry took the benign AlreadyResolved arm — returning `dedup_offset_for`'s head
+        // fallback, a fabricated offset pointing at an UNRELATED record, for a message that was never
+        // appended (a silent exactly-once violation). The fix rolls the resolve back to Prepared
+        // (mirroring txn_prepare), so the retry re-drives the real append instead of fabricating success.
+        let one = one_record_bytes();
+        // A cap that holds exactly two 16-byte records; the txn's real append would be the third.
+        let mut e = open(config_with_total_cap(2 * one));
+
+        // Prepare the txn — its half record lives in `txn/`, separate from the real log's byte cap.
+        e.txn_prepare(b"tx1", "", &txn_half(&[0xcd; 16]), b"")
+            .unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+
+        // Fill the real log to the cap with two normal produces.
+        assert_eq!(produce(&mut e, &[0xab; 16]), Offset::new(0));
+        assert_eq!(produce(&mut e, &[0xab; 16]), Offset::new(1));
+        let flushed_before = e.flushed_offset();
+
+        // The commit's real append is the third record: it sheds the non-fatal AtCapacity.
+        let err = e.txn_commit(b"tx1").unwrap_err();
+        assert!(
+            err.is_at_capacity(),
+            "the commit's real append sheds the byte cap, got {err:?}"
+        );
+        assert!(!err.is_fatal(), "the shed is never fatal");
+        assert!(e.is_healthy(), "the writer stays live after a shed");
+
+        // THE FIX: the in-memory resolve was rolled back, so the txn is STILL Prepared (not Resolved),
+        // its buffered payload preserved, and nothing phantom landed in the real stream.
+        assert_eq!(
+            e.txn_prepared_count(),
+            1,
+            "the failed commit rolled the resolve back to Prepared (pre-fix: 0, leaked as Committed)"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            flushed_before,
+            "no phantom record was appended (the durable head still covers only the two fillers)"
+        );
+
+        // A same-process retry while still at capacity must SURFACE the shed again — NOT fabricate a
+        // success. Pre-fix this returned Ok(Offset::new(2)) (`dedup_offset_for`'s head fallback), a
+        // fabricated offset for the unrelated record at the head.
+        let retry = e.txn_commit(b"tx1");
+        assert!(
+            matches!(retry, Err(ref e) if e.is_at_capacity()),
+            "the retry re-drives and sheds again, never fabricating an AlreadyResolved success, got {retry:?}"
+        );
+        assert_eq!(
+            e.txn_prepared_count(),
+            1,
+            "still Prepared after the second shed — never silently resolved"
+        );
+
+        // The txn payload (0xcd) NEVER reached a consumer: only the two fillers were ever visible.
+        assert_eq!(
+            drain_visible(&mut e),
+            vec![vec![0xab; 16], vec![0xab; 16]],
+            "the un-committed half message never became visible — no poison/phantom delivery"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_sheds_after_the_real_append_re_drives_to_exactly_one_record_on_retry() {
+        // #801 positive path: STEP A (the real append) SUCCEEDS and records the txn-id seq high-water,
+        // then STEP A2 (the dedup-seq checkpoint write) FAILS non-fatally. The resolve is rolled back to
+        // Prepared, and after the condition CLEARS a same-process retry re-drives — its `commit_real_append`
+        // dedups against the seq high-water recorded in attempt 1, so it returns the SAME offset and just
+        // re-fsyncs the still-buffered record: EXACTLY ONE durable record at the returned offset, visible
+        // once, never a double-append and never a fabricated success.
+        use ironbus_storage::fault::FaultFs;
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+
+        // A first txn commits cleanly: this materializes the main-log segment AND the producer-seq
+        // checkpoint file, so the faulted commit below fails on the checkpoint WRITE (STEP A2), not on a
+        // first-time file create.
+        e.txn_prepare(b"tx0", "", &txn_half(b"zero"), b"").unwrap();
+        assert_eq!(e.txn_commit(b"tx0").unwrap(), Offset::new(0));
+
+        // Prepare the txn under test, then arm a write fault: STEP A buffers the record (no write) and
+        // records the seq, STEP A2's checkpoint write_all_at then fails.
+        e.txn_prepare(b"tx1", "", &txn_half(b"one"), b"").unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        control.set_fail_write(true);
+        let err = e.txn_commit(b"tx1").unwrap_err();
+        assert!(
+            !err.is_fatal(),
+            "the checkpoint-write shed is non-fatal, got {err:?}"
+        );
+        assert!(
+            e.is_healthy(),
+            "the engine stays live after the non-fatal shed"
+        );
+        assert_eq!(
+            e.txn_prepared_count(),
+            1,
+            "the failed commit rolled the resolve back to Prepared, not Committed"
+        );
+
+        // Clear the condition and RETRY: the re-drive dedups to the same offset and commits exactly one
+        // durable record.
+        control.set_fail_write(false);
+        let off = e.txn_commit(b"tx1").unwrap();
+        assert_eq!(
+            off,
+            Offset::new(1),
+            "the re-drive commits at the dense next offset"
+        );
+        assert_eq!(e.txn_prepared_count(), 0, "the txn is now resolved");
+
+        // Idempotent re-commit returns the same offset and appends nothing.
+        assert_eq!(e.txn_commit(b"tx1").unwrap(), Offset::new(1));
+
+        // Exactly the two committed records are visible, in order, with no duplicate of tx1.
+        // (Inline drain: the shared `drain_visible` helper is typed for the in-memory FS only.)
+        let mut seen = Vec::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    seen.push(d.record.payload.to_vec());
+                    e.ack(&d.token);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![b"zero".to_vec(), b"one".to_vec()],
+            "exactly one durable record per committed txn — no double-append, no loss"
+        );
     }
 
     #[test]
