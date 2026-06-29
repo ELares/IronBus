@@ -29,8 +29,8 @@ Where this spec constrains an existing surface it cites the issue that owns it: 
 never claims those surfaces already carry auth; they do not.
 
 This document is the authority for the auth contract. The README "Secure by
-default" bullets and the THREAT_MODEL "specified controls not yet implemented"
-table are summaries that point here; where they differ, this document is canonical.
+default" bullets and the THREAT_MODEL security-controls table are summaries that
+point here; where they differ, this document is canonical.
 
 ---
 
@@ -350,9 +350,11 @@ and the leaked credential is rejected the instant the second deploy lands.
 
 ## Configuration surface (constrains #14)
 
-The credential and scope configuration is owned by the #14 configuration system;
-this spec states the keys it must provide and their semantics, not their final TOML
-spelling (which #14 freezes). All of these are **specified, not implemented.**
+The credential and scope configuration is owned by the configuration system; this
+spec states the keys it must provide and their semantics. These are **implemented**
+(#631; minted and managed via the `ironbus passwd` tool and the `--auth-config`
+identity table), except the mTLS trust anchor, which is configurable but inert until
+the TLS transport (#766) lands.
 
 - An **identity table**: a set of named identities, each with an explicit scope set
   drawn from `{publish, subscribe, admin}` and a credential binding for one of the
@@ -371,23 +373,26 @@ No configuration key carries a credential expiry time, by design (see
 
 ---
 
-## Specified but not implemented (honest status)
+## Authentication status (implemented vs still-specified)
 
-None of the following exists in the binary today. Do not assume any of it.
+Most of the connection-scoped auth model below SHIPS today (#631 / #633 / #635). Auth is opt-in: a broker
+with no configured auth table is unauthenticated (the dev default, unchanged), and a broker with an auth
+table pins the identity and scope set at the `Connect` handshake. What remains is the TLS transport (#766).
+A row is only present if it says **IMPLEMENTED**.
 
 | Item | Status | Owner |
 | --- | --- | --- |
-| Populated `Connect`/`Info` handshake bodies carrying the mechanism + credential | Specified here, frozen in #11 | #11, #106 |
-| Bearer token (SHA-256 storage, constant-time compare) | Specified, not implemented | #106 |
-| Username/password (Argon2id m=19 MiB, t=2, p=1) | Specified, not implemented | #106 |
-| mTLS SAN identity (URI-then-DNS, CN excluded, no-match rejected) | Specified, not implemented | #106, #107 |
-| The three scopes (publish/subscribe/admin, no implication) | Specified, not implemented | #106 |
-| Admin scope on `/admin`, the #15/#136 diagnostics, and mutating admin (#299) | Specified, not implemented | #106, #15, #99, #299 |
-| Additive credential-set rotation (no expiry timer) | Specified, not implemented | #106 |
-| Uniform Authorization Violation `Err` (no oracle) | Specified, not implemented | #106 |
-| TLS 1.3 transport that carries the credential on a non-loopback bind | Specified | #107 |
-| Failed-auth lockout and per-source pre-auth DoS defenses (per-IP rate limit, half-open cap, lockout) | **IMPLEMENTED** (#633) | #633 |
-| Secret-file fail-closed permissions; security audit events | Secret-file perms IMPLEMENTED; audit events specified | #109 |
+| Populated `Connect`/`Info` handshake bodies carrying the mechanism + credential (`parse_connect_auth`) | **IMPLEMENTED** | #631 |
+| Bearer token (SHA-256 storage, constant-time compare) | **IMPLEMENTED** | #631 |
+| Username/password (Argon2id m=19 MiB, t=2, p=1) | **IMPLEMENTED** | #631 |
+| mTLS SAN identity (URI-then-DNS, CN excluded, no-match rejected) | Verification **IMPLEMENTED** (#631), but **inert until the TLS transport lands** (#766) | #631, #766 |
+| The three scopes (publish/subscribe/admin, no implication) | **IMPLEMENTED** | #631 |
+| Admin scope on `/admin` and the #15/#136 diagnostics | Admin scope **IMPLEMENTED** (#631); mutating admin verbs remain open (#299) | #631, #299 |
+| Additive credential-set rotation (no expiry timer; add-then-remove) | **IMPLEMENTED** | #631 |
+| Uniform Authorization Violation `Err` (no oracle) | **IMPLEMENTED** (constant-time, one `AuthError::Violation`) | #631 |
+| TLS 1.3 transport that carries the credential on a non-loopback bind | Specified, **NOT implemented** — the wire is plaintext today | #766 |
+| Failed-auth lockout and per-source pre-auth DoS defenses (per-IP rate limit, half-open cap, lockout) | **IMPLEMENTED** | #633 |
+| Secret-file fail-closed permissions; security audit events | **IMPLEMENTED** (secret-file perms + the structured audit-event stream) | #109, #635 |
 
 ## The `ironbus passwd` minting tool (#631)
 
