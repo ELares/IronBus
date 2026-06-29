@@ -99,7 +99,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -683,6 +683,32 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
 /// busy-spins. The same cadence the metadata [`ClusterRuntime`](super::runtime::ClusterRuntime) uses.
 const DATAPLANE_POLL: Duration = Duration::from_millis(100);
 
+/// The cap on CONCURRENT inbound peer reader threads on the data-plane listener (#865). Each accepted
+/// peer link spawns a detached reader thread (its own ~[`PER_CONNECTION_STACK_BYTES`](crate::rss::PER_CONNECTION_STACK_BYTES)
+/// stack and an fd), and follower-report auth happens only later inside `recv()` — after the thread and
+/// fd already exist. Without a cap, anything on the cluster network (a flood, or a peer holding many idle
+/// links) spawns unbounded threads and exhausts fd/RAM, collapsing the node — asymmetric with the
+/// client-facing server's `max_connections` cap. This mirrors the client default (256): far above any
+/// real cluster's inbound peer-link count (a node's followers), yet a hard bound — at 256 the reader
+/// stacks total ~16 MiB, well within the refuse-to-boot RAM budget even on an edge node. Over the cap an
+/// inbound link is refused (dropped) rather than spawning a thread.
+const MAX_DATAPLANE_READERS: usize = 256;
+
+/// Releases one concurrent-reader slot on drop (#865), so the [`MAX_DATAPLANE_READERS`] count is
+/// decremented when a reader thread exits on EITHER a normal return OR a panic unwind — the count can
+/// never leak and pin the cap. Constructed before the reader spawn and moved into it; a spawn FAILURE
+/// drops it too, releasing the slot the accept loop reserved.
+struct DataPlaneReaderSlot {
+    /// The shared concurrent-reader counter to decrement on drop.
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for DataPlaneReaderSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The follower fetch budgets: how many records / bytes a follower asks for per `FetchRecords`. The
 /// leader's read plane already bounds a response to a single sealed segment run, so a catch-up is
 /// several rounds; these are the FULL (un-throttled) upper bounds, themselves under
@@ -938,9 +964,23 @@ where
         let shutdown_l = Arc::clone(&shutdown);
         let server_l = Arc::clone(&server);
         let release_l = release.clone();
+        // The concurrent inbound-reader counter (#865), owned by the listener thread: each spawned
+        // reader holds a slot guard that decrements it on exit, so the listener caps concurrent peer
+        // readers at `MAX_DATAPLANE_READERS` and refuses any link beyond it rather than spawning an
+        // unbounded number of threads under a cluster-network flood.
+        let active_readers = Arc::new(AtomicUsize::new(0));
         let listener_handle = std::thread::Builder::new()
             .name("ib-dataplane-listen".to_string())
-            .spawn(move || run_dataplane_listener(listener, server_l, release_l, shutdown_l))
+            .spawn(move || {
+                run_dataplane_listener(
+                    listener,
+                    server_l,
+                    release_l,
+                    shutdown_l,
+                    MAX_DATAPLANE_READERS,
+                    active_readers,
+                );
+            })
             .expect("spawn data-plane listener thread");
 
         // The FOLLOWER side: one fetch loop per followed partition, dialing the leader's data address.
@@ -1013,9 +1053,12 @@ impl<F: Filesystem, C: Clock> Drop for DataPlaneRuntime<F, C> {
     }
 }
 
-/// The data-plane LISTENER thread: accept inbound peer connections and spawn a reader per connection.
-/// Reader threads are detached; they exit on a closed/broken link or shutdown. The accept loop is
-/// non-blocking and polls the shutdown flag so a stop is prompt.
+/// The data-plane LISTENER thread: accept inbound peer connections and spawn a reader per connection,
+/// up to `max_readers` CONCURRENT readers (#865). Reader threads are detached; they exit on a
+/// closed/broken link or shutdown, releasing their slot on `active_readers`. The accept loop is
+/// non-blocking and polls the shutdown flag so a stop is prompt. Over the cap an inbound link is
+/// REFUSED (dropped) rather than spawning an unbounded thread, and a thread-creation failure is logged
+/// and shed rather than silently swallowed.
 // A thread entry point: it OWNS the listener, the shared server, and the shutdown flag (cloned into
 // each per-connection reader it spawns) for the thread's lifetime; a borrow would fight the 'static
 // spawn bound and prevent cloning into the spawned readers.
@@ -1025,6 +1068,8 @@ fn run_dataplane_listener<F, C>(
     server: Arc<Mutex<DataPlaneServer<F, C>>>,
     release: AckRelease<F, C>,
     shutdown: Arc<AtomicBool>,
+    max_readers: usize,
+    active_readers: Arc<AtomicUsize>,
 ) where
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
@@ -1032,6 +1077,21 @@ fn run_dataplane_listener<F, C>(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                // CAP the concurrent inbound peer readers (#865): the accept loop is the sole
+                // incrementer of `active_readers` (readers only decrement, on exit), so this
+                // load-then-spawn is race-free against the cap — the count can never exceed the cap.
+                // At the cap, REFUSE the link by dropping the stream (it closes) rather than spawning an
+                // unbounded thread; auth happens only later inside `recv()`, so this bounds an
+                // unauthenticated cluster-network flood at the cheapest point. Logged (the flood is
+                // self-limiting — this fires only while saturated, once per refused link).
+                if active_readers.load(Ordering::Acquire) >= max_readers {
+                    tracing::warn!(
+                        cap = max_readers,
+                        "data plane: inbound peer reader cap reached; refusing a new link"
+                    );
+                    drop(stream);
+                    continue;
+                }
                 // The listener is NON-BLOCKING (so this accept loop can poll the shutdown flag), and on
                 // BSD/macOS an accepted stream INHERITS the listener's `O_NONBLOCK`. A blocking-mode read
                 // timeout (`SO_RCVTIMEO`, set below) is IGNORED on a non-blocking socket: `read` returns
@@ -1046,11 +1106,29 @@ fn run_dataplane_listener<F, C>(
                 let server = Arc::clone(&server);
                 let release = release.clone();
                 let sd = Arc::clone(&shutdown);
-                let _ = std::thread::Builder::new()
+                // Reserve the reader slot BEFORE spawning; the guard, moved into the reader, releases it
+                // on the reader's exit (return OR panic unwind), so the count can never leak. A spawn
+                // FAILURE drops the closure (and so the guard), releasing the slot automatically.
+                active_readers.fetch_add(1, Ordering::AcqRel);
+                let slot = DataPlaneReaderSlot {
+                    active: Arc::clone(&active_readers),
+                };
+                let spawn_result = std::thread::Builder::new()
                     .name("ib-dataplane-read".to_string())
                     .spawn(move || {
+                        let _slot = slot;
                         run_dataplane_reader(DataPlaneLink::new(stream), &server, &release, &sd);
                     });
+                if spawn_result.is_err() {
+                    // The OS refused thread creation (EAGAIN/ENOMEM): the failed closure was dropped,
+                    // which released the reserved reader slot (`slot`'s drop) and closed the stream.
+                    // Previously the spawn result was discarded with `let _ =`, swallowing the failure
+                    // silently (#865). Log it so an operator sees the thread/fd pressure, then keep
+                    // accepting rather than wedging the listener.
+                    tracing::warn!(
+                        "data plane: failed to spawn an inbound peer reader thread; link dropped"
+                    );
+                }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 sleep_interruptible(DATAPLANE_POLL, &shutdown);
@@ -2618,6 +2696,90 @@ mod tests {
         assert!(!server.seam().controller().is_leader(P));
         assert!(!server.seam().controller().is_follower(P));
         assert!(server.follower_partitions().is_empty());
+    }
+
+    #[test]
+    fn the_dataplane_listener_caps_concurrent_inbound_readers_and_refuses_beyond_it() {
+        // #865: each accepted inbound peer link spawns a reader thread (its own stack + fd), and auth
+        // happens only later inside `recv()`. Without a cap, a cluster-network flood (or a peer holding
+        // many idle links) spawns unbounded threads and exhausts fd/RAM. The listener now BOUNDS
+        // concurrent readers and REFUSES beyond the cap. Drive `run_dataplane_listener` directly with a
+        // small cap and an inspectable counter, open MORE connections than the cap, and assert the live
+        // reader count stays at the cap (excess links are refused) rather than growing 1:1.
+        const P: u64 = 0;
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 1,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        // A minimal server with no roles: the test exercises the LISTENER cap, and an idle reader simply
+        // parks on `recv()` (a read timeout loops and re-checks shutdown), so no serving plane is needed.
+        let server = DataPlaneServer::from_placements(
+            9, // not a replica — holds no plane
+            &placements,
+            quorum3(),
+            |_| None,
+            &InMemReplicaLogs,
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let server = Arc::new(Mutex::new(server));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let active_readers = Arc::new(AtomicUsize::new(0));
+        let cap = 2usize;
+
+        let listener_thread = std::thread::Builder::new()
+            .spawn({
+                let shutdown = Arc::clone(&shutdown);
+                let active = Arc::clone(&active_readers);
+                move || {
+                    run_dataplane_listener(
+                        listener,
+                        server,
+                        AckRelease::ServerOnly,
+                        shutdown,
+                        cap,
+                        active,
+                    );
+                }
+            })
+            .unwrap();
+
+        // Open well MORE connections than the cap, holding them all idle (kept in a Vec so they stay
+        // open — dropping one would close it and free a reader).
+        let total = cap + 3; // 5
+        let mut clients = Vec::new();
+        for _ in 0..total {
+            clients.push(TcpStream::connect(addr).unwrap());
+        }
+
+        // Poll until the cap saturates: the first `cap` links became parked readers; the rest are
+        // refused (dropped) by the listener. The accept loop is the SOLE incrementer and checks the cap
+        // before each spawn, so the count can never exceed `cap`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while active_readers.load(Ordering::Acquire) < cap && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The live reader count is BOUNDED by the cap, not 1:1 with the connections: exactly `cap`
+        // readers are live and the other `total - cap` inbound links were refused — the #865 bound.
+        assert_eq!(
+            active_readers.load(Ordering::Acquire),
+            cap,
+            "concurrent inbound readers are capped at {cap}, not 1:1 with {total} connections"
+        );
+
+        // Tear down: signal shutdown, join the listener loop; the detached readers exit on their next
+        // shutdown re-check (and drop their slot). Holding `clients` until here kept the readers parked.
+        shutdown.store(true, Ordering::Release);
+        listener_thread.join().unwrap();
+        drop(clients);
     }
 
     /// The wired reader rejects a hostile oversized data-plane frame over a REAL socket without
