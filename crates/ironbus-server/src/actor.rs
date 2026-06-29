@@ -596,7 +596,7 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     /// # Errors
     /// Returns [`ActorGone`] if the actor exited before the batch could be enqueued. (A per-append SHED
     /// is NOT an error: the L0 produce is dropped, counted, and the rest of the batch still sends.)
-    pub fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
+    pub fn produce_no_reply_batch(&self, mut appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
         if appends.is_empty() {
             return Ok(());
         }
@@ -618,19 +618,23 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
         // actor would shed; it never false-rejects). Drop at-or-over-cap appends here, count each on the
         // L0 shed counter (folded into `fire_and_forget_shed`, not `produce_rejected`, never silent), and
         // send only the admitted ones, IN ORDER, in one command. If every append sheds, send nothing.
-        let mut admitted: Vec<OwnedAppend> = Vec::with_capacity(appends.len());
-        for append in appends {
+        // Filter at-or-over-cap appends IN PLACE (no second allocation): `retain` calls the predicate
+        // once per append in order, so the per-append shed-sampling and the IN-ORDER admission are
+        // identical to the per-message path; only the extra `admitted` Vec is gone. If every append
+        // sheds, send nothing.
+        appends.retain(|_| {
             if self.cap_gate.would_shed() {
                 self.cap_gate.record_l0_shed();
+                false
             } else {
-                admitted.push(append);
+                true
             }
-        }
-        if admitted.is_empty() {
+        });
+        if appends.is_empty() {
             return Ok(());
         }
         self.tx
-            .send(Command::ProduceNoReplyBatch { appends: admitted })
+            .send(Command::ProduceNoReplyBatch { appends })
             .map_err(|_| ActorGone)
     }
 
@@ -1321,15 +1325,17 @@ fn gather_commands<F, C>(
 {
     let produces = commands
         .iter()
-        .filter(|c| {
-            matches!(
-                c,
-                Command::Produce { .. }
-                    | Command::ProduceNoReply { .. }
-                    | Command::ProduceNoReplyBatch { .. }
-            )
+        .map(|c| match c {
+            Command::Produce { .. } | Command::ProduceNoReply { .. } => 1,
+            // A batched Level-0 submit represents `appends.len()` pipelined produces, not one: count
+            // them so a coalesced batch trips the bounded-gather heuristic the same as that many
+            // per-message produces would. It group-commits as one batch regardless; counting the
+            // appends only restores the cross-socket-read fsync amortization the gather is meant to
+            // capture (otherwise a single 1000-append batch reads as "1 produce" and never gathers).
+            Command::ProduceNoReplyBatch { appends } => appends.len(),
+            _ => 0,
         })
-        .count();
+        .sum::<usize>();
     if produces < 2 {
         return;
     }
@@ -2132,6 +2138,48 @@ mod tests {
         assert_eq!(
             rejected_after, rejected_before,
             "an L0 cap-shed must NOT touch produce_rejected (that is the Level-1 rejection counter)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn an_over_cap_level0_batch_sheds_every_append_into_fire_and_forget_shed() {
+        // THE BATCHED L0 CAP PRE-CHECK (#11 fast path, the capped `retain` arm of
+        // `produce_no_reply_batch`): once the durable log is at/over its drop-new byte cap, a BATCH of
+        // Level-0 produces is shed IN PLACE just like the per-message `produce_no_reply` — every shed
+        // append is counted in `fire_and_forget_shed` (a fire-and-forget drop), NOT `produce_rejected`,
+        // and when every append sheds NOTHING is enqueued. `produce_no_reply_batch` returns `Ok(())` (a
+        // shed L0 is not an error). The only observable is the counter delta — this is the batch twin of
+        // `an_over_cap_level0_produce_is_shed_...` and guards the capped admission the #11 review flagged.
+        const BATCH: u64 = 7;
+        let cap = 512;
+        let (handle, actor, _control) = rig_capped(cap, DiskFullPolicy::DropNew);
+        let accepted = fill_to_cap(&handle, &[0x5a_u8; 64], cap);
+        assert!(accepted > 0, "some records were accepted before the cap");
+        let faf_before = handle
+            .with(|e| e.backpressure_snapshot().fire_and_forget_shed)
+            .unwrap();
+        let rejected_before = handle.with(|e| e.counters().produce_rejected).unwrap();
+
+        // One batch of over-cap L0s: every append is at/over the cap, so the capped `retain` arm sheds
+        // all of them at the connection thread (no enqueue, no error).
+        let batch: Vec<OwnedAppend> = (0..BATCH)
+            .map(|_| append_l0(b"over-cap-l0-batch"))
+            .collect();
+        handle.produce_no_reply_batch(batch).unwrap();
+
+        let faf_after = handle
+            .with(|e| e.backpressure_snapshot().fire_and_forget_shed)
+            .unwrap();
+        let rejected_after = handle.with(|e| e.counters().produce_rejected).unwrap();
+        assert_eq!(
+            faf_after - faf_before,
+            BATCH,
+            "every over-cap L0 in the batch is counted in fire_and_forget_shed (never silent)"
+        );
+        assert_eq!(
+            rejected_after, rejected_before,
+            "a batched L0 cap-shed must NOT touch produce_rejected (the Level-1 rejection counter)"
         );
         let _ = recover(handle, actor);
     }
