@@ -789,7 +789,7 @@ mod live_federation_tests {
         )
         .expect("mirror log opens");
         let cursors = OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("geo cursor");
-        MirrorApplier::new(log, cursors)
+        MirrorApplier::new(log, cursors, true)
     }
 
     /// The connector dials a peer gateway (outbound) and pulls a peer-origin stream into its local mirror
