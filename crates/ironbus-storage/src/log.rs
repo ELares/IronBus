@@ -5904,6 +5904,73 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_spill_flush_write_mid_append_still_recovers_a_dense_consistent_log() {
+        use crate::fault::FaultFs;
+        // #859, the partial-write case: the clean-fail variant above proves the IN-MEMORY roll back; a
+        // real `write_all_at` can persist a PREFIX of the spill buffer and THEN error, leaving garbage
+        // on disk past the durable head. This asserts the fix is sound there too: after the roll back the
+        // next successful flush rewrites from the unchanged `pending_base`, overwriting the partial bytes,
+        // so the reopened log is dense and consistent with no torn-frame corruption and no lost ack.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let probe = fs.inner().clone();
+        // A large survivor (4 KiB) whose frame dwarfs the 64-byte torn prefix, so its flush fully
+        // overwrites the persisted partial bytes - the recovered log carries no leftover garbage.
+        let survivor = vec![0xABu8; 4096];
+        {
+            let mut log = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+            for i in 0..3u64 {
+                assert_eq!(log.append(&rec(b"durable")).unwrap(), Offset::new(i));
+            }
+            log.sync().unwrap();
+
+            // The > 256 KiB record's spill flush persists 64 bytes then errors (a torn write).
+            let big = vec![b'x'; 300 * 1024];
+            control.arm_torn_write(64);
+            assert!(
+                log.append(&rec(&big)).is_err(),
+                "the > 256 KiB record's spill flush tears (persists a prefix, then errors)"
+            );
+
+            // The roll back restored the writer; the survivor takes offset 3 and its flush overwrites the
+            // 64 torn bytes at the unchanged pending_base.
+            let after = log.append(&rec(&survivor)).unwrap();
+            assert_eq!(
+                after,
+                Offset::new(3),
+                "no offset reuse or skip after a torn spill flush"
+            );
+            log.sync().unwrap();
+
+            let recs = log.read_from(Offset::ZERO, 1000).unwrap();
+            assert_eq!(
+                recs.len(),
+                4,
+                "dense, no duplicate frame from the torn write"
+            );
+            assert_eq!(&recs.last().unwrap().payload[..], &survivor[..]);
+        }
+
+        // Reopen over the disk that carried the partial bytes: recovery yields exactly the dense log, the
+        // big record's torn prefix never resurfaces as a record, and the acked survivor is durable.
+        let reopened = Log::open(probe, ManualClock::new(), LogConfig::default()).unwrap();
+        let recs = reopened.read_from(Offset::ZERO, 1000).unwrap();
+        assert_eq!(
+            recs.len(),
+            4,
+            "the dense log survives reopen after a partial spill-flush write"
+        );
+        assert_eq!(
+            &recs.last().unwrap().payload[..],
+            &survivor[..],
+            "the post-fault record survives a reopen even when the failed flush left partial bytes"
+        );
+        assert!(
+            recs.iter().all(|r| r.payload.len() != 300 * 1024),
+            "the torn big record (the only 300 KiB payload) never becomes a readable record"
+        );
+    }
+
+    #[test]
     fn a_fatal_fsync_freezes_the_writer_and_reads_keep_serving_the_flushed_prefix() {
         use crate::fault::FaultFs;
         let (fs, control) = FaultFs::new(InMemoryFs::new());
