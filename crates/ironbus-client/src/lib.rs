@@ -1623,6 +1623,24 @@ impl Client {
         Ok(())
     }
 
+    /// Opens a COALESCING at-most-once (QoS-0) producer over this client: the batched companion to the
+    /// per-call [`Client::produce_fire_and_forget`]. It frames each fire-and-forget publish into a wire
+    /// buffer and writes that buffer to the socket with ONE `write_all` only at [`STREAM_FLUSH_BYTES`]
+    /// boundaries (or on an explicit [`FireForgetProducer::flush`]), turning a tight per-message send
+    /// loop's thousands of tiny per-publish socket writes into a handful of large ones — the same
+    /// syscall coalescing a core pub/sub client performs — without changing the wire bytes the broker
+    /// sees. For a single producer that wants maximum at-most-once send throughput. No reply is ever
+    /// read (a fire-and-forget `Pub` is unacked by contract). Call [`FireForgetProducer::flush`] after
+    /// the last publish to push the final partial batch.
+    #[must_use]
+    pub fn fire_and_forget_producer(&mut self) -> FireForgetProducer<'_> {
+        FireForgetProducer {
+            client: self,
+            wire: Vec::with_capacity(STREAM_FLUSH_BYTES + 1024),
+            body: Vec::new(),
+        }
+    }
+
     /// Opens an AUTO-PIPELINING durable producer (#508) over this client with the default in-flight
     /// window ([`DEFAULT_PIPELINE_WINDOW`]): the ergonomic high-throughput companion to the awaited
     /// [`Client::produce`], for a SINGLE producer that wants its publishes durable (at-least-once,
@@ -3171,6 +3189,70 @@ pub struct PipelinedProducer<'a> {
     wire: Vec<u8>,
 }
 
+/// A COALESCING at-most-once (QoS-0) producer: the batched companion to [`Client::produce_fire_and_forget`],
+/// opened by [`Client::fire_and_forget_producer`]. Each [`send`](FireForgetProducer::send) frames one
+/// fire-and-forget `Pub` into a shared wire buffer and writes the buffer to the socket with ONE
+/// `write_all` only when it reaches [`STREAM_FLUSH_BYTES`] (or on an explicit
+/// [`flush`](FireForgetProducer::flush)), instead of one `write_all` syscall per publish. For a tight
+/// single-producer at-most-once loop this collapses thousands of tiny per-message socket writes into a
+/// handful of large ones — the same coalescing a core pub/sub client (e.g. NATS) does — lifting QoS-0
+/// send throughput several-fold without changing the wire bytes the broker decodes.
+///
+/// No reply is read (a fire-and-forget `Pub` is unacked by contract), so there is no flow-control
+/// window: it pushes as fast as the socket drains, and TCP backpressure is the only pacing. The
+/// buffered (not-yet-flushed) tail is not on the broker yet; this is at-most-once either way (the
+/// broker may itself drop a send under its fire-and-forget token bucket), so a lost tail on a
+/// mid-stream IO error is consistent with the no-guarantee contract. Call
+/// [`flush`](FireForgetProducer::flush) after the last [`send`](FireForgetProducer::send) to push the
+/// final partial batch.
+#[derive(Debug)]
+pub struct FireForgetProducer<'a> {
+    client: &'a mut Client,
+    /// The coalesced wire bytes for the buffered publishes, written with one `write_all` on flush.
+    wire: Vec<u8>,
+    /// Scratch reused to encode each publish body before it is framed into `wire`.
+    body: Vec<u8>,
+}
+
+impl FireForgetProducer<'_> {
+    /// Buffers one AT-MOST-ONCE (QoS-0) publish, flushing the coalesced buffer to the socket with one
+    /// `write_all` when it reaches [`STREAM_FLUSH_BYTES`]. The publish's `fire_and_forget` field is
+    /// forced SET on the wire (the method's contract), exactly like [`Client::produce_fire_and_forget`].
+    /// No reply is read; the caller's input buffers are free to reuse on return.
+    ///
+    /// # Errors
+    /// [`ClientError::Body`] / [`ClientError::Frame`] on an encode failure, or an IO error on the
+    /// triggered flush `write_all`. On an IO error the connection state is undefined (drop the
+    /// [`Client`]).
+    pub fn send(&mut self, message: &PubBody<'_>) -> Result<(), ClientError> {
+        self.body.clear();
+        let faf = PubBody {
+            fire_and_forget: true,
+            ..*message
+        };
+        encode_pub(&faf, &mut self.body).map_err(ClientError::Body)?;
+        encode_frame(FrameType::Pub, &self.body, &mut self.wire).map_err(ClientError::Frame)?;
+        if self.wire.len() >= STREAM_FLUSH_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Writes any buffered-but-unflushed publishes to the socket with one `write_all`; a no-op when the
+    /// buffer is empty. Call this after the last [`send`](FireForgetProducer::send) so the final partial
+    /// batch reaches the broker.
+    ///
+    /// # Errors
+    /// An IO error on the `write_all` (the connection state is then undefined).
+    pub fn flush(&mut self) -> Result<(), ClientError> {
+        if !self.wire.is_empty() {
+            self.client.stream.write_all(&self.wire)?;
+            self.wire.clear();
+        }
+        Ok(())
+    }
+}
+
 impl PipelinedProducer<'_> {
     /// The configured in-flight window: how many publishes are buffered before an automatic flush.
     #[must_use]
@@ -4413,6 +4495,136 @@ mod tests {
         assert_eq!(messages[0].offset, 0);
         assert_eq!(messages[0].payload, b"qos0");
         assert_eq!(messages[1].payload, b"alo");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fire_and_forget_producer_coalesces_yet_every_record_lands_in_order_end_to_end() {
+        // The coalescing QoS-0 producer batches many fire-and-forget Pubs into the wire buffer and
+        // writes them with one `write_all` (here via the explicit flush, the batch being well under the
+        // 32 KiB auto-flush threshold), yet every record still lands durably IN ORDER, and the coalesced
+        // no-ack batch does NOT desync the connection: a following at-least-once produce on the SAME
+        // connection still gets its PubAck at the next offset.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        {
+            let mut producer = c.fire_and_forget_producer();
+            for i in 0..5u8 {
+                producer
+                    .send(&PubBody {
+                        flags: 0,
+                        timestamp_ms: 0,
+                        key: b"",
+                        headers: b"",
+                        dedup: None,
+                        fire_and_forget: false, // forced true by the producer
+                        payload: &[b'a' + i],
+                    })
+                    .unwrap();
+            }
+            // The 5 small publishes are still buffered (well under the 32 KiB flush threshold); the
+            // explicit flush is what puts them on the wire with one `write_all`.
+            producer.flush().unwrap();
+        }
+        // A normal at-least-once produce on the SAME connection still gets its PubAck at offset 5,
+        // proving the 5 coalesced no-ack frames did not leave a stray reply on the wire.
+        let offset = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"alo",
+            })
+            .unwrap();
+        assert_eq!(
+            offset, 5,
+            "the at-least-once produce landed after the 5 coalesced QoS-0 ones"
+        );
+        // Fetch: all 6 records are durable and in order; the coalesced batch landed at offsets 0..=4.
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(
+            messages.len(),
+            6,
+            "all 5 coalesced records plus the at-least-once one are durable"
+        );
+        for i in 0u8..5 {
+            let m = &messages[usize::from(i)];
+            assert_eq!(m.offset, u64::from(i));
+            assert_eq!(m.payload, vec![b'a' + i]);
+        }
+        assert_eq!(messages[5].payload, b"alo");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fire_and_forget_producer_auto_flushes_at_the_32kib_boundary_in_order_end_to_end() {
+        // The COMPANION to the explicit-flush test above. This drives enough bytes that `send` itself
+        // crosses the STREAM_FLUSH_BYTES (32 KiB) boundary and AUTO-flushes mid-loop — the core
+        // coalescing mechanism — with NO explicit flush between sends. Eighty ~1 KiB publishes frame to
+        // ~80 KiB, so the in-`send` auto-flush fires twice during the loop (around 32 KiB and 64 KiB),
+        // leaving a partial tail the explicit flush pushes. Every record must still land durably IN
+        // ORDER, and the coalesced no-ack stream must not desync the connection: a following
+        // at-least-once produce still gets its PubAck at the next offset.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let payload = vec![b'q'; 1000];
+        let count: u8 = 80;
+        {
+            let mut faf = c.fire_and_forget_producer();
+            for _ in 0..count {
+                faf.send(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    dedup: None,
+                    fire_and_forget: false, // forced true by the producer
+                    payload: &payload,
+                })
+                .unwrap();
+            }
+            // Push the partial tail left after the in-`send` auto-flushes.
+            faf.flush().unwrap();
+        }
+        // Synchronize on an at-least-once produce: its awaited PubAck proves the broker has appended
+        // every prior coalesced L0 (the auto-flushed ones included). It lands right after them.
+        let offset = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"sync",
+            })
+            .unwrap();
+        assert_eq!(
+            offset,
+            u64::from(count),
+            "the at-least-once produce landed after all the auto-flushed QoS-0 records"
+        );
+        // `offset == count` above is the proof that all `count` auto-flushed records landed durably and
+        // IN ORDER: a single-writer connection assigns the sync produce offset `count` only if exactly
+        // `count` records preceded it (a dropped or reordered auto-flush would shift it). Additionally
+        // spot-check byte integrity of the auto-flushed prefix -- one fetch window must come back as the
+        // exact payload at sequential offsets, proving the 32 KiB-boundary flush never split or corrupted
+        // a frame. One `fetch` returns at most the negotiated credit window, so this checks the prefix,
+        // not all `count`.
+        let prefix = c.fetch(u32::from(count)).unwrap().messages;
+        assert!(
+            !prefix.is_empty(),
+            "the auto-flushed prefix is durable and fetchable"
+        );
+        for (i, m) in prefix.iter().enumerate() {
+            assert_eq!(m.offset, u64::try_from(i).unwrap());
+            assert_eq!(m.payload, payload);
+        }
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }

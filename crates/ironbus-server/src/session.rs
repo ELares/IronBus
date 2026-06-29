@@ -222,6 +222,15 @@ impl From<&str> for GroupName {
 #[derive(Debug, Default)]
 pub struct Session {
     connected: bool,
+    /// The pass-scoped LEVEL-0 (no-ack / fire-and-forget) produce batch (#11 fast path): Level-0
+    /// produces decoded from one socket read accumulate here and are handed to the actor as ONE
+    /// `produce_no_reply_batch` send at the flush boundary, instead of one channel send per message —
+    /// the broker-side twin of the client's coalescing `FireForgetProducer`, cutting the per-message
+    /// session->actor handoff that caps QoS-0 ingest. It is FLUSHED (so the actor observes this
+    /// connection's single total order) before any Level-1 produce or non-produce job and at the end of
+    /// every pass, so it never holds state across passes. Empty (the `Default`) for a connection that
+    /// never publishes Level-0, so a non-publishing or at-least-once-only connection is unchanged.
+    level0_pending: Vec<OwnedAppend>,
     /// The work-group this connection is subscribed to, set by SUB and cleared by UNSUB.
     /// Empty selects the default group (#9), so an unsubscribed consumer behaves exactly as
     /// before. FLOW fetches and ACKs route to this group.
@@ -627,6 +636,14 @@ impl Session {
                         if let Err(e) = self.handle_pub(engine, body, &mut parked, out) {
                             break Err(e);
                         }
+                        // The Level-0 safety cap (#11 fast path): a buffer packed with tiny QoS-0 PUB
+                        // frames cannot accumulate the no-ack batch without bound. At the cap, flush the
+                        // batch to the actor in one send and start a fresh one, so memory stays bounded.
+                        if self.level0_pending.len() >= MAX_PARKED_PRODUCES {
+                            if let Err(e) = self.flush_level0(engine) {
+                                break Err(e);
+                            }
+                        }
                         // The safety cap: a buffer packed with tiny PUB frames cannot park without
                         // bound. At the cap the window is released (awaited FIFO) and a new window
                         // starts; the cap matches the actor channel's default bound, so a capped
@@ -641,7 +658,12 @@ impl Session {
                         // on the wire is exactly the frame order (FIFO per connection). The
                         // actor-side ordering is also preserved: the actor flushes its pending
                         // produce batch before running any job, so an ack/flow/sub still observes
-                        // every prior produce durable.
+                        // every prior produce durable. A Level-0 batch accumulated BEFORE this
+                        // non-produce frame must reach the actor FIRST too (single total order), so
+                        // flush it before the ack drain + dispatch.
+                        if let Err(e) = self.flush_level0(engine) {
+                            break Err(e);
+                        }
                         if let Err(e) = drain_parked(engine, member_id, &mut parked, out) {
                             break Err(e);
                         }
@@ -659,6 +681,10 @@ impl Session {
         // runs (those produces already reached the actor and their acks belong on the wire before
         // the close), but the FIRST error wins: a drain error after a loop error is the same fatal
         // engine event and is subsumed by it.
+        // Flush any trailing Level-0 batch to the actor (#11 fast path) so the connection's last QoS-0
+        // produces are submitted before the pass returns; then release every still-parked ack. Both run
+        // even on an error exit (those produces/acks belong on the actor/wire before the close).
+        let level0_flushed = self.flush_level0(engine);
         let drained = drain_parked(engine, member_id, &mut parked, out);
         // Drain any CLUSTER produce-acks the data plane RELEASED for this connection onto the wire
         // (#719): a clustered `C2-fsync` produce's wire `PubAck` was WITHHELD when it parked (in
@@ -705,7 +731,7 @@ impl Session {
         }
         match result {
             Err(e) => Err(e),
-            Ok(progress) => drained.map(|()| progress),
+            Ok(progress) => level0_flushed.and(drained).map(|()| progress),
         }
     }
 
@@ -751,6 +777,10 @@ impl Session {
                 let member_id = self.member_id;
                 let mut parked = Vec::new();
                 self.handle_pub(engine, body, &mut parked, out)?;
+                // This one-off Pub path submits and immediately drains, so flush any Level-0 it batched
+                // right away (no cross-frame accumulation here) — keeping the pass-scoped batch empty for
+                // the main loop and preserving the single total order.
+                self.flush_level0(engine)?;
                 drain_parked(engine, member_id, &mut parked, out).map(|()| false)
             }
             // The consume/ack vocabulary all requires the `subscribe` scope (#631): a connection
@@ -1389,7 +1419,12 @@ impl Session {
         // (single-writer storage / single total order) but never acked. An old fire-and-forget publish
         // takes exactly this path (it decodes as Level 0).
         if level0 {
-            engine.produce_no_reply(append)?;
+            // COALESCE into the pass-scoped Level-0 batch (#11 fast path): accumulate this no-ack
+            // produce and hand the whole socket-read's worth to the actor in ONE
+            // `produce_no_reply_batch` send at the flush boundary, instead of one channel send per
+            // message. The batch is flushed before any Level-1 produce or non-produce job and at the end
+            // of the pass, so the actor still observes this connection's single total order.
+            self.level0_pending.push(append);
             return Ok(());
         }
         // LEVEL 1 / LEVEL 2 (at-least-once; L2 falls back to L1 this phase): SUBMIT the produce to the
@@ -1398,12 +1433,34 @@ impl Session {
         // awaited path's, only written later in the same pass. The submission still blocks on a FULL
         // actor channel (backpressure), and the actor still releases the reply only after the covering
         // group-commit fsync (I2). This path is unchanged from before the ack-level feature.
+        //
+        // A Level-0 batch accumulated BEFORE this at-least-once produce must reach the actor FIRST so the
+        // single total order holds (the L0s decoded earlier are appended before this L1): flush it now.
+        self.flush_level0(engine)?;
         let submission = engine.produce_submit(append)?;
         parked.push(ParkedPub {
             submission,
             fire_and_forget,
             wants_confirm,
         });
+        Ok(())
+    }
+
+    /// Flushes the pass-scoped Level-0 batch ([`Session::level0_pending`]) to the actor as ONE
+    /// `produce_no_reply_batch` send (#11 fast path), draining it; a no-op when empty. Called before any
+    /// Level-1 produce or non-produce job on this connection — so the actor observes the connection's
+    /// single total order — and at the end of every pass (so it never holds state across passes).
+    ///
+    /// # Errors
+    /// [`SessionError::ActorGone`] if the append actor exited before the batch could be enqueued.
+    fn flush_level0<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+        &mut self,
+        engine: &E,
+    ) -> Result<(), SessionError> {
+        if self.level0_pending.is_empty() {
+            return Ok(());
+        }
+        engine.produce_no_reply_batch(std::mem::take(&mut self.level0_pending))?;
         Ok(())
     }
 
@@ -2958,8 +3015,12 @@ impl Session {
         if decoded.stream_id.is_empty() {
             let mut parked = Vec::new();
             self.handle_pub(engine, decoded.pub_body, &mut parked, out)?;
+            // Flush any Level-0 this one-off subject-routed publish batched before draining (no
+            // cross-frame accumulation here), keeping the single total order.
+            self.flush_level0(engine)?;
             return drain_parked(engine, self.member_id, &mut parked, out);
         }
+
         let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
             reply_err(out, "stream id must be valid UTF-8");
             return Ok(());
