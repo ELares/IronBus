@@ -548,10 +548,18 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             self.pending.truncate(before);
             return Err(StorageError::SegmentFull);
         };
+        let pos_before = self.write_pos;
         self.write_pos = end;
         // Spill: bound the buffer regardless of the survivor count, one write per spill window.
         if self.pending.len() >= PENDING_SPILL_BYTES {
-            self.flush_pending()?;
+            if let Err(e) = self.flush_pending() {
+                // #859: same torn-writer roll back as `append` - a spill-flush IO error mid-append left
+                // `write_pos` advanced and the frame buffered with `record_count` un-bumped. Restore the
+                // pre-append state so the next survivor append cannot reuse this offset/seq, then propagate.
+                self.pending.truncate(before);
+                self.write_pos = pos_before;
+                return Err(e);
+            }
         }
         self.record_count += 1;
         self.last_seq = record.seq;
@@ -656,15 +664,29 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         }
         let len =
             u64::try_from(self.pending.len() - before).map_err(|_| StorageError::SegmentFull)?;
-        let end = self
-            .write_pos
+        let pos_before = self.write_pos;
+        let end = pos_before
             .checked_add(len)
             .ok_or(StorageError::SegmentFull)?;
         self.write_pos = end;
         // Spill: bound the buffer regardless of how long a relaxed durability level defers the
         // sync. One write per spill still reduces syscalls by spill/record-size to one.
         if self.pending.len() >= PENDING_SPILL_BYTES {
-            self.flush_pending()?;
+            if let Err(e) = self.flush_pending() {
+                // #859: the spill flush failed mid-append (ENOSPC / flash EIO). `write_pos` was already
+                // advanced and the just-encoded frame is still buffered, but `record_count`/`last_seq`
+                // have NOT been bumped yet - a TORN writer state. Left as-is, the NEXT append would reuse
+                // this offset/seq (`record_count` did not advance) and, when a later flush succeeds, write
+                // BOTH frames under one count - corrupting the log and silently losing the acked record.
+                // Roll back to the EXACT pre-append state (drop the encoded frame, restore `write_pos`) so
+                // the writer stays consistent and a retry is safe, then propagate the IO error so the
+                // producer is never acked. `flush_pending` leaves `pending` / `pending_base` untouched on
+                // error, so only the frame and `write_pos` need undoing; this mirrors the encode-failure
+                // roll back above.
+                self.pending.truncate(before);
+                self.write_pos = pos_before;
+                return Err(e);
+            }
         }
         self.record_count += 1;
         self.last_seq = record.seq;
