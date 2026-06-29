@@ -4007,7 +4007,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // ONE coordinated commit tick (#678): K dirtied named streams => K fdatasync barriers,
         // amortized over the batch; a clean stream costs nothing. The default `""` slot is never
         // dirtied here, so this never syncs the root a second time.
-        let _outcome: CommitOutcome = self.streams.commit_tick();
+        let outcome: CommitOutcome = self.streams.commit_tick();
+        // #861: a named stream whose covering `fdatasync` FAILED this tick is now FROZEN read-only -
+        // its durable head did NOT advance and its parked acks were NOT released. `commit_tick` never
+        // returns `Err` by contract; the caller MUST inspect `froze`. Surface a FATAL `WriterFrozen`
+        // instead of acking a non-durable record, exactly as the default stream's `commit_batch()?`
+        // does. Acking here would violate I2 (ack-implies-durable, per stream): the producer would be
+        // told the record is durable while the disk barrier faulted, and a power cut would lose it from
+        // the torn tail. This also covers the txn-commit-to-a-named-stream path, which routes here.
+        if outcome.froze.contains(&id) {
+            return Err(EngineError::Storage(StorageError::WriterFrozen));
+        }
         Ok(offset)
     }
 
@@ -16017,6 +16027,40 @@ mod tests {
             e.poll_in_stream("orders", "g", 0).unwrap(),
             Poll::Idle
         ));
+    }
+
+    #[test]
+    fn a_named_stream_produce_whose_fdatasync_fails_returns_fatal_not_an_ack() {
+        use ironbus_storage::fault::FaultFs;
+        // #861 regression: when a named stream's covering fdatasync FAILS, `commit_tick` freezes that
+        // stream (it lands in `froze`, NOT `synced`) and by contract returns no `Err`. `produce_in_stream`
+        // MUST inspect `froze` and surface a FATAL `WriterFrozen`, exactly like the default stream's
+        // `commit_batch()?` - otherwise it acks a NON-DURABLE record (I2 violation) that a power cut loses
+        // from the torn tail.
+        let (faultfs, control) = FaultFs::new(InMemoryFs::new());
+        let mut e = Engine::open(faultfs, ManualClock::new(), config(10, 5)).unwrap();
+
+        // First produce succeeds (declares the stream; the fsync is clean).
+        assert_eq!(
+            e.produce_in_stream("orders", &append_at(b"durable"))
+                .unwrap(),
+            Offset::new(0)
+        );
+
+        // Arm an fsync fault, then produce again: the cross-stream commit tick's fdatasync fails and
+        // freezes the stream. The fix turns that into a FATAL error rather than acking offset 1.
+        control.set_fail_sync(true);
+        let err = e
+            .produce_in_stream("orders", &append_at(b"not-durable"))
+            .expect_err("a frozen named stream must NOT ack - it must return a fatal error");
+        assert!(
+            err.is_fatal(),
+            "the frozen-named-stream error must be fatal (the session then sends a fatal frame, not a PubAck): {err:?}"
+        );
+        assert!(
+            matches!(err, EngineError::Storage(StorageError::WriterFrozen)),
+            "expected WriterFrozen, got: {err:?}"
+        );
     }
 
     #[test]
