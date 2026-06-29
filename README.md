@@ -6,11 +6,11 @@
 
 **A single durable, crash-safe message queue for the edge, in one static Rust binary.**
 
-> Status: early implementation. The architecture is vetted in the GitHub issues; the code is now being built one small, reviewed, CI-gated PR at a time. Start at the [vision EPIC (#1)](https://github.com/ELares/IronBus/issues/1).
+> Status: active development. The single-node broker, multi-stream + subjects + wildcards, a real multi-node cluster, idempotent + transactional produce, auth, and the observability tooling have all shipped; the remaining v2 items (partitions, TLS, routing richness) are tracked with a per-capability status in [docs/MISSION.md](docs/MISSION.md) §2. Code lands one small, reviewed, CI-gated PR at a time. Start at the [vision EPIC (#1)](https://github.com/ELares/IronBus/issues/1).
 >
-> **Where this is going:** the v2 mission is for IronBus to be feature-rich and decisively better than NATS on every front, **single node or clustered**, with clustering a first-class goal (not post-1.0). Read **[docs/MISSION.md](docs/MISSION.md)** — it is scrupulously explicit about what is achieved and measured today versus what is v2 target, not yet built.
+> **Where this is going:** the v2 mission is for IronBus to be feature-rich and decisively better than NATS on every front, **single node or clustered**, with clustering a first-class goal (not post-1.0) — and most of it has shipped. Read **[docs/MISSION.md](docs/MISSION.md)** — it is scrupulously explicit, in three tiers, about what is measured today, what is shipped and wired (with scope edges), and what is still target.
 
-IronBus is one durable, ordered queue (think a single AWS SQS queue) that lives on the device, survives power loss and corrupt files on its own, and fans out to many consumers. It ships as a single static binary you can drop onto a Raspberry Pi. It takes the best small, composable ideas from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, and SQS, and leaves behind the operational weight and the silent durability footguns that do not survive a battery-less edge node. The single-node durable broker is what runs today; multi-stream, subjects, and a real multi-node cluster are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)). A KV store and an object store are non-goals: IronBus stays a pure message bus.
+IronBus is one durable, ordered queue (think a single AWS SQS queue) that lives on the device, survives power loss and corrupt files on its own, and fans out to many consumers. It ships as a single static binary you can drop onto a Raspberry Pi. It takes the best small, composable ideas from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, and SQS, and leaves behind the operational weight and the silent durability footguns that do not survive a battery-less edge node. The single-node durable broker, multi-stream + subjects + wildcards, and a real multi-node cluster all run today; the remaining v2 items (partitions, TLS, routing richness) are tracked with a per-capability status in [docs/MISSION.md](docs/MISSION.md). A KV store and an object store are non-goals: IronBus stays a pure message bus.
 
 ---
 
@@ -52,22 +52,22 @@ We rank the tenets, and when two conflict we resolve in this order: **Resilient 
 - Self-healing: it detects corruption, skips poison records and quarantines unreadable segments, resynchronizes to the next valid record, and reports exactly what was lost.
 - A single static binary that is both the broker and the CLI.
 
-**What ships today is a single node; the rest is the v2 roadmap, not a permanent identity.** The v2
-mission is for IronBus to be feature-rich and decisively better than NATS on every front, single node
-**or clustered** — see [docs/MISSION.md](docs/MISSION.md). Single node is the zero-config default the
-cluster degrades to, not the ceiling:
+**Most of the v2 mission has shipped; the remaining items are the v2 roadmap, all tracked with an
+explicit status in [docs/MISSION.md](docs/MISSION.md) §2.** The mission is for IronBus to be feature-rich
+and decisively better than NATS on every front, single node **or clustered**. Single node is the
+zero-config default the cluster degrades to, not the ceiling:
 
-- **One log today; multi-stream, subjects, and a routing fabric are the v2 roadmap.** The shipped binary
-  is one durable ordered log. Multiple streams, subject routing, and wildcards are planned (v2
-  single-node milestones), not a non-goal. A KV store and an object store are non-goals: IronBus stays a
-  pure message bus. Until multi-stream lands, multiple independent queues can be run as separate instances.
-- **Single node today; a real cluster is the v2 roadmap, and clustering is first-class.** The shipped
-  binary is single-node durable (`fdatasync` before ack). Replication is **not** a non-goal and **not**
-  deferred to post-1.0: real multi-node clustering — leader/follower replication with NATS-cluster parity
-  and better — is a first-class v2 goal that **preserves** every durability/recovery/edge/flash-wear
-  guarantee below. The cluster ack default is `fsync`'d-on-a-quorum, and the cluster recovery invariants
-  (CI1–CI4) extend the single-node bounded-and-reported-loss discipline across replicas
-  ([docs/MISSION.md](docs/MISSION.md)).
+- **Multi-stream + subjects + wildcards ship today; partitions are the remaining gap.** Named streams,
+  subject routing, and `*` / `>` wildcards are wired end-to-end (an unbound subject is a typed fail-closed
+  reject); partitions are built in storage but not yet wired through the engine (V2-M2, #693). A KV store
+  and an object store are non-goals: IronBus stays a pure message bus.
+- **A real multi-node cluster ships today; clustering is first-class.** Beyond the zero-config single node
+  (`fdatasync` before ack), a genuine cluster runs behind `--cluster-id / --cluster-peer`: a metadata Raft
+  group, per-partition ISR pull replication, a `fsync`'d-on-a-quorum ack default, leader-epoch fencing, and
+  footer / CRC divergence self-heal that **preserve** every durability / recovery / edge / flash-wear
+  guarantee below; the cluster recovery invariants (CI1–CI4) extend the single-node
+  bounded-and-reported-loss discipline across replicas. Scope edge: replication covers the default log
+  today (multi-partition awaits #693) and the cluster benchmarks are not yet CI-gated (#636).
 
 **IronBus is explicitly NOT (these are durable non-goals):**
 
@@ -82,7 +82,7 @@ cluster degrades to, not the ceiling:
 
 IronBus is one static binary that is **both the broker and the CLI**. Below is the whole loop: install it, start the broker on your edge device, then point producers and consumers at it. The local examples use the default address `127.0.0.1:7777`, so you can drop `--addr` when everything runs on the same box.
 
-> Security heads-up: the wire protocol is **not yet encrypted or authenticated** (TLS and auth are designed but not implemented). Keep the broker bound to loopback or a trusted LAN behind a firewall or an SSH / WireGuard tunnel. Do not expose it to the open internet.
+> Security heads-up: the wire protocol is **not yet encrypted** — TLS is designed but not implemented ([#766](https://github.com/ELares/IronBus/issues/766)), so the wire is plaintext. Authentication **is** implemented (bearer token or Argon2id password, with publish / subscribe / admin scopes), but until TLS lands keep the broker bound to loopback or a trusted LAN behind a firewall or an SSH / WireGuard tunnel. Do not expose it to the open internet.
 
 ### 1. Install
 
@@ -147,7 +147,7 @@ ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny
 
 ### 3. Producers: one, or many
 
-The broker is **one durable, totally ordered log**. Any number of producers append to it; the order is the order the broker fsynced them.
+Each stream is **one durable, totally ordered log** (a single-stream broker is the default). Any number of producers append to it; the order is the order the broker fsynced them.
 
 ```sh
 # Publish one message. It prints the durable offset once the record is fsynced
@@ -273,7 +273,7 @@ A fresh-eyes second pass over every issue resolved over one hundred design quest
 
 | Question | Decision |
 | --- | --- |
-| Logical scope | One durable ordered queue per instance today. Multi-stream, subjects, and partitions are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)), not a permanent non-goal. A KV store and an object store are non-goals (IronBus stays a pure message bus). |
+| Logical scope | Multi-stream + subjects + wildcards over one node today; partitions are the remaining v2 item (#693, see [docs/MISSION.md](docs/MISSION.md)). A KV store and an object store are non-goals (IronBus stays a pure message bus). |
 | Delivery contract | At-least-once, pull-based in v1. SQS-style visibility-timeout leases (default 30s, hard cap 5 minutes), persisted redelivery count, default max-deliver 5, then dead-letter queue. |
 | Ordering | Total durable order of the log. Per-group at-least-once, not per-group strict in-order delivery. Exactly-once is a non-goal. |
 | Storage model | Log-is-WAL: a publish is one framed, checksummed, record-aligned append to the active segment, and that append is the durable record. No separate WAL file. The offset index is derived and rebuildable. |
@@ -285,7 +285,7 @@ A fresh-eyes second pass over every issue resolved over one hundred design quest
 | Bounded loss report | After any skip, report (records_lost, bytes_lost, segments_affected) plus the offset range and a reason enum, via a log line, a recovery report file, and a Prometheus counter. Loss is capped at one segment or 64 MiB per event and 1 percent of durable bytes per recovery; exceeding either freezes the log read-only and alerts. |
 | Runtime | tokio (multi-threaded), with the durability commit on a dedicated thread. io_uring is a deferred, feature-flagged, Linux 5.10 and newer optimization, never the foundation, to protect the Cross Platform tenet. |
 | Targets | First-class: aarch64, x86_64, armv7 musl static binaries, kernel floor Linux 4.19. Best-effort, CI-built: macOS. Windows is a non-goal for v1. |
-| Replication | Single-node durable today; a real multi-node cluster (leader/follower replication, NATS-cluster parity and better, `fsync`'d-on-a-quorum ack default) is a first-class v2 goal, not a non-goal — see [docs/MISSION.md](docs/MISSION.md). It preserves the single-node durability/recovery/edge guarantees. |
+| Replication | A real multi-node cluster ships today (leader/follower ISR replication, `fsync`'d-on-a-quorum ack default, leader-epoch fencing, divergence self-heal) behind `--cluster-id / --cluster-peer`, preserving the single-node durability/recovery/edge guarantees. Default-log replication today; multi-partition awaits #693 and the cluster benchmarks are not yet CI-gated (#636) — see [docs/MISSION.md](docs/MISSION.md). |
 | License | Dual `MIT OR Apache-2.0` across the whole workspace. |
 | MSRV | Rust 1.78, may rise only in a minor release, new floor always at least 6 months old. |
 
@@ -312,8 +312,8 @@ These claims are not taken on faith. Verification ([#21](https://github.com/ELar
 
 Security ([#18](https://github.com/ELares/IronBus/issues/18)) is shaped for devices on untrusted networks:
 
-- **TLS 1.3 only**, and it is mandatory on any non-loopback bind. Plaintext is allowed solely on the loopback interface. There is no insecure-network opt-in flag at all. The binary carries its own modern TLS stack, so the oldest target platform still gets TLS 1.3.
-- **Three explicit scopes**: publish, subscribe, admin. Auth is by bearer token, username and password (Argon2id, edge-tuned), or mTLS, which is the recommended mechanism for untrusted LANs.
+- **TLS 1.3 is the designed transport, but it is NOT yet implemented ([#766](https://github.com/ELares/IronBus/issues/766)): the wire is plaintext today.** No TLS stack is linked, and any `--tls-*` material is reserved and refused at startup (the broker will not boot with it set). Until TLS lands, bind to loopback or run behind an SSH / WireGuard tunnel on a trusted network, with auth enabled. The design intent (TLS 1.3 only, mandatory on non-loopback, the binary carrying its own modern TLS stack so the oldest target still gets 1.3) is tracked in [docs/MISSION.md](docs/MISSION.md) and #766.
+- **Three explicit scopes**: publish, subscribe, admin. Auth **ships today and is enforced**: bearer token or username and password (Argon2id, edge-tuned). The **mTLS** mechanism is wired but inert (it fails closed) until the TLS transport (#766) lands, so it cannot be used yet.
 - **Safe by default**: IronBus refuses to start if a secret-bearing file is group or world readable, and ships bounded pre-auth defenses (half-open connection caps, per-source connection rate limits, failed-auth backoff) so a handshake flood cannot exhaust a small device.
 - Optional **encryption at rest** with AES-256-GCM or ChaCha20-Poly1305, selected by runtime CPU feature detection.
 
