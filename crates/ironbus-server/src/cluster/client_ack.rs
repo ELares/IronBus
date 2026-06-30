@@ -392,22 +392,29 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
     /// in offset order, for that connection to flush on its own pass. Below `min_isr` releases NOTHING
     /// (the no-false-ack property, on the real client wire). Returns the number of replies released.
     ///
-    /// Locks the shared server, then the outbox — both briefly, NEVER across a socket write (the
-    /// release just moves bytes into the outbox; the owning connection's thread does the actual write).
+    /// Locks the shared server, THEN the outbox, holding BOTH across the release + deposit — both
+    /// briefly, NEVER across a socket write (the release just moves bytes into the outbox; the owning
+    /// connection's thread does the actual write). Holding both (the same server→outbox order
+    /// [`drop_connection`](Self::drop_connection) uses, so no deadlock) makes the gate/seam drain and
+    /// the outbox deposit ATOMIC w.r.t. a concurrent disconnect: `drop_connection` cannot interleave
+    /// between them, so a just-released ack is never deposited into an already-cleared dead-owner
+    /// outbox that nobody drains (#871). Either the report fully deposits and then `drop_connection`
+    /// clears it, or `drop_connection` purges the still-parked ack first and the report releases
+    /// nothing for it.
     pub fn on_follower_report(&self, partition: u64, report: &AckReplicatedBody) -> usize {
-        let released = {
-            let Ok(mut srv) = self.server.lock() else {
-                return 0;
-            };
-            match srv.seam_mut().on_follower_report_owned(partition, report) {
-                Ok(r) => r,
-                Err(_) => return 0,
-            }
+        // A poisoned server lock means the runtime is tearing down; do nothing (as before).
+        let Ok(mut srv) = self.server.lock() else {
+            return 0;
+        };
+        let Ok(released) = srv.seam_mut().on_follower_report_owned(partition, report) else {
+            return 0;
         };
         if released.is_empty() {
             return 0;
         }
         let count = released.len();
+        // Acquire the outbox WHILE still holding the server lock (see the method doc): this is what
+        // closes the deposit race against a concurrent `drop_connection`.
         let mut outbox = self
             .outbox
             .lock()
@@ -431,11 +438,30 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
         outbox.remove(&member.get()).unwrap_or_default()
     }
 
-    /// Drop any released-but-undrained acks for a producer connection that DISCONNECTED (#719): nobody
-    /// is left to flush them, so the outbox entry is removed rather than leaked. Called from the
-    /// connection-cleanup path, like the #497 `drop_l2_confirms`. (A still-PARKED ack — withheld inside
-    /// the seam, not yet released — is left to the seam's bounded gate; this only clears the outbox.)
+    /// Drop every still-withheld ack for a producer connection that DISCONNECTED (#719, #869, #871):
+    /// nobody is left to flush them, so leaving them parked leaks reply bytes + gate-cap slots that an
+    /// unsatisfiable quorum (a follower partitioned below `min_isr`) may never drain. Called from the
+    /// connection-cleanup path, like the #497 `drop_l2_confirms`.
+    ///
+    /// Purges in TWO places: the seam's still-PARKED acks + their quorum-ack-gate `pending` slots (via
+    /// [`ProduceAckSeam::purge_owner`], so a later follower report can never release — or re-deposit —
+    /// them), then the per-connection released-but-undrained outbox. The seam purge is done FIRST and
+    /// the outbox purge under the SAME contiguous critical section ordering the runtime uses (server
+    /// lock, then outbox), so a concurrent `on_follower_report` cannot release the owner's acks into the
+    /// outbox between the two clears. A poisoned server lock recovers in place (the cleanup must still
+    /// run) rather than skipping the purge.
     pub fn drop_connection(&self, member: MemberId) {
+        // Hold the server lock THEN the outbox lock across BOTH purges — the SAME order
+        // `on_follower_report` holds them (it now keeps the server lock through its outbox deposit), so
+        // the two operations serialize on the server lock: a concurrent report either fully releases +
+        // deposits this owner's acks BEFORE this runs (then the outbox clear below drops them) or finds
+        // them already purged from the seam/gate and releases nothing. No deadlock (consistent
+        // server→outbox order). A poisoned lock recovers in place — the cleanup must still run.
+        let mut srv = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        srv.seam_mut().purge_owner(member.get());
         let mut outbox = self
             .outbox
             .lock()
@@ -705,6 +731,51 @@ mod tests {
         );
         // A second drain is empty (the outbox entry was removed).
         assert!(gate.drain_released(member).is_empty());
+    }
+
+    #[test]
+    fn drop_connection_purges_a_disconnected_producers_still_parked_ack() {
+        // #871: a producer that parks a C2-fsync ack below min_isr then DISCONNECTS must have its
+        // STILL-PARKED ack purged from the seam AND the quorum-gate by `drop_connection` — not leaked
+        // until the partition heals. (Before this fix it cleared only the released-but-undrained outbox,
+        // leaving the parked ack — and its gate-cap slot — to leak.)
+        let gate = leader_gate(8); // leader fsync'd through 8; no follower reported → below min_isr
+        let member = MemberId::new(7);
+        let offset = 3;
+        let disposition = gate.on_local_fsynced_ack(member, P, offset, wire_ack(offset));
+        assert_eq!(disposition, AckDisposition::Parked);
+        assert_eq!(
+            gate.server.lock().unwrap().seam().parked_len(),
+            1,
+            "the wire PubAck is withheld in the seam"
+        );
+        assert_eq!(
+            gate.server
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .pending_ack_count(P),
+            1
+        );
+
+        // The producer disconnects: drop_connection purges its parked ack from BOTH the seam and gate.
+        gate.drop_connection(member);
+        assert_eq!(
+            gate.server.lock().unwrap().seam().parked_len(),
+            0,
+            "the disconnected producer's parked ack was purged (not leaked)"
+        );
+        assert_eq!(
+            gate.server
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .pending_ack_count(P),
+            0,
+            "and its quorum-gate cap slot was freed"
+        );
     }
 
     #[test]

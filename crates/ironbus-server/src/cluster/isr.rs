@@ -512,6 +512,17 @@ impl<T> QuorumAckGate<T> {
         self.pending.len()
     }
 
+    /// Drop every pending ack whose token satisfies `is_dead` — e.g. a disconnected producer's tokens
+    /// (#871) — returning the count removed. The survivors keep their order (offsets stay
+    /// non-decreasing), and `released_through` is untouched: a purged token simply never releases, so
+    /// release semantics are unchanged. This frees the dropped acks' backlog-cap slots (#864/#869) so a
+    /// new produce is no longer refused by dead-owner entries an unsatisfiable quorum will never drain.
+    pub fn purge_where(&mut self, mut is_dead: impl FnMut(&T) -> bool) -> usize {
+        let before = self.pending.len();
+        self.pending.retain(|p| !is_dead(&p.token));
+        before - self.pending.len()
+    }
+
     /// Whether an ack for `offset` is still being withheld.
     #[must_use]
     pub fn is_pending(&self, offset: u64) -> bool {
