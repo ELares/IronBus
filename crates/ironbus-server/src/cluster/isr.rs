@@ -547,28 +547,25 @@ impl<T> QuorumAckGate<T> {
         };
         // Re-driving with a non-advancing commit must release nothing new.
         let commit = commit.max(self.released_through);
-        // Release EVERY pending ack whose record is now quorum-committed (`offset < commit`),
-        // preserving the pending (submission) order of BOTH the released and the retained acks.
+        // Release the contiguous SUBMISSION-ORDER prefix of acks whose record is now quorum-committed
+        // (`offset < commit`). This is a strict prefix drain on purpose: each producer connection's acks
+        // are delivered in FIFO submission order (the client's `produce_window` correlates replies by
+        // ARRIVAL POSITION, not by offset — broker-assigned offsets are unknown until the ack arrives),
+        // so an ack may NEVER be released ahead of an earlier-submitted one on the same stream.
         //
-        // An all-fresh-produce gate is in non-decreasing offset order, so this releases exactly the
-        // same contiguous prefix a prefix-drain would. But a dedup-hit (#917) parks an OLD duplicate
-        // offset that can sit BELOW a higher already-parked offset, breaking the non-decreasing order.
-        // A plain prefix drain (`drain(..position(>= commit))`) would then STRAND that duplicate behind
-        // the higher entry until the HIGHER offset committed, not its own — so a duplicate whose record
-        // is already quorum-durable could be withheld through a partial-ISR stall. Scanning the whole
-        // list ties every ack's release to ITS OWN offset's quorum-commit, never a later one's, and can
-        // never release an offset `>= commit` (no false ack). This runs per follower-report (not the
-        // produce hot path) over a list bounded by the #864 cap, so the single O(n) pass is cheap.
-        let mut released = Vec::new();
-        let mut retained = Vec::with_capacity(self.pending.len());
-        for p in self.pending.drain(..) {
-            if p.offset < commit {
-                released.push(p.token);
-            } else {
-                retained.push(p);
-            }
-        }
-        self.pending = retained;
+        // A dedup-hit (#917) can park an OLD duplicate offset BELOW a higher already-parked offset, so
+        // `pending` is not always non-decreasing; the prefix drain correctly holds such a duplicate
+        // behind its FIFO-predecessor (releasing it would re-order that connection's ack stream and
+        // corrupt the client's position-indexed results) — it releases once the blocking earlier ack
+        // does, and a never-committing blocker withholds BOTH (the producer waits, unavailable over
+        // unsafe) until `purge_owner` reclaims them on disconnect. An ack at `offset >= commit` is
+        // committed iff `offset < commit`.
+        let split = self
+            .pending
+            .iter()
+            .position(|p| p.offset >= commit)
+            .unwrap_or(self.pending.len());
+        let released: Vec<T> = self.pending.drain(..split).map(|p| p.token).collect();
         self.released_through = commit;
         released
     }
@@ -804,12 +801,13 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_releases_an_out_of_order_duplicate_park_by_its_own_offset() {
+    fn the_gate_holds_an_out_of_order_duplicate_behind_its_fifo_predecessor() {
         // #917: a dedup-hit parks an OLD duplicate offset that can sit BELOW a higher already-parked
         // offset (a fresh produce pipelined between an original and its retry), so `pending` is no
-        // longer non-decreasing. The release must still tie each ack to ITS OWN offset's quorum-commit,
-        // never a later entry's — a plain prefix drain would strand the duplicate behind the higher
-        // offset until THAT offset committed.
+        // longer non-decreasing. Each producer connection's acks are delivered in FIFO SUBMISSION
+        // order (the client correlates replies by ARRIVAL POSITION, not by offset), so the duplicate
+        // must be HELD behind the offset-6 ack submitted before it — releasing it early would re-order
+        // that connection's ack stream and corrupt the client's position-indexed results.
         let mut gate: QuorumAckGate<u64> = QuorumAckGate::new();
         // Token 100 = original at offset 5; token 6 = a fresh produce at offset 6; token 200 = the
         // dedup retry at offset 5, parked AFTER offset 6 (out of order).
@@ -818,18 +816,19 @@ mod tests {
         let _ = gate.park(5, 200);
         assert_eq!(gate.pending_len(), 3);
 
-        // Quorum-commit = 6 → offset 5 is committed, offset 6 is NOT. BOTH offset-5 acks (the original
-        // AND the out-of-order duplicate) release, in submission order; the offset-6 ack stays parked.
+        // Quorum-commit = 6 → only the contiguous FIFO prefix releases: just the original offset-5 ack.
+        // The out-of-order duplicate stays withheld behind the offset-6 ack (it cannot jump the queue).
         let released = gate.release_up_to(Some(6));
         assert_eq!(
             released,
-            vec![100, 200],
-            "both offset-5 acks release; the duplicate is not stranded behind offset 6"
+            vec![100],
+            "only the FIFO prefix releases; the duplicate waits behind its offset-6 predecessor"
         );
-        assert_eq!(gate.pending_len(), 1, "only the offset-6 ack remains");
+        assert_eq!(gate.pending_len(), 2);
 
-        // When offset 6 commits (quorum 7), it releases. No double-release of the offset-5 acks.
-        assert_eq!(gate.release_up_to(Some(7)), vec![6]);
+        // When offset 6 commits (quorum 7), the offset-6 ack AND the duplicate behind it release, in
+        // submission order — preserving the connection's FIFO ack stream. No double-release.
+        assert_eq!(gate.release_up_to(Some(7)), vec![6, 200]);
         assert_eq!(gate.pending_len(), 0);
     }
 
