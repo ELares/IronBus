@@ -294,7 +294,11 @@ pub(crate) fn run_context(args: &[String], out: &mut impl Write) -> Result<(), C
     }
 }
 
-/// `context create <name> [--addr a] [--token t] [--tls-ca p] [--tls-server-name n] [--data-dir d] [--use]`.
+/// `context create <name> [--addr a] [--token-file p | --token t] [--tls-ca p] [--tls-server-name n] [--data-dir d] [--use]`.
+///
+/// The bearer token is a SECRET: prefer `--token-file <path>` (StrictModes-checked owner-only on unix)
+/// or `--token-file -` (stdin) so it never lands on the process argv table; `--token <t>` is kept for
+/// back-compat but warns about argv exposure (#885).
 fn context_create(path: &Path, args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut name: Option<String> = None;
     let mut ctx = Context::default();
@@ -303,7 +307,21 @@ fn context_create(path: &Path, args: &[String], out: &mut impl Write) -> Result<
     while i < args.len() {
         match args[i].as_str() {
             "--addr" => ctx.addr = Some(crate::take_value("--addr", args, &mut i)?),
-            "--token" => ctx.token = Some(crate::take_value("--token", args, &mut i)?),
+            "--token" => {
+                let token = crate::take_value("--token", args, &mut i)?;
+                // #885: a bearer token is a secret; on argv it is visible to any local user via `ps` /
+                // `/proc/<pid>/cmdline` for the lifetime of the invocation and lingers in shell history.
+                // Warn (to stderr, never stdout) and steer to the off-argv path, mirroring `passwd`.
+                eprintln!(
+                    "warning: --token exposes the bearer token in the process table and shell history; \
+                     prefer `--token-file <path>` (or `--token-file -` to read from stdin)"
+                );
+                ctx.token = Some(token);
+            }
+            "--token-file" => {
+                let path = crate::take_value("--token-file", args, &mut i)?;
+                ctx.token = Some(read_token_from_file_or_stdin(&path)?);
+            }
             "--tls-ca" => ctx.tls_ca = Some(crate::take_value("--tls-ca", args, &mut i)?),
             "--tls-server-name" => {
                 ctx.tls_server_name = Some(crate::take_value("--tls-server-name", args, &mut i)?);
@@ -340,6 +358,38 @@ fn context_create(path: &Path, args: &[String], out: &mut impl Write) -> Result<
     let verb = if existed { "updated" } else { "created" };
     writeln!(out, "{verb} context `{name}`")?;
     Ok(())
+}
+
+/// Read a bearer token from a file (or from stdin when `path` is `-`), so the secret never appears on
+/// the process argv table (#885) — mirroring `passwd`'s `--password-file` discipline. On unix the file
+/// is StrictModes-checked fail-closed (owner-only) BEFORE it is read, exactly like the auth-config /
+/// TLS-key / password file. One trailing newline (and an accompanying CR) is trimmed, the shape a
+/// `printf` / `echo` / heredoc produces, so the stored token is the intended value, not `token\n`. The
+/// token must be valid UTF-8 (it is sent as a UTF-8 wire credential).
+fn read_token_from_file_or_stdin(path: &str) -> Result<String, CliError> {
+    use std::io::Read as _;
+    let mut bytes = if path == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| CliError::Usage(format!("cannot read --token-file from stdin: {e}")))?;
+        buf
+    } else {
+        // The token file is a secret reference: fail-closed owner-only check on unix (no-op elsewhere,
+        // where POSIX mode bits do not apply), then read.
+        #[cfg(unix)]
+        crate::strict_mode_check_secret_file(path)?;
+        std::fs::read(path)
+            .map_err(|e| CliError::Usage(format!("cannot read --token-file `{path}`: {e}")))?
+    };
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| CliError::Usage("the token in --token-file is not valid UTF-8".to_string()))
 }
 
 /// `context use <name>` — point `current` at an existing context.
@@ -553,6 +603,60 @@ mod tests {
         std::fs::write(&path, "this is = = not toml").unwrap();
         let e = load(&path).unwrap_err();
         assert_eq!(e.exit_code(), crate::EXIT_USAGE);
+    }
+
+    #[test]
+    fn create_reads_the_token_from_a_file_not_argv() {
+        // #885: `--token-file` reads the bearer token from a file (off the argv table), trimming one
+        // trailing newline, and on unix StrictModes-checks the file owner-only fail-closed first.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contexts.toml");
+        let tok = dir.path().join("token.secret");
+        std::fs::write(&tok, "s3cr3t-bearer\n").unwrap(); // a trailing newline, the printf/echo shape
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tok, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let mut buf = Vec::new();
+        context_create(
+            &path,
+            &args(&[
+                "prod",
+                "--addr",
+                "example.com:7000",
+                "--token-file",
+                tok.to_str().unwrap(),
+            ]),
+            &mut buf,
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(
+            cfg.contexts.get("prod").and_then(|c| c.token.as_deref()),
+            Some("s3cr3t-bearer"),
+            "the token is read from the file with the trailing newline trimmed"
+        );
+
+        // On unix, a group/world-readable token file is refused fail-closed (StrictModes).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tok, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let mut buf2 = Vec::new();
+            let e = context_create(
+                &path,
+                &args(&["staging", "--token-file", tok.to_str().unwrap()]),
+                &mut buf2,
+            )
+            .unwrap_err();
+            assert_eq!(
+                e.exit_code(),
+                crate::EXIT_USAGE,
+                "a group/world-readable token file is refused"
+            );
+        }
     }
 
     #[test]
