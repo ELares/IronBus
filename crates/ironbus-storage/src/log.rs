@@ -4137,10 +4137,16 @@ mod tests {
         // #868: a crash during `start_segment` can leave the highest segment as an EMPTY unsealed
         // tail (the prior segment was sealed before this one was created, so it holds nothing
         // durable). Recovery must roll forward and recreate it, recording the abandonment in the loss
-        // report, NOT abort the whole boot on `Segment(Truncated)` and wedge a restart loop. Three
-        // empty shapes are covered: 0 bytes, a zeroed 64-byte header, and a header + all-zero
-        // preallocated body (the start_segment preallocation case).
-        for trailing_len in [0usize, SEGMENT_HEADER_LEN, SEGMENT_HEADER_LEN + 256] {
+        // report, NOT abort the whole boot on `Segment(Truncated)` and wedge a restart loop. Four
+        // empty shapes are covered: 0 bytes, a zeroed 64-byte header, a header + small all-zero
+        // preallocated body, and a header + all-zero body LARGER than one `segment_body_is_all_zero`
+        // chunk (4096), which exercises the multi-iteration cross-chunk scan path.
+        for trailing_len in [
+            0usize,
+            SEGMENT_HEADER_LEN,
+            SEGMENT_HEADER_LEN + 256,
+            SEGMENT_HEADER_LEN + 4096 + 64,
+        ] {
             let fs = InMemoryFs::new();
             // A valid sealed chain seg-0 (offsets 0,1) then seg-1 (offset 2).
             let f0 = fs.create_new(&segment_file_name(0)).unwrap();
