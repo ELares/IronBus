@@ -1884,6 +1884,13 @@ mod tests {
         DiskFullPolicy, EngineConfig, Poll, DEFAULT_GROUP_IDLE_EVICT_MS, DEFAULT_MAX_GROUPS,
     };
 
+    use ironbus_core::clock::ManualClock;
+    use ironbus_core::delivery::DeliveryConfig;
+    use ironbus_core::lease::LeaseConfig;
+    use ironbus_storage::fault::{FaultControl, FaultFs};
+    use ironbus_storage::fs::InMemoryFs;
+    use ironbus_storage::log::LogConfig;
+
     #[test]
     fn the_default_stream_always_routes_to_shard_zero() {
         // #811: the default stream `""` is PINNED to shard 0 for ANY shard count, so its byte-identical
@@ -1920,12 +1927,6 @@ mod tests {
             distinct.len()
         );
     }
-    use ironbus_core::clock::ManualClock;
-    use ironbus_core::delivery::DeliveryConfig;
-    use ironbus_core::lease::LeaseConfig;
-    use ironbus_storage::fault::{FaultControl, FaultFs};
-    use ironbus_storage::fs::InMemoryFs;
-    use ironbus_storage::log::LogConfig;
 
     fn config() -> EngineConfig {
         EngineConfig {
