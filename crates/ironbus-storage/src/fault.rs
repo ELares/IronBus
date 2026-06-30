@@ -84,6 +84,10 @@ pub struct FaultControl {
     /// A monotonic count of every `open` that ran, so a test can assert that a repeated read of one
     /// sealed segment opens it ONCE (the #808 reader cache), not once per read.
     open_count: Arc<AtomicU64>,
+    /// A condvar gate the READ path waits on while closed — the read analogue of `sync_gate` (#809).
+    /// Lets a test park a fetch-serve mid-read (in a positioned `read_at`) and then prove the server lock
+    /// is NOT held during the serve (off-lock fetch-serve), without a wall-clock sleep.
+    read_gate: Arc<SyncGate>,
 }
 
 /// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
@@ -282,6 +286,70 @@ impl FaultControl {
     #[must_use]
     pub fn sync_count(&self) -> u64 {
         self.sync_count.load(Ordering::SeqCst)
+    }
+
+    /// Closes the READ gate (#809): the NEXT positioned `read_at` blocks until [`open_read_gate`], so a
+    /// test can park a fetch-serve mid-read. Already-passed reads are unaffected.
+    ///
+    /// [`open_read_gate`]: FaultControl::open_read_gate
+    pub fn close_read_gate(&self) {
+        let mut state = self
+            .read_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 = false;
+    }
+
+    /// Opens the READ gate, releasing any parked read and letting later reads pass straight through.
+    pub fn open_read_gate(&self) {
+        let mut state = self
+            .read_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 = true;
+        self.read_gate.cv.notify_all();
+    }
+
+    /// Blocks (on the condvar, no wall-clock sleep) until at least `n` reads have ENTERED the closed read
+    /// gate, so a test can deterministically wait for a fetch-serve to be parked mid-read.
+    pub fn wait_for_read_gate_entered(&self, n: u64) {
+        let mut state = self
+            .read_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.1 < n {
+            state = self
+                .read_gate
+                .cv
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Parks the calling read on the condvar if the read gate is closed, bumping the entered-count (and
+    /// notifying waiters) so [`wait_for_read_gate_entered`] can observe the stall. No wall-clock sleep.
+    ///
+    /// [`wait_for_read_gate_entered`]: FaultControl::wait_for_read_gate_entered
+    fn enter_read_gate(&self) {
+        let mut state = self
+            .read_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.0 {
+            state.1 = state.1.saturating_add(1);
+            self.read_gate.cv.notify_all();
+            while !state.0 {
+                state = self
+                    .read_gate
+                    .cv
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
     }
 
     /// Records that a sync ran and, if the gate is closed, parks the calling thread on the condvar
@@ -518,6 +586,8 @@ fn injected_read_error() -> io::Error {
 
 impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        // Park here if the read gate is closed (#809) — a test stalls a fetch-serve mid-read this way.
+        self.control.enter_read_gate();
         if self.control.read_should_fail() {
             return Err(injected_read_error());
         }
