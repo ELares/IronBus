@@ -1800,17 +1800,21 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // so the at-risk exposure resets to zero: this is what bounds the relaxed levels' loss to at
         // most one open segment's worth of records (#341, #379).
         self.unsynced_record_bytes = 0;
-        // A roll SEALED a segment: the sealed set changed, so REPUBLISH the whole off-actor read
-        // plane (#539) — the new immutable sealed snapshot FIRST (Release), then the new frontier
-        // (Release). After this the just-sealed segment is served lock-free off-actor; before it the
-        // active-tail fallback served those same records, so consume behavior is identical across the
-        // seal. A no-op if no consumer has built the plane.
-        self.republish_read_plane();
         // Create the next active segment. The predecessor is already durably sealed, so a failure
         // here loses NO data and must not permanently freeze the writer on a TRANSIENT resource fault
         // (EMFILE / a short ENOSPC at the roll boundary, #867): `create_or_defer_segment` records a
         // pending roll and surfaces the raw, NON-FATAL error, and the next write retries the create.
-        self.create_or_defer_segment(next_id, self.next_seq, self.next_offset)
+        let result = self.create_or_defer_segment(next_id, self.next_seq, self.next_offset);
+        // A roll SEALED a segment: the sealed set changed, so REPUBLISH the whole off-actor read
+        // plane (#539) — the new immutable sealed snapshot FIRST (Release), then the new frontier
+        // (Release). After this the just-sealed segment is served lock-free off-actor; before it the
+        // active-tail fallback served those same records, so consume behavior is identical across the
+        // seal. A no-op if no consumer has built the plane. Done AFTER the create so the new active
+        // slot is installed first (so `build_sealed_descriptor` includes the just-sealed predecessor
+        // in the sealed prefix); on a DEFERRED roll there is no active slot and the predecessor is
+        // served as a fully-sealed prefix (#867).
+        self.republish_read_plane();
+        result
     }
 
     /// Creates the next active segment for a roll, distinguishing a TRANSIENT create fault (defer and
@@ -1865,9 +1869,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             Ok(w) => w,
             Err(e) => return Err(defer(self, e)),
         };
-        // Durability-barrier phase — a failure is a genuine durability fault: FREEZE.
-        writer.sync().map_err(|_| StorageError::WriterFrozen)?;
-        self.fs.sync_dir().map_err(|_| StorageError::WriterFrozen)?;
+        // Durability-barrier phase — a failure is a genuine durability fault: FREEZE. Clear any
+        // pending roll so the freeze is TERMINAL even when this is a retry of a previously-deferred
+        // roll, matching `WriterFrozen`'s "fatal, never-retried" contract (a later write must not
+        // resume it via `ensure_writable`). The orphan new segment is recovered at boot (#868).
+        if writer.sync().is_err() || self.fs.sync_dir().is_err() {
+            self.pending_roll = None;
+            return Err(StorageError::WriterFrozen);
+        }
         // Durable: install the new active segment and clear the pending roll.
         self.install_started_segment(writer, id, base_offset);
         self.pending_roll = None;
@@ -2419,6 +2428,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// Returns [`StorageError::WriterFrozen`] if the writer is already frozen, or if this fdatasync
     /// fails its durability barrier (which freezes the writer read-only).
     pub(crate) fn sync_data_only(&mut self) -> Result<(), StorageError> {
+        // Complete any transient-fault-deferred roll first (#867), so this barrier runs against a
+        // fully installed active segment rather than a momentarily-deferred one.
+        self.ensure_writable()?;
         self.active()?;
         let frozen = match self.active.as_mut() {
             Some(w) => w.sync_data_only().is_err(),
@@ -2579,13 +2591,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.clock.clone()
     }
 
-    /// Whether the writer is still live (an active segment is open). The writer freezes
-    /// (`active` becomes `None`) when a fatal `fdatasync` fails (see [`Log::sync`]) or a segment
-    /// roll fails; this reports that degraded state without a failing write, so a health check
-    /// can surface it. Reads keep serving the durable prefix from a frozen writer.
+    /// Whether the writer is still live (NOT permanently frozen). The writer freezes when a fatal
+    /// `fdatasync` fails (see [`Log::sync`]) or a roll hits a genuine durability-barrier fault; this
+    /// reports that degraded state without a failing write, so a health check can surface it. Reads
+    /// keep serving the durable prefix from a frozen writer.
+    ///
+    /// A roll a TRANSIENT fault merely DEFERRED (#867) has `active == None` but is RESUMABLE — the
+    /// next write completes the deferred create — so it reports `true`, NOT a freeze: a momentary
+    /// EMFILE/ENOSPC at a roll boundary must not flap a node out of `/readyz`.
     #[must_use]
     pub fn is_writable(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() || self.pending_roll.is_some()
     }
 
     /// Reads up to `max` records starting at log offset `start`, crossing segment
@@ -3743,12 +3759,27 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // base is the first offset NOT in the sealed prefix (the sealed end). With no sealed
         // predecessor (only the active segment, or none) the sealed prefix is empty and ends at the
         // oldest offset.
-        let sealed_count = self.segments.len().saturating_sub(1);
+        //
+        // When there is NO active segment — a frozen writer, or a roll a transient fault deferred
+        // (#867), where the last slot is the just-sealed predecessor, not an active tail — EVERY slot
+        // is sealed and the sealed prefix runs to the durable head. Treating the predecessor as active
+        // here would drop the hottest just-sealed segment from the off-actor plane (it would fall back
+        // through the actor) until the next republish.
+        let active_present = self.active.is_some();
+        let sealed_count = if active_present {
+            self.segments.len().saturating_sub(1)
+        } else {
+            self.segments.len()
+        };
         let sealed_slots = &self.segments[..sealed_count];
-        let sealed_end = self
-            .segments
-            .last()
-            .map_or(oldest, SegmentSlot::covered_base_offset);
+        let sealed_end = if active_present {
+            self.segments
+                .last()
+                .map_or(oldest, SegmentSlot::covered_base_offset)
+        } else {
+            // No active tail: the durable head is the end of the (fully sealed) prefix.
+            self.next_offset.get()
+        };
         let mut sealed = Vec::with_capacity(sealed_count);
         for slot in sealed_slots {
             if slot.compacted_covered.is_some() {
@@ -5266,6 +5297,97 @@ mod tests {
         let _ = log.next_offset();
         let _ = log.next_seq();
         let _ = log.active_segment_id();
+    }
+
+    #[test]
+    fn a_roll_republishes_the_just_sealed_segment_to_the_off_actor_read_plane() {
+        // #867 review finding 1: the roll must republish the #539 read plane AFTER installing the new
+        // active segment, so the just-sealed predecessor is served lock-free off-actor rather than
+        // forced through the actor. Build the plane FIRST (so the roll republishes it), roll, then
+        // read a predecessor offset and assert it completes off-plane (no fallback).
+        let mut log = open_mem(small_config());
+        let _ = log.read_plane().unwrap(); // cache the plane so the next roll REPUBLISHES it
+        let mut durable = 0u64;
+        while log.active_segment_id() == 0 {
+            log.append(&rec(&[7u8; 20])).unwrap();
+            log.sync().unwrap();
+            durable += 1;
+        }
+        assert!(log.active_segment_id() >= 1, "a roll happened");
+        let plane = log.read_plane().unwrap();
+        let read = plane.read_one(Offset::ZERO).unwrap();
+        assert_eq!(
+            read.records.len(),
+            1,
+            "the just-sealed predecessor's record is served"
+        );
+        assert!(
+            read.fallback_from.is_none(),
+            "the just-sealed segment is served off-actor, not via the through-actor fallback"
+        );
+        let _ = durable;
+    }
+
+    #[test]
+    fn a_persistent_transient_create_fault_keeps_deferring_then_resumes() {
+        use crate::fault::FaultFs;
+        // #867 review finding 5: a transient create fault that persists across several writes must
+        // keep DEFERRING (each write non-fatal, the writer never frozen and reported writable) and
+        // then resume cleanly once the fault clears — no data lost, no offset skipped.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        let mut durable = 0u64;
+        while !log.active_segment_at_or_over_cap().unwrap() {
+            assert_eq!(log.append(&rec(&[7u8; 20])).unwrap(), Offset::new(durable));
+            log.sync().unwrap();
+            durable += 1;
+        }
+        // The next 3 create_new calls fail: the roll defers, and the next two writes RE-defer.
+        control.fail_create_new(3);
+        for attempt in 0..3 {
+            let err = log.append(&rec(&[8u8; 20])).unwrap_err();
+            assert!(
+                !matches!(err, StorageError::WriterFrozen),
+                "attempt {attempt} must not freeze: {err:?}"
+            );
+            assert!(
+                log.is_writable(),
+                "attempt {attempt}: a deferred roll is resumable, reported writable (#867 finding 2)"
+            );
+            assert_eq!(
+                log.flushed_offset(),
+                Offset::new(durable),
+                "attempt {attempt}: no durable data lost while deferring"
+            );
+        }
+        // The fault has cleared: the next write completes the roll at the un-consumed offset.
+        assert_eq!(log.append(&rec(&[9u8; 20])).unwrap(), Offset::new(durable));
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(reopened.next_offset(), Offset::new(durable + 1));
+    }
+
+    #[test]
+    fn a_deferred_roll_is_completed_by_a_later_sync() {
+        use crate::fault::FaultFs;
+        // #867 review finding 5: a deferred roll is completed by ANY write entry point, not just
+        // append — here a `sync` finishes it via `ensure_writable`.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        let mut durable = 0u64;
+        while !log.active_segment_at_or_over_cap().unwrap() {
+            log.append(&rec(&[7u8; 20])).unwrap();
+            log.sync().unwrap();
+            durable += 1;
+        }
+        control.fail_create_new(1);
+        let err = log.append(&rec(&[8u8; 20])).unwrap_err();
+        assert!(!matches!(err, StorageError::WriterFrozen), "got {err:?}");
+        // A `sync` (not an append) completes the deferred roll; the fault has already cleared.
+        log.sync().unwrap();
+        assert!(log.is_writable(), "the roll completed, the writer is live");
+        assert_eq!(log.append(&rec(&[9u8; 20])).unwrap(), Offset::new(durable));
     }
 
     #[test]
