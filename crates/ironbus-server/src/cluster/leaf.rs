@@ -94,6 +94,7 @@
 //! * Gateway/supercluster FEDERATION (symmetric cluster-to-cluster) is the SEPARATE #626 — NOT here; the
 //!   leaf-spoke is asymmetric hub + many leaves.
 
+use bytes::Bytes;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -306,8 +307,10 @@ pub struct LeafPushRequest {
     /// How many complete CRC-framed records `frame_bytes` carries.
     pub record_count: u32,
     /// The contiguous CRC-framed local record frames — the leaf's bytes VERBATIM (UNTRUSTED on the hub
-    /// until re-validated, exactly like a geo pull response on the puller).
-    pub frame_bytes: Vec<u8>,
+    /// until re-validated, exactly like a geo pull response on the puller). A zero-copy `Bytes` (#920):
+    /// the serve path hands back a refcount-bump clone of the storage layer's `RawByteRun.bytes` rather
+    /// than `to_vec()`-ing the whole run per fan-out leaf, exactly as #810 did for the replication path.
+    pub frame_bytes: Bytes,
 }
 
 impl LeafPushRequest {
@@ -375,7 +378,7 @@ impl LeafPushRequest {
             stream,
             from_leaf_offset,
             record_count,
-            frame_bytes: body[name_end..].to_vec(),
+            frame_bytes: Bytes::copy_from_slice(&body[name_end..]),
         })
     }
 }
@@ -526,7 +529,7 @@ impl<'a, F: Filesystem> LeafForwarder<'a, F> {
             stream: hub_stream.to_string(),
             from_leaf_offset: sealed.run.first_offset.get(),
             record_count: u32::try_from(sealed.run.record_count).unwrap_or(u32::MAX),
-            frame_bytes: sealed.run.bytes.to_vec(),
+            frame_bytes: sealed.run.bytes.clone(),
         })
     }
 }
@@ -595,7 +598,7 @@ impl<F: Filesystem, C: Clock> HubPushReceiver<F, C> {
         // syncs the validated prefix, and is surfaced — the hub NEVER appends a byte it has not validated.
         let mut at = 0usize;
         let mut appended = 0u64;
-        let bytes = req.frame_bytes.as_slice();
+        let bytes = req.frame_bytes.as_ref();
         while at < bytes.len() {
             let at_leaf_offset = from + appended;
             let (view, frame_len) = match codec::decode(&bytes[at..]) {
@@ -1058,7 +1061,7 @@ mod tests {
             stream: "orders".to_string(),
             from_leaf_offset: 42,
             record_count: 2,
-            frame_bytes: vec![1, 2, 3, 4, 5],
+            frame_bytes: Bytes::from_static(&[1, 2, 3, 4, 5]),
         };
         let bytes = req.encode().unwrap();
         assert_eq!(LeafPushRequest::decode(&bytes).unwrap(), req);
@@ -1070,7 +1073,7 @@ mod tests {
             stream: String::new(),
             from_leaf_offset: 0,
             record_count: 0,
-            frame_bytes: Vec::new(),
+            frame_bytes: Bytes::new(),
         };
         let bytes = req.encode().unwrap();
         assert_eq!(LeafPushRequest::decode(&bytes).unwrap(), req);
@@ -1108,7 +1111,7 @@ mod tests {
             stream: "x".repeat(MAX_ORIGIN_STREAM_LEN + 1),
             from_leaf_offset: 0,
             record_count: 0,
-            frame_bytes: Vec::new(),
+            frame_bytes: Bytes::new(),
         };
         assert!(matches!(
             req.encode(),
@@ -1122,7 +1125,7 @@ mod tests {
             stream: "s".to_string(),
             from_leaf_offset: 0,
             record_count: 0,
-            frame_bytes: Vec::new(),
+            frame_bytes: Bytes::new(),
         }
         .encode()
         .unwrap();
@@ -1309,7 +1312,7 @@ mod tests {
             stream: "orders".to_string(),
             from_leaf_offset: 0,
             record_count: 2,
-            frame_bytes: frames,
+            frame_bytes: Bytes::from(frames),
         };
         let err = hub.apply_push(&req).unwrap_err();
         assert!(

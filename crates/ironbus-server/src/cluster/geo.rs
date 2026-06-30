@@ -91,6 +91,7 @@
 //!   conflict handling is OUT OF SCOPE — this is read-only mirror + fan-in source
 //!   (single-origin-of-truth, no conflict).
 
+use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,8 +255,10 @@ pub struct MirrorPullResponse {
     /// How many complete CRC-framed records `frame_bytes` carries.
     pub record_count: u32,
     /// The contiguous CRC-framed on-disk record frames — the origin's bytes VERBATIM (UNTRUSTED on the
-    /// puller until re-validated).
-    pub frame_bytes: Vec<u8>,
+    /// puller until re-validated). A zero-copy `Bytes` (#920): the serve path hands back a refcount-bump
+    /// clone of the storage layer's `RawByteRun.bytes` rather than `to_vec()`-ing the whole run per
+    /// mirror-pull, exactly as #810 did for the replication path.
+    pub frame_bytes: Bytes,
 }
 
 impl MirrorPullResponse {
@@ -306,7 +309,7 @@ impl MirrorPullResponse {
             origin_high_watermark,
             first_offset,
             record_count,
-            frame_bytes: body[PULL_RESPONSE_PREFIX_LEN..].to_vec(),
+            frame_bytes: Bytes::copy_from_slice(&body[PULL_RESPONSE_PREFIX_LEN..]),
         })
     }
 }
@@ -510,7 +513,7 @@ impl<'a, F: Filesystem> OriginServer<'a, F> {
             origin_high_watermark: hw,
             first_offset: sealed.run.first_offset.get(),
             record_count: u32::try_from(sealed.run.record_count).unwrap_or(u32::MAX),
-            frame_bytes: sealed.run.bytes.to_vec(),
+            frame_bytes: sealed.run.bytes.clone(),
         })
     }
 }
@@ -943,7 +946,7 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
         let mut at = 0usize;
         let mut seen = 0u64; // frames CONSUMED (skipped-as-already-applied + appended) = origin-offset progress
         let mut applied = 0u64; // frames actually APPENDED this pull
-        let bytes = resp.frame_bytes.as_slice();
+        let bytes = resp.frame_bytes.as_ref();
         while at < bytes.len() {
             let at_origin_offset = cursor + seen;
             let (view, frame_len) = match codec::decode(&bytes[at..]) {
@@ -1526,7 +1529,7 @@ mod tests {
             origin_high_watermark: 9,
             first_offset: 3,
             record_count: 2,
-            frame_bytes: vec![1, 2, 3, 4, 5],
+            frame_bytes: Bytes::from_static(&[1, 2, 3, 4, 5]),
         };
         let bytes = resp.encode();
         assert_eq!(MirrorPullResponse::decode(&bytes).unwrap(), resp);
@@ -1887,7 +1890,7 @@ mod tests {
                     &mut b,
                 )
                 .unwrap();
-                b
+                Bytes::from(b)
             },
         };
         assert!(matches!(
@@ -1937,7 +1940,7 @@ mod tests {
             origin_high_watermark: 2,
             first_offset: 0,
             record_count: 2,
-            frame_bytes: frames,
+            frame_bytes: Bytes::from(frames),
         };
         let err = app.apply_pull_response("o/", &resp).unwrap_err();
         assert!(
