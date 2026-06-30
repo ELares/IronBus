@@ -459,8 +459,19 @@ pub type AckToken = u64;
 /// recovered with `into_inner` everywhere (a follower-apply panic must not wedge the whole data plane).
 pub(crate) type FollowerHandle<F, C> = Arc<Mutex<EpochAwareFollower<F, C>>>;
 
-/// Lock a follower handle, recovering from a poisoned lock (`into_inner`) so a panic in one partition's
+/// Lock a follower handle, recovering from a poisoned lock (`into_inner`) so a panic in ONE partition's
 /// apply never wedges the whole data plane (#809).
+///
+/// This is a deliberate scope change from the pre-#809 global lock, which failed CLOSED on a poison (the
+/// fetch loop's `let Ok(..) = server.lock() else return` tore down on a poisoned global). Recovering a
+/// poisoned PER-PARTITION follower is sound here: `apply_fetch_response` returns a typed `Err` for every
+/// EXPECTED fault (corrupt / non-contiguous / storage) — a panic is therefore a latent bug, not
+/// adversarial input — and the follower's durable state is never left half-applied in a way a later read
+/// could serve as committed: `next_offset` advances only AFTER `Log::append` returns `Ok` (a torn append
+/// errors rather than advancing), and follower reads clamp to `follower_safe_watermark(plane.flushed(),
+/// known_committed_hw)`, so any torn UNCOMMITTED tail is never served below the committed bar. (If a
+/// poison ever needs stricter handling, fail closed by dropping the follower and forcing a clean
+/// re-fetch — tracked as a #809 follow-up.)
 fn lock_follower<F: Filesystem, C: Clock>(
     handle: &FollowerHandle<F, C>,
 ) -> std::sync::MutexGuard<'_, EpochAwareFollower<F, C>> {
@@ -1217,9 +1228,18 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
         // from `&log`) and the learned epoch history (cloned), never ownership of the log. On a verify
         // failure the follower role is restored unchanged. The `Arc` then drops here; the follower's
         // replica-log writer is released once the last clone (an exiting fetch thread's) drops — the same
-        // "serve through the read plane only" outcome as the old `into_log()`+`drop(log)`, only the
-        // writer release is deferred to the thread's exit instead of being immediate (harmless: nothing
-        // else writes this replica log, and the leader serves only up to the committed HW).
+        // "serve through the read plane only" outcome as the old `into_log()`+`drop(log)`, only the writer
+        // release is deferred to the thread's exit instead of being immediate.
+        //
+        // SAFETY of the deferred release: only ONE writer ever touches this replica log (the leader's
+        // append actor is not yet wired, so nothing else writes it), and the follower lock serializes a
+        // racing post-promotion apply against this promotion. Such an apply CAN still advance the leader's
+        // served frontier (`plane.flushed()`), but it only appends a byte-identical, CRC-revalidated,
+        // CONTIGUOUS continuation of the same authoritative old-leader lineage ABOVE the promotion
+        // frontier — adopting more of the uncommitted tail under the new epoch, never overwriting
+        // committed data and keeping the epoch fence at `frontier` consistent. When the append actor IS
+        // wired to write this log, add an explicit single-writer handoff (wait for the fetch thread to
+        // exit / the `Arc` to drop before opening the writer) — tracked as a #809 follow-up.
         let plane_epochs = {
             let guard = lock_follower(&follower);
             let log = guard.follower().log();
