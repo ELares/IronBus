@@ -448,6 +448,12 @@ pub struct Session {
     /// a later scope denial. Empty until authenticated; never a credential. Only meaningful on an
     /// auth-required broker (a no-auth broker never authenticates and never denies a scope).
     identity_name: String,
+    /// The half-open (accepted-but-not-yet-authenticated) slot (#633, #880): held from accept until the
+    /// `Connect` handshake RESOLVES, then dropped here (decrementing the global half-open count) so the
+    /// `--max-preauth-connections` cap measures connections still mid-handshake, NOT authenticated
+    /// long-lived ones. `None` when no half-open cap is wired, or once the handshake has resolved. A
+    /// slowloris that never sends a well-formed `Connect` keeps it until the connection times out.
+    half_open_slot: Option<crate::preauth::HalfOpenSlot>,
 }
 
 impl Session {
@@ -512,6 +518,18 @@ impl Session {
         peer_ip: std::net::IpAddr,
     ) -> Session {
         self.preauth = Some((guard, peer_ip));
+        self
+    }
+
+    /// Hands the connection's half-open (#633) RAII slot to the session, so it is dropped when the
+    /// `Connect` handshake RESOLVES (a well-formed `Connect`, success or failure) rather than at
+    /// connection teardown — making the `--max-preauth-connections` cap measure connections still
+    /// mid-handshake, NOT authenticated long-lived ones (#880). A builder-style setter (like
+    /// [`with_preauth`](Session::with_preauth)) so only the server's live accept path opts in; an inert
+    /// slot (no half-open cap configured) is a harmless no-op on drop.
+    #[must_use]
+    pub fn with_half_open_slot(mut self, slot: crate::preauth::HalfOpenSlot) -> Session {
+        self.half_open_slot = Some(slot);
         self
     }
 
@@ -951,12 +969,20 @@ impl Session {
         let req = match decode_connect(body) {
             Ok(req) => req,
             // A non-empty but malformed Connect body: surface a typed error and keep the connection
-            // open. The credit is not fixed, so a subsequent valid Connect/Flow still negotiates.
+            // open. The credit is not fixed, so a subsequent valid Connect/Flow still negotiates. The
+            // handshake is NOT resolved, so the half-open slot is intentionally KEPT — the client is
+            // still mid-handshake and a slowloris must not be able to free its slot with garbage.
             Err(e) => {
                 reply_err(out, &e.to_string());
                 return Ok(());
             }
         };
+        // A well-formed Connect: the handshake is now RESOLVING (auth below succeeds or fails, then this
+        // connection is authenticated or closed). Release the half-open (pre-auth) slot here so the #633
+        // half-open cap measures connections still mid-handshake, not authenticated long-lived ones
+        // (#880). A bad-credential flood is bounded by the per-IP auth-failure lockout, not this cap, so
+        // releasing before the auth verdict is correct; an inert slot (no cap configured) is a no-op.
+        self.half_open_slot = None;
         // AUTHENTICATE FIRST (#631, V2-M7), before any negotiation or `connected` flip. On an
         // auth-required broker (an identity table is configured) the `Connect` MUST carry a valid
         // credential; the resolved identity's scope set is PINNED to the connection for its lifetime. On
@@ -7177,6 +7203,52 @@ mod tests {
             out.is_empty(),
             "a fire-and-forget dedup hit must send no frame: {out:?}"
         );
+    }
+
+    #[test]
+    fn the_half_open_slot_is_released_when_the_connect_handshake_resolves() {
+        use crate::preauth::{PreAuthConfig, PreAuthGuard};
+        // #880: a well-formed Connect must release the half-open (#633) slot when the handshake
+        // resolves, so `--max-preauth-connections` measures connections still mid-handshake, NOT
+        // authenticated long-lived ones. With a cap of 1, an authed connection that kept its slot would
+        // block every later accept — a self-inflicted availability outage.
+        let cfg = PreAuthConfig {
+            per_ip_rate_per_sec: 0,
+            per_ip_burst: 0,
+            half_open_cap: 1,
+            lockout_threshold: 0,
+            lockout_window_ms: 0,
+            lockout_cooldown_ms: 0,
+        };
+        let connz = Arc::new(crate::connz::ConnectionMetrics::new());
+        let guard = Arc::new(PreAuthGuard::new(
+            cfg,
+            Arc::new(ManualClock::new()) as Arc<dyn Clock>,
+            connz,
+        ));
+        let slot = guard.on_accept("1.2.3.4".parse().unwrap()).unwrap();
+        assert_eq!(
+            guard.half_open_count(),
+            1,
+            "the accept reserved the half-open slot"
+        );
+        // The cap of 1 is full while the first connection is mid-handshake: a second accept is refused.
+        assert!(guard.on_accept("5.6.7.8".parse().unwrap()).is_err());
+
+        // The connection sends a well-formed Connect: the handshake resolves and the slot is released.
+        let mut s = Session::new().with_half_open_slot(slot);
+        let mut out = Vec::new();
+        s.process(&AtCapacityEngine, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        assert_eq!(
+            guard.half_open_count(),
+            0,
+            "the slot was released when the Connect handshake resolved (#880)"
+        );
+
+        // The cap is free again: a new accept succeeds even though the first connection is still open
+        // and authenticated. Pre-fix the slot stayed held for the whole connection and this failed.
+        assert!(guard.on_accept("5.6.7.8".parse().unwrap()).is_ok());
     }
 
     #[test]
