@@ -88,6 +88,12 @@ pub struct FaultControl {
     /// Lets a test park a fetch-serve mid-read (in a positioned `read_at`) and then prove the server lock
     /// is NOT held during the serve (off-lock fetch-serve), without a wall-clock sleep.
     read_gate: Arc<SyncGate>,
+    /// While non-zero, the next this-many `create_new` calls fail with a TRANSIENT injected IO error
+    /// (decrementing on each, so a count of 1 fails exactly the next call), modelling an EMFILE/short
+    /// ENOSPC at a segment-roll boundary. Lets a test prove a transient create fault DEFERS the roll
+    /// rather than permanently freezing the writer (#867): arm 1, drive a roll, then assert a later
+    /// append succeeds once the fault has cleared. `0` disables it.
+    fail_create_new: Arc<AtomicU64>,
 }
 
 /// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
@@ -164,6 +170,32 @@ impl FaultControl {
         }
         let threshold = self.fail_sync_dir_after.load(Ordering::SeqCst);
         threshold != 0 && self.sync_dir_count.load(Ordering::SeqCst) >= threshold
+    }
+
+    /// Arms a TRANSIENT `create_new` failure (#867): the next `count` calls to `create_new` fail with
+    /// an injected IO error, then it self-clears. Models a momentary EMFILE / short ENOSPC at a
+    /// segment-roll boundary so a test can prove the roll DEFERS (the writer stays resumable) instead
+    /// of permanently freezing. `0` disables it.
+    pub fn fail_create_new(&self, count: u64) {
+        self.fail_create_new.store(count, Ordering::SeqCst);
+    }
+
+    /// `true` (consuming one armed failure) if this `create_new` should fail. A no-op returning
+    /// `false` once the armed count is exhausted.
+    fn create_new_should_fail(&self) -> bool {
+        loop {
+            let n = self.fail_create_new.load(Ordering::SeqCst);
+            if n == 0 {
+                return false;
+            }
+            if self
+                .fail_create_new
+                .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
     }
 
     fn record_sync_dir(&self) {
@@ -435,6 +467,7 @@ impl FaultControl {
         self.set_fail_read(false);
         self.set_short_read(0);
         self.set_fail_sync_dir(false);
+        self.fail_create_new(0);
         // Consume any still-armed one-shot torn write so it cannot fire on a later op.
         let _ = self.take_torn_write();
     }
@@ -509,6 +542,13 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     }
 
     fn create_new(&self, name: &str) -> io::Result<Self::File> {
+        // A transient create fault (#867): fail BEFORE delegating, so no partial file is left behind,
+        // modelling EMFILE/short-ENOSPC where the inode is never created.
+        if self.control.create_new_should_fail() {
+            return Err(io::Error::other(
+                "injected transient create_new fault (#867)",
+            ));
+        }
         Ok(FaultFile {
             inner: self.inner.create_new(name)?,
             control: self.control.clone(),
