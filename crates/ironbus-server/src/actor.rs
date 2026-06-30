@@ -720,6 +720,22 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     }
 }
 
+/// The APPEND SHARD a produce to `stream` routes to (#811), in `0..shards`. The DEFAULT stream `""` is
+/// PINNED to shard 0 (mirroring `StreamId::is_default`), preserving its byte-identical single-log path; a
+/// named stream hashes its validated name bytes (a stable `DefaultHasher` — never persisted, so the hash
+/// algorithm can change freely) modulo `shards`. With `shards == 1` (the unsharded broker today) this
+/// always returns 0, so the routing seam is byte-for-byte until a later phase spawns K shard actors.
+#[must_use]
+pub fn shard_of(stream: &str, shards: usize) -> usize {
+    use core::hash::{Hash, Hasher};
+    if shards <= 1 || stream.is_empty() {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    stream.as_bytes().hash(&mut hasher);
+    usize::try_from(hasher.finish() % shards as u64).unwrap_or(0)
+}
+
 /// The engine access a [`Session`](crate::session::Session) needs: a group-committed produce and a
 /// generic "run this on the engine" call. Production wires [`EngineHandle`] (the channel to the
 /// append actor); session UNIT tests wire [`DirectEngine`] (a same-thread `&mut Engine`), so the
@@ -788,6 +804,40 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
     where
         R: Send + 'static,
         J: FnOnce(&mut Engine<F, C>) -> R + Send + 'static;
+
+    /// The number of APPEND SHARDS this engine is fanned across (#811). `1` for the single-actor engine
+    /// (the default, and every test fixture); a sharded engine returns its shard count. The caller picks a
+    /// produce's shard with [`shard_of`]`(stream, self.shard_count())` and dispatches via
+    /// [`with_on_shard`](EngineAccess::with_on_shard), so a hot stream's appends never head-of-line-block
+    /// a cold stream's on the same core once `K > 1` lands.
+    fn shard_count(&self) -> usize {
+        1
+    }
+
+    /// Run `job` on the append SHARD `shard` owns (#811) — the shard-routed twin of
+    /// [`with`](EngineAccess::with). The DEFAULT (single-actor) impl IGNORES `shard` and runs on the one
+    /// engine, so it is BYTE-FOR-BYTE identical to `with` while the broker is unsharded (`shard_count() ==
+    /// 1`, so the only `shard` a caller ever passes is `0`). A future K-shard engine overrides this to send
+    /// the job to shard `shard`'s actor. Landing this seam now (the `StreamId` routing flows through the
+    /// dispatch layer) is what later phases flip to spawn K shard actors — the default stream `""` always
+    /// resolves to shard 0 ([`shard_of`]), preserving its byte-identical single-log path.
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the shard's engine is no longer reachable.
+    fn with_on_shard<R, J>(&self, shard: usize, job: J) -> Result<R, ActorGone>
+    where
+        R: Send + 'static,
+        J: FnOnce(&mut Engine<F, C>) -> R + Send + 'static,
+    {
+        // Single-actor engine: there is one shard (0); route every job to it. A sharded engine overrides.
+        debug_assert!(
+            shard < self.shard_count(),
+            "shard index {shard} out of range for {} shards",
+            self.shard_count()
+        );
+        let _ = shard;
+        self.with(job)
+    }
 
     /// The current MONOTONIC time (nanoseconds) from the engine's clock seam, read LOCALLY (no actor
     /// round-trip), so a connection handler can stamp a produce's ENQUEUE instant for the CoDel
@@ -1833,6 +1883,43 @@ mod tests {
     use crate::engine::{
         DiskFullPolicy, EngineConfig, Poll, DEFAULT_GROUP_IDLE_EVICT_MS, DEFAULT_MAX_GROUPS,
     };
+
+    #[test]
+    fn the_default_stream_always_routes_to_shard_zero() {
+        // #811: the default stream `""` is PINNED to shard 0 for ANY shard count, so its byte-identical
+        // single-log path is preserved when sharding lands. And with one shard, EVERY stream routes to 0,
+        // so the routing seam is byte-for-byte today.
+        for shards in [1usize, 2, 4, 8, 64] {
+            assert_eq!(shard_of("", shards), 0, "default stream pins to shard 0");
+        }
+        for name in ["orders", "clicks", "a/b/c", "x"] {
+            assert_eq!(
+                shard_of(name, 1),
+                0,
+                "with one shard every stream is shard 0"
+            );
+        }
+    }
+
+    #[test]
+    fn shard_of_is_deterministic_in_range_and_spreads_named_streams() {
+        // Deterministic (same name -> same shard) and always in range; named streams spread across the
+        // shards (a sanity check, not a statistical one) so a fan-out actually parallelizes.
+        const K: usize = 8;
+        for name in ["orders", "clicks", "telemetry", "a/b/c"] {
+            let s = shard_of(name, K);
+            assert!(s < K, "shard {s} in range for {K}");
+            assert_eq!(s, shard_of(name, K), "deterministic for {name}");
+        }
+        let distinct: std::collections::HashSet<usize> = (0..200u32)
+            .map(|i| shard_of(&format!("stream-{i}"), K))
+            .collect();
+        assert!(
+            distinct.len() >= K / 2,
+            "200 named streams spread across the shards (got {} of {K})",
+            distinct.len()
+        );
+    }
     use ironbus_core::clock::ManualClock;
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;

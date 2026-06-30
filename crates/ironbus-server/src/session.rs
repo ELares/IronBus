@@ -3082,7 +3082,11 @@ impl Session {
             ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
         let stream = stream.to_string();
-        let outcome = engine.with(move |e| {
+        // Route the named-stream produce to its append SHARD (#811): hash the name (by ref) BEFORE the
+        // job moves it, so no extra allocation. With one shard (today) this is always 0 and `with_on_shard`
+        // is byte-for-byte `with`.
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let outcome = engine.with_on_shard(shard, move |e| {
             let view = Append {
                 timestamp_ms: append.timestamp_ms,
                 flags: RecordFlags::from_bits(append.flags),
