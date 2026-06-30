@@ -851,6 +851,29 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
         origin_key: &str,
         resp: &MirrorPullResponse,
     ) -> Result<ApplyOutcome, GeoError> {
+        self.apply_pull_response_inner(origin_key, resp, true)
+    }
+
+    /// TEST SEAM (#906): apply `resp` but STOP after the batch's records and any mid-batch seal markers,
+    /// BEFORE the final marker, the group-commit `log.sync()`, and the cursor commit — modeling a crash in
+    /// the durability window. The mid-batch seals are already durable (each fsynced its segment with a
+    /// marker tail); the active segment's unsynced tail and the cursor are not, so a subsequent
+    /// `simulate_power_loss` leaves exactly the post-crash durable state to test recovery against.
+    #[cfg(test)]
+    fn apply_then_crash_before_final_sync(
+        &mut self,
+        origin_key: &str,
+        resp: &MirrorPullResponse,
+    ) -> Result<ApplyOutcome, GeoError> {
+        self.apply_pull_response_inner(origin_key, resp, false)
+    }
+
+    fn apply_pull_response_inner(
+        &mut self,
+        origin_key: &str,
+        resp: &MirrorPullResponse,
+        finalize: bool,
+    ) -> Result<ApplyOutcome, GeoError> {
         let cursor = self.cursors.cursor(origin_key);
         // An empty run (caught up to the origin's HW) is a clean no-op that still reflects the observed
         // HW. Its `first_offset` may be the cursor OR the origin HW; either way nothing is applied.
@@ -955,10 +978,22 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
                 headers: view.headers,
                 payload: view.payload,
             };
-            self.log.append(&append)?;
+            // Append the record, managing segment boundaries so a marker always caps a sealed segment
+            // (#906). `at_origin_offset` is this origin's applied extent BEFORE this record, i.e. the HWM
+            // a sealing marker would record for the records already in the active segment.
+            self.append_origin_record(origin_key, &append, at_origin_offset)?;
             applied += 1;
             seen += 1;
             at += frame_len;
+        }
+        if !finalize {
+            // TEST-ONLY crash point (#906): the records and any mid-batch seal markers are appended (the
+            // seals are durable), but the final marker + group-commit fsync + cursor commit have NOT run.
+            return Ok(ApplyOutcome {
+                applied,
+                cursor: cursor + seen,
+                origin_high_watermark: resp.origin_high_watermark,
+            });
         }
         // Durably commit the applied batch to the local log (one fsync per pull — the group-commit shape).
         // For a multi-origin source that appended records, the per-origin HWM marker is appended FIRST so
@@ -1024,13 +1059,76 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
         }
     }
 
-    /// Durably sync the just-applied batch, FIRST appending the per-origin HWM marker (#906) when this
-    /// batch actually appended records to a MULTI-origin source log — so the marker (the per-origin
-    /// applied-offset snapshot, `hwm` for `origin_key`) is covered by the SAME `log.sync()` fsync as the
-    /// records it describes. That single-fsync atomicity is exactly what the separately-fsynced cursor
-    /// lacks, and is what closes the double-apply window. For a single-origin applier, or a batch that
-    /// appended nothing (a pure-skip / idle pull), NO marker is written and this is just `log.sync()` —
-    /// so the mirror's byte-identical log and the steady-state idle path are unchanged.
+    /// Append one validated origin record to the local fan-in log, managing segment boundaries so a HWM
+    /// marker ALWAYS caps a sealed segment (#906). For a MULTI-origin source: if the active segment is at
+    /// or over the soft cap (the next normal append would roll it), FIRST append the current per-origin
+    /// HWM marker as that segment's sealing TRAILER and force-seal it — so the just-sealed, fsynced
+    /// segment ends with a marker covering exactly its records — then append this record (which starts the
+    /// fresh segment) WITHOUT an implicit roll. This guarantees the durable tail is always a marker no
+    /// matter where rolls fall, closing the roll-straddle window where the old "marker after the batch"
+    /// approach left a data record stranded as the sealed tail. `hwm_before` is this origin's applied
+    /// extent BEFORE this record — exactly what a sealing marker records for the records already resident.
+    /// For a single-origin applier this is a plain `log.append` (the `next_offset` anchor is roll-proof,
+    /// and the mirror's byte-identical layout must be preserved).
+    fn append_origin_record(
+        &mut self,
+        origin_key: &str,
+        record: &Append<'_>,
+        hwm_before: u64,
+    ) -> Result<(), GeoError> {
+        if self.single_origin {
+            self.log.append(record)?;
+            return Ok(());
+        }
+        if self.log.active_segment_at_or_over_cap()? {
+            // The active segment is full: cap it with a marker (covering the records already in it) so its
+            // durable tail is a marker, then seal it. A crash after this seal recovers the right HWM from
+            // that tail; the record below starts the fresh segment.
+            self.write_hwm_marker(origin_key, hwm_before)?;
+            self.log.seal_active_segment()?;
+        }
+        self.log.append_without_roll(record)?;
+        Ok(())
+    }
+
+    /// Append a per-origin HWM marker record to the local fan-in log (#906) via `append_without_roll` (so
+    /// it never triggers a roll itself — segment boundaries are managed by the caller), after advancing
+    /// `origin_hwm[origin_key]` to `hwm` (monotonic). The payload is the magic plus the FULL `(origin ->
+    /// applied offset)` snapshot, so one marker covers EVERY origin's records resident in the segment, not
+    /// just this origin's. Multi-origin only — callers guarantee `!single_origin`.
+    fn write_hwm_marker(&mut self, origin_key: &str, hwm: u64) -> Result<(), GeoError> {
+        // Update the in-memory per-origin HWM, then encode the FULL snapshot. Scoped so the `origin_hwm`
+        // borrow ends before `self.log` is touched below.
+        let payload = {
+            let map = self.origin_hwm.get_or_insert_with(BTreeMap::new);
+            let slot = map.entry(origin_key.to_string()).or_insert(0);
+            *slot = (*slot).max(hwm);
+            let snapshot = encode_cursor_payload(map);
+            let mut payload = Vec::with_capacity(GEO_HWM_MARKER_MAGIC.len() + snapshot.len());
+            payload.extend_from_slice(GEO_HWM_MARKER_MAGIC);
+            payload.extend_from_slice(&snapshot);
+            payload
+        };
+        let timestamp_ms = self.log.now_unix_millis();
+        self.log.append_without_roll(&Append {
+            timestamp_ms,
+            flags: RecordFlags::EMPTY,
+            key: GEO_HWM_MARKER_KEY,
+            headers: b"",
+            payload: &payload,
+        })?;
+        Ok(())
+    }
+
+    /// Durably sync the just-applied batch, FIRST appending the FINAL per-origin HWM marker (#906) when
+    /// this batch appended records to a MULTI-origin source log — so the marker (the per-origin
+    /// applied-offset snapshot, `hwm` for `origin_key`) rides the SAME `log.sync()` fsync as the records
+    /// it describes in the active (not-yet-sealed) segment. Mid-batch rolls are handled separately by
+    /// [`append_origin_record`](MirrorApplier::append_origin_record), which caps each sealed segment with
+    /// its own marker; this writes the final marker for the still-open segment. For a single-origin
+    /// applier, or a batch that appended nothing (a pure-skip / idle pull), NO marker is written and this
+    /// is just `log.sync()` — so the mirror's byte-identical log and the steady-state idle path are
+    /// unchanged.
     fn sync_with_hwm_marker(
         &mut self,
         origin_key: &str,
@@ -1038,26 +1136,7 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
         appended: bool,
     ) -> Result<(), GeoError> {
         if appended && !self.single_origin {
-            // Update the in-memory per-origin HWM (monotonic), then encode the FULL snapshot as the marker
-            // payload. Scoped so the `origin_hwm` borrow ends before `self.log` is touched below.
-            let payload = {
-                let map = self.origin_hwm.get_or_insert_with(BTreeMap::new);
-                let slot = map.entry(origin_key.to_string()).or_insert(0);
-                *slot = (*slot).max(hwm);
-                let snapshot = encode_cursor_payload(map);
-                let mut payload = Vec::with_capacity(GEO_HWM_MARKER_MAGIC.len() + snapshot.len());
-                payload.extend_from_slice(GEO_HWM_MARKER_MAGIC);
-                payload.extend_from_slice(&snapshot);
-                payload
-            };
-            let timestamp_ms = self.log.now_unix_millis();
-            self.log.append(&Append {
-                timestamp_ms,
-                flags: RecordFlags::EMPTY,
-                key: GEO_HWM_MARKER_KEY,
-                headers: b"",
-                payload: &payload,
-            })?;
+            self.write_hwm_marker(origin_key, hwm)?;
         }
         self.log.sync()?;
         Ok(())
@@ -2061,6 +2140,158 @@ mod tests {
         for (i, p) in b_seen.iter().enumerate() {
             assert_eq!(*p, format!("B-{i:02}").as_bytes());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_multi_origin_re_pull_after_a_roll_straddle_crash_skips_not_double_applies() {
+        // #906 (THE roll-straddle hole the first cut missed): a fan-in apply batch can span a LOCAL
+        // segment roll. `roll()` seals + fsyncs the old segment INDEPENDENTLY (segment.rs `seal` →
+        // `sync_all`), so a crash AFTER a mid-batch seal but BEFORE the batch's final fsync would, under
+        // the naive "one marker after the batch" scheme, leave a DATA record as the durable tail →
+        // recovery reads an empty HWM → the already-durable prefix is RE-APPLIED. The fix caps EVERY
+        // sealed segment with a marker (`append_origin_record` writes the marker as the sealing trailer
+        // via `append_without_roll` + `seal_active_segment`), so the durable tail is always a marker.
+        //
+        // We exercise it for real: origins with BIG segments (one pull serves many records) feeding a
+        // small-segment local log (so the batch straddles several rolls), then a power-loss crash before
+        // the final sync via the `apply_then_crash_before_final_sync` seam.
+        let big = LogConfig {
+            max_segment_bytes: 4096,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        };
+        let mut origin_a = Log::open(InMemoryFs::new(), ManualClock::new(), big).unwrap();
+        for i in 0..120u32 {
+            origin_a
+                .append(&rec(format!("A-{i:03}").as_bytes()))
+                .unwrap();
+        }
+        origin_a.sync().unwrap();
+        let served_a = plane_served_end(&origin_a);
+        assert!(
+            served_a >= 20,
+            "origin A serves a many-record sealed prefix: {served_a}"
+        );
+
+        let mut origin_b =
+            Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..12u32 {
+            origin_b
+                .append(&rec(format!("B-{i:03}").as_bytes()))
+                .unwrap();
+        }
+        origin_b.sync().unwrap();
+        let served_b = plane_served_end(&origin_b);
+        assert!(served_b >= 2);
+
+        let fs = InMemoryFs::new();
+        let (ka, kb) = ("a/", "b/");
+        {
+            let mut app = source_applier(fs.clone());
+            // Drain B fully (committed), so the marker's full snapshot must also carry B across the crash.
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                assert!(guard < 1000);
+                if app
+                    .apply_pull_response(kb, &origin_pull(&origin_b, app.cursor(kb)))
+                    .unwrap()
+                    .applied
+                    == 0
+                {
+                    break;
+                }
+            }
+            assert_eq!(app.cursor(kb), served_b);
+
+            // Apply ONE big A pull, but CRASH before its final sync: the many records straddle several
+            // local 256-byte rolls, so mid-batch seals (each marker-capped) become durable while the
+            // active tail + A's cursor do not.
+            let out = app
+                .apply_then_crash_before_final_sync(ka, &origin_pull(&origin_a, 0))
+                .unwrap();
+            assert!(
+                out.applied >= 20,
+                "the A pull applied many records: {}",
+                out.applied
+            );
+        }
+
+        // POWER LOSS: every unsynced byte is dropped. The mid-batch-sealed (marker-capped) segments
+        // survive; the active tail (the post-last-seal A records + the never-written final marker) and
+        // A's uncommitted cursor are gone.
+        fs.simulate_power_loss();
+
+        // Reopen: recovery rebuilds the per-origin HWM from the DURABLE TAIL. The fix guarantees that tail
+        // is a MARKER (every sealed segment is marker-capped), even though A's batch straddled a roll, so
+        // A's recovered HWM is strictly between 0 and the batch end. Pre-fix the durable tail would have
+        // been a DATA record → empty HWM → `a_durable == 0` → the assertion below would fail and the
+        // re-pull would double-apply. B's committed cursor survived.
+        let mut app = source_applier(fs.clone());
+        assert_eq!(
+            app.cursor(kb),
+            served_b,
+            "B's committed cursor survived the crash"
+        );
+        let recovered = app.read_durable_hwm().unwrap();
+        let a_durable = recovered.get(ka).copied().unwrap_or(0);
+        assert!(
+            a_durable > 0 && a_durable < served_a,
+            "the durable tail is a marker carrying A's PARTIAL durable HWM (a roll-straddle): {a_durable} \
+             of {served_a} — pre-fix this would be 0 (a data-record tail) and the prefix would double-apply"
+        );
+        assert_eq!(
+            recovered.get(kb).copied(),
+            Some(served_b),
+            "the same marker snapshot also preserved B's HWM across the crash"
+        );
+
+        // Re-pull A to convergence from its (uncommitted => 0) cursor: the already-durable prefix
+        // [0, a_durable) is SKIPPED, the lost tail is re-applied fresh. No A record appears twice.
+        let mut guard = 0;
+        let mut re_applied = 0u64;
+        while app.cursor(ka) < served_a {
+            guard += 1;
+            assert!(guard < 1000, "A re-pull did not converge");
+            re_applied += app
+                .apply_pull_response(ka, &origin_pull(&origin_a, app.cursor(ka)))
+                .unwrap()
+                .applied;
+        }
+        assert_eq!(app.cursor(ka), served_a);
+
+        // The fan-in log holds EXACTLY served_a A-records and served_b B-records — each origin record
+        // once, in order. A roll-straddle double-apply of [0, a_durable) would push a_seen above served_a.
+        let local = app.log().read_from(Offset::new(0), 100_000).unwrap();
+        let a_seen: Vec<&[u8]> = local
+            .iter()
+            .map(|r| r.payload.as_ref())
+            .filter(|p| p.starts_with(b"A-"))
+            .collect();
+        let b_seen: Vec<&[u8]> = local
+            .iter()
+            .map(|r| r.payload.as_ref())
+            .filter(|p| p.starts_with(b"B-"))
+            .collect();
+        assert_eq!(
+            a_seen.len() as u64,
+            served_a,
+            "A applied EXACTLY once — no roll-straddle double-apply (#906)"
+        );
+        assert_eq!(b_seen.len() as u64, served_b, "B untouched");
+        for (i, p) in a_seen.iter().enumerate() {
+            assert_eq!(*p, format!("A-{i:03}").as_bytes());
+        }
+        for (i, p) in b_seen.iter().enumerate() {
+            assert_eq!(*p, format!("B-{i:03}").as_bytes());
+        }
+        // The lost tail [a_durable, served_a) really was re-applied (not silently dropped).
+        assert!(
+            re_applied >= served_a - a_durable,
+            "the lost active tail was re-applied fresh: {re_applied} >= {}",
+            served_a - a_durable
+        );
     }
 
     #[test]

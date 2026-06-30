@@ -1790,6 +1790,56 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// space is exhausted or the record is too large to frame, [`StorageError::WriterFrozen`] if a
     /// prior fatal error froze the writer, or an IO error from the write.
     pub fn append(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
+        self.append_inner(record, true)
+    }
+
+    /// Like [`append`](Log::append) but NEVER triggers the implicit soft-size-cap roll: the record
+    /// always lands in the CURRENT active segment, even if that pushes it past `max_segment_bytes`. The
+    /// caller manages segment boundaries explicitly via [`seal_active_segment`](Log::seal_active_segment).
+    /// The byte-cap and daily-write-budget sheds still apply (durability and the wear governor are
+    /// unchanged). Used by the geo source applier (#906) to keep a per-origin HWM marker and the records
+    /// it covers in ONE segment, so a segment never seals BETWEEN them — which would strand the marker in
+    /// a different fsync than its data and reopen the multi-origin double-apply window across a roll.
+    ///
+    /// # Errors
+    /// Same as [`append`](Log::append) (byte-cap / daily-budget sheds, `SegmentFull`, `WriterFrozen`, IO),
+    /// minus anything roll-specific.
+    pub fn append_without_roll(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
+        self.append_inner(record, false)
+    }
+
+    /// Force-seal the active segment and start a fresh one — exactly the seal the implicit soft-cap roll
+    /// performs (the seal fsyncs the segment via its footer). A no-op if the active segment is empty
+    /// (nothing to seal). Lets a caller that appends via [`append_without_roll`](Log::append_without_roll)
+    /// place a segment boundary DETERMINISTICALLY — e.g. right after a sealing trailer record — so a
+    /// segment never seals between a marker and the records it covers (#906).
+    ///
+    /// # Errors
+    /// [`StorageError::WriterFrozen`] if the writer is frozen, or an IO error from the seal's fsync.
+    pub fn seal_active_segment(&mut self) -> Result<(), StorageError> {
+        if self.active()?.record_count() == 0 {
+            return Ok(());
+        }
+        self.roll()
+    }
+
+    /// Whether the active segment is at or over the soft size cap (`max_segment_bytes`) AND non-empty —
+    /// i.e. the next normal [`append`](Log::append) would roll it first. A caller using
+    /// [`append_without_roll`](Log::append_without_roll) consults this to decide when to place a sealing
+    /// trailer record + [`seal_active_segment`](Log::seal_active_segment) (#906).
+    ///
+    /// # Errors
+    /// [`StorageError::WriterFrozen`] if the writer is frozen.
+    pub fn active_segment_at_or_over_cap(&self) -> Result<bool, StorageError> {
+        let active = self.active()?;
+        Ok(active.write_pos() >= self.config.max_segment_bytes && active.record_count() > 0)
+    }
+
+    fn append_inner(
+        &mut self,
+        record: &Append<'_>,
+        allow_roll: bool,
+    ) -> Result<Offset, StorageError> {
         // Hard durable-log byte cap (the drop-new shed): when the log is at or over the cap,
         // reject the produce and write nothing, advancing no offset or sequence. The check is
         // at-or-over BEFORE the append (like the segment cap), so the log overshoots by at most
@@ -1833,9 +1883,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         }
 
         // Soft size cap: roll before appending if the active segment has reached the cap,
-        // but never roll an empty one (so an oversized record still gets written).
+        // but never roll an empty one (so an oversized record still gets written). `allow_roll` is
+        // false ONLY on the `append_without_roll` path (#906), where the caller manages segment
+        // boundaries explicitly so a marker and the records it covers cannot seal apart.
         let active = self.active()?;
-        if active.write_pos() >= self.config.max_segment_bytes && active.record_count() > 0 {
+        if allow_roll
+            && active.write_pos() >= self.config.max_segment_bytes
+            && active.record_count() > 0
+        {
             self.roll()?;
         }
 
