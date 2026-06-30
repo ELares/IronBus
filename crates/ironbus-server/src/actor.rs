@@ -822,6 +822,17 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         false
     }
 
+    /// Whether the durable-log writer APPEARS healthy (not frozen), read from a PUBLISHED flag WITHOUT
+    /// going through the actor (#862), so `/readyz` can answer on a hung writer instead of queuing a job
+    /// behind the wedged fsync and HANGING. The DEFAULT returns `true` (no actor / an in-process test
+    /// fixture is assumed live); [`EngineHandle`] overrides it to read the actor's last-published
+    /// `is_healthy()`. This is an ADVISORY read: it reflects the state as of the last completed batch, so
+    /// a freeze becomes visible after the batch that froze the writer commits — exactly when the old
+    /// `engine.with(|e| e.is_healthy())` would have observed it, but without the blocking round-trip.
+    fn writer_appears_healthy(&self) -> bool {
+        true
+    }
+
     /// The CLUSTER produce-ack decision (#719) for one durable produce on connection `member`: called
     /// AFTER the local group-commit fsync returned `Appended(offset)`, with the `offset`, and the EXACT
     /// wire-`PubAck` frame bytes the session would otherwise write now.
@@ -958,6 +969,13 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         // it answers even while the actor is wedged on a hung fsync. `false` until the serve path arms
         // the bound (`bound == 0` is disabled), so single-node and unconfigured brokers are unaffected.
         self.actor_watchdog.overran(now_monotonic_nanos)
+    }
+
+    fn writer_appears_healthy(&self) -> bool {
+        // A non-blocking atomic read of the writer-frozen flag the actor publishes after each batch
+        // (#862): `/readyz` reads this instead of `engine.with(|e| e.is_healthy())`, so a hung writer
+        // can never block the health server. `true` for a fresh broker that has run no batch yet.
+        self.actor_watchdog.writer_healthy()
     }
 
     fn client_ack_disposition(
@@ -1111,6 +1129,17 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for SharedEngine<F, C> 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (e.consumer_credit(), e.consumer_credit_bytes())
+    }
+
+    fn writer_appears_healthy(&self) -> bool {
+        // The shared-engine test fixture (a `Mutex<Engine>`, no separate actor): read the REAL writer
+        // state under the lock, so a frozen engine reports unhealthy to `/readyz` exactly as the old
+        // `engine.with(|e| e.is_healthy())` did. The lock is uncontended in a health test (no real
+        // actor holds it across an fsync), so this never blocks — unlike the production `EngineHandle`,
+        // whose override reads the actor's PUBLISHED flag so a HUNG actor can never block the read.
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_healthy()
     }
 }
 
@@ -1535,6 +1564,11 @@ where
         // disabled (the default), so the steady-state loop is unchanged for a broker that has not
         // opted in.
         engine.codel_queue_empty();
+        // Publish the writer's live/frozen state for `/readyz` to read non-blockingly (#862): the
+        // covering commit just ran, so `is_healthy()` now reflects a frozen writer (a fsync that RETURNED
+        // an error) — and a `/readyz` probe reads this flag instead of round-tripping through the actor,
+        // so it can never hang behind the writer. A cheap local read + one relaxed store, per batch.
+        watchdog.publish_writer_healthy(engine.is_healthy());
         // The batch committed (its fsync returned) and the queue drained: the actor returns to IDLE
         // (it blocks in `rx.recv()` next), so clear the watchdog — an idle actor is never wedged (#862).
         watchdog.mark_idle();
@@ -2050,6 +2084,51 @@ mod tests {
         // cleanly — proving the watchdog detection did not itself disturb the actor.
         control.open_sync_gate();
         produce.join().unwrap();
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join();
+    }
+
+    #[test]
+    fn the_actor_publishes_a_frozen_writer_and_readyz_reads_it_without_a_round_trip() {
+        // #862 PRODUCTION PUBLISH→READ PATH: after a covering fsync RETURNS an error and freezes the
+        // writer, `run_actor` publishes `engine.is_healthy()` to the watchdog, and
+        // `EngineAccess::writer_appears_healthy` (what `/readyz` reads) returns that PUBLISHED flag
+        // WITHOUT queuing a job through the actor. `admin_resilience` proves the `/readyz` 503 over a
+        // `SharedEngine` (a direct-lock fixture); this proves the REAL actor wiring — that the running
+        // append actor actually publishes the frozen state the non-blocking read reports.
+        let (handle, actor, control) = rig();
+
+        // A clean produce keeps the writer live; force the batch's post-commit publish to complete (a
+        // follow-up `Run` job is processed in a LATER actor iteration, so the produce batch's publish
+        // has run by the time `with` returns) and confirm the published flag reads HEALTHY.
+        handle.produce(append(b"live")).expect("a clean produce");
+        let _ = handle.with(|_| ());
+        assert!(
+            handle.writer_appears_healthy(),
+            "a live writer publishes healthy"
+        );
+
+        // Arm a FATAL fsync (one that RETURNS an error, not the hang above): the next produce's covering
+        // fdatasync fails and freezes the writer one-way. The produce comes back `Fatal`, and — unlike a
+        // hang — the actor keeps serving (a frozen writer answers reads, refuses writes).
+        control.set_fail_sync(true);
+        let outcome = handle.produce(append(b"freeze"));
+        assert!(
+            matches!(outcome, Ok(ProduceOutcome::Fatal(_))),
+            "the covering fsync error freezes the writer: {outcome:?}"
+        );
+
+        // Force the FROZEN batch's publish to complete, then assert the NON-BLOCKING read reports the
+        // writer unhealthy — exactly the signal `/readyz` sheds 503 on, observed WITHOUT a hung actor.
+        let _ = handle.with(|_| ());
+        assert!(
+            !handle.writer_appears_healthy(),
+            "the actor published the frozen writer; /readyz reads it without a round-trip (#862)"
+        );
+
+        // Clear the armed fault so teardown's drain does not re-trip it, then join cleanly.
+        control.set_fail_sync(false);
         let _ = handle.shutdown();
         drop(handle);
         let _ = actor.join();

@@ -14,7 +14,7 @@
 //! ([`ironbus_core::clock::Clock::now_monotonic_nanos`]), never the wall clock, so an NTP step never
 //! drives liveness.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A shared monotonic "last made progress" timestamp the broker's main loop ticks and `/healthz`
 /// reads, the heart of the liveness hysteresis watchdog (#95).
@@ -84,8 +84,15 @@ impl LivenessBeacon {
 /// hung writer. This watches the actor itself. Unlike the accept loop, the actor does NOT tick while
 /// idle (it blocks awaiting a command), so a stale-since-last-tick model would false-trip on a quiet
 /// broker; instead a `processing_since` of `0` means IDLE (never wedged), and a non-zero stamp older
-/// than the bound means the in-flight batch has overrun — a genuine wedge, not idleness. Cheap to
-/// share: two `AtomicU64`, relaxed ordering (advisory heartbeat, not a synchronization point).
+/// than the bound means the in-flight batch has overrun — a genuine wedge, not idleness.
+///
+/// It also carries the writer's FROZEN state (#862) as a published flag, so the health server can answer
+/// `/readyz` WITHOUT going through the actor at all. Previously `/readyz` read the frozen state via
+/// `engine.with(|e| e.is_healthy())`, which queues a job behind the actor — and on a HUNG fsync that job
+/// blocks FOREVER, wedging the single-threaded health server so even the watchdog's own 503 is never
+/// served. Publishing the frozen flag here lets `/readyz` shed on `draining` / a wedge / a frozen writer
+/// with three non-blocking atomic reads and NO actor round-trip, so it can never hang. Cheap to share:
+/// two `AtomicU64` + one `AtomicBool`, relaxed ordering (advisory heartbeat, not a synchronization point).
 #[derive(Debug)]
 pub struct ActorWatchdog {
     /// The monotonic nanos the actor began the current batch, or `0` when idle (blocked awaiting a
@@ -96,15 +103,21 @@ pub struct ActorWatchdog {
     ///
     /// [`set_bound_nanos`]: ActorWatchdog::set_bound_nanos
     bound_nanos: AtomicU64,
+    /// The writer's live/frozen state, PUBLISHED by the actor after each batch (`engine.is_healthy()`),
+    /// so `/readyz` can read it non-blockingly instead of through the actor (#862). `true` = live (the
+    /// default for a fresh broker that has run no batch yet); `false` once a covering fsync RETURNED an
+    /// error and froze the writer.
+    writer_healthy: AtomicBool,
 }
 
 impl ActorWatchdog {
-    /// A fresh watchdog (idle) with the given overrun `bound_nanos` (`0` = disabled).
+    /// A fresh watchdog (idle, writer live) with the given overrun `bound_nanos` (`0` = disabled).
     #[must_use]
     pub fn new(bound_nanos: u64) -> ActorWatchdog {
         ActorWatchdog {
             processing_since: AtomicU64::new(0),
             bound_nanos: AtomicU64::new(bound_nanos),
+            writer_healthy: AtomicBool::new(true),
         }
     }
 
@@ -138,6 +151,19 @@ impl ActorWatchdog {
         }
         let since = self.processing_since.load(Ordering::Relaxed);
         since != 0 && now_monotonic_nanos.saturating_sub(since) > bound
+    }
+
+    /// Publishes the writer's live/frozen state (`engine.is_healthy()`), called by the actor after each
+    /// batch's covering commit (#862). One relaxed store on the per-batch boundary.
+    pub fn publish_writer_healthy(&self, healthy: bool) {
+        self.writer_healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    /// The last-published writer live/frozen state, read non-blockingly by `/readyz` (#862) so it never
+    /// has to round-trip through the actor (which a hung fsync would block forever). `true` = live.
+    #[must_use]
+    pub fn writer_healthy(&self) -> bool {
+        self.writer_healthy.load(Ordering::Relaxed)
     }
 }
 
@@ -255,6 +281,27 @@ mod tests {
         assert!(
             w.overran(32),
             "a batch begun at t=0 still overruns the bound"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_publishes_and_reads_the_writer_frozen_state() {
+        // #862: /readyz reads the writer live/frozen state from this published flag (non-blocking), NOT
+        // through the actor — so a frozen (or hung) writer can never block the readiness check.
+        let w = ActorWatchdog::new(0);
+        assert!(
+            w.writer_healthy(),
+            "a fresh watchdog reports the writer live"
+        );
+        w.publish_writer_healthy(false);
+        assert!(
+            !w.writer_healthy(),
+            "a frozen writer is published and read back"
+        );
+        w.publish_writer_healthy(true);
+        assert!(
+            w.writer_healthy(),
+            "a live writer reads back live again (not a one-way latch here)"
         );
     }
 }
