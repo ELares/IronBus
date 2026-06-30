@@ -1441,7 +1441,11 @@ impl AuthMechanism {
 /// client, and the empty `Connect` body, decode to `auth = None`, byte-for-byte unchanged. A client
 /// that authenticates appends this section; the section is the ONLY place a secret travels on the
 /// wire, and on a non-loopback bind it travels only inside the established TLS session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// NOTE: `Debug` is HAND-WRITTEN (below), NOT derived (#882): `material` holds the plaintext bearer
+// token / username+password, so a derived `Debug` would print the secret verbatim — and any error/struct
+// that embeds an `AuthCredential` and derives `Debug` would transitively leak it to logs. The manual impl
+// redacts `material` so the type's "no logging of the secret" contract is actually enforceable.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthCredential {
     /// Which of the three v1 mechanisms this credential is for.
     pub mechanism: AuthMechanism,
@@ -1450,6 +1454,21 @@ pub struct AuthCredential {
     /// - `Password`: `username` then `password`, each `u16`-length-prefixed.
     /// - `Mtls`: empty (the credential is the TLS peer certificate, not body bytes).
     pub material: Vec<u8>,
+}
+
+impl core::fmt::Debug for AuthCredential {
+    /// REDACTS the plaintext secret (#882): prints the mechanism and the material LENGTH only, never the
+    /// bytes, so neither a direct `{:?}` nor a transitive `Debug` through an embedding type can leak the
+    /// token/password to logs or a panic message.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AuthCredential")
+            .field("mechanism", &self.mechanism)
+            .field(
+                "material",
+                &format_args!("<redacted; {} bytes>", self.material.len()),
+            )
+            .finish()
+    }
 }
 
 /// The TRAILING-section marker byte that introduces an appended auth credential in the `Connect`
@@ -4355,6 +4374,57 @@ mod tests {
             let decoded = decode_connect(&body).unwrap();
             assert_eq!(decoded.requested_credit, Some(7));
             assert_eq!(decoded.default_tier, Some(1));
+        }
+    }
+
+    #[test]
+    fn auth_credential_debug_redacts_the_secret() {
+        // #882: the hand-written `Debug` must never print the plaintext token/password — directly or
+        // transitively through an embedding type. We use distinctive secret bytes and assert the
+        // formatted output contains NEITHER the secret nor any of its bytes, but DOES carry the mechanism
+        // and a redaction marker with the length.
+        // A struct that EMBEDS the credential and derives Debug must also not leak it (the common pattern).
+        // The field is read only through the derived `Debug` (the point of the test), hence the allow.
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Wrapper {
+            cred: AuthCredential,
+        }
+        const SECRET: &[u8] = b"correct-horse-battery-staple-TOKEN";
+        let cred = AuthCredential {
+            mechanism: AuthMechanism::Bearer,
+            material: SECRET.to_vec(),
+        };
+        let direct = format!("{cred:?}");
+        let transitive = format!("{:?}", Wrapper { cred: cred.clone() });
+        // The exact shape a *derived* `Debug` over `Vec<u8>` would emit: the decimal byte array
+        // `[99, 111, 114, ...]`. Strip the enclosing brackets so a nested/transitive rendering still
+        // matches the inner run. This is the assertion that genuinely discriminates against the
+        // regression — the UTF-8 string checks below would NOT (a byte-array leak never spells
+        // "correct-horse"); they only guard a hypothetical `Display`/string leak.
+        let leaked_byte_array = format!("{SECRET:?}");
+        let leaked_inner = &leaked_byte_array[1..leaked_byte_array.len() - 1];
+        for rendered in [&direct, &transitive] {
+            assert!(
+                !rendered.contains(leaked_inner),
+                "Debug leaked the secret byte array: {rendered}"
+            );
+            assert!(
+                !rendered.contains("correct-horse"),
+                "Debug leaked the secret: {rendered}"
+            );
+            assert!(
+                !rendered.contains("battery"),
+                "Debug leaked the secret: {rendered}"
+            );
+            assert!(
+                rendered.contains("redacted") && rendered.contains("34 bytes"),
+                "Debug shows a redaction marker with the length: {rendered}"
+            );
+            assert!(
+                rendered.contains("Bearer"),
+                "Debug still shows the mechanism: {rendered}"
+            );
         }
     }
 
