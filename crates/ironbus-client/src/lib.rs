@@ -586,10 +586,25 @@ fn with_ack_level_bits(flags: u8, level: AckLevel) -> u8 {
 /// `Message` an equivalent per-record `Deliver` would. The FIRST decompression failure is recorded in
 /// `poison` (carrying the record's offset/generation so the caller can ack/nack-skip it); the rest of
 /// the batch is still drained before the error surfaces.
+///
+/// `decompressed_bytes` is the running total of materialized payload bytes for the whole fetch window;
+/// once it would exceed `max_aggregate` ([`MAX_FETCH_DECOMPRESSED_BYTES`]) the batch is poisoned with a
+/// [`ClientError::BadResponse`] (#879), so a credit-bounded fetch of a tiny wire response can never
+/// expand to credit x the per-record cap of resident RAM.
+/// The AGGREGATE materialized-payload-bytes ceiling for ONE fetch window (#879): the running sum of
+/// decompressed/raw payload bytes a single `fetch`/`fetch_batch` may push into its `messages` Vec before
+/// it fails closed with [`ClientError::BadResponse`]. The per-record decompression cap
+/// (`DEFAULT_MAX_DECOMPRESSED_BYTES`, 8 MiB) bounds ONE record; this bounds the WHOLE window, so a
+/// credit-bounded fetch of many tiny high-ratio frames cannot materialize `credit x 8 MiB` resident.
+/// 256 MiB = 32 max-size records, generous for a legitimate batch yet far below a multi-GiB OOM.
+const MAX_FETCH_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
 fn ingest_delivery(
     d: &DeliverBody<'_>,
     messages: &mut Vec<Message>,
     poison: &mut Option<ClientError>,
+    decompressed_bytes: &mut usize,
+    max_aggregate: usize,
 ) {
     // Draining after a decompression failure: the frame is consumed (keeping the connection framed) but
     // the delivery is dropped un-acked, so the broker redelivers it after its visibility timeout.
@@ -619,6 +634,20 @@ fn ingest_delivery(
     } else {
         (d.flags, d.payload.to_vec())
     };
+    // #879: bound the AGGREGATE materialized payload bytes for this fetch window, not just the
+    // per-record 8 MiB decompression cap. A producer can pre-store many high-ratio records that each
+    // claim ~the per-record cap but are a few wire bytes, so a credit-bounded fetch of a tiny wire
+    // response could otherwise materialize credit x 8 MiB resident in `messages` (an OOM the per-record
+    // cap does not prevent). Charge the just-decoded payload and fail closed once the running total
+    // crosses the ceiling; like a per-record decompression failure, the remaining frames are drained
+    // (poison set) so the connection stays framed, then the error is returned.
+    *decompressed_bytes = decompressed_bytes.saturating_add(payload.len());
+    if *decompressed_bytes > max_aggregate {
+        *poison = Some(ClientError::BadResponse(
+            "fetch response exceeded the aggregate decompressed-bytes cap",
+        ));
+        return;
+    }
     messages.push(Message {
         offset: d.offset,
         generation: d.generation,
@@ -1715,6 +1744,7 @@ impl Client {
     /// # Errors
     /// Returns a [`ClientError`] on an IO error, a server error, a decode failure, or a server that
     /// streams more frames than `limit`.
+    #[allow(clippy::too_many_lines)] // one cohesive frame-dispatch loop (deliver / batch / advisory / poison-drain)
     fn read_fetch_response(&mut self, limit: usize) -> Result<Fetch, ClientError> {
         let mut messages = Vec::new();
         let mut dead_letters = Vec::new();
@@ -1731,6 +1761,10 @@ impl Client {
         // server-side, so it counts here too, as does every frame drained after a decompression
         // failure (a buggy or hostile server cannot stream any of them without bound).
         let mut frames = 0usize;
+        // #879: the running total of materialized payload bytes across this fetch window, capped at
+        // [`MAX_FETCH_DECOMPRESSED_BYTES`] so a credit-bounded fetch of a tiny wire response cannot
+        // expand to credit x the per-record 8 MiB cap of resident RAM.
+        let mut decompressed_bytes = 0usize;
         loop {
             let (frame_type, body) = self.read_frame()?;
             // The credit check binds every batch frame uniformly (deliveries, advisories, and
@@ -1746,7 +1780,13 @@ impl Client {
             match (frame_type, body) {
                 (FrameType::Deliver, body) => {
                     let d = decode_deliver(&body).map_err(ClientError::Body)?;
-                    ingest_delivery(&d, &mut messages, &mut poison);
+                    ingest_delivery(
+                        &d,
+                        &mut messages,
+                        &mut poison,
+                        &mut decompressed_bytes,
+                        MAX_FETCH_DECOMPRESSED_BYTES,
+                    );
                 }
                 // A raw-framed batch (#541): ONE frame carrying a contiguous run of records as their
                 // ON-DISK frame bytes. Decode the header (the run's first_offset / generation /
@@ -1797,7 +1837,13 @@ impl Client {
                             headers: view.headers,
                             payload: view.payload,
                         };
-                        ingest_delivery(&d, &mut messages, &mut poison);
+                        ingest_delivery(
+                            &d,
+                            &mut messages,
+                            &mut poison,
+                            &mut decompressed_bytes,
+                            MAX_FETCH_DECOMPRESSED_BYTES,
+                        );
                         offset = offset.saturating_add(1);
                         decoded = decoded.saturating_add(1);
                         cursor += consumed;
@@ -3394,6 +3440,52 @@ pub struct FlushSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingest_delivery_caps_the_aggregate_decompressed_bytes() {
+        // #879: the running aggregate of materialized payload bytes is bounded across a fetch window,
+        // not just per-record. Once the running total would exceed the ceiling, the batch is poisoned
+        // (BadResponse) and the over-cap record (and every later one) is NOT materialized — so a
+        // credit-bounded fetch of many tiny high-ratio frames can never OOM the client.
+        let cap = 1000usize;
+        let big = vec![0u8; 400]; // an uncompressed payload; the COMPRESSED path uses the same accounting
+        let rec = |off: u64| DeliverBody {
+            offset: off,
+            generation: 0,
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            payload: &big,
+        };
+        let mut messages = Vec::new();
+        let mut poison: Option<ClientError> = None;
+        let mut total = 0usize;
+
+        // Two records (800 bytes) fit under the 1000-byte cap.
+        ingest_delivery(&rec(0), &mut messages, &mut poison, &mut total, cap);
+        ingest_delivery(&rec(1), &mut messages, &mut poison, &mut total, cap);
+        assert!(poison.is_none(), "under the cap nothing is poisoned");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(total, 800);
+
+        // The third record (1200 total) crosses the cap: the batch is poisoned and it is NOT pushed.
+        ingest_delivery(&rec(2), &mut messages, &mut poison, &mut total, cap);
+        assert!(
+            matches!(poison, Some(ClientError::BadResponse(_))),
+            "crossing the cap poisons the batch"
+        );
+        assert_eq!(messages.len(), 2, "the over-cap record is not materialized");
+
+        // A subsequent record is drained un-materialized (the poison short-circuits ingest).
+        ingest_delivery(&rec(3), &mut messages, &mut poison, &mut total, cap);
+        assert_eq!(
+            messages.len(),
+            2,
+            "later records are dropped while poisoned"
+        );
+    }
+
     use ironbus_core::clock::Clock as _; // the monotonic seam for the serve loop's #95 beacon
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;

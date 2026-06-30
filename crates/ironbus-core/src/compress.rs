@@ -40,7 +40,10 @@
 //! - A per-unit DECOMPRESSED-size CAP ([`DEFAULT_MAX_DECOMPRESSED_BYTES`], 8 MiB by
 //!   default) is checked against the descriptor's `uncompressed_len` BEFORE a single byte
 //!   is allocated, so a decompression bomb that claims a huge output cannot drive an
-//!   unbounded allocation.
+//!   unbounded allocation. This cap is PER RECORD: a caller that materializes MANY records
+//!   (e.g. a credit-bounded consumer fetch) must impose its OWN aggregate ceiling, or its
+//!   peak resident is `count x cap`, not `cap` — the client does so via
+//!   `MAX_FETCH_DECOMPRESSED_BYTES` (#879).
 //! - The output buffer is sized to EXACTLY `uncompressed_len` and lz4 decompresses INTO
 //!   that bounded buffer, so a stream that tries to write past the claimed length is a
 //!   typed error, never an over-allocation.
