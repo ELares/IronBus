@@ -392,22 +392,29 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
     /// in offset order, for that connection to flush on its own pass. Below `min_isr` releases NOTHING
     /// (the no-false-ack property, on the real client wire). Returns the number of replies released.
     ///
-    /// Locks the shared server, then the outbox — both briefly, NEVER across a socket write (the
-    /// release just moves bytes into the outbox; the owning connection's thread does the actual write).
+    /// Locks the shared server, THEN the outbox, holding BOTH across the release + deposit — both
+    /// briefly, NEVER across a socket write (the release just moves bytes into the outbox; the owning
+    /// connection's thread does the actual write). Holding both (the same server→outbox order
+    /// [`drop_connection`](Self::drop_connection) uses, so no deadlock) makes the gate/seam drain and
+    /// the outbox deposit ATOMIC w.r.t. a concurrent disconnect: `drop_connection` cannot interleave
+    /// between them, so a just-released ack is never deposited into an already-cleared dead-owner
+    /// outbox that nobody drains (#871). Either the report fully deposits and then `drop_connection`
+    /// clears it, or `drop_connection` purges the still-parked ack first and the report releases
+    /// nothing for it.
     pub fn on_follower_report(&self, partition: u64, report: &AckReplicatedBody) -> usize {
-        let released = {
-            let Ok(mut srv) = self.server.lock() else {
-                return 0;
-            };
-            match srv.seam_mut().on_follower_report_owned(partition, report) {
-                Ok(r) => r,
-                Err(_) => return 0,
-            }
+        // A poisoned server lock means the runtime is tearing down; do nothing (as before).
+        let Ok(mut srv) = self.server.lock() else {
+            return 0;
+        };
+        let Ok(released) = srv.seam_mut().on_follower_report_owned(partition, report) else {
+            return 0;
         };
         if released.is_empty() {
             return 0;
         }
         let count = released.len();
+        // Acquire the outbox WHILE still holding the server lock (see the method doc): this is what
+        // closes the deposit race against a concurrent `drop_connection`.
         let mut outbox = self
             .outbox
             .lock()
@@ -444,9 +451,12 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
     /// outbox between the two clears. A poisoned server lock recovers in place (the cleanup must still
     /// run) rather than skipping the purge.
     pub fn drop_connection(&self, member: MemberId) {
-        // Hold the server lock THEN the outbox lock (the same order the runtime's `on_follower_report`
-        // acquires them, so no deadlock) across BOTH purges, so a concurrent report cannot release this
-        // owner's acks into the outbox between the two clears.
+        // Hold the server lock THEN the outbox lock across BOTH purges — the SAME order
+        // `on_follower_report` holds them (it now keeps the server lock through its outbox deposit), so
+        // the two operations serialize on the server lock: a concurrent report either fully releases +
+        // deposits this owner's acks BEFORE this runs (then the outbox clear below drops them) or finds
+        // them already purged from the seam/gate and releases nothing. No deadlock (consistent
+        // server→outbox order). A poisoned lock recovers in place — the cleanup must still run.
         let mut srv = self
             .server
             .lock()
