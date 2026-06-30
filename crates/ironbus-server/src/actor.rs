@@ -32,6 +32,7 @@
 //!   [`ActorGone`], never a panic, so neither side hangs forever if the other dies.
 
 use crate::engine::{DiskFullPolicy, Engine, EngineError};
+use crate::liveness::ActorWatchdog;
 use crate::produce_gate::ProduceCapGate;
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
@@ -408,6 +409,13 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// `cap_gate`): every connection reads the one slot the bootstrap fills. Until it is filled (the
     /// brief bootstrap window) the produce path acks immediately exactly as the non-cluster path does.
     client_ack: Option<ClientAckSlot<F, C>>,
+    /// The actor-progress watchdog (#862): the SAME `Arc` the actor thread stamps `busy`/`idle` on
+    /// around each command batch (including its covering fsync). The health server reads it (via
+    /// [`EngineAccess::actor_watchdog_overran`]) WITHOUT going through the actor, so a HUNG fsync that
+    /// blocks the actor forever flips `/healthz` and `/readyz` to 503 instead of leaving liveness green.
+    /// Shared on clone (like `cap_gate`): one watchdog per actor. Disabled (`bound == 0`) until the
+    /// serve path sets the bound via [`set_actor_watchdog_bound`](Self::set_actor_watchdog_bound).
+    actor_watchdog: Arc<ActorWatchdog>,
 }
 
 /// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
@@ -433,6 +441,8 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // The SAME shared cluster produce-ack slot (#719): every connection reads the one slot the
             // data-plane bootstrap fills, so the `Arc<OnceLock>` is shared on clone. `None` off-cluster.
             client_ack: self.client_ack.clone(),
+            // The SAME shared actor-progress watchdog (#862): one per actor, read by the health server.
+            actor_watchdog: Arc::clone(&self.actor_watchdog),
         }
     }
 }
@@ -448,6 +458,15 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     pub fn with_client_ack_slot(mut self, slot: ClientAckSlot<F, C>) -> Self {
         self.client_ack = Some(slot);
         self
+    }
+
+    /// Arm the append-actor wedge watchdog (#862) with an overrun bound in NANOSECONDS; `0` DISABLES it
+    /// (the default). Called ONCE at serve start from the configured bound, BEFORE any produce can wedge,
+    /// so a hung durability fsync that blocks the actor longer than `bound_nanos` flips `/healthz` and
+    /// `/readyz` to 503 (via [`EngineAccess::actor_watchdog_overran`]) instead of leaving liveness green.
+    /// The bound is shared across every connection's handle clone (one watchdog per actor).
+    pub fn set_actor_watchdog_bound(&self, bound_nanos: u64) {
+        self.actor_watchdog.set_bound_nanos(bound_nanos);
     }
 
     /// The shared cluster produce-ack gate (#719), once the data-plane bootstrap has filled the slot;
@@ -791,6 +810,29 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         false
     }
 
+    /// Whether the append actor's IN-FLIGHT command batch has overrun the watchdog bound at
+    /// `now_monotonic_nanos` — i.e. a HUNG durability fsync has wedged the actor thread (#862). A cheap
+    /// LOCAL, non-blocking atomic read (it does NOT go through the actor, so it answers even while the
+    /// actor is wedged). The DEFAULT impl returns `false` (no actor / no watchdog — every non-handle
+    /// `EngineAccess`, e.g. an in-process test fixture, is never "wedged"). [`EngineHandle`] overrides it
+    /// to consult its shared [`ActorWatchdog`]. The health server uses this to flip `/healthz` and
+    /// `/readyz` to 503 on a wedge instead of leaving liveness green or hanging `/readyz` behind the
+    /// wedged fsync.
+    fn actor_watchdog_overran(&self, _now_monotonic_nanos: u64) -> bool {
+        false
+    }
+
+    /// Whether the durable-log writer APPEARS healthy (not frozen), read from a PUBLISHED flag WITHOUT
+    /// going through the actor (#862), so `/readyz` can answer on a hung writer instead of queuing a job
+    /// behind the wedged fsync and HANGING. The DEFAULT returns `true` (no actor / an in-process test
+    /// fixture is assumed live); [`EngineHandle`] overrides it to read the actor's last-published
+    /// `is_healthy()`. This is an ADVISORY read: it reflects the state as of the last completed batch, so
+    /// a freeze becomes visible after the batch that froze the writer commits — exactly when the old
+    /// `engine.with(|e| e.is_healthy())` would have observed it, but without the blocking round-trip.
+    fn writer_appears_healthy(&self) -> bool {
+        true
+    }
+
     /// The CLUSTER produce-ack decision (#719) for one durable produce on connection `member`: called
     /// AFTER the local group-commit fsync returned `Appended(offset)`, with the `offset`, and the EXACT
     /// wire-`PubAck` frame bytes the session would otherwise write now.
@@ -920,6 +962,20 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
     fn has_client_ack_gate(&self) -> bool {
         // A cheap local read: the slot exists AND is filled (a clustered serve past bootstrap).
         self.client_ack_gate().is_some()
+    }
+
+    fn actor_watchdog_overran(&self, now_monotonic_nanos: u64) -> bool {
+        // A non-blocking atomic read of the shared watchdog (#862): does NOT go through the actor, so
+        // it answers even while the actor is wedged on a hung fsync. `false` until the serve path arms
+        // the bound (`bound == 0` is disabled), so single-node and unconfigured brokers are unaffected.
+        self.actor_watchdog.overran(now_monotonic_nanos)
+    }
+
+    fn writer_appears_healthy(&self) -> bool {
+        // A non-blocking atomic read of the writer-frozen flag the actor publishes after each batch
+        // (#862): `/readyz` reads this instead of `engine.with(|e| e.is_healthy())`, so a hung writer
+        // can never block the health server. `true` for a fresh broker that has run no batch yet.
+        self.actor_watchdog.writer_healthy()
     }
 
     fn client_ack_disposition(
@@ -1073,6 +1129,17 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for SharedEngine<F, C> 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (e.consumer_credit(), e.consumer_credit_bytes())
+    }
+
+    fn writer_appears_healthy(&self) -> bool {
+        // The shared-engine test fixture (a `Mutex<Engine>`, no separate actor): read the REAL writer
+        // state under the lock, so a frozen engine reports unhealthy to `/readyz` exactly as the old
+        // `engine.with(|e| e.is_healthy())` did. The lock is uncontended in a health test (no real
+        // actor holds it across an fsync), so this never blocks — unlike the production `EngineHandle`,
+        // whose override reads the actor's PUBLISHED flag so a HUNG actor can never block the read.
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_healthy()
     }
 }
 
@@ -1239,9 +1306,25 @@ where
         _ => cap_gate.disengage(),
     }
     let actor_gate = Arc::clone(&cap_gate);
+    // The actor-progress watchdog (#862), shared between the actor thread (which stamps busy/idle) and
+    // every EngineHandle clone (the health server reads it). Created DISABLED (bound 0); the serve path
+    // arms it via `EngineHandle::set_actor_watchdog_bound`, so existing callers/tests are inert by
+    // default. The actor's clock is read for the stamp; the health server reads the SAME clock seam.
+    let actor_watchdog = Arc::new(ActorWatchdog::new(0));
+    let actor_watchdog_thread = Arc::clone(&actor_watchdog);
+    let actor_clock = clock.clone();
     let join = std::thread::Builder::new()
         .name("ironbus-append-actor".to_string())
-        .spawn(move || run_actor(engine, &rx, gather_micros, &actor_gate))
+        .spawn(move || {
+            run_actor(
+                engine,
+                &rx,
+                gather_micros,
+                &actor_gate,
+                &actor_watchdog_thread,
+                &actor_clock,
+            )
+        })
         // A thread-spawn failure at startup is unrecoverable for the server, but the no-panic bar is
         // for the LIBRARY hot paths; spawning the single actor at boot is a startup step. Surface it
         // by propagating the panic only here (boot), never on a request path.
@@ -1261,6 +1344,8 @@ where
             // [`EngineHandle::with_client_ack_slot`] right after this returns, BEFORE any connection's
             // handle is cloned, so every connection sees it.
             client_ack: None,
+            // The shared actor-progress watchdog (#862), disabled until the serve path arms its bound.
+            actor_watchdog,
         },
         join,
     )
@@ -1359,11 +1444,17 @@ fn gather_commands<F, C>(
 /// appended (no sync) and their replies parked; a non-produce job or the end of the drain triggers
 /// the ONE `commit_batch` that covers the parked produces, after which their replies are released.
 /// Returns the engine on exit so a caller can recover it.
+// The drain/group-commit loop is one cohesive unit (recv → drain → per-command append/run/shutdown →
+// one covering fsync → publish); splitting it would scatter the single-writer ordering it enforces. The
+// #862 watchdog stamps push it one line over the pedantic 100-line bound.
+#[allow(clippy::too_many_lines)]
 fn run_actor<F, C>(
     mut engine: Engine<F, C>,
     rx: &Receiver<Command<F, C>>,
     gather_micros: u64,
     cap_gate: &ProduceCapGate,
+    watchdog: &ActorWatchdog,
+    clock: &C,
 ) -> Engine<F, C>
 where
     F: Filesystem,
@@ -1374,11 +1465,19 @@ where
     let mut pending: Vec<PendingProduce> = Vec::new();
     loop {
         // Block for the next command; a disconnect (the last handle dropped) ends the loop after a
-        // final drain so no acked-but-not-durable record is lost.
+        // final drain so no acked-but-not-durable record is lost. While blocked here the actor is IDLE
+        // (the watchdog was cleared at the end of the previous pass), so a quiet broker never trips it.
         let Ok(first) = rx.recv() else {
+            // Shutdown drain: mark BUSY across it so a wedged final fsync is still detectable, then exit.
+            watchdog.mark_busy(clock.now_monotonic_nanos());
             flush_pending(&mut engine, &mut pending);
             return engine;
         };
+        // A command arrived: the actor is now BUSY processing this batch — the append AND the covering
+        // durability fsync. The watchdog stamps the start instant (one relaxed store per BATCH); if the
+        // fsync HANGS, this stamp stays put while the clock advances and the health server's
+        // `actor_watchdog_overran` trips once the bound is exceeded (#862).
+        watchdog.mark_busy(clock.now_monotonic_nanos());
         let mut commands = vec![first];
         // Drain everything immediately available so a concurrent burst of produces forms one group.
         while let Ok(cmd) = rx.try_recv() {
@@ -1465,6 +1564,17 @@ where
         // disabled (the default), so the steady-state loop is unchanged for a broker that has not
         // opted in.
         engine.codel_queue_empty();
+        // Publish the writer's live/frozen state for `/readyz` to read non-blockingly (#862): the
+        // covering commit just ran, so `is_healthy()` now reflects a frozen writer (a fsync that RETURNED
+        // an error) — and a `/readyz` probe reads this flag instead of round-tripping through the actor,
+        // so it can never hang behind the writer. A cheap local read + one relaxed store, per batch.
+        watchdog.publish_writer_healthy(engine.is_healthy());
+        // The batch committed (its fsync returned) and the queue drained: the actor returns to IDLE
+        // (it blocks in `rx.recv()` next), so clear the watchdog — an idle actor is never wedged (#862).
+        // ORDER IS LOAD-BEARING: `mark_idle` is a RELEASE store that publishes the `publish_writer_healthy`
+        // store just above it, so a `/readyz` reader that sees the cleared wedge (Acquire) also sees the
+        // frozen flag — never a transient stale-healthy 200 on a weakly-ordered arch. Do not reorder.
+        watchdog.mark_idle();
     }
 }
 
@@ -1928,6 +2038,103 @@ mod tests {
             }
         }
         accepted
+    }
+
+    #[test]
+    fn a_hung_fsync_wedges_the_actor_and_the_watchdog_detects_it() {
+        // #862: a HUNG durability fsync blocks the single append actor FOREVER. The accept-loop liveness
+        // beacon is deliberately decoupled and stays green, and `/readyz` (which queues a job through the
+        // actor) would HANG behind the wedged fsync — a silent total stall with liveness reporting
+        // healthy. The actor-progress watchdog detects it: the actor stamps `busy` BEFORE the fsync, and
+        // the health server's NON-BLOCKING `actor_watchdog_overran` (which never goes through the actor)
+        // trips once the in-flight batch overruns the bound, so `/healthz` and `/readyz` flip to 503.
+        const BOUND: u64 = 1_000;
+        let (handle, actor, control) = rig();
+        handle.set_actor_watchdog_bound(BOUND);
+        let t0 = handle.now_monotonic_nanos();
+
+        // IDLE: with no in-flight batch the actor is never reported wedged, no matter how much time
+        // passes — only an overrunning in-flight batch trips it (a quiet broker never false-503s).
+        assert!(
+            !handle.actor_watchdog_overran(t0 + BOUND + 2),
+            "an idle actor is never reported wedged"
+        );
+
+        // Arm a HUNG fsync: the next produce's covering fdatasync PARKS on the closed gate forever.
+        control.close_sync_gate();
+        let produce = {
+            let h = handle.clone();
+            // This BLOCKS in the wedged fsync; it returns only once the gate is opened at teardown.
+            std::thread::spawn(move || {
+                let _ = h.produce(append(b"wedge"));
+            })
+        };
+        // Deterministically wait until the actor is parked mid-fsync (so `mark_busy` has already run).
+        control.wait_for_sync_gate_entered(1);
+
+        // The actor is now BUSY (stamped at ~t0) and wedged in the fsync. Within the bound it is still
+        // healthy; PAST the bound the watchdog trips — detected WITHOUT going through the wedged actor.
+        assert!(
+            !handle.actor_watchdog_overran(t0 + BOUND),
+            "within the bound the in-flight batch is not yet wedged (strict >)"
+        );
+        assert!(
+            handle.actor_watchdog_overran(t0 + BOUND + 2),
+            "past the bound the hung-fsync wedge is DETECTED — /healthz and /readyz flip to 503 (#862)"
+        );
+
+        // Recover: open the gate so the parked fsync completes, the produce returns, and the actor joins
+        // cleanly — proving the watchdog detection did not itself disturb the actor.
+        control.open_sync_gate();
+        produce.join().unwrap();
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join();
+    }
+
+    #[test]
+    fn the_actor_publishes_a_frozen_writer_and_readyz_reads_it_without_a_round_trip() {
+        // #862 PRODUCTION PUBLISH→READ PATH: after a covering fsync RETURNS an error and freezes the
+        // writer, `run_actor` publishes `engine.is_healthy()` to the watchdog, and
+        // `EngineAccess::writer_appears_healthy` (what `/readyz` reads) returns that PUBLISHED flag
+        // WITHOUT queuing a job through the actor. `admin_resilience` proves the `/readyz` 503 over a
+        // `SharedEngine` (a direct-lock fixture); this proves the REAL actor wiring — that the running
+        // append actor actually publishes the frozen state the non-blocking read reports.
+        let (handle, actor, control) = rig();
+
+        // A clean produce keeps the writer live; force the batch's post-commit publish to complete (a
+        // follow-up `Run` job is processed in a LATER actor iteration, so the produce batch's publish
+        // has run by the time `with` returns) and confirm the published flag reads HEALTHY.
+        handle.produce(append(b"live")).expect("a clean produce");
+        let _ = handle.with(|_| ());
+        assert!(
+            handle.writer_appears_healthy(),
+            "a live writer publishes healthy"
+        );
+
+        // Arm a FATAL fsync (one that RETURNS an error, not the hang above): the next produce's covering
+        // fdatasync fails and freezes the writer one-way. The produce comes back `Fatal`, and — unlike a
+        // hang — the actor keeps serving (a frozen writer answers reads, refuses writes).
+        control.set_fail_sync(true);
+        let outcome = handle.produce(append(b"freeze"));
+        assert!(
+            matches!(outcome, Ok(ProduceOutcome::Fatal(_))),
+            "the covering fsync error freezes the writer: {outcome:?}"
+        );
+
+        // Force the FROZEN batch's publish to complete, then assert the NON-BLOCKING read reports the
+        // writer unhealthy — exactly the signal `/readyz` sheds 503 on, observed WITHOUT a hung actor.
+        let _ = handle.with(|_| ());
+        assert!(
+            !handle.writer_appears_healthy(),
+            "the actor published the frozen writer; /readyz reads it without a round-trip (#862)"
+        );
+
+        // Clear the armed fault so teardown's drain does not re-trip it, then join cleanly.
+        control.set_fail_sync(false);
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join();
     }
 
     #[test]

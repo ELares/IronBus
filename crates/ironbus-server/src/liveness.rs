@@ -14,7 +14,7 @@
 //! ([`ironbus_core::clock::Clock::now_monotonic_nanos`]), never the wall clock, so an NTP step never
 //! drives liveness.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A shared monotonic "last made progress" timestamp the broker's main loop ticks and `/healthz`
 /// reads, the heart of the liveness hysteresis watchdog (#95).
@@ -67,6 +67,119 @@ impl LivenessBeacon {
     #[must_use]
     pub fn stuck_for_window(&self, now_monotonic_nanos: u64, window_nanos: u64) -> bool {
         window_nanos != 0 && self.since_progress_nanos(now_monotonic_nanos) > window_nanos
+    }
+}
+
+/// A shared actor-progress watchdog (#862): the append actor stamps the monotonic instant it BEGINS
+/// processing a command batch — which includes the covering durability `fdatasync` — and clears it
+/// when the batch completes and it returns to idle. The health server reads it WITHOUT going through
+/// the actor, so a HUNG fsync (a failing eMMC doing long internal retries, a stalled networked/overlay
+/// FS, brownout-stuck flash on the edge target) that blocks the actor thread FOREVER is DETECTED:
+/// `processing_since` stays put while the monotonic clock advances, and once the gap exceeds the
+/// configured bound the broker reports UNHEALTHY (flipping `/healthz` AND `/readyz` to 503) so an
+/// orchestrator restarts it — instead of liveness staying green while the whole produce path is wedged.
+///
+/// This is DISTINCT from [`LivenessBeacon`]: that watches the ACCEPT loop, which is deliberately
+/// decoupled from the writer (#95) and keeps ticking even while the actor is wedged, so it cannot see a
+/// hung writer. This watches the actor itself. Unlike the accept loop, the actor does NOT tick while
+/// idle (it blocks awaiting a command), so a stale-since-last-tick model would false-trip on a quiet
+/// broker; instead a `processing_since` of `0` means IDLE (never wedged), and a non-zero stamp older
+/// than the bound means the in-flight batch has overrun — a genuine wedge, not idleness.
+///
+/// It also carries the writer's FROZEN state (#862) as a published flag, so the health server can answer
+/// `/readyz` WITHOUT going through the actor at all. Previously `/readyz` read the frozen state via
+/// `engine.with(|e| e.is_healthy())`, which queues a job behind the actor — and on a HUNG fsync that job
+/// blocks FOREVER, wedging the single-threaded health server so even the watchdog's own 503 is never
+/// served. Publishing the frozen flag here lets `/readyz` shed on `draining` / a wedge / a frozen writer
+/// with three non-blocking atomic reads and NO actor round-trip, so it can never hang. Cheap to share:
+/// two `AtomicU64` + one `AtomicBool`, relaxed ordering (advisory heartbeat, not a synchronization point).
+#[derive(Debug)]
+pub struct ActorWatchdog {
+    /// The monotonic nanos the actor began the current batch, or `0` when idle (blocked awaiting a
+    /// command). Stored as `max(1)` so a `now` of `0` (a fresh manual clock) is never mistaken for idle.
+    processing_since: AtomicU64,
+    /// The overrun bound in nanos: an in-flight batch older than this is WEDGED. `0` = the watchdog is
+    /// DISABLED (it never trips), the default until a serve configures it via [`set_bound_nanos`].
+    ///
+    /// [`set_bound_nanos`]: ActorWatchdog::set_bound_nanos
+    bound_nanos: AtomicU64,
+    /// The writer's live/frozen state, PUBLISHED by the actor after each batch (`engine.is_healthy()`),
+    /// so `/readyz` can read it non-blockingly instead of through the actor (#862). `true` = live (the
+    /// default for a fresh broker that has run no batch yet); `false` once a covering fsync RETURNED an
+    /// error and froze the writer.
+    writer_healthy: AtomicBool,
+}
+
+impl ActorWatchdog {
+    /// A fresh watchdog (idle, writer live) with the given overrun `bound_nanos` (`0` = disabled).
+    #[must_use]
+    pub fn new(bound_nanos: u64) -> ActorWatchdog {
+        ActorWatchdog {
+            processing_since: AtomicU64::new(0),
+            bound_nanos: AtomicU64::new(bound_nanos),
+            writer_healthy: AtomicBool::new(true),
+        }
+    }
+
+    /// Sets the overrun bound in nanos; `0` disables the watchdog. Called once at serve start from the
+    /// configured value, before any produce can wedge.
+    pub fn set_bound_nanos(&self, bound_nanos: u64) {
+        self.bound_nanos.store(bound_nanos, Ordering::Relaxed);
+    }
+
+    /// Records that the actor BEGAN a command batch at `now_monotonic_nanos` (it is about to append and
+    /// run the covering fsync). One relaxed store on the actor's per-BATCH boundary, never per message.
+    pub fn mark_busy(&self, now_monotonic_nanos: u64) {
+        self.processing_since
+            .store(now_monotonic_nanos.max(1), Ordering::Relaxed);
+    }
+
+    /// Records that the actor FINISHED a batch and is returning to idle (awaiting the next command).
+    /// Clears the in-flight stamp so the watchdog cannot trip on an idle actor.
+    ///
+    /// This is a RELEASE store, and it is the publication point for the wedge→frozen handoff (#862): the
+    /// actor calls [`publish_writer_healthy`] (the writer's live/frozen state) and THEN `mark_idle`, so a
+    /// health reader whose [`overran`] ACQUIRE-loads this cleared stamp is guaranteed to also observe that
+    /// prior `writer_healthy` store. Without it, a weakly-ordered arch (e.g. aarch64) could let `/readyz`
+    /// observe the cleared wedge but a stale-healthy flag for one probe, transiently reporting 200 on a
+    /// writer that just froze. Release/Acquire closes that window; on x86 (TSO) it is a no-op anyway.
+    ///
+    /// [`publish_writer_healthy`]: ActorWatchdog::publish_writer_healthy
+    /// [`overran`]: ActorWatchdog::overran
+    pub fn mark_idle(&self) {
+        self.processing_since.store(0, Ordering::Release);
+    }
+
+    /// Whether the actor's current batch has been in flight longer than the configured bound — a hung
+    /// fsync. `false` when idle (`processing_since == 0`), when no bound is configured (`bound == 0`),
+    /// or within the bound. The comparison is strict `>` so the exact-bound boundary is still healthy.
+    ///
+    /// The `processing_since` load is ACQUIRE so that reading the idle stamp (`0`) synchronizes-with the
+    /// actor's [`mark_idle`] RELEASE store and transitively publishes the writer-frozen flag the actor set
+    /// just before it — see [`mark_idle`] for why `/readyz`'s wedge-then-frozen check needs this.
+    ///
+    /// [`mark_idle`]: ActorWatchdog::mark_idle
+    #[must_use]
+    pub fn overran(&self, now_monotonic_nanos: u64) -> bool {
+        let bound = self.bound_nanos.load(Ordering::Relaxed);
+        if bound == 0 {
+            return false;
+        }
+        let since = self.processing_since.load(Ordering::Acquire);
+        since != 0 && now_monotonic_nanos.saturating_sub(since) > bound
+    }
+
+    /// Publishes the writer's live/frozen state (`engine.is_healthy()`), called by the actor after each
+    /// batch's covering commit (#862). One relaxed store on the per-batch boundary.
+    pub fn publish_writer_healthy(&self, healthy: bool) {
+        self.writer_healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    /// The last-published writer live/frozen state, read non-blockingly by `/readyz` (#862) so it never
+    /// has to round-trip through the actor (which a hung fsync would block forever). `true` = live.
+    #[must_use]
+    pub fn writer_healthy(&self) -> bool {
+        self.writer_healthy.load(Ordering::Relaxed)
     }
 }
 
@@ -131,5 +244,80 @@ mod tests {
         }
         // Now the loop wedges: no further tick. After a full window it sheds.
         assert!(b.stuck_for_window(now + window + 1, window));
+    }
+
+    #[test]
+    fn an_idle_actor_watchdog_never_overruns() {
+        // #862: a `processing_since` of 0 means the actor is idle (blocked awaiting a command), so the
+        // watchdog must NOT trip no matter how much time passes — only an in-flight batch can wedge.
+        let w = ActorWatchdog::new(30);
+        assert!(!w.overran(0));
+        assert!(!w.overran(u64::MAX), "an idle actor is never wedged");
+        // A finished batch (mark_busy then mark_idle) returns to idle: never wedged afterward.
+        w.mark_busy(100);
+        w.mark_idle();
+        assert!(!w.overran(100 + 1_000_000));
+    }
+
+    #[test]
+    fn a_busy_actor_watchdog_overruns_only_past_the_bound() {
+        // The actor begins a batch at t=100; within the bound it is healthy, at exactly the bound it is
+        // still healthy (strict >), and past the bound the in-flight batch is WEDGED (a hung fsync).
+        let w = ActorWatchdog::new(30);
+        w.mark_busy(100);
+        assert!(!w.overran(100 + 10));
+        assert!(!w.overran(100 + 30));
+        assert!(w.overran(100 + 31), "the in-flight batch overran the bound");
+        // The actor completing the batch clears the wedge (no flapping latch): idle again.
+        w.mark_idle();
+        assert!(!w.overran(100 + 1_000));
+    }
+
+    #[test]
+    fn a_zero_bound_disables_the_actor_watchdog() {
+        // bound 0 = disabled: even a very old in-flight stamp never trips (the default until a serve
+        // configures a bound). Setting a bound then engages it.
+        let w = ActorWatchdog::new(0);
+        w.mark_busy(1);
+        assert!(!w.overran(u64::MAX));
+        w.set_bound_nanos(30);
+        assert!(w.overran(1 + 31));
+        w.set_bound_nanos(0);
+        assert!(!w.overran(u64::MAX), "re-disabling stops the watchdog");
+    }
+
+    #[test]
+    fn a_busy_stamp_of_zero_is_not_mistaken_for_idle() {
+        // A fresh manual clock can read `now == 0`; `mark_busy` stores `max(1)`, so a batch that began
+        // at logical time 0 is still seen as busy (not idle) and can overrun.
+        let w = ActorWatchdog::new(30);
+        w.mark_busy(0);
+        assert!(!w.overran(0));
+        // The stamp is clamped to 1, so the overrun is at now > 1 + bound (= 31), not idle-forever.
+        assert!(
+            w.overran(32),
+            "a batch begun at t=0 still overruns the bound"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_publishes_and_reads_the_writer_frozen_state() {
+        // #862: /readyz reads the writer live/frozen state from this published flag (non-blocking), NOT
+        // through the actor — so a frozen (or hung) writer can never block the readiness check.
+        let w = ActorWatchdog::new(0);
+        assert!(
+            w.writer_healthy(),
+            "a fresh watchdog reports the writer live"
+        );
+        w.publish_writer_healthy(false);
+        assert!(
+            !w.writer_healthy(),
+            "a frozen writer is published and read back"
+        );
+        w.publish_writer_healthy(true);
+        assert!(
+            w.writer_healthy(),
+            "a live writer reads back live again (not a one-way latch here)"
+        );
     }
 }
