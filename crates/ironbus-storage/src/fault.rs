@@ -81,6 +81,9 @@ pub struct FaultControl {
     /// (a retire dir-fsync), so the crash window is precisely between the compacted-segment commit
     /// and the originals being durably removed.
     fail_sync_dir_after: Arc<AtomicU64>,
+    /// A monotonic count of every `open` that ran, so a test can assert that a repeated read of one
+    /// sealed segment opens it ONCE (the #808 reader cache), not once per read.
+    open_count: Arc<AtomicU64>,
 }
 
 /// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
@@ -161,6 +164,17 @@ impl FaultControl {
 
     fn record_sync_dir(&self) {
         self.sync_dir_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A monotonic count of every `open` that has run, so a test can assert the #808 reader cache opens a
+    /// sealed segment ONCE across many reads (and re-opens after a roll/reap drops the old snapshot).
+    #[must_use]
+    pub fn open_count(&self) -> u64 {
+        self.open_count.load(Ordering::SeqCst)
+    }
+
+    fn record_open(&self) {
+        self.open_count.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Arms (or disarms) short reads: while `limit` is non-zero, every `read_at` returns at most
@@ -417,8 +431,11 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     type File = FaultFile<F::File>;
 
     fn open(&self, name: &str) -> io::Result<Self::File> {
+        let file = self.inner.open(name)?;
+        // Count only a SUCCESSFUL open, so an open-count assertion measures real fd opens (#808).
+        self.control.record_open();
         Ok(FaultFile {
-            inner: self.inner.open(name)?,
+            inner: file,
             control: self.control.clone(),
         })
     }
