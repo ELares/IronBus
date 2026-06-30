@@ -288,11 +288,6 @@ impl FaultControl {
         self.sync_count.load(Ordering::SeqCst)
     }
 
-    /// Records that a sync ran and, if the gate is closed, parks the calling thread on the condvar
-    /// until the gate is opened. The entered-count is bumped (and waiters notified) when a sync
-    /// parks, so [`wait_for_sync_gate_entered`] can observe the stall. No wall-clock sleep.
-    ///
-    /// [`wait_for_sync_gate_entered`]: FaultControl::wait_for_sync_gate_entered
     /// Closes the READ gate (#809): the NEXT positioned `read_at` blocks until [`open_read_gate`], so a
     /// test can park a fetch-serve mid-read. Already-passed reads are unaffected.
     ///
@@ -357,6 +352,11 @@ impl FaultControl {
         }
     }
 
+    /// Records that a sync ran and, if the gate is closed, parks the calling thread on the condvar
+    /// until the gate is opened. The entered-count is bumped (and waiters notified) when a sync
+    /// parks, so [`wait_for_sync_gate_entered`] can observe the stall. No wall-clock sleep.
+    ///
+    /// [`wait_for_sync_gate_entered`]: FaultControl::wait_for_sync_gate_entered
     fn enter_sync_gate(&self) {
         self.sync_count.fetch_add(1, Ordering::SeqCst);
         let mut state = self
