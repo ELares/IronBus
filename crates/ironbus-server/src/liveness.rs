@@ -136,20 +136,36 @@ impl ActorWatchdog {
 
     /// Records that the actor FINISHED a batch and is returning to idle (awaiting the next command).
     /// Clears the in-flight stamp so the watchdog cannot trip on an idle actor.
+    ///
+    /// This is a RELEASE store, and it is the publication point for the wedge→frozen handoff (#862): the
+    /// actor calls [`publish_writer_healthy`] (the writer's live/frozen state) and THEN `mark_idle`, so a
+    /// health reader whose [`overran`] ACQUIRE-loads this cleared stamp is guaranteed to also observe that
+    /// prior `writer_healthy` store. Without it, a weakly-ordered arch (e.g. aarch64) could let `/readyz`
+    /// observe the cleared wedge but a stale-healthy flag for one probe, transiently reporting 200 on a
+    /// writer that just froze. Release/Acquire closes that window; on x86 (TSO) it is a no-op anyway.
+    ///
+    /// [`publish_writer_healthy`]: ActorWatchdog::publish_writer_healthy
+    /// [`overran`]: ActorWatchdog::overran
     pub fn mark_idle(&self) {
-        self.processing_since.store(0, Ordering::Relaxed);
+        self.processing_since.store(0, Ordering::Release);
     }
 
     /// Whether the actor's current batch has been in flight longer than the configured bound — a hung
     /// fsync. `false` when idle (`processing_since == 0`), when no bound is configured (`bound == 0`),
     /// or within the bound. The comparison is strict `>` so the exact-bound boundary is still healthy.
+    ///
+    /// The `processing_since` load is ACQUIRE so that reading the idle stamp (`0`) synchronizes-with the
+    /// actor's [`mark_idle`] RELEASE store and transitively publishes the writer-frozen flag the actor set
+    /// just before it — see [`mark_idle`] for why `/readyz`'s wedge-then-frozen check needs this.
+    ///
+    /// [`mark_idle`]: ActorWatchdog::mark_idle
     #[must_use]
     pub fn overran(&self, now_monotonic_nanos: u64) -> bool {
         let bound = self.bound_nanos.load(Ordering::Relaxed);
         if bound == 0 {
             return false;
         }
-        let since = self.processing_since.load(Ordering::Relaxed);
+        let since = self.processing_since.load(Ordering::Acquire);
         since != 0 && now_monotonic_nanos.saturating_sub(since) > bound
     }
 

@@ -1571,6 +1571,9 @@ where
         watchdog.publish_writer_healthy(engine.is_healthy());
         // The batch committed (its fsync returned) and the queue drained: the actor returns to IDLE
         // (it blocks in `rx.recv()` next), so clear the watchdog — an idle actor is never wedged (#862).
+        // ORDER IS LOAD-BEARING: `mark_idle` is a RELEASE store that publishes the `publish_writer_healthy`
+        // store just above it, so a `/readyz` reader that sees the cleared wedge (Acquire) also sees the
+        // frozen flag — never a transient stale-healthy 200 on a weakly-ordered arch. Do not reorder.
         watchdog.mark_idle();
     }
 }
