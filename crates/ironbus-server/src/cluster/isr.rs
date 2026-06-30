@@ -547,18 +547,25 @@ impl<T> QuorumAckGate<T> {
         };
         // Re-driving with a non-advancing commit must release nothing new.
         let commit = commit.max(self.released_through);
-        // The pending list is in offset order; split off the released prefix. An ack at `offset` is
+        // Release the contiguous SUBMISSION-ORDER prefix of acks whose record is now quorum-committed
+        // (`offset < commit`). This is a strict prefix drain on purpose: each producer connection's acks
+        // are delivered in FIFO submission order (the client's `produce_window` correlates replies by
+        // ARRIVAL POSITION, not by offset — broker-assigned offsets are unknown until the ack arrives),
+        // so an ack may NEVER be released ahead of an earlier-submitted one on the same stream.
+        //
+        // A dedup-hit (#917) can park an OLD duplicate offset BELOW a higher already-parked offset, so
+        // `pending` is not always non-decreasing; the prefix drain correctly holds such a duplicate
+        // behind its FIFO-predecessor (releasing it would re-order that connection's ack stream and
+        // corrupt the client's position-indexed results) — it releases once the blocking earlier ack
+        // does, and a never-committing blocker withholds BOTH (the producer waits, unavailable over
+        // unsafe) until `purge_owner` reclaims them on disconnect. An ack at `offset >= commit` is
         // committed iff `offset < commit`.
         let split = self
             .pending
             .iter()
             .position(|p| p.offset >= commit)
             .unwrap_or(self.pending.len());
-        let released: Vec<T> = self
-            .pending
-            .drain(..split)
-            .map(|p| p.token)
-            .collect::<Vec<_>>();
+        let released: Vec<T> = self.pending.drain(..split).map(|p| p.token).collect();
         self.released_through = commit;
         released
     }
@@ -790,6 +797,38 @@ mod tests {
         // Quorum advances to 3 → offsets 1 and 2 release, in order.
         let released = gate.release_up_to(Some(3));
         assert_eq!(released, vec![1, 2]);
+        assert_eq!(gate.pending_len(), 0);
+    }
+
+    #[test]
+    fn the_gate_holds_an_out_of_order_duplicate_behind_its_fifo_predecessor() {
+        // #917: a dedup-hit parks an OLD duplicate offset that can sit BELOW a higher already-parked
+        // offset (a fresh produce pipelined between an original and its retry), so `pending` is no
+        // longer non-decreasing. Each producer connection's acks are delivered in FIFO SUBMISSION
+        // order (the client correlates replies by ARRIVAL POSITION, not by offset), so the duplicate
+        // must be HELD behind the offset-6 ack submitted before it — releasing it early would re-order
+        // that connection's ack stream and corrupt the client's position-indexed results.
+        let mut gate: QuorumAckGate<u64> = QuorumAckGate::new();
+        // Token 100 = original at offset 5; token 6 = a fresh produce at offset 6; token 200 = the
+        // dedup retry at offset 5, parked AFTER offset 6 (out of order).
+        let _ = gate.park(5, 100);
+        let _ = gate.park(6, 6);
+        let _ = gate.park(5, 200);
+        assert_eq!(gate.pending_len(), 3);
+
+        // Quorum-commit = 6 → only the contiguous FIFO prefix releases: just the original offset-5 ack.
+        // The out-of-order duplicate stays withheld behind the offset-6 ack (it cannot jump the queue).
+        let released = gate.release_up_to(Some(6));
+        assert_eq!(
+            released,
+            vec![100],
+            "only the FIFO prefix releases; the duplicate waits behind its offset-6 predecessor"
+        );
+        assert_eq!(gate.pending_len(), 2);
+
+        // When offset 6 commits (quorum 7), the offset-6 ack AND the duplicate behind it release, in
+        // submission order — preserving the connection's FIFO ack stream. No double-release.
+        assert_eq!(gate.release_up_to(Some(7)), vec![6, 200]);
         assert_eq!(gate.pending_len(), 0);
     }
 

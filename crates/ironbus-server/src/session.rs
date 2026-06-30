@@ -4262,25 +4262,45 @@ fn write_pub_reply_gated<
     fire_and_forget: bool,
     out: &mut Vec<u8>,
 ) -> Result<(), SessionError> {
-    if let ProduceOutcome::Appended(offset) = outcome {
+    // Both a fresh `Appended` and a dedup-hit `AppendedDuplicate` must clear the C2-fsync quorum gate
+    // before their ack is released: an idempotent RETRY of a C2-fsync produce whose original offset is
+    // NOT yet quorum-committed must NOT get an immediate `PubAckDuplicate` for a record that is durable
+    // only on the leader (#917). They differ ONLY in the reply FRAME TYPE (`PubAck` vs `PubAckDuplicate`)
+    // and the gate keys on the (original) offset, so a duplicate releases exactly when the original is
+    // quorum-fsync'd — immediately if it already is. A fire-and-forget produce never yields either
+    // outcome (it yields `FireAndForgetAppended`), so this never withholds a no-reply produce.
+    let gated = match &outcome {
+        ProduceOutcome::Appended(offset) => Some((*offset, FrameType::PubAck)),
+        // Only a REPLY-wanting duplicate is gated. Today a fire-and-forget produce never reaches this
+        // reply path at all (a QoS-0 publish early-returns into the no-reply L0 batch before a
+        // `ParkedPub` is pushed, so `fire_and_forget` is always `false` here). Guard on the flag anyway
+        // as defense-in-depth: the actor's dedup path yields `AppendedDuplicate` regardless of the flag
+        // (unlike the fresh-append path, which maps a QoS-0 produce to `FireAndForgetAppended`), so a
+        // future routing change must not be able to quorum-gate or write a frame for a QoS-0 duplicate.
+        ProduceOutcome::AppendedDuplicate(offset) if !fire_and_forget => {
+            Some((*offset, FrameType::PubAckDuplicate))
+        }
+        _ => None,
+    };
+    if let Some((offset, frame_type)) = gated {
         // SINGLE-NODE / no-cluster FAST PATH (zero added cost): with NO cluster gate the produce-ack is
         // written DIRECTLY into `out`, byte-for-byte today's path — no temp allocation, no lock, no extra
         // work. `has_client_ack_gate` is a cheap local bool (default `false`), so the non-cluster hot
         // path never even builds the bytes the gate would need.
         if !engine.has_client_ack_gate() {
-            reply_pub_ack(out, FrameType::PubAck, offset);
+            reply_pub_ack(out, frame_type, offset);
             return Ok(());
         }
-        // CLUSTERED path: build the EXACT wire PubAck bytes the immediate-ack path would write, then let
+        // CLUSTERED path: build the EXACT wire reply bytes the immediate-ack path would write, then let
         // the gate decide whether to write them now or withhold them for quorum-fsync.
         let mut reply_bytes = Vec::with_capacity(11);
-        reply_pub_ack(&mut reply_bytes, FrameType::PubAck, offset);
+        reply_pub_ack(&mut reply_bytes, frame_type, offset);
         match engine.client_ack_disposition(member_id, offset.get(), reply_bytes) {
             // The gate vanished between the bool check and here (a teardown race), or handed the bytes
             // back (non-C2-fsync level, or a partition this node does not lead): write them now,
             // byte-identical.
             None => {
-                reply_pub_ack(out, FrameType::PubAck, offset);
+                reply_pub_ack(out, frame_type, offset);
             }
             Some(crate::cluster::dataplane::AckDisposition::WriteNow(bytes)) => {
                 out.extend_from_slice(&bytes);
@@ -4292,7 +4312,7 @@ fn write_pub_reply_gated<
                     out.extend_from_slice(&f);
                 }
             }
-            // Clustered C2-fsync to a led partition, below/at quorum: WITHHOLD the wire PubAck. The data
+            // Clustered C2-fsync to a led partition, below/at quorum: WITHHOLD the wire reply. The data
             // plane releases it onto this connection's outbox on quorum-fsync; the session drains it on a
             // later pass. No false ack below min_isr (the gate releases nothing).
             Some(crate::cluster::dataplane::AckDisposition::Parked) => {}
@@ -4334,9 +4354,14 @@ fn write_pub_reply(
         // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
         // broker returns the ORIGINAL offset via the NEW PubAckDuplicate frame (the frozen PubAck
         // body is untouched). It is a SUCCESS (`rc = 0`, `duplicate = true`), never an error, so an
-        // idempotent retry over a lossy edge link does not loop.
+        // idempotent retry over a lossy edge link does not loop. The fire-and-forget arm is
+        // defense-in-depth (a QoS-0 publish does not reach this reply path today): the actor's dedup
+        // path yields `AppendedDuplicate` regardless of the flag, so honor the QoS-0 no-frame contract
+        // here, exactly like every other outcome's fire-and-forget arm.
         ProduceOutcome::AppendedDuplicate(offset) => {
-            reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
+            if !fire_and_forget {
+                reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
+            }
             Ok(())
         }
         // A stale-epoch fence (#33): a zombie session reused an old `producer_id` with an epoch
@@ -7029,6 +7054,128 @@ mod tests {
         assert!(
             out.is_empty(),
             "a fence sent a frame to a QoS-0 pub: {out:?}"
+        );
+    }
+
+    /// A mock whose produce path always reports a dedup HIT (`AppendedDuplicate`), with a cluster ack
+    /// gate present that PARKS the ack (the original offset is below quorum). For #917.
+    struct DedupParkingEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for DedupParkingEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            Ok(ProduceOutcome::AppendedDuplicate(Offset::new(5)))
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+        fn has_client_ack_gate(&self) -> bool {
+            true
+        }
+        fn client_ack_disposition(
+            &self,
+            _member: MemberId,
+            _offset: u64,
+            _reply_bytes: Vec<u8>,
+        ) -> Option<crate::cluster::dataplane::AckDisposition> {
+            Some(crate::cluster::dataplane::AckDisposition::Parked)
+        }
+    }
+
+    /// Same dedup hit, but the gate RELEASES the duplicate-ack now (the original is already
+    /// quorum-committed): the `PubAckDuplicate` is written, byte-identical to the immediate path (#917).
+    struct DedupReleasingEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for DedupReleasingEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            Ok(ProduceOutcome::AppendedDuplicate(Offset::new(5)))
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+        fn has_client_ack_gate(&self) -> bool {
+            true
+        }
+        fn client_ack_disposition(
+            &self,
+            _member: MemberId,
+            _offset: u64,
+            reply_bytes: Vec<u8>,
+        ) -> Option<crate::cluster::dataplane::AckDisposition> {
+            Some(crate::cluster::dataplane::AckDisposition::WriteNow(
+                reply_bytes,
+            ))
+        }
+    }
+
+    #[test]
+    fn a_dedup_hit_c2_fsync_produce_routes_through_the_quorum_gate() {
+        // #917: a dedup-hit (AppendedDuplicate) on a clustered C2-fsync serve must clear the SAME quorum
+        // gate as a fresh Appended. Below quorum the duplicate-ack is WITHHELD (no immediate
+        // PubAckDuplicate for a record durable only on the leader); at quorum it is written.
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &DedupParkingEngine,
+            &frame(FrameType::Connect, b""),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        connect_and_pub(&mut s, &DedupParkingEngine, &mut out);
+        assert!(
+            out.is_empty(),
+            "a dedup hit below quorum must withhold the PubAckDuplicate: {out:?}"
+        );
+
+        // When the gate releases (the original IS quorum-committed), the PubAckDuplicate IS written.
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &DedupReleasingEngine,
+            &frame(FrameType::Connect, b""),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        connect_and_pub(&mut s, &DedupReleasingEngine, &mut out);
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAckDuplicate,
+            "a dedup hit at quorum writes the duplicate-ack"
+        );
+
+        // A FIRE-AND-FORGET produce that dedup-hits sends NO frame (the QoS-0 no-frame contract), even
+        // with a cluster gate present: the actor returns `AppendedDuplicate` regardless of the flag, so
+        // a QoS-0 duplicate must never be quorum-gated or written (it would desync the reply stream).
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &DedupParkingEngine);
+        assert!(
+            out.is_empty(),
+            "a fire-and-forget dedup hit must send no frame: {out:?}"
         );
     }
 
