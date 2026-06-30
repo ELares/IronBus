@@ -59,13 +59,51 @@
 //! asserts byte-for-byte equality).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 
+use crate::fs::Filesystem;
 use crate::naming::segment_file_name;
 use crate::segment::{OwnedRecord, RawByteRun, SegmentReader, StorageError};
 use ironbus_core::types::Offset;
+
+/// The lazily-opened [`SegmentReader`] cache for a [`SealedSnapshot`] (#808): one `OnceLock` per sealed
+/// segment, PARALLEL to `SealedSnapshot::segments` (same index). Opening a sealed segment does an
+/// `open(2)` + `fstat(2)` + a 64-byte header `pread` + a header-CRC decode; a sealed segment is
+/// IMMUTABLE, so that work is identical on every read and is cached here, opened on first touch and
+/// reused by all subsequent reads. The reader is shared as an `Arc` across the concurrent off-actor
+/// readers — positioned (`pread`) reads need no cursor and no lock — and the WHOLE snapshot (and thus
+/// every fd it opened) drops when a roll/reap republishes a fresh snapshot, so fds never leak past the
+/// generation that opened them.
+struct SlotReaders<F: Filesystem>(Vec<OnceLock<Arc<SegmentReader<F::File>>>>);
+
+impl<F: Filesystem> SlotReaders<F> {
+    /// A fresh, all-empty cache sized to `len` sealed segments (one `OnceLock` per slot).
+    fn empty(len: usize) -> SlotReaders<F> {
+        SlotReaders((0..len).map(|_| OnceLock::new()).collect())
+    }
+}
+
+// Manual `Clone`/`Debug` so neither requires `F::File: Clone`/`Debug` (the `Filesystem::File` associated
+// type carries no such bound). A clone shares the already-opened readers via their `Arc`s — but a clone
+// is never on the publish path (`republish_sealed` builds a FRESH snapshot), so no fd is shared across
+// generations; `Debug` prints only counts, never the readers.
+impl<F: Filesystem> Clone for SlotReaders<F> {
+    fn clone(&self) -> SlotReaders<F> {
+        SlotReaders(self.0.clone())
+    }
+}
+
+impl<F: Filesystem> std::fmt::Debug for SlotReaders<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let opened = self.0.iter().filter(|c| c.get().is_some()).count();
+        f.debug_struct("SlotReaders")
+            .field("slots", &self.0.len())
+            .field("opened", &opened)
+            .finish_non_exhaustive()
+    }
+}
 
 /// One SEALED segment in a [`SealedSnapshot`]: its identity, covered offset range, and the resident
 /// sparse seek anchors (#537) so a reader can SEEK without the writer's live `Log` state.
@@ -149,13 +187,17 @@ impl SealedSegment {
 /// one; a reader holding an older `Arc` simply reads an older (still-valid, possibly fewer-segments)
 /// view, which the flushed frontier bound clamps correctly.
 #[derive(Clone, Debug)]
-pub(crate) struct SealedSnapshot<F> {
+pub(crate) struct SealedSnapshot<F: Filesystem> {
     /// The filesystem handle, shared (the same directory the writer owns). Reads open their OWN
     /// `SegmentReader` over an immutable sealed file, so a concurrent reader never aliases the
     /// writer's active `SegmentWriter` handle.
     fs: Arc<F>,
     /// The sealed segments, ascending by base offset. The ACTIVE (un-sealed) segment is NEVER here.
     segments: Vec<SealedSegment>,
+    /// The lazily-opened `SegmentReader` per sealed segment (#808), PARALLEL to `segments`: a read opens
+    /// each immutable sealed file once and reuses it, instead of re-doing open+fstat+header-CRC per read.
+    /// Dropped (fds closed) with the snapshot when a roll/reap republishes a fresh one.
+    readers: SlotReaders<F>,
     /// The lowest covered offset across the snapshot (the first segment's base): a read below it is
     /// out of range, exactly as the `Log` reports `OffsetOutOfRange`.
     oldest: u64,
@@ -204,6 +246,47 @@ pub struct RawSealedRead {
 }
 
 impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
+    /// Builds an immutable sealed snapshot with a fresh (all-empty) per-segment reader cache (#808).
+    pub(crate) fn new(
+        fs: Arc<F>,
+        segments: Vec<SealedSegment>,
+        oldest: u64,
+        sealed_end: u64,
+    ) -> SealedSnapshot<F> {
+        let readers = SlotReaders::empty(segments.len());
+        SealedSnapshot {
+            fs,
+            segments,
+            readers,
+            oldest,
+            sealed_end,
+        }
+    }
+
+    /// The opened [`SegmentReader`] for sealed segment slot `i`, opening it on first touch and reusing the
+    /// cached one thereafter (#808). Shared as an `Arc` across the concurrent off-actor readers. A
+    /// double-open race is merely wasteful, never wrong: a sealed file is immutable, so two opens produce
+    /// byte-identical readers; the loser's `Arc` drops and closes its fd immediately, and every caller
+    /// returns the SAME stored reader.
+    fn reader_for(
+        &self,
+        i: usize,
+        slot: &SealedSegment,
+    ) -> Result<Arc<SegmentReader<F::File>>, StorageError> {
+        if let Some(reader) = self.readers.0[i].get() {
+            return Ok(Arc::clone(reader));
+        }
+        let opened = Arc::new(SegmentReader::open(
+            self.fs.open(&segment_file_name(slot.id))?,
+        )?);
+        // `set` fails if another thread won the race; either way the slot is now initialized, so read it
+        // back and return the stored reader (the winner's), letting `opened` drop if we lost.
+        let _ = self.readers.0[i].set(opened);
+        Ok(Arc::clone(self.readers.0[i].get().expect(
+            "slot reader is initialized after set or a lost race",
+        )))
+    }
+
     /// The index in `segments` of the sealed segment whose range holds `offset` (the slot with the
     /// largest base not exceeding `offset`). Callers guarantee `offset >= oldest`.
     fn segment_index_for(&self, offset: u64) -> usize {
@@ -260,7 +343,9 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         let mut out: Vec<OwnedRecord> = Vec::new();
         let mut byte_total = 0usize;
         let mut fallback_from = None;
-        for slot in &self.segments[self.segment_index_for(start)..] {
+        let base = self.segment_index_for(start);
+        for (offset_in_base, slot) in self.segments[base..].iter().enumerate() {
+            let slot_index = base + offset_in_base;
             if slot.base_offset >= visible_sealed_end {
                 break;
             }
@@ -287,7 +372,7 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
             let below_flushed =
                 usize::try_from(flushed.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
             let want = remaining.saturating_add(gap).min(below_flushed);
-            let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+            let reader = self.reader_for(slot_index, slot)?;
             let records = reader.scan_from(byte_pos, Offset::new(anchor_offset), read_end, want)?;
             for record in records {
                 // Skip the bounded run the anchor preceded `seg_start` by.
@@ -372,7 +457,8 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         if start >= visible_sealed_end {
             return Ok(empty(Some(start)));
         }
-        let slot = &self.segments[self.segment_index_for(start)];
+        let slot_index = self.segment_index_for(start);
+        let slot = &self.segments[slot_index];
         let seg_start = start.max(slot.base_offset);
         // A COMPACTED (v2, sparse) slot is served by the through-actor v2 scan, not this plane: a
         // sparse survivor run is not a dense contiguous byte range, so hand the remainder back.
@@ -397,7 +483,7 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         let below_visible =
             usize::try_from(seg_visible_end.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
         let want = max_records.saturating_add(gap).min(below_visible);
-        let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+        let reader = self.reader_for(slot_index, slot)?;
         let run =
             reader.raw_byte_range(byte_pos, Offset::new(anchor_offset), read_end, want, None)?;
         // The anchor may sit BEFORE `seg_start` (sparse anchors land one-per-stride): trim the leading
@@ -508,7 +594,7 @@ fn push_record(
 /// SAME published frontier and snapshot. The single append actor (through the `Log` it owns) is the
 /// only PUBLISHER; any number of readers observe concurrently with it and with each other.
 #[derive(Clone, Debug)]
-pub struct ReadPlane<F> {
+pub struct ReadPlane<F: Filesystem> {
     /// The read-visible (flushed) high-water mark, published RELEASE by the writer after every
     /// commit/flush/seal and observed ACQUIRE by readers as the hard read bound. Shared so a `Log`
     /// clone and every reader see the same cell.
@@ -531,12 +617,9 @@ impl<F: crate::fs::Filesystem> ReadPlane<F> {
     ) -> ReadPlane<F> {
         ReadPlane {
             flushed: Arc::new(AtomicU64::new(flushed)),
-            sealed: Arc::new(ArcSwap::from_pointee(SealedSnapshot {
-                fs,
-                segments,
-                oldest,
-                sealed_end,
-            })),
+            sealed: Arc::new(ArcSwap::from_pointee(SealedSnapshot::new(
+                fs, segments, oldest, sealed_end,
+            ))),
         }
     }
 
@@ -551,12 +634,9 @@ impl<F: crate::fs::Filesystem> ReadPlane<F> {
         sealed_end: u64,
     ) {
         let fs = Arc::clone(&self.sealed.load().fs);
-        self.sealed.store(Arc::new(SealedSnapshot {
-            fs,
-            segments,
-            oldest,
-            sealed_end,
-        }));
+        self.sealed.store(Arc::new(SealedSnapshot::new(
+            fs, segments, oldest, sealed_end,
+        )));
     }
 
     /// PUBLISHES the new read-visible (flushed) frontier (the writer side, after every commit). A
@@ -651,11 +731,25 @@ impl<F: crate::fs::Filesystem> ReadPlane<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fault::{FaultControl, FaultFs};
     use crate::fs::InMemoryFs;
     use crate::log::{Append, Log, LogConfig};
     use ironbus_core::clock::ManualClock;
     use ironbus_core::types::RecordFlags;
     use std::sync::atomic::AtomicU64 as StdAtomicU64;
+
+    /// A tiny-segment log over a `FaultFs` whose `FaultControl` counts every `open(2)`, so a test can
+    /// assert the #808 reader cache opens a sealed segment ONCE across many reads.
+    fn small_fault_log() -> (Log<FaultFs<InMemoryFs>, ManualClock>, FaultControl) {
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let config = LogConfig {
+            max_segment_bytes: 256,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        };
+        let log = Log::open(fs, ManualClock::new(), config).unwrap();
+        (log, control)
+    }
 
     fn rec(payload: &[u8]) -> Append<'_> {
         Append {
@@ -710,6 +804,81 @@ mod tests {
                 "off-actor served more than through-actor at {start}"
             );
         }
+    }
+
+    /// #808: many reads of ONE sealed segment open its file ONCE (the per-snapshot reader cache), not
+    /// once per read — the syscall/fd-churn win. With the cache OFF (a fresh `SegmentReader::open` per
+    /// read) the open-count delta would equal the number of reads.
+    #[test]
+    fn repeated_sealed_reads_open_each_segment_once() {
+        let (mut log, control) = small_fault_log();
+        for i in 0..40u32 {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+            if i % 7 == 0 {
+                log.sync().unwrap();
+            }
+        }
+        log.sync().unwrap();
+        let plane = log.read_plane().unwrap();
+        // Offset 0 is in the first sealed segment (the tiny cap sealed several). Read it many times
+        // through the SAME (unchanged) snapshot: the segment is opened on the first read and reused.
+        let baseline = control.open_count();
+        let mut served = 0;
+        for _ in 0..25 {
+            let read = plane.read_range(Offset::new(0), 1, None).unwrap();
+            served += read.records.len();
+        }
+        assert_eq!(served, 25, "every read served the record at offset 0");
+        let opens = control.open_count() - baseline;
+        assert_eq!(
+            opens, 1,
+            "25 reads of one sealed segment opened it ONCE (#808), not 25 times"
+        );
+    }
+
+    /// #808: the reader cache is PER-SNAPSHOT. When a roll/reap republishes a fresh snapshot, the old
+    /// snapshot (and its opened fds) drops, and a read through the new snapshot RE-OPENS — proving the
+    /// cache never carries a stale fd across a generation (and that retired fds are released, not leaked).
+    #[test]
+    fn a_republished_snapshot_reopens_the_segment() {
+        let (mut log, control) = small_fault_log();
+        for i in 0..40u32 {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+            if i % 7 == 0 {
+                log.sync().unwrap();
+            }
+        }
+        log.sync().unwrap();
+
+        // Warm the cache for segment 0 in the current snapshot.
+        let plane = log.read_plane().unwrap();
+        let baseline = control.open_count();
+        let _ = plane.read_range(Offset::new(0), 1, None).unwrap();
+        let _ = plane.read_range(Offset::new(0), 1, None).unwrap();
+        assert_eq!(
+            control.open_count() - baseline,
+            1,
+            "the warm snapshot opened segment 0 once"
+        );
+
+        // Append + sync more so the writer seals another segment and REPUBLISHES the snapshot.
+        for i in 40..90u32 {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+            if i % 7 == 0 {
+                log.sync().unwrap();
+            }
+        }
+        log.sync().unwrap();
+
+        // Read segment 0 again through the fresh snapshot: its cache is empty, so it re-opens once.
+        let after_republish = control.open_count();
+        let _ = plane.read_range(Offset::new(0), 1, None).unwrap();
+        let _ = plane.read_range(Offset::new(0), 1, None).unwrap();
+        assert_eq!(
+            control.open_count() - after_republish,
+            1,
+            "a republished snapshot re-opens segment 0 once (the old generation's fd was dropped, not reused)"
+        );
     }
 
     /// #664: the off-actor WINDOW-BOUNDED read-end (`SealedSegment::window_read_end`) is correct over

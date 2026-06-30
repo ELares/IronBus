@@ -596,6 +596,75 @@ impl CompactedIndex {
     }
 }
 
+/// The default number of opened SEALED-segment readers the through-actor `Log` keeps resident (#808).
+/// Each entry is one fd + a validated header; the cache is FIFO-bounded so a retention-off cold full
+/// scan opens-and-reuses a working set instead of leaking one fd per sealed segment. 256 sits well under
+/// a typical 1024 `RLIMIT_NOFILE`, leaving room for the active writer fd plus sockets.
+const DEFAULT_SEALED_READER_CACHE_CAP: usize = 256;
+
+/// A small FIFO-bounded cache of opened [`SegmentReader`]s keyed by SEALED segment id (#808), used by the
+/// through-actor `Log` read path so a repeated `read_from` over a hot sealed segment does ONE
+/// open+fstat+header-CRC, not one per read. The active (growing) segment is NEVER cached. Interior
+/// mutability (the read path is `&self`), single-writer / never aliased across threads — the same
+/// rationale as `segment_indexes`. Holds only derived data: dropping or rebuilding an entry changes
+/// nothing a reader observes (same bytes, same per-record CRC), it only re-pays the open. Entries are
+/// evicted at segment retirement via [`Log::evict_segment_index`]; segment ids are never recycled
+/// (ADR 0002), so a cached fd can never alias a different physical segment.
+struct SealedReaderCache<F: Filesystem> {
+    readers:
+        std::cell::RefCell<std::collections::HashMap<u64, std::sync::Arc<SegmentReader<F::File>>>>,
+    /// Insertion order of the resident ids, so the cache sheds the OLDEST opened reader when it hits its
+    /// cap — a bound on resident fds, not a correctness device (any victim is safe to re-open).
+    fifo: std::cell::RefCell<std::collections::VecDeque<u64>>,
+    cap: usize,
+}
+
+impl<F: Filesystem> SealedReaderCache<F> {
+    fn new(cap: usize) -> SealedReaderCache<F> {
+        SealedReaderCache {
+            readers: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fifo: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            cap,
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<std::sync::Arc<SegmentReader<F::File>>> {
+        self.readers.borrow().get(&id).cloned()
+    }
+
+    fn insert(&self, id: u64, reader: std::sync::Arc<SegmentReader<F::File>>) {
+        let mut readers = self.readers.borrow_mut();
+        if !readers.contains_key(&id) {
+            let mut fifo = self.fifo.borrow_mut();
+            while fifo.len() >= self.cap {
+                match fifo.pop_front() {
+                    Some(evicted) => {
+                        readers.remove(&evicted);
+                    }
+                    None => break,
+                }
+            }
+            fifo.push_back(id);
+        }
+        readers.insert(id, reader);
+    }
+
+    fn evict(&self, id: u64) {
+        if self.readers.borrow_mut().remove(&id).is_some() {
+            self.fifo.borrow_mut().retain(|&x| x != id);
+        }
+    }
+}
+
+impl<F: Filesystem> std::fmt::Debug for SealedReaderCache<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedReaderCache")
+            .field("resident", &self.readers.borrow().len())
+            .field("cap", &self.cap)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A single durable, ordered log backed by one data directory of segment files.
 ///
 /// One active segment receives appends; sealed predecessors hold the older records.
@@ -731,6 +800,12 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// and caches an entry behind a `RefCell`, holding only derived data (dropping or rebuilding it
     /// changes nothing a reader observes — same survivors, same CRC validation).
     compacted_indexes: std::cell::RefCell<std::collections::HashMap<u64, CompactedIndex>>,
+    /// The resident, FIFO-bounded cache of OPENED sealed-segment readers (#808): the through-actor read
+    /// path (e.g. the Tier-W per-record poll, which reads `read_from(off, 1)` per delivered message)
+    /// reuses one opened `SegmentReader` per sealed segment instead of re-opening (open+fstat+header-CRC)
+    /// on every read. The active segment is never cached (it grows); evicted in lockstep with the seek
+    /// index by [`Log::evict_segment_index`] at retirement.
+    sealed_readers: SealedReaderCache<F>,
     /// The lock-free, off-actor consume READ plane (#539): the shared atomic flushed frontier plus
     /// the arc-swapped immutable snapshot of the SEALED segments + their seek anchors, which any
     /// number of reader threads observe with NO lock and NO append-actor round-trip. The single
@@ -820,6 +895,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // A fresh log has no compacted segment, so the sparse index map (#481) starts
                     // empty; it is filled lazily the first time a compacted slot is read.
                     compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+                    sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
                     // The off-actor read plane (#539) is built lazily on the first consumer
                     // `read_plane()` call; a never-read log pays nothing.
                     read_plane: std::cell::RefCell::new(None),
@@ -994,6 +1070,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The compacted (sparse) seek index map (#481) is likewise resident-only: a reopen
             // rebuilds it lazily from the durable frames the first time a compacted slot is read.
             compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
         };
@@ -1364,6 +1441,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The compacted (sparse) seek index map (#481) starts empty and is filled lazily on the
             // read path; the recovered chain may include compacted segments, indexed on first read.
             compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
         };
@@ -2369,6 +2447,29 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(out)
     }
 
+    /// The opened [`SegmentReader`] for segment `id`, served from the resident reader cache (#808) for a
+    /// SEALED segment (opened on first touch, reused thereafter) and opened FRESH for the active segment
+    /// (which grows, so its length/tail must never be cached). The returned `Arc` is cheap to clone and
+    /// reads it with positioned `pread`s.
+    fn sealed_reader_for(
+        &self,
+        id: u64,
+    ) -> Result<std::sync::Arc<SegmentReader<F::File>>, StorageError> {
+        if id == self.active_id {
+            return Ok(std::sync::Arc::new(SegmentReader::open(
+                self.fs.open(&segment_file_name(id))?,
+            )?));
+        }
+        if let Some(reader) = self.sealed_readers.get(id) {
+            return Ok(reader);
+        }
+        let reader =
+            std::sync::Arc::new(SegmentReader::open(self.fs.open(&segment_file_name(id))?)?);
+        self.sealed_readers
+            .insert(id, std::sync::Arc::clone(&reader));
+        Ok(reader)
+    }
+
     /// Reads ONE segment's contribution to a [`Log::read_range`] in a single forward pass, pushing
     /// the in-range records into `out` and advancing `byte_total` (#538). Returns `true` when the
     /// read should STOP (a record/byte/flushed bound was hit), `false` to advance to the next
@@ -2451,7 +2552,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let below_flushed =
             usize::try_from(bounds.flushed.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
         let want = remaining.saturating_add(gap).min(below_flushed);
-        let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+        // #808: reuse an opened reader for a SEALED segment (the consume hot path — Tier-W polls
+        // `read_from(off, 1)` per delivered message), re-opening only the growing active segment.
+        let reader = self.sealed_reader_for(slot.id)?;
         let records = reader.scan_from(byte_pos, Offset::new(anchor_offset), read_end, want)?;
         for record in records {
             // Skip the bounded run of records the anchor preceded `seg_start` by.
@@ -3350,6 +3453,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     fn evict_segment_index(&mut self, id: u64) {
         self.segment_indexes.borrow_mut().remove(&id);
         self.compacted_indexes.borrow_mut().remove(&id);
+        // Drop the cached open reader (and its fd) for the retired segment in lockstep (#808), so a
+        // reaped/compacted-away segment's fd is released, not leaked.
+        self.sealed_readers.evict(id);
     }
 
     fn segment_index_for(&self, offset: u64) -> usize {
@@ -3578,6 +3684,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// the evict-on-retirement contract directly.
     fn has_segment_index(&self, id: u64) -> bool {
         self.segment_indexes.borrow().contains_key(&id)
+    }
+
+    /// Whether an opened sealed-segment reader (#808) is currently cached for segment `id`. Lets a test
+    /// assert the same evict-on-retirement contract for the reader cache.
+    fn has_sealed_reader(&self, id: u64) -> bool {
+        self.sealed_readers.get(id).is_some()
     }
 
     /// The number of resident seek indexes currently cached, so a test can assert the resident set
@@ -5382,6 +5494,67 @@ mod tests {
         assert!(
             !log.has_segment_index(oldest.id),
             "the force-reaped segment's index must be evicted"
+        );
+    }
+
+    #[test]
+    fn repeated_read_from_opens_a_sealed_segment_once() {
+        // #808: the through-actor consume hot path (Tier-W polls `read_from(off, 1)` per delivered
+        // message) reuses one opened reader per SEALED segment, so N reads of one sealed segment do ONE
+        // open, not N. Without the cache the open-count delta would equal the number of reads.
+        use crate::fault::FaultFs;
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        for i in 0..16u8 {
+            log.append(&rec(&[i; 16])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(
+            log.segments.len() >= 2,
+            "the tiny cap sealed several segments"
+        );
+        let oldest = log.segments[0];
+        let base = oldest.base_offset;
+        // Read the first sealed segment's base offset many times; it is opened on the first read and the
+        // opened reader is reused for the rest.
+        let baseline = control.open_count();
+        for _ in 0..20 {
+            let recs = log.read_from(Offset::new(base), 1).unwrap();
+            assert_eq!(recs.len(), 1, "each read served the sealed record");
+        }
+        assert_eq!(
+            control.open_count() - baseline,
+            1,
+            "20 reads of one sealed segment opened it ONCE (#808), not 20 times"
+        );
+        assert!(
+            log.has_sealed_reader(oldest.id),
+            "the sealed reader is cached"
+        );
+    }
+
+    #[test]
+    fn a_force_reap_evicts_the_cached_sealed_reader() {
+        // #808: a retired segment's cached reader (and its fd) is dropped in lockstep with its seek index
+        // via `evict_segment_index`, so a reaped segment never leaves a leaked fd behind.
+        let mut log = open_mem(small_config());
+        for i in 0..16u8 {
+            log.append(&rec(&[i; 16])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.segments.len() >= 2);
+        let oldest = log.segments[0];
+        // Warm the cache for the oldest sealed segment.
+        let _ = log.read_from(Offset::new(oldest.base_offset), 1).unwrap();
+        assert!(
+            log.has_sealed_reader(oldest.id),
+            "the oldest sealed segment's reader is cached after a read"
+        );
+        let out = log.reap_oldest_forced().unwrap();
+        assert!(out.is_some(), "a force-reap removes the oldest");
+        assert!(
+            !log.has_sealed_reader(oldest.id),
+            "the force-reaped segment's cached reader (and its fd) must be evicted (#808)"
         );
     }
 
