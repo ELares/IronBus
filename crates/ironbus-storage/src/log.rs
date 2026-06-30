@@ -948,21 +948,26 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(log)
     }
 
-    /// #868: if the HIGHEST-id segment has a zero-length or undecodable HEADER, remove it and
-    /// return the reduced id list plus its id, so [`Log::open`] rolls forward and recreates it
-    /// instead of aborting the whole boot on an empty unsealed tail (the `start_segment`-crash and
-    /// trailing-header-bit-rot cases). The reaped tail holds nothing durable: the prior segment was
-    /// sealed before this one was created.
+    /// #868: if the HIGHEST-id segment is an EMPTY unsealed tail left by a crash during
+    /// `start_segment` (a 0-length or header-only file, or a header followed by an all-zero
+    /// preallocated body), remove it and return the reduced id list plus its id, so [`Log::open`]
+    /// rolls forward and recreates it instead of aborting the whole boot. The reaped tail holds
+    /// nothing durable: the prior segment was sealed before this one was created.
     ///
-    /// Deliberately narrow, so genuine corruption still fails closed:
-    /// - Only the TRAILING segment is considered; a bad header on any non-final segment is left for
-    ///   the strict chain scan ([`scan_recover_chain`](Log::scan_recover_chain)) to reject.
-    /// - Only an undecodable/too-short header reaps. A header that DECODES (even to a conflicting
-    ///   id, the [`StorageError::SegmentIdMismatch`] case) is left intact for the strict scan.
-    /// - If the bad trailing segment is the SOLE segment and is not [`FIRST_SEGMENT_ID`], its
-    ///   predecessors were retention-reaped, so the offset/seq space does not start at zero and an
-    ///   unreadable header gives no way to reconstruct it. Recreating it as a fresh segment 0 would
-    ///   reuse already-consumed offsets, so this is left to hard-fail rather than silently reset.
+    /// Deliberately narrow, because for a durable log a WRONG reap is silent data loss. ALL hold:
+    /// - There is at least one PREDECESSOR (`ids.len() >= 2`). A sole bad-header segment is left to
+    ///   the strict scan, which fails closed: an unreadable header gives no way to reconstruct the
+    ///   offset/seq space, and an empty-looking sole segment is byte-indistinguishable from a wholly
+    ///   corrupt one (the corruption-corpus `*_fails_closed` contract, e.g. `all_zeros_whole_*`).
+    /// - The trailing HEADER is undecodable or too short. A header that DECODES (even to a
+    ///   conflicting id, the [`StorageError::SegmentIdMismatch`] case) is a normal tail for the scan.
+    /// - The trailing BODY is provably EMPTY (see
+    ///   [`segment_body_is_all_zero`](Log::segment_body_is_all_zero)): if ANY non-zero record byte
+    ///   follows the bad header, the segment may hold acked records (for example a bit-rotted
+    ///   ACTIVE-segment header over real frames), so it must NOT be deleted — it is left for the
+    ///   strict scan to fail closed and PRESERVE the file for forensics. This body proof is the line
+    ///   between an availability recovery and data loss.
+    /// - A bad header on any NON-final segment is untouched here and still hard-fails in the scan.
     /// - A real IO error (not a structural header error) is propagated, never masked into a reap.
     fn reap_bad_trailing_segment(
         fs: &F,
@@ -971,24 +976,55 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let Some(&last) = ids.last() else {
             return Ok((ids, None));
         };
-        match SegmentReader::open(fs.open(&segment_file_name(last))?) {
-            // The header decodes: a normal active/sealed tail. Leave it for the strict scan, which
-            // recovers an unsealed tail, rolls a sealed one forward, or rejects an id mismatch.
-            Ok(_) => Ok((ids, None)),
-            // A structural HEADER error (too short, bad magic, bad CRC, unknown version): the empty
-            // unsealed tail. Reap it unless it is the unreconstructable sole-non-zero-id case above,
-            // which stays a hard fail (leave `ids` intact so the strict scan surfaces the error).
-            Err(StorageError::Segment(_)) => {
-                if ids.len() == 1 && last != FIRST_SEGMENT_ID {
-                    return Ok((ids, None));
-                }
-                fs.remove(&segment_file_name(last))?;
-                ids.pop();
-                Ok((ids, Some(last)))
-            }
-            // A genuine IO error reading the header is not an empty tail; surface it unchanged.
-            Err(e) => Err(e),
+        // A sole bad-header segment has no predecessor to roll forward from: fail closed.
+        if ids.len() < 2 {
+            return Ok((ids, None));
         }
+        let name = segment_file_name(last);
+        // A decodable header is a normal tail (recovered / rolled / id-rejected by the strict scan);
+        // only an undecodable/too-short header is a reap candidate. A real IO error is surfaced.
+        match SegmentReader::open(fs.open(&name)?) {
+            Ok(_) => return Ok((ids, None)),
+            Err(StorageError::Segment(_)) => {}
+            Err(e) => return Err(e),
+        }
+        // The header is undecodable. Reap ONLY if the body carries no record bytes — a genuinely
+        // empty preallocated tail, not a populated segment whose header rotted. The re-open is
+        // because `SegmentReader::open` consumed the first handle.
+        if !Self::segment_body_is_all_zero(&fs.open(&name)?)? {
+            return Ok((ids, None));
+        }
+        fs.remove(&name)?;
+        ids.pop();
+        Ok((ids, Some(last)))
+    }
+
+    /// `true` if `file` has no record bytes past the 64-byte segment header: it is at most a header
+    /// long, or every byte in `[SEGMENT_HEADER_LEN, len)` is zero. Used by #868's reap to prove a
+    /// bad-header trailing segment is a genuinely-empty preallocated tail (safe to recreate) rather
+    /// than a populated segment whose header rotted (whose acked records must never be silently
+    /// deleted). Reads in bounded chunks so a `max_segment_bytes`-preallocated file costs no large
+    /// allocation.
+    fn segment_body_is_all_zero(file: &F::File) -> Result<bool, StorageError> {
+        let file_len = file.len()?;
+        let header = SEGMENT_HEADER_LEN as u64;
+        if file_len <= header {
+            return Ok(true);
+        }
+        let mut pos = header;
+        let mut buf = [0u8; 4096];
+        while pos < file_len {
+            let want = buf
+                .len()
+                .min(usize::try_from(file_len - pos).unwrap_or(usize::MAX));
+            let chunk = &mut buf[..want];
+            file.read_exact_at(chunk, pos)?;
+            if chunk.iter().any(|&b| b != 0) {
+                return Ok(false);
+            }
+            pos += want as u64;
+        }
+        Ok(true)
     }
 
     /// Walks every segment in ascending order from a streaming recovery scan, validating the
@@ -4098,12 +4134,13 @@ mod tests {
 
     #[test]
     fn recovery_rolls_forward_over_a_bad_header_trailing_segment() {
-        // #868: a crash during `start_segment` (or trailing-header bit-rot) can leave the highest
-        // segment as a 0-length or zeroed-header file — an empty unsealed tail that holds nothing
-        // durable (the prior segment was sealed before this one was created). Recovery must roll
-        // forward and recreate it, recording the abandonment in the loss report, NOT abort the whole
-        // boot on `Segment(Truncated)` and wedge a restart loop. Both bad-header shapes are covered.
-        for trailing_len in [0usize, SEGMENT_HEADER_LEN] {
+        // #868: a crash during `start_segment` can leave the highest segment as an EMPTY unsealed
+        // tail (the prior segment was sealed before this one was created, so it holds nothing
+        // durable). Recovery must roll forward and recreate it, recording the abandonment in the loss
+        // report, NOT abort the whole boot on `Segment(Truncated)` and wedge a restart loop. Three
+        // empty shapes are covered: 0 bytes, a zeroed 64-byte header, and a header + all-zero
+        // preallocated body (the start_segment preallocation case).
+        for trailing_len in [0usize, SEGMENT_HEADER_LEN, SEGMENT_HEADER_LEN + 256] {
             let fs = InMemoryFs::new();
             // A valid sealed chain seg-0 (offsets 0,1) then seg-1 (offset 2).
             let f0 = fs.create_new(&segment_file_name(0)).unwrap();
@@ -4115,11 +4152,11 @@ mod tests {
             let mut w1 = SegmentWriter::create(f1, header_at(1, 2)).unwrap();
             w1.append(&view(2, b"c")).unwrap();
             w1.seal().unwrap();
-            // The trailing seg-2 a crash left mid-`start_segment`: 0 bytes, or a zeroed (undecodable)
-            // 64-byte header. Both are a bad HEADER, the pre-fix unskippable abort.
+            // The trailing seg-2 a crash left mid-`start_segment`: 0 bytes, a zeroed (undecodable)
+            // 64-byte header, or a header + preallocated all-zero body. All are an empty bad-HEADER
+            // tail, the pre-fix unskippable abort.
             let f2 = fs.create_new(&segment_file_name(2)).unwrap();
-            f2.write_all_at(&[0u8; SEGMENT_HEADER_LEN][..trailing_len], 0)
-                .unwrap();
+            f2.write_all_at(&vec![0u8; trailing_len], 0).unwrap();
             f2.sync_data().unwrap();
             assert!(
                 matches!(
@@ -4166,8 +4203,9 @@ mod tests {
 
     #[test]
     fn recovery_still_hard_fails_a_bad_header_that_is_not_an_empty_trailing_tail() {
-        // The #868 roll-forward is deliberately narrow: a bad header still fails closed unless it is
-        // an empty, reconstructable TRAILING tail.
+        // The #868 roll-forward is deliberately narrow: a bad header still fails closed unless it is a
+        // genuinely-EMPTY trailing tail with a valid predecessor. Each case must fail closed, and a
+        // populated segment must NOT be deleted.
 
         // (1) A bad header on a NON-final segment is real mid-chain corruption, not an empty tail:
         // seg-0 zeroed, seg-1 a valid sealed trailing segment. The trailing reap leaves seg-1 alone
@@ -4185,17 +4223,48 @@ mod tests {
             "a bad header on a non-final segment must hard-fail"
         );
 
-        // (2) The bad trailing segment is the SOLE segment and its id is not 0: its predecessors
-        // were retention-reaped, so the offset/seq space does not start at 0 and an unreadable
-        // header gives no way to reconstruct it. Recreating it as a fresh seg-0 would reuse
-        // already-consumed offsets, so this stays a hard fail rather than a silent reset.
+        // (2) A SOLE bad-header segment has no predecessor to roll forward from, so it fails closed
+        // whether its id is 0 (a wholly-corrupt log is byte-indistinguishable from an empty one — the
+        // corruption-corpus `*_fails_closed` contract) or > 0 (predecessors retention-reaped, so the
+        // offset/seq space cannot be reconstructed from an unreadable header).
+        for sole_id in [0u64, 5] {
+            let fs = InMemoryFs::new();
+            let f = fs.create_new(&segment_file_name(sole_id)).unwrap();
+            f.write_all_at(&[0u8; SEGMENT_HEADER_LEN], 0).unwrap();
+            f.sync_data().unwrap();
+            assert!(
+                Log::open(fs, ManualClock::new(), small_config()).is_err(),
+                "a sole bad-header segment (id {sole_id}) must hard-fail"
+            );
+        }
+
+        // (3) The cardinal case (data-loss safety): a POPULATED trailing segment whose header rotted
+        // holds sole-copy acked records. It must NOT be reaped — recovery fails closed AND the file
+        // is preserved for forensics. seg-0 sealed, seg-1 active with a real record, then seg-1's
+        // magic is clobbered while the record frame after the header stays intact.
         let fs = InMemoryFs::new();
-        let f5 = fs.create_new(&segment_file_name(5)).unwrap();
-        f5.write_all_at(&[0u8; SEGMENT_HEADER_LEN], 0).unwrap();
-        f5.sync_data().unwrap();
+        let f0 = fs.create_new(&segment_file_name(0)).unwrap();
+        let mut w0 = SegmentWriter::create(f0, header_at(0, 0)).unwrap();
+        w0.append(&view(0, b"a")).unwrap();
+        w0.seal().unwrap();
+        let f1 = fs.create_new(&segment_file_name(1)).unwrap();
+        let mut w1 = SegmentWriter::create(f1, header_at(1, 1)).unwrap();
+        w1.append(&view(1, b"sole-copy-acked-record")).unwrap();
+        w1.sync().unwrap();
+        drop(w1);
+        // Clobber only seg-1's magic at offset 0; the record frame past the 64-byte header is intact,
+        // so the body is NOT all-zero and the reap must decline.
+        let f1 = fs.open(&segment_file_name(1)).unwrap();
+        f1.write_all_at(&[0u8; 8], 0).unwrap();
+        f1.sync_data().unwrap();
+        let probe = fs.clone();
         assert!(
             Log::open(fs, ManualClock::new(), small_config()).is_err(),
-            "a sole bad-header segment with id != 0 must hard-fail (unreconstructable offsets)"
+            "a populated trailing segment with a rotted header must hard-fail, never silently reap"
+        );
+        assert!(
+            probe.exists(&segment_file_name(1)).unwrap(),
+            "the populated segment must be preserved (not deleted) for forensics"
         );
     }
 
