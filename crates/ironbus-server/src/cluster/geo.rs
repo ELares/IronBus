@@ -98,7 +98,7 @@ use std::time::Duration;
 
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::{self, DecodeError};
-use ironbus_core::types::Offset;
+use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{
     decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType, MAX_FRAME_LEN,
 };
@@ -106,7 +106,7 @@ use ironbus_storage::checkpoint::SlotCheckpoint;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log};
 use ironbus_storage::read_plane::ReadPlane;
-use ironbus_storage::segment::StorageError;
+use ironbus_storage::segment::{OwnedRecord, StorageError};
 
 /// The hard maximum size, in bytes, of the CRC-framed record-byte payload one cross-cluster pull
 /// RESPONSE may carry. Bounds the origin's serve budget AND, on the puller, the UNTRUSTED remote bytes
@@ -540,6 +540,19 @@ pub const CURSOR_FILE: &str = "geo.cursor";
 /// the cap is a fail-closed [`GeoError::Cursor`] on commit (never a silent truncation).
 pub const GEO_CURSOR_PAYLOAD: usize = 4096;
 
+/// The reserved record KEY of a geo SOURCE's in-log per-origin high-watermark marker (#906). It is
+/// NUL-prefixed so it can never collide in practice with a client/origin routing key (those are
+/// non-NUL-leading UTF-8 keys); together with [`GEO_HWM_MARKER_MAGIC`] in the payload it is the two-part
+/// discriminator a recovery (or any future read path) uses to tell a HWM marker apart from an applied
+/// origin record. A marker lives ONLY in the local fan-in log (never on the wire) and ONLY for a
+/// multi-origin source — a mirror's byte-identical log takes no markers.
+const GEO_HWM_MARKER_KEY: &[u8] = b"\x00ironbus.geo.hwm";
+
+/// The leading payload magic of a geo per-origin HWM marker record (#906). The bytes AFTER the magic are
+/// an [`encode_cursor_payload`] snapshot of the `(origin_key -> applied_origin_offset)` map durable as of
+/// this record — the same codec the [`OriginCursorStore`] uses, reused verbatim.
+const GEO_HWM_MARKER_MAGIC: &[u8] = b"\x00IBGEOHWM\x00";
+
 /// A durable, per-origin RESUME CURSOR store (#623): the origin offset the mirror/source has APPLIED for
 /// each origin, persisted so a disconnect/restart resumes from there, never re-applying or skipping. It
 /// is the geo analogue of a consumer's committed checkpoint.
@@ -749,9 +762,19 @@ pub struct MirrorApplier<F: Filesystem, C: Clock> {
     /// flag must stay false for any applier whose log can take a non-origin write.
     ///
     /// A MULTI-origin source fans N origins into one interleaved log, so `next_offset` (the fan-in
-    /// total) is NOT any single origin's offset and cannot anchor it; that path keeps trusting the
-    /// per-origin cursor alone.
+    /// total) is NOT any single origin's offset and cannot anchor it; that path anchors instead on the
+    /// per-origin in-log HWM ([`origin_hwm`](MirrorApplier::origin_hwm)).
     single_origin: bool,
+    /// The per-origin durable high-watermark for a MULTI-origin source (#906): `origin_key ->` the
+    /// applied origin offset that is DURABLE in the local fan-in log, recovered from the tail HWM marker
+    /// and made durable by the SAME `log.sync()` as the records (unlike the separately-fsynced cursor).
+    /// It is the multi-origin analogue of the single-origin `next_offset` anchor, closing the same
+    /// sync-before-cursor-commit crash window: a re-pull below it is SKIPPED, never double-applied.
+    ///
+    /// `None` until lazily rebuilt on the first apply after open (see
+    /// [`ensure_origin_hwm`](MirrorApplier::ensure_origin_hwm)); always `None`/unused for a single-origin
+    /// applier, which uses `next_offset` and writes no markers.
+    origin_hwm: Option<BTreeMap<String, u64>>,
 }
 
 impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
@@ -765,6 +788,9 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             log,
             cursors,
             single_origin,
+            // Lazily rebuilt from the tail HWM marker on the first multi-origin apply (#906), so `new`
+            // stays infallible and open never fails on a transient read.
+            origin_hwm: None,
         }
     }
 
@@ -844,14 +870,18 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             });
         }
 
+        // Lazily rebuild a multi-origin source's per-origin in-log HWM from the tail marker, once, before
+        // it anchors the skip below (#906). A no-op for a single-origin applier or once already loaded.
+        self.ensure_origin_hwm()?;
+
         // The durable anchor for already-applied data. For a single-origin applier (a MIRROR, or a
         // SOURCE with one origin) the local log's `next_offset` EQUALS the count of origin records
         // already durable, so a frame whose origin offset is below it was already synced and must NOT be
         // re-appended (#799): this closes the crash window between the record sync below and the cursor
-        // commit, where a restart re-pulls from a cursor that lags the durable log. A multi-origin source
-        // has no such positional anchor (its `next_offset` is the fan-in total of interleaved origins),
-        // so it trusts the cursor alone (`durable_anchor == cursor`, never skipping); that residual
-        // window is tracked separately.
+        // commit, where a restart re-pulls from a cursor that lags the durable log. A MULTI-origin source
+        // has no such positional anchor (its `next_offset` is the fan-in total of interleaved origins), so
+        // it anchors on the per-origin in-log HWM instead (#906) — recovered from the tail marker and made
+        // durable by the SAME `log.sync()` as the records, closing the identical window for the fan-in case.
         let durable_anchor = if self.single_origin {
             // INVARIANT: for a single-origin applier the cursor never RUNS AHEAD of the durable log
             // head — the load-bearing sync-before-commit order guarantees the records are durable
@@ -868,7 +898,18 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             );
             self.log.next_offset().get().max(cursor)
         } else {
-            cursor
+            // #906: a multi-origin source anchors on its per-origin in-log HWM. `max(cursor, hwm)` so a
+            // re-pull after the sync-before-cursor-commit crash window (cursor stale, but the records +
+            // their HWM marker durable) SKIPS the already-applied frames instead of double-applying them.
+            // Absent a marker (a fresh or legacy log) the HWM is 0, so this degrades to `cursor` — the
+            // exact pre-#906 behavior, which self-heals once the first new batch writes a marker.
+            let hwm = self
+                .origin_hwm
+                .as_ref()
+                .and_then(|m| m.get(origin_key))
+                .copied()
+                .unwrap_or(0);
+            cursor.max(hwm)
         };
 
         // Walk the verbatim frame bytes, RE-VALIDATING one frame at a time. `codec::decode` is the
@@ -885,10 +926,11 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             let (view, frame_len) = match codec::decode(&bytes[at..]) {
                 Ok(decoded) => decoded,
                 Err(reason) => {
-                    // Fail closed: apply nothing from this frame onward. Sync the validated prefix, then
+                    // Fail closed: apply nothing from this frame onward. Sync the validated prefix (writing
+                    // the per-origin HWM marker first when this batch appended any records, #906), then
                     // advance the cursor past exactly the frames consumed (newly synced or already
                     // durable), so the next pull resumes cleanly.
-                    self.log.sync()?;
+                    self.sync_with_hwm_marker(origin_key, cursor + seen, applied > 0)?;
                     if seen > 0 {
                         self.cursors.commit(origin_key, cursor + seen)?;
                     }
@@ -919,7 +961,9 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             at += frame_len;
         }
         // Durably commit the applied batch to the local log (one fsync per pull — the group-commit shape).
-        self.log.sync()?;
+        // For a multi-origin source that appended records, the per-origin HWM marker is appended FIRST so
+        // it rides the SAME fsync as the data (#906) — the atomicity the separately-fsynced cursor lacks.
+        self.sync_with_hwm_marker(origin_key, cursor + seen, applied > 0)?;
 
         // `seen` is the number of frames the response actually carried (skipped + appended), which must
         // match its claimed count; `applied` (only the newly-appended) may be smaller after a skip.
@@ -944,6 +988,87 @@ impl<F: Filesystem, C: Clock> MirrorApplier<F, C> {
             cursor: new_cursor,
             origin_high_watermark: resp.origin_high_watermark,
         })
+    }
+
+    /// Lazily rebuild a MULTI-origin source's per-origin durable HWM (#906) from the local log's tail
+    /// marker, once, on the first apply after open. A no-op for a single-origin applier (it anchors on
+    /// `next_offset`) or once `origin_hwm` is already loaded. Kept out of `new` so construction stays
+    /// infallible and an open never trips on a transient read.
+    fn ensure_origin_hwm(&mut self) -> Result<(), GeoError> {
+        if self.single_origin || self.origin_hwm.is_some() {
+            return Ok(());
+        }
+        self.origin_hwm = Some(self.read_durable_hwm()?);
+        Ok(())
+    }
+
+    /// Read the per-origin durable HWM snapshot from the local log's HIGHEST-offset record (#906). The
+    /// tail of a source log is always the latest HWM marker — every batch that appended records ends with
+    /// one and the highest offset is never reaped — so this is an O(1) tail read. A log with no records,
+    /// or whose tail is not a marker (a fresh log, or a legacy pre-#906 log), recovers as an EMPTY map:
+    /// the safe degrade to cursor-only (`durable_anchor == cursor`), identical to pre-#906 behavior, which
+    /// self-heals after the first new batch writes a marker. A marker-LOOKING but undecodable tail (a
+    /// pathological key+magic collision) likewise degrades to empty rather than failing the open.
+    fn read_durable_hwm(&self) -> Result<BTreeMap<String, u64>, GeoError> {
+        let next = self.log.next_offset().get();
+        if next == 0 {
+            return Ok(BTreeMap::new());
+        }
+        let tail = self.log.read_from(Offset::new(next - 1), 1)?;
+        match tail.first() {
+            Some(rec) if Self::is_hwm_marker(rec) => {
+                let body = &rec.payload.as_ref()[GEO_HWM_MARKER_MAGIC.len()..];
+                Ok(decode_cursor_payload(body).unwrap_or_default())
+            }
+            _ => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Durably sync the just-applied batch, FIRST appending the per-origin HWM marker (#906) when this
+    /// batch actually appended records to a MULTI-origin source log — so the marker (the per-origin
+    /// applied-offset snapshot, `hwm` for `origin_key`) is covered by the SAME `log.sync()` fsync as the
+    /// records it describes. That single-fsync atomicity is exactly what the separately-fsynced cursor
+    /// lacks, and is what closes the double-apply window. For a single-origin applier, or a batch that
+    /// appended nothing (a pure-skip / idle pull), NO marker is written and this is just `log.sync()` —
+    /// so the mirror's byte-identical log and the steady-state idle path are unchanged.
+    fn sync_with_hwm_marker(
+        &mut self,
+        origin_key: &str,
+        hwm: u64,
+        appended: bool,
+    ) -> Result<(), GeoError> {
+        if appended && !self.single_origin {
+            // Update the in-memory per-origin HWM (monotonic), then encode the FULL snapshot as the marker
+            // payload. Scoped so the `origin_hwm` borrow ends before `self.log` is touched below.
+            let payload = {
+                let map = self.origin_hwm.get_or_insert_with(BTreeMap::new);
+                let slot = map.entry(origin_key.to_string()).or_insert(0);
+                *slot = (*slot).max(hwm);
+                let snapshot = encode_cursor_payload(map);
+                let mut payload = Vec::with_capacity(GEO_HWM_MARKER_MAGIC.len() + snapshot.len());
+                payload.extend_from_slice(GEO_HWM_MARKER_MAGIC);
+                payload.extend_from_slice(&snapshot);
+                payload
+            };
+            let timestamp_ms = self.log.now_unix_millis();
+            self.log.append(&Append {
+                timestamp_ms,
+                flags: RecordFlags::EMPTY,
+                key: GEO_HWM_MARKER_KEY,
+                headers: b"",
+                payload: &payload,
+            })?;
+        }
+        self.log.sync()?;
+        Ok(())
+    }
+
+    /// Whether a local-log record is a geo per-origin HWM marker (#906): its key is the reserved sentinel
+    /// AND its payload leads with the marker magic. The two-part discriminator keeps an ordinary applied
+    /// origin record (which never carries this NUL-prefixed key) from being mistaken for a marker.
+    fn is_hwm_marker(rec: &OwnedRecord) -> bool {
+        rec.key.as_ref() == GEO_HWM_MARKER_KEY
+            && rec.payload.as_ref().starts_with(GEO_HWM_MARKER_MAGIC)
     }
 }
 
@@ -1811,7 +1936,235 @@ mod tests {
         // Both origins' records are all present (fan-in), and their counts equal each sealed prefix.
         assert_eq!(a_seen.len() as u64, served_a);
         assert_eq!(b_seen.len() as u64, served_b);
-        assert_eq!(a_seen.len() + b_seen.len(), local.len());
+        // The fan-in log holds exactly the A records, the B records, and the per-origin HWM markers
+        // (#906) — nothing else, no duplicates: every record is accounted for.
+        let markers = local
+            .iter()
+            .filter(|r| r.payload.as_ref().starts_with(GEO_HWM_MARKER_MAGIC))
+            .count();
+        assert_eq!(a_seen.len() + b_seen.len() + markers, local.len());
+    }
+
+    #[test]
+    fn a_multi_origin_source_re_pull_after_the_crash_window_skips_not_double_applies() {
+        // #906: a multi-origin SOURCE syncs the applied records (with their per-origin HWM marker) in ONE
+        // fsync, then commits the per-origin cursor in a SEPARATE fsync. A crash between the two leaves the
+        // records + marker durable but the cursor STALE. THE BUG: pre-fix the multi-origin path had no
+        // positional anchor (its `next_offset` is the interleaved fan-in total), so a re-pull from the
+        // stale cursor RE-APPLIED the already-durable batch — a duplicated block in the fan-in stream. THE
+        // FIX: the per-origin in-log HWM, recovered from the tail marker (durable with the SAME fsync as
+        // the records), anchors the skip so the re-pull is an enforced no-op. We reproduce the post-crash
+        // DURABLE state (records + marker ahead, cursor lagging) exactly as the single-origin #799 test does.
+        let mut origin_a =
+            Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        let mut origin_b =
+            Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            origin_a
+                .append(&rec(format!("A-{i:02}").as_bytes()))
+                .unwrap();
+            origin_b
+                .append(&rec(format!("B-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        origin_a.sync().unwrap();
+        origin_b.sync().unwrap();
+        let served_a = plane_served_end(&origin_a);
+        let served_b = plane_served_end(&origin_b);
+        assert!(served_a >= 4 && served_b >= 4);
+
+        let log_fs = InMemoryFs::new();
+        let (ka, kb) = ("a/", "b/");
+        // Apply BOTH origins to convergence via the REAL apply path (markers written, riding the same
+        // fsync as their records). This is the durable LOG state at the instant of the crash.
+        {
+            let mut app = source_applier(log_fs.clone());
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                assert!(guard < 1000, "initial fan-in did not converge");
+                let pa = app
+                    .apply_pull_response(ka, &origin_pull(&origin_a, app.cursor(ka)))
+                    .unwrap();
+                let pb = app
+                    .apply_pull_response(kb, &origin_pull(&origin_b, app.cursor(kb)))
+                    .unwrap();
+                if pa.applied == 0 && pb.applied == 0 {
+                    break;
+                }
+            }
+            assert_eq!(app.cursor(ka), served_a);
+            assert_eq!(app.cursor(kb), served_b);
+        }
+
+        // CRASH WINDOW: the records + their HWM marker are durable (the log fsync landed) but A's cursor
+        // commit was LOST (the second, separate fsync did not). Reproduce that exact durable state the way
+        // the single-origin #799 test does — the log and the cursor on INDEPENDENT disks, so the cursor
+        // can sit BELOW the log head without the monotonic-commit guard refusing it: reopen the fan-in log
+        // (with its tail marker), and pair it with a FRESH cursor store committed FORWARD from 0 to the
+        // stale value A held before the lost commit (B's commit landed, so B is at its applied offset).
+        let stale_a = served_a - 3;
+        let log = Log::open(log_fs.clone(), ManualClock::new(), small_config()).unwrap();
+        let mut cursors = OriginCursorStore::open(&InMemoryFs::new()).unwrap();
+        cursors.commit(ka, stale_a).unwrap();
+        cursors.commit(kb, served_b).unwrap();
+        let mut app = MirrorApplier::new(log, cursors, false);
+        assert_eq!(
+            app.cursor(ka),
+            stale_a,
+            "A's cursor lags its durable log (the crash window)"
+        );
+        assert_eq!(app.cursor(kb), served_b, "B's cursor is intact");
+
+        // Re-pull A from the stale cursor to convergence: every re-served frame is already durable in the
+        // fan-in log, so the applier SKIPS them all and NEVER re-appends. Pre-#906 each was re-appended.
+        let mut guard = 0;
+        while app.cursor(ka) < served_a {
+            guard += 1;
+            assert!(guard < 1000, "the re-pull loop did not converge");
+            let out = app
+                .apply_pull_response(ka, &origin_pull(&origin_a, app.cursor(ka)))
+                .unwrap();
+            assert_eq!(
+                out.applied, 0,
+                "a re-pulled, already-applied frame must never be re-appended (#906)"
+            );
+        }
+        assert_eq!(
+            app.cursor(ka),
+            served_a,
+            "A's cursor re-anchored to its durable applied offset"
+        );
+
+        // No duplicated block: the fan-in log holds EXACTLY A's and B's served prefixes (plus markers), in
+        // per-origin order. If A had been double-applied, `a_seen.len()` would exceed `served_a`.
+        let local = app.log().read_from(Offset::new(0), 10_000).unwrap();
+        let a_seen: Vec<&[u8]> = local
+            .iter()
+            .map(|r| r.payload.as_ref())
+            .filter(|p| p.starts_with(b"A-"))
+            .collect();
+        let b_seen: Vec<&[u8]> = local
+            .iter()
+            .map(|r| r.payload.as_ref())
+            .filter(|p| p.starts_with(b"B-"))
+            .collect();
+        assert_eq!(
+            a_seen.len() as u64,
+            served_a,
+            "A was NOT double-applied — the fan-in log did not grow"
+        );
+        assert_eq!(b_seen.len() as u64, served_b, "B is untouched");
+        for (i, p) in a_seen.iter().enumerate() {
+            assert_eq!(*p, format!("A-{i:02}").as_bytes());
+        }
+        for (i, p) in b_seen.iter().enumerate() {
+            assert_eq!(*p, format!("B-{i:02}").as_bytes());
+        }
+    }
+
+    #[test]
+    fn a_multi_origin_source_recovers_the_per_origin_hwm_from_the_tail_marker() {
+        // #906: the per-origin HWM marker holds the FULL `(origin -> applied offset)` snapshot, so on
+        // reopen the durable HWM for EVERY origin is rebuilt O(1) from the single tail record — the
+        // positional anchor the multi-origin path previously lacked.
+        let mut origin_a =
+            Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        let mut origin_b =
+            Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            origin_a
+                .append(&rec(format!("A-{i:02}").as_bytes()))
+                .unwrap();
+            origin_b
+                .append(&rec(format!("B-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        origin_a.sync().unwrap();
+        origin_b.sync().unwrap();
+        let served_a = plane_served_end(&origin_a);
+        let served_b = plane_served_end(&origin_b);
+        assert!(served_a >= 4 && served_b >= 4);
+
+        let fs = InMemoryFs::new();
+        let (ka, kb) = ("a/", "b/");
+        {
+            let mut app = source_applier(fs.clone());
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                assert!(guard < 1000, "fan-in did not converge");
+                let pa = app
+                    .apply_pull_response(ka, &origin_pull(&origin_a, app.cursor(ka)))
+                    .unwrap();
+                let pb = app
+                    .apply_pull_response(kb, &origin_pull(&origin_b, app.cursor(kb)))
+                    .unwrap();
+                if pa.applied == 0 && pb.applied == 0 {
+                    break;
+                }
+            }
+        }
+
+        // Reopen and read the durable HWM straight off the tail marker: BOTH origins are reconstructed.
+        let app = source_applier(fs.clone());
+        let hwm = app.read_durable_hwm().unwrap();
+        assert_eq!(
+            hwm.get(ka).copied(),
+            Some(served_a),
+            "A's durable HWM recovered from the tail marker"
+        );
+        assert_eq!(
+            hwm.get(kb).copied(),
+            Some(served_b),
+            "B's durable HWM recovered from the tail marker"
+        );
+    }
+
+    #[test]
+    fn a_mirror_writes_no_hwm_markers() {
+        // #906: the HWM marker is a MULTI-origin-source mechanism ONLY. A single-origin MIRROR anchors on
+        // `next_offset` and keeps its byte-IDENTICAL log — it must NEVER write a marker (a marker would
+        // perturb the mirror's positional byte-identity with its origin).
+        let mut origin = Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            origin.append(&rec(format!("m-{i:02}").as_bytes())).unwrap();
+        }
+        origin.sync().unwrap();
+        let served = plane_served_end(&origin);
+        assert!(served >= 4);
+
+        let key = "origin/";
+        let mut app = applier(InMemoryFs::new()); // single_origin = true
+        let mut guard = 0;
+        while app.cursor(key) < served {
+            guard += 1;
+            assert!(guard < 1000, "mirror did not converge");
+            if app
+                .apply_pull_response(key, &origin_pull(&origin, app.cursor(key)))
+                .unwrap()
+                .applied
+                == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(app.cursor(key), served);
+
+        // Not one record in the mirror log is a HWM marker: the log is byte-for-byte the origin's prefix.
+        let local = app.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(
+            local.len() as u64,
+            served,
+            "the mirror log holds exactly the origin's served prefix — no extra marker records"
+        );
+        assert!(
+            local.iter().all(|r| {
+                !r.payload.as_ref().starts_with(GEO_HWM_MARKER_MAGIC)
+                    && r.key.as_ref() != GEO_HWM_MARKER_KEY
+            }),
+            "a single-origin mirror writes NO HWM markers (#906) — byte-identity preserved"
+        );
     }
 
     #[test]
@@ -2287,7 +2640,12 @@ mod live_geo_tests {
         for (i, p) in b_seen.iter().enumerate() {
             assert_eq!(*p, format!("B-{i:03}").as_bytes());
         }
-        assert_eq!(a_seen.len() + b_seen.len(), local.len());
+        // Account for the per-origin HWM markers (#906): every fan-in record is an A, a B, or a marker.
+        let markers = local
+            .iter()
+            .filter(|r| r.payload.as_ref().starts_with(GEO_HWM_MARKER_MAGIC))
+            .count();
+        assert_eq!(a_seen.len() + b_seen.len() + markers, local.len());
 
         sd_a.store(true, Ordering::Release);
         sd_b.store(true, Ordering::Release);
