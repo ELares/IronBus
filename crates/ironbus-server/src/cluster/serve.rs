@@ -119,6 +119,7 @@ use super::dataplane::{
     DataPlaneError, DataPlaneFrame, PlacementRole, ProduceAckSeam,
 };
 use super::isr::IsrConfig;
+use super::replication::{FetchRecordsBody, FetchResponseBody};
 use super::rereplication::{
     FetchBudget, ReReplicationThrottle, FULL_CATCHUP_BYTES, FULL_CATCHUP_RECORDS,
 };
@@ -518,6 +519,14 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
         frame: DataPlaneFrame,
     ) -> Result<DataPlaneAction, DataPlaneError> {
         self.seam.controller_mut().handle_frame(partition, frame)
+    }
+
+    /// The leader's `Arc`-shared read plane for `partition`, or `None` if this node is not its leader
+    /// (#809). The reader thread clones this under the server lock then serves `FetchRecords` OFF the
+    /// lock — see [`DataPlaneController::leader_read_plane`].
+    #[must_use]
+    pub fn leader_read_plane(&self, partition: u64) -> Option<Arc<ReadPlane<F>>> {
+        self.seam.controller().leader_read_plane(partition)
     }
 
     /// Record an inbound follower [`AckReplicatedBody`](super::isr::AckReplicatedBody) report for
@@ -1168,6 +1177,48 @@ fn run_dataplane_listener<F, C>(
 ///
 /// Every bound in [`DataPlaneLink::recv`] is applied: a hostile / oversized / corrupt frame is a typed
 /// error that drops the link, never a panic or an over-allocation (the fail-closed bounded codec).
+/// The outcome of [`serve_fetch_off_lock`]: what the reader thread does with a served `FetchRecords`.
+enum OffLockServe {
+    /// The server `Mutex` was poisoned (a holder panicked) — the reader thread tears down.
+    Poisoned,
+    /// Serve produced a response frame to send to the follower.
+    Send(FetchResponseBody),
+    /// Nothing to send: this node is not the partition's leader, or the serve faulted — drop the frame
+    /// (exactly what the old through-`handle_frame` path did with a `WrongRole`/`UnknownPartition` error).
+    Drop,
+}
+
+/// Serve a follower's `FetchRecords` for `partition` OFF the global server lock (#809): take the lock
+/// ONLY to clone the leader's `Arc<ReadPlane>` (a refcount bump), DROP it, then run the seek/scan +
+/// `Bytes`-slice serve with NO lock held. `ReadPlaneLeader::serve_fetch` is a pure read over the
+/// wait-free read plane (its own `ArcSwap`/Acquire ordering governs freshness, never this `Mutex`), so K
+/// followers' fetch-serves to different partitions run in parallel instead of serializing on the one lock
+/// across each `read_range_raw`. Factored out (rather than inlined in the reader loop) so a test can drive
+/// the EXACT lock/serve sequence and prove the lock is released during the serve.
+fn serve_fetch_off_lock<F, C>(
+    server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+    partition: u64,
+    req: &FetchRecordsBody,
+) -> OffLockServe
+where
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    // The ONLY work under the lock: clone the partition's read-plane `Arc`. The lock is dropped at the
+    // end of this block, BEFORE the serve below.
+    let plane = match server.lock() {
+        Ok(srv) => srv.leader_read_plane(partition),
+        Err(_) => return OffLockServe::Poisoned,
+    };
+    let Some(plane) = plane else {
+        return OffLockServe::Drop; // not this node's leader role for the partition
+    };
+    match crate::cluster::replication::ReadPlaneLeader::new(&plane).serve_fetch(req) {
+        Ok(response) => OffLockServe::Send(response),
+        Err(_) => OffLockServe::Drop, // a serve fault: drop, matching the old `.ok()`-swallow behavior
+    }
+}
+
 fn run_dataplane_reader<F, C>(
     mut link: DataPlaneLink<TcpStream>,
     server: &Arc<Mutex<DataPlaneServer<F, C>>>,
@@ -1197,6 +1248,29 @@ fn run_dataplane_reader<F, C>(
                         };
                         let _ = srv.on_follower_report_bytes(partition, &report);
                     }
+                }
+            }
+            // #809: serve a `FetchRecords` OFF the global server lock. Take the lock ONLY to clone the
+            // partition's `Arc<ReadPlane>` (a refcount bump), drop it, then run the seek/scan +
+            // `Bytes`-slice serve with NO lock held — so K followers' fetch-serves to DIFFERENT partitions
+            // run in parallel instead of serializing on the one global lock across each `read_range_raw`.
+            // `serve_fetch` is a pure read (`&self`) over the wait-free read plane, whose freshness comes
+            // from its own `ArcSwap`/Acquire ordering (never from this `Mutex`), so off-lock serve sees an
+            // identical-or-fresher snapshot. A non-leader (`None`) drops the frame, exactly as the old
+            // through-`handle_frame` path did (it returned a `WrongRole`/`UnknownPartition` error the
+            // generic arm swallowed with `.ok()`).
+            Ok(Some((partition, DataPlaneFrame::FetchRequest(req)))) => {
+                match serve_fetch_off_lock(server, partition, &req) {
+                    OffLockServe::Poisoned => return, // the runtime is tearing down
+                    OffLockServe::Send(response) => {
+                        if link
+                            .send(partition, &DataPlaneFrame::FetchResponse(response))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    OffLockServe::Drop => {} // not this node's leader role, or a serve fault: drop it
                 }
             }
             Ok(Some((partition, frame))) => {
@@ -1502,6 +1576,7 @@ mod tests {
     use ironbus_core::types::RecordFlags;
     use ironbus_proto::frame::encode_frame as proto_encode_frame;
     use ironbus_proto::message::{decode_pub_ack, encode_pub_ack, PubAckBody};
+    use ironbus_storage::fault::{FaultControl, FaultFs};
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::io::RandomAccessFile;
     use ironbus_storage::log::{Append, Log, LogConfig};
@@ -1618,6 +1693,73 @@ mod tests {
     /// role serves fetches from (NO `&Log` borrow). This is what makes the `DataPlaneServer` `Send`.
     fn leader_plane(log: &Log<InMemoryFs, ManualClock>) -> Arc<ReadPlane<InMemoryFs>> {
         Arc::new(log.read_plane().expect("read plane builds"))
+    }
+
+    /// A leaked leader log over a FAULT fs (so reads pass through the read gate), its `Arc`-shared read
+    /// plane, and the fault control — used to PARK a fetch-serve mid-read and prove the server lock is free
+    /// during the serve (#809).
+    fn fault_leader_plane(n: u32) -> (Arc<ReadPlane<FaultFs<InMemoryFs>>>, FaultControl) {
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).expect("log opens");
+        for i in 0..n {
+            log.append(&rec(format!("rep-{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let plane = Arc::new(log.read_plane().expect("read plane builds"));
+        Box::leak(Box::new(log));
+        (plane, control)
+    }
+
+    #[test]
+    fn a_fetch_serve_does_not_hold_the_server_lock_across_the_read() {
+        // #809: the reader thread serves a `FetchRecords` OFF the global server lock. We park a fetch-serve
+        // mid-read (the fault read gate) and prove the server `Mutex` is FREE during the serve — so a
+        // second partition's fetch-serve would NOT wait behind it. Pre-#809 the serve ran UNDER the lock
+        // (through `handle_frame`), so the lock would be HELD across the parked read and this `try_lock`
+        // would be `WouldBlock`.
+        const P: u64 = 0;
+        let (plane, control) = fault_leader_plane(25);
+        let mut controller: DataPlaneController<FaultFs<InMemoryFs>, ManualClock> =
+            DataPlaneController::new(1);
+        controller.start_leader(P, plane, EpochCache::new(), &[2, 3], quorum3());
+        let server = Arc::new(Mutex::new(DataPlaneServer::new(
+            1,
+            ProduceAckSeam::new(controller),
+        )));
+
+        // Close the read gate so the next positioned read parks; spawn the off-lock fetch-serve.
+        control.close_read_gate();
+        let server_t = Arc::clone(&server);
+        let serve = std::thread::spawn(move || {
+            serve_fetch_off_lock(
+                &server_t,
+                P,
+                &FetchRecordsBody {
+                    from_offset: 0,
+                    max_records: 10,
+                    max_bytes: 0,
+                },
+            )
+        });
+
+        // Wait until the serve is parked mid-read (deterministic, condvar — no wall-clock sleep).
+        control.wait_for_read_gate_entered(1);
+
+        // THE DISCRIMINATING ASSERTION: the server `Mutex` is FREE while the serve is parked in the read,
+        // because the serve clones the read plane under the lock and then serves OFF the lock. Pre-#809
+        // (serve under the lock) this would be `WouldBlock`. The guard drops immediately.
+        assert!(
+            server.try_lock().is_ok(),
+            "the server Mutex must NOT be held during the fetch-serve read (#809 off-lock serve)"
+        );
+
+        // Release the parked read; the off-lock serve completes and produces a response.
+        control.open_read_gate();
+        let outcome = serve.join().expect("serve thread joins");
+        assert!(
+            matches!(outcome, OffLockServe::Send(_)),
+            "the off-lock serve produced a FetchResponse"
+        );
     }
 
     /// The first offset the leader's read plane does NOT serve off-actor (its sealed-served end): chain

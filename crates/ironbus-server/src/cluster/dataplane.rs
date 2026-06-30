@@ -535,6 +535,20 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         )
     }
 
+    /// The leader's `Arc`-shared read plane for `partition`, or `None` if this node is not its leader
+    /// (#809). The reader thread clones this under the server lock and then serves the `FetchRecords`
+    /// OFF the lock: `ReadPlaneLeader::serve_fetch` is a pure read (`&self`) over the wait-free
+    /// [`ReadPlane`] (its own `ArcSwap`/Acquire ordering, independent of the server `Mutex`), so K
+    /// followers' fetch-serves to different partitions run in PARALLEL instead of serializing on the one
+    /// global lock across each `read_range_raw`.
+    #[must_use]
+    pub fn leader_read_plane(&self, partition: u64) -> Option<Arc<ReadPlane<F>>> {
+        match self.roles.get(&partition) {
+            Some(PartitionRole::Leader { plane, .. }) => Some(Arc::clone(plane)),
+            _ => None,
+        }
+    }
+
     /// Register this node as the LEADER of `partition`, serving fetches from the `Arc`-shared, off-actor
     /// read `plane` (#654, #715) — NOT a `&Log` borrow, so the leader never writes (or borrows) its log
     /// and the controller stays `Send`. Gates produces through an [`IsrTracker`] / [`QuorumAckGate`]
