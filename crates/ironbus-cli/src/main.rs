@@ -887,8 +887,10 @@ USAGE:
                   [--min-samples <n>] [--json]            (opt-in: build --features zstd)
     ironbus dict install --data-dir <dir> --dict <path> [--json]   (opt-in: --features zstd)
     ironbus dict ls --data-dir <dir> [--json]                      (opt-in: --features zstd)
-    ironbus context create <name> [--addr <host:port>] [--token <t>] [--tls-ca <path>]
-                  [--tls-server-name <name>] [--data-dir <dir>] [--use]
+    ironbus context create <name> [--addr <host:port>] [--token-file <path> | --token <t>]
+                  [--tls-ca <path>] [--tls-server-name <name>] [--data-dir <dir>] [--use]
+                  (token is a secret: prefer --token-file <path>, or --token-file - for stdin;
+                   --token <t> is visible in the process table)
     ironbus context (use <name> | list | show [<name>] | rm <name> | current)
     ironbus completion <bash|zsh|fish>
     ironbus cheat
