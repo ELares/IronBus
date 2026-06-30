@@ -109,7 +109,7 @@
 //! * **Snapshot / compaction** (#660), **multi-partition fan-out optimization**, and the
 //!   **cross-cluster geo** plane (C7) are separate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use ironbus_core::clock::Clock;
@@ -842,6 +842,24 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
             }),
             None => Err(DataPlaneError::UnknownPartition { partition }),
         }
+    }
+
+    /// Remove `tokens` from EVERY led partition's quorum-ack gate (#869, #871): a disconnected
+    /// producer's still-parked acks are dropped from the gate `pending` so their backlog-cap slots are
+    /// freed and they never release. Returns the total removed across all partitions. A token is parked
+    /// in exactly one gate, so the cross-partition sweep removes each at most once; an empty `tokens` is
+    /// a cheap no-op (the common disconnect, which parked nothing).
+    pub fn purge_parked_tokens(&mut self, tokens: &BTreeSet<AckToken>) -> usize {
+        if tokens.is_empty() {
+            return 0;
+        }
+        let mut removed = 0;
+        for role in self.roles.values_mut() {
+            if let PartitionRole::Leader { gate, .. } = role {
+                removed += gate.purge_where(|t| tokens.contains(t));
+            }
+        }
+        removed
     }
 
     /// Record a follower's [`AckReplicatedBody`] report for `partition` and RELEASE any produce acks
@@ -1685,6 +1703,32 @@ impl<F: Filesystem, C: Clock> ProduceAckSeam<F, C> {
             .iter()
             .filter_map(|t| self.parked.remove(t))
             .collect()
+    }
+
+    /// Purge every still-PARKED ack owned by `owner` from BOTH the seam's reply side-table AND the
+    /// controller's quorum-ack gates (#869, #871). Called when a producer connection disconnects: its
+    /// withheld `C2-fsync` acks can never be delivered (no connection is left to write them), so leaving
+    /// them parked leaks the reply bytes + the gate's backlog-cap slots an unsatisfiable quorum (a
+    /// follower partitioned below `min_isr`) may never drain. Returns the number of parked acks dropped.
+    ///
+    /// Because the entries are removed from the seam here, a LATER follower report can never release
+    /// them — so it can never re-deposit them into the dead owner's outbox either (#871's second leak).
+    pub fn purge_owner(&mut self, owner: u64) -> usize {
+        let dead: BTreeSet<AckToken> = self
+            .parked
+            .iter()
+            .filter(|(_, (o, _))| *o == owner)
+            .map(|(t, _)| *t)
+            .collect();
+        if dead.is_empty() {
+            return 0;
+        }
+        for t in &dead {
+            self.parked.remove(t);
+        }
+        // Free the gate-cap slots too, so the cap is not permanently consumed by dead-owner entries.
+        self.controller.purge_parked_tokens(&dead);
+        dead.len()
     }
 }
 
@@ -2618,6 +2662,107 @@ mod tests {
         );
         // Silence the unused-mut on `followers` if the loop above ever changes.
         let _ = &mut followers;
+    }
+
+    #[test]
+    fn purge_owner_drops_a_disconnected_producers_parked_acks_and_frees_gate_slots() {
+        // #869/#871: a producer that parks C2-fsync acks below min_isr (no quorum, never released) then
+        // DISCONNECTS must have its parked acks purged from BOTH the seam side-table AND the gate's
+        // backlog, so its reply bytes and (#864) cap slots are not leaked until the partition heals. The
+        // purge is owner-selective: a still-connected producer's acks survive.
+        const P: u64 = 0;
+        const M: u64 = 7; // the disconnecting producer
+        const N: u64 = 9; // a different, still-connected producer
+        let (mut seam, _followers, served_end) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 10);
+        assert!(
+            served_end >= 4,
+            "need at least 4 served offsets for this fixture"
+        );
+
+        // Park (below min_isr → all stay parked) in monotone offset order: M owns 0,1,2; N owns 3.
+        for (owner, off) in [(M, 0u64), (M, 1), (M, 2), (N, 3)] {
+            let d = seam
+                .on_local_fsynced_ack_owned(
+                    owner,
+                    ClusterAckLevel::C2Fsync,
+                    P,
+                    off,
+                    wire_pub_ack(off),
+                )
+                .unwrap();
+            assert_eq!(d, AckDisposition::Parked, "owner {owner} offset {off}");
+        }
+        assert_eq!(seam.parked_len(), 4);
+        assert_eq!(seam.controller().pending_ack_count(P), 4);
+
+        // M disconnects: purge drops its 3 parked acks from the seam AND frees its 3 gate-cap slots.
+        assert_eq!(seam.purge_owner(M), 3, "M's three parked acks were dropped");
+        assert_eq!(seam.parked_len(), 1, "only N's ack remains in the seam");
+        assert_eq!(
+            seam.controller().pending_ack_count(P),
+            1,
+            "M's gate-cap slots were freed too (not just the seam side-table)"
+        );
+
+        // Purging an owner that parked nothing is a cheap no-op.
+        assert_eq!(seam.purge_owner(12345), 0);
+        assert_eq!(seam.parked_len(), 1);
+    }
+
+    #[test]
+    fn a_quorum_report_after_purge_releases_nothing_for_a_dead_owner() {
+        // #871 second leak: once a disconnected owner's acks are purged, a LATER follower report that
+        // reaches quorum must release NOTHING for it — so its bytes can never be re-deposited into a
+        // dead-owner outbox nobody drains.
+        const P: u64 = 0;
+        const M: u64 = 7;
+        let (mut seam, mut followers, served_end) = led_cluster(P, 1, &[1, 2, 3], quorum3(), 25);
+        let offset = served_end - 1;
+        let d = seam
+            .on_local_fsynced_ack_owned(
+                M,
+                ClusterAckLevel::C2Fsync,
+                P,
+                offset,
+                wire_pub_ack(offset),
+            )
+            .unwrap();
+        assert_eq!(d, AckDisposition::Parked);
+        assert_eq!(seam.parked_len(), 1);
+
+        // M disconnects BEFORE quorum catches up.
+        assert_eq!(seam.purge_owner(M), 1);
+        assert_eq!(seam.parked_len(), 0);
+
+        // Drive the 2nd replica to quorum-fsync past `offset`. With M's ack purged, the report releases
+        // nothing — so nothing is ever re-deposited for the dead owner.
+        let mut released: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..40 {
+            if seam.controller().is_leader(P) {
+                let req = followers[0].make_fetch_request(P, 8, 4096).unwrap();
+                let action = seam
+                    .controller_mut()
+                    .handle_frame(P, DataPlaneFrame::FetchRequest(req))
+                    .unwrap();
+                let resp = match action {
+                    DataPlaneAction::SendFetchResponse { response, .. } => response,
+                    other => panic!("expected a fetch response, got {other:?}"),
+                };
+                followers[0]
+                    .handle_frame(P, DataPlaneFrame::FetchResponse(resp))
+                    .unwrap();
+                let report = followers[0].follower_report(P).unwrap();
+                released.extend(seam.on_follower_report(P, &report).unwrap());
+            }
+            if followers[0].follower_high_watermark(P).unwrap() >= served_end {
+                break;
+            }
+        }
+        assert!(
+            released.is_empty(),
+            "a purged owner's ack is never released, so it is never re-deposited"
+        );
+        assert_eq!(seam.parked_len(), 0);
     }
 
     #[test]

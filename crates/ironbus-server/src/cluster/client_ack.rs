@@ -431,11 +431,27 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
         outbox.remove(&member.get()).unwrap_or_default()
     }
 
-    /// Drop any released-but-undrained acks for a producer connection that DISCONNECTED (#719): nobody
-    /// is left to flush them, so the outbox entry is removed rather than leaked. Called from the
-    /// connection-cleanup path, like the #497 `drop_l2_confirms`. (A still-PARKED ack — withheld inside
-    /// the seam, not yet released — is left to the seam's bounded gate; this only clears the outbox.)
+    /// Drop every still-withheld ack for a producer connection that DISCONNECTED (#719, #869, #871):
+    /// nobody is left to flush them, so leaving them parked leaks reply bytes + gate-cap slots that an
+    /// unsatisfiable quorum (a follower partitioned below `min_isr`) may never drain. Called from the
+    /// connection-cleanup path, like the #497 `drop_l2_confirms`.
+    ///
+    /// Purges in TWO places: the seam's still-PARKED acks + their quorum-ack-gate `pending` slots (via
+    /// [`ProduceAckSeam::purge_owner`], so a later follower report can never release — or re-deposit —
+    /// them), then the per-connection released-but-undrained outbox. The seam purge is done FIRST and
+    /// the outbox purge under the SAME contiguous critical section ordering the runtime uses (server
+    /// lock, then outbox), so a concurrent `on_follower_report` cannot release the owner's acks into the
+    /// outbox between the two clears. A poisoned server lock recovers in place (the cleanup must still
+    /// run) rather than skipping the purge.
     pub fn drop_connection(&self, member: MemberId) {
+        // Hold the server lock THEN the outbox lock (the same order the runtime's `on_follower_report`
+        // acquires them, so no deadlock) across BOTH purges, so a concurrent report cannot release this
+        // owner's acks into the outbox between the two clears.
+        let mut srv = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        srv.seam_mut().purge_owner(member.get());
         let mut outbox = self
             .outbox
             .lock()
@@ -705,6 +721,51 @@ mod tests {
         );
         // A second drain is empty (the outbox entry was removed).
         assert!(gate.drain_released(member).is_empty());
+    }
+
+    #[test]
+    fn drop_connection_purges_a_disconnected_producers_still_parked_ack() {
+        // #871: a producer that parks a C2-fsync ack below min_isr then DISCONNECTS must have its
+        // STILL-PARKED ack purged from the seam AND the quorum-gate by `drop_connection` — not leaked
+        // until the partition heals. (Before this fix it cleared only the released-but-undrained outbox,
+        // leaving the parked ack — and its gate-cap slot — to leak.)
+        let gate = leader_gate(8); // leader fsync'd through 8; no follower reported → below min_isr
+        let member = MemberId::new(7);
+        let offset = 3;
+        let disposition = gate.on_local_fsynced_ack(member, P, offset, wire_ack(offset));
+        assert_eq!(disposition, AckDisposition::Parked);
+        assert_eq!(
+            gate.server.lock().unwrap().seam().parked_len(),
+            1,
+            "the wire PubAck is withheld in the seam"
+        );
+        assert_eq!(
+            gate.server
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .pending_ack_count(P),
+            1
+        );
+
+        // The producer disconnects: drop_connection purges its parked ack from BOTH the seam and gate.
+        gate.drop_connection(member);
+        assert_eq!(
+            gate.server.lock().unwrap().seam().parked_len(),
+            0,
+            "the disconnected producer's parked ack was purged (not leaked)"
+        );
+        assert_eq!(
+            gate.server
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .pending_ack_count(P),
+            0,
+            "and its quorum-gate cap slot was freed"
+        );
     }
 
     #[test]
