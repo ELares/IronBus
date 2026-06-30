@@ -4271,7 +4271,13 @@ fn write_pub_reply_gated<
     // outcome (it yields `FireAndForgetAppended`), so this never withholds a no-reply produce.
     let gated = match &outcome {
         ProduceOutcome::Appended(offset) => Some((*offset, FrameType::PubAck)),
-        ProduceOutcome::AppendedDuplicate(offset) => Some((*offset, FrameType::PubAckDuplicate)),
+        // A dedup hit on a FIRE-AND-FORGET produce sends NO frame (the QoS-0 no-frame contract): the
+        // actor's dedup path returns `AppendedDuplicate` even for a fire-and-forget produce (unlike the
+        // fresh-append path, which maps it to `FireAndForgetAppended`), so guard on the flag here so a
+        // QoS-0 duplicate is never quorum-gated or written. Only a REPLY-wanting duplicate is gated.
+        ProduceOutcome::AppendedDuplicate(offset) if !fire_and_forget => {
+            Some((*offset, FrameType::PubAckDuplicate))
+        }
         _ => None,
     };
     if let Some((offset, frame_type)) = gated {
@@ -4346,9 +4352,14 @@ fn write_pub_reply(
         // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
         // broker returns the ORIGINAL offset via the NEW PubAckDuplicate frame (the frozen PubAck
         // body is untouched). It is a SUCCESS (`rc = 0`, `duplicate = true`), never an error, so an
-        // idempotent retry over a lossy edge link does not loop.
+        // idempotent retry over a lossy edge link does not loop. A FIRE-AND-FORGET produce that
+        // dedup-hits sends NO frame (the QoS-0 no-frame contract): the actor's dedup path yields
+        // `AppendedDuplicate` regardless of the flag, so honor it here, exactly like every other
+        // outcome's fire-and-forget arm.
         ProduceOutcome::AppendedDuplicate(offset) => {
-            reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
+            if !fire_and_forget {
+                reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
+            }
             Ok(())
         }
         // A stale-epoch fence (#33): a zombie session reused an old `producer_id` with an epoch
@@ -7153,6 +7164,16 @@ mod tests {
             one_response(&out).0,
             FrameType::PubAckDuplicate,
             "a dedup hit at quorum writes the duplicate-ack"
+        );
+
+        // A FIRE-AND-FORGET produce that dedup-hits sends NO frame (the QoS-0 no-frame contract), even
+        // with a cluster gate present: the actor returns `AppendedDuplicate` regardless of the flag, so
+        // a QoS-0 duplicate must never be quorum-gated or written (it would desync the reply stream).
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &DedupParkingEngine);
+        assert!(
+            out.is_empty(),
+            "a fire-and-forget dedup hit must send no frame: {out:?}"
         );
     }
 
