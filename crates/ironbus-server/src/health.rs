@@ -238,7 +238,9 @@ where
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+// The route dispatcher is one cohesive match over the fixed health routes (/metrics, /healthz,
+// /readyz, /admin, 404); the #862 actor-watchdog 503 branches push it one line over the pedantic bound.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle<F, C, E>(
     mut stream: TcpStream,
     engine: &E,
@@ -304,12 +306,25 @@ where
         // A slow-but-progressing broker keeps ticking and stays 200; a frozen writer (a readyz 503)
         // is still live here. A zero window disables the watchdog (always 200 while up).
         "/healthz" => {
-            if progress.stuck_for_window(clock.now_monotonic_nanos(), liveness_window_nanos) {
+            let now = clock.now_monotonic_nanos();
+            // 503 if EITHER the ACCEPT loop wedged (#95) OR the APPEND ACTOR wedged on a hung fsync
+            // (#862). The actor-watchdog read is a non-blocking atomic that answers even while the actor
+            // is wedged, so a hung writer no longer leaves liveness GREEN (the silent total-stall bug) —
+            // an orchestrator now sees 503 and restarts the node. Disabled (always healthy here) until
+            // the serve path arms the bound, so an unconfigured/single-node broker is unchanged.
+            if progress.stuck_for_window(now, liveness_window_nanos) {
                 respond(
                     &mut stream,
                     503,
                     "Service Unavailable",
                     "no event-loop progress",
+                )
+            } else if engine.actor_watchdog_overran(now) {
+                respond(
+                    &mut stream,
+                    503,
+                    "Service Unavailable",
+                    "append actor wedged",
                 )
             } else {
                 respond(&mut stream, 200, "OK", "ok")
@@ -323,6 +338,18 @@ where
             // (the drain has not started), so the 503 must come from the gate, not the engine check.
             if draining.load(Ordering::Acquire) {
                 respond(&mut stream, 503, "Service Unavailable", "draining")
+            } else if engine.actor_watchdog_overran(clock.now_monotonic_nanos()) {
+                // The append actor is WEDGED on a hung fsync (#862): answer 503 DIRECTLY via the
+                // non-blocking watchdog atomic, BEFORE `engine.with` — which would queue a job behind the
+                // wedged fsync and HANG `/readyz` forever (detection would then depend solely on the
+                // prober's own timeout, and on a single-node edge box with no orchestrator nothing would
+                // detect it). Checked here so a wedge is reported, not hung on.
+                respond(
+                    &mut stream,
+                    503,
+                    "Service Unavailable",
+                    "append actor wedged",
+                )
             } else {
                 // Read the writer-health flag through the actor (the single owner). If the actor is
                 // gone (a shutdown drain), the broker is not ready: surface 503 rather than hang.
@@ -2529,10 +2556,47 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// A test `EngineAccess` that reports the append-actor wedge watchdog (#862) as overrun on demand,
+    /// delegating every real call to a shared engine. It lets a test drive the HTTP health server and
+    /// assert `/healthz` and `/readyz` flip to 503 the moment the watchdog trips — WITHOUT staging a real
+    /// hung fsync (the actor-level `a_hung_fsync_wedges...` test already proves the real-wedge detection).
+    struct WedgeableEngine {
+        inner: SharedEngine<InMemoryFs, Arc<ironbus_core::clock::ManualClock>>,
+        wedged: Arc<AtomicBool>,
+    }
+
+    impl EngineAccess<InMemoryFs, Arc<ironbus_core::clock::ManualClock>> for WedgeableEngine {
+        fn produce(
+            &self,
+            append: crate::actor::OwnedAppend,
+        ) -> Result<crate::actor::ProduceOutcome, crate::actor::ActorGone> {
+            self.inner.produce(append)
+        }
+        fn with<R, J>(&self, job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, Arc<ironbus_core::clock::ManualClock>>) -> R
+                + Send
+                + 'static,
+        {
+            self.inner.with(job)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            self.inner.now_monotonic_nanos()
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            self.inner.consumer_credit_caps()
+        }
+        fn actor_watchdog_overran(&self, _now_monotonic_nanos: u64) -> bool {
+            self.wedged.load(Ordering::Relaxed)
+        }
+    }
+
     /// Runs `serve_health` over a `ManualClock` with the given liveness `window_nanos` and a beacon
     /// the caller drives, so the #95 hysteresis watchdog can be exercised deterministically: the test
     /// advances the clock and ticks (or withholds) the beacon, then probes `/healthz`. Returns the
-    /// bound address, the shutdown flag, the join handle, the shared clock, and the shared beacon.
+    /// bound address, the shutdown flag, the join handle, the shared clock, the shared beacon, and the
+    /// shared actor-watchdog "wedged" flag (#862; default `false`, so liveness tests are unaffected).
     #[allow(clippy::type_complexity)]
     fn start_watchdog(
         window_nanos: u64,
@@ -2542,6 +2606,7 @@ mod tests {
         std::thread::JoinHandle<()>,
         Arc<ironbus_core::clock::ManualClock>,
         Arc<LivenessBeacon>,
+        Arc<AtomicBool>,
     ) {
         use ironbus_core::clock::ManualClock;
         let clock = Arc::new(ManualClock::new());
@@ -2589,7 +2654,14 @@ mod tests {
             },
         )
         .unwrap();
-        let shared: SharedEngine<InMemoryFs, Arc<ManualClock>> = Arc::new(Mutex::new(engine));
+        let inner: SharedEngine<InMemoryFs, Arc<ManualClock>> = Arc::new(Mutex::new(engine));
+        // The actor-watchdog "wedged" flag (#862), default false so the liveness tests behave exactly as
+        // before; the actor-wedge test flips it to drive /healthz and /readyz to 503.
+        let wedged = Arc::new(AtomicBool::new(false));
+        let engine_access = WedgeableEngine {
+            inner,
+            wedged: Arc::clone(&wedged),
+        };
         // The beacon starts at the clock's origin (0), exactly as the broker seeds it from its start
         // instant, so it is fresh at t=0 and only goes stale once the clock advances past the window
         // with no tick.
@@ -2604,7 +2676,7 @@ mod tests {
             move || {
                 serve_health(
                     &listener,
-                    &shared,
+                    &engine_access,
                     &shutdown,
                     false,
                     &beacon,
@@ -2614,7 +2686,7 @@ mod tests {
                 .unwrap();
             }
         });
-        (addr, shutdown, handle, clock, beacon)
+        (addr, shutdown, handle, clock, beacon, wedged)
     }
 
     #[test]
@@ -2622,7 +2694,7 @@ mod tests {
         // With a 30 ms window: a beacon tick at the current instant keeps /healthz 200 even after the
         // clock advances a little (under the window), so a slow-but-progressing loop never sheds.
         let window = 30_000_000; // 30 ms in nanos
-        let (addr, shutdown, handle, clock, beacon) = start_watchdog(window);
+        let (addr, shutdown, handle, clock, beacon, _wedged) = start_watchdog(window);
 
         // Fresh at t=0.
         let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
@@ -2644,7 +2716,7 @@ mod tests {
         // clock has advanced past the window /healthz sheds 503. This is the only thing that makes
         // the guard real: remove the watchdog (revert to a static 200) and this fails.
         let window = 30_000_000; // 30 ms
-        let (addr, shutdown, handle, clock, beacon) = start_watchdog(window);
+        let (addr, shutdown, handle, clock, beacon, _wedged) = start_watchdog(window);
 
         // Tick once at t=0, then let the loop wedge: no more ticks.
         beacon.mark_progress(clock.now_monotonic_nanos());
@@ -2680,7 +2752,7 @@ mod tests {
         // with no client work, so even across MANY window-lengths of pure idle /healthz never sheds.
         // This pins "idle is progress" so the watchdog cannot crash-loop an idle edge node.
         let window = 30_000_000; // 30 ms
-        let (addr, shutdown, handle, clock, beacon) = start_watchdog(window);
+        let (addr, shutdown, handle, clock, beacon, _wedged) = start_watchdog(window);
 
         // Model a long idle run: a 5 ms idle poll tick repeated past several windows.
         for _ in 0..50 {
@@ -2695,10 +2767,64 @@ mod tests {
     }
 
     #[test]
+    fn healthz_and_readyz_flip_to_503_when_the_append_actor_is_wedged() {
+        // #862 end-to-end at the HTTP layer: when the append actor is wedged on a hung fsync, /healthz
+        // AND /readyz both flip to 503 — instead of /healthz staying GREEN (the accept-loop beacon is
+        // decoupled, #95) and /readyz HANGING behind the wedged fsync. The actor-level
+        // `a_hung_fsync_wedges...` test proves the real-wedge detection; this proves the health surface
+        // surfaces it. The accept-loop beacon is kept FRESH throughout so the actor-watchdog is the SOLE
+        // reason for any 503, never the liveness window.
+        let window = 30_000_000; // 30 ms
+        let (addr, shutdown, handle, clock, beacon, wedged) = start_watchdog(window);
+        beacon.mark_progress(clock.now_monotonic_nanos());
+
+        // Not wedged: both routes are healthy.
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            h.starts_with("HTTP/1.1 200 OK"),
+            "healthy before the wedge: {h}"
+        );
+        let r = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 200 OK"),
+            "ready before the wedge: {r}"
+        );
+
+        // The append actor wedges (a hung fsync overran the bound): /healthz AND /readyz flip to 503,
+        // and /readyz answers PROMPTLY (the non-blocking watchdog read, never the wedged actor).
+        wedged.store(true, Ordering::Release);
+        beacon.mark_progress(clock.now_monotonic_nanos());
+        let h2 = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            h2.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "healthz flips to 503 on an actor wedge: {h2}"
+        );
+        assert!(h2.ends_with("append actor wedged"), "{h2}");
+        let r2 = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(
+            r2.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "readyz flips to 503 (and does NOT hang) on an actor wedge: {r2}"
+        );
+        assert!(r2.ends_with("append actor wedged"), "{r2}");
+
+        // Recovery (the fsync completed and the actor un-wedged): both return to healthy — not a latch.
+        wedged.store(false, Ordering::Release);
+        beacon.mark_progress(clock.now_monotonic_nanos());
+        let h3 = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            h3.starts_with("HTTP/1.1 200 OK"),
+            "healthz recovers after the wedge clears: {h3}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn a_zero_window_disables_the_healthz_watchdog() {
         // window 0 = the watchdog is off: /healthz is the legacy static 200 no matter how stale the
         // beacon, the opt-out path (and the contract the existing metrics/admin helpers rely on).
-        let (addr, shutdown, handle, clock, _beacon) = start_watchdog(0);
+        let (addr, shutdown, handle, clock, _beacon, _wedged) = start_watchdog(0);
         // Advance far past any window with NO beacon tick: still 200, because the watchdog is off.
         clock.advance_monotonic_nanos(10_000_000_000);
         let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");

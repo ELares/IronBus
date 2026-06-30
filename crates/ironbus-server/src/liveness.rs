@@ -70,6 +70,77 @@ impl LivenessBeacon {
     }
 }
 
+/// A shared actor-progress watchdog (#862): the append actor stamps the monotonic instant it BEGINS
+/// processing a command batch — which includes the covering durability `fdatasync` — and clears it
+/// when the batch completes and it returns to idle. The health server reads it WITHOUT going through
+/// the actor, so a HUNG fsync (a failing eMMC doing long internal retries, a stalled networked/overlay
+/// FS, brownout-stuck flash on the edge target) that blocks the actor thread FOREVER is DETECTED:
+/// `processing_since` stays put while the monotonic clock advances, and once the gap exceeds the
+/// configured bound the broker reports UNHEALTHY (flipping `/healthz` AND `/readyz` to 503) so an
+/// orchestrator restarts it — instead of liveness staying green while the whole produce path is wedged.
+///
+/// This is DISTINCT from [`LivenessBeacon`]: that watches the ACCEPT loop, which is deliberately
+/// decoupled from the writer (#95) and keeps ticking even while the actor is wedged, so it cannot see a
+/// hung writer. This watches the actor itself. Unlike the accept loop, the actor does NOT tick while
+/// idle (it blocks awaiting a command), so a stale-since-last-tick model would false-trip on a quiet
+/// broker; instead a `processing_since` of `0` means IDLE (never wedged), and a non-zero stamp older
+/// than the bound means the in-flight batch has overrun — a genuine wedge, not idleness. Cheap to
+/// share: two `AtomicU64`, relaxed ordering (advisory heartbeat, not a synchronization point).
+#[derive(Debug)]
+pub struct ActorWatchdog {
+    /// The monotonic nanos the actor began the current batch, or `0` when idle (blocked awaiting a
+    /// command). Stored as `max(1)` so a `now` of `0` (a fresh manual clock) is never mistaken for idle.
+    processing_since: AtomicU64,
+    /// The overrun bound in nanos: an in-flight batch older than this is WEDGED. `0` = the watchdog is
+    /// DISABLED (it never trips), the default until a serve configures it via [`set_bound_nanos`].
+    ///
+    /// [`set_bound_nanos`]: ActorWatchdog::set_bound_nanos
+    bound_nanos: AtomicU64,
+}
+
+impl ActorWatchdog {
+    /// A fresh watchdog (idle) with the given overrun `bound_nanos` (`0` = disabled).
+    #[must_use]
+    pub fn new(bound_nanos: u64) -> ActorWatchdog {
+        ActorWatchdog {
+            processing_since: AtomicU64::new(0),
+            bound_nanos: AtomicU64::new(bound_nanos),
+        }
+    }
+
+    /// Sets the overrun bound in nanos; `0` disables the watchdog. Called once at serve start from the
+    /// configured value, before any produce can wedge.
+    pub fn set_bound_nanos(&self, bound_nanos: u64) {
+        self.bound_nanos.store(bound_nanos, Ordering::Relaxed);
+    }
+
+    /// Records that the actor BEGAN a command batch at `now_monotonic_nanos` (it is about to append and
+    /// run the covering fsync). One relaxed store on the actor's per-BATCH boundary, never per message.
+    pub fn mark_busy(&self, now_monotonic_nanos: u64) {
+        self.processing_since
+            .store(now_monotonic_nanos.max(1), Ordering::Relaxed);
+    }
+
+    /// Records that the actor FINISHED a batch and is returning to idle (awaiting the next command).
+    /// Clears the in-flight stamp so the watchdog cannot trip on an idle actor.
+    pub fn mark_idle(&self) {
+        self.processing_since.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the actor's current batch has been in flight longer than the configured bound — a hung
+    /// fsync. `false` when idle (`processing_since == 0`), when no bound is configured (`bound == 0`),
+    /// or within the bound. The comparison is strict `>` so the exact-bound boundary is still healthy.
+    #[must_use]
+    pub fn overran(&self, now_monotonic_nanos: u64) -> bool {
+        let bound = self.bound_nanos.load(Ordering::Relaxed);
+        if bound == 0 {
+            return false;
+        }
+        let since = self.processing_since.load(Ordering::Relaxed);
+        since != 0 && now_monotonic_nanos.saturating_sub(since) > bound
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +202,59 @@ mod tests {
         }
         // Now the loop wedges: no further tick. After a full window it sheds.
         assert!(b.stuck_for_window(now + window + 1, window));
+    }
+
+    #[test]
+    fn an_idle_actor_watchdog_never_overruns() {
+        // #862: a `processing_since` of 0 means the actor is idle (blocked awaiting a command), so the
+        // watchdog must NOT trip no matter how much time passes — only an in-flight batch can wedge.
+        let w = ActorWatchdog::new(30);
+        assert!(!w.overran(0));
+        assert!(!w.overran(u64::MAX), "an idle actor is never wedged");
+        // A finished batch (mark_busy then mark_idle) returns to idle: never wedged afterward.
+        w.mark_busy(100);
+        w.mark_idle();
+        assert!(!w.overran(100 + 1_000_000));
+    }
+
+    #[test]
+    fn a_busy_actor_watchdog_overruns_only_past_the_bound() {
+        // The actor begins a batch at t=100; within the bound it is healthy, at exactly the bound it is
+        // still healthy (strict >), and past the bound the in-flight batch is WEDGED (a hung fsync).
+        let w = ActorWatchdog::new(30);
+        w.mark_busy(100);
+        assert!(!w.overran(100 + 10));
+        assert!(!w.overran(100 + 30));
+        assert!(w.overran(100 + 31), "the in-flight batch overran the bound");
+        // The actor completing the batch clears the wedge (no flapping latch): idle again.
+        w.mark_idle();
+        assert!(!w.overran(100 + 1_000));
+    }
+
+    #[test]
+    fn a_zero_bound_disables_the_actor_watchdog() {
+        // bound 0 = disabled: even a very old in-flight stamp never trips (the default until a serve
+        // configures a bound). Setting a bound then engages it.
+        let w = ActorWatchdog::new(0);
+        w.mark_busy(1);
+        assert!(!w.overran(u64::MAX));
+        w.set_bound_nanos(30);
+        assert!(w.overran(1 + 31));
+        w.set_bound_nanos(0);
+        assert!(!w.overran(u64::MAX), "re-disabling stops the watchdog");
+    }
+
+    #[test]
+    fn a_busy_stamp_of_zero_is_not_mistaken_for_idle() {
+        // A fresh manual clock can read `now == 0`; `mark_busy` stores `max(1)`, so a batch that began
+        // at logical time 0 is still seen as busy (not idle) and can overrun.
+        let w = ActorWatchdog::new(30);
+        w.mark_busy(0);
+        assert!(!w.overran(0));
+        // The stamp is clamped to 1, so the overrun is at now > 1 + bound (= 31), not idle-forever.
+        assert!(
+            w.overran(32),
+            "a batch begun at t=0 still overruns the bound"
+        );
     }
 }

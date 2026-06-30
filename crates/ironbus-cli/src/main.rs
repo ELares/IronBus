@@ -766,6 +766,15 @@ const DEFAULT_VISIBILITY_MS: u64 = 30_000;
 /// DISABLES the watchdog (`/healthz` is then a static 200 while up). 10 s matches the #95 spec.
 const DEFAULT_HEALTH_LIVENESS_WINDOW_MS: u64 = 10_000;
 
+/// The default APPEND-ACTOR WEDGE-WATCHDOG bound for `serve` (#862), in milliseconds: a durability
+/// `fdatasync` that hangs (a failing eMMC, a stalled overlay/networked FS, brownout-stuck flash) blocks
+/// the single append actor forever, and the accept-loop liveness beacon is decoupled (#95) so `/healthz`
+/// would stay green while the whole produce path is wedged and `/readyz` would hang behind the stuck
+/// fsync. Once an in-flight batch overruns this bound, `/healthz` AND `/readyz` flip to 503 so an
+/// orchestrator restarts the node. `0` DISABLES the watchdog. 30 s is far above any legitimate
+/// slow-but-progressing fsync, so it never false-trips a merely slow disk.
+const DEFAULT_ACTOR_WATCHDOG_BOUND_MS: u64 = 30_000;
+
 /// The default graceful-shutdown DRAIN TIMEOUT for `serve` (#637), in milliseconds: on a SIGTERM the
 /// broker flips `/readyz` to 503, then drains in-flight work (flush + checkpoint), and force-exits if
 /// the drain has not finished within this window — so an orchestrated stop (k8s `terminationGracePeriod`)
@@ -2254,6 +2263,8 @@ struct ServeFlags {
     health_addr: Option<String>,
     /// The `/healthz` liveness hysteresis window in ms (#95); `None` falls back to the default.
     health_liveness_window_ms: Option<u64>,
+    /// The append-actor wedge-watchdog bound in ms (#862); `None` falls back to the default. `0` disables.
+    actor_watchdog_bound_ms: Option<u64>,
     /// The fail-closed acknowledgement for a NON-LOOPBACK `--health-addr` (#95): the metrics/health
     /// surface is unauthenticated and unencrypted (TLS/#107 and auth/#106 are not wired), so a
     /// non-loopback bind refuses to start unless the operator sets this. A bare boolean flag.
@@ -2679,6 +2690,10 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                 f.health_liveness_window_ms =
                     Some(take_number("--health-liveness-window-ms", args, &mut i)?);
             }
+            "--actor-watchdog-bound-ms" => {
+                f.actor_watchdog_bound_ms =
+                    Some(take_number("--actor-watchdog-bound-ms", args, &mut i)?);
+            }
             // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
             "--health-allow-public" => {
                 f.health_allow_public = true;
@@ -3040,6 +3055,12 @@ fn parse_serve_flags_with_env_and_reader(
                 f.health_liveness_window_ms,
                 env,
                 DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            )?,
+            actor_watchdog_bound_ms: resolve_number(
+                "--actor-watchdog-bound-ms",
+                f.actor_watchdog_bound_ms,
+                env,
+                DEFAULT_ACTOR_WATCHDOG_BOUND_MS,
             )?,
             health_allow_public: resolve_bool("--health-allow-public", f.health_allow_public, env)?,
             // #878: the dedup caps take their default from the PROFILE PRESET (edge-tiny lowers them so
@@ -4760,6 +4781,11 @@ struct ServeConfig {
     /// healthy idle loop stays 200. `0` = the watchdog is DISABLED (a static-200 `/healthz` while up).
     /// Default 10 s (`DEFAULT_HEALTH_LIVENESS_WINDOW_MS`).
     health_liveness_window_ms: u64,
+    /// The append-actor wedge-watchdog bound in MILLISECONDS (#862): a durability `fdatasync` that hangs
+    /// longer than this wedges the single append actor, and the broker flips `/healthz` AND `/readyz` to
+    /// 503 (so an orchestrator restarts it) instead of leaving liveness green and hanging `/readyz`. `0`
+    /// = DISABLED. Default 30 s (`DEFAULT_ACTOR_WATCHDOG_BOUND_MS`), far above any legitimate slow fsync.
+    actor_watchdog_bound_ms: u64,
     /// Acknowledge a NON-LOOPBACK `--health-addr` bind (#95), fail-closed default. The health surface
     /// (`/metrics`, `/healthz`, `/readyz`, optional `/admin`) is UNAUTHENTICATED and UNENCRYPTED: TLS
     /// (#107) and an auth identity (#106) are specified but NOT yet wired, so per the #107 bind
@@ -4939,6 +4965,7 @@ impl ServeConfig {
             enable_otlp_export: false,
             otlp_endpoint: None,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            actor_watchdog_bound_ms: DEFAULT_ACTOR_WATCHDOG_BOUND_MS,
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
@@ -6179,6 +6206,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          group_idle_evict_ms={} checkpoint_interval={} max_deliver={} \
          allow_unlimited_deliver={} disk_full_policy={policy} visibility_timeout_ms={} \
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
+         actor_watchdog_bound_ms={} \
          enable_admin={} ram_ceiling_bytes={} dedup_max_ids={} dedup_max_producers={} \
          durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
@@ -6203,6 +6231,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.max_age_ms,
         config.max_messages,
         config.health_liveness_window_ms,
+        config.actor_watchdog_bound_ms,
         config.enable_admin,
         config.ram_ceiling_bytes,
         config.dedup_max_ids,
@@ -7790,6 +7819,11 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         Some(slot) => shared.with_client_ack_slot(slot),
         None => shared,
     };
+    // Arm the append-actor wedge watchdog (#862) BEFORE any produce can run: a durability fsync that
+    // hangs longer than this bound flips `/healthz` and `/readyz` to 503 (instead of leaving liveness
+    // green and hanging readyz), so an orchestrator restarts a node whose disk has stalled. `0` disables
+    // it. The bound is generous (default 30 s) so a slow-but-progressing fsync never false-trips.
+    shared.set_actor_watchdog_bound(config.actor_watchdog_bound_ms.saturating_mul(1_000_000));
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -8815,6 +8849,7 @@ fn cmd_serve(
         // consume them too or the Windows `-D warnings` build trips field-never-read, invisible to a
         // macOS reviewer (the recurring #288/#99 footgun).
         config.health_liveness_window_ms,
+        config.actor_watchdog_bound_ms,
         config.health_allow_public,
         config.visibility_ms,
         // The #33 dedup knobs are read only on the Unix serve path (they size the engine's dedup
@@ -12698,6 +12733,7 @@ mod tests {
             enable_otlp_export: false,
             otlp_endpoint: None,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            actor_watchdog_bound_ms: DEFAULT_ACTOR_WATCHDOG_BOUND_MS,
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
@@ -16125,6 +16161,7 @@ mod tests {
             enable_otlp_export: false,
             otlp_endpoint: None,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            actor_watchdog_bound_ms: DEFAULT_ACTOR_WATCHDOG_BOUND_MS,
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
@@ -18865,6 +18902,28 @@ mod tests {
         assert_eq!(
             set.config.max_in_flight, 8,
             "the trailing flag still parses"
+        );
+    }
+
+    #[test]
+    fn serve_parses_the_actor_watchdog_bound_flag() {
+        // #862: the append-actor wedge-watchdog bound (ms) parses into the ServeConfig with the 30 s
+        // default absent the flag; an explicit value (incl. 0 = disabled) wins.
+        let def = parse_serve_flags(&["--data-dir".to_string(), "/tmp/x".to_string()]).unwrap();
+        assert_eq!(
+            def.config.actor_watchdog_bound_ms, DEFAULT_ACTOR_WATCHDOG_BOUND_MS,
+            "the actor-watchdog bound defaults to 30 s"
+        );
+        let set = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/x".to_string(),
+            "--actor-watchdog-bound-ms".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            set.config.actor_watchdog_bound_ms, 0,
+            "0 disables the actor-wedge watchdog"
         );
     }
 
