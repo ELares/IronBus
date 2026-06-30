@@ -4271,10 +4271,12 @@ fn write_pub_reply_gated<
     // outcome (it yields `FireAndForgetAppended`), so this never withholds a no-reply produce.
     let gated = match &outcome {
         ProduceOutcome::Appended(offset) => Some((*offset, FrameType::PubAck)),
-        // A dedup hit on a FIRE-AND-FORGET produce sends NO frame (the QoS-0 no-frame contract): the
-        // actor's dedup path returns `AppendedDuplicate` even for a fire-and-forget produce (unlike the
-        // fresh-append path, which maps it to `FireAndForgetAppended`), so guard on the flag here so a
-        // QoS-0 duplicate is never quorum-gated or written. Only a REPLY-wanting duplicate is gated.
+        // Only a REPLY-wanting duplicate is gated. Today a fire-and-forget produce never reaches this
+        // reply path at all (a QoS-0 publish early-returns into the no-reply L0 batch before a
+        // `ParkedPub` is pushed, so `fire_and_forget` is always `false` here). Guard on the flag anyway
+        // as defense-in-depth: the actor's dedup path yields `AppendedDuplicate` regardless of the flag
+        // (unlike the fresh-append path, which maps a QoS-0 produce to `FireAndForgetAppended`), so a
+        // future routing change must not be able to quorum-gate or write a frame for a QoS-0 duplicate.
         ProduceOutcome::AppendedDuplicate(offset) if !fire_and_forget => {
             Some((*offset, FrameType::PubAckDuplicate))
         }
@@ -4352,10 +4354,10 @@ fn write_pub_reply(
         // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
         // broker returns the ORIGINAL offset via the NEW PubAckDuplicate frame (the frozen PubAck
         // body is untouched). It is a SUCCESS (`rc = 0`, `duplicate = true`), never an error, so an
-        // idempotent retry over a lossy edge link does not loop. A FIRE-AND-FORGET produce that
-        // dedup-hits sends NO frame (the QoS-0 no-frame contract): the actor's dedup path yields
-        // `AppendedDuplicate` regardless of the flag, so honor it here, exactly like every other
-        // outcome's fire-and-forget arm.
+        // idempotent retry over a lossy edge link does not loop. The fire-and-forget arm is
+        // defense-in-depth (a QoS-0 publish does not reach this reply path today): the actor's dedup
+        // path yields `AppendedDuplicate` regardless of the flag, so honor the QoS-0 no-frame contract
+        // here, exactly like every other outcome's fire-and-forget arm.
         ProduceOutcome::AppendedDuplicate(offset) => {
             if !fire_and_forget {
                 reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
