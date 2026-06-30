@@ -110,7 +110,7 @@
 //!   **cross-cluster geo** plane (C7) are separate.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ironbus_core::clock::Clock;
 use ironbus_core::epoch_cache::{EpochCache, LeaderEpochEndOffset};
@@ -454,6 +454,64 @@ pub type AckToken = u64;
 /// `Arc` (rather than a borrow) is exactly what makes the controller `Send`, so the data plane can run
 /// on a peer-I/O thread alongside the append actor. The FOLLOWER role OWNS its replica log (it appends
 /// the leader's bytes to its OWN copy, via its OWN single writer). `None` holds no state.
+/// The per-partition follower handle (#809): an `Arc<Mutex<EpochAwareFollower>>` the follower fetch
+/// thread clones once and applies under, off the node-global server `Mutex`. A poisoned lock is
+/// recovered with `into_inner` everywhere (a follower-apply panic must not wedge the whole data plane).
+pub(crate) type FollowerHandle<F, C> = Arc<Mutex<EpochAwareFollower<F, C>>>;
+
+/// Lock a follower handle, recovering from a poisoned lock (`into_inner`) so a panic in ONE partition's
+/// apply never wedges the whole data plane (#809).
+///
+/// This is a deliberate scope change from the pre-#809 global lock, which failed CLOSED on a poison (the
+/// fetch loop's `let Ok(..) = server.lock() else return` tore down on a poisoned global). Recovering a
+/// poisoned PER-PARTITION follower is sound here: `apply_fetch_response` returns a typed `Err` for every
+/// EXPECTED fault (corrupt / non-contiguous / storage) — a panic is therefore a latent bug, not
+/// adversarial input — and the follower's durable state is never left half-applied in a way a later read
+/// could serve as committed: `next_offset` advances only AFTER `Log::append` returns `Ok` (a torn append
+/// errors rather than advancing), and follower reads clamp to `follower_safe_watermark(plane.flushed(),
+/// known_committed_hw)`, so any torn UNCOMMITTED tail is never served below the committed bar. (If a
+/// poison ever needs stricter handling, fail closed by dropping the follower and forcing a clean
+/// re-fetch — tracked as a #809 follow-up.)
+fn lock_follower<F: Filesystem, C: Clock>(
+    handle: &FollowerHandle<F, C>,
+) -> std::sync::MutexGuard<'_, EpochAwareFollower<F, C>> {
+    handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Apply a leader's `FetchResponse` to a follower HANDLE — decode + CRC-revalidate + append + `log.sync()`
+/// — under the handle's PER-PARTITION lock (#809), returning the follower's new fsync'd frontier. The
+/// follower fetch thread calls this OFF the node-global server `Mutex` (it holds only this handle's lock
+/// across the fsync), so partition A's apply no longer blocks partition B's serve/apply.
+///
+/// # Errors
+/// [`DataPlaneError::Replication`] (fail-closed) on a corrupt / tampered / truncated frame — nothing from
+/// the bad frame onward is appended.
+pub fn apply_on_follower<F: Filesystem, C: Clock>(
+    handle: &FollowerHandle<F, C>,
+    resp: &FetchResponseBody,
+) -> Result<u64, DataPlaneError> {
+    let outcome = lock_follower(handle)
+        .follower_mut()
+        .apply_fetch_response(resp)?;
+    Ok(outcome.next_offset)
+}
+
+/// Build a follower HANDLE's [`AckReplicatedBody`] report ("I have fsync'd every record below my
+/// `next_offset`") under its per-partition lock (#809) — the off-global-lock twin of
+/// [`DataPlaneController::follower_report`], called by the follower fetch thread after `apply_on_follower`.
+#[must_use]
+pub fn report_from_follower<F: Filesystem, C: Clock>(
+    handle: &FollowerHandle<F, C>,
+    node_id: u64,
+) -> AckReplicatedBody {
+    AckReplicatedBody {
+        follower_id: node_id,
+        fsynced_offset: lock_follower(handle).follower().next_fetch_offset().get(),
+    }
+}
+
 enum PartitionRole<F: Filesystem, C: Clock> {
     /// This node LEADS the partition: it serves fetches from the leader's read plane + gates produces
     /// through the ISR quorum.
@@ -472,10 +530,15 @@ enum PartitionRole<F: Filesystem, C: Clock> {
     },
     /// This node FOLLOWS the partition: it pulls the leader's bytes + self-heals on divergence.
     Follower {
-        /// The epoch-aware follower over this node's OWN replica log (fetch + apply + reconcile).
-        /// Boxed so the `Follower` variant (which owns a whole replica `Log` + epoch cache) does not
-        /// bloat every `Leader` slot — the enum is held one-per-partition in a `BTreeMap`.
-        follower: Box<EpochAwareFollower<F, C>>,
+        /// The epoch-aware follower over this node's OWN replica log (fetch + apply + reconcile), held
+        /// behind a PER-PARTITION `Arc<Mutex>` (#809): the follower fetch thread clones the handle once
+        /// and applies (decode + append + fsync) under THIS lock, NOT the node-global server `Mutex`, so
+        /// partition A's apply/fsync no longer blocks partition B's serve/apply. The controller's
+        /// follower-routing methods lock the same handle; the lock order is always global-server →
+        /// follower-handle (the fetch thread holds the follower handle WITHOUT the global lock), so no
+        /// deadlock. Promotion builds the leader plane from the locked `&log` without consuming the
+        /// `Arc`, so a still-running fetch thread's clone never blocks failover.
+        follower: FollowerHandle<F, C>,
     },
 }
 
@@ -549,6 +612,21 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         }
     }
 
+    /// The per-partition follower handle for `partition`, or `None` if this node is not its follower
+    /// (#809). The follower fetch thread clones this ONCE (under a brief server lock) and then drives
+    /// fetch/apply/report on it via [`apply_on_follower`] / [`report_from_follower`] OFF the global server
+    /// `Mutex`, so partition A's apply (incl. its `log.sync()` fsync) no longer blocks partition B's
+    /// serve/apply. The handle stays valid across a role change: promotion does not consume the `Arc`, so
+    /// a still-running fetch thread's clone is harmless (its next `make_fetch_request` reports the role is
+    /// gone and it exits).
+    #[must_use]
+    pub fn follower_handle(&self, partition: u64) -> Option<FollowerHandle<F, C>> {
+        match self.roles.get(&partition) {
+            Some(PartitionRole::Follower { follower }) => Some(Arc::clone(follower)),
+            _ => None,
+        }
+    }
+
     /// Register this node as the LEADER of `partition`, serving fetches from the `Arc`-shared, off-actor
     /// read `plane` (#654, #715) — NOT a `&Log` borrow, so the leader never writes (or borrows) its log
     /// and the controller stays `Send`. Gates produces through an [`IsrTracker`] / [`QuorumAckGate`]
@@ -592,7 +670,7 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         self.roles.insert(
             partition,
             PartitionRole::Follower {
-                follower: Box::new(EpochAwareFollower::new(Follower::new(log))),
+                follower: Arc::new(Mutex::new(EpochAwareFollower::new(Follower::new(log)))),
             },
         );
     }
@@ -851,9 +929,9 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         max_bytes: u32,
     ) -> Result<FetchRecordsBody, DataPlaneError> {
         match self.roles.get(&partition) {
-            Some(PartitionRole::Follower { follower }) => {
-                Ok(follower.follower().fetch_request(max_records, max_bytes))
-            }
+            Some(PartitionRole::Follower { follower }) => Ok(lock_follower(follower)
+                .follower()
+                .fetch_request(max_records, max_bytes)),
             Some(PartitionRole::Leader { .. }) => Err(DataPlaneError::WrongRole {
                 partition,
                 needed: "follower",
@@ -876,9 +954,11 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         partition: u64,
         resp: &FetchResponseBody,
     ) -> Result<u64, DataPlaneError> {
-        match self.roles.get_mut(&partition) {
+        match self.roles.get(&partition) {
             Some(PartitionRole::Follower { follower }) => {
-                let outcome = follower.follower_mut().apply_fetch_response(resp)?;
+                let outcome = lock_follower(follower)
+                    .follower_mut()
+                    .apply_fetch_response(resp)?;
                 Ok(outcome.next_offset)
             }
             Some(PartitionRole::Leader { .. }) => Err(DataPlaneError::WrongRole {
@@ -900,7 +980,7 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         match self.roles.get(&partition) {
             Some(PartitionRole::Follower { follower }) => Ok(AckReplicatedBody {
                 follower_id: self.node_id,
-                fsynced_offset: follower.follower().next_fetch_offset().get(),
+                fsynced_offset: lock_follower(follower).follower().next_fetch_offset().get(),
             }),
             Some(PartitionRole::Leader { .. }) => Err(DataPlaneError::WrongRole {
                 partition,
@@ -924,9 +1004,9 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         epoch: LeaderEpoch,
         start_offset: Offset,
     ) -> Result<(), DataPlaneError> {
-        match self.roles.get_mut(&partition) {
+        match self.roles.get(&partition) {
             Some(PartitionRole::Follower { follower }) => {
-                follower.assign_epoch(epoch, start_offset)?;
+                lock_follower(follower).assign_epoch(epoch, start_offset)?;
                 Ok(())
             }
             Some(PartitionRole::Leader { .. }) => Err(DataPlaneError::WrongRole {
@@ -961,9 +1041,10 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
     where
         L: FnMut(LeaderEpoch) -> LeaderEpochEndOffset,
     {
-        match self.roles.get_mut(&partition) {
+        match self.roles.get(&partition) {
             Some(PartitionRole::Follower { follower }) => {
-                Ok(follower.reconcile_with_leader(committed_hw, leader_end_offset)?)
+                Ok(lock_follower(follower)
+                    .reconcile_with_leader(committed_hw, leader_end_offset)?)
             }
             Some(PartitionRole::Leader { .. }) => Err(DataPlaneError::WrongRole {
                 partition,
@@ -980,18 +1061,25 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
     pub fn follower_high_watermark(&self, partition: u64) -> Option<u64> {
         match self.roles.get(&partition) {
             Some(PartitionRole::Follower { follower }) => {
-                Some(follower.follower().high_watermark().get())
+                Some(lock_follower(follower).follower().high_watermark().get())
             }
             _ => None,
         }
     }
 
-    /// Borrow the follower's replica [`Log`] for `partition` (e.g. to assert byte-identity against the
-    /// leader, or to serve a follower read). `None` for a leader / absent partition.
-    #[must_use]
-    pub fn follower_log(&self, partition: u64) -> Option<&Log<F, C>> {
+    /// Run `f` against the follower's replica [`Log`] for `partition` under the per-partition follower
+    /// lock (#809) — e.g. to assert byte-identity against the leader, or to read its frontier. Returns
+    /// `Some(f(&log))` for a follower, `None` for a leader / absent partition. (The follower log is now
+    /// behind an `Arc<Mutex>`, so it cannot be borrowed out across the lock; a closure scopes the borrow.)
+    pub fn with_follower_log<R>(
+        &self,
+        partition: u64,
+        f: impl FnOnce(&Log<F, C>) -> R,
+    ) -> Option<R> {
         match self.roles.get(&partition) {
-            Some(PartitionRole::Follower { follower }) => Some(follower.follower().log()),
+            Some(PartitionRole::Follower { follower }) => {
+                Some(f(lock_follower(follower).follower().log()))
+            }
             _ => None,
         }
     }
@@ -1135,48 +1223,60 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
                 });
             }
         };
-        // APPLY-TIME COMMITTED-COMPLETENESS SELF-VERIFY (defense in depth, #618b). Before this node takes
-        // leadership, re-check that its OWN durable log covers the committed-HW bar carried with the
-        // failover. `next_offset()` is its durable frontier (the first offset it has NOT durably
-        // appended); it must be >= the bar (so every offset below the bar is durably held here). If not,
-        // ABORT — restore the follower role and fail closed, so no leader missing committed data is ever
-        // created (the partition stays leaderless / recoverable). This catches an optimistic or buggy
-        // proposal that the proposer-side gate somehow let through.
-        let durable_frontier = follower.follower().log().next_offset().get();
-        if durable_frontier < committed_hw_bar {
-            // Put the follower role back UNCHANGED — we did not consume it; this node keeps following.
-            self.roles
-                .insert(partition, PartitionRole::Follower { follower });
-            return Err(DataPlaneError::FailoverIncomplete {
-                partition,
-                durable_frontier,
-                committed_hw: committed_hw_bar,
-            });
-        }
-        // Split the follower into its owned log + its learned epoch history. The log is the committed
-        // data this node ALREADY holds — promotion serves it as-is (no fetch, no copy).
-        let (follower, mut epochs) = follower.into_parts();
-        let log = follower.into_log();
-        // The frontier the new epoch begins at: the first offset NOT yet held (its durable prefix). All
-        // records from here on are served under the new (bumped) leadership epoch.
-        let frontier = log.next_offset();
-        // Build the leader's read plane over the SAME log (zero byte copy). The plane holds its own
-        // Arc<Filesystem> over the same directory, so it stays valid for the leader role's lifetime.
-        let plane = Arc::new(
-            log.read_plane()
-                .map_err(|e| DataPlaneError::Replication(ReplicationError::Storage(e)))?,
-        );
-        // SEED THE FENCE: record the new (strictly-higher) leadership epoch starting at the current
-        // frontier. `assign` is a no-op if the epoch is unchanged and FAILS CLOSED if it regresses, so a
-        // failover that did not bump the epoch is rejected here rather than silently un-fencing the old
-        // leader. After this the leader answers OffsetForLeaderEpoch under the new epoch — the KIP-101
-        // fence a returning old leader is truncated against.
-        epochs
-            .assign(new_epoch, frontier)
-            .map_err(|e| DataPlaneError::Replication(ReplicationError::EpochCache(e)))?;
-        // The owned `log` is dropped here (its writer released) — the promoted leader serves through the
-        // read plane only; in a live broker its append actor becomes the sole writer (FLAGGED hot-path).
-        drop(log);
+        // Build the leader's plane + seeded epoch cache from the follower's log UNDER its per-partition
+        // lock (#809), WITHOUT consuming the `Arc` — the leader role needs only the read plane (built
+        // from `&log`) and the learned epoch history (cloned), never ownership of the log. On a verify
+        // failure the follower role is restored unchanged. The `Arc` then drops here; the follower's
+        // replica-log writer is released once the last clone (an exiting fetch thread's) drops — the same
+        // "serve through the read plane only" outcome as the old `into_log()`+`drop(log)`, only the writer
+        // release is deferred to the thread's exit instead of being immediate.
+        //
+        // SAFETY of the deferred release: only ONE writer ever touches this replica log (the leader's
+        // append actor is not yet wired, so nothing else writes it), and the follower lock serializes a
+        // racing post-promotion apply against this promotion. Such an apply CAN still advance the leader's
+        // served frontier (`plane.flushed()`), but it only appends a byte-identical, CRC-revalidated,
+        // CONTIGUOUS continuation of the same authoritative old-leader lineage ABOVE the promotion
+        // frontier — adopting more of the uncommitted tail under the new epoch, never overwriting
+        // committed data and keeping the epoch fence at `frontier` consistent. When the append actor IS
+        // wired to write this log, add an explicit single-writer handoff (wait for the fetch thread to
+        // exit / the `Arc` to drop before opening the writer) — tracked as a #809 follow-up.
+        let plane_epochs = {
+            let guard = lock_follower(&follower);
+            let log = guard.follower().log();
+            // APPLY-TIME COMMITTED-COMPLETENESS SELF-VERIFY (defense in depth, #618b): the node's OWN
+            // durable frontier (`next_offset`) must cover the committed-HW bar, else ABORT fail-closed so
+            // no leader missing committed data is ever created. `Err(frontier)` carries the offending value.
+            let frontier = log.next_offset();
+            if frontier.get() < committed_hw_bar {
+                Err(frontier.get())
+            } else {
+                let plane = Arc::new(
+                    log.read_plane()
+                        .map_err(|e| DataPlaneError::Replication(ReplicationError::Storage(e)))?,
+                );
+                // SEED THE FENCE on a CLONE of the learned epoch history (strictly-higher new epoch at the
+                // current frontier; `assign` fails closed on a regression). The follower keeps its copy.
+                let mut epochs = guard.epochs().clone();
+                epochs
+                    .assign(new_epoch, frontier)
+                    .map_err(|e| DataPlaneError::Replication(ReplicationError::EpochCache(e)))?;
+                Ok((plane, epochs))
+            }
+        };
+        let (plane, epochs) = match plane_epochs {
+            Ok(pe) => pe,
+            Err(durable_frontier) => {
+                // Restore the follower role UNCHANGED — we did not consume it; this node keeps following.
+                self.roles
+                    .insert(partition, PartitionRole::Follower { follower });
+                return Err(DataPlaneError::FailoverIncomplete {
+                    partition,
+                    durable_frontier,
+                    committed_hw: committed_hw_bar,
+                });
+            }
+        };
+        drop(follower);
         self.start_leader(partition, plane, epochs, replica_ids, isr_config);
         Ok(())
     }
@@ -1204,7 +1304,7 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
         match self.roles.get(&partition) {
             Some(PartitionRole::Follower { follower }) => {
                 // The follower's OWN durably-replicated, CRC-revalidated flushed prefix.
-                let own_flushed = follower.follower().read_plane()?.flushed();
+                let own_flushed = lock_follower(follower).follower().read_plane()?.flushed();
                 Ok(Some(follower_safe_watermark(
                     own_flushed,
                     known_committed_hw,
@@ -1258,7 +1358,9 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
             }
             None => return Err(DataPlaneError::UnknownPartition { partition }),
         };
-        let plane = follower.follower().read_plane()?;
+        // `read_plane()` returns an OWNED plane (built fresh over the follower's `Arc<Filesystem>`), so it
+        // outlives the brief per-partition lock taken here (#809).
+        let plane = lock_follower(follower).follower().read_plane()?;
         let safe = follower_safe_watermark(plane.flushed(), known_committed_hw);
         let wanted_end = Offset::new(from.get().saturating_add(max_records as u64));
         match classify_follower_read(tier, from, wanted_end, safe) {
@@ -1884,11 +1986,11 @@ mod tests {
 
         // Follower 2's replica is BYTE-IDENTICAL to the leader over the read-plane-served prefix (every
         // replicated segment file matches the leader's same-named file).
-        assert_replicated_byte_identical(
-            follower2.follower_log(P).unwrap(),
-            &leader_log,
-            served_end,
-        );
+        follower2
+            .with_follower_log(P, |log| {
+                assert_replicated_byte_identical(log, &leader_log, served_end);
+            })
+            .unwrap();
 
         // Catch follower 3 up too (its reports release nothing new — the acks already released).
         for _ in 0..(leader_hw + 4) {
@@ -1901,11 +2003,11 @@ mod tests {
                 "acks already released, none re-release"
             );
         }
-        assert_replicated_byte_identical(
-            follower3.follower_log(P).unwrap(),
-            &leader_log,
-            served_end,
-        );
+        follower3
+            .with_follower_log(P, |log| {
+                assert_replicated_byte_identical(log, &leader_log, served_end);
+            })
+            .unwrap();
     }
 
     // ---- below min_isr a produce BLOCKS (no false ack) -------------------------------------------
@@ -2103,11 +2205,11 @@ mod tests {
             let resp = new_leader.serve_fetch(P, &req).unwrap();
             follower.apply_fetch_response(P, &resp).unwrap();
         }
-        assert_replicated_byte_identical(
-            follower.follower_log(P).unwrap(),
-            &new_leader_log,
-            new_served,
-        );
+        follower
+            .with_follower_log(P, |log| {
+                assert_replicated_byte_identical(log, &new_leader_log, new_served);
+            })
+            .unwrap();
     }
 
     // ---- single-node / single-replica = the local-fsync ack, byte-identical ----------------------
@@ -2242,10 +2344,8 @@ mod tests {
             follower.apply_fetch_response(P, &resp).unwrap();
         }
         let durable = follower
-            .follower_log(P)
-            .expect("follower log")
-            .next_offset()
-            .get();
+            .with_follower_log(P, |log| log.next_offset().get())
+            .expect("follower log");
         assert!(durable > 0, "the follower durably holds some records");
 
         // A bar ABOVE the follower's durable frontier => the self-verify aborts fail-closed.

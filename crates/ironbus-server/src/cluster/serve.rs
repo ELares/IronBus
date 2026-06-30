@@ -529,6 +529,17 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
         self.seam.controller().leader_read_plane(partition)
     }
 
+    /// The per-partition follower handle for `partition`, or `None` if this node is not its follower
+    /// (#809). The follower fetch thread clones this once under the server lock then applies OFF the lock
+    /// — see [`DataPlaneController::follower_handle`].
+    #[must_use]
+    pub fn follower_handle(
+        &self,
+        partition: u64,
+    ) -> Option<super::dataplane::FollowerHandle<F, C>> {
+        self.seam.controller().follower_handle(partition)
+    }
+
     /// Record an inbound follower [`AckReplicatedBody`](super::isr::AckReplicatedBody) report for
     /// `partition` and return the REAL wire-`PubAck` byte-frames the report just released past the
     /// quorum-commit (in offset order), for the caller to flush onto the parked producer connections.
@@ -1423,6 +1434,20 @@ fn follower_fetch_loop<F, C>(
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
 {
+    // #809: clone this partition's follower handle ONCE. The per-iteration apply (decode + append +
+    // `log.sync()` fsync) then runs on it OFF the node-global server `Mutex`, holding only this handle's
+    // PER-PARTITION lock — so partition A's apply/fsync never blocks partition B's serve/apply/park. The
+    // handle stays valid across a promotion (which does NOT consume the `Arc`); the per-iteration
+    // `make_fetch_request` still goes through the controller and exits the loop once the role is gone.
+    let (handle, node_id) = {
+        let Ok(srv) = server.lock() else {
+            return; // poisoned: tearing down
+        };
+        match srv.follower_handle(partition) {
+            Some(handle) => (handle, srv.node_id()),
+            None => return, // not a follower of this partition
+        }
+    };
     // The budget the throttle decided for the NEXT fetch. Seeded full-rate: the first fetch of a
     // freshly-dialed link runs at full budget (the backlog is not known until the first response), and
     // the throttle shapes every subsequent fetch from the observed backlog + service delay.
@@ -1471,26 +1496,22 @@ fn follower_fetch_loop<F, C>(
                 // The network round-trip ended here (response received), BEFORE the local apply/fsync.
                 let net_nanos = u64::try_from(fetch_sent.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let leader_hw = resp.high_watermark;
-                // Apply + build the report under a short lock, then send the report off-lock.
+                // Apply + build the report OFF the global server lock (#809) — under this partition's
+                // follower lock only, so the apply's `log.sync()` fsync does not block another partition's
+                // serve/apply. Then send the report off-lock (as before).
                 let report = {
-                    let Ok(mut srv) = server.lock() else {
-                        return;
-                    };
                     if resp.record_count > 0 {
                         // Apply the CRC-revalidated bytes to the follower's own replica log. A
                         // divergence / corrupt frame fails closed (nothing from the bad frame is
                         // appended); drop this response and re-fetch from the current frontier.
-                        if srv
-                            .seam_mut()
-                            .controller_mut()
-                            .apply_fetch_response(partition, &resp)
-                            .is_err()
-                        {
+                        if crate::cluster::dataplane::apply_on_follower(&handle, &resp).is_err() {
                             // Fail-closed: reconnect + refetch from the recovered frontier.
                             return;
                         }
                     }
-                    srv.seam().controller().follower_report(partition).ok()
+                    Some(crate::cluster::dataplane::report_from_follower(
+                        &handle, node_id,
+                    ))
                 };
                 // The follower's next offset AFTER the apply (its fsync'd frontier) — what it just
                 // reported. The backlog is the leader's high-watermark minus this.
@@ -1759,6 +1780,68 @@ mod tests {
         assert!(
             matches!(outcome, OffLockServe::Send(_)),
             "the off-lock serve produced a FetchResponse"
+        );
+    }
+
+    #[test]
+    fn a_follower_apply_does_not_hold_the_server_lock_across_the_fsync() {
+        // #809 Phase 2: the follower fetch thread applies a fetch response (decode + append + `log.sync()`
+        // fsync) OFF the node-global server `Mutex`, under the partition's OWN follower lock. We park a
+        // follower apply mid-fsync (the fault sync gate) and prove the server `Mutex` is FREE (so another
+        // partition's serve/apply/park would not wait) while the per-partition follower lock IS held — i.e.
+        // the apply runs under the partition lock, NOT the global lock. Pre-#809 the apply ran under the
+        // global lock, so `server.try_lock()` would be `WouldBlock` during the parked fsync.
+        const P: u64 = 0;
+        // A leader controller with a few sealed records to serve a real fetch response.
+        let leader_log = leaked_leader_log(12);
+        let mut leader: DataPlaneController<InMemoryFs, ManualClock> = DataPlaneController::new(1);
+        leader.start_leader(
+            P,
+            leader_plane(leader_log),
+            EpochCache::new(),
+            &[2],
+            quorum3(),
+        );
+
+        // A FOLLOWER `DataPlaneServer` over a FAULT-fs replica log, so we can park its apply's fsync.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let follower_log = Log::open(fs, ManualClock::new(), small_config()).expect("follower log");
+        let mut fc: DataPlaneController<FaultFs<InMemoryFs>, ManualClock> =
+            DataPlaneController::new(2);
+        fc.start_follower(P, follower_log);
+        let server = Arc::new(Mutex::new(DataPlaneServer::new(2, ProduceAckSeam::new(fc))));
+
+        // Build the follower's fetch request and serve it from the leader → a real `FetchResponse`.
+        let req = server
+            .lock()
+            .unwrap()
+            .seam()
+            .controller()
+            .make_fetch_request(P, 8, 4096)
+            .unwrap();
+        let resp = leader.serve_fetch(P, &req).unwrap();
+        assert!(resp.record_count > 0, "the leader served records to apply");
+        let handle = server.lock().unwrap().follower_handle(P).unwrap();
+
+        // Park the apply mid-fsync, then assert the off-global-lock / on-partition-lock property.
+        control.close_sync_gate();
+        let apply_handle = Arc::clone(&handle);
+        let apply = std::thread::spawn(move || {
+            crate::cluster::dataplane::apply_on_follower(&apply_handle, &resp)
+        });
+        control.wait_for_sync_gate_entered(1);
+        assert!(
+            server.try_lock().is_ok(),
+            "the server Mutex is FREE during the follower apply's fsync (#809 — off the global lock)"
+        );
+        assert!(
+            handle.try_lock().is_err(),
+            "the apply holds the PER-PARTITION follower lock during the fsync (not the global lock)"
+        );
+        control.open_sync_gate();
+        assert!(
+            apply.join().unwrap().is_ok(),
+            "the off-lock apply completed once the fsync was released"
         );
     }
 
@@ -2062,13 +2145,11 @@ mod tests {
         }
 
         fn replica_dump(&self) -> Vec<(String, Vec<u8>)> {
-            dump_segments(
-                self.server
-                    .seam()
-                    .controller()
-                    .follower_log(self.partition)
-                    .unwrap(),
-            )
+            self.server
+                .seam()
+                .controller()
+                .with_follower_log(self.partition, dump_segments)
+                .unwrap()
         }
     }
 
@@ -3397,12 +3478,20 @@ mod live_runtime_tests {
         // runtime: lock the server and dump the follower's own replica log.
         {
             let f2 = f2_rt.server().lock().unwrap();
-            let dump = dump_segments(f2.seam().controller().follower_log(P).unwrap());
+            let dump = f2
+                .seam()
+                .controller()
+                .with_follower_log(P, dump_segments)
+                .unwrap();
             assert_replicated_byte_identical(&dump, leader_log);
         }
         {
             let f3 = f3_rt.server().lock().unwrap();
-            let dump = dump_segments(f3.seam().controller().follower_log(P).unwrap());
+            let dump = f3
+                .seam()
+                .controller()
+                .with_follower_log(P, dump_segments)
+                .unwrap();
             assert_replicated_byte_identical(&dump, leader_log);
         }
 
@@ -3560,7 +3649,11 @@ mod live_runtime_tests {
         // Its recovered replica is byte-identical to the leader.
         {
             let f = f_rt2.server().lock().unwrap();
-            let dump = dump_segments(f.seam().controller().follower_log(P).unwrap());
+            let dump = f
+                .seam()
+                .controller()
+                .with_follower_log(P, dump_segments)
+                .unwrap();
             assert_replicated_byte_identical(&dump, leader_log);
         }
         f_rt2.stop();
@@ -3979,7 +4072,11 @@ mod live_runtime_tests {
         // gap-free (a gap or reorder would diverge the bytes and the apply would have failed closed).
         {
             let f = f_rt.server().lock().unwrap();
-            let dump = dump_segments(f.seam().controller().follower_log(P).unwrap());
+            let dump = f
+                .seam()
+                .controller()
+                .with_follower_log(P, dump_segments)
+                .unwrap();
             assert_replicated_byte_identical(&dump, leader_log);
         }
 
