@@ -578,6 +578,14 @@ fn with_ack_level_bits(flags: u8, level: AckLevel) -> u8 {
     (flags & !PUB_FLAG_ACK_LEVEL_MASK) | bits
 }
 
+/// The AGGREGATE materialized-payload-bytes ceiling for ONE fetch window (#879): the running sum of
+/// decompressed/raw payload bytes a single `fetch`/`fetch_batch` may push into its `messages` Vec before
+/// it fails closed with [`ClientError::BadResponse`]. The per-record decompression cap
+/// (`DEFAULT_MAX_DECOMPRESSED_BYTES`, 8 MiB) bounds ONE record; this bounds the WHOLE window, so a
+/// credit-bounded fetch of many tiny high-ratio frames cannot materialize `credit x 8 MiB` resident.
+/// 256 MiB = 32 max-size records, generous for a legitimate batch yet far below a multi-GiB OOM.
+const MAX_FETCH_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
 /// Ingests one decoded delivery (`d`) into the fetch result, applying the SAME transparent broker-side
 /// decompression (#430) the per-record path does and pushing the resulting [`Message`] onto `messages`
 /// — UNLESS a prior decompression failure already poisoned the batch (`poison.is_some()`), in which case
@@ -591,14 +599,6 @@ fn with_ack_level_bits(flags: u8, level: AckLevel) -> u8 {
 /// once it would exceed `max_aggregate` ([`MAX_FETCH_DECOMPRESSED_BYTES`]) the batch is poisoned with a
 /// [`ClientError::BadResponse`] (#879), so a credit-bounded fetch of a tiny wire response can never
 /// expand to credit x the per-record cap of resident RAM.
-/// The AGGREGATE materialized-payload-bytes ceiling for ONE fetch window (#879): the running sum of
-/// decompressed/raw payload bytes a single `fetch`/`fetch_batch` may push into its `messages` Vec before
-/// it fails closed with [`ClientError::BadResponse`]. The per-record decompression cap
-/// (`DEFAULT_MAX_DECOMPRESSED_BYTES`, 8 MiB) bounds ONE record; this bounds the WHOLE window, so a
-/// credit-bounded fetch of many tiny high-ratio frames cannot materialize `credit x 8 MiB` resident.
-/// 256 MiB = 32 max-size records, generous for a legitimate batch yet far below a multi-GiB OOM.
-const MAX_FETCH_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
-
 fn ingest_delivery(
     d: &DeliverBody<'_>,
     messages: &mut Vec<Message>,
