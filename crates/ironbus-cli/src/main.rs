@@ -18846,6 +18846,14 @@ mod tests {
         // A file owned by the broker's effective uid is trusted.
         assert!(strict_mode_secret_file_verdict("/x", 0o600, MALLORY, MALLORY).is_ok());
 
+        // The ordinary (#635) non-root case: a non-root broker rejects a THIRD party's 0600 file.
+        assert_eq!(
+            strict_mode_secret_file_verdict("/x", 0o600, MALLORY, 2000)
+                .unwrap_err()
+                .0,
+            SECRET_REFUSAL_WRONG_OWNER
+        );
+
         // The mode check still fires regardless of owner: a group/world bit is fatal even self-owned.
         assert_eq!(
             strict_mode_secret_file_verdict("/x", 0o640, MALLORY, MALLORY)
@@ -18855,6 +18863,13 @@ mod tests {
         );
         assert_eq!(
             strict_mode_secret_file_verdict("/x", 0o604, ROOT, ROOT)
+                .unwrap_err()
+                .0,
+            SECRET_REFUSAL_GROUP_WORLD
+        );
+        // Mode-vs-owner precedence: when BOTH would fail, the mode (group/world) check wins.
+        assert_eq!(
+            strict_mode_secret_file_verdict("/x", 0o640, MALLORY, ROOT)
                 .unwrap_err()
                 .0,
             SECRET_REFUSAL_GROUP_WORLD
