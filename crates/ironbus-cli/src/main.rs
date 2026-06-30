@@ -5271,8 +5271,10 @@ const SECRET_REFUSAL_GROUP_WORLD: &str = "group_world_readable";
 const SECRET_REFUSAL_WRONG_OWNER: &str = "wrong_owner";
 
 /// The shared body of the `StrictModes` check (#635): returns `Ok(())` when the file is owner-only and
-/// owned by the broker's uid, or `Err((condition, CliError))` naming both the audit condition tag and
-/// the human error. The contents are NEVER read — only `stat`'d.
+/// owned by the broker's EFFECTIVE uid (or by root), or `Err((condition, CliError))` naming both the
+/// audit condition tag and the human error. The contents are NEVER read — only `stat`'d. The pure
+/// decision is factored into [`strict_mode_secret_file_verdict`] so it is unit-testable with arbitrary
+/// uids (this wrapper just does the `stat` and reads the broker's effective uid).
 #[cfg(unix)]
 fn strict_mode_check_secret_file_inner(path: &str) -> Result<(), (&'static str, CliError)> {
     use std::os::unix::fs::MetadataExt;
@@ -5285,8 +5287,27 @@ fn strict_mode_check_secret_file_inner(path: &str) -> Result<(), (&'static str, 
             )),
         )
     })?;
+    strict_mode_secret_file_verdict(path, meta.mode(), meta.uid(), unsafe_geteuid())
+}
+
+/// The PURE `StrictModes` decision for a secret file (#635, #881, #886): given its stat'd `mode` and
+/// owner `file_uid`, and the broker's effective uid `our_euid`, returns `Ok(())` only when the file is
+/// owner-only AND owned by the broker's effective uid OR by root. No syscall, no fs — so it is unit-
+/// testable with arbitrary uids.
+///
+/// The owner check gates on the FILE owner, NOT on whether the broker is root: a root broker must still
+/// reject an attacker-owned 0600 file (a non-root local user could read AND rewrite it), so the only
+/// trusted owners are the broker's own (effective) uid and root (uid 0, which a root broker could
+/// rewrite anyway) (#881). The comparison uses the EFFECTIVE uid because that is the identity that
+/// actually governs the subsequent file read (#886).
+#[cfg(unix)]
+fn strict_mode_secret_file_verdict(
+    path: &str,
+    mode: u32,
+    file_uid: u32,
+    our_euid: u32,
+) -> Result<(), (&'static str, CliError)> {
     // `mode & 0o077`: any group/other read/write/execute bit is fatal.
-    let mode = meta.mode();
     if mode & 0o077 != 0 {
         return Err((
             SECRET_REFUSAL_GROUP_WORLD,
@@ -5297,16 +5318,15 @@ fn strict_mode_check_secret_file_inner(path: &str) -> Result<(), (&'static str, 
             )),
         ));
     }
-    // Wrong-owner: a 0600 file owned by ANOTHER user is still readable by that user.
-    let uid = meta.uid();
-    let our_uid = unsafe_getuid();
-    if uid != our_uid && our_uid != 0 {
+    // Wrong-owner: a 0600 file owned by ANOTHER (non-root) user is still readable AND writable by that
+    // user, so it is rejected even when the broker runs as root.
+    if file_uid != our_euid && file_uid != 0 {
         return Err((
             SECRET_REFUSAL_WRONG_OWNER,
             CliError::Usage(format!(
-                "refusing to start: secret-bearing file `{path}` is owned by uid {uid}, not the \
-                 broker's uid {our_uid}; a secret file must be owned by the user the broker runs as. \
-                 The file contents were not read."
+                "refusing to start: secret-bearing file `{path}` is owned by uid {file_uid}, not the \
+                 broker's effective uid {our_euid} or root; a secret file must be owned by the user the \
+                 broker runs as. The file contents were not read."
             )),
         ));
     }
@@ -5340,15 +5360,17 @@ fn strict_mode_check_secret_file_audited(
     }
 }
 
-/// The broker process's real user id, for the `StrictModes` wrong-owner check (#635). `libc::getuid`
-/// is always-successful and the only FFI here; `libc` is already a pure-Rust syscall binding in the
-/// shipped graph (the data-dir lock uses `flock(2)` the same way).
+/// The broker process's EFFECTIVE user id, for the `StrictModes` wrong-owner check (#635, #886). The
+/// effective uid (not the real uid) is the identity that governs the secret file's `stat`/read, so it is
+/// the right one to compare the file owner against. `libc::geteuid` is always-successful and the only FFI
+/// here; `libc` is already a pure-Rust syscall binding in the shipped graph (the data-dir lock uses
+/// `flock(2)` the same way).
 #[cfg(unix)]
-fn unsafe_getuid() -> u32 {
-    // SAFETY: getuid() takes no arguments, never fails, and only reads the process's real uid.
+fn unsafe_geteuid() -> u32 {
+    // SAFETY: geteuid() takes no arguments, never fails, and only reads the process's effective uid.
     #[allow(unsafe_code)]
     unsafe {
-        libc::getuid()
+        libc::geteuid()
     }
 }
 
@@ -18793,6 +18815,50 @@ mod tests {
         assert!(strict_mode_check_secret_file(path.to_str().unwrap()).is_ok());
         // A missing file fails closed.
         assert!(strict_mode_check_secret_file("/no/such/secret/file").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_mode_verdict_rejects_a_non_root_owned_file_even_when_the_broker_is_root() {
+        // #881: a root broker (effective uid 0) must STILL reject a 0600 secret file owned by an
+        // unprivileged local user — the wrong-owner check gates on the FILE owner, NOT on whether the
+        // broker is root (the OLD code skipped the owner check entirely when our uid was 0). #886: the
+        // identity compared is the EFFECTIVE uid. Tested on the pure verdict so arbitrary uids are
+        // exercisable without needing to own a temp file as another user.
+        const MALLORY: u32 = 1000;
+        const ROOT: u32 = 0;
+
+        // A root broker pointed at mallory's 0600 file fails closed (the #881 regression).
+        let e = strict_mode_secret_file_verdict("/x", 0o600, MALLORY, ROOT).unwrap_err();
+        assert_eq!(e.0, SECRET_REFUSAL_WRONG_OWNER);
+        match e.1 {
+            CliError::Usage(m) => {
+                assert!(m.contains("owned by uid 1000"), "{m}");
+                assert!(m.contains("effective uid 0 or root"), "{m}");
+                assert!(m.contains("contents were not read"), "{m}");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+
+        // A root-OWNED (uid 0) 0600 file is trusted by any broker (root could rewrite it anyway).
+        assert!(strict_mode_secret_file_verdict("/x", 0o600, ROOT, ROOT).is_ok());
+        assert!(strict_mode_secret_file_verdict("/x", 0o600, ROOT, MALLORY).is_ok());
+        // A file owned by the broker's effective uid is trusted.
+        assert!(strict_mode_secret_file_verdict("/x", 0o600, MALLORY, MALLORY).is_ok());
+
+        // The mode check still fires regardless of owner: a group/world bit is fatal even self-owned.
+        assert_eq!(
+            strict_mode_secret_file_verdict("/x", 0o640, MALLORY, MALLORY)
+                .unwrap_err()
+                .0,
+            SECRET_REFUSAL_GROUP_WORLD
+        );
+        assert_eq!(
+            strict_mode_secret_file_verdict("/x", 0o604, ROOT, ROOT)
+                .unwrap_err()
+                .0,
+            SECRET_REFUSAL_GROUP_WORLD
+        );
     }
 
     // `#[cfg(unix)]`: calls `load_auth_config` (itself `#[cfg(unix)]` — it StrictModes-checks the
