@@ -58,12 +58,35 @@
 //! same materialized records the through-actor path returns (the differential test in `log.rs`
 //! asserts byte-for-byte equality).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 
 use crate::fs::Filesystem;
+
+/// The maximum opened SEALED-segment readers a single off-actor snapshot generation caches (#808). Beyond
+/// it, a read opens its segment UNCACHED (per-read, like pre-#808) so a retention-off cold full backfill
+/// can never hold one fd per sealed segment at once (an EMFILE exposure). A tailing/replication working
+/// set is small and touched first, so it stays fully cached; only a cold deep replay past the cap re-opens
+/// per read. Mirrors the through-actor `Log`'s `DEFAULT_SEALED_READER_CACHE_CAP`.
+const DEFAULT_PLANE_READER_CACHE_CAP: usize = 256;
+
+/// The per-snapshot reader-cache cap, overridable in tests to a small value so a cap test need not open
+/// hundreds of segments. `0` (the default) means "use [`DEFAULT_PLANE_READER_CACHE_CAP`]".
+#[cfg(test)]
+static TEST_PLANE_READER_CACHE_CAP: AtomicUsize = AtomicUsize::new(0);
+
+fn plane_reader_cache_cap() -> usize {
+    #[cfg(test)]
+    {
+        let overridden = TEST_PLANE_READER_CACHE_CAP.load(Ordering::Relaxed);
+        if overridden != 0 {
+            return overridden;
+        }
+    }
+    DEFAULT_PLANE_READER_CACHE_CAP
+}
 use crate::naming::segment_file_name;
 use crate::segment::{OwnedRecord, RawByteRun, SegmentReader, StorageError};
 use ironbus_core::types::Offset;
@@ -76,31 +99,41 @@ use ironbus_core::types::Offset;
 /// readers — positioned (`pread`) reads need no cursor and no lock — and the WHOLE snapshot (and thus
 /// every fd it opened) drops when a roll/reap republishes a fresh snapshot, so fds never leak past the
 /// generation that opened them.
-struct SlotReaders<F: Filesystem>(Vec<OnceLock<Arc<SegmentReader<F::File>>>>);
+///
+/// FD-BOUNDED: at most `cap` slots are ever cached in one generation (`opened` counts the cached slots,
+/// lock-free). A read past the cap opens UNCACHED — per-read, exactly as before #808 — so a cold full
+/// backfill within one generation can never hold one fd per sealed segment at once (the EMFILE exposure).
+/// The cap is a SOFT bound: concurrent openers may exceed it by at most the number of racing threads.
+struct SlotReaders<F: Filesystem> {
+    slots: Vec<OnceLock<Arc<SegmentReader<F::File>>>>,
+    /// The number of slots actually opened-and-cached so far this generation (the resident-fd bound).
+    opened: AtomicUsize,
+    cap: usize,
+}
 
 impl<F: Filesystem> SlotReaders<F> {
-    /// A fresh, all-empty cache sized to `len` sealed segments (one `OnceLock` per slot).
+    /// A fresh, all-empty cache sized to `len` sealed segments (one `OnceLock` per slot), bounded to
+    /// [`plane_reader_cache_cap`] resident readers.
     fn empty(len: usize) -> SlotReaders<F> {
-        SlotReaders((0..len).map(|_| OnceLock::new()).collect())
+        SlotReaders {
+            slots: (0..len).map(|_| OnceLock::new()).collect(),
+            opened: AtomicUsize::new(0),
+            cap: plane_reader_cache_cap(),
+        }
     }
 }
 
-// Manual `Clone`/`Debug` so neither requires `F::File: Clone`/`Debug` (the `Filesystem::File` associated
-// type carries no such bound). A clone shares the already-opened readers via their `Arc`s — but a clone
-// is never on the publish path (`republish_sealed` builds a FRESH snapshot), so no fd is shared across
-// generations; `Debug` prints only counts, never the readers.
-impl<F: Filesystem> Clone for SlotReaders<F> {
-    fn clone(&self) -> SlotReaders<F> {
-        SlotReaders(self.0.clone())
-    }
-}
-
+// Manual `Debug` so it needs no `F::File: Debug` bound (the `Filesystem::File` associated type carries
+// none) and prints only counts, never the readers. NO `Clone`: a clone would share opened fds via their
+// `Arc`s and the `opened` counter could not be meaningfully copied; the publish path
+// (`republish_sealed`) always builds a FRESH snapshot, never clones, so `SealedSnapshot` does not derive
+// `Clone` either — removing a latent fd-aliasing footgun.
 impl<F: Filesystem> std::fmt::Debug for SlotReaders<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let opened = self.0.iter().filter(|c| c.get().is_some()).count();
         f.debug_struct("SlotReaders")
-            .field("slots", &self.0.len())
-            .field("opened", &opened)
+            .field("slots", &self.slots.len())
+            .field("opened", &self.opened.load(Ordering::Relaxed))
+            .field("cap", &self.cap)
             .finish_non_exhaustive()
     }
 }
@@ -186,7 +219,11 @@ impl SealedSegment {
 /// round-trip. Replaced wholesale by the writer when a roll seals a new segment or a reap retires
 /// one; a reader holding an older `Arc` simply reads an older (still-valid, possibly fewer-segments)
 /// view, which the flushed frontier bound clamps correctly.
-#[derive(Clone, Debug)]
+//
+// NOT `Clone`: the per-segment reader cache (`SlotReaders`, #808) holds opened fds whose `Arc`s must not
+// be aliased across snapshot generations, and the publish path (`republish_sealed`) always builds a FRESH
+// snapshot rather than cloning, so `Clone` is unused — dropping it removes the fd-aliasing footgun.
+#[derive(Debug)]
 pub(crate) struct SealedSnapshot<F: Filesystem> {
     /// The filesystem handle, shared (the same directory the writer owns). Reads open their OWN
     /// `SegmentReader` over an immutable sealed file, so a concurrent reader never aliases the
@@ -273,18 +310,25 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         i: usize,
         slot: &SealedSegment,
     ) -> Result<Arc<SegmentReader<F::File>>, StorageError> {
-        if let Some(reader) = self.readers.0[i].get() {
+        if let Some(reader) = self.readers.slots[i].get() {
             return Ok(Arc::clone(reader));
         }
         let opened = Arc::new(SegmentReader::open(
             self.fs.open(&segment_file_name(slot.id))?,
         )?);
-        // `set` fails if another thread won the race; either way the slot is now initialized, so read it
-        // back and return the stored reader (the winner's), letting `opened` drop if we lost.
-        let _ = self.readers.0[i].set(opened);
-        Ok(Arc::clone(self.readers.0[i].get().expect(
-            "slot reader is initialized after set or a lost race",
-        )))
+        // Cache only while under the per-generation cap (the resident-fd bound). Past it, return the fresh
+        // open UNCACHED — a per-read open exactly as before #808 — so a cold full backfill can't pin one
+        // fd per sealed segment. `opened < cap` is a soft check (concurrent openers may exceed it by the
+        // number of racing threads, never unboundedly).
+        if self.readers.opened.load(Ordering::Relaxed) < self.readers.cap {
+            // `set` fails if another thread won the race for this slot; count ONLY a winning set so
+            // `opened` tracks distinct cached slots. Either way the slot is now initialized.
+            if self.readers.slots[i].set(Arc::clone(&opened)).is_ok() {
+                self.readers.opened.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(self.readers.slots[i].get().map_or(opened, Arc::clone));
+        }
+        Ok(opened)
     }
 
     /// The index in `segments` of the sealed segment whose range holds `offset` (the slot with the
@@ -726,6 +770,13 @@ impl<F: crate::fs::Filesystem> ReadPlane<F> {
         let snapshot = self.sealed.load();
         snapshot.read_range_raw(start.get(), flushed, max_records, max_bytes)
     }
+
+    /// The number of sealed-segment readers currently cached in the live snapshot (#808): the resident-fd
+    /// count, which the per-generation cap bounds. Lets a test assert the fd bound directly.
+    #[cfg(test)]
+    fn resident_reader_count(&self) -> usize {
+        self.sealed.load().readers.opened.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -879,6 +930,47 @@ mod tests {
             1,
             "a republished snapshot re-opens segment 0 once (the old generation's fd was dropped, not reused)"
         );
+    }
+
+    /// #808 (SHOULD-FIX): the per-snapshot reader cache is FD-BOUNDED — it never caches more than its cap
+    /// readers, so a cold full backfill within one generation cannot pin one fd per sealed segment. With a
+    /// cap of 2, reading the WHOLE multi-segment sealed prefix leaves at most 2 readers resident; the
+    /// over-cap segments are read uncached (correctness unchanged — same bytes).
+    #[test]
+    fn the_plane_reader_cache_is_fd_bounded_per_generation() {
+        TEST_PLANE_READER_CACHE_CAP.store(2, Ordering::Relaxed);
+        let (mut log, _control) = small_fault_log();
+        for i in 0..60u32 {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+            if i % 5 == 0 {
+                log.sync().unwrap();
+            }
+        }
+        log.sync().unwrap();
+        let plane = log.read_plane().unwrap();
+        let flushed = log.flushed_offset().get();
+        // Read across the whole sealed prefix many times (well more segments than the cap of 2).
+        let mut total = 0;
+        for _ in 0..3 {
+            for off in 0..flushed {
+                total += plane
+                    .read_range(Offset::new(off), 1, None)
+                    .unwrap()
+                    .records
+                    .len();
+            }
+        }
+        assert!(total > 0, "the sealed prefix served records");
+        assert!(
+            plane.resident_reader_count() <= 2,
+            "the cache never holds more than its cap of 2 readers (fd-bounded), got {}",
+            plane.resident_reader_count()
+        );
+        assert!(
+            plane.resident_reader_count() >= 1,
+            "but it does cache within the cap (the hot segment is reused)"
+        );
+        TEST_PLANE_READER_CACHE_CAP.store(0, Ordering::Relaxed);
     }
 
     /// #664: the off-actor WINDOW-BOUNDED read-end (`SealedSegment::window_read_end`) is correct over
