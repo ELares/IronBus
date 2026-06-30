@@ -977,12 +977,6 @@ impl Session {
                 return Ok(());
             }
         };
-        // A well-formed Connect: the handshake is now RESOLVING (auth below succeeds or fails, then this
-        // connection is authenticated or closed). Release the half-open (pre-auth) slot here so the #633
-        // half-open cap measures connections still mid-handshake, not authenticated long-lived ones
-        // (#880). A bad-credential flood is bounded by the per-IP auth-failure lockout, not this cap, so
-        // releasing before the auth verdict is correct; an inert slot (no cap configured) is a no-op.
-        self.half_open_slot = None;
         // AUTHENTICATE FIRST (#631, V2-M7), before any negotiation or `connected` flip. On an
         // auth-required broker (an identity table is configured) the `Connect` MUST carry a valid
         // credential; the resolved identity's scope set is PINNED to the connection for its lifetime. On
@@ -1028,6 +1022,12 @@ impl Session {
                     mechanism,
                     outcome: crate::audit::Outcome::Failure,
                 });
+                // The handshake has RESOLVED (auth FAILED, AFTER the memory-hard Argon2id verify above):
+                // release the half-open slot (#880). Dropping it only AFTER the verify keeps the #633
+                // half-open cap as the documented GLOBAL backstop on concurrent unauthenticated verifies
+                // (preauth.rs §2) — a distributed flood must not be able to run more concurrent verifies
+                // than the cap by freeing the slot before the verify.
+                self.half_open_slot = None;
                 reply_auth_violation(out);
                 return Err(SessionError::AuthViolation);
             };
@@ -1060,6 +1060,13 @@ impl Session {
                 connz.record_authenticated();
             }
         }
+        // The handshake has RESOLVED (authenticated, or a no-auth broker with nothing to verify): release
+        // the half-open slot (#880) so an authenticated long-lived connection no longer pins it. Done
+        // AFTER the auth block (the memory-hard Argon2id verify), so the #633 half-open cap stays the
+        // documented GLOBAL backstop on concurrent unauthenticated verifies; a slowloris that never
+        // reaches here keeps its slot until the connection times out. An inert / `None` slot is a no-op,
+        // and a repeated Connect re-runs this idempotently (the slot is already released).
+        self.half_open_slot = None;
         self.connected = true;
         // Record the client's request (re-recorded on a repeated Connect, which re-negotiates
         // idempotently). It is also used by the lazy `credit_ceiling` fallback for a session that never
@@ -7249,6 +7256,72 @@ mod tests {
         // The cap is free again: a new accept succeeds even though the first connection is still open
         // and authenticated. Pre-fix the slot stayed held for the whole connection and this failed.
         assert!(guard.on_accept("5.6.7.8".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn the_half_open_slot_releases_after_the_auth_verdict_on_both_success_and_failure() {
+        use crate::preauth::{PreAuthConfig, PreAuthGuard};
+        // #880 (post-verdict release): on an AUTH-REQUIRED broker the half-open slot is dropped only
+        // AFTER the auth verdict (so the #633 cap stays the global backstop on concurrent unauthenticated
+        // Argon2id verifies). It is released on BOTH a FAILED Connect (through the auth-failure branch)
+        // and a successful one — but never before the verify runs.
+        let cfg = PreAuthConfig {
+            per_ip_rate_per_sec: 0,
+            per_ip_burst: 0,
+            half_open_cap: 4,
+            lockout_threshold: 0,
+            lockout_window_ms: 0,
+            lockout_cooldown_ms: 0,
+        };
+        let connz = Arc::new(crate::connz::ConnectionMetrics::new());
+        let guard = Arc::new(PreAuthGuard::new(
+            cfg,
+            Arc::new(ManualClock::new()) as Arc<dyn Clock>,
+            connz,
+        ));
+        let e = DirectEngine::new(engine());
+        let token = b"a-secret-token-of-32-bytes-len!!";
+
+        // A FAILED auth (no credential on an auth-required broker) still releases the slot — through the
+        // auth-failure branch, AFTER the verify.
+        let slot_fail = guard.on_accept("1.1.1.1".parse().unwrap()).unwrap();
+        assert_eq!(guard.half_open_count(), 1);
+        let mut s = Session::with_member_id_and_auth(
+            MemberId::new(0),
+            bearer_auth(token, &[Scope::Publish]),
+            None,
+        )
+        .with_half_open_slot(slot_fail);
+        let mut out = Vec::new();
+        assert!(matches!(
+            s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+                .unwrap_err(),
+            SessionError::AuthViolation
+        ));
+        assert_eq!(
+            guard.half_open_count(),
+            0,
+            "a failed auth releases the slot (in the auth-failure branch, after the verify)"
+        );
+
+        // A SUCCESSFUL auth releases the slot too.
+        let slot_ok = guard.on_accept("2.2.2.2".parse().unwrap()).unwrap();
+        assert_eq!(guard.half_open_count(), 1);
+        let mut s2 = Session::with_member_id_and_auth(
+            MemberId::new(1),
+            bearer_auth(token, &[Scope::Publish]),
+            None,
+        )
+        .with_half_open_slot(slot_ok);
+        let mut out2 = Vec::new();
+        s2.process(&e, &connect_with_bearer(token), &mut out2)
+            .unwrap();
+        assert!(s2.authenticated);
+        assert_eq!(
+            guard.half_open_count(),
+            0,
+            "a successful auth releases the slot"
+        );
     }
 
     #[test]
