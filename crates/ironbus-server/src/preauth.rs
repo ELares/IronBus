@@ -377,19 +377,22 @@ impl PreAuthGuard {
         self.lock_ips().len()
     }
 
-    /// The current half-open count (for tests).
+    /// The current half-open count (for tests, incl. the #880 session-level release test).
     #[cfg(test)]
-    fn half_open_count(&self) -> usize {
+    pub(crate) fn half_open_count(&self) -> usize {
         self.half_open.load(Ordering::Acquire)
     }
 }
 
-/// An RAII slot for one half-open (accepted-but-not-yet-authed) connection (#633). Held by the
-/// connection handler for the whole handshake window; on drop (handshake resolved — success, failure,
-/// or disconnect) it decrements the global half-open count, so a stalled/slowloris half-open client
-/// holds at most one slot and the count can never leak. It OWNS an `Arc` clone of the guard so it is
-/// `'static` and moves into the spawned handler thread. When the half-open cap is disabled the slot is
-/// inert (`guard: None`), so a no-cap broker pays nothing.
+/// An RAII slot for one half-open (accepted-but-not-yet-authed) connection (#633). Handed to the
+/// connection's [`Session`](crate::session::Session) (`with_half_open_slot`) and dropped when the
+/// `Connect` HANDSHAKE RESOLVES — a well-formed `Connect`, whether auth succeeds or fails (#880) — or,
+/// for a slowloris that never sends a well-formed `Connect`, when the connection times out and drops
+/// the session. On drop it decrements the global half-open count, so a stalled half-open client holds
+/// at most one slot, the count can never leak, AND an authenticated long-lived connection no longer
+/// pins a slot (so the cap measures mid-handshake connections, not total ones). It OWNS an `Arc` clone
+/// of the guard so it is `'static` and moves into the spawned handler thread. When the half-open cap is
+/// disabled the slot is inert (`guard: None`), so a no-cap broker pays nothing.
 #[derive(Debug)]
 pub struct HalfOpenSlot {
     guard: Option<Arc<PreAuthGuard>>,

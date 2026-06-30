@@ -414,12 +414,12 @@ where
                         active: slot_active,
                         connz: Arc::clone(&connz_for_conn),
                     };
-                    // Hold the half-open slot (#633) for the WHOLE handshake window: it is dropped here
-                    // when the handler returns (handshake resolved — success, failure, or disconnect),
-                    // decrementing the global half-open count, so a stalled/slowloris half-open client
-                    // holds at most one slot and the count can never leak. `None` when the half-open cap
-                    // is disabled (the slot is inert).
-                    let _half_open = half_open_slot;
+                    // Hand the half-open slot (#633) to the session so it is released when the `Connect`
+                    // HANDSHAKE RESOLVES (a well-formed Connect, success or failure), not at connection
+                    // teardown — so the `--max-preauth-connections` cap measures connections still
+                    // mid-handshake, NOT authenticated long-lived ones (#880). A slowloris that never
+                    // sends a well-formed Connect keeps it until the read timeout closes the connection.
+                    // `None` when the half-open cap is disabled (no slot to hand over).
                     let _ = handle_connection(
                         stream,
                         &engine,
@@ -429,6 +429,7 @@ where
                         preauth_for_conn,
                         peer_ip,
                         audit_for_conn,
+                        half_open_slot,
                     );
                 });
                 if spawn_outcome.is_err() {
@@ -470,6 +471,7 @@ fn handle_connection<F, C>(
     preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
     peer_ip: std::net::IpAddr,
     audit: Option<crate::audit::AuditEmitter>,
+    half_open_slot: Option<crate::preauth::HalfOpenSlot>,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -501,6 +503,13 @@ where
     // no-op when no audit sink is configured (the byte-for-byte historical path).
     if let Some(emitter) = audit {
         session = session.with_audit(emitter);
+    }
+    // Hand the half-open (#633) slot to the session so it is released when the `Connect` handshake
+    // RESOLVES (a well-formed Connect), not at connection teardown (#880) — so the cap measures
+    // mid-handshake connections, not authenticated long-lived ones. `None` (no half-open cap wired) and
+    // an inert slot are both harmless no-ops on drop.
+    if let Some(slot) = half_open_slot {
+        session = session.with_half_open_slot(slot);
     }
     // The read/dispatch loop, run to completion so the cleanup below ALWAYS executes on exit:
     // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
@@ -1134,6 +1143,7 @@ mod tests {
                     &connz,
                     None,
                     peer.ip(),
+                    None,
                     None,
                 )
             }
