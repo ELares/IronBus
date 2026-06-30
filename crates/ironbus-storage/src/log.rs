@@ -821,6 +821,27 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// nothing. The cell holds only derived state: the snapshot is rebuilt from `self.segments`, so
     /// dropping or rebuilding it changes nothing a reader observes.
     read_plane: std::cell::RefCell<Option<ReadPlane<F>>>,
+    /// A roll that SEALED the predecessor but could not yet CREATE the next active segment, because
+    /// `start_segment` hit a transient resource fault (EMFILE from fd exhaustion, a short ENOSPC a
+    /// reap will clear, EINTR) at the roll boundary (#867). The seal is durable, so no data is lost;
+    /// the next write retries the deferred creation via [`ensure_writable`](Log::ensure_writable), so
+    /// a recoverable fault no longer permanently freezes the writer. `None` in steady state: the only
+    /// thing that sets it is a failed `start_segment` during a roll, and the next successful create
+    /// clears it. While it is `Some`, `active` is `None` but the writer is RESUMABLE, not frozen.
+    pending_roll: Option<PendingRoll>,
+}
+
+/// A deferred active-segment creation: a [`Log::roll`] sealed the old segment but a transient fault
+/// stopped it from creating the next one, so the create is retried on the next write (#867). The
+/// fields are exactly the arguments [`Log::start_segment`] needs to finish the roll.
+#[derive(Clone, Copy, Debug)]
+struct PendingRoll {
+    /// The id of the not-yet-created next active segment.
+    id: u64,
+    /// Its base sequence (continues the sealed predecessor's run).
+    base_seq: Seq,
+    /// Its base offset (continues the sealed predecessor's run).
+    base_offset: Offset,
 }
 
 /// The bounds of a single [`Log::read_range`] pass, threaded to the per-segment read helpers so
@@ -908,6 +929,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // The off-actor read plane (#539) is built lazily on the first consumer
                     // `read_plane()` call; a never-read log pays nothing.
                     read_plane: std::cell::RefCell::new(None),
+                    pending_roll: None,
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 log
@@ -1178,6 +1200,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
+            pending_roll: None,
         };
 
         if scan.footer.is_some() {
@@ -1549,6 +1572,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
+            pending_roll: None,
         };
 
         match active {
@@ -1653,13 +1677,28 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // grow-on-append and surfaces at the append/sync as it does today (the doc's ENOSPC-to-
         // `AtCapacity` routing is a forward refinement, not required for correctness).
         let _ = file.preallocate(self.config.max_segment_bytes);
-        let writer = SegmentWriter::create(file, header)?;
-        let mut writer = writer;
+        let mut writer = SegmentWriter::create(file, header)?;
         writer.sync()?; // the header is durable...
         self.fs.sync_dir()?; // ...and so is its directory entry.
-                             // The segment header is physical write volume an SSD/eMMC wear model charges (#118): the
-                             // 64-byte header is on disk now (the `sync` above made it durable). Counted here, after the
-                             // create succeeded, so a failed create never inflates the physical-bytes total.
+        self.install_started_segment(writer, id, base_offset);
+        Ok(())
+    }
+
+    /// Installs a freshly created + durably-headered active segment into the in-memory log state: the
+    /// active writer, its id, its (empty) retention slot, and its empty resident seek index, and
+    /// charges the header's physical write volume. The IO half (create + preallocate + header/dir
+    /// fsync) is done by the caller ([`start_segment`](Log::start_segment) or
+    /// [`create_or_defer_segment`](Log::create_or_defer_segment)); this is the infallible commit that
+    /// makes the new segment the active one once it is durable.
+    fn install_started_segment(
+        &mut self,
+        writer: SegmentWriter<F::File>,
+        id: u64,
+        base_offset: Offset,
+    ) {
+        // The segment header is physical write volume an SSD/eMMC wear model charges (#118): the
+        // 64-byte header is on disk now (the `sync` above made it durable). Counted here, after the
+        // create succeeded, so a failed create never inflates the physical-bytes total.
         self.charge_physical(SEGMENT_HEADER_LEN as u64);
         self.active = Some(writer);
         self.active_id = id;
@@ -1692,7 +1731,6 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 flushed_end: SEGMENT_HEADER_LEN as u64,
             },
         );
-        Ok(())
     }
 
     /// The next FRESH segment id, strictly greater than any id ever used: `max(active_id, the
@@ -1750,12 +1788,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // segment's header were charged on append and `start_segment`).
         self.charge_physical(SEGMENT_FOOTER_LEN as u64);
         self.sealed_record_bytes = self.sealed_record_bytes.saturating_add(old_record_bytes);
-        self.start_segment(next_id, self.next_seq, self.next_offset)
-            .map_err(|_| StorageError::WriterFrozen)?;
         // Sealing fsynced every record in the old segment, so both the visible and the DURABLE
         // head advance to the start of the new segment even without an explicit sync. Advancing
         // `synced_offset` here is what bounds a relaxed level's loss to the open segment's unsynced
-        // tail: a roll is a real durability barrier, so every record up to it is durable (#341).
+        // tail: a roll is a real durability barrier, so every record up to it is durable (#341). These
+        // reflect the SEAL (already durable), so they hold even if the create below is deferred by a
+        // transient fault (#867): the durable head is `next_offset` the moment the predecessor sealed.
         self.flushed_offset = self.next_offset;
         self.synced_offset = self.next_offset;
         // The seal made every previously-unsynced record durable and the new active segment is empty,
@@ -1768,6 +1806,82 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // active-tail fallback served those same records, so consume behavior is identical across the
         // seal. A no-op if no consumer has built the plane.
         self.republish_read_plane();
+        // Create the next active segment. The predecessor is already durably sealed, so a failure
+        // here loses NO data and must not permanently freeze the writer on a TRANSIENT resource fault
+        // (EMFILE / a short ENOSPC at the roll boundary, #867): `create_or_defer_segment` records a
+        // pending roll and surfaces the raw, NON-FATAL error, and the next write retries the create.
+        self.create_or_defer_segment(next_id, self.next_seq, self.next_offset)
+    }
+
+    /// Creates the next active segment for a roll, distinguishing a TRANSIENT create fault (defer and
+    /// retry) from a genuine DURABILITY-BARRIER fault (freeze), so a recoverable resource fault no
+    /// longer permanently freezes the writer (#867).
+    ///
+    /// The predecessor was already sealed and fsynced before this is reached, so NOTHING here can lose
+    /// durable data, and reads keep serving off the sealed plane regardless of the outcome:
+    /// - **Create phase** (`create_new` + `SegmentWriter::create`): a failure is a transient resource
+    ///   fault (EMFILE from fd exhaustion, a short ENOSPC a reap will clear, EINTR). Record a
+    ///   [`PendingRoll`] and return the RAW error, which is NOT [`StorageError::WriterFrozen`], so
+    ///   [`EngineError::is_fatal`] is false and the writer stays RESUMABLE: the next write retries via
+    ///   [`ensure_writable`](Log::ensure_writable), so the writer resumes once the fault clears.
+    /// - **Durability-barrier phase** (the header / dir fsync): a failure means the disk cannot make
+    ///   even the 64-byte header durable — a genuine durability fault — so FREEZE
+    ///   ([`StorageError::WriterFrozen`]), exactly as a failed sync on the append path does, so a dead
+    ///   disk is surfaced fail-stop to health rather than retried forever.
+    ///
+    /// Any partial orphan from a prior failed attempt is removed first so the retry's `create_new`
+    /// cannot collide on the id; the orphan holds nothing durable (the predecessor is already sealed),
+    /// so the remove is safe and best-effort.
+    fn create_or_defer_segment(
+        &mut self,
+        id: u64,
+        base_seq: Seq,
+        base_offset: Offset,
+    ) -> Result<(), StorageError> {
+        let _ = self.fs.remove(&segment_file_name(id));
+        let header = SegmentHeader {
+            segment_id: id,
+            base_seq,
+            base_offset,
+            created_unix_ms: self.clock.now_unix_millis(),
+            flags: 0,
+        };
+        // Create phase — a failure is transient: DEFER (the predecessor is durably sealed, no loss).
+        let defer = |this: &mut Self, e: StorageError| -> StorageError {
+            let _ = this.fs.remove(&segment_file_name(id));
+            this.pending_roll = Some(PendingRoll {
+                id,
+                base_seq,
+                base_offset,
+            });
+            e
+        };
+        let file = match self.fs.create_new(&segment_file_name(id)) {
+            Ok(f) => f,
+            Err(e) => return Err(defer(self, StorageError::Io(e))),
+        };
+        let _ = file.preallocate(self.config.max_segment_bytes);
+        let mut writer = match SegmentWriter::create(file, header) {
+            Ok(w) => w,
+            Err(e) => return Err(defer(self, e)),
+        };
+        // Durability-barrier phase — a failure is a genuine durability fault: FREEZE.
+        writer.sync().map_err(|_| StorageError::WriterFrozen)?;
+        self.fs.sync_dir().map_err(|_| StorageError::WriterFrozen)?;
+        // Durable: install the new active segment and clear the pending roll.
+        self.install_started_segment(writer, id, base_offset);
+        self.pending_roll = None;
+        Ok(())
+    }
+
+    /// Completes a roll whose active-segment creation was deferred by a transient fault (#867), so
+    /// the writer resumes once the fault clears. A no-op when no roll is pending (the steady state).
+    /// Called at the top of every write entry point: if the deferred create still fails it returns
+    /// the raw (non-fatal) error and stays pending, so the write is refused without freezing.
+    fn ensure_writable(&mut self) -> Result<(), StorageError> {
+        if let Some(p) = self.pending_roll {
+            self.create_or_defer_segment(p.id, p.base_seq, p.base_offset)?;
+        }
         Ok(())
     }
 
@@ -2000,6 +2114,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// # Errors
     /// [`StorageError::WriterFrozen`] if the writer is frozen, or an IO error from the seal's fsync.
     pub fn seal_active_segment(&mut self) -> Result<(), StorageError> {
+        // Finish any roll a transient fault deferred first (#867): a pending roll already sealed the
+        // predecessor, so once its empty successor is created there is nothing more to seal.
+        self.ensure_writable()?;
         if self.active()?.record_count() == 0 {
             return Ok(());
         }
@@ -2014,6 +2131,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// # Errors
     /// [`StorageError::WriterFrozen`] if the writer is frozen.
     pub fn active_segment_at_or_over_cap(&self) -> Result<bool, StorageError> {
+        // A roll deferred by a transient fault (#867) has already sealed the predecessor; its
+        // not-yet-created successor will be EMPTY, so it is not at cap. Answer without a frozen error
+        // (this is a `&self` query, so it cannot itself complete the deferred create).
+        if self.pending_roll.is_some() {
+            return Ok(false);
+        }
         let active = self.active()?;
         Ok(active.write_pos() >= self.config.max_segment_bytes && active.record_count() > 0)
     }
@@ -2065,6 +2188,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             }
         }
 
+        // Complete any roll a transient fault deferred (#867) before touching the writer, so a
+        // momentary EMFILE/ENOSPC at a previous roll boundary resolves on this write instead of having
+        // permanently frozen the stream. If the deferred create still fails, this returns the raw
+        // (non-fatal) error and the produce is refused without freezing.
+        self.ensure_writable()?;
         // Soft size cap: roll before appending if the active segment has reached the cap,
         // but never roll an empty one (so an oversized record still gets written). `allow_roll` is
         // false ONLY on the `append_without_roll` path (#906), where the caller manages segment
@@ -2180,6 +2308,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // and a health check sees the degraded state. Reads keep serving the durable prefix.
         // The sync needs the writer mutably (#452: it flushes the pending buffered records to
         // the file before its fdatasync, so durable keeps its meaning).
+        // Finish any transient-fault-deferred roll first (#867); the predecessor it sealed is already
+        // durable, so once the empty successor exists there is nothing pending to sync.
+        self.ensure_writable()?;
         self.active()?;
         let frozen = match self.active.as_mut() {
             Some(w) => w.sync().is_err(),
@@ -2226,6 +2357,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// # Errors
     /// Returns [`StorageError::WriterFrozen`] if a prior fatal fsync already froze the writer.
     pub fn flush_no_sync(&mut self) -> Result<(), StorageError> {
+        // Finish any transient-fault-deferred roll first (#867) so a momentary roll-boundary fault
+        // does not leave the visible head stuck.
+        self.ensure_writable()?;
         // A frozen writer has no active segment: surface the fatal state rather than silently
         // advancing the visible head over records the writer can no longer own.
         self.active()?;
@@ -3073,6 +3207,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     ///   surgery or the re-derivation. The unlink-then-truncate order keeps the chain
     ///   valid-prefix-recoverable at every step, so a crash mid-surgery is reconciled by [`Log::open`].
     pub fn truncate_to(&mut self, target: Offset) -> Result<TruncateOutcome, StorageError> {
+        // Finish any transient-fault-deferred roll first (#867) so the truncation acts on a fully
+        // installed active segment, not a momentarily-deferred one.
+        self.ensure_writable()?;
         // Fail closed if the writer is already dead: we never truncate against a frozen log.
         self.active()?;
         let next = self.next_offset.get();
@@ -3252,6 +3389,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if !config.enabled {
             return Ok(crate::compaction::CompactionOutcome::default());
         }
+        // Finish any transient-fault-deferred roll first (#867) so compaction sees a fully installed
+        // active segment.
+        self.ensure_writable()?;
         // Never compact on a frozen writer (it has no active segment to protect against, but the
         // log is degraded; do no extra IO).
         self.active()?;
@@ -5048,22 +5188,76 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_roll_freezes_the_writer() {
-        let mut log = open_mem(small_config());
-        // Pre-create the file the next roll targets, so its create_new fails mid-roll.
-        log.filesystem().create_new(&segment_file_name(1)).unwrap();
-        let mut roll_err = None;
-        for i in 0..20u8 {
-            if let Err(e) = log.append(&rec(&[i; 20])) {
-                roll_err = Some(e);
-                break;
-            }
+    fn a_transient_create_fault_at_a_roll_defers_and_resumes_the_writer() {
+        use crate::fault::FaultFs;
+        // #867: a momentary EMFILE / short ENOSPC failing `create_new` at a roll boundary must NOT
+        // permanently freeze the writer. The roll's predecessor is already durably sealed, so the
+        // create is DEFERRED (a non-fatal error) and retried on the next write, which succeeds once
+        // the fault clears — instead of the old behaviour that killed write availability until restart.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+
+        // Fill the first segment (syncing each record) until the next append would roll it.
+        let mut durable = 0u64;
+        while !log.active_segment_at_or_over_cap().unwrap() {
+            assert_eq!(log.append(&rec(&[7u8; 20])).unwrap(), Offset::new(durable));
+            log.sync().unwrap();
+            durable += 1;
+        }
+
+        // Arm a one-shot transient create fault; the next append triggers a roll whose `create_new`
+        // fails. The roll seals the predecessor (durable) and then DEFERS the create.
+        control.fail_create_new(1);
+        let err = log.append(&rec(&[8u8; 20])).unwrap_err();
+        assert!(
+            !matches!(err, StorageError::WriterFrozen),
+            "a transient create fault must NOT freeze the writer: {err:?}"
+        );
+        assert!(matches!(err, StorageError::Io(_)), "got {err:?}");
+        // The predecessor was durably sealed by the roll, so its records survive; the failed produce
+        // consumed no offset (the reservation happens after the roll).
+        assert_eq!(log.flushed_offset(), Offset::new(durable));
+
+        // The fault has cleared: the NEXT append completes the deferred roll and succeeds, proving the
+        // writer resumed rather than freezing until restart. The resumed produce takes the offset the
+        // deferred one did not consume.
+        assert_eq!(log.append(&rec(&[9u8; 20])).unwrap(), Offset::new(durable));
+        log.sync().unwrap();
+        assert_eq!(
+            log.active_segment_id(),
+            1,
+            "the deferred roll completed to segment 1"
+        );
+
+        // Everything is durable across a reopen: the predecessor's records plus the resumed one.
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(reopened.next_offset(), Offset::new(durable + 1));
+    }
+
+    #[test]
+    fn a_durability_barrier_fault_at_a_roll_freezes_the_writer() {
+        use crate::fault::FaultFs;
+        // #867: a TRANSIENT create fault defers, but a genuine DURABILITY-BARRIER fault — the new
+        // segment's directory-publish fsync — is a real durability failure and must still FREEZE the
+        // writer fail-stop, so a dead disk surfaces to health instead of being retried forever.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        while !log.active_segment_at_or_over_cap().unwrap() {
+            log.append(&rec(&[7u8; 20])).unwrap();
             log.sync().unwrap();
         }
-        // The roll's create_new hit AlreadyExists, which froze the writer: the freezing
-        // append surfaces the fatal `WriterFrozen`, not a soft IO error.
-        assert!(matches!(roll_err, Some(StorageError::WriterFrozen)));
-        // The writer is frozen: further writes refuse, getters stay sane (no panic).
+        // Fail the new segment's directory-publish fsync during the roll (the seal of the predecessor
+        // fsyncs the FILE, not the directory, so it still succeeds — only the create's barrier fails).
+        control.set_fail_sync_dir(true);
+        let err = log.append(&rec(&[8u8; 20])).unwrap_err();
+        assert!(
+            matches!(err, StorageError::WriterFrozen),
+            "a durability-barrier fault at a roll must freeze: {err:?}"
+        );
+        // The freeze is permanent even after the fault clears: further writes refuse, getters stay
+        // sane (no panic).
+        control.set_fail_sync_dir(false);
         assert!(matches!(
             log.append(&rec(b"x")),
             Err(StorageError::WriterFrozen)
@@ -6289,18 +6483,17 @@ mod tests {
 
     #[test]
     fn reads_serve_the_durable_prefix_from_a_frozen_writer() {
-        let mut log = open_mem(small_config());
-        // Pre-create the file the first roll targets, so that roll fails and freezes.
-        log.filesystem().create_new(&segment_file_name(1)).unwrap();
-        let mut froze = false;
-        for i in 0..30u8 {
-            if log.append(&rec(&[i; 20])).is_err() {
-                froze = true;
-                break;
-            }
+        use crate::fault::FaultFs;
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        let mut durable = 0u64;
+        while !log.active_segment_at_or_over_cap().unwrap() {
+            log.append(&rec(&[7u8; 20])).unwrap();
             log.sync().unwrap();
+            durable += 1;
         }
-        assert!(froze, "a roll should have been attempted and failed");
+        // Freeze the writer with a durability-barrier fault at the roll (the new segment's dir fsync).
+        control.set_fail_sync_dir(true);
         assert!(matches!(
             log.append(&rec(b"x")),
             Err(StorageError::WriterFrozen)
@@ -6308,6 +6501,7 @@ mod tests {
         // Reads ignore the writer and still serve the flushed prefix.
         let records = log.read_from(Offset::ZERO, 100).unwrap();
         assert!(!records.is_empty());
+        assert_eq!(records.len() as u64, durable);
         assert_eq!(records.len() as u64, log.flushed_offset().get());
     }
 
