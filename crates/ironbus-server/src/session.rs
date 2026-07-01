@@ -1991,6 +1991,9 @@ impl Session {
         // by at most one message, which is the standard credit semantics and stays bounded.
         let ceiling_bytes = self.credit_ceiling_bytes(engine)?;
         let mut delivered = 0u32;
+        // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
+        // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
+        let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
         for _ in 0..credits {
             // The byte budget binds (#275): stop once in-flight bytes have reached the budget, unless
             // this connection holds nothing in-flight (the floor-of-one). A budget of 0 is unlimited,
@@ -2034,7 +2037,7 @@ impl Session {
                         headers: &d.record.headers,
                         payload: &d.record.payload,
                     };
-                    let mut frame_body = Vec::new();
+                    frame_body.clear();
                     // The record's key/headers came through PUB (u16-bounded), so this cannot
                     // exceed the field limit; on the impossible error, stop the batch.
                     if encode_deliver(&msg, &mut frame_body).is_err() {
@@ -2060,7 +2063,7 @@ impl Session {
                 // (#63); the durable DLQ topic write is still separate. The advisory does not
                 // count toward the delivered total. Keep draining the batch.
                 Ok(Poll::Parked { offset, .. }) => {
-                    let mut frame_body = Vec::new();
+                    frame_body.clear();
                     encode_dead_letter(
                         &DeadLetterBody {
                             offset: offset.get(),
@@ -2085,7 +2088,7 @@ impl Session {
                 }) => {
                     self.leased
                         .retain(|&offset, _| offset >= earliest_retained.get());
-                    self.emit_truncation(out, earliest_retained.get(), skipped);
+                    self.emit_truncation(out, &mut frame_body, earliest_retained.get(), skipped);
                 }
                 // The group's cursor advanced across a KEY-COMPACTION hole (#337, #411): the offsets
                 // in `[from, to)` were superseded by a later record for the same key, so they are
@@ -2099,7 +2102,7 @@ impl Session {
                 // either way: the next poll resumes at `to`.
                 Ok(Poll::Compacted { from, to }) => {
                     if self.gap_marker_enabled {
-                        Self::emit_compaction(out, from.get(), to.get());
+                        Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
                     }
                 }
                 // Nothing more deliverable right now: end the batch early.
@@ -2233,6 +2236,9 @@ impl Session {
             Some(now.saturating_add(budget_nanos))
         };
         let mut delivered = 0u32;
+        // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
+        // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
+        let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
         for _ in 0..credits {
             // The deadline binds (#489): once the monotonic clock has reached it, end the batch with
             // whatever was gathered. Skipped for a no-wait / no-deadline fetch (`deadline` is `None`).
@@ -2269,7 +2275,7 @@ impl Session {
                         headers: &d.record.headers,
                         payload: &d.record.payload,
                     };
-                    let mut frame_body = Vec::new();
+                    frame_body.clear();
                     if encode_deliver(&msg, &mut frame_body).is_err() {
                         break;
                     }
@@ -2290,7 +2296,7 @@ impl Session {
                 // A parked (poison) message: the same in-band dead-letter advisory as `handle_flow`. It
                 // consumes a credit slot (it ran a poll) but does not count toward `delivered`.
                 Ok(Poll::Parked { offset, .. }) => {
-                    let mut frame_body = Vec::new();
+                    frame_body.clear();
                     encode_dead_letter(
                         &DeadLetterBody {
                             offset: offset.get(),
@@ -2309,13 +2315,13 @@ impl Session {
                 }) => {
                     self.leased
                         .retain(|&offset, _| offset >= earliest_retained.get());
-                    self.emit_truncation(out, earliest_retained.get(), skipped);
+                    self.emit_truncation(out, &mut frame_body, earliest_retained.get(), skipped);
                 }
                 // A key-compaction hole: identical to `handle_flow` — a gap-marker-capable consumer gets
                 // the COMPACTED marker, a non-capable one silently advances. Keep draining.
                 Ok(Poll::Compacted { from, to }) => {
                     if self.gap_marker_enabled {
-                        Self::emit_compaction(out, from.get(), to.get());
+                        Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
                     }
                 }
                 // Nothing more deliverable right now: end the batch early (the no_wait / ready-now case).
@@ -2489,6 +2495,9 @@ impl Session {
         let mut delivered = 0u32;
         let mut cursor = 0usize;
         let mut offset = run.first_offset.get();
+        // One reusable scratch buffer for the run's per-record frame bodies (#826): cleared and
+        // reused each iteration instead of allocating a fresh `Vec` per delivered record.
+        let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
         while cursor < run.bytes.len() {
             // Re-validate and decode each stored frame (header + body CRC). A torn/corrupt frame is
             // fail-closed: stop the run here rather than ship a bad record (never a blind-trusted byte).
@@ -2505,7 +2514,7 @@ impl Session {
                 headers: view.headers,
                 payload: view.payload,
             };
-            let mut frame_body = Vec::new();
+            frame_body.clear();
             if encode_deliver(&msg, &mut frame_body).is_err() {
                 break;
             }
@@ -2542,6 +2551,9 @@ impl Session {
         match engine.with(move |e| e.stream_fetch_in(&group, member, start, want, max_bytes))? {
             Ok(StreamBatch { records, .. }) => {
                 let mut delivered = 0u32;
+                // One reusable scratch buffer for this batch's per-record frame bodies (#826):
+                // cleared and reused each iteration instead of a fresh `Vec` per delivered record.
+                let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
                 for record in &records {
                     let msg = DeliverBody {
                         offset: record.offset.get(),
@@ -2554,7 +2566,7 @@ impl Session {
                         headers: &record.headers,
                         payload: &record.payload,
                     };
-                    let mut frame_body = Vec::new();
+                    frame_body.clear();
                     if encode_deliver(&msg, &mut frame_body).is_err() {
                         break;
                     }
@@ -2638,6 +2650,9 @@ impl Session {
                 }
                 // The ACTIVE-tail remainder (which the raw read does not serve) as ordinary per-record
                 // `Deliver` frames, immediately following the batch — so the run stays contiguous.
+                // One reusable scratch buffer for the tail's per-record frame bodies (#826): cleared
+                // and reused each iteration instead of a fresh `Vec` per delivered record.
+                let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
                 for record in &tail {
                     let msg = DeliverBody {
                         offset: record.offset.get(),
@@ -2648,7 +2663,7 @@ impl Session {
                         headers: &record.headers,
                         payload: &record.payload,
                     };
-                    let mut frame_body = Vec::new();
+                    frame_body.clear();
                     if encode_deliver(&msg, &mut frame_body).is_err() {
                         break;
                     }
@@ -2731,8 +2746,16 @@ impl Session {
     /// byte-untracked: the span is reported by its record count `to - from`, matching the recovery-side
     /// `loss-report.v1` convention). A consumer WITHOUT the capability gets the legacy `Truncated`
     /// (tag 18) instead, so the two NEVER double-signal and an old consumer is never sent the new tag.
-    fn emit_truncation(&self, out: &mut Vec<u8>, earliest_retained: u64, skipped: u64) {
-        let mut frame_body = Vec::new();
+    fn emit_truncation(
+        &self,
+        out: &mut Vec<u8>,
+        frame_body: &mut Vec<u8>,
+        earliest_retained: u64,
+        skipped: u64,
+    ) {
+        // `frame_body` is the caller's reusable per-batch scratch (#826): clear (retaining capacity)
+        // before encoding this advisory, exactly as the per-record delivery path does.
+        frame_body.clear();
         if self.gap_marker_enabled {
             let to = earliest_retained;
             let from = to.saturating_sub(skipped);
@@ -2743,18 +2766,18 @@ impl Session {
                     bytes_skipped: 0,
                     reason: gap_reason::TRIMMED,
                 },
-                &mut frame_body,
+                frame_body,
             );
-            reply(out, FrameType::GapMarker, &frame_body);
+            reply(out, FrameType::GapMarker, frame_body);
         } else {
             encode_truncated(
                 &TruncatedBody {
                     earliest_retained,
                     skipped,
                 },
-                &mut frame_body,
+                frame_body,
             );
-            reply(out, FrameType::Truncated, &frame_body);
+            reply(out, FrameType::Truncated, frame_body);
         }
     }
 
@@ -2769,8 +2792,10 @@ impl Session {
     /// consumer; a non-capable consumer silently advances (a compacted hole is not a loss, so it gets
     /// NO frame and never the legacy `Truncated`), so the two never double-signal. The capability gate
     /// lives at the call site (the per-poll loop), so this carries no `&self` state.
-    fn emit_compaction(out: &mut Vec<u8>, from: u64, to: u64) {
-        let mut frame_body = Vec::new();
+    fn emit_compaction(out: &mut Vec<u8>, frame_body: &mut Vec<u8>, from: u64, to: u64) {
+        // `frame_body` is the caller's reusable per-batch scratch (#826): clear (retaining capacity)
+        // before encoding, matching the per-record delivery path.
+        frame_body.clear();
         encode_gap_marker(
             &GapMarkerBody {
                 from,
@@ -2778,9 +2803,9 @@ impl Session {
                 bytes_skipped: 0,
                 reason: gap_reason::COMPACTED,
             },
-            &mut frame_body,
+            frame_body,
         );
-        reply(out, FrameType::GapMarker, &frame_body);
+        reply(out, FrameType::GapMarker, frame_body);
     }
 
     fn handle_sub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
@@ -4202,6 +4227,16 @@ fn drive_back_check<
         write_txn_check(&check.txn_id, out);
     }
 }
+
+/// Reusable scratch capacity for a per-record `Deliver`/advisory frame body (#826). A hoisted
+/// `frame_body` buffer starts at this size so a small-payload record encodes without a growth
+/// realloc; `frame_body.clear()` retains the capacity across records, so the per-record malloc/free
+/// and growth reallocs are removed and the buffer amortizes to the largest frame the loop has seen.
+/// Covers the fixed 25-byte DELIVER header (offset + generation + flags + timestamp), the two u16
+/// var-length prefixes for key/headers, and a small payload; a larger payload simply grows once and
+/// stays grown for the rest of the batch. Scratch only — the bytes are copied into `out`, so the
+/// value is a pure allocation hint and never affects the encoded frame.
+const DELIVER_FRAME_SCRATCH_CAP: usize = 256;
 
 /// The safety cap on a single pass's pipelined produce window (#450): how many produces a session
 /// may PARK (submitted to the actor, ack not yet awaited) before it must release the window. It
