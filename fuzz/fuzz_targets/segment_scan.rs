@@ -17,5 +17,9 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(reader) = SegmentReader::open(file) {
         let _ = reader.scan();
         let _ = reader.scan_recovery();
+        // #835: the v2 sparse-survivor recovery parser is the other untrusted-bytes entry point
+        // recovery drives (`recover_with_compaction`). Like the v1 scans it must never panic on any
+        // byte string — only error or yield a bounded valid prefix.
+        let _ = reader.scan_compacted();
     }
 });
