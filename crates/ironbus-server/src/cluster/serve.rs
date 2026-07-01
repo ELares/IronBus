@@ -540,6 +540,16 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
             .collect()
     }
 
+    /// This node's LEGITIMATE inbound data-plane-link fanout as a leader: Σ over its led partitions of
+    /// (that partition's configured follower count) — see
+    /// [`DataPlaneController::led_inbound_link_count`]. The data-plane listener sizes its concurrent
+    /// inbound-reader cap to this (floored at the old fixed 256) so a high-partition-fanout leader admits
+    /// every real follower rather than refusing links past a borrowed constant (#915).
+    #[must_use]
+    pub fn led_inbound_link_count(&self) -> usize {
+        self.seam.controller().led_inbound_link_count()
+    }
+
     /// Register a follower target (used by [`from_placements`](Self::from_placements); exposed for a
     /// caller that builds the seam directly).
     pub fn set_follower_target(&mut self, partition: u64, leader: u64) {
@@ -748,26 +758,52 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
 /// busy-spins. The same cadence the metadata [`ClusterRuntime`](super::runtime::ClusterRuntime) uses.
 const DATAPLANE_POLL: Duration = Duration::from_millis(100);
 
-/// The cap on CONCURRENT inbound peer reader threads on the data-plane listener (#865). Each accepted
-/// peer link spawns a detached reader thread (its own stack and an fd), and follower-report auth happens
-/// only later inside `recv()` — after the thread and fd already exist. Without a cap, anything on the
-/// cluster network (a flood, or a peer holding many idle links) spawns unbounded threads and exhausts
-/// fd/RAM, collapsing the node — asymmetric with the client-facing server's `max_connections` cap. This
-/// mirrors the client default (256): a hard bound at ~256 × [`PER_CONNECTION_STACK_BYTES`](crate::rss::PER_CONNECTION_STACK_BYTES)
-/// ≈ 16 MiB of touched reader-stack RSS (the project's per-connection RSS estimate; the virtual reservation
-/// is larger — the default thread stack — and, like the client plane's reader stacks, is not charged in the
-/// #115 refuse-to-boot budget). Over the cap an inbound link is refused (dropped) rather than spawning a
-/// thread.
+/// The FLOOR (and small-deployment default) for the cap on CONCURRENT inbound peer reader threads on the
+/// data-plane listener (#865, #915). Each accepted peer link spawns a detached reader thread (its own
+/// stack and an fd), and follower-report auth happens only later inside `recv()` — after the thread and
+/// fd already exist. Without a cap, anything on the cluster network (a flood, or a peer holding many idle
+/// links) spawns unbounded threads and exhausts fd/RAM, collapsing the node — asymmetric with the
+/// client-facing server's `max_connections` cap. This floor mirrors the client default (256): a bound at
+/// ~256 × [`PER_CONNECTION_STACK_BYTES`](crate::rss::PER_CONNECTION_STACK_BYTES) ≈ 16 MiB of touched
+/// reader-stack RSS (the project's per-connection RSS estimate; the virtual reservation is larger — the
+/// default thread stack — and, like the client plane's reader stacks, is not charged in the #115
+/// refuse-to-boot budget). Over the effective cap an inbound link is refused (dropped) rather than
+/// spawning a thread.
 ///
-/// LIMITATION (#865 review, follow-up): a leader's LEGITIMATE inbound links are one per (followed
-/// partition × follower), so a HIGH-partition-fanout leader (e.g. hundreds of partitions × replicas) can
-/// exceed 256 and the cap would then refuse real followers, stalling replication on the refused
-/// partitions. For the edge-first target the fanout is far below 256, so a hard constant is the
-/// first-cut hardening; a configurable cap sized to the legitimate fanout (rather than borrowed from the
-/// client `max_connections` default) is the tracked follow-up.
-const MAX_DATAPLANE_READERS: usize = 256;
+/// #865 shipped this as a hard CONSTANT cap. #915 (this) makes the effective cap CONFIGURABLE and sizes
+/// its default to the legitimate inbound fanout instead of borrowing the client `max_connections`
+/// default: a leader's LEGITIMATE inbound links are one per (led partition × follower)
+/// ([`DataPlaneServer::led_inbound_link_count`]), so a HIGH-partition-fanout leader (e.g. hundreds of
+/// partitions × replicas) can exceed 256, and a hard 256 would then refuse real followers, stalling
+/// replication on the refused partitions. The effective cap is now
+/// [`effective_dataplane_reader_cap`]`(configured, led_inbound_link_count)`: it defaults to (and is
+/// FLOORED at) this constant so a small edge deployment is unaffected, grows to the legitimate fanout so
+/// no real follower is ever refused, and an operator override still bounds an unauthenticated flood.
+const DEFAULT_MIN_DATAPLANE_READERS: usize = 256;
 
-/// Releases one concurrent-reader slot on drop (#865), so the [`MAX_DATAPLANE_READERS`] count is
+/// The EFFECTIVE concurrent inbound data-plane reader cap (#915): the operator-`configured` cap if any,
+/// otherwise the [`DEFAULT_MIN_DATAPLANE_READERS`] default, then RAISED to `led_inbound_link_count` (this
+/// node's legitimate inbound follower fanout, [`DataPlaneServer::led_inbound_link_count`]) so a
+/// high-fanout leader admits every real follower link rather than refusing past a too-small constant.
+///
+/// Two guarantees hold jointly:
+/// * a LEGITIMATE follower is NEVER refused for lack of a slot — the cap is at least the exact
+///   led-partition inbound fanout, so all real links fit even when the operator configured a smaller cap;
+/// * an UNAUTHENTICATED flood is still BOUNDED — the cap is finite (the configured value, or the default
+///   floor, whichever with the fanout is the larger), so the listener still drops links past it and never
+///   spawns unbounded threads.
+///
+/// Flooring the default at 256 leaves a small edge deployment (fanout ≪ 256) on exactly today's bound.
+fn effective_dataplane_reader_cap(
+    configured: Option<usize>,
+    led_inbound_link_count: usize,
+) -> usize {
+    configured
+        .unwrap_or(DEFAULT_MIN_DATAPLANE_READERS)
+        .max(led_inbound_link_count)
+}
+
+/// Releases one concurrent-reader slot on drop (#865), so the concurrent-reader count is
 /// decremented when a reader thread exits on EITHER a normal return OR a panic unwind — the count can
 /// never leak and pin the cap. Constructed before the reader spawn and moved into it; a spawn FAILURE
 /// drops it too, releasing the slot the accept loop reserved.
@@ -914,7 +950,9 @@ where
         self_data_addr: SocketAddr,
         peer_data_addrs: &BTreeMap<u64, SocketAddr>,
     ) -> io::Result<Self> {
-        Self::start_inner(server, self_data_addr, peer_data_addrs, None)
+        // No client gate and no configured reader cap: the inbound-reader cap defaults to the legitimate
+        // led-partition fanout, floored at the old constant (#915).
+        Self::start_inner(server, self_data_addr, peer_data_addrs, None, None)
     }
 
     /// Like [`Self::start`], but BUILDS a shared CLIENT produce-ack
@@ -952,6 +990,9 @@ where
                 status: None,
                 confirm_timeout: None,
             }),
+            // No configured reader cap: default to the legitimate led-partition fanout, floored at the
+            // old constant (#915).
+            None,
         )
     }
 
@@ -960,6 +1001,12 @@ where
     /// status snapshot (the follower-read committed-HW safe-watermark source). With an empty advertise map
     /// the `NOT_LEADER` redirect still fires (the client re-tries its known peers); without a status handle a
     /// follower-read fails closed (serves nothing) until a committed-HW checkpoint is known.
+    ///
+    /// `dataplane_reader_cap` is the operator-configured cap on concurrent inbound data-plane reader
+    /// threads (#915), threaded from the broker/cluster config. `None` (the usual case) sizes the cap to
+    /// this node's legitimate led-partition inbound fanout, floored at the old constant. A `Some(n)` value
+    /// is honored as the operator bound but still raised to the exact legitimate fanout so a real follower
+    /// is never refused — see [`effective_dataplane_reader_cap`].
     ///
     /// # Errors
     /// As [`Self::start`].
@@ -973,6 +1020,7 @@ where
         configured_level: super::ack_level::ClusterAckLevel,
         leader_client_addrs: BTreeMap<u64, SocketAddr>,
         status: Arc<Mutex<super::runtime::ClusterStatus>>,
+        dataplane_reader_cap: Option<usize>,
     ) -> io::Result<Self> {
         Self::start_inner(
             server,
@@ -988,6 +1036,7 @@ where
                 status: Some(status),
                 confirm_timeout: None,
             }),
+            dataplane_reader_cap,
         )
     }
 
@@ -1002,6 +1051,7 @@ where
         self_data_addr: SocketAddr,
         peer_data_addrs: &BTreeMap<u64, SocketAddr>,
         client_cfg: Option<ClientGateConfig>,
+        dataplane_reader_cap: Option<usize>,
     ) -> io::Result<Self> {
         // Bind the data-plane peer listener BEFORE spawning anything, so a bind failure is synchronous
         // (no half-started runtime). Non-blocking so the accept loop polls the shutdown flag.
@@ -1009,6 +1059,13 @@ where
         listener.set_nonblocking(true)?;
 
         let follower_partitions = server.follower_partitions();
+        // The EFFECTIVE inbound-reader cap (#915): the operator-configured value (threaded from the
+        // broker/cluster config) if any, else the default floor, RAISED to this node's legitimate
+        // inbound-follower fanout so a high-partition-fanout leader admits every real follower link
+        // instead of refusing past a borrowed constant. Computed from the server (its committed roles)
+        // BEFORE it is moved into the shared `Arc<Mutex>`.
+        let dataplane_reader_cap =
+            effective_dataplane_reader_cap(dataplane_reader_cap, server.led_inbound_link_count());
         let server = Arc::new(Mutex::new(server));
         let shutdown = Arc::new(AtomicBool::new(false));
         // Build the client produce-ack gate around the SAME server Arc when a config was given (#719/#735).
@@ -1039,7 +1096,8 @@ where
         let release_l = release.clone();
         // The concurrent inbound-reader counter (#865), owned by the listener thread: each spawned
         // reader holds a slot guard that decrements it on exit, so the listener caps concurrent peer
-        // readers at `MAX_DATAPLANE_READERS` and refuses any link beyond it rather than spawning an
+        // readers at `dataplane_reader_cap` (#915: sized to the legitimate fanout, floored at the old
+        // constant, operator-overridable) and refuses any link beyond it rather than spawning an
         // unbounded number of threads under a cluster-network flood.
         let active_readers = Arc::new(AtomicUsize::new(0));
         let listener_handle = std::thread::Builder::new()
@@ -1050,7 +1108,7 @@ where
                     server_l,
                     release_l,
                     shutdown_l,
-                    MAX_DATAPLANE_READERS,
+                    dataplane_reader_cap,
                     active_readers,
                 );
             })
@@ -3041,6 +3099,80 @@ mod tests {
     }
 
     #[test]
+    fn led_inbound_link_count_sums_per_led_partition_followers_and_ignores_followed() {
+        // #915: the legitimate inbound-link fanout is Σ over the partitions this node LEADS of that
+        // partition's follower count (replicas − leader). Partitions this node FOLLOWS contribute
+        // nothing (this node dials OUT for those). Build a node that leads three partitions (each a
+        // 3-replica set → 2 followers apiece) and follows a fourth, and assert the count is exactly
+        // 3 × 2 == 6, not touched by the followed partition.
+        const ME: u64 = 1;
+        let mut placements: BTreeMap<u64, Placement> = BTreeMap::new();
+        for p in 0..3u64 {
+            placements.insert(
+                p,
+                Placement {
+                    replicas: vec![ME, 2, 3],
+                    leader: ME,
+                    epoch: 1,
+                },
+            );
+        }
+        // A FOLLOWED partition (led by node 2): its two other replicas are inbound links on node 2's
+        // listener, NOT ours — it must add 0 to our led fanout.
+        placements.insert(
+            9,
+            Placement {
+                replicas: vec![ME, 2, 3],
+                leader: 2,
+                epoch: 1,
+            },
+        );
+        let planes: BTreeMap<u64, Arc<ReadPlane<InMemoryFs>>> = (0..3u64)
+            .map(|p| (p, leader_plane(leaked_leader_log(1))))
+            .collect();
+        let server = DataPlaneServer::from_placements(
+            ME,
+            &placements,
+            quorum3(),
+            |p| planes.get(&p).cloned(),
+            &InMemReplicaLogs,
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            server.led_inbound_link_count(),
+            6,
+            "3 led partitions × 2 followers each; the followed partition adds nothing"
+        );
+    }
+
+    #[test]
+    fn effective_reader_cap_grows_to_fanout_floors_at_default_and_honors_override() {
+        // #915: the effective inbound-reader cap must (a) default to the legitimate fanout so a
+        // high-partition-fanout leader (fanout > the old fixed 256) admits EVERY real follower instead
+        // of refusing links past a borrowed constant — the bug this fixes — while (b) never dropping
+        // below the old 256 floor for a small edge deployment, and (c) honoring an operator override as
+        // the flood bound yet still raising it to the exact fanout so a legitimate follower is never
+        // refused.
+        // (a) high fanout, no override: the cap GROWS to the fanout (old code was stuck at 256 → refused).
+        assert_eq!(effective_dataplane_reader_cap(None, 600), 600);
+        // (b) small fanout, no override: floored at the old constant so edge deployments are unaffected.
+        assert_eq!(
+            effective_dataplane_reader_cap(None, 3),
+            DEFAULT_MIN_DATAPLANE_READERS
+        );
+        assert_eq!(
+            effective_dataplane_reader_cap(None, DEFAULT_MIN_DATAPLANE_READERS),
+            DEFAULT_MIN_DATAPLANE_READERS
+        );
+        // (c) an override ABOVE the fanout is the bound (an unauthenticated flood is capped there)...
+        assert_eq!(effective_dataplane_reader_cap(Some(1000), 600), 1000);
+        // ...and an override BELOW the fanout is still raised to the fanout, so a real follower is never
+        // refused for lack of a slot even under a too-small operator cap.
+        assert_eq!(effective_dataplane_reader_cap(Some(50), 600), 600);
+    }
+
+    #[test]
     fn the_dataplane_listener_caps_concurrent_inbound_readers_and_refuses_beyond_it() {
         // #865: each accepted inbound peer link spawns a reader thread (its own stack + fd), and auth
         // happens only later inside `recv()`. Without a cap, a cluster-network flood (or a peer holding
@@ -4247,6 +4379,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             advertise.clone(),
             Arc::clone(&leader_status),
+            None,
         )
         .expect("leader runtime with client gate");
         let leader_gate = leader_rt
@@ -4282,6 +4415,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             advertise.clone(),
             Arc::clone(&f_status),
+            None,
         )
         .expect("follower runtime with client gate");
         let follower_gate = f_rt
@@ -4323,6 +4457,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             BTreeMap::new(), // EMPTY advertise map (the hintless baseline)
             Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
+            None,
         )
         .expect("follower runtime, empty advertise");
         let hintless_gate = f_rt2
@@ -4443,6 +4578,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             BTreeMap::new(),
             Arc::clone(&leader_status),
+            None,
         )
         .expect("leader runtime");
 
@@ -4475,6 +4611,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             BTreeMap::new(),
             Arc::clone(&f_status),
+            None,
         )
         .expect("follower runtime with client gate");
         let gate = f_rt
@@ -4607,6 +4744,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             BTreeMap::new(),
             Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
+            None,
         )
         .expect("leader runtime");
 
@@ -4634,6 +4772,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             BTreeMap::new(),
             Arc::clone(&f_status),
+            None,
         )
         .expect("follower runtime");
         let gate = f_rt.client_gate().cloned().expect("client gate");
@@ -4723,6 +4862,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             BTreeMap::new(),
             Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
+            None,
         )
         .expect("leader runtime");
 
@@ -4750,6 +4890,7 @@ mod live_runtime_tests {
             crate::cluster::ack_level::ClusterAckLevel::C1,
             BTreeMap::new(),
             Arc::clone(&f_status),
+            None,
         )
         .expect("follower runtime");
         let gate = f_rt.client_gate().cloned().expect("client gate");

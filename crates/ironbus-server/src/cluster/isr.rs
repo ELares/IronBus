@@ -303,6 +303,17 @@ impl IsrTracker {
         self.config.min_isr
     }
 
+    /// The number of CONFIGURED followers of this partition (the replica set minus the leader). This is
+    /// the count of LEGITIMATE inbound data-plane links this leader must admit for the partition — one
+    /// per follower's fetch/report loop — regardless of each follower's current in-sync state (a lagging
+    /// or briefly-disconnected follower still reconnects and needs its slot). Summed across a node's led
+    /// partitions it is the node's legitimate inbound-link fanout, which sizes the data-plane reader cap
+    /// (#915) so a high-fanout leader never refuses a real follower.
+    #[must_use]
+    pub fn follower_count(&self) -> usize {
+        self.followers.len()
+    }
+
     /// Raise the leader's own fsync'd frontier to `flushed_offset` (its `Log::flushed_offset` after a
     /// local group-commit `fdatasync`). The leader is always an ISR member; this is the I2 local-fsync
     /// frontier that the cluster quorum builds on. Monotonic: a smaller value is ignored.
