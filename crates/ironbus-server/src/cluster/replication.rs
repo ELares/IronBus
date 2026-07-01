@@ -1654,6 +1654,160 @@ mod tests {
         assert!(follower.high_watermark().get() < 20);
     }
 
+    // ----- C8-I1: a follower POWER-CUT drops its unsynced tail, but every REPORTED-durable
+    // (quorum-fsync'd) offset survives byte-identical when the replica is reopened from its
+    // durable on-disk image (#841/#627) -----
+
+    #[test]
+    fn follower_power_cut_preserves_every_reported_durable_offset_byte_identical() {
+        // C8-I1, the replicated committed-survival invariant: `apply_fetch_response` fdatasyncs the
+        // replicated batch (`self.log.sync()`) BEFORE it returns the ApplyOutcome, so the offset it
+        // REPORTS as durably-replicated is covered by that sync. This test pins that ordering
+        // against a REAL unsynced-tail loss: it power-cuts the follower's filesystem (reverting
+        // every not-yet-fsync'd byte to the durable image), drops the live handle, and reopens the
+        // replica log FROM SCRATCH. Every reported-durable offset must survive AND be byte-identical
+        // to the leader's committed bytes. A regression that reported an offset before its covering
+        // fdatasync would lose the active-segment tail here and FAIL — while the pre-existing
+        // live-handle dump / clean-reopen tests would NOT catch it (both retain page-cache-only
+        // bytes that a real power cut discards).
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..40u32 {
+            leader_log
+                .append(&rec(format!("cut-{i:03}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        assert_eq!(leader_log.flushed_offset().get(), 40);
+
+        // A fresh follower fetches + re-validates + appends until caught up, over a filesystem we
+        // keep a probe handle to (the handle aliases the SAME disk the log writes, so we can
+        // power-cut it after the follower has reported durability).
+        let follower_fs = InMemoryFs::new();
+        let follower = Follower::new(open_log(follower_fs.clone(), small_config()));
+        let follower = replicate_to_catch_up(&leader_log, follower, 7, 4096);
+
+        // The offset the follower REPORTED as durably-replicated: the fsync inside
+        // `apply_fetch_response` ran before this was observable.
+        let reported_durable = follower.next_fetch_offset().get();
+        assert_eq!(
+            reported_durable, 40,
+            "the follower reported all 40 replicated offsets as durable"
+        );
+
+        // THE POWER-CUT: revert every write not covered by an fsync to the durable on-disk image.
+        // Drop the live handle FIRST so the subsequent open is a genuine cold reopen, not a
+        // page-cache-warm handle.
+        drop(follower);
+        follower_fs.simulate_power_loss();
+
+        // Reopen the replica log from scratch — purely from its durable on-disk bytes.
+        let reopened = open_log(follower_fs, small_config());
+
+        // SURVIVAL: recovery restores AT LEAST every reported-durable offset. None of the
+        // quorum-fsync'd prefix was lost to the power cut.
+        assert!(
+            reopened.next_offset().get() >= reported_durable,
+            "reopened next_offset {} fell below the reported-durable offset {reported_durable} — \
+             a committed offset was lost to the power cut",
+            reopened.next_offset().get(),
+        );
+
+        // BYTE-IDENTITY: every surviving offset decodes to exactly the leader's committed record,
+        let leader_recs = leader_log.read_from(Offset::ZERO, 1000).unwrap();
+        let reopened_recs = reopened.read_from(Offset::ZERO, 1000).unwrap();
+        assert!(
+            reopened_recs.len() >= usize::try_from(reported_durable).unwrap(),
+            "the recovered prefix is at least the reported-durable length"
+        );
+        for (i, (recovered, committed)) in reopened_recs.iter().zip(leader_recs.iter()).enumerate()
+        {
+            assert_eq!(
+                recovered, committed,
+                "record at offset {i} diverged from the leader's committed bytes after the cut"
+            );
+        }
+        // and the raw on-disk segment bytes are the leader's, frame-for-frame (byte-identity of the
+        // whole recovered image, since the follower reported the full committed prefix as durable).
+        assert_eq!(
+            dump_segments(&reopened),
+            dump_segments(&leader_log),
+            "the power-cut-and-reopened replica is byte-identical to the leader"
+        );
+    }
+
+    #[test]
+    fn follower_power_cut_drops_an_unsynced_tail_below_the_reported_offset() {
+        // The DISCRIMINATING companion to the survival test: it proves the power-cut harness
+        // actually MODELS loss (so the survival assertion above is not vacuous). The follower
+        // durably replicates + REPORTS a prefix, then an in-flight batch is appended to its log
+        // WITHOUT an fsync (an un-reported, page-cache-only tail). The power cut must drop that
+        // unsynced tail — the reopened durable image ends exactly at (or within) the reported,
+        // fsync-covered prefix, never past it.
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..24u32 {
+            leader_log
+                .append(&rec(format!("t{i:03}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+
+        // Replicate a first, bounded prefix and record the reported-durable offset (fsync'd inside
+        // apply_fetch_response).
+        let follower_fs = InMemoryFs::new();
+        let mut follower = Follower::new(open_log(follower_fs.clone(), small_config()));
+        let leader = ReplicationLeader::new(&leader_log);
+        let req = follower.fetch_request(8, u32::MAX);
+        let resp = leader.serve_fetch(&req).unwrap();
+        let reported_durable = follower.apply_fetch_response(&resp).unwrap().next_offset;
+        assert!(
+            reported_durable > 0,
+            "the first bounded fetch reported a non-empty durable prefix"
+        );
+
+        // Now append an IN-FLIGHT tail straight to the follower's log WITHOUT syncing — bytes the
+        // follower has NOT reported as durable. Keep the probe handle's view of what is unsynced.
+        let unsynced_from = follower.log_mut().next_offset().get();
+        for i in 0..8u32 {
+            follower
+                .log_mut()
+                .append(&rec(format!("inflight{i}").as_bytes()))
+                .unwrap();
+        }
+        let staged = follower.log_mut().next_offset().get();
+        assert!(staged > unsynced_from, "an in-flight tail was staged");
+
+        // Power-cut: the unsynced tail (every byte past the last fsync) is discarded.
+        drop(follower);
+        follower_fs.simulate_power_loss();
+        let reopened = open_log(follower_fs, small_config());
+
+        // The reported, fsync-covered prefix SURVIVES.
+        assert!(
+            reopened.next_offset().get() >= reported_durable,
+            "the reported-durable prefix must survive the cut"
+        );
+        // The unsynced in-flight tail did NOT fully survive: recovery ends at or below where the
+        // last fsync left it, strictly short of the staged, never-fsync'd frontier.
+        assert!(
+            reopened.next_offset().get() < staged,
+            "the never-fsync'd in-flight tail (up to {staged}) must not survive the power cut, \
+             but recovery restored {}",
+            reopened.next_offset().get()
+        );
+        // The REPORTED-durable prefix (offsets below `reported_durable`) is byte-identical to the
+        // leader's committed bytes. (The in-flight tail above it is deliberately NOT leader data —
+        // it only exists to prove the power cut discards a never-fsync'd tail — so it is excluded
+        // from this leader-equality check.)
+        let leader_recs = leader_log.read_from(Offset::ZERO, 1000).unwrap();
+        let reopened_recs = reopened.read_from(Offset::ZERO, 1000).unwrap();
+        for i in 0..usize::try_from(reported_durable).unwrap() {
+            assert_eq!(
+                reopened_recs[i], leader_recs[i],
+                "reported-durable offset {i} diverged from the leader's committed bytes"
+            );
+        }
+    }
+
     // ----- catch-up from a NON-ZERO offset -----
 
     #[test]
