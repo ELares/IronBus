@@ -859,4 +859,164 @@ mod tests {
             })
         );
     }
+
+    /// Recompute and stamp the trailing crc32c over `buf[..len-4]` so a hand-built body is
+    /// crc-VALID: it forces the decoder PAST the [`SeqSnapshotError::BadCrc`] gate to the
+    /// length/slicing arithmetic under test, isolating the `BadLength` paths.
+    fn seal_crc(buf: &mut [u8]) {
+        let crc_at = buf.len() - 4;
+        let crc = crc32c::crc32c(&buf[..crc_at]);
+        buf[crc_at..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_rejects_an_entry_length_that_overruns_the_body() {
+        // A crc-valid body whose FIRST entry declares a u16 plen far larger than the remaining
+        // bytes: `entry_tail = pos + plen + 24` overruns `crc_at` (producer_seq.rs:468). The
+        // decoder must return BadLength, never slice out of bounds and panic.
+        let mut buf = vec![SNAPSHOT_VERSION];
+        buf.extend_from_slice(&1u32.to_le_bytes()); // declared count = 1
+        buf.extend_from_slice(&u16::MAX.to_le_bytes()); // plen = 65535, wildly past the body
+        buf.extend_from_slice(&[0u8; 8]); // a few real bytes, nowhere near 65535 + 24
+        buf.extend_from_slice(&[0u8; 4]); // crc placeholder
+        seal_crc(&mut buf);
+        assert_eq!(
+            decode_seq_snapshot(&buf),
+            Err(SeqSnapshotError::BadLength { len: buf.len() })
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_trailing_stub_too_short_for_a_length_prefix() {
+        // A crc-valid body with exactly ONE byte left between the header and the trailing crc: the
+        // `while pos < crc_at` loop enters but `pos + 2 > crc_at` (producer_seq.rs:460), so there is
+        // not even room for the next entry's u16 length prefix. Must be BadLength, never a panic.
+        let mut buf = vec![SNAPSHOT_VERSION];
+        buf.extend_from_slice(&0u32.to_le_bytes()); // declared count (checked only after the loop)
+        buf.push(0u8); // a single stray body byte: fewer than 2 remain before crc_at
+        buf.extend_from_slice(&[0u8; 4]); // crc placeholder
+        seal_crc(&mut buf);
+        // crc_at = header(5) + stub(1) = 6, pos starts at 5, so pos + 2 = 7 > 6 -> BadLength.
+        assert_eq!(
+            decode_seq_snapshot(&buf),
+            Err(SeqSnapshotError::BadLength { len: buf.len() })
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_length_prefix_split_across_the_crc_boundary() {
+        // The `pos + 2 > crc_at` guard also covers a SECOND entry whose 2-byte length prefix would
+        // straddle the crc: a valid first entry, then a lone trailing byte. Exercises line 460 after
+        // the loop has already consumed one whole entry (a different `pos` than the stub case above).
+        let mut buf = vec![SNAPSHOT_VERSION];
+        buf.extend_from_slice(&2u32.to_le_bytes()); // declared 2, but only 1 whole entry + a stub
+        buf.extend_from_slice(&1u16.to_le_bytes()); // entry 0: plen = 1
+        buf.push(b'a');
+        buf.extend_from_slice(&7u64.to_le_bytes()); // epoch
+        buf.extend_from_slice(&9u64.to_le_bytes()); // last_seq
+        buf.extend_from_slice(&11u64.to_le_bytes()); // last_offset
+        buf.push(0u8); // a lone trailing byte: a split length prefix
+        buf.extend_from_slice(&[0u8; 4]); // crc placeholder
+        seal_crc(&mut buf);
+        assert_eq!(
+            decode_seq_snapshot(&buf),
+            Err(SeqSnapshotError::BadLength { len: buf.len() })
+        );
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The headline round-trip property (#834): `encode_seq_snapshot` then
+        /// `decode_seq_snapshot` is the identity for ANY sorted-distinct producer set — every
+        /// `(producer_id, epoch, last_seq, last_offset)` high-water survives a durable checkpoint
+        /// byte-for-byte, so a broker restart resurrects the exactly-once table exactly as saved.
+        #[test]
+        fn snapshot_codec_round_trips(
+            raw in prop::collection::vec(
+                (
+                    prop::collection::vec(any::<u8>(), 0..24),
+                    any::<u64>(),
+                    any::<u64>(),
+                    any::<u64>(),
+                ),
+                0..48,
+            ),
+        ) {
+            // Dedup by producer_id and sort ascending, the codec's strict-sorted-distinct contract
+            // (the registry's snapshot_pairs guarantees it in production).
+            let mut map = std::collections::BTreeMap::new();
+            for (pid, epoch, last_seq, last_offset) in raw {
+                map.insert(pid, (epoch, last_seq, last_offset));
+            }
+            let pairs: Vec<SeqHighWater> = map
+                .into_iter()
+                .map(|(pid, (e, s, o))| (pid, e, s, Offset::new(o)))
+                .collect();
+            let mut buf = Vec::new();
+            encode_seq_snapshot(&pairs, &mut buf);
+            let decoded = decode_seq_snapshot(&buf).expect("a freshly encoded snapshot decodes");
+            prop_assert_eq!(decoded, pairs);
+        }
+
+        /// Any single-bit flip in a snapshot this small is caught by the trailing crc32c, so a
+        /// silently corrupted high-water table is NEVER restored (it degrades to at-least-once
+        /// instead of resurrecting a wrong dedup offset).
+        #[test]
+        fn snapshot_codec_detects_single_bit_flips(
+            raw in prop::collection::vec(
+                (prop::collection::vec(any::<u8>(), 0..8), any::<u64>(), any::<u64>(), any::<u64>()),
+                1..24,
+            ),
+            idx in 0usize..8192,
+            bit in 0u8..8,
+        ) {
+            let mut map = std::collections::BTreeMap::new();
+            for (pid, epoch, last_seq, last_offset) in raw {
+                map.insert(pid, (epoch, last_seq, last_offset));
+            }
+            let pairs: Vec<SeqHighWater> = map
+                .into_iter()
+                .map(|(pid, (e, s, o))| (pid, e, s, Offset::new(o)))
+                .collect();
+            let mut buf = Vec::new();
+            encode_seq_snapshot(&pairs, &mut buf);
+            let i = idx % buf.len();
+            buf[i] ^= 1u8 << bit;
+            // The flip either breaks the crc, the version, the count, or the sort — every corruption
+            // is a typed error, and NONE panics. Re-flipping the crc bytes could in principle land
+            // back on a valid crc only if the flip is self-cancelling, which a single flip is not.
+            prop_assert!(
+                decode_seq_snapshot(&buf).is_err(),
+                "a flip of byte {} bit {} slipped through", i, bit
+            );
+        }
+
+        /// The fuzz round-trip property under `cargo test` (the seeded regression for
+        /// fuzz/fuzz_targets/seq_snapshot.rs): the decoder is TOTAL over arbitrary/torn bytes —
+        /// it returns a typed error or a valid set, and proptest turns any panic into a failure.
+        #[test]
+        fn decode_never_panics_on_arbitrary_bytes(
+            data in prop::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let _ = decode_seq_snapshot(&data);
+        }
+
+        /// The same total-decoder property biased toward WELL-FORMED headers (correct version and a
+        /// small declared count), so the fuzzer spends its bytes inside the per-entry length/slicing
+        /// arithmetic — the exact `pos + 2` / `pos + plen + 24` math the BadLength paths guard —
+        /// rather than bouncing off the version/crc gates.
+        #[test]
+        fn decode_never_panics_on_structured_torn_bytes(
+            declared in 0u32..8,
+            body in prop::collection::vec(any::<u8>(), 0..96),
+        ) {
+            let mut buf = vec![SNAPSHOT_VERSION];
+            buf.extend_from_slice(&declared.to_le_bytes());
+            buf.extend_from_slice(&body);
+            buf.extend_from_slice(&[0u8; 4]);
+            seal_crc(&mut buf); // force past BadCrc into the length arithmetic
+            let _ = decode_seq_snapshot(&buf);
+        }
+    }
 }

@@ -71,6 +71,9 @@ fn drive_target(target: &str, file: &Path, data: &[u8]) {
         "cursor_snapshot" => replay(file, || {
             let _ = AckCursor::decode_snapshot(data);
         }),
+        "seq_snapshot" => replay(file, || {
+            let _ = ironbus_core::producer_seq::decode_seq_snapshot(data);
+        }),
         "segment_scan" => replay(file, || {
             let f = InMemoryFile::new();
             if f.write_all_at(data, 0).is_err() {
@@ -113,6 +116,7 @@ const TARGETS: &[&str] = &[
     "record_codec",
     "frame_decode",
     "cursor_snapshot",
+    "seq_snapshot",
     "segment_scan",
     "pub_body",
     "ack_body",

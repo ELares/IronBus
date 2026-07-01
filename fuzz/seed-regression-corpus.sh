@@ -153,6 +153,17 @@ printf '' | place cursor_snapshot                                   # empty snap
 printf '\001' | place cursor_snapshot                               # one stray byte
 printf '\377\377\377\377\377\377\377\377' | place cursor_snapshot   # all-ones header bytes
 
+# seq_snapshot (#834): a torn/hostile producer-sequence high-water checkpoint must never crash
+# recovery. Layout `[ version:u8 ][ count:u32 LE ][ entry* ][ crc32c:u32 LE ]`, each entry
+# `[ plen:u16 LE ][ pid ][ epoch:u64 ][ last_seq:u64 ][ last_offset:u64 ]`. The overlong-plen seed
+# aims the fuzzer at the `pos + plen + 24` slicing math (the BadLength path), the stub seed at the
+# `pos + 2` length-prefix guard.
+printf '' | place seq_snapshot                                      # empty snapshot
+printf '\001' | place seq_snapshot                                  # one stray byte (< min len)
+printf '\377\377\377\377\377\377\377\377' | place seq_snapshot      # all-ones header bytes
+printf '\001\001\000\000\000\377\377\000\000\000\000\000' | place seq_snapshot  # v1, count=1, plen=0xffff overruns
+printf '\001\000\000\000\000\000\000\000\000' | place seq_snapshot  # v1, count=0, lone stub byte before crc
+
 # Final report / drift check.
 if [ "$mode" = check ]; then
   committed=$fuzz_dir/corpus-regression
