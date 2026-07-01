@@ -682,6 +682,10 @@ struct ProfilePreset {
     /// so `edge-tiny` LOWERS it (each slot is a maximal frame) to a handful so the guard's term-7
     /// charge fits its 64 MiB ceiling; `balanced`/`throughput` use the shipped default.
     max_prepared: usize,
+    /// `txn.max_prepared_bytes` (`--max-prepared-bytes`): the OPTIONAL exact resident-byte budget for
+    /// prepared half messages (#958). `0` = OFF (only the count cap binds) — every shipped preset leaves
+    /// it off, so it is a purely opt-in tightening an operator sets by flag/env.
+    max_prepared_bytes: u64,
 }
 
 /// The `edge-tiny` preset: `docs/CONFIG.md` section 6, identical to the `tiny` table in
@@ -717,6 +721,9 @@ const EDGE_TINY_PRESET: ProfilePreset = ProfilePreset {
     // would refuse under 64 MiB. A tiny edge node runs few concurrent transactions, so 2 prepared slots
     // (~32 MiB) is a bounded ceiling that still leaves headroom under 64 MiB alongside the other terms.
     max_prepared: 2,
+    // The exact byte budget is OFF by default (#958): edge-tiny already fits via the lowered count cap
+    // above, so the byte budget stays a purely opt-in tightening an operator may add.
+    max_prepared_bytes: 0,
 };
 
 /// The `balanced` preset: THE default, and EXACTLY the compiled-in `DEFAULT_*` constant set, so a
@@ -746,6 +753,8 @@ const BALANCED_PRESET: ProfilePreset = ProfilePreset {
     // `balanced` IS the default knob set, so it keeps the shipped prepared cap (with the guard off, its
     // ~1 TiB worst case is not charged against any ceiling).
     max_prepared: DEFAULT_MAX_PREPARED,
+    // Byte budget OFF (#958): `balanced` is the zero-config default, so only the count cap binds.
+    max_prepared_bytes: 0,
 };
 
 /// The `throughput` preset: `docs/CONFIG.md` section 6, wide buffers for a multi-core hub. 256 MiB
@@ -772,6 +781,8 @@ const THROUGHPUT_PRESET: ProfilePreset = ProfilePreset {
     dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
     // A hub sizes RAM out of band (guard off), so it keeps the shipped default prepared cap.
     max_prepared: DEFAULT_MAX_PREPARED,
+    // Byte budget OFF (#958): a hub sizes RAM out of band, so only the count cap binds.
+    max_prepared_bytes: 0,
 };
 
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
@@ -2250,6 +2261,12 @@ struct ServeFlags {
     /// `edge-tiny`). Bounds the resident prepared-half-message RAM the refuse-to-boot guard charges
     /// under a `TxnPrepare` flood of distinct `txn_id`s.
     max_prepared: Option<usize>,
+    /// The OPTIONAL exact resident-byte budget for prepared half messages (#909 follow-up, #958);
+    /// `None` falls back to the profile preset (`0` = OFF everywhere by default, so only the count cap
+    /// `--max-prepared` binds). When set to a non-zero value the engine's per-prepare byte accounting
+    /// refuses any prepare that would push the resident sum past it, so the refuse-to-boot guard's
+    /// term-7 charge is the exact byte budget rather than the worst-case `max_prepared * maximal frame`.
+    max_prepared_bytes: Option<u64>,
     /// The durability LEVEL (#341, #379) selected by `--durability-level` / `IRONBUS_DURABILITY_LEVEL`.
     /// `None` resolves to the default `sync` (ack-implies-durable, I2, zero acked loss). An unknown
     /// name is a usage error.
@@ -2543,6 +2560,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--max-prepared" => {
                 f.max_prepared = Some(take_number("--max-prepared", args, &mut i)?);
+            }
+            "--max-prepared-bytes" => {
+                f.max_prepared_bytes = Some(take_number("--max-prepared-bytes", args, &mut i)?);
             }
             "--disk-full-policy" => {
                 f.disk_full_policy = Some(take_value("--disk-full-policy", args, &mut i)?);
@@ -3123,6 +3143,14 @@ fn parse_serve_flags_with_env_and_reader(
                 f.max_prepared,
                 env,
                 preset.max_prepared,
+            )?,
+            // #958: the OPTIONAL exact byte budget takes its default from the profile preset (OFF = `0`
+            // everywhere), still overridable by env/flag — the byte-side sibling of `--max-prepared`.
+            max_prepared_bytes: resolve_number(
+                "--max-prepared-bytes",
+                f.max_prepared_bytes,
+                env,
+                preset.max_prepared_bytes,
             )?,
             // The durability level and its interval triggers (#341, #379). The level is resolved
             // above (flag > env > default `sync`); the interval triggers take their defaults when not
@@ -4653,6 +4681,10 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
         // wire-supplied, so the count is bounded only by this cap, not the connection count. The engine
         // honors it via `Engine::set_txn_max_prepared`, so the charge is a true bound.
         max_prepared: u64::try_from(config.max_prepared).unwrap_or(u64::MAX),
+        // Term 7's OPTIONAL exact byte budget (#958): `0` = OFF (term 7 charges the worst-case count
+        // above); when set the engine's per-prepare byte accounting holds the resident sum under it, so
+        // the guard charges the exact budget — the txn sibling of `consumer_credit_bytes` on term 1.
+        max_prepared_bytes: config.max_prepared_bytes,
     };
     match ironbus_server::rss::fits_under_ram_ceiling(&footprint) {
         ironbus_server::rss::RamCeilingVerdict::Disabled
@@ -4862,6 +4894,13 @@ struct ServeConfig {
     /// LOWERS it (each slot is a maximal frame) so the guard fits its 64 MiB ceiling; floored to 1 by the
     /// engine.
     max_prepared: usize,
+    /// The OPTIONAL exact resident-byte budget for prepared half messages (#909 follow-up, #958): `0` =
+    /// OFF (only the count cap `max_prepared` binds); when non-zero the engine's per-prepare byte
+    /// accounting refuses any prepare that would push the resident sum past it, so the refuse-to-boot
+    /// guard's term-7 charge is the exact byte budget rather than the worst-case `max_prepared * maximal
+    /// frame` — the txn sibling of `consumer_credit_bytes`. Threaded into the engine via
+    /// `Engine::set_txn_max_prepared_bytes` (as `None` when `0`). Default `0` (OFF) on every preset.
+    max_prepared_bytes: u64,
     /// The DURABILITY LEVEL (#341, #379): how an ack relates to the covering `fdatasync`. Default
     /// [`DurabilityLevelArg::Sync`] (ack only after the covering fdatasync, I2, ZERO acked loss on a
     /// power cut), so a zero-config broker is power-loss safe. The relaxed levels weaken I2 by a
@@ -5026,6 +5065,8 @@ impl ServeConfig {
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
             // #909: the bench broker uses the shipped default prepared cap (the guard is off here).
             max_prepared: DEFAULT_MAX_PREPARED,
+            // #958: no exact byte budget by default (OFF), so only the count cap binds.
+            max_prepared_bytes: 0,
             // The bench broker runs the default durable level (#341): ack-implies-durable, the same
             // power-loss-safe guarantee the shipped `serve` default carries.
             durability_level: DurabilityLevelArg::Sync,
@@ -6286,7 +6327,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
          actor_watchdog_bound_ms={} \
          enable_admin={} ram_ceiling_bytes={} dedup_max_ids={} dedup_max_producers={} \
-         max_prepared={} \
+         max_prepared={} max_prepared_bytes={} \
          durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
          flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
@@ -6316,6 +6357,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.dedup_max_ids,
         config.dedup_max_producers,
         config.max_prepared,
+        config.max_prepared_bytes,
         config.flush_interval_ms,
         config.flush_max_bytes,
         config.async_loss_ack,
@@ -9242,6 +9284,14 @@ fn open_engine_with<F: Filesystem + Clone>(
     // like the compaction / key-shared config below; a broker whose txn store is created lazily on the
     // first `TxnPrepare` picks up the remembered value. `edge-tiny` lowers it so its ceiling fits.
     engine.set_txn_max_prepared(config.max_prepared);
+    // Wire the OPTIONAL exact byte budget (#958): `0` means OFF (only the count cap above binds), so
+    // pass `None`; a non-zero budget arms the engine's per-prepare byte accounting, making the guard's
+    // term-7 charge the exact byte ceiling. Server-side only, like the count cap above.
+    engine.set_txn_max_prepared_bytes(if config.max_prepared_bytes == 0 {
+        None
+    } else {
+        Some(config.max_prepared_bytes)
+    });
     // Enable OPT-IN key compaction (#337) when `--compact` was passed (OFF by default). It runs the
     // off-hot-path compactor after each produce-path reaper run; it never touches the active segment,
     // so it cannot block an append. A broker without `--compact` is byte-for-byte unchanged.
@@ -12830,6 +12880,7 @@ mod tests {
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
             // #909: the shipped default prepared cap (the guard is off unless a ceiling is set).
             max_prepared: DEFAULT_MAX_PREPARED,
+            max_prepared_bytes: 0,
             // The default durable level (#341): a test config that does not opt in stays power-loss
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,
@@ -16260,6 +16311,7 @@ mod tests {
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
             // #909: the shipped default prepared cap (the guard is off unless a ceiling is set).
             max_prepared: DEFAULT_MAX_PREPARED,
+            max_prepared_bytes: 0,
             // The default durable level (#341): a test config that does not opt in stays power-loss
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,

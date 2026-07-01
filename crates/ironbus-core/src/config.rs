@@ -395,6 +395,10 @@ pub const KEY_TABLE: &[KeySpec] = &[
         key: "delivery.max_prepared",
         kind: KeyKind::Integer,
     },
+    KeySpec {
+        key: "delivery.max_prepared_bytes",
+        kind: KeyKind::Integer,
+    },
     // [network]
     KeySpec {
         key: "network.listen",
