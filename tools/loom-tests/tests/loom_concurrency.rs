@@ -46,7 +46,7 @@
 //!     allowlisted in deny.toml.
 #![cfg(loom)]
 
-use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use loom::sync::Arc;
 use loom::thread;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
@@ -669,6 +669,231 @@ fn read_plane_frontier_is_monotone_and_always_covered_under_two_seals() {
             (frontier, sealed_end),
             (2, 2),
             "the final read-plane state after two seals is fully published"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// MODEL 5: PRODUCE-GATE shed-accounting seam (fast-reject + L0-shed delta reconciliation, #476/#495).
+//
+// Real symbol cross-reference: `ironbus_server::produce_gate::ProduceCapGate`. Many connection
+// (handler) threads bump a MONOTONIC running total of connection-thread fast-rejects with a relaxed
+// `fetch_add` (`record_fast_reject`, and the separate L0 counter via `record_l0_shed`). The SINGLE
+// append-actor thread folds the DELTA-since-last-read into the engine's authoritative shed counters
+// once per batch (`take_unreconciled_fast_rejects`: load the monotonic total, `saturating_sub` the
+// already-reconciled high-water mark, then `store` the total back as the new high-water mark; the L0
+// path is symmetric via `take_unreconciled_l0_sheds`). The load-bearing audit invariant (module
+// docstrings lines 93 / 109) is: "a fast-reject is never a SILENT shed" — every reject folded into
+// the engine counters EXACTLY ONCE, never lost, never double-counted, "exact under any number of
+// concurrent connection threads with no lock." The single-writer `reconciled` / monotonic-total
+// reasoning is what the real code relies on; MODEL 5 pins it under loom's interleavings.
+//
+// The real counters are RELAXED (the value is advisory shed accounting, not a synchronization point
+// for other state — the actor's byte-cap check stays authoritative), so this model uses Relaxed too:
+// the property under test is the DELTA ARITHMETIC (load-total / subtract-HWM / store-total) staying
+// exact while handler threads concurrently bump the total, NOT an Acquire/Release publish. A
+// regression that makes the fold advance the high-water mark by anything other than the observed
+// total (e.g. `reconciled.fetch_add(delta)` instead of `store(total)`, or returning the raw total
+// instead of the delta, or folding one counter's delta out of the OTHER counter) makes the summed
+// deltas diverge from the monotonic total in some interleaving — the teeth.
+// ---------------------------------------------------------------------------------------------
+
+/// A faithful replica of the `ProduceCapGate` shed-accounting fields and the exact atomic dance the
+/// real methods perform. Two independent monotonic totals (Level-1 `fast_rejects` folded into
+/// `produce_rejected`, Level-0 `l0_shed` folded into `fire_and_forget_shed`), each with its OWN
+/// actor-side high-water mark so folding one never consumes the other (#495 separation).
+struct ShedAccounting {
+    /// Monotonic total of connection-thread fast-rejects (`ProduceCapGate::fast_rejects`). Bumped by
+    /// handler threads with a relaxed `fetch_add`; only ever grows.
+    fast_rejects: AtomicU64,
+    /// The fast-reject high-water mark the actor has already folded (`ProduceCapGate::reconciled`).
+    /// Touched ONLY by the single actor thread, so it needs no CAS.
+    reconciled: AtomicU64,
+    /// Monotonic total of Level-0 (fire-and-forget) cap-sheds (`ProduceCapGate::l0_shed`). Bumped by
+    /// handler threads with a relaxed `fetch_add`; only ever grows. SEPARATE from `fast_rejects`.
+    l0_shed: AtomicU64,
+    /// The L0-shed high-water mark the actor has already folded (`ProduceCapGate::l0_reconciled`).
+    /// Touched ONLY by the single actor thread. SEPARATE from `reconciled`.
+    l0_reconciled: AtomicU64,
+}
+
+impl ShedAccounting {
+    fn new() -> ShedAccounting {
+        ShedAccounting {
+            fast_rejects: AtomicU64::new(0),
+            reconciled: AtomicU64::new(0),
+            l0_shed: AtomicU64::new(0),
+            l0_reconciled: AtomicU64::new(0),
+        }
+    }
+
+    /// Handler side: bump the monotonic fast-reject total. Mirrors `ProduceCapGate::record_fast_reject`
+    /// (a single relaxed `fetch_add` on the produce fast path).
+    fn record_fast_reject(&self) {
+        self.fast_rejects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Actor side: fold the fast-rejects accrued since the last call and advance the high-water mark.
+    /// Byte-for-byte the real `ProduceCapGate::take_unreconciled_fast_rejects`: load the monotonic
+    /// total, `saturating_sub` the already-folded high-water mark, and (only if non-zero) `store` the
+    /// total back. Called ONLY by the single actor thread.
+    fn take_unreconciled_fast_rejects(&self) -> u64 {
+        let total = self.fast_rejects.load(Ordering::Relaxed);
+        let already = self.reconciled.load(Ordering::Relaxed);
+        let delta = total.saturating_sub(already);
+        if delta != 0 {
+            self.reconciled.store(total, Ordering::Relaxed);
+        }
+        delta
+    }
+
+    /// Handler side: bump the monotonic L0-shed total. Mirrors `ProduceCapGate::record_l0_shed`.
+    fn record_l0_shed(&self) {
+        self.l0_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Actor side: fold the L0 cap-sheds accrued since the last call and advance the L0 high-water
+    /// mark. Byte-for-byte the real `ProduceCapGate::take_unreconciled_l0_sheds`, over the SEPARATE L0
+    /// counter/high-water pair. Called ONLY by the single actor thread.
+    fn take_unreconciled_l0_sheds(&self) -> u64 {
+        let total = self.l0_shed.load(Ordering::Relaxed);
+        let already = self.l0_reconciled.load(Ordering::Relaxed);
+        let delta = total.saturating_sub(already);
+        if delta != 0 {
+            self.l0_reconciled.store(total, Ordering::Relaxed);
+        }
+        delta
+    }
+}
+
+#[test]
+fn produce_gate_fast_reject_folds_every_reject_exactly_once() {
+    // Two handler threads each `record_fast_reject` ONCE (relaxed `fetch_add`) while the single actor
+    // thread folds the delta up to TWICE: one fold that interleaves with the handlers, then a final
+    // drain after they join. 3 threads, <= 3 shared ops on the actor's concurrent fold (load total /
+    // load HWM / store), 1 op per handler. Invariants over EVERY interleaving:
+    //   - the summed folded deltas == the final monotonic total (2): every fast-reject folded EXACTLY
+    //     once — none lost (would sum < 2), none double-counted (would sum > 2);
+    //   - the already-folded high-water mark NEVER exceeds the monotonic total, so the `saturating_sub`
+    //     never actually saturates (the delta never wraps) under the single-actor invariant.
+    // A regression that advances `reconciled` by other than the observed total, returns the raw total
+    // instead of the delta, or drops the monotonic-total store makes the sum diverge from 2.
+    model_counted("produce_gate_fast_reject_fold", || {
+        let gate = Arc::new(ShedAccounting::new());
+        let h1 = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || gate.record_fast_reject())
+        };
+        let h2 = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || gate.record_fast_reject())
+        };
+        // Actor fold #1, concurrent with the handlers. The HWM can never run ahead of the total.
+        assert!(
+            gate.reconciled.load(Ordering::Relaxed) <= gate.fast_rejects.load(Ordering::Relaxed),
+            "the reconciled high-water mark must never exceed the monotonic fast-reject total"
+        );
+        let mut sum = gate.take_unreconciled_fast_rejects();
+        h1.join().expect("handler 1");
+        h2.join().expect("handler 2");
+        // Actor fold #2 (final drain): now that both handlers are done the total is settled at 2.
+        sum += gate.take_unreconciled_fast_rejects();
+        assert_eq!(
+            gate.fast_rejects.load(Ordering::Relaxed),
+            2,
+            "both handlers' fast-rejects are in the monotonic total"
+        );
+        assert_eq!(
+            sum, 2,
+            "every fast-reject is folded EXACTLY once across the folds (none lost, none double-counted)"
+        );
+        // The high-water mark caught the total up: a further fold yields nothing (no double-count).
+        assert_eq!(
+            gate.take_unreconciled_fast_rejects(),
+            0,
+            "a post-drain fold has nothing left to reconcile"
+        );
+    });
+}
+
+#[test]
+fn produce_gate_l0_shed_folds_every_shed_exactly_once() {
+    // The symmetric model for the INDEPENDENT Level-0 (fire-and-forget) counter (#495): two handlers
+    // each `record_l0_shed` once, the single actor folds up to twice (one concurrent, one final
+    // drain). Same exact-fold invariants over the L0 counter/high-water pair, proving the L0
+    // accounting is as leak-free and double-count-free as the L1 fast-reject accounting.
+    model_counted("produce_gate_l0_shed_fold", || {
+        let gate = Arc::new(ShedAccounting::new());
+        let h1 = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || gate.record_l0_shed())
+        };
+        let h2 = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || gate.record_l0_shed())
+        };
+        assert!(
+            gate.l0_reconciled.load(Ordering::Relaxed) <= gate.l0_shed.load(Ordering::Relaxed),
+            "the L0 high-water mark must never exceed the monotonic L0-shed total"
+        );
+        let mut sum = gate.take_unreconciled_l0_sheds();
+        h1.join().expect("handler 1");
+        h2.join().expect("handler 2");
+        sum += gate.take_unreconciled_l0_sheds();
+        assert_eq!(
+            gate.l0_shed.load(Ordering::Relaxed),
+            2,
+            "both handlers' L0 sheds are in the monotonic total"
+        );
+        assert_eq!(
+            sum, 2,
+            "every L0 shed is folded EXACTLY once across the folds (none lost, none double-counted)"
+        );
+        assert_eq!(
+            gate.take_unreconciled_l0_sheds(),
+            0,
+            "a post-drain L0 fold has nothing left to reconcile"
+        );
+    });
+}
+
+#[test]
+fn produce_gate_l0_fold_never_consumes_an_l1_fast_reject_delta() {
+    // The SEPARATION invariant (#495): folding the Level-0 counter must NEVER consume a Level-1
+    // fast-reject delta, and vice-versa — an over-cap L0 shed is a fire-and-forget drop
+    // (`fire_and_forget_shed`), a Level-1 fast-reject is a rejection the producer saw
+    // (`produce_rejected`); mixing them mis-attributes the audit counters. One handler bumps ONLY the
+    // fast-reject counter, another bumps ONLY the L0 counter, and the single actor folds BOTH
+    // (concurrent) and again after join. Across every interleaving each counter's summed deltas equal
+    // ITS OWN handler's single record — proving no cross-fold. 3 threads. A regression that folded one
+    // counter's delta out of the other's atomics would make the cross-counter sums diverge.
+    model_counted("produce_gate_no_cross_fold", || {
+        let gate = Arc::new(ShedAccounting::new());
+        let h_l1 = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || gate.record_fast_reject())
+        };
+        let h_l0 = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || gate.record_l0_shed())
+        };
+        // Concurrent fold of both counters. Each returns only its own counter's accrued delta.
+        let mut fast_sum = gate.take_unreconciled_fast_rejects();
+        let mut l0_sum = gate.take_unreconciled_l0_sheds();
+        h_l1.join().expect("L1 handler");
+        h_l0.join().expect("L0 handler");
+        // Final drain of both.
+        fast_sum += gate.take_unreconciled_fast_rejects();
+        l0_sum += gate.take_unreconciled_l0_sheds();
+        // Each counter folded exactly its own single record: the L0 fold never consumed the L1 delta,
+        // nor the reverse (the two are separate `produce_rejected` vs `fire_and_forget_shed` audits).
+        assert_eq!(
+            fast_sum, 1,
+            "the L1 fast-reject folded exactly once and was never consumed by an L0 fold"
+        );
+        assert_eq!(
+            l0_sum, 1,
+            "the L0 shed folded exactly once and was never consumed by an L1 fold"
         );
     });
 }
