@@ -107,7 +107,9 @@
 
 use crate::fs::Filesystem;
 use crate::layout::STREAMS_SUBDIR;
-use crate::log::{par_recover_open, Append, Log, LogConfig, RECOVERY_OPEN_MAX_WORKERS};
+use crate::log::{
+    par_recover_open, par_sync_data_only, Append, Log, LogConfig, RECOVERY_OPEN_MAX_WORKERS,
+};
 use crate::loss::LossReport;
 use crate::naming::{
     is_valid_stream_name, parse_stream_subdir_name, stream_subdir_name, MAX_STREAM_NAME_LEN,
@@ -537,9 +539,12 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
     /// records — [`Log::has_unsynced_records`]):
     ///   1. **flush**: [`Log::flush_no_sync`] drains each dirtied stream's `pending` buffer to the
     ///      page cache (independent per fd, cheap, no fsync);
-    ///   2. **barrier**: [`Log::sync_data_only`] issues the covering `fdatasync` on each dirtied
-    ///      stream's fd — K dirtied streams = K barriers (the kernel cannot batch `fdatasync` across
-    ///      different fds; this is honest, see [`CommitOutcome`]);
+    ///   2. **barrier**: [`crate::log::par_sync_data_only`] issues the covering `fdatasync` on each
+    ///      dirtied stream's fd — K dirtied streams = K barriers (the kernel cannot batch `fdatasync`
+    ///      across different fds; this is honest, see [`CommitOutcome`]). Because each stream is an
+    ///      INDEPENDENT fd, the K barriers are FANNED OUT concurrently across a bounded scoped-worker
+    ///      set and JOINED before any ack releases, so the tick's barrier phase costs max(barrier)
+    ///      not sum(barrier) (#823);
     ///   3. **release**: for each stream whose barrier SUCCEEDED,
     ///      [`Log::advance_synced_offset_after_external_sync`] advances its durable head and the
     ///      returned [`CommitOutcome::synced`] reports the offset up to which its acks may release.
@@ -565,9 +570,10 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
     /// pre-#564 correctness-first path and is kept for callers that want fail-fast.)
     #[must_use]
     pub fn commit_tick(&mut self) -> CommitOutcome {
-        // Pick the DIRTIED streams up front (default-first, deterministic). A clean/cold stream — or
-        // a frozen one — is never touched, so a tick's cost scales with the hot set, not the total
-        // stream count. We snapshot the ids so the three passes below borrow each log mutably in turn.
+        // Snapshot the DIRTIED stream ids up front (default-first, deterministic BTreeMap key order).
+        // A clean/cold stream — or a frozen one — is never touched, so a tick's cost scales with the
+        // hot set, not the total stream count. The ordinal of each id in this Vec is the tag the
+        // barrier fan-out reassembles by, so the release pass stays in this deterministic order.
         let dirtied: Vec<StreamId> = self
             .streams
             .iter()
@@ -580,40 +586,73 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
             froze: Vec::new(),
             fdatasyncs_issued: 0,
         };
+        // Every froze ordinal (from a PASS-1 flush freeze OR a PASS-2 barrier freeze) lands here and
+        // is sorted into the deterministic dirtied order at the end, byte-identical to the serial loop.
+        let mut froze_ord: Vec<usize> = Vec::new();
 
-        for id in dirtied {
-            let Some(log) = self.streams.get_mut(&id) else {
-                // A stream cannot vanish mid-tick (no concurrent declare/drop here), but be defensive.
-                continue;
-            };
-
-            // PASS 1 — flush this stream's pending bytes to the page cache (no fsync). A flush
-            // failure is the fatal frozen-writer class, identical to a failed barrier: record the
-            // freeze, do NOT advance the durable head, and continue with the siblings.
-            if log.flush_no_sync().is_err() {
-                outcome.fdatasyncs_issued += 1; // the barrier this stream owed is accounted, frozen pre-sync
-                outcome.froze.push(id);
-                continue;
+        // PASS 1 (serial, cheap): flush each dirtied stream's pending bytes to the page cache (no
+        // fsync). A flush failure is the fatal frozen-writer class, identical to a failed barrier:
+        // record the freeze and do NOT advance the durable head. A stream that flushes OK hands its
+        // disjoint `&mut Log` to the barrier fan-out (tagged by its ordinal in `dirtied`). Every
+        // dirtied stream owes exactly one barrier, counted here whether it flush-froze or reaches
+        // PASS 2 (identical count to the serial loop).
+        //
+        // We resolve the `&mut Log` handles by draining the whole map with `iter_mut` and matching
+        // each entry against `dirtied` by ordinal, so the handles are disjoint (`get_mut` in a loop
+        // cannot yield K simultaneous `&mut`). `dirtied` is in the same key order as `iter_mut`, so a
+        // single forward walk aligns them.
+        let mut barriers: Vec<(usize, &mut Log<F, C>)> = Vec::with_capacity(dirtied.len());
+        {
+            let mut next = 0usize;
+            for (id, log) in &mut self.streams {
+                if next >= dirtied.len() {
+                    break;
+                }
+                if *id != dirtied[next] {
+                    continue; // a clean stream between two dirtied ones
+                }
+                let ord = next;
+                next += 1;
+                outcome.fdatasyncs_issued += 1;
+                if log.flush_no_sync().is_err() {
+                    froze_ord.push(ord);
+                    continue;
+                }
+                barriers.push((ord, log));
             }
-
-            // PASS 2 — the covering fdatasync on THIS stream's fd. K dirtied streams => K barriers
-            // (fdatasync cannot be batched across fds). One barrier per dirtied stream is counted
-            // whether it succeeds or freezes the writer.
-            outcome.fdatasyncs_issued += 1;
-            if log.sync_data_only().is_err() {
-                // The barrier failed: this one stream is now frozen read-only, its acks stay PARKED
-                // (I2 upheld — never ack-as-durable without a returned fdatasync). Siblings continue.
-                outcome.froze.push(id);
-                continue;
-            }
-
-            // PASS 3 — the barrier returned: advance THIS stream's durable head and report the
-            // offset up to which its parked acks may release. Per-stream I2: this stream's acks
-            // release only now, after its own fdatasync.
-            log.advance_synced_offset_after_external_sync();
-            outcome.synced.push((id, log.synced_offset()));
         }
 
+        // PASS 2 (fan-out): issue the K covering fdatasyncs CONCURRENTLY across a bounded scoped-worker
+        // set, then JOIN every barrier before ANY ack is released. Each stream is its own fd/`Log`
+        // (disjoint `&mut`), so the barriers are independent and the tick's barrier phase now costs
+        // max(barrier) instead of sum(barrier) (#823). DURABILITY: `par_sync_data_only` returns only
+        // after EVERY barrier has completed, and PASS 3 advances a stream's durable head ONLY on its
+        // `Ok(())` result — a failed fd freezes ONLY its own commits, never a sibling's, and no ack
+        // releases until after this join.
+        let mut barrier_results = par_sync_data_only(barriers);
+        // Reassemble in the deterministic dirtied order (the fan-out returns completion order).
+        barrier_results.sort_unstable_by_key(|(ord, _)| *ord);
+
+        // PASS 3 (serial, deterministic): for each stream whose barrier returned, advance its durable
+        // head and report its ack-release offset (per-stream I2 — acks release only now, after its own
+        // fdatasync); a stream whose barrier failed freezes (acks stay parked).
+        for (ord, result) in barrier_results {
+            let id = &dirtied[ord];
+            if result.is_ok() {
+                if let Some(log) = self.streams.get_mut(id) {
+                    log.advance_synced_offset_after_external_sync();
+                    outcome.synced.push((id.clone(), log.synced_offset()));
+                }
+            } else {
+                froze_ord.push(ord);
+            }
+        }
+
+        froze_ord.sort_unstable();
+        outcome.froze = froze_ord
+            .into_iter()
+            .map(|ord| dirtied[ord].clone())
+            .collect();
         outcome
     }
 
@@ -1070,6 +1109,66 @@ mod tests {
 
         // 30 records were committed across the 3 dirtied streams for 3 barriers: ~0.1 fsync/record.
         // Doubling the per-stream record count would NOT change the barrier count — O(1/batch).
+    }
+
+    /// #823: with K>1 streams dirtied in ONE tick the K covering fdatasyncs are FANNED OUT
+    /// concurrently across a bounded scoped-worker set, yet the outcome stays byte-identical to the
+    /// old serial barrier loop. Under a total fsync fault EVERY dirtied fd's barrier fails on its own
+    /// (per-stream freeze isolation survives the fan-out), the froze set is reported in the
+    /// deterministic default-first order (NOT thread-completion order), and — the paramount durability
+    /// invariant — NO stream's durable head advanced and NO ack released, because every barrier is
+    /// JOINED before the release pass runs.
+    #[test]
+    fn fanned_out_barrier_freeze_is_deterministic_and_acks_nothing() {
+        let (mut set, _, control) = open_faulty(InMemoryFs::new());
+        let def = StreamId::default_stream();
+        let a = StreamId::named("a").unwrap();
+        let b = StreamId::named("b").unwrap();
+        let c = StreamId::named("c").unwrap();
+        for id in [&a, &b, &c] {
+            set.declare(id).unwrap();
+        }
+        // Dirty all 4 streams (default, a, b, c), several records each — K = 4 barriers in one tick.
+        for _ in 0..4 {
+            for id in [&def, &a, &b, &c] {
+                set.append_to(id, &rec(b"r")).unwrap();
+            }
+        }
+        // Each dirtied stream's durable head BEFORE the tick (trails its append head).
+        let before: BTreeMap<StreamId, Offset> = [&def, &a, &b, &c]
+            .iter()
+            .map(|id| ((*id).clone(), set.get(id).unwrap().synced_offset()))
+            .collect();
+
+        control.set_fail_sync(true);
+        let outcome = set.commit_tick();
+        control.set_fail_sync(false);
+
+        assert_eq!(outcome.fdatasyncs_issued, 4);
+        assert!(
+            outcome.synced.is_empty(),
+            "no commit acked when its covering fdatasync failed"
+        );
+        // The froze set is the deterministic default-first (BTreeMap key) order, not completion order.
+        assert_eq!(
+            outcome.froze,
+            vec![def.clone(), a.clone(), b.clone(), c.clone()],
+            "froze reported in deterministic default-first order"
+        );
+        // Each dirtied fd froze on its OWN barrier fault; none advanced its durable head (the release
+        // pass ran only after the join, so a failed barrier released no ack).
+        for id in [&def, &a, &b, &c] {
+            let log = set.get(id).unwrap();
+            assert_eq!(
+                log.synced_offset(),
+                before[id],
+                "a frozen stream's durable head must NOT advance"
+            );
+            assert!(
+                !log.is_writable(),
+                "each dirtied fd froze on its own barrier"
+            );
+        }
     }
 
     /// PER-STREAM I2: each stream's durable head ([`Log::synced_offset`]) advances only after ITS OWN

@@ -102,7 +102,9 @@
 //!   from the `StreamSet` storage primitive.
 
 use crate::fs::Filesystem;
-use crate::log::{par_recover_open, Append, Log, LogConfig, RECOVERY_OPEN_MAX_WORKERS};
+use crate::log::{
+    par_recover_open, par_sync_data_only, Append, Log, LogConfig, RECOVERY_OPEN_MAX_WORKERS,
+};
 use crate::loss::LossReport;
 use crate::naming::partition_subdir_name;
 use crate::segment::{OwnedRecord, StorageError};
@@ -422,9 +424,11 @@ impl<F: Filesystem, C: Clock> PartitionedStream<F, C> {
     /// The tick has three passes over the DIRTIED partitions ([`Log::has_unsynced_records`]):
     ///   1. **flush** — [`Log::flush_no_sync`] drains each dirtied partition's `pending` to the page
     ///      cache (cheap, no fsync);
-    ///   2. **barrier** — [`Log::sync_data_only`] issues the covering `fdatasync` on each dirtied
-    ///      partition's fd (K dirtied partitions = K barriers; the kernel cannot batch `fdatasync`
-    ///      across fds);
+    ///   2. **barrier** — [`crate::log::par_sync_data_only`] issues the covering `fdatasync` on each
+    ///      dirtied partition's fd (K dirtied partitions = K barriers; the kernel cannot batch
+    ///      `fdatasync` across fds, but because each partition is an INDEPENDENT fd the K barriers are
+    ///      FANNED OUT concurrently across a bounded scoped-worker set and JOINED before any ack
+    ///      releases, so the tick's barrier phase costs max(barrier) not sum(barrier), #823);
     ///   3. **release** — for each partition whose barrier SUCCEEDED,
     ///      [`Log::advance_synced_offset_after_external_sync`] advances its durable head, reported in
     ///      [`PartitionCommitOutcome::synced`].
@@ -442,55 +446,72 @@ impl<F: Filesystem, C: Clock> PartitionedStream<F, C> {
     /// reported, not raised, so one frozen partition does not abort a sibling's commit.
     #[must_use]
     pub fn commit_tick(&mut self) -> PartitionCommitOutcome {
-        // Pick the DIRTIED partitions up front (index order, deterministic). A clean/cold partition —
-        // or a frozen one — is never touched, so a tick's cost scales with the dirtied set, not P.
-        let dirtied: Vec<usize> = self
+        // `i` always comes from enumerating `self.partitions`, whose length is `P <= u32::MAX`, so
+        // the conversion is exact; the non-panicking `unwrap_or` fallback is unreachable (it keeps
+        // `commit_tick` panic-free, so `missing_panics_doc` stays satisfied).
+        let to_idx = |i: usize| PartitionIndex::new(u32::try_from(i).unwrap_or(u32::MAX));
+
+        let dirtied_count = self
             .partitions
             .iter()
-            .enumerate()
-            .filter(|(_, log)| log.has_unsynced_records())
-            .map(|(i, _)| i)
-            .collect();
+            .filter(|log| log.has_unsynced_records())
+            .count();
 
         let mut outcome = PartitionCommitOutcome {
-            synced: Vec::with_capacity(dirtied.len()),
+            synced: Vec::with_capacity(dirtied_count),
             froze: Vec::new(),
             fdatasyncs_issued: 0,
         };
+        // Every froze index (from a PASS-1 flush freeze OR a PASS-2 barrier freeze) lands here and is
+        // sorted into ascending partition-index order at the end, byte-identical to the serial loop.
+        let mut froze: Vec<usize> = Vec::new();
 
-        for i in dirtied {
-            let log = &mut self.partitions[i];
-            // `i` came from enumerating `self.partitions`, whose length is `P <= u32::MAX`, so the
-            // conversion is exact; the non-panicking `unwrap_or` fallback is unreachable (it keeps
-            // `commit_tick` panic-free, so `missing_panics_doc` stays satisfied).
-            let idx = PartitionIndex::new(u32::try_from(i).unwrap_or(u32::MAX));
-
-            // PASS 1 — flush this partition's pending bytes to the page cache (no fsync). A flush
-            // failure is the fatal frozen-writer class, identical to a failed barrier: record the
-            // freeze, do NOT advance the durable head, and continue with the siblings.
-            if log.flush_no_sync().is_err() {
-                outcome.fdatasyncs_issued += 1; // the barrier this partition owed, frozen pre-sync
-                outcome.froze.push(idx);
+        // PASS 1 (serial, cheap): flush each DIRTIED partition's pending bytes to the page cache (no
+        // fsync), in index order. A flush failure is the fatal frozen-writer class, identical to a
+        // failed barrier: record the freeze and do NOT advance the durable head. A partition that
+        // flushes OK hands its disjoint `&mut Log` to the barrier fan-out. Every dirtied partition
+        // owes exactly one barrier, counted here whether it flush-froze or reaches PASS 2 (identical
+        // count to the serial loop).
+        let mut barriers: Vec<(usize, &mut Log<F, C>)> = Vec::with_capacity(dirtied_count);
+        for (i, log) in self.partitions.iter_mut().enumerate() {
+            if !log.has_unsynced_records() {
                 continue;
             }
-
-            // PASS 2 — the covering fdatasync on THIS partition's fd. K dirtied partitions => K
-            // barriers (fdatasync cannot be batched across fds). One barrier per dirtied partition is
-            // counted whether it succeeds or freezes the writer.
             outcome.fdatasyncs_issued += 1;
-            if log.sync_data_only().is_err() {
-                // The barrier failed: this one partition is now frozen read-only, its acks stay PARKED
-                // (I2 upheld). Siblings continue.
-                outcome.froze.push(idx);
+            if log.flush_no_sync().is_err() {
+                froze.push(i);
                 continue;
             }
-
-            // PASS 3 — the barrier returned: advance THIS partition's durable head and report the
-            // offset up to which its parked acks may release. Per-partition I2.
-            log.advance_synced_offset_after_external_sync();
-            outcome.synced.push((idx, log.synced_offset()));
+            barriers.push((i, log));
         }
 
+        // PASS 2 (fan-out): issue the K covering fdatasyncs CONCURRENTLY across a bounded scoped-worker
+        // set, then JOIN every barrier before ANY ack is released. Each partition is its own fd/`Log`
+        // (disjoint `&mut`), so the barriers are independent and the tick's barrier phase now costs
+        // max(barrier) instead of sum(barrier) (#823). DURABILITY: `par_sync_data_only` returns only
+        // after EVERY barrier has completed, and PASS 3 advances a partition's durable head ONLY on
+        // its `Ok(())` result — a failed fd freezes ONLY its own commits, never a sibling's, and no
+        // ack releases until after this join.
+        let mut barrier_results = par_sync_data_only(barriers);
+        // Reassemble in ASCENDING partition-index order (the fan-out returns completion order), so the
+        // durable-head advance / ack-release pass below is deterministic and byte-identical to serial.
+        barrier_results.sort_unstable_by_key(|(i, _)| *i);
+
+        // PASS 3 (serial, deterministic): for each partition whose barrier returned, advance its
+        // durable head and report its ack-release offset (per-partition I2 — acks release only now,
+        // after its own fdatasync); a partition whose barrier failed freezes (acks stay parked).
+        for (i, result) in barrier_results {
+            if result.is_ok() {
+                let log = &mut self.partitions[i];
+                log.advance_synced_offset_after_external_sync();
+                outcome.synced.push((to_idx(i), log.synced_offset()));
+            } else {
+                froze.push(i);
+            }
+        }
+
+        froze.sort_unstable();
+        outcome.froze = froze.into_iter().map(to_idx).collect();
         outcome
     }
 }
@@ -1087,6 +1108,109 @@ mod tests {
             .is_err());
         let p1 = stream.partition(PartitionIndex::new(1)).unwrap();
         assert_eq!(p1.synced_offset(), p1.next_offset());
+    }
+
+    /// #823: with K>1 partitions dirtied in ONE tick the K covering fdatasyncs are FANNED OUT
+    /// concurrently across a bounded scoped-worker set, yet the outcome stays byte-identical to the
+    /// old serial barrier loop. Under a total fsync fault EVERY dirtied fd's barrier fails on its own
+    /// (per-fd freeze isolation survives the fan-out), the froze set is reported in ASCENDING
+    /// partition-index order (deterministic reassembly, NOT thread-completion order), and — the
+    /// paramount durability invariant — NO partition's durable head advanced and NO ack was released,
+    /// because every barrier is JOINED before the release pass runs.
+    #[test]
+    fn fanned_out_barrier_freeze_is_deterministic_and_acks_nothing() {
+        let (fs, control): (FaultFs<InMemoryFs>, FaultControl) = FaultFs::new(InMemoryFs::new());
+        let (mut stream, _) =
+            PartitionedStream::open(&fs, ManualClock::new(), cfg(), count(5)).unwrap();
+
+        // Dirty partitions 0..4 (leave 4 cold), several records each — K = 4 barriers in one tick.
+        for _ in 0..4 {
+            for i in 0..4u32 {
+                stream
+                    .partition_mut(PartitionIndex::new(i))
+                    .unwrap()
+                    .append(&keyless(b"r"))
+                    .unwrap();
+            }
+        }
+        // The durable head of each dirtied partition BEFORE the tick (trails its append head).
+        let before_heads: Vec<_> = (0..4u32)
+            .map(|i| {
+                stream
+                    .partition(PartitionIndex::new(i))
+                    .unwrap()
+                    .synced_offset()
+            })
+            .collect();
+
+        // Fail EVERY fdatasync: each of the K fanned-out barriers must fail independently.
+        control.set_fail_sync(true);
+        let outcome = stream.commit_tick();
+        control.set_fail_sync(false);
+
+        // One barrier counted per dirtied partition; the cold partition 4 cost nothing.
+        assert_eq!(outcome.fdatasyncs_issued, 4);
+        // I2 / durability invariant: not one partition acked when its barrier failed.
+        assert!(
+            outcome.synced.is_empty(),
+            "no commit acked when its covering fdatasync failed"
+        );
+        // The froze set is deterministic ascending index order, regardless of worker completion order.
+        let froze_idx: Vec<u32> = outcome.froze.iter().map(|p| p.get()).collect();
+        assert_eq!(
+            froze_idx,
+            vec![0, 1, 2, 3],
+            "froze reported in deterministic ascending partition-index order"
+        );
+        // Every dirtied fd froze on its OWN barrier fault, and NONE advanced its durable head — the
+        // release pass ran only after the join, so a failed barrier released no ack.
+        for (i, before) in before_heads.iter().enumerate() {
+            let idx = PartitionIndex::new(u32::try_from(i).unwrap());
+            let log = stream.partition(idx).unwrap();
+            assert_eq!(
+                log.synced_offset(),
+                *before,
+                "a frozen partition's durable head must NOT advance"
+            );
+            assert!(
+                !log.is_writable(),
+                "each dirtied fd froze on its own barrier"
+            );
+        }
+    }
+
+    /// #823: with K>1 partitions dirtied and NO fault, the fanned-out barriers all succeed and the
+    /// outcome is byte-identical to serial — every dirtied fd synced (ascending order), each durable
+    /// head advanced to its append head, exactly K barriers issued.
+    #[test]
+    fn fanned_out_barriers_all_succeed_and_advance_every_durable_head() {
+        let (fs, control): (FaultFs<InMemoryFs>, FaultControl) = FaultFs::new(InMemoryFs::new());
+        let (mut stream, _) =
+            PartitionedStream::open(&fs, ManualClock::new(), cfg(), count(6)).unwrap();
+        for _ in 0..3 {
+            for i in 0..6u32 {
+                stream
+                    .partition_mut(PartitionIndex::new(i))
+                    .unwrap()
+                    .append(&keyless(b"r"))
+                    .unwrap();
+            }
+        }
+        let before = control.sync_count();
+        let outcome = stream.commit_tick();
+        assert_eq!(control.sync_count() - before, 6, "K=6 covering fdatasyncs");
+        assert_eq!(outcome.fdatasyncs_issued, 6);
+        assert!(outcome.froze.is_empty());
+        let synced_idx: Vec<u32> = outcome.synced.iter().map(|(p, _)| p.get()).collect();
+        assert_eq!(
+            synced_idx,
+            vec![0, 1, 2, 3, 4, 5],
+            "synced in ascending order"
+        );
+        for i in 0..6u32 {
+            let log = stream.partition(PartitionIndex::new(i)).unwrap();
+            assert_eq!(log.synced_offset(), log.next_offset());
+        }
     }
 
     /// A foreign directory under a P>1 stream's root (not a canonical `p-*/` name) is left alone at

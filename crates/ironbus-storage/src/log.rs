@@ -976,6 +976,98 @@ where
         .collect()
 }
 
+/// The upper bound on the number of covering `fdatasync` barriers ONE group-commit tick fans out
+/// concurrently (#823). Same shape as [`RECOVERY_OPEN_MAX_WORKERS`]: a small fixed cap keeps the
+/// barrier fan-out from ever spawning one-thread-per-dirtied-fd on a wide (K = hundreds) tick, while
+/// still overlapping the blocking syscalls; the effective width is `min(this, cores, K)`.
+pub(crate) const COMMIT_BARRIER_MAX_WORKERS: usize = 8;
+
+/// Fans out the K per-fd covering `fdatasync` barriers of ONE group-commit tick
+/// ([`crate::streamset::StreamSet::commit_tick`] / [`crate::partitioned::PartitionedStream::commit_tick`])
+/// across a bounded [`std::thread::scope`] worker set, so the tick's barrier phase costs
+/// `max(barrier)` instead of `sum(barrier)` (#823). Each dirtied partition/stream is its OWN [`Log`]
+/// over its own segment set, so its covering `fdatasync` is on an INDEPENDENT fd and the K barriers
+/// are embarrassingly parallel; the kernel cannot batch `fdatasync` across fds, but the barriers can
+/// OVERLAP in wall time. Returns one `(tag, barrier result)` per input; the returned order is NOT
+/// input order (results come back in completion order), so the caller reassembles by `tag`.
+///
+/// Mirrors [`par_recover_open`] / [`Log::par_scan_segments`]: a fixed set of scoped workers steals the
+/// `(tag, &mut Log)` barriers off one shared queue, so a fast fd's worker immediately picks up the
+/// next barrier rather than blocking behind a slow one; helpers are spawned FALLIBLY via
+/// `Builder::spawn_scoped` and the MAIN thread is itself the final participant, so OS thread
+/// exhaustion degrades to fewer helpers (or fully serial) instead of panicking. No external threadpool
+/// (no rayon). The effective width is `min(COMMIT_BARRIER_MAX_WORKERS, cores, K)`; a single dirtied fd
+/// (the common `P = 1` / default-stream tick) runs inline on the calling thread with NO threads
+/// spawned — byte- and behaviour-identical to the old serial barrier loop.
+///
+/// ## Durability invariant (paramount)
+/// This ONLY parallelizes the blocking `fdatasync` SYSCALLS. It does NOT touch any durable-head or
+/// ack bookkeeping: each barrier is a disjoint `&mut Log` (no two barriers touch shared state, so the
+/// ack/commit accounting cannot race), and this returns ONLY after EVERY barrier has completed (a full
+/// JOIN). The caller MUST therefore run its durable-head advance / ack-release pass ONLY after this
+/// returns, and advance a fd's durable head ONLY on that fd's `Ok(())` result — a fd whose barrier
+/// returned `Err` (froze) must have its commits FAIL (durable head not advanced, acks stay parked),
+/// never acked. No ack in the group is released until after this join, so I2 (ack-implies-durable) and
+/// the per-fd freeze isolation are byte-identical to the serial loop.
+pub(crate) fn par_sync_data_only<F: Filesystem, C: Clock>(
+    barriers: Vec<(usize, &mut Log<F, C>)>,
+) -> Vec<(usize, Result<(), StorageError>)> {
+    let total = barriers.len();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(COMMIT_BARRIER_MAX_WORKERS)
+        .min(total);
+    if workers <= 1 {
+        // One barrier, one core, or a single-worker cap: run the fdatasyncs inline (no threads, no
+        // queue), byte-identical to the old serial barrier loop.
+        return barriers
+            .into_iter()
+            .map(|(tag, log)| (tag, log.sync_data_only()))
+            .collect();
+    }
+    // Shared work queue of the remaining `(tag, &mut Log)` barriers. Each participant locks the queue
+    // just long enough to POP one barrier (O(1), not the blocking fsync) and then runs that fd's
+    // `fdatasync` OUTSIDE the lock, so the barriers themselves overlap. The `&mut Log` handles are
+    // disjoint (each names a different fd/writer), so no barrier can observe or mutate another's
+    // writer state — the pop order does not matter because the caller reassembles by `tag`.
+    // `&mut Log` is `Send` (`Log: Send`), so `Mutex<Vec<(usize, &mut Log)>>` is `Sync`.
+    let queue: std::sync::Mutex<Vec<(usize, &mut Log<F, C>)>> = std::sync::Mutex::new(barriers);
+    std::thread::scope(|s| {
+        // Helpers are spawned FALLIBLY: a worker that cannot be created (OS thread exhaustion) is
+        // simply skipped, and the main thread below is the final participant that drains whatever is
+        // left — so even if EVERY helper fails to spawn, every barrier still runs (serially, inline).
+        let handles: Vec<_> = (0..workers.saturating_sub(1))
+            .filter_map(|k| {
+                let queue = &queue;
+                std::thread::Builder::new()
+                    .name(format!("ib-commit-fsync-{k}"))
+                    .spawn_scoped(s, move || {
+                        let mut local: Vec<(usize, Result<(), StorageError>)> = Vec::new();
+                        while let Some((tag, log)) =
+                            queue.lock().expect("commit barrier queue poisoned").pop()
+                        {
+                            local.push((tag, log.sync_data_only()));
+                        }
+                        local
+                    })
+                    .ok()
+            })
+            .collect();
+        // The main thread is the final participant: drain whatever barriers remain (this alone covers
+        // the whole set if no helper spawned).
+        let mut all: Vec<(usize, Result<(), StorageError>)> = Vec::with_capacity(total);
+        while let Some((tag, log)) = queue.lock().expect("commit barrier queue poisoned").pop() {
+            all.push((tag, log.sync_data_only()));
+        }
+        // JOIN every helper before returning: no barrier result — and so no ack — is released until
+        // every fd's fdatasync has completed.
+        for h in handles {
+            all.extend(h.join().expect("commit-tick fsync worker panicked"));
+        }
+        all
+    })
+}
+
 impl<F: Filesystem, C: Clock> Log<F, C> {
     /// Opens the log in `fs`, recovering the active segment or creating a fresh one.
     ///
