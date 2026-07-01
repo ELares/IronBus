@@ -706,6 +706,68 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         Ok(Offset::new(offset))
     }
 
+    /// Appends a PRE-ENCODED, ALREADY-VALIDATED frame VERBATIM — the follower replication ingest
+    /// fast path (#820). `frame` is one complete on-disk record frame the caller has just decoded
+    /// in place with the intact-record predicate ([`codec::decode`]: magic, version, header CRC32C,
+    /// body CRC32C, and — for large bodies — xxh3-64). Because the leader already produced the
+    /// canonical sealed frame and the follower assigns the SAME `seq`/offset positionally, the frame
+    /// is byte-identical to what [`SegmentWriter::append`] would re-encode from the decoded record;
+    /// copying it verbatim skips the redundant re-frame + re-checksum (the same crc32c-over-header,
+    /// crc32c-over-body, and xxh3-64 the decode just verified). `seq` and `timestamp_ms` are the
+    /// decoded frame's own values, carried in for the writer's `last_seq` / `max_timestamp_ms`
+    /// bookkeeping only — they are NOT re-embedded (the bytes are copied as-is).
+    ///
+    /// This does NOT re-validate `frame`: validation is the caller's decode step. Passing bytes that
+    /// are not a single complete, already-validated frame would corrupt the segment. Its byte effect
+    /// (the pending buffer content and `write_pos` advance) is identical to `append` of the record
+    /// `frame` decodes to.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::SegmentFull`] if the record count or byte length would overflow, or an
+    /// IO error from a spill flush (rolled back to the exact pre-append state, as in `append`).
+    pub fn append_verbatim(
+        &mut self,
+        frame: &[u8],
+        seq: Seq,
+        timestamp_ms: u64,
+    ) -> Result<Offset, StorageError> {
+        if self.record_count == u32::MAX {
+            return Err(StorageError::SegmentFull);
+        }
+        // Offsets are monotonic and never reused; refuse to wrap the offset space rather than mint a
+        // duplicate id (mirrors `append`).
+        let offset = self
+            .header
+            .base_offset
+            .get()
+            .checked_add(u64::from(self.record_count))
+            .ok_or(StorageError::SegmentFull)?;
+        // Copy the verbatim frame straight into the shared pending buffer — ONE contiguous memcpy in
+        // place of the codec's re-encode (4 extend_from_slice copies + 2x crc32c + xxh3). The bytes
+        // reach the file at the next flush point, exactly like an encoded frame.
+        let len = u64::try_from(frame.len()).map_err(|_| StorageError::SegmentFull)?;
+        let before = self.pending.len();
+        self.pending.extend_from_slice(frame);
+        let pos_before = self.write_pos;
+        let end = pos_before
+            .checked_add(len)
+            .ok_or(StorageError::SegmentFull)?;
+        self.write_pos = end;
+        // Spill under the same bound as `append`, with the same #859 torn-writer roll back on a
+        // mid-append flush IO error (restore `pending` and `write_pos` before `record_count` bumps).
+        if self.pending.len() >= PENDING_SPILL_BYTES {
+            if let Err(e) = self.flush_pending() {
+                self.pending.truncate(before);
+                self.write_pos = pos_before;
+                return Err(e);
+            }
+        }
+        self.record_count += 1;
+        self.last_seq = seq;
+        self.max_timestamp_ms = self.max_timestamp_ms.max(timestamp_ms);
+        Ok(Offset::new(offset))
+    }
+
     /// Flushes appended records to durable storage (fdatasync). A record is durable
     /// once this returns.
     ///
