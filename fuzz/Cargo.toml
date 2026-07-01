@@ -43,6 +43,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "seq_snapshot"
+path = "fuzz_targets/seq_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "segment_scan"
 path = "fuzz_targets/segment_scan.rs"
 test = false
