@@ -852,6 +852,57 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_before_quorum_is_not_resurrected_by_a_later_follower_report() {
+        // #855 (drop-then-release ordering): a producer parks a C2-fsync ack BELOW min_isr, then
+        // DISCONNECTS before quorum. A LATER follower report that reaches quorum must NOT resurrect
+        // an outbox entry keyed by the now-gone member id. Member ids are monotonic and never reused,
+        // so a resurrected entry would never be drained and never re-dropped — a permanent orphan
+        // (the slow outbox leak this issue describes). `drop_connection` purges the seam's still-parked
+        // ack, so the report releases nothing for the dead owner and deposits nothing into its outbox.
+        //
+        // The only prior coverage exercises the OPPOSITE order (release, then drop —
+        // `a_disconnect_drops_undrained_released_acks`), and the #871 test stops at the purge and never
+        // drives a subsequent quorum-reaching report. This pins the drop-BEFORE-quorum ordering.
+        let gate = leader_gate(1); // leader fsync'd through 1 (offset 0); no follower yet → below min_isr
+        let member = MemberId::new(42);
+        let offset = 0;
+        let disposition = gate.on_local_fsynced_ack(member, P, offset, wire_ack(offset));
+        assert_eq!(disposition, AckDisposition::Parked);
+
+        // The producer disconnects BEFORE quorum: the parked ack is purged from the seam here.
+        gate.drop_connection(member);
+        assert_eq!(
+            gate.server.lock().unwrap().seam().parked_len(),
+            0,
+            "drop_connection purged the still-parked ack before any quorum report"
+        );
+
+        // A follower report that WOULD have brought the 2-of-3 quorum for offset 0 now arrives. Because
+        // the parked ack was purged, it releases NOTHING and re-creates NO outbox entry for the gone member.
+        let report = AckReplicatedBody {
+            follower_id: 2,
+            fsynced_offset: 1,
+        };
+        assert_eq!(
+            gate.on_follower_report(P, &report),
+            0,
+            "a post-drop quorum report releases nothing for the disconnected owner"
+        );
+        assert!(
+            gate.drain_released(member).is_empty(),
+            "the dead owner's outbox entry is never resurrected (no drain)"
+        );
+        assert!(
+            !gate.outbox.lock().unwrap().contains_key(&member.get()),
+            "no outbox entry is keyed by the gone member id (no permanent orphan)"
+        );
+        assert!(
+            gate.outbox.lock().unwrap().is_empty(),
+            "the outbox holds no orphaned entries at all"
+        );
+    }
+
+    #[test]
     fn a_disconnect_drops_undrained_released_acks() {
         let gate = leader_gate(1);
         let member = MemberId::new(99);
