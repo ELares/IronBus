@@ -594,6 +594,14 @@ where
     // byte; a larger value is the trailing partial frame's `needed` hint, so a near-cap frame
     // trickled byte-by-byte is decoded once it is whole, not once per byte (#176).
     let mut needed: usize = 0;
+    // The response buffer, hoisted above the loop and reused across passes like `inbuf`/`chunk`
+    // (#826 did the same for the deliver scratch). `Session::process` is APPEND-ONLY (it never
+    // clears `out`), and every pass fully drains `out` via `write_all` before the next `clear()`,
+    // so reuse is sound: no stale bytes ever survive into a later response. This drops one
+    // alloc/free per response-producing pass and keeps a deliver-heavy consume pass's multi-frame
+    // buffer warm instead of re-growing it from zero every poll. `Vec::new()` stays lazy, so an
+    // idle/ping-only connection whose passes leave `out` empty never allocates.
+    let mut out: Vec<u8> = Vec::new();
     loop {
         let n = stream.read(&mut chunk[..])?;
         if n == 0 {
@@ -605,7 +613,7 @@ where
             continue;
         }
 
-        let mut out = Vec::new();
+        out.clear();
         let Ok(progress) = session.process(engine, &inbuf, &mut out) else {
             // A malformed frame, a fatal engine error, or a gone actor: flush any queued response
             // and close (a length-prefixed stream cannot resync).
@@ -831,6 +839,69 @@ mod tests {
             Poll::Message(d) => assert_eq!(d.record.payload.as_ref(), b"net"),
             other => panic!("expected the produced message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn two_produces_on_one_connection_each_get_exactly_their_own_ack() {
+        // #833 discriminator: `connection_loop` now REUSES one response buffer across passes and
+        // `clear()`s it at the top of each pass. That is sound only because `Session::process` is
+        // append-only and every pass fully drains `out` before the next `clear()`. If the reused
+        // buffer were ever NOT cleared, a later pass would re-emit the PRIOR pass's frames as a
+        // stale prefix: the second produce would read back the FIRST produce's PubAck(offset 0)
+        // instead of its own PubAck(offset 1). We drive two produces down one connection and pin
+        // each PubAck to its own offset, so any stale-prefix regression trips the offset asserts.
+        let (handle, actor) = spawn_inmem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = Vec::new();
+        client.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(read_one_frame(&mut client, &mut buf).0, FrameType::Info);
+
+        for expected_offset in 0u64..2 {
+            let mut pub_body = Vec::new();
+            encode_pub(
+                &PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"k",
+                    headers: b"",
+                    dedup: None,
+                    fire_and_forget: false,
+                    payload: b"net",
+                },
+                &mut pub_body,
+            )
+            .unwrap();
+            client.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
+            let (ty, body) = read_one_frame(&mut client, &mut buf);
+            assert_eq!(ty, FrameType::PubAck, "each pass emits exactly its own ack");
+            assert_eq!(
+                body,
+                expected_offset.to_le_bytes(),
+                "the reused response buffer carries no stale prefix from the prior pass"
+            );
+        }
+
+        drop(client);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = recover_engine(handle, actor);
     }
 
     #[test]
