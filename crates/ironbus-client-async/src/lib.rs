@@ -75,6 +75,27 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
+/// The smallest per-read scratch size. Reading at least this many bytes even when the decoder asks
+/// for fewer preserves the small-frame batching the client has always relied on: one socket read can
+/// pull several tiny frames, so the trailing frames stay buffered rather than forcing a read apiece.
+/// Matches the historical fixed 4 KiB read chunk. VERBATIM port of the sync client's `READ_WINDOW`.
+const READ_WINDOW: usize = 4096;
+
+/// The largest per-read scratch size. Bounds the reused scratch buffer so a large frame (a ~16 MiB
+/// `DeliverBatch`) is assembled in ~64 capped reads rather than one giant allocation, while the
+/// decoder's `needed` hint still lets a single read pull as much of the frame as the socket has.
+/// VERBATIM port of the sync client's `READ_CAP`.
+const READ_CAP: usize = 256 * 1024;
+
+/// How many bytes to read next while completing a frame, given the decoder's `needed` total-length
+/// hint and how many valid bytes are already buffered (`filled`). Sizes the read to the outstanding
+/// deficit, clamped into `[READ_WINDOW, READ_CAP]`. Reading past `needed` (when the deficit is under
+/// the window) is harmless — the extra bytes belong to following frames and stay buffered. VERBATIM
+/// port of the sync client's `frame_read_size`.
+fn frame_read_size(needed: usize, filled: usize) -> usize {
+    needed.saturating_sub(filled).clamp(READ_WINDOW, READ_CAP)
+}
+
 // Re-export the sync client's public data types VERBATIM: this crate's API RETURNS these exact types
 // (it does not redefine them), so a caller can name them without depending on `ironbus-client`
 // directly. They are the SYNC client's types, shared unchanged — the wire contract is identical.
@@ -239,9 +260,15 @@ async fn read_frame_from(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
 ) -> Result<(FrameType, Vec<u8>), ClientError> {
-    let mut chunk = [0u8; 4096];
+    // Reused scratch for each socket read. `buf` grows ONLY via `extend_from_slice`, run
+    // SYNCHRONOUSLY after the read future resolves — so `buf.len()` is always exactly the count of
+    // valid buffered bytes. This is cancellation-safe: if the read future is dropped (a
+    // `tokio::time::timeout` firing mid-read), the `extend` never runs and `buf` is untouched, so a
+    // later read decodes from clean bytes instead of zero pollution. Error-safe too: `?` propagates
+    // without having touched `buf`.
+    let mut scratch: Vec<u8> = Vec::new();
     loop {
-        match decode_frame(buf).map_err(ClientError::Frame)? {
+        let needed = match decode_frame(buf).map_err(ClientError::Frame)? {
             FrameDecode::Frame {
                 type_tag,
                 body,
@@ -253,13 +280,17 @@ async fn read_frame_from(
                 buf.drain(..consumed);
                 return Ok((ty, body));
             }
-            FrameDecode::Incomplete { .. } => {}
+            FrameDecode::Incomplete { needed } => needed,
+        };
+        let read_size = frame_read_size(needed, buf.len());
+        if scratch.len() < read_size {
+            scratch.resize(read_size, 0);
         }
-        let n = stream.read(&mut chunk).await?;
+        let n = stream.read(&mut scratch[..read_size]).await?;
         if n == 0 {
             return Err(ClientError::Closed);
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&scratch[..n]);
     }
 }
 
@@ -1551,17 +1582,24 @@ impl AsyncClient {
     ///
     /// On return, `decode_frame(&self.buf)` is guaranteed to yield [`FrameDecode::Frame`].
     async fn fill_frame(&mut self) -> Result<(), ClientError> {
-        let mut chunk = [0u8; 4096];
+        // See `read_frame_from`: `self.buf` grows ONLY via a synchronous `extend_from_slice` after
+        // the read future resolves, so dropping this future mid-read (a timeout) leaves `self.buf`
+        // holding exactly its valid bytes — the next read decodes clean, no zero pollution.
+        let mut scratch: Vec<u8> = Vec::new();
         loop {
-            match decode_frame(&self.buf).map_err(ClientError::Frame)? {
+            let needed = match decode_frame(&self.buf).map_err(ClientError::Frame)? {
                 FrameDecode::Frame { .. } => return Ok(()),
-                FrameDecode::Incomplete { .. } => {}
+                FrameDecode::Incomplete { needed } => needed,
+            };
+            let read_size = frame_read_size(needed, self.buf.len());
+            if scratch.len() < read_size {
+                scratch.resize(read_size, 0);
             }
-            let n = self.stream.read(&mut chunk).await?;
+            let n = self.stream.read(&mut scratch[..read_size]).await?;
             if n == 0 {
                 return Err(ClientError::Closed);
             }
-            self.buf.extend_from_slice(&chunk[..n]);
+            self.buf.extend_from_slice(&scratch[..n]);
         }
     }
 }
@@ -1892,6 +1930,135 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    /// A connected loopback tokio TCP pair `(client, server)`, both ends owned by the caller so a
+    /// test can drive reads and writes deterministically. `connect` completes into the listener
+    /// backlog, so the subsequent `accept` returns the peer end.
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn read_frame_from_reassembles_a_large_frame_dribbled_in_pieces() {
+        // #819 (async port): a frame far larger than the per-read cap is completed by sizing each read
+        // from the decoder's `needed` hint (clamped at READ_CAP), so a ~1 MiB frame takes a handful of
+        // capped reads. Dribbling it in small pieces from the peer — with the reader stitching between
+        // pieces — must reassemble the exact bytes, proving the needed-hint sizing loses no byte.
+        let body = vec![0xABu8; 1_000_000]; // >> READ_CAP, forcing several capped reads
+        let wire = frame(FrameType::Deliver, &body);
+
+        let (mut client, mut server) = tcp_pair().await;
+        let wire_for_writer = wire.clone();
+        let writer = tokio::spawn(async move {
+            for chunk in wire_for_writer.chunks(7000) {
+                server.write_all(chunk).await.unwrap();
+                server.flush().await.unwrap();
+            }
+        });
+
+        let mut buf = Vec::new();
+        let (ty, got) = read_frame_from(&mut client, &mut buf).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(ty, FrameType::Deliver);
+        assert_eq!(
+            got, body,
+            "the dribbled large frame reassembles byte-for-byte"
+        );
+        assert!(
+            buf.is_empty(),
+            "the frame drained cleanly, nothing left over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_read_future_mid_frame_leaves_the_buffer_uncorrupted_and_a_retry_completes() {
+        // #819 THE cancellation-safety guarantee (async): `buf` grows ONLY by a SYNCHRONOUS
+        // `extend_from_slice` AFTER the read future resolves — never pre-grown with placeholder zeros.
+        // So when `tokio::time::timeout` fires and DROPS the fill future mid-read, the `extend` never
+        // runs and `buf` is left holding EXACTLY the valid bytes received so far, with no zero
+        // pollution. A retry on that SAME buffer must then complete the frame with no desync — the
+        // failure mode a truncate-on-error patch could never fix, since the drop happens across the
+        // await with no error to truncate on.
+        let body = vec![0x5Au8; 8000];
+        let wire = frame(FrameType::Deliver, &body);
+        let split = 100; // an arbitrary partial prefix, mid-frame
+
+        let (mut client, mut server) = tcp_pair().await;
+
+        // Only the first `split` bytes are available; the rest is withheld so the fill future is parked
+        // in the socket read when the timeout fires and drops it.
+        server.write_all(&wire[..split]).await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            read_frame_from(&mut client, &mut buf),
+        )
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "the fill future is dropped by the timeout mid-read"
+        );
+        // THE INVARIANT: the dropped future never ran its `extend`, so `buf` holds exactly the valid
+        // bytes — no zero padding across the await.
+        assert_eq!(
+            buf.len(),
+            split,
+            "buf.len() equals the valid buffered byte count after the drop"
+        );
+        assert_eq!(
+            buf,
+            &wire[..split],
+            "the buffered bytes are the exact prefix, not zero pollution"
+        );
+
+        // The rest arrives; a fresh read on the same (pollution-free) buffer completes the frame.
+        server.write_all(&wire[split..]).await.unwrap();
+        server.flush().await.unwrap();
+        let (ty, got) = read_frame_from(&mut client, &mut buf).await.unwrap();
+        assert_eq!(ty, FrameType::Deliver);
+        assert_eq!(
+            got, body,
+            "the retry reassembles the full frame — no desync"
+        );
+        assert!(buf.is_empty(), "the completed frame drained cleanly");
+    }
+
+    #[tokio::test]
+    async fn read_frame_from_batches_small_frames_from_a_single_read() {
+        // #819 non-regression (async port): sizing the read from the `needed` hint must NOT lose the
+        // small-frame batching — one socket read can pull several tiny frames. Two small frames written
+        // together are pulled in one read; the first `read_frame_from` returns frame A while frame B
+        // stays BUFFERED (`buf` non-empty), and a second call returns B with no further bytes sent.
+        let a = frame(FrameType::Info, b"alpha");
+        let b = frame(FrameType::Pong, b"");
+        let mut both = a.clone();
+        both.extend_from_slice(&b);
+
+        let (mut client, mut server) = tcp_pair().await;
+        server.write_all(&both).await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        let (ty_a, body_a) = read_frame_from(&mut client, &mut buf).await.unwrap();
+        assert_eq!(ty_a, FrameType::Info);
+        assert_eq!(body_a, b"alpha");
+        assert!(
+            !buf.is_empty(),
+            "frame B was batched into the same read and stays buffered"
+        );
+
+        // No more bytes are sent; B decodes purely from the buffer.
+        let (ty_b, body_b) = read_frame_from(&mut client, &mut buf).await.unwrap();
+        assert_eq!(ty_b, FrameType::Pong);
+        assert!(body_b.is_empty());
+        assert!(buf.is_empty(), "both frames drained");
     }
 
     #[tokio::test]
