@@ -791,6 +791,8 @@ impl std::error::Error for EngineError {
         match self {
             EngineError::Storage(e) => Some(e),
             EngineError::Txn(e) => Some(e),
+            EngineError::InvalidSubject(e) => Some(e),
+            EngineError::BindRejected(e) => Some(e),
             _ => None,
         }
     }
@@ -8388,6 +8390,37 @@ mod tests {
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::types::RecordFlags;
     use ironbus_storage::fs::InMemoryFs;
+
+    // Regression for #893: `EngineError::source()` must forward the wrapped typed reason for the
+    // `InvalidSubject`/`BindRejected` variants so a chain-walk can downcast to the root error, not
+    // just read it through `Display`.
+    #[test]
+    fn engine_error_source_chains_wrapped_reasons() {
+        use std::error::Error as _;
+
+        let subject_err = SubjectError::TooDeep { depth: 99 };
+        let engine_err = EngineError::InvalidSubject(subject_err);
+        let src = engine_err
+            .source()
+            .expect("InvalidSubject must expose a source");
+        assert!(
+            src.downcast_ref::<SubjectError>().is_some(),
+            "source() of InvalidSubject must downcast to SubjectError"
+        );
+
+        let sublist_err = SublistError::ForkLimitExceeded {
+            worst_case: 512,
+            limit: 256,
+        };
+        let engine_err = EngineError::BindRejected(sublist_err);
+        let src = engine_err
+            .source()
+            .expect("BindRejected must expose a source");
+        assert!(
+            src.downcast_ref::<SublistError>().is_some(),
+            "source() of BindRejected must downcast to SublistError"
+        );
+    }
 
     fn config(max_in_flight: u32, max_deliver: u32) -> EngineConfig {
         EngineConfig {
