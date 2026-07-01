@@ -112,6 +112,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "deliver_batch_body"
+path = "fuzz_targets/deliver_batch_body.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace (which is `crates/*`): a cargo-fuzz crate must build with the
 # nightly sanitizer toolchain, separately from the merge-blocking stable workspace.
 [workspace]

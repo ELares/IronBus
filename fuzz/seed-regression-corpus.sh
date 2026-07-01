@@ -148,6 +148,19 @@ printf '' | place gap_marker_body                                   # empty = to
 printf '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\001' | place gap_marker_body  # 25 bytes, reason=TRIMMED
 printf '\377\377\377\377\377\377\377\377' | place gap_marker_body   # 8 bytes: short (truncated)
 
+# deliver_batch body (#541, #850): `[ version:u8 ][ field_len:u16 LE ][ block ][ record bytes ]`, the
+# client-side raw-framed batch decoder. Hostile shapes (empty, unknown version, an over-declared
+# field_len that overruns the body) must each be a typed BodyError, never a panic / over-read; a
+# short block defaults the missing fields (still Ok, empty record run). The VALID seed is a real
+# 2-record batch (first_offset=100, gen=0, record_count=2) carrying two on-disk record frames — the
+# body an `encode_deliver_batch` produces — so the fuzzer reaches the on-disk `codec::decode` loop
+# with a well-formed run to mutate from. (Regenerate with the gen helper if the layout changes.)
+printf '' | place deliver_batch_body                                # empty = not a valid DeliverBatch
+printf '\011\000\000' | place deliver_batch_body                    # version 9 (unknown) -> BadHandshakeVersion
+printf '\001\377\377' | place deliver_batch_body                    # version 1, field_len=0xffff overruns body
+printf '\001\000\000' | place deliver_batch_body                    # version 1, empty block -> defaulted header, no records
+printf '\001\024\000\144\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\002\000\000\000\102\111\001\002\000\000\000\000\000\000\000\000\350\003\000\000\000\000\000\000\002\000\000\000\000\000\000\000\014\000\000\000\335\372\273\377\153\060\160\141\171\154\157\141\144\055\172\145\162\157\146\146\374\172\072\000\000\000\102\111\001\000\001\000\000\000\000\000\000\000\351\003\000\000\000\000\000\000\000\000\000\000\002\000\000\000\013\000\000\000\013\214\055\151\150\061\160\141\171\154\157\141\144\055\157\156\145\023\101\205\125\071\000\000\000' | place deliver_batch_body  # valid 2-record batch
+
 # cursor_snapshot: a torn/hostile durable checkpoint payload must never crash recovery.
 printf '' | place cursor_snapshot                                   # empty snapshot
 printf '\001' | place cursor_snapshot                               # one stray byte
