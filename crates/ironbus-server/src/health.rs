@@ -72,7 +72,7 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +83,30 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// The request line is bounded; a client that sends no newline within this many bytes is
 /// rejected rather than buffered without limit.
 const MAX_REQUEST_LINE: usize = 8 * 1024;
+/// The HARD CAP on health probe connections handled CONCURRENTLY (#874). The accept loop hands each
+/// accepted probe to its own short-lived handler thread so one slow/stalled client can no longer
+/// serialize (and thereby starve) every other probe — but the concurrency is BOUNDED: beyond this
+/// many in-flight handlers the loop SHEDS the connection (drops the stream, which closes it) instead
+/// of spawning without limit. This mirrors the wire server's connection cap (#865) so
+/// `network.health_allow_public` cannot be turned into a thread/fd-exhaustion `DoS`: a slow client
+/// occupies at most one slot, and a flood is refused, never amplified into unbounded threads. The
+/// health surface is intentionally low-traffic (a handful of orchestrator probes plus scrapers), so
+/// this ceiling is ample for every legitimate caller while still capping a hostile one.
+const MAX_CONCURRENT_HEALTH_HANDLERS: usize = 32;
+
+/// Releases a concurrent-health-handler slot on drop — on a normal return OR a panic unwind — so a
+/// slot is never leaked even if a handler panics (#874). The matching increment is the accept loop's
+/// `fetch_add` at admission; this drop is the paired `fetch_sub`. Mirrors the wire server's
+/// `ConnectionSlot` (#865/#866).
+struct HealthHandlerSlot<'a> {
+    in_flight: &'a AtomicUsize,
+}
+
+impl Drop for HealthHandlerSlot<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Serves the health endpoints over `listener` until `shutdown` is set. Connections are
 /// handled inline (health traffic is low and loopback), each bounded by [`REQUEST_TIMEOUT`].
@@ -114,7 +138,7 @@ pub fn serve_health<F, C, E>(
 where
     F: Filesystem + 'static,
     C: Clock + Clone + 'static,
-    E: EngineAccess<F, C>,
+    E: EngineAccess<F, C> + Sync,
 {
     // The legacy entry point: no connz metric is scraped (a fresh, un-shared one) and no data-dir is
     // measured, so `/metrics` reports the honest zero / "unavailable" for the connz (#572) and
@@ -159,7 +183,7 @@ pub fn serve_health_connz<F, C, E>(
 where
     F: Filesystem + 'static,
     C: Clock + Clone + 'static,
-    E: EngineAccess<F, C>,
+    E: EngineAccess<F, C> + Sync,
 {
     // The legacy entry point has no DRAINING readiness gate (#637): pass a never-set flag, so `/readyz`
     // behaves exactly as before (200 while the writer is healthy, 503 only on a frozen writer / gone
@@ -207,34 +231,83 @@ pub fn serve_health_connz_draining<F, C, E>(
 where
     F: Filesystem + 'static,
     C: Clock + Clone + 'static,
-    E: EngineAccess<F, C>,
+    E: EngineAccess<F, C> + Sync,
 {
-    // Own the data-dir path once for the loop's lifetime (the per-request handler borrows it).
+    // Own the data-dir path once for the loop's lifetime (each per-request handler borrows it).
     let data_dir = data_dir.map(Path::to_path_buf);
+    let data_dir = data_dir.as_deref();
     listener.set_nonblocking(true)?;
-    while !shutdown.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                // One bad client must not end the loop; contain its IO error.
-                let _ = handle(
-                    stream,
-                    engine,
-                    draining,
-                    admin_enabled,
-                    progress,
-                    liveness_window_nanos,
-                    clock,
-                    connz,
-                    data_dir.as_deref(),
-                );
+    // The number of health handlers currently in flight, the BOUND enforced against
+    // `MAX_CONCURRENT_HEALTH_HANDLERS` (#874). Lives on this loop's stack; the scoped handler threads
+    // borrow it and the scope joins every one of them before this function returns.
+    let in_flight = AtomicUsize::new(0);
+    // A THREAD SCOPE, so each handler may borrow the loop's `engine`/`clock`/beacons by reference
+    // (no `'static`/clone required) while the scope GUARANTEES every outstanding handler is joined
+    // before `serve_health_connz_draining` returns — preserving graceful shutdown: when `shutdown`
+    // flips, the accept loop below breaks and the scope drains the in-flight handlers, exactly as the
+    // old inline loop finished its one in-flight request before returning.
+    std::thread::scope(|scope| {
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    // BOUNDED CONCURRENCY (#874): admit at most `MAX_CONCURRENT_HEALTH_HANDLERS`
+                    // in-flight handlers. At the cap, SHED the connection (drop the stream, which
+                    // closes it) rather than spawn an unbounded thread — so a slow/stalled probe
+                    // client (or a `health_allow_public` flood) occupies at most one slot and can
+                    // NEVER starve a liveness/readiness probe nor exhaust threads/fds. The load is a
+                    // single relaxed-ish atomic; a benign over-admit race across the check and the
+                    // `fetch_add` can only transiently exceed the cap by the number of concurrent
+                    // accepts (one, since accept is single-threaded here), well within safety.
+                    if in_flight.load(Ordering::Acquire) >= MAX_CONCURRENT_HEALTH_HANDLERS {
+                        drop(stream); // shed: closes the connection immediately
+                        continue;
+                    }
+                    // Reserve the slot BEFORE spawning so the cap is honored even if two accepts race;
+                    // the handler's `HealthHandlerSlot` releases it on return OR a panic unwind.
+                    in_flight.fetch_add(1, Ordering::AcqRel);
+                    // FALLIBLE spawn (#866): `std::thread::spawn` PANICS on a thread-creation refusal
+                    // (EAGAIN under a cgroup `pids.max` / `RLIMIT_NPROC`), which the release profile's
+                    // `panic = "abort"` would turn into a whole-broker abort. `Builder::spawn_scoped`
+                    // surfaces it as an `Err` the loop SHEDS, undoing the reserve — exactly the
+                    // bounded shed the at-cap branch does — instead of killing the health server.
+                    let spawned = std::thread::Builder::new()
+                        .name("ironbus-health".to_string())
+                        .spawn_scoped(scope, {
+                            let in_flight = &in_flight;
+                            move || {
+                                // Release the reserved slot on EVERY exit (return or unwind).
+                                let _slot = HealthHandlerSlot { in_flight };
+                                // One bad client must not end the loop; contain its IO error. It is
+                                // now confined to THIS handler thread, so a slow client blocks only
+                                // its own connection, never the accept loop or other probes.
+                                let _ = handle(
+                                    stream,
+                                    engine,
+                                    draining,
+                                    admin_enabled,
+                                    progress,
+                                    liveness_window_nanos,
+                                    clock,
+                                    connz,
+                                    data_dir,
+                                );
+                            }
+                        });
+                    if spawned.is_err() {
+                        // The OS refused thread creation: the closure (and its `stream`) was dropped,
+                        // closing the connection, and the `HealthHandlerSlot` was never built — so
+                        // UNDO the reserve here and keep serving, shedding like the at-cap branch.
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                // A transient accept failure must not tear the listener down.
+                Err(_) => std::thread::sleep(ACCEPT_POLL),
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL);
-            }
-            // A transient accept failure must not tear the listener down.
-            Err(_) => std::thread::sleep(ACCEPT_POLL),
         }
-    }
+    });
     Ok(())
 }
 
@@ -2489,6 +2562,58 @@ mod tests {
             "broker survived the malformed request and still serves: {h}"
         );
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_probe_clients_do_not_block_a_concurrent_healthz_probe() {
+        // #874 regression: the health accept loop must handle each probe connection with BOUNDED
+        // concurrency, so a slow/stalled client can no longer serialize — and thereby starve — a
+        // liveness/readiness probe. A client that opens a connection and dribbles a PARTIAL request
+        // head with NO terminating newline holds its handler for the full REQUEST_TIMEOUT (5s). Pre-fix
+        // the single inline accept loop was stuck on each such client for those 5s, so a concurrent
+        // `GET /healthz` waited behind them (here behind FOUR of them, ~20s, past any read timeout) and
+        // a k8s liveness probe would time out and RESTART a healthy broker. Post-fix each stalled client
+        // occupies only its own handler thread (within the concurrency cap), so the healthy probe is
+        // served immediately.
+        let (addr, shutdown, handle, _engine) = start();
+
+        // Four stalled clients (well under MAX_CONCURRENT_HEALTH_HANDLERS): each sends a request line
+        // fragment with NO '\n', so its handler blocks in `read_request_head` until the 5s timeout. Held
+        // in a Vec so the sockets stay open (a dropped `TcpStream` would EOF and free the handler early).
+        let mut stalled = Vec::new();
+        for _ in 0..4 {
+            let mut c = TcpStream::connect(addr).unwrap();
+            // No CRLF anywhere: `read_request_head` never sees a newline and blocks for REQUEST_TIMEOUT.
+            c.write_all(b"GET /healthz HTTP/1.1").unwrap();
+            c.flush().unwrap();
+            stalled.push(c);
+        }
+        // Let the accept loop take the stalled connections and enter their handlers before the probe
+        // races in (pre-fix this is where the single loop is now wedged for ~5s each).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The concurrent healthy probe must return 200 WELL within the window the stalled clients hold.
+        // Pre-fix it blocks ~5s+ behind the serialized stalled handlers (often past `request`'s own 5s
+        // read timeout, panicking); the 2s ceiling — far below the ~5s per stalled handler yet far above
+        // the settle — fails pre-fix and passes comfortably post-fix.
+        let started = std::time::Instant::now();
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        let elapsed = started.elapsed();
+        assert!(
+            h.starts_with("HTTP/1.1 200 OK"),
+            "the concurrent probe is still served 200: {h}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the concurrent /healthz probe must not serialize behind the stalled clients \
+             (took {elapsed:?}); pre-#874-fix the single inline accept loop blocked it behind their \
+             ~5s handlers"
+        );
+
+        // Release the stalled clients (frees their handlers), then shut down and join the scope.
+        drop(stalled);
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
