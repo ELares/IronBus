@@ -5525,6 +5525,191 @@ mod tests {
         assert_eq!(buf, expected, "the v1 TxnListen body wire format is frozen");
     }
 
+    proptest! {
+        // #588/#640: the newer stream-addressed / txn wire bodies had only fixed-example tests (a
+        // single non-empty id and a single non-empty body). These properties sweep each id/group over
+        // 0..=cap (empty AND exactly-at-cap included) and, for the PubBody-carrying verbs, an
+        // explicitly-EMPTY pub_body tail as well as a random non-empty one — locking down the field-len
+        // framing vs the cap-before-alloc boundary and the empty-tail block-length count that a fixed
+        // value cannot exercise. Round-trip holds for EVERY valid input by construction, so the
+        // properties are deterministic (never flaky). encode caps only at the u16 wire limit while
+        // decode caps at MAX_*_LEN, so the strategies stay at/under MAX_*_LEN (the asymmetry above the
+        // cap is by design and pinned by the separate MAX+1-rejection tests).
+
+        /// PubTo: a stream-id prefix followed by the verbatim PubBody tail (empty tail included).
+        #[test]
+        fn any_pub_to_round_trips(
+            stream_id in prop::collection::vec(any::<u8>(), 0..=MAX_STREAM_ID_LEN),
+            empty_body in any::<bool>(),
+            flags in any::<u8>(),
+            timestamp_ms in any::<u64>(),
+            key in prop::collection::vec(any::<u8>(), 0..64),
+            headers in prop::collection::vec(any::<u8>(), 0..64),
+            payload in prop::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let inner = PubBody {
+                flags: flags & !PUB_WIRE_ONLY_FLAGS,
+                timestamp_ms,
+                key: &key,
+                headers: &headers,
+                dedup: None,
+                fire_and_forget: false,
+                payload: &payload,
+            };
+            let mut pub_body = Vec::new();
+            if !empty_body {
+                encode_pub(&inner, &mut pub_body).unwrap();
+            }
+            let msg = PubToBody {
+                stream_id: &stream_id,
+                pub_body: &pub_body,
+            };
+            let mut buf = Vec::new();
+            encode_pub_to(&msg, &mut buf).unwrap();
+            let decoded = decode_pub_to(&buf).unwrap();
+            prop_assert_eq!(decoded, msg);
+            // The verbatim tail decodes back through the UNCHANGED PubBody codec when non-empty (an
+            // empty tail is a legal PubTo but not a legal PubBody), so the empty-tail case only checks
+            // the carrier-level boundary.
+            if empty_body {
+                prop_assert!(decoded.pub_body.is_empty());
+            } else {
+                prop_assert_eq!(decode_pub(decoded.pub_body).unwrap(), inner);
+            }
+        }
+
+        /// SubTo: a stream-id and a work-group name, each length-framed inside the block.
+        #[test]
+        fn any_sub_to_round_trips(
+            stream_id in prop::collection::vec(any::<u8>(), 0..=MAX_STREAM_ID_LEN),
+            group in prop::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let msg = SubToBody {
+                stream_id: &stream_id,
+                group: &group,
+            };
+            let mut buf = Vec::new();
+            encode_sub_to(&msg, &mut buf).unwrap();
+            prop_assert_eq!(decode_sub_to(&buf).unwrap(), msg);
+        }
+
+        /// TxnPrepare: a txn-id + stream-id prefix followed by the verbatim PubBody tail (empty
+        /// included), sweeping both ids over 0..=their caps.
+        #[test]
+        fn any_txn_prepare_round_trips(
+            txn_id in prop::collection::vec(any::<u8>(), 0..=MAX_TXN_ID_LEN),
+            stream_id in prop::collection::vec(any::<u8>(), 0..=MAX_STREAM_ID_LEN),
+            empty_body in any::<bool>(),
+            flags in any::<u8>(),
+            timestamp_ms in any::<u64>(),
+            key in prop::collection::vec(any::<u8>(), 0..64),
+            headers in prop::collection::vec(any::<u8>(), 0..64),
+            payload in prop::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let inner = PubBody {
+                flags: flags & !PUB_WIRE_ONLY_FLAGS,
+                timestamp_ms,
+                key: &key,
+                headers: &headers,
+                dedup: None,
+                fire_and_forget: false,
+                payload: &payload,
+            };
+            let mut pub_body = Vec::new();
+            if !empty_body {
+                encode_pub(&inner, &mut pub_body).unwrap();
+            }
+            let msg = TxnPrepareBody {
+                txn_id: &txn_id,
+                stream_id: &stream_id,
+                pub_body: &pub_body,
+            };
+            let mut buf = Vec::new();
+            encode_txn_prepare(&msg, &mut buf).unwrap();
+            let decoded = decode_txn_prepare(&buf).unwrap();
+            prop_assert_eq!(decoded, msg);
+            if empty_body {
+                prop_assert!(decoded.pub_body.is_empty());
+            } else {
+                prop_assert_eq!(decode_pub(decoded.pub_body).unwrap(), inner);
+            }
+        }
+
+        /// TxnListen: just the listener group, length-framed (empty and at-cap included).
+        #[test]
+        fn any_txn_listen_round_trips(
+            group in prop::collection::vec(any::<u8>(), 0..=MAX_TXN_LISTEN_GROUP_LEN),
+        ) {
+            let msg = TxnListenBody { group: &group };
+            let mut buf = Vec::new();
+            encode_txn_listen(&msg, &mut buf).unwrap();
+            prop_assert_eq!(decode_txn_listen(&buf).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn stream_and_txn_bodies_accept_ids_exactly_at_cap() {
+        // #588/#640 boundary: the fixed tests only pin MAX+1 REJECTION; pin the mirror ACCEPTANCE at
+        // EXACTLY the cap (id length == cap accepted by both encode and decode), so an off-by-one in
+        // the cap-before-alloc check (== cap accepted by encode but rejected by decode) is caught.
+        // Deterministic (no proptest), so the exact-cap boundary is ALWAYS exercised.
+        let at_stream_cap = vec![b's'; MAX_STREAM_ID_LEN];
+        let at_txn_cap = vec![b't'; MAX_TXN_ID_LEN]; // == MAX_TXN_LISTEN_GROUP_LEN too
+
+        // PubTo: stream id exactly at the cap, with an explicitly-empty pub_body tail.
+        let mut buf = Vec::new();
+        encode_pub_to(
+            &PubToBody {
+                stream_id: &at_stream_cap,
+                pub_body: &[],
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded = decode_pub_to(&buf).unwrap();
+        assert_eq!(decoded.stream_id, at_stream_cap.as_slice());
+        assert!(decoded.pub_body.is_empty());
+
+        // SubTo: stream id exactly at the cap.
+        let mut buf = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: &at_stream_cap,
+                group: b"g",
+            },
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_sub_to(&buf).unwrap().stream_id,
+            at_stream_cap.as_slice()
+        );
+
+        // TxnPrepare: BOTH the txn id and the stream id exactly at their caps, empty pub_body tail.
+        let mut buf = Vec::new();
+        encode_txn_prepare(
+            &TxnPrepareBody {
+                txn_id: &at_txn_cap,
+                stream_id: &at_stream_cap,
+                pub_body: b"",
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded = decode_txn_prepare(&buf).unwrap();
+        assert_eq!(decoded.txn_id, at_txn_cap.as_slice());
+        assert_eq!(decoded.stream_id, at_stream_cap.as_slice());
+        assert!(decoded.pub_body.is_empty());
+
+        // TxnListen: group exactly at the cap.
+        let mut buf = Vec::new();
+        encode_txn_listen(&TxnListenBody { group: &at_txn_cap }, &mut buf).unwrap();
+        assert_eq!(
+            decode_txn_listen(&buf).unwrap().group,
+            at_txn_cap.as_slice()
+        );
+    }
+
     #[test]
     fn sub_to_round_trips_stream_id_and_group() {
         // #588: SubTo carries both a stream id and a work-group name, each round-tripping; empty
