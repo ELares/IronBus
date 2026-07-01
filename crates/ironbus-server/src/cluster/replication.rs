@@ -350,13 +350,15 @@ impl OffsetForLeaderEpochResponse {
 /// FAILS CLOSED on any corrupt / malformed / out-of-order input.
 #[derive(Debug)]
 pub enum ReplicationError {
-    /// A fetch REQUEST body was not the fixed expected length (malformed / truncated / over-long).
+    /// A fixed-length REQUEST / query body (a fetch request or a control-plane query such as
+    /// `CommittedHwQuery`) was not the expected length or carried a bad discriminant byte (malformed /
+    /// truncated / over-long).
     MalformedRequest {
         /// The body length seen.
         len: usize,
     },
-    /// A fetch RESPONSE body header was short or its stored frame-byte length disagreed with the
-    /// bytes actually present.
+    /// A RESPONSE body header was short, its stored frame-byte length disagreed with the bytes actually
+    /// present, or (for a fixed-length control-plane response) it was not the expected length.
     MalformedResponse {
         /// The body length seen.
         len: usize,
@@ -422,10 +424,17 @@ pub enum ReplicationError {
     Storage(StorageError),
     /// An underlying IO error reading from / writing to the peer link.
     Io(io::Error),
-    /// The peer-link frame envelope was malformed or carried an unexpected type tag.
-    Frame {
-        /// A human description of the framing fault.
-        what: String,
+    /// The peer-link frame ENVELOPE was malformed (an empty / oversized frame). The typed
+    /// [`FrameError`] is carried verbatim — not stringified — so a caller can still reach it via
+    /// `source()`, mirroring `PeerWireError::Frame` (transport.rs) and `DivergenceError::Frame`
+    /// (divergence.rs) rather than collapsing the same fault to a `String`.
+    Frame(FrameError),
+    /// The peer link carried a frame whose type tag is not routable on this link (an unexpected /
+    /// unknown verb). Kept as a distinct typed variant — mirroring `PeerWireError::UnexpectedFrameType`
+    /// — instead of a `format!`-ed string, since it is NOT a [`FrameError`].
+    UnexpectedFrameType {
+        /// The raw type tag seen.
+        tag: u8,
     },
     /// A resync (truncate + re-fetch) ran but the replica did NOT converge byte-identical to the clean
     /// quorum leader — the post-resync re-fingerprint still reported divergence (#798). FAIL CLOSED: a
@@ -491,7 +500,11 @@ impl core::fmt::Display for ReplicationError {
             }
             ReplicationError::Storage(e) => write!(f, "replication local append failed: {e}"),
             ReplicationError::Io(e) => write!(f, "replication peer link IO error: {e}"),
-            ReplicationError::Frame { what } => write!(f, "replication peer frame error: {what}"),
+            ReplicationError::Frame(e) => write!(f, "replication peer frame envelope error: {e}"),
+            ReplicationError::UnexpectedFrameType { tag } => write!(
+                f,
+                "replication link carried an unexpected frame type tag {tag}"
+            ),
             ReplicationError::ResyncDidNotConverge { remaining } => write!(
                 f,
                 "resync did not converge: {remaining} segment(s) still divergent from the leader"
@@ -507,11 +520,26 @@ impl core::fmt::Display for ReplicationError {
     }
 }
 
-impl std::error::Error for ReplicationError {}
+impl std::error::Error for ReplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReplicationError::Frame(e) => Some(e),
+            ReplicationError::Io(e) => Some(e),
+            ReplicationError::Storage(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for ReplicationError {
     fn from(e: io::Error) -> Self {
         ReplicationError::Io(e)
+    }
+}
+
+impl From<FrameError> for ReplicationError {
+    fn from(e: FrameError) -> Self {
+        ReplicationError::Frame(e)
     }
 }
 
@@ -1220,9 +1248,7 @@ impl<S: Read + Write> ReplicationLink<S> {
 
     fn send(&mut self, ty: FrameType, body: &[u8]) -> Result<(), ReplicationError> {
         let mut frame = Vec::with_capacity(body.len() + 5);
-        encode_frame(ty, body, &mut frame).map_err(|e| ReplicationError::Frame {
-            what: e.to_string(),
-        })?;
+        encode_frame(ty, body, &mut frame)?;
         self.stream.write_all(&frame)?;
         Ok(())
     }
@@ -1256,11 +1282,7 @@ impl<S: Read + Write> ReplicationLink<S> {
                 Err(FrameError::FrameTooLarge { len }) => {
                     return Err(ReplicationError::ResponseTooLarge { len })
                 }
-                Err(e) => {
-                    return Err(ReplicationError::Frame {
-                        what: e.to_string(),
-                    })
-                }
+                Err(e) => return Err(ReplicationError::Frame(e)),
             }
             let n = self.stream.read(&mut chunk)?;
             if n == 0 {
@@ -1296,9 +1318,7 @@ impl<S: Read + Write> ReplicationLink<S> {
                     _ => Err(ReplicationError::MalformedEpochQuery { len: body.len() }),
                 }
             }
-            _ => Err(ReplicationError::Frame {
-                what: format!("unexpected frame type tag {type_tag} on a replication link"),
-            }),
+            _ => Err(ReplicationError::UnexpectedFrameType { tag: type_tag }),
         }
     }
 }
@@ -2523,5 +2543,37 @@ mod tests {
         // Epoch 1 ended where epoch 4 began: offset 10.
         assert_eq!(resp.end_offset.answered_epoch, LeaderEpoch::new(1));
         assert_eq!(resp.end_offset.end_offset, Offset::new(10));
+    }
+
+    #[test]
+    fn peer_frame_fault_is_typed_and_reaches_the_frameerror_via_source() {
+        use std::error::Error;
+        // #894: the peer-frame ENVELOPE fault carries the TYPED FrameError (via `From`), not a
+        // stringified message — so a caller can still recover it through the error chain, exactly
+        // like `PeerWireError::Frame`. No `e.to_string()` collapses the typed fault anymore.
+        let err: ReplicationError = FrameError::EmptyFrame.into();
+        assert!(matches!(
+            err,
+            ReplicationError::Frame(FrameError::EmptyFrame)
+        ));
+        let source =
+            Error::source(&err).expect("Frame variant must expose its FrameError as source");
+        assert!(
+            source.downcast_ref::<FrameError>().is_some(),
+            "source() of a framing fault must be the underlying FrameError"
+        );
+    }
+
+    #[test]
+    fn decode_typed_rejects_an_unroutable_tag_as_a_distinct_typed_variant() {
+        // #894: a frame whose type tag is not a replication verb is the genuinely-non-FrameError
+        // fault, so it is its OWN typed variant (carrying the tag) rather than a `format!` string
+        // conflated with the envelope fault.
+        let err = ReplicationLink::<Pipe>::decode_typed(FrameType::Ping.as_u8(), &[])
+            .expect_err("an unroutable type tag must be rejected");
+        assert!(matches!(
+            err,
+            ReplicationError::UnexpectedFrameType { tag } if tag == FrameType::Ping.as_u8()
+        ));
     }
 }
