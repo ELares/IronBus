@@ -107,7 +107,7 @@
 
 use crate::fs::Filesystem;
 use crate::layout::STREAMS_SUBDIR;
-use crate::log::{Append, Log, LogConfig};
+use crate::log::{par_recover_open, Append, Log, LogConfig, RECOVERY_OPEN_MAX_WORKERS};
 use crate::loss::LossReport;
 use crate::naming::{
     is_valid_stream_name, parse_stream_subdir_name, stream_subdir_name, MAX_STREAM_NAME_LEN,
@@ -308,8 +308,13 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
     /// SKIPPED, never opened as a stream, exactly as a foreign file is skipped by segment recovery.
     ///
     /// Total recovery work is O(Σ records across all streams) — each stream's recovery is its
-    /// existing single-log recovery, run once. It could be parallelized later (each stream is fully
-    /// independent), but is sequential here; parallel recovery is not needed for correctness.
+    /// existing single-log recovery, run once. The named streams are opened in PARALLEL across a
+    /// bounded worker set ([`par_recover_open`], #822): each stream is a byte-isolated subtree, so a
+    /// torn segment in one cannot touch a sibling or the root, and the index-aligned results are
+    /// folded into the `BTreeMap` in key order — so the recovered map, every [`StreamRecovery`], and
+    /// the first error surfaced are byte-for-byte identical to a strictly serial open. The DEFAULT
+    /// stream is opened FIRST, serially (its #670 marker check fail-closes the whole boot before any
+    /// named-stream work), exactly as before.
     ///
     /// A data dir with no `streams/` subtree (the common single-log deployment) opens with ONLY the
     /// default stream and never materializes `streams/`, so its on-disk shape is unchanged.
@@ -340,23 +345,36 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         //    opened as an INDEPENDENT Log at `streams/<dir>/`; a foreign directory is skipped.
         if fs.subdir_exists(STREAMS_SUBDIR).map_err(StorageError::Io)? {
             let streams_fs = fs.subdir(STREAMS_SUBDIR).map_err(StorageError::Io)?;
-            for dir in streams_fs.list_subdirs().map_err(StorageError::Io)? {
-                let Some(name) = parse_stream_subdir_name(&dir) else {
-                    // A stray/foreign directory under streams/ (not a canonical hex stream name):
-                    // skip it, exactly as segment recovery skips a foreign file. It never opens as a
-                    // stream and never shadows a real one.
-                    continue;
-                };
-                let id = StreamId(name);
-                // Open the named stream's INDEPENDENT log at streams/<dir>/. Its recovery is over its
-                // own durable bytes alone: a torn segment here cannot touch the root log or a sibling.
+            // Enumerate the named-stream subtrees SERIALLY (cheap dir listing + name parse), skipping
+            // any stray/foreign directory (not a canonical hex stream name) exactly as before — it
+            // never opens as a stream and never shadows a real one. `list_subdirs` is already sorted,
+            // so `named` is in a deterministic order.
+            let named: Vec<(StreamId, String)> = streams_fs
+                .list_subdirs()
+                .map_err(StorageError::Io)?
+                .into_iter()
+                .filter_map(|dir| parse_stream_subdir_name(&dir).map(|name| (StreamId(name), dir)))
+                .collect();
+            // Open every named stream's INDEPENDENT log at streams/<dir>/ in PARALLEL across a
+            // bounded worker set (#822). Each open recovers over its own durable bytes alone: a torn
+            // segment here cannot touch the root log or a sibling. Results are index-aligned to
+            // `named`; the fold below inserts them into the BTreeMap in key order, so the recovered
+            // map + summaries are byte-for-byte the serial-open result.
+            let opened = par_recover_open(&named, RECOVERY_OPEN_MAX_WORKERS, |(_, dir)| {
                 let log = Log::open(
-                    streams_fs.subdir(&dir).map_err(StorageError::Io)?,
+                    streams_fs.subdir(dir).map_err(StorageError::Io)?,
                     clock.clone(),
                     config,
                 )?;
-                recoveries.insert(id.clone(), recovery_of(&log));
-                streams.insert(id, log);
+                let recovery = recovery_of(&log);
+                Ok::<_, StorageError>((recovery, log))
+            });
+            // Fold in `named` order: `?` surfaces the FIRST failing stream's error exactly as the
+            // serial loop did (which stopped at the first failing dir in the same order).
+            for (result, (id, _dir)) in opened.into_iter().zip(named.iter()) {
+                let (recovery, log) = result?;
+                recoveries.insert(id.clone(), recovery);
+                streams.insert(id.clone(), log);
             }
         }
 
@@ -1271,5 +1289,63 @@ mod tests {
         let outcome = set.commit_tick();
         assert_eq!(control.sync_count() - before, 0);
         assert_eq!(outcome, CommitOutcome::default());
+    }
+
+    /// #822: with MANY named streams (well past the outer worker cap), the PARALLEL open recovers
+    /// every stream's own data, in a DETERMINISTIC id order, byte-for-byte identical across repeated
+    /// cold opens — the parallel path's reassembly must be reproducible, never dependent on which
+    /// worker won which stream. This exercises the bounded outer pool (streams > workers) end to end.
+    #[test]
+    fn many_named_streams_recover_in_parallel_deterministically() {
+        let fs = InMemoryFs::new();
+        let def = StreamId::default_stream();
+        // 24 named streams > RECOVERY_OPEN_MAX_WORKERS (8), so the outer pool genuinely steals work.
+        let ids: Vec<StreamId> = (0..24)
+            .map(|i| StreamId::named(&format!("stream-{i:03}")).unwrap())
+            .collect();
+        {
+            let (mut set, _) = open(&fs);
+            for id in &ids {
+                set.declare(id).unwrap();
+            }
+            set.append_to(&def, &rec(b"default")).unwrap();
+            // Each named stream i gets exactly i+1 records tagged with its index, so a mis-assembled
+            // (worker-order) recovery would surface as a stream holding the WRONG records.
+            for (i, id) in ids.iter().enumerate() {
+                for r in 0..=i {
+                    set.append_to(id, &rec(format!("s{i:03}-r{r}").as_bytes()))
+                        .unwrap();
+                }
+            }
+            set.sync_all().unwrap();
+        }
+
+        // Two independent cold opens must agree exactly (reproducibility of the parallel path).
+        let (set_a, rec_a) = open(&fs);
+        let (set_b, rec_b) = open(&fs);
+
+        // Deterministic id order: default first, then the named streams in sorted order.
+        let mut expected_order = vec![def.clone()];
+        expected_order.extend(ids.iter().cloned());
+        expected_order.sort();
+        assert_eq!(set_a.stream_ids(), expected_order);
+        assert_eq!(set_b.stream_ids(), set_a.stream_ids());
+
+        for (i, id) in ids.iter().enumerate() {
+            // Same recovery summary from both opens (clean, no loss).
+            assert!(rec_a[id].loss_report.is_empty(), "{} clean", id.name());
+            assert_eq!(
+                rec_a[id].recovered_truncated_bytes,
+                rec_b[id].recovered_truncated_bytes
+            );
+            // Each stream holds exactly its OWN records — not a sibling's.
+            let read = set_a.read_range(id, Offset::ZERO, 1000, None).unwrap();
+            assert_eq!(read.len(), i + 1, "{} has its own record count", id.name());
+            assert_eq!(&*read[0].payload, format!("s{i:03}-r0").as_bytes());
+            // Byte-identical read from the second open.
+            let read_b = set_b.read_range(id, Offset::ZERO, 1000, None).unwrap();
+            assert_eq!(read.len(), read_b.len());
+            assert_eq!(&*read[i].payload, &*read_b[i].payload);
+        }
     }
 }

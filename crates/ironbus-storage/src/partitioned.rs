@@ -102,7 +102,7 @@
 //!   from the `StreamSet` storage primitive.
 
 use crate::fs::Filesystem;
-use crate::log::{Append, Log, LogConfig};
+use crate::log::{par_recover_open, Append, Log, LogConfig, RECOVERY_OPEN_MAX_WORKERS};
 use crate::loss::LossReport;
 use crate::naming::partition_subdir_name;
 use crate::segment::{OwnedRecord, StorageError};
@@ -211,7 +211,11 @@ impl<F: Filesystem + Clone, C: Clock + Clone> PartitionedStream<F, C> {
     /// partition's own summary, and a torn/corrupt partition recovers to ITS OWN valid prefix without
     /// shortening or corrupting any sibling (the resilience-isolation property). Total recovery work is
     /// O(Σ records across all partitions) — each partition's recovery is its existing single-log
-    /// recovery, run once.
+    /// recovery, run once. The partitions (`count > 1`) are opened in PARALLEL across a bounded worker
+    /// set ([`par_recover_open`], #822): each is a byte-isolated subtree, and the index-aligned results
+    /// are pushed in index order, so the recovered `partitions` vector, every [`PartitionRecovery`],
+    /// and the first error surfaced are byte-for-byte identical to a strictly serial open. The
+    /// single-partition (`count == 1`) path opens inline on the calling thread, unchanged.
     ///
     /// # Errors
     /// Propagates a [`StorageError`] from opening/recovering any partition (including the fail-closed
@@ -236,13 +240,22 @@ impl<F: Filesystem + Clone, C: Clock + Clone> PartitionedStream<F, C> {
         } else {
             // P > 1: each partition i is an INDEPENDENT log at root/p-<08x(i)>/. The partition subdir
             // is created on first open (Filesystem::subdir creates it) and recovered on reopen. Open
-            // them in index order so `partitions[i]` is partition i.
-            for i in 0..count.get() {
+            // them in PARALLEL across a bounded worker set (#822): each partition recovers over its
+            // own durable bytes alone, so a torn segment in one cannot touch a sibling. Results are
+            // index-aligned to `0..count`; the fold below pushes them in index order, so
+            // `partitions[i]` is partition i and every `PartitionRecovery` (and the first error
+            // surfaced) is byte-for-byte the serial-open result.
+            let indices: Vec<u32> = (0..count.get()).collect();
+            let opened = par_recover_open(&indices, RECOVERY_OPEN_MAX_WORKERS, |&i| {
                 let dir = partition_subdir_name(i);
                 let part_fs = root.subdir(&dir).map_err(StorageError::Io)?;
                 let log = Log::open(part_fs, clock.clone(), config)?;
-                let idx = PartitionIndex::new(i);
-                recoveries.push(recovery_of(idx, &log));
+                let recovery = recovery_of(PartitionIndex::new(i), &log);
+                Ok::<_, StorageError>((recovery, log))
+            });
+            for result in opened {
+                let (recovery, log) = result?;
+                recoveries.push(recovery);
                 partitions.push(log);
             }
         }
@@ -900,6 +913,54 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// #822: with MANY partitions (well past the outer worker cap), the PARALLEL open recovers each
+    /// partition's OWN data at its OWN index, byte-for-byte identical across repeated cold opens. A
+    /// worker-order (mis-assembled) recovery would place partition i's records at the wrong index;
+    /// this pins `partitions[i]` to partition i and asserts reproducibility.
+    #[test]
+    fn many_partitions_recover_in_parallel_deterministically() {
+        let fs = InMemoryFs::new();
+        // 20 partitions > RECOVERY_OPEN_MAX_WORKERS (8): the outer pool genuinely steals work.
+        let p = 20u32;
+        {
+            let (mut stream, _) = open(&fs, p);
+            // Partition i gets exactly i+1 records, each tagged with its partition index.
+            for i in 0..p {
+                for r in 0..=i {
+                    stream
+                        .partition_mut(PartitionIndex::new(i))
+                        .unwrap()
+                        .append(&keyless(format!("p{i:02}-r{r}").as_bytes()))
+                        .unwrap();
+                }
+            }
+            stream.sync_all().unwrap();
+        }
+
+        let (stream_a, rec_a) = open(&fs, p);
+        let (stream_b, rec_b) = open(&fs, p);
+
+        // Recovery vector is in partition-index order in BOTH opens.
+        assert_eq!(rec_a.len(), p as usize);
+        for i in 0..p {
+            assert_eq!(rec_a[i as usize].partition, PartitionIndex::new(i));
+            assert_eq!(rec_b[i as usize].partition, PartitionIndex::new(i));
+            assert!(rec_a[i as usize].loss_report.is_empty());
+            // Each partition holds exactly its OWN i+1 records — not a sibling's.
+            let read = stream_a
+                .read_range(PartitionIndex::new(i), Offset::ZERO, 1000, None)
+                .unwrap();
+            assert_eq!(read.len(), (i + 1) as usize, "partition {i} record count");
+            assert_eq!(&*read[0].payload, format!("p{i:02}-r0").as_bytes());
+            // Byte-identical from the second cold open.
+            let read_b = stream_b
+                .read_range(PartitionIndex::new(i), Offset::ZERO, 1000, None)
+                .unwrap();
+            assert_eq!(read.len(), read_b.len());
+            assert_eq!(&*read[i as usize].payload, &*read_b[i as usize].payload);
+        }
     }
 
     /// THE COMMIT COORDINATOR COMMITS MULTIPLE PARTITIONS IN ONE TICK, issuing exactly one fdatasync
