@@ -790,17 +790,34 @@ const DATAPLANE_POLL: Duration = Duration::from_millis(100);
 /// no real follower is ever refused, and an operator override still bounds an unauthenticated flood.
 const DEFAULT_MIN_DATAPLANE_READERS: usize = 256;
 
+/// The headroom the fanout-driven cap keeps ABOVE the exact led-partition fetch fanout (#961, #915
+/// follow-up) for the NON-fetch inbound links the same listener also serves: a transient CONFIRM
+/// connection ([`query_leader_committed_hw`] dials the leader's data-plane addr for a dirty-tier
+/// committed-HW confirm, #739) and a follower whose fetch link dropped and RECONNECTED before the stale
+/// reader thread notices (up to [`DATAPLANE_POLL`] later, so the old and new links briefly overlap).
+///
+/// Without it, when the cap is sized to the EXACT fetch fanout (`led_inbound_link_count` > the 256 floor,
+/// no operator override) there is ZERO headroom, so a confirm or a reconnect-overlap transiently trips the
+/// cap and is refused (it self-heals on retry, but not literally "never"). The [`DEFAULT_MIN_DATAPLANE_READERS`]
+/// floor already supplies this slack for a small deployment (fanout ≪ 256); this margin restores the same
+/// slack in the fanout-driven regime. It stays SMALL so an unauthenticated flood is still bounded near the
+/// legitimate fanout (a large confirm/reconnect burst past the margin still self-heals on retry).
+const DATAPLANE_NONFETCH_HEADROOM: usize = 16;
+
 /// The EFFECTIVE concurrent inbound data-plane reader cap (#915): the operator-`configured` cap if any,
-/// otherwise the [`DEFAULT_MIN_DATAPLANE_READERS`] default, then RAISED to `led_inbound_link_count` (this
-/// node's legitimate inbound follower fanout, [`DataPlaneServer::led_inbound_link_count`]) so a
-/// high-fanout leader admits every real follower link rather than refusing past a too-small constant.
+/// otherwise the [`DEFAULT_MIN_DATAPLANE_READERS`] default, then RAISED to `led_inbound_link_count` plus
+/// [`DATAPLANE_NONFETCH_HEADROOM`] (this node's legitimate inbound follower FETCH fanout,
+/// [`DataPlaneServer::led_inbound_link_count`], plus a small margin for the non-fetch links the same
+/// listener serves) so a high-fanout leader admits every real follower link — and a transient confirm /
+/// reconnect-overlap alongside it — rather than refusing past a too-small constant.
 ///
 /// Two guarantees hold jointly:
 /// * a LEGITIMATE follower is NEVER refused for lack of a slot — the cap is at least the exact
-///   led-partition inbound fanout, so all real links fit even when the operator configured a smaller cap;
+///   led-partition inbound fanout (plus non-fetch headroom), so all real links fit even when the operator
+///   configured a smaller cap;
 /// * an UNAUTHENTICATED flood is still BOUNDED — the cap is finite (the configured value, or the default
-///   floor, whichever with the fanout is the larger), so the listener still drops links past it and never
-///   spawns unbounded threads.
+///   floor, whichever with the fanout-plus-headroom is the larger), so the listener still drops links past
+///   it and never spawns unbounded threads.
 ///
 /// Flooring the default at 256 leaves a small edge deployment (fanout ≪ 256) on exactly today's bound.
 fn effective_dataplane_reader_cap(
@@ -809,7 +826,7 @@ fn effective_dataplane_reader_cap(
 ) -> usize {
     configured
         .unwrap_or(DEFAULT_MIN_DATAPLANE_READERS)
-        .max(led_inbound_link_count)
+        .max(led_inbound_link_count.saturating_add(DATAPLANE_NONFETCH_HEADROOM))
 }
 
 /// Releases one concurrent-reader slot on drop (#865), so the concurrent-reader count is
@@ -3162,23 +3179,38 @@ mod tests {
         // of refusing links past a borrowed constant — the bug this fixes — while (b) never dropping
         // below the old 256 floor for a small edge deployment, and (c) honoring an operator override as
         // the flood bound yet still raising it to the exact fanout so a legitimate follower is never
-        // refused.
-        // (a) high fanout, no override: the cap GROWS to the fanout (old code was stuck at 256 → refused).
-        assert_eq!(effective_dataplane_reader_cap(None, 600), 600);
-        // (b) small fanout, no override: floored at the old constant so edge deployments are unaffected.
+        // refused. #961: in the fanout-driven regime the cap also keeps DATAPLANE_NONFETCH_HEADROOM slack
+        // ABOVE the exact fetch fanout for the non-fetch links the same listener serves (a confirm dial, a
+        // reconnect-overlap), so those are not transiently refused when the cap == the exact fanout.
+        // (a) high fanout, no override: the cap GROWS to the fanout PLUS the non-fetch headroom (old code
+        // was stuck at 256 → refused every real follower; #915 grew to exactly 600 → zero headroom for a
+        // confirm/reconnect; #961 keeps the small margin).
+        assert_eq!(
+            effective_dataplane_reader_cap(None, 600),
+            600 + DATAPLANE_NONFETCH_HEADROOM
+        );
+        // (b) small fanout, no override: floored at the old constant so edge deployments are unaffected —
+        // the 256 floor already dwarfs fanout + headroom, so nothing changes for them.
         assert_eq!(
             effective_dataplane_reader_cap(None, 3),
             DEFAULT_MIN_DATAPLANE_READERS
         );
+        // At the floor itself the fanout == 256 case (cap == exact fanout under #915) now gains the
+        // headroom: this is precisely the zero-headroom boundary #961 closes.
         assert_eq!(
             effective_dataplane_reader_cap(None, DEFAULT_MIN_DATAPLANE_READERS),
-            DEFAULT_MIN_DATAPLANE_READERS
+            DEFAULT_MIN_DATAPLANE_READERS + DATAPLANE_NONFETCH_HEADROOM
         );
-        // (c) an override ABOVE the fanout is the bound (an unauthenticated flood is capped there)...
+        // (c) an override ABOVE the fanout (+ headroom) is the bound (an unauthenticated flood is capped
+        // there)...
         assert_eq!(effective_dataplane_reader_cap(Some(1000), 600), 1000);
-        // ...and an override BELOW the fanout is still raised to the fanout, so a real follower is never
-        // refused for lack of a slot even under a too-small operator cap.
-        assert_eq!(effective_dataplane_reader_cap(Some(50), 600), 600);
+        // ...and an override BELOW the fanout is still raised to the fanout PLUS the non-fetch headroom, so
+        // a real follower — and a transient confirm/reconnect beside it — is never refused for lack of a
+        // slot even under a too-small operator cap.
+        assert_eq!(
+            effective_dataplane_reader_cap(Some(50), 600),
+            600 + DATAPLANE_NONFETCH_HEADROOM
+        );
     }
 
     #[test]
