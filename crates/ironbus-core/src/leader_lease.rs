@@ -326,6 +326,7 @@ impl LeadershipTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const LEASE: u64 = 1_000; // 1_000 ns lease window, so tests advance time in small integers.
 
@@ -566,5 +567,95 @@ mod tests {
         // Re-tick keeps it the sole, unfenced leader.
         solo.observe(1, true, 1);
         assert!(solo.can_act_as_leader(1));
+    }
+
+    proptest! {
+        /// Fold a RANDOM sequence of `(term, is_leader, now_delta)` observations into a single
+        /// [`LeadershipTracker`], with `now` accumulated strictly non-decreasing (the monotonic
+        /// clock seam), and after EVERY step assert the leader-epoch fencing invariants. Where
+        /// the hand-rolled `#[test]`s above pin fixed interleavings, this drives the whole
+        /// observation space (term up/equal/down × leadership flap × the renew-vs-grant and
+        /// lease-expiry boundaries) — the cluster-level analogue of `lease.rs`'s proptest.
+        #[test]
+        fn folding_random_observations_upholds_the_leader_epoch_fences(
+            steps in prop::collection::vec((0u8..8, any::<bool>(), 0u8..4), 0..64),
+        ) {
+            let mut t = LeadershipTracker::new(LEASE);
+            let mut now: u64 = 0;
+
+            for (term, is_leader, now_delta) in steps {
+                let term = u64::from(term);
+                now += u64::from(now_delta); // strictly non-decreasing monotonic time
+
+                let prev_epoch = t.epoch();
+                let prev_lease = t.lease();
+
+                let outcome = t.observe(term, is_leader, now);
+
+                // (1) Monotonicity: the epoch NEVER regresses across observations.
+                prop_assert!(
+                    t.epoch() >= prev_epoch,
+                    "epoch regressed from {prev_epoch:?} to {:?}",
+                    t.epoch()
+                );
+
+                if term < prev_epoch.get() {
+                    // (2) A stale, lower-term observation is fenced: it returns `Stale` and leaves
+                    // BOTH the epoch and the lease byte-identical to before the call.
+                    prop_assert_eq!(
+                        outcome,
+                        EpochObservation::Stale {
+                            current: prev_epoch,
+                            observed: LeaderEpoch::new(term),
+                        }
+                    );
+                    prop_assert_eq!(t.epoch(), prev_epoch, "a stale observation regressed the epoch");
+                    prop_assert_eq!(t.lease(), prev_lease, "a stale observation mutated the lease");
+                } else {
+                    // A non-stale (>=) observation advances the epoch to exactly the observed term.
+                    prop_assert_eq!(t.epoch(), LeaderEpoch::new(term));
+
+                    // (5) A same-epoch step where this node is NOT the leader drops the lease, so
+                    // it cannot act — the immediate step-down fence.
+                    if !is_leader {
+                        prop_assert_eq!(t.lease(), None, "a non-leader step must drop the lease");
+                        prop_assert!(!t.can_act_as_leader(now));
+                    }
+                }
+
+                // (3) Acting as leader IMPLIES a still-valid lease pinned to the current epoch.
+                if t.can_act_as_leader(now) {
+                    let lease = t.lease().expect("can_act_as_leader ⇒ a lease is held");
+                    prop_assert_eq!(lease.epoch(), t.epoch());
+                    prop_assert!(lease.is_valid(now));
+                    // The exact complement of the fence: a valid lease-holder's write at its OWN
+                    // current epoch must be allowed through (not fenced) — the acting path.
+                    prop_assert!(
+                        !t.fences(t.epoch(), now),
+                        "a valid lease-holder's own-epoch write must not be fenced"
+                    );
+                }
+
+                // (4) The fence: every epoch strictly BELOW the current one is fenced; and when
+                // this node holds no valid lease, EVERY candidate epoch is fenced.
+                let holds_valid_lease = t.can_act_as_leader(now);
+                for e in 0..=t.epoch().get() + 2 {
+                    let candidate = LeaderEpoch::new(e);
+                    if e < t.epoch().get() {
+                        prop_assert!(
+                            t.fences(candidate, now),
+                            "an older epoch {e} must be fenced at epoch {:?}",
+                            t.epoch()
+                        );
+                    }
+                    if !holds_valid_lease {
+                        prop_assert!(
+                            t.fences(candidate, now),
+                            "with no valid lease, epoch {e} must be fenced"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
