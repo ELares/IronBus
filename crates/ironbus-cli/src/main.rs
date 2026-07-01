@@ -380,6 +380,12 @@ const DEFAULT_DEDUP_WINDOW_MS: u64 = ironbus_core::dedup::DEFAULT_WINDOW_NANOS /
 /// `producer_id` over the cap evicts the least-recently-active window. Floored to 1 by the engine.
 const DEFAULT_DEDUP_MAX_PRODUCERS: usize = ironbus_core::dedup::DEFAULT_MAX_PRODUCERS;
 
+/// The default cap on concurrently-PREPARED transactional half messages (#909), sourced from the
+/// engine's [`ironbus_core::txn::DEFAULT_MAX_PREPARED`] so the CLI and engine default stay one source of
+/// truth. The `txn_id` is wire-supplied, so this caps the resident prepared-payload RAM the refuse-to-
+/// boot guard charges; `edge-tiny` lowers it (each slot is a maximal frame). Floored to 1 by the engine.
+const DEFAULT_MAX_PREPARED: usize = ironbus_core::txn::DEFAULT_MAX_PREPARED;
+
 /// The disk-full overflow policy parsed from `serve --disk-full-policy` (#82). A platform-neutral,
 /// `Copy` mirror of the engine's policy enum, so it lives in the (non-Unix-gated) `ServeConfig` and
 /// is validated on every platform; the Unix on-disk path maps it to the engine's `DiskFullPolicy`.
@@ -671,6 +677,11 @@ struct ProfilePreset {
     /// `dedup.max_producers` (`--dedup-max-producers`): the cap on concurrently-tracked dedup windows.
     /// `edge-tiny` LOWERS it (#878) for the same reason.
     dedup_max_producers: usize,
+    /// `txn.max_prepared` (`--max-prepared`): the cap on concurrently-PREPARED transactional half
+    /// messages (#909). Each prepared half message buffers a full producer-controlled record in RAM,
+    /// so `edge-tiny` LOWERS it (each slot is a maximal frame) to a handful so the guard's term-7
+    /// charge fits its 64 MiB ceiling; `balanced`/`throughput` use the shipped default.
+    max_prepared: usize,
 }
 
 /// The `edge-tiny` preset: `docs/CONFIG.md` section 6, identical to the `tiny` table in
@@ -701,6 +712,11 @@ const EDGE_TINY_PRESET: ProfilePreset = ProfilePreset {
     // leaving comfortable headroom under the 64 MiB ceiling alongside the ~15 MiB buffers and any store.
     dedup_max_ids: 256,
     dedup_max_producers: 64,
+    // LOWERED prepared cap (#909): the shipped default (65_536) implies ~1 TiB of buffered half-message
+    // payloads in the worst case (each a maximal ~16 MiB frame), which the guard now charges (term 7) and
+    // would refuse under 64 MiB. A tiny edge node runs few concurrent transactions, so 2 prepared slots
+    // (~32 MiB) is a bounded ceiling that still leaves headroom under 64 MiB alongside the other terms.
+    max_prepared: 2,
 };
 
 /// The `balanced` preset: THE default, and EXACTLY the compiled-in `DEFAULT_*` constant set, so a
@@ -727,6 +743,9 @@ const BALANCED_PRESET: ProfilePreset = ProfilePreset {
     // off, their ~269 GiB worst case is not charged against any ceiling).
     dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
     dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+    // `balanced` IS the default knob set, so it keeps the shipped prepared cap (with the guard off, its
+    // ~1 TiB worst case is not charged against any ceiling).
+    max_prepared: DEFAULT_MAX_PREPARED,
 };
 
 /// The `throughput` preset: `docs/CONFIG.md` section 6, wide buffers for a multi-core hub. 256 MiB
@@ -751,6 +770,8 @@ const THROUGHPUT_PRESET: ProfilePreset = ProfilePreset {
     // A hub sizes RAM out of band (guard off), so it keeps the shipped default dedup caps.
     dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
     dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+    // A hub sizes RAM out of band (guard off), so it keeps the shipped default prepared cap.
+    max_prepared: DEFAULT_MAX_PREPARED,
 };
 
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
@@ -2224,6 +2245,11 @@ struct ServeFlags {
     /// The cap on the NUMBER of distinct per-producer dedup windows (#33); `None` falls back to the
     /// default. Bounds the TOTAL dedup memory under a flood of distinct `producer_id`s.
     dedup_max_producers: Option<usize>,
+    /// The cap on concurrently-PREPARED transactional half messages (#909); `None` falls back to the
+    /// profile preset (the shipped default for `balanced`/`throughput`, a lowered handful for
+    /// `edge-tiny`). Bounds the resident prepared-half-message RAM the refuse-to-boot guard charges
+    /// under a `TxnPrepare` flood of distinct `txn_id`s.
+    max_prepared: Option<usize>,
     /// The durability LEVEL (#341, #379) selected by `--durability-level` / `IRONBUS_DURABILITY_LEVEL`.
     /// `None` resolves to the default `sync` (ack-implies-durable, I2, zero acked loss). An unknown
     /// name is a usage error.
@@ -2514,6 +2540,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--dedup-max-producers" => {
                 f.dedup_max_producers = Some(take_number("--dedup-max-producers", args, &mut i)?);
+            }
+            "--max-prepared" => {
+                f.max_prepared = Some(take_number("--max-prepared", args, &mut i)?);
             }
             "--disk-full-policy" => {
                 f.disk_full_policy = Some(take_value("--disk-full-policy", args, &mut i)?);
@@ -3085,6 +3114,15 @@ fn parse_serve_flags_with_env_and_reader(
                 f.dedup_max_producers,
                 env,
                 preset.dedup_max_producers,
+            )?,
+            // #909: the prepared cap takes its default from the PROFILE PRESET (edge-tiny lowers it so the
+            // charged prepared-payload RAM term fits its 64 MiB ceiling; balanced/throughput keep the
+            // shipped default), still overridable by env/flag — exactly like the dedup caps above.
+            max_prepared: resolve_number(
+                "--max-prepared",
+                f.max_prepared,
+                env,
+                preset.max_prepared,
             )?,
             // The durability level and its interval triggers (#341, #379). The level is resolved
             // above (flag > env > default `sync`); the interval triggers take their defaults when not
@@ -4609,6 +4647,12 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
         // count is bounded only by these caps, not the connection count.
         dedup_max_producers: u64::try_from(config.dedup_max_producers).unwrap_or(u64::MAX),
         dedup_max_ids: u64::try_from(config.dedup_max_ids).unwrap_or(u64::MAX),
+        // Term 7, the prepared transactional half messages (#909): charged at the CONFIGURED cap, so a
+        // config whose prepared cap cannot stay under the ceiling is refused (the shipped 65_536 default
+        // is ~1 TiB of maximal half-message frames; the edge-tiny preset lowers it). `txn_id` is
+        // wire-supplied, so the count is bounded only by this cap, not the connection count. The engine
+        // honors it via `Engine::set_txn_max_prepared`, so the charge is a true bound.
+        max_prepared: u64::try_from(config.max_prepared).unwrap_or(u64::MAX),
     };
     match ironbus_server::rss::fits_under_ram_ceiling(&footprint) {
         ironbus_server::rss::RamCeilingVerdict::Disabled
@@ -4810,6 +4854,14 @@ struct ServeConfig {
     /// flood of distinct ids cannot grow RAM without bound. Default 4096
     /// (`DEFAULT_DEDUP_MAX_PRODUCERS`); floored to 1 by the engine.
     dedup_max_producers: usize,
+    /// The cap on concurrently-PREPARED transactional half messages (#909): the most half messages the
+    /// txn 2PC store buffers (durable + resident) before a further `TxnPrepare` is refused. The `txn_id`
+    /// is wire-supplied and attacker-chosen, so this bounds the resident prepared-payload RAM the
+    /// refuse-to-boot guard charges (term 7) — the txn sibling of `dedup_max_producers`. Threaded into
+    /// the engine via `Engine::set_txn_max_prepared`. Default `65_536` (`DEFAULT_MAX_PREPARED`); `edge-tiny`
+    /// LOWERS it (each slot is a maximal frame) so the guard fits its 64 MiB ceiling; floored to 1 by the
+    /// engine.
+    max_prepared: usize,
     /// The DURABILITY LEVEL (#341, #379): how an ack relates to the covering `fdatasync`. Default
     /// [`DurabilityLevelArg::Sync`] (ack only after the covering fdatasync, I2, ZERO acked loss on a
     /// power cut), so a zero-config broker is power-loss safe. The relaxed levels weaken I2 by a
@@ -4972,6 +5024,8 @@ impl ServeConfig {
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+            // #909: the bench broker uses the shipped default prepared cap (the guard is off here).
+            max_prepared: DEFAULT_MAX_PREPARED,
             // The bench broker runs the default durable level (#341): ack-implies-durable, the same
             // power-loss-safe guarantee the shipped `serve` default carries.
             durability_level: DurabilityLevelArg::Sync,
@@ -6232,6 +6286,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
          actor_watchdog_bound_ms={} \
          enable_admin={} ram_ceiling_bytes={} dedup_max_ids={} dedup_max_producers={} \
+         max_prepared={} \
          durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
          flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
@@ -6260,6 +6315,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.ram_ceiling_bytes,
         config.dedup_max_ids,
         config.dedup_max_producers,
+        config.max_prepared,
         config.flush_interval_ms,
         config.flush_max_bytes,
         config.async_loss_ack,
@@ -9176,6 +9232,12 @@ fn open_engine_with<F: Filesystem + Clone>(
     )
     .map_err(|e| CliError::Internal(format!("opening broker {context}: {e}")))?;
     let mut engine = engine;
+    // Bound the concurrently-PREPARED transactional half messages (#909): the refuse-to-boot RAM guard
+    // charges `max_prepared * a maximal frame` (term 7), so the engine MUST honor the configured cap
+    // (else the guard's proof is a lie). Applied here at boot (server-side, not on the wire), exactly
+    // like the compaction / key-shared config below; a broker whose txn store is created lazily on the
+    // first `TxnPrepare` picks up the remembered value. `edge-tiny` lowers it so its ceiling fits.
+    engine.set_txn_max_prepared(config.max_prepared);
     // Enable OPT-IN key compaction (#337) when `--compact` was passed (OFF by default). It runs the
     // off-hot-path compactor after each produce-path reaper run; it never touches the active segment,
     // so it cannot block an append. A broker without `--compact` is byte-for-byte unchanged.
@@ -12762,6 +12824,8 @@ mod tests {
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+            // #909: the shipped default prepared cap (the guard is off unless a ceiling is set).
+            max_prepared: DEFAULT_MAX_PREPARED,
             // The default durable level (#341): a test config that does not opt in stays power-loss
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,
@@ -16190,6 +16254,8 @@ mod tests {
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+            // #909: the shipped default prepared cap (the guard is off unless a ceiling is set).
+            max_prepared: DEFAULT_MAX_PREPARED,
             // The default durable level (#341): a test config that does not opt in stays power-loss
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,
@@ -16282,12 +16348,50 @@ mod tests {
             // ~269 GiB dedup term would (correctly) refuse to boot.
             dedup_max_ids: 256,
             dedup_max_producers: 64,
+            // #909: the edge-tiny preset also lowers the prepared cap (each slot is a maximal frame);
+            // the shipped default (65_536) would imply ~1 TiB of half messages and refuse to boot.
+            max_prepared: 2,
             ..validation_config()
         };
         assert!(
             validate_serve_config(&cfg).is_ok(),
-            "edge-tiny caps (with lowered dedup) fit under the 64 MiB ceiling, so the broker must boot"
+            "edge-tiny caps (with lowered dedup + prepared) fit under the 64 MiB ceiling, so the broker \
+             must boot"
         );
+    }
+
+    #[test]
+    fn validate_refuses_edge_tiny_with_a_blown_up_max_prepared() {
+        // #909: edge-tiny FITS at its lowered `--max-prepared` (2 slots), but restoring the shipped
+        // default (65_536) under the same 64 MiB ceiling implies ~1 TiB of buffered half-message
+        // payloads — provably over, so the guard refuses to boot. This is the txn sibling of the #878
+        // dedup refusal and the exact defect #909 closes: pre-#909 the guard did not charge the prepared
+        // payloads, so an edge box booted under 64 MiB yet a `TxnPrepare` flood of distinct txn_ids could
+        // pin the default 65_536 maximal records in RAM and OOM it.
+        let cfg = ServeConfig {
+            max_connections: 32,
+            consumer_credit: 8,
+            consumer_credit_bytes: 256 * 1024,
+            max_groups: 64,
+            max_streams: 64,
+            max_in_flight: 256,
+            ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
+            dedup_max_ids: 256,
+            dedup_max_producers: 64,
+            // The BLOWN knob: the shipped default prepared cap under the tiny ceiling.
+            max_prepared: DEFAULT_MAX_PREPARED,
+            ..validation_config()
+        };
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("--ram-ceiling-bytes"), "names the ceiling: {m}");
+                assert!(m.contains("refuses to boot"), "{m}");
+                assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+            }
+            other => panic!(
+                "a default --max-prepared under a 64 MiB ceiling must be refused, got {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -16356,6 +16460,9 @@ mod tests {
             // fits its 64 MiB ceiling; the shipped 4096 * 100_000 defaults would refuse.
             dedup_max_ids: 256,
             dedup_max_producers: 64,
+            // #909: the lowered prepared cap keeps term 7 small (~32 MiB), so these #445 memory-fold
+            // tests flip PURELY on the store, not on a blown prepared term.
+            max_prepared: 2,
             ..validation_config()
         }
     }
@@ -16414,38 +16521,42 @@ mod tests {
     #[test]
     fn the_store_fold_charges_one_image_a_two_image_mutant_over_refuses_here() {
         // PINS THE MULTIPLIER at the validate level, where the model test alone cannot: the edge-tiny
-        // buffer terms (~15 MiB) PLUS the #878 dedup term (~11 MiB, edge-tiny's lowered caps) sum to
-        // ~26 MiB, so with a 32 MiB store cap the worst case is ~58 MiB charged at ONE image (fits the
-        // 64 MiB ceiling, BOOTS — the correct post-#492 verdict for the single-image EphemeralFile
-        // backend) and ~90 MiB charged at TWO (refuses). The ceiling sits BETWEEN the one-image and
-        // two-image floors, so a STALE 2x mutant (the pre-#492 InMemoryFile live+durable charge)
-        // OVER-refuses this exact valid config and fails here. Companion to the rss model test, which
-        // pins the literal 1 in the formula; this one proves the 1 reaches the real boot verdict with
-        // no slack. (The 1 GiB test above pins the OTHER direction: a fold-removal mutant that charges
-        // 0x boots a config that must refuse, so together they fix the multiplier at exactly 1.)
+        // buffer terms (~15 MiB) PLUS the #878 dedup term (~11 MiB) PLUS the #909 prepared term (~32 MiB,
+        // edge-tiny's 2-slot cap at a maximal frame each) sum to ~58 MiB, leaving ~6 MiB of headroom under
+        // the 64 MiB ceiling. So with a 4 MiB store cap the worst case is ~62 MiB charged at ONE image
+        // (fits, BOOTS — the correct post-#492 verdict for the single-image EphemeralFile backend) and
+        // ~66 MiB charged at TWO (refuses). The ceiling sits BETWEEN the one-image and two-image floors,
+        // so a STALE 2x mutant (the pre-#492 InMemoryFile live+durable charge) OVER-refuses this exact
+        // valid config and fails here. Companion to the rss model test, which pins the literal 1 in the
+        // formula; this one proves the 1 reaches the real boot verdict with no slack. (The 1 GiB test
+        // above pins the OTHER direction: a fold-removal mutant that charges 0x boots a config that must
+        // refuse, so together they fix the multiplier at exactly 1.) The store cap is small because the
+        // #909 prepared term now consumes most of the tiny ceiling's headroom.
         let cfg = ServeConfig {
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
-            max_total_bytes: 32 * 1024 * 1024,
+            max_total_bytes: 4 * 1024 * 1024,
             ..edge_tiny_caps()
         };
         assert!(
             validate_serve_config(&cfg).is_ok(),
-            "32 MiB of store cap is 32 MiB of store image (post-#492 single image); with ~15 MiB \
-             of buffers that fits the 64 MiB ceiling and must boot — a stale 2x mutant over-refuses"
+            "4 MiB of store cap is 4 MiB of store image (post-#492 single image); with the ~58 MiB \
+             of edge-tiny buffers + dedup + prepared terms that fits the 64 MiB ceiling and must boot \
+             — a stale 2x mutant over-refuses"
         );
     }
 
     #[test]
     fn memory_storage_boots_when_the_ceiling_covers_the_store_and_buffers() {
         // The fold's accepting direction: a memory-mode config whose ceiling covers the buffer
-        // terms PLUS the store image (1 * max-total-bytes, post-#492) validates and boots. 8 MiB
-        // of cap means 8 MiB of store image; with the ~15 MiB edge-tiny buffer worst case plus the
-        // ~11 MiB #878 dedup term that sums to ~34 MiB, well under the 64 MiB ceiling.
+        // terms PLUS the store image (1 * max-total-bytes, post-#492) validates and boots. 4 MiB
+        // of cap means 4 MiB of store image; with the ~15 MiB edge-tiny buffer worst case plus the
+        // ~11 MiB #878 dedup term plus the ~32 MiB #909 prepared term that sums to ~62 MiB, just
+        // under the 64 MiB ceiling.
         let cfg = ServeConfig {
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
-            max_total_bytes: 8 * 1024 * 1024,
+            max_total_bytes: 4 * 1024 * 1024,
             ..edge_tiny_caps()
         };
         assert!(

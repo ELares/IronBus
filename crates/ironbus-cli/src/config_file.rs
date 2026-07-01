@@ -180,6 +180,7 @@ fn key_to_env_name(key: &str) -> Option<&'static str> {
         "delivery.dedup_max_ids" => "IRONBUS_DEDUP_MAX_IDS",
         "delivery.dedup_window_ms" => "IRONBUS_DEDUP_WINDOW_MS",
         "delivery.dedup_max_producers" => "IRONBUS_DEDUP_MAX_PRODUCERS",
+        "delivery.max_prepared" => "IRONBUS_MAX_PREPARED",
         "network.listen" => "IRONBUS_ADDR",
         "network.health_addr" => "IRONBUS_HEALTH_ADDR",
         "network.health_allow_public" => "IRONBUS_HEALTH_ALLOW_PUBLIC",

@@ -391,6 +391,10 @@ pub const KEY_TABLE: &[KeySpec] = &[
         key: "delivery.dedup_max_producers",
         kind: KeyKind::Integer,
     },
+    KeySpec {
+        key: "delivery.max_prepared",
+        kind: KeyKind::Integer,
+    },
     // [network]
     KeySpec {
         key: "network.listen",

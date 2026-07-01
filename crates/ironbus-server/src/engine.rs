@@ -2640,6 +2640,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// timeout / retry cadence / attempt cap. Defaults to [`ironbus_core::txn::BackCheckConfig::default`]
     /// (a 30 s timeout, a 15 s retry, a 5-attempt cap), the production-safe schedule.
     back_check_config: ironbus_core::txn::BackCheckConfig,
+    /// The cap on concurrently-PREPARED transactional half messages (#909): applied to the txn store's
+    /// [`ironbus_core::txn::TxnTable`] at open AND whenever set via [`Engine::set_txn_max_prepared`], so
+    /// a deployment can bound the resident prepared-half-message RAM the refuse-to-boot guard charges
+    /// (the txn sibling of the #878 dedup cap). Defaults to [`ironbus_core::txn::DEFAULT_MAX_PREPARED`]
+    /// (`65_536`); an edge profile LOWERS it so the guard's term-7 charge fits its RAM ceiling.
+    txn_max_prepared: usize,
     /// The per-STREAM default message TTL (V2-M4, #549): a record reached on the poll path whose
     /// EFFECTIVE TTL (the lower of this and the record's own per-message TTL) has passed against the
     /// WALL-clock seam (anchored to the record's durable producer `timestamp_ms`) is EXPIRED — skipped
@@ -3066,6 +3072,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The back-check tunables (#640 part 2): the production-safe default schedule until an
             // operator (or a test) overrides it via `set_back_check_config`.
             back_check_config: ironbus_core::txn::BackCheckConfig::default(),
+            // The concurrently-prepared cap (#909): the shipped default until an operator lowers it via
+            // `set_txn_max_prepared` (an edge profile does, so the refuse-to-boot guard's term-7 charge
+            // fits its ceiling). An eager-recovered txn store above opened with the default cap is
+            // retuned to this value by the boot-time setter, exactly like `back_check_config`.
+            txn_max_prepared: ironbus_core::txn::DEFAULT_MAX_PREPARED,
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
@@ -4142,7 +4153,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 self.log.filesystem(),
                 self.log.clock_clone(),
                 self.txn_config,
-                ironbus_core::txn::TxnConfig::default(),
+                ironbus_core::txn::TxnConfig {
+                    max_prepared: self.txn_max_prepared,
+                    ..ironbus_core::txn::TxnConfig::default()
+                },
                 self.back_check_config,
             )
             .map_err(EngineError::Storage)?;
@@ -4500,6 +4514,28 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if let Some(store) = self.txn.as_mut() {
             store.back_check_mut().set_config(config);
         }
+    }
+
+    /// Sets the concurrently-PREPARED cap (#909): the maximum transactional half messages that may be
+    /// buffered (durable + resident) at once before a further `TxnPrepare` is refused. Server-side only
+    /// (NOT on the wire), like [`Engine::set_back_check_config`]. Applied to the open txn store's
+    /// lifecycle table immediately (so it takes effect without a reopen) AND remembered for a later lazy
+    /// open. A deployment configures it once at boot; the default is
+    /// [`ironbus_core::txn::DEFAULT_MAX_PREPARED`] (`65_536`), which an edge profile lowers so the
+    /// refuse-to-boot RAM guard's prepared-payload term fits the ceiling. Lowering it below the current
+    /// prepared count never drops a live half message (durable, undelivered data); it only refuses
+    /// further prepares until the backlog drains under the cap.
+    pub fn set_txn_max_prepared(&mut self, max_prepared: usize) {
+        self.txn_max_prepared = max_prepared;
+        if let Some(store) = self.txn.as_mut() {
+            store.table_mut().set_max_prepared(max_prepared);
+        }
+    }
+
+    /// The active concurrently-PREPARED cap (#909), for the refuse-to-boot guard's accounting and tests.
+    #[must_use]
+    pub fn txn_max_prepared(&self) -> usize {
+        self.txn_max_prepared
     }
 
     /// Registers (or re-registers, after a reconnect) producer connection `member` as the live listener
@@ -16836,6 +16872,34 @@ mod tests {
         assert_eq!(off, Offset::new(0));
         assert_eq!(e.txn_prepared_count(), 0);
         assert_eq!(drain_visible(&mut e), vec![b"half".to_vec()]);
+    }
+
+    #[test]
+    fn set_txn_max_prepared_lowers_the_cap_the_engine_actually_enforces() {
+        // #909 HONESTY LINK: the refuse-to-boot RAM guard charges `max_prepared * a maximal frame`
+        // (term 7), so the engine MUST actually enforce the lowered cap — else the guard's proof is a
+        // lie (it charges 2 slots while the engine would buffer 65_536). This test drives the cap down to
+        // 1 and asserts the SECOND distinct prepare is REFUSED with `TooManyPrepared`, so the resident
+        // prepared-payload backlog is bounded by exactly the value the guard charged.
+        let mut e = open(config(10, 5));
+        e.set_txn_max_prepared(1);
+        assert_eq!(e.txn_max_prepared(), 1);
+        // The setter applies even when the txn store is lazily created on this first prepare.
+        e.txn_prepare(b"tx1", "", &txn_half(b"one"), b"").unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        match e.txn_prepare(b"tx2", "", &txn_half(b"two"), b"") {
+            Err(EngineError::Txn(ironbus_core::txn::TxnError::TooManyPrepared { cap })) => {
+                assert_eq!(
+                    cap, 1,
+                    "the enforced cap is the lowered value the guard charged"
+                );
+            }
+            other => panic!("a second prepare past the lowered cap must be refused, got {other:?}"),
+        }
+        // The refused txn left no residue; the one prepared half message is still resolvable.
+        assert_eq!(e.txn_prepared_count(), 1);
+        e.txn_rollback(b"tx1").unwrap();
+        assert_eq!(e.txn_prepared_count(), 0);
     }
 
     #[test]
