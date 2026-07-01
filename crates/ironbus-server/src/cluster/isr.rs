@@ -78,7 +78,7 @@
 //! cluster with `min_isr >= 2`. This module adds no state and no code to the single-node append path;
 //! merely linking it changes nothing on disk or on the wire for a standalone broker.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use ironbus_proto::frame::{
     decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType, MAX_FRAME_LEN,
@@ -455,10 +455,11 @@ pub struct PendingAck<T> {
 /// `T` is the caller's opaque routing token (see [`PendingAck`]). The gate stores pending acks in
 /// offset order so release is a single front-to-back drain; it never reorders acks past one another.
 pub struct QuorumAckGate<T> {
-    /// Pending acks in strictly increasing offset order (produces are appended in offset order, so a
-    /// push is always at the back). A `VecDeque` would also serve; a `Vec` drained from the front in
-    /// order is simplest and the front-drain is amortized O(released).
-    pending: Vec<PendingAck<T>>,
+    /// Pending acks in submission order (produces are appended in offset order, so a push is always at
+    /// the back). A `VecDeque` so [`release_up_to`](Self::release_up_to) front-drains the committed
+    /// prefix via `pop_front` — O(released), no tail memmove — instead of `Vec::drain(..split)` which
+    /// shifted the un-released tail down on every partial release (#831). `park` stays a back-push.
+    pending: VecDeque<PendingAck<T>>,
     /// The highest offset already released, so a re-drive at a non-advancing quorum-commit offset
     /// releases nothing twice. Starts at 0 (no offset released yet; offset 0's ack releases when
     /// `quorum_commit >= 1`).
@@ -492,7 +493,7 @@ impl<T> QuorumAckGate<T> {
     #[must_use]
     pub fn with_cap(cap: usize) -> Self {
         Self {
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             released_through: 0,
             cap,
         }
@@ -512,7 +513,7 @@ impl<T> QuorumAckGate<T> {
         if self.cap != 0 && self.pending.len() >= self.cap {
             return false;
         }
-        self.pending.push(PendingAck { offset, token });
+        self.pending.push_back(PendingAck { offset, token });
         true
     }
 
@@ -571,12 +572,17 @@ impl<T> QuorumAckGate<T> {
         // does, and a never-committing blocker withholds BOTH (the producer waits, unavailable over
         // unsafe) until `purge_owner` reclaims them on disconnect. An ack at `offset >= commit` is
         // committed iff `offset < commit`.
-        let split = self
-            .pending
-            .iter()
-            .position(|p| p.offset >= commit)
-            .unwrap_or(self.pending.len());
-        let released: Vec<T> = self.pending.drain(..split).map(|p| p.token).collect();
+        //
+        // The drain is a `pop_front` walk over the committed prefix: it STOPS at the first ack whose
+        // `offset >= commit` (identical to the old `position(>= commit)` split), so the prefix released
+        // is byte-identical to the former `Vec::drain(..split)`. `VecDeque::pop_front` is O(1) — no
+        // tail memmove on a partial release (#831) — so the whole drain is O(released), not O(tail).
+        let mut released = Vec::new();
+        while self.pending.front().is_some_and(|p| p.offset < commit) {
+            if let Some(ack) = self.pending.pop_front() {
+                released.push(ack.token);
+            }
+        }
         self.released_through = commit;
         released
     }
@@ -840,6 +846,47 @@ mod tests {
         // When offset 6 commits (quorum 7), the offset-6 ack AND the duplicate behind it release, in
         // submission order — preserving the connection's FIFO ack stream. No double-release.
         assert_eq!(gate.release_up_to(Some(7)), vec![6, 200]);
+        assert_eq!(gate.pending_len(), 0);
+    }
+
+    #[test]
+    fn repeated_partial_drains_always_leaving_a_tail_release_the_exact_fifo_prefix() {
+        // #831: the steady state is a PARTIAL release — the newest parked offsets stay withheld
+        // awaiting quorum-fsync while an older contiguous prefix releases, so every call leaves a
+        // non-empty tail (the O(tail)-memmove case the VecDeque front-drain eliminates). This walks a
+        // sliding commit over a large backlog and asserts each pass releases EXACTLY the committed
+        // submission-order prefix, once, in order — the prefix-drain semantics must be byte-identical
+        // to the former `Vec::drain(..split)` regardless of the backing structure.
+        const N: u64 = 4096;
+        let mut gate: QuorumAckGate<u64> = QuorumAckGate::new();
+        for i in 0..N {
+            assert!(gate.park(i, i));
+        }
+
+        // Advance the commit in strides, always stopping short of the back so a tail always remains.
+        let mut next_expected = 0u64;
+        let mut commit = 0u64;
+        while commit < N - 1 {
+            commit = (commit + 7).min(N - 1); // leave at least the last entry parked
+            let released = gate.release_up_to(Some(commit));
+            let want: Vec<u64> = (next_expected..commit).collect();
+            assert_eq!(
+                released, want,
+                "each pass releases exactly the new committed prefix"
+            );
+            next_expected = commit;
+            assert_eq!(
+                gate.pending_len(),
+                usize::try_from(N - commit).unwrap(),
+                "the un-released tail is retained, never dropped or reordered"
+            );
+            assert!(
+                gate.pending_len() > 0,
+                "a tail always remains (partial drain)"
+            );
+        }
+        // Finally commit past the back: the last entry releases and nothing is left.
+        assert_eq!(gate.release_up_to(Some(N)), vec![N - 1]);
         assert_eq!(gate.pending_len(), 0);
     }
 
