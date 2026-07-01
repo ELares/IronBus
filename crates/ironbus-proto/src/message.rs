@@ -4044,8 +4044,13 @@ mod tests {
         }
 
         /// Decoding arbitrary bytes as any fallible body codec (PUB, ACK, DELIVER, DEAD_LETTER,
-        /// TRUNCATED) never panics and never reads out of bounds: each returns a typed
-        /// `BodyError` or a valid view, the property-level complement to the per-codec fuzz targets.
+        /// TRUNCATED, CONNECT, INFO, and the #851 stream/subject/txn ingress bodies) never panics and
+        /// never reads out of bounds: each returns a typed `BodyError` or a valid view, and for the
+        /// three verbatim carriers the carried `pub_body` re-decodes without panic — the property-level
+        /// complement to the per-codec fuzz targets. This is the fully-arbitrary sweep (mostly rejected
+        /// at the version gate); `framed_broker_ingress_bodies_round_trip_and_never_panic` is the
+        /// companion WELL-FRAMED sweep that reliably reaches the read-helper caps and the carrier
+        /// `decode_pub(pub_body)` composition.
         #[test]
         fn decoding_arbitrary_bytes_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
             let _ = decode_pub(&bytes);
@@ -4113,6 +4118,93 @@ mod tests {
             // SUB is infallible: any byte string is a valid body, and decoding it recovers the
             // exact bytes as the group, so it cannot panic either.
             prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());
+            // #851: the six BROKER-INGRESS stream/subject/txn body decoders are untrusted attack
+            // surface too (a hostile PubTo/SubTo/TxnPrepare/PubSubject/SubSubject/BindSubject at the
+            // leader). Each rides the version+`field_len` frame and the capped `read_stream_id`/
+            // `read_subject`/`read_txn_id` helpers, none of which the six hand-picked reject cases
+            // sweep — so decoding any byte string must be a typed `BodyError` or a valid view, never a
+            // panic / over-read / over-allocation.
+            let _ = decode_sub_to(&bytes);
+            let _ = decode_bind_subject(&bytes);
+            let _ = decode_sub_subject(&bytes);
+            // The three VERBATIM CARRIERS expose `pub_body = r.rest()`, which the broker feeds straight
+            // into `decode_pub`. Drive that broker-as-used COMPOSITION on the fuzz input: on a decoded
+            // view, re-decoding the carried `pub_body` tail must also never panic.
+            if let Ok(view) = decode_pub_to(&bytes) {
+                let _ = decode_pub(view.pub_body);
+            }
+            if let Ok(view) = decode_pub_subject(&bytes) {
+                let _ = decode_pub(view.pub_body);
+            }
+            if let Ok(view) = decode_txn_prepare(&bytes) {
+                let _ = decode_pub(view.pub_body);
+            }
+        }
+
+        /// #851 (companion, WELL-FRAMED sweep): the fully-arbitrary sweep above almost never gets past
+        /// the fixed `STREAM_WIRE_BODY_VERSION` gate, so it rarely exercises the read-helper caps or the
+        /// verbatim-carrier `decode_pub(pub_body)` composition that are the real residual risk. Here the
+        /// six ingress bodies are built VALID (via their encoders) from arbitrary field contents, so
+        /// decode is driven all the way through the block and — for the carriers — leaves an ARBITRARY
+        /// `pub_body` tail. Each body must round-trip EXACTLY (a discriminating identity, not a mere
+        /// no-panic), and re-decoding the carrier `pub_body` tail with `decode_pub` (the broker-as-used
+        /// composition) must never panic on that arbitrary tail.
+        #[test]
+        fn framed_broker_ingress_bodies_round_trip_and_never_panic(
+            stream_id in prop::collection::vec(any::<u8>(), 0..80),
+            group in prop::collection::vec(any::<u8>(), 0..80),
+            subject in prop::collection::vec(any::<u8>(), 0..80),
+            txn_id in prop::collection::vec(any::<u8>(), 0..80),
+            pub_body in prop::collection::vec(any::<u8>(), 0..96),
+        ) {
+            // PubTo (verbatim carrier): stream_id + arbitrary pub_body tail.
+            let mut buf = Vec::new();
+            encode_pub_to(&PubToBody { stream_id: &stream_id, pub_body: &pub_body }, &mut buf).unwrap();
+            let v = decode_pub_to(&buf).unwrap();
+            prop_assert_eq!(v.stream_id, stream_id.as_slice());
+            prop_assert_eq!(v.pub_body, pub_body.as_slice());
+            let _ = decode_pub(v.pub_body);
+
+            // PubSubject (verbatim carrier): subject + arbitrary pub_body tail.
+            let mut buf = Vec::new();
+            encode_pub_subject(&PubSubjectBody { subject: &subject, pub_body: &pub_body }, &mut buf).unwrap();
+            let v = decode_pub_subject(&buf).unwrap();
+            prop_assert_eq!(v.subject, subject.as_slice());
+            prop_assert_eq!(v.pub_body, pub_body.as_slice());
+            let _ = decode_pub(v.pub_body);
+
+            // TxnPrepare (verbatim carrier): txn_id + stream_id + arbitrary pub_body tail.
+            let mut buf = Vec::new();
+            encode_txn_prepare(
+                &TxnPrepareBody { txn_id: &txn_id, stream_id: &stream_id, pub_body: &pub_body },
+                &mut buf,
+            ).unwrap();
+            let v = decode_txn_prepare(&buf).unwrap();
+            prop_assert_eq!(v.txn_id, txn_id.as_slice());
+            prop_assert_eq!(v.stream_id, stream_id.as_slice());
+            prop_assert_eq!(v.pub_body, pub_body.as_slice());
+            let _ = decode_pub(v.pub_body);
+
+            // SubTo: stream_id + group (both u16-len framed inside the block).
+            let mut buf = Vec::new();
+            encode_sub_to(&SubToBody { stream_id: &stream_id, group: &group }, &mut buf).unwrap();
+            let v = decode_sub_to(&buf).unwrap();
+            prop_assert_eq!(v.stream_id, stream_id.as_slice());
+            prop_assert_eq!(v.group, group.as_slice());
+
+            // SubSubject: subject + group.
+            let mut buf = Vec::new();
+            encode_sub_subject(&SubSubjectBody { subject: &subject, group: &group }, &mut buf).unwrap();
+            let v = decode_sub_subject(&buf).unwrap();
+            prop_assert_eq!(v.subject, subject.as_slice());
+            prop_assert_eq!(v.group, group.as_slice());
+
+            // BindSubject: stream_id + pattern.
+            let mut buf = Vec::new();
+            encode_bind_subject(&BindSubjectBody { stream_id: &stream_id, pattern: &subject }, &mut buf).unwrap();
+            let v = decode_bind_subject(&buf).unwrap();
+            prop_assert_eq!(v.stream_id, stream_id.as_slice());
+            prop_assert_eq!(v.pattern, subject.as_slice());
         }
 
         #[test]

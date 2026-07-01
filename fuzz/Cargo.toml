@@ -119,6 +119,50 @@ test = false
 doc = false
 bench = false
 
+# #851: the six broker-ingress stream/subject/txn body decoders (verbatim carriers also drive
+# `decode_pub` on the carried `pub_body` tail, the broker-as-used composition).
+[[bin]]
+name = "pub_to_body"
+path = "fuzz_targets/pub_to_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sub_to_body"
+path = "fuzz_targets/sub_to_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "txn_prepare_body"
+path = "fuzz_targets/txn_prepare_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pub_subject_body"
+path = "fuzz_targets/pub_subject_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sub_subject_body"
+path = "fuzz_targets/sub_subject_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bind_subject_body"
+path = "fuzz_targets/bind_subject_body.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace (which is `crates/*`): a cargo-fuzz crate must build with the
 # nightly sanitizer toolchain, separately from the merge-blocking stable workspace.
 [workspace]
