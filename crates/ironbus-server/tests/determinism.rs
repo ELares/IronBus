@@ -177,3 +177,113 @@ fn the_lz4_lifecycle_produces_a_byte_identical_disk_image() {
         total(&none_image)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #964: extend the engine determinism gate to a MULTI-STREAM workload that COLD-REOPENS the engine,
+// so the standing gate exercises the engine-integrated #822 parallel recovery — `StreamSet::open`'s
+// `par_recover_open` over the `streams/<hex>/` subtrees — rather than only the single default `Log`.
+// The default-stream gates above never materialize `streams/`, so their reopen (if any) opens ZERO
+// named subtrees. Producing to > the recovery worker cap of named streams and REOPENING drives the
+// bounded outer pool end to end, and folding the recovered per-stream view in makes a worker-order
+// mis-assembly (a stream serving a sibling's records) diverge run-vs-run.
+
+/// `> RECOVERY_OPEN_MAX_WORKERS` (8), so the engine's reopen genuinely steals named-stream opens off
+/// the shared cursor rather than opening them inline.
+const NAMED_STREAM_FANOUT: usize = 12;
+
+/// A record with a fixed producer timestamp (part of the workload, never a wall clock).
+fn record(payload: &[u8]) -> Append<'_> {
+    Append {
+        timestamp_ms: 0,
+        flags: RecordFlags::EMPTY,
+        key: b"",
+        headers: b"",
+        payload,
+    }
+}
+
+/// The FULL durable image of `fs`: this level's files AND the `streams/<hex>/` subtrees the
+/// multi-stream layout creates, as a sorted list of (path, bytes). The flat [`Filesystem::list`] the
+/// default gates use reports only the root files, so it would silently MISS the named subtrees.
+fn full_image(fs: &InMemoryFs, prefix: &str) -> Vec<(String, Vec<u8>)> {
+    let mut image: Vec<(String, Vec<u8>)> = fs
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|name| {
+            let bytes = fs.open(&name).unwrap().snapshot();
+            (format!("{prefix}{name}"), bytes)
+        })
+        .collect();
+    for dir in fs.list_subdirs().unwrap() {
+        let child = fs.subdir(&dir).unwrap();
+        image.extend(full_image(&child, &format!("{prefix}{dir}/")));
+    }
+    image.sort();
+    image
+}
+
+/// Produces to the default stream AND many named streams, COLD-REOPENS the engine (driving the
+/// engine-integrated #822 parallel recovery over > the worker cap of named subtrees), and returns a
+/// fingerprint of BOTH the full on-disk image and the recovered per-stream payloads. Stream `i` gets
+/// `i+1` records tagged with `(i, r)`, so a mis-assembled recovery would surface in the read-back.
+fn run_multi_stream_workload() -> Vec<(String, Vec<u8>)> {
+    let fs = InMemoryFs::new();
+    let names: Vec<String> = (0..NAMED_STREAM_FANOUT)
+        .map(|i| format!("s{i:03}"))
+        .collect();
+    {
+        let mut engine = Engine::open(fs.clone(), ManualClock::new(), config()).unwrap();
+        // Default-stream lifecycle so the root log + cursor.ckpt are in the image too.
+        engine.produce(&record(b"default")).unwrap();
+        engine.maybe_checkpoint().unwrap();
+        // Each named stream i gets i+1 records; `produce_in_stream` commits (fdatasyncs) the named
+        // log in-band, so no explicit sync is needed before the reopen.
+        for (i, name) in names.iter().enumerate() {
+            for r in 0..=i {
+                engine
+                    .produce_in_stream(name, &record(format!("s{i:03}-r{r}").as_bytes()))
+                    .unwrap();
+            }
+        }
+    }
+    // COLD REOPEN => engine-integrated #822 parallel recovery over the > worker-cap named subtrees.
+    let mut engine = Engine::open(fs.clone(), ManualClock::new(), config()).unwrap();
+    let mut fingerprint = full_image(&fs, "");
+    // Fold the RECOVERED per-stream view in. Draining via `poll_in_stream` leases each offset once and
+    // advances only the IN-MEMORY cursor (no checkpoint here), so the disk image snapshotted above is
+    // untouched; the record count per stream stays under `max_in_flight`, so one drain reaches head.
+    for name in &names {
+        let mut payloads = Vec::new();
+        while let Poll::Message(d) = engine.poll_in_stream(name, "g", 0).unwrap() {
+            payloads.extend_from_slice(&d.record.payload);
+            payloads.push(b'\n');
+        }
+        fingerprint.push((format!("recovered:{name}"), payloads));
+    }
+    fingerprint.sort();
+    fingerprint
+}
+
+#[test]
+fn the_multi_stream_engine_recovers_byte_identically_across_runs() {
+    let first = run_multi_stream_workload();
+    let second = run_multi_stream_workload();
+    // Non-vacuity: more than one named-stream subtree materialized under `streams/`, so the reopen's
+    // parallel open really ran over > 1 subtree (not the zero-named-subtree default path).
+    let named_subtrees = first
+        .iter()
+        .filter_map(|(path, _)| path.strip_prefix("streams/"))
+        .filter_map(|rest| rest.split_once('/').map(|(head, _)| head))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        named_subtrees.len() > 1,
+        "the workload should materialize > 1 named-stream subtree, got {named_subtrees:?}"
+    );
+    assert_eq!(
+        first, second,
+        "the engine multi-stream write+parallel-recovery path is not deterministic: ambient time/\
+         randomness in the write, or worker-order non-determinism in the parallel reassembly, \
+         leaked into the recovered image"
+    );
+}
