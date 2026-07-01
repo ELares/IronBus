@@ -40,7 +40,14 @@ use zeroize::Zeroize;
 /// the single explicit [`Secret::expose`] accessor (no `Deref`, no public field), and the bytes are
 /// zeroed on drop with a non-elidable write so the optimizer cannot remove the clear. A struct that
 /// holds a `Secret` and derives `Debug` therefore renders the field as the placeholder for free.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Equality is DELIBERATELY not derived (#897): a derived `PartialEq`/`Eq` synthesizes a
+/// data-dependent, early-exit `==` over the secret bytes — precisely the timing-oracle primitive the
+/// bearer path avoids via `subtle::ConstantTimeEq`. The type has no equality consumers, and its
+/// safety narrative (redaction by construction) implies callers need not think about how a `Secret`
+/// compares; leaving the derive off keeps that footgun unreachable. If secret equality is ever needed,
+/// hand-implement it over `subtle::ConstantTimeEq` and document that the comparison is constant-time.
+#[derive(Clone)]
 pub struct Secret(Vec<u8>);
 
 impl Secret {
