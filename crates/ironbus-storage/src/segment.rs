@@ -3116,4 +3116,226 @@ mod tests {
             }
         ));
     }
+
+    // ---- #835: the v2 sparse-survivor recovery parser `scan_compacted` hard-fail branches ----
+    //
+    // `scan_compacted` has its OWN copies of the durability hard-fail checks the v1 `scan`/
+    // `scan_recovery` tests guard: an out-of-span or out-of-order survivor sequence
+    // (`RecoveredSequenceMismatch`) and a footer that names a different segment id
+    // (`FooterSegmentMismatch`). It runs during `recover_with_compaction` over untrusted on-disk
+    // bytes a brownout or attacker may have corrupted; a regression that mis-ordered the span guard
+    // (e.g. compared against `base_offset` instead of `covered_end_seq`, or dropped the
+    // strictly-increasing check) would let recovery SILENTLY serve an out-of-span/out-of-order
+    // survivor and reconstruct a wrong original offset (`seq + delta`), violating I5 offset
+    // monotonicity. These build a REAL committed compacted segment with `create_compacted` +
+    // `append_at` + `seal_compacted`, then corrupt exactly one fact and assert the matching hard
+    // error (and that NO records are served).
+
+    /// Builds a committed `version` = 2 COMPACTED segment on a fresh in-memory file from the given
+    /// SPARSE survivor sequences (which must be strictly increasing and within
+    /// `[base_seq, covered_end_seq)`). Returns the file, each survivor's frame START byte position
+    /// (in survivor order), and the footer start byte, so a test can corrupt one frame or the
+    /// footer in place. Segment id is `7`; the offset-minus-seq delta is `base_offset - base_seq`.
+    fn build_compacted(
+        seqs: &[u64],
+        base_seq: u64,
+        base_offset: u64,
+        covered_end_seq: u64,
+    ) -> (Arc<InMemoryFile>, Vec<u64>, u64) {
+        let h = SegmentHeader {
+            segment_id: 7,
+            base_seq: Seq::new(base_seq),
+            base_offset: Offset::new(base_offset),
+            created_unix_ms: 0,
+            flags: ironbus_core::format::SEGMENT_FLAG_COMPACTED,
+        };
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create_compacted(Arc::clone(&file), h).unwrap();
+        let mut positions = Vec::new();
+        for (i, &s) in seqs.iter().enumerate() {
+            // The frame START byte is the writer's byte position BEFORE the append (write_pos
+            // advances synchronously even though the frame group-commits at seal).
+            positions.push(w.write_pos());
+            let off = Offset::new(base_offset + (s - base_seq));
+            w.append_at(off, &rec(s, &[u8::try_from(i).unwrap(); 6]))
+                .unwrap();
+        }
+        let footer_start = w.write_pos();
+        let footer = SegmentFooter {
+            segment_id: 7,
+            last_seq: Seq::new(*seqs.last().unwrap()),
+            record_count: u32::try_from(seqs.len()).unwrap(),
+        };
+        let meta = CompactionMeta {
+            covered_base_offset: base_offset,
+            covered_end_offset: base_offset + (covered_end_seq - base_seq),
+            covered_base_seq: base_seq,
+            covered_end_seq,
+            highest_covered_source_id: 7,
+        };
+        w.seal_compacted(&footer, &meta).unwrap();
+        (file, positions, footer_start)
+    }
+
+    /// Rewrites the `seq` field of the frame at `frame_start` to `new_seq` and repairs the frame's
+    /// HEADER CRC, so the corrupted frame still decodes cleanly (CRC-valid) and the ONLY thing wrong
+    /// is the sequence value — exactly the recycled/mixed-file corruption the span + strictly-
+    /// increasing guard must catch, never a CRC miss that would end the scan harmlessly.
+    fn rewrite_frame_seq(bytes: &mut [u8], frame_start: u64, new_seq: u64) {
+        use ironbus_core::format::header_offsets as ho;
+        let fs = usize::try_from(frame_start).unwrap();
+        bytes[fs + ho::SEQ..fs + ho::SEQ + 8].copy_from_slice(&new_seq.to_le_bytes());
+        // The header CRC covers [0, 32) of the frame; recompute it so the tampered seq is accepted
+        // by `codec::decode` and the failure is forced through the sequence guard, not the CRC.
+        let crc = crc32c::crc32c(&bytes[fs..fs + RECORD_HEADER_LEN - 4]);
+        bytes[fs + ho::HEADER_CRC..fs + ho::HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn overwrite(file: &Arc<InMemoryFile>, bytes: &[u8]) {
+        file.set_len(0).unwrap();
+        file.write_all_at(bytes, 0).unwrap();
+    }
+
+    #[test]
+    fn scan_compacted_reads_valid_sparse_survivors() {
+        // The positive baseline: a correctly built compacted segment scans to Some, proving the
+        // corruption tests below fail because of the CORRUPTION, not a malformed build. The sparse
+        // survivor sequences 100, 102, 105 reconstruct their original offsets via the constant
+        // offset-minus-seq delta (base_offset 1000 - base_seq 100 = 900).
+        let (file, _pos, footer_start) = build_compacted(&[100, 102, 105], 100, 1000, 106);
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan_compacted()
+            .unwrap()
+            .expect("a valid compacted segment scans to Some");
+        assert_eq!(scan.records.len(), 3);
+        assert_eq!(
+            scan.records
+                .iter()
+                .map(|r| r.offset.get())
+                .collect::<Vec<_>>(),
+            vec![1000, 1002, 1005],
+            "survivor offsets reconstructed from the constant delta"
+        );
+        assert_eq!(
+            scan.records.iter().map(|r| r.seq.get()).collect::<Vec<_>>(),
+            vec![100, 102, 105],
+            "survivor sequences land on disk verbatim"
+        );
+        assert_eq!(scan.valid_end, footer_start);
+        assert_eq!(scan.footer.record_count, 3);
+        assert_eq!(scan.footer.segment_id, 7);
+    }
+
+    #[test]
+    fn scan_compacted_rejects_out_of_order_survivor_seq() {
+        // Rewrite the third survivor's seq (105) to 101, which is <= the previous survivor's seq
+        // (102): a CRC-valid frame in the wrong order. The strictly-increasing guard must reject it
+        // as a hard error rather than serve an out-of-order survivor (which would reconstruct a
+        // wrong original offset and break I5). Drop the `prev_seq.is_some_and(|p| seq <= p)` term
+        // and this test goes green while the bug ships — the mutation check.
+        let (file, pos, _fs) = build_compacted(&[100, 102, 105], 100, 1000, 106);
+        let mut bytes = file.snapshot();
+        rewrite_frame_seq(&mut bytes, pos[2], 101);
+        overwrite(&file, &bytes);
+        let err = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan_compacted()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::RecoveredSequenceMismatch {
+                    index: 2,
+                    expected: 103,
+                    found: 101,
+                }
+            ),
+            "out-of-order survivor seq must be a hard error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn scan_compacted_rejects_survivor_seq_outside_covered_span() {
+        // Two span-guard cases, each on its own freshly built segment.
+        //
+        // (a) seq >= covered_end_seq: rewrite the third survivor's seq (105) to 106, which equals
+        //     covered_end_seq. It is strictly greater than the previous survivor (102), so ONLY the
+        //     `seq >= meta.covered_end_seq` span term catches it — the exact guard a regression that
+        //     compared against `base_offset` instead of `covered_end_seq` would drop.
+        {
+            let (file, pos, _fs) = build_compacted(&[100, 102, 105], 100, 1000, 106);
+            let mut bytes = file.snapshot();
+            rewrite_frame_seq(&mut bytes, pos[2], 106);
+            overwrite(&file, &bytes);
+            let err = SegmentReader::open(Arc::clone(&file))
+                .unwrap()
+                .scan_compacted()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StorageError::RecoveredSequenceMismatch {
+                        index: 2,
+                        expected: 103,
+                        found: 106,
+                    }
+                ),
+                "a survivor seq at/after covered_end_seq must be a hard error, got {err:?}"
+            );
+        }
+        // (b) seq < base_seq: rewrite the FIRST survivor's seq (100) to 99, below the header's
+        //     base_seq. `prev_seq` is None here, so ONLY the `seq < base_seq` span term catches it.
+        {
+            let (file, pos, _fs) = build_compacted(&[100, 102, 105], 100, 1000, 106);
+            let mut bytes = file.snapshot();
+            rewrite_frame_seq(&mut bytes, pos[0], 99);
+            overwrite(&file, &bytes);
+            let err = SegmentReader::open(Arc::clone(&file))
+                .unwrap()
+                .scan_compacted()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StorageError::RecoveredSequenceMismatch {
+                        index: 0,
+                        expected: 100,
+                        found: 99,
+                    }
+                ),
+                "a survivor seq below base_seq must be a hard error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_compacted_rejects_footer_naming_a_different_segment() {
+        // Re-encode the trailing v2 footer (via encode_v2, so the footer CRC stays valid) naming a
+        // DIFFERENT segment id (999) than the header's (7). A body-consistent footer that binds to
+        // the wrong segment is a mixed/recycled file: recovery must refuse it, never serve survivors
+        // whose provenance it cannot trust. The block after the footer is left untouched so the
+        // scan reaches the footer<->header binding check.
+        let (file, _pos, footer_start) = build_compacted(&[100, 102, 105], 100, 1000, 106);
+        let lying = SegmentFooter {
+            segment_id: 999,
+            last_seq: Seq::new(105),
+            record_count: 3,
+        };
+        file.write_all_at(&lying.encode_v2(), footer_start).unwrap();
+        let err = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan_compacted()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::FooterSegmentMismatch {
+                    header: 7,
+                    footer: 999,
+                }
+            ),
+            "a compacted footer naming a different segment must be rejected, got {err:?}"
+        );
+    }
 }
