@@ -58,6 +58,7 @@
 //! same materialized records the through-actor path returns (the differential test in `log.rs`
 //! asserts byte-for-byte equality).
 
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -331,6 +332,27 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         Ok(opened)
     }
 
+    /// [`Self::reader_for`], but classifying the compaction-retire race (#803): the off-actor plane
+    /// re-opens sealed segments BY NAME and holds no handle across the snapshot-load/open gap, so a read
+    /// racing `compact_run`/`reap` can reach `fs.open` AFTER the actor has unlinked the source file
+    /// (`compaction.rs` retires sources BEFORE `republish_read_plane`, and an already-loaded snapshot
+    /// `Arc` still lists them). That surfaces as `Io(NotFound)` for data that still exists in the
+    /// republished compacted segment. Return `Ok(None)` for exactly that case so the caller degrades to a
+    /// single through-actor fallback (the authoritative current slot set) rather than propagating a
+    /// spurious hard error that would drop the serve link. Any OTHER error — a real IO fault or a decode
+    /// failure — still propagates.
+    fn reader_or_retired(
+        &self,
+        i: usize,
+        slot: &SealedSegment,
+    ) -> Result<Option<Arc<SegmentReader<F::File>>>, StorageError> {
+        match self.reader_for(i, slot) {
+            Ok(reader) => Ok(Some(reader)),
+            Err(StorageError::Io(ref e)) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The index in `segments` of the sealed segment whose range holds `offset` (the slot with the
     /// largest base not exceeding `offset`). Callers guarantee `offset >= oldest`.
     fn segment_index_for(&self, offset: u64) -> usize {
@@ -416,7 +438,14 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
             let below_flushed =
                 usize::try_from(flushed.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
             let want = remaining.saturating_add(gap).min(below_flushed);
-            let reader = self.reader_for(slot_index, slot)?;
+            let Some(reader) = self.reader_or_retired(slot_index, slot)? else {
+                // #803: this segment was concurrently retired by compaction (unlinked before the
+                // read plane was republished). The data still exists in the republished compacted
+                // segment, so hand the remainder — from this segment's covered base, clamped to
+                // `start` — back to the actor rather than surfacing a spurious NotFound.
+                fallback_from = Some(start.max(slot.base_offset));
+                break;
+            };
             let records = reader.scan_from(byte_pos, Offset::new(anchor_offset), read_end, want)?;
             for record in records {
                 // Skip the bounded run the anchor preceded `seg_start` by.
@@ -527,7 +556,12 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         let below_visible =
             usize::try_from(seg_visible_end.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
         let want = max_records.saturating_add(gap).min(below_visible);
-        let reader = self.reader_for(slot_index, slot)?;
+        let Some(reader) = self.reader_or_retired(slot_index, slot)? else {
+            // #803: this segment was concurrently retired by compaction (unlinked before the read
+            // plane was republished). The data still exists in the republished compacted segment, so
+            // resume through the actor from this segment's start rather than surfacing NotFound.
+            return Ok(empty(Some(seg_start)));
+        };
         let run =
             reader.raw_byte_range(byte_pos, Offset::new(anchor_offset), read_end, want, None)?;
         // The anchor may sit BEFORE `seg_start` (sparse anchors land one-per-stride): trim the leading
@@ -929,6 +963,86 @@ mod tests {
             control.open_count() - after_republish,
             1,
             "a republished snapshot re-opens segment 0 once (the old generation's fd was dropped, not reused)"
+        );
+    }
+
+    /// The lowest-id sealed segment file name in `fs` (the oldest, covering offset 0).
+    fn oldest_segment_file(fs: &InMemoryFs) -> String {
+        let mut names: Vec<String> = fs
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.starts_with("seg-"))
+            .collect();
+        names.sort();
+        names.into_iter().next().expect("a sealed segment file")
+    }
+
+    /// #803: a read racing the compaction retire must NOT surface a spurious `NotFound`. The off-actor
+    /// plane re-opens sealed segments BY NAME and holds no handle across the load/open gap, so a read
+    /// through an already-loaded snapshot can reach `fs.open` AFTER the actor unlinked that source file
+    /// (compaction retires the sources BEFORE it republishes the plane). We reproduce exactly that window
+    /// by unlinking the sealed segment covering offset 0 out from under the plane WITHOUT warming its
+    /// reader cache, then asserting the read degrades to a through-actor fallback rather than erroring.
+    /// Without the fix (a bare `?` on the open) this read returns `Err(Io(NotFound))` and the serve link
+    /// is dropped.
+    #[test]
+    fn a_read_racing_the_compaction_retire_falls_back_instead_of_notfound() {
+        fn filled_log() -> Log<InMemoryFs, ManualClock> {
+            let mut log = small_log();
+            for i in 0..200u32 {
+                log.append(&rec(&i.to_le_bytes())).unwrap();
+                if i % 7 == 0 {
+                    log.sync().unwrap();
+                }
+            }
+            log.sync().unwrap();
+            log
+        }
+
+        // Sanity (a SEPARATE log, so warming its cache cannot affect the race log below): offset 0 IS
+        // served off-actor from a sealed segment file — the read path genuinely reaches `fs.open`. Were
+        // it not, the race assertions would pass trivially even without the fix.
+        let control = filled_log();
+        let before = control
+            .read_plane()
+            .unwrap()
+            .read_range(Offset::new(0), 4, None)
+            .unwrap();
+        assert_eq!(before.records[0].offset.get(), 0);
+        assert_eq!(before.fallback_from, None, "offset 0 is served off-actor");
+
+        let log = filled_log();
+        // `read_plane()` hands back a CLONE of the SAME cached plane (shared snapshot + reader cache), so
+        // we must not warm this plane's slot-0 reader before the retire — a cached fd would keep the
+        // inode alive and mask the race. The plane's slot-0 reader is therefore cold here.
+        let plane = log.read_plane().unwrap();
+
+        // Retire the oldest sealed segment file out from under `plane` — the InMemoryFs clone shares the
+        // same store, so this removal is exactly what `compact_run` does before `republish_read_plane`.
+        // `plane`'s snapshot still lists the (now deleted) segment and its reader cache is cold.
+        let fs = log.filesystem().clone();
+        let victim = oldest_segment_file(&fs);
+        fs.remove(&victim).unwrap();
+
+        // read_range: the retired slot must yield a graceful fallback at its base (offset 0), not an error.
+        let read = plane
+            .read_range(Offset::new(0), 4, None)
+            .expect("a read racing the retire must not surface NotFound");
+        assert_eq!(
+            read.fallback_from,
+            Some(0),
+            "the retired sealed segment hands its range back to the actor"
+        );
+
+        // read_range_raw: same contract — resume through the actor, never a hard NotFound.
+        let raw = plane
+            .read_range_raw(Offset::new(0), 4, None)
+            .expect("a raw read racing the retire must not surface NotFound");
+        assert_eq!(
+            raw.fallback_from,
+            Some(0),
+            "the retired sealed segment hands its raw range back to the actor"
         );
     }
 
