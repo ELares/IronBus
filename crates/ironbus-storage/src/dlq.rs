@@ -450,6 +450,18 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
         }
     }
 
+    /// Drops `group`'s entire dead-lettered offset set (key and all) when the group itself is torn
+    /// down (#905). Unlike [`DlqSink::prune_below`], which trims a still-live group's set against its
+    /// advancing cursor, this forgets a group that has been EVICTED: its cursor is gone, so nothing
+    /// in-process can re-poison under that name, and leaving the (now committed-past, often empty)
+    /// entry behind is a per-group-lifecycle memory leak in the map. Safe because the durable DLQ is
+    /// the source of truth: a fresh group of the same name that later dead-letters rebuilds its exact
+    /// set from [`DlqSink::rebuild_dead_lettered_set`] on reopen, and in-process re-adds on append.
+    /// A no-op when the group has no tracked dead-letters.
+    pub fn forget_group(&mut self, group: &str) {
+        self.dead_lettered.remove(group);
+    }
+
     /// Appends one poison record to the sink and makes it durable (fsync) BEFORE returning, then
     /// adds the source offset to the in-memory dead-lettered set. This is the durable half of the
     /// crash-atomic move: the caller appends-and-fsyncs HERE first, and only then commits the source
@@ -814,5 +826,39 @@ mod tests {
         // Pruning past everything drops the group entry entirely.
         sink.prune_below("a", 6);
         assert_eq!(sink.highest_for_group("a"), None);
+    }
+
+    #[test]
+    fn forget_group_drops_the_whole_entry_regardless_of_the_watermark() {
+        // #905: an EVICTED group's cursor is gone, so nothing re-poisons under it in-process; the
+        // dedup entry (even a non-empty one prune_below cannot reach) must be freed to avoid a
+        // per-group-lifecycle leak in the map, while OTHER groups are untouched.
+        let fs = InMemoryFs::new();
+        let mut sink = DlqSink::open(&fs, ManualClock::new(), config()).unwrap();
+        sink.append_poison("gone", &source_record(5, b"", b"", b"p"), 6)
+            .unwrap();
+        sink.append_poison("stays", &source_record(3, b"", b"", b"p"), 6)
+            .unwrap();
+        assert_eq!(sink.highest_for_group("gone"), Some(5));
+
+        // forget_group drops the entire "gone" entry (unlike prune_below, no watermark is consulted),
+        // leaving the durable record count and every other group intact.
+        sink.forget_group("gone");
+        assert_eq!(sink.highest_for_group("gone"), None);
+        assert!(!sink.already_dead_lettered("gone", 5));
+        assert_eq!(
+            sink.highest_for_group("stays"),
+            Some(3),
+            "other groups untouched"
+        );
+        assert_eq!(
+            sink.records(),
+            2,
+            "forget_group is in-memory only; records survive"
+        );
+
+        // Forgetting an untracked group is a harmless no-op.
+        sink.forget_group("never");
+        assert_eq!(sink.highest_for_group("never"), None);
     }
 }

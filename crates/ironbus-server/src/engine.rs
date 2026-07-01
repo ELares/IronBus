@@ -6283,6 +6283,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if ghost == GhostPolicy::Release {
             self.group_last_checkpointed.remove(group);
         }
+        // Free the evicted group's DLQ dedup entry (#905). Only when the sink is ALREADY open — never
+        // force it open here, so a broker that never dead-lettered still never creates `dlq/`. The
+        // evicted group's cursor is gone, so nothing re-poisons under it in-process; a reopen rebuilds
+        // any still-durable entries from the DLQ records regardless. Without this, the per-group key
+        // (an empty-after-pruning `BTreeSet` plus the group-name `String`) leaks once per evicted
+        // group that ever dead-lettered, reclaimed only on reopen.
+        if let Some(sink) = self.dlq.as_mut() {
+            sink.forget_group(group);
+        }
         Ok(())
     }
 
@@ -8242,6 +8251,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn dlq_records(&self) -> u64 {
         self.dlq.as_ref().map_or(0, DlqSink::records)
+    }
+
+    /// The highest source offset the DLQ dedup set CURRENTLY tracks for `group`, or `None` if the
+    /// group is not tracked (or the sink is not open). Test-only inspection of the per-group dedup
+    /// map used to prove the evicted-group entry is dropped (#905).
+    #[cfg(test)]
+    fn dlq_dedup_highest_for_group(&self, group: &str) -> Option<u64> {
+        self.dlq.as_ref().and_then(|s| s.highest_for_group(group))
     }
 
     /// The number of messages currently in flight (leased, not yet acked).
@@ -13855,6 +13872,71 @@ mod tests {
         assert!(
             !e.group_last_checkpointed.contains_key("caught"),
             "explicit unsub releases the ghost"
+        );
+    }
+
+    #[test]
+    fn evicting_a_group_drops_its_dlq_dedup_entry() {
+        // #905: evicting a group that has dead-lettered must FREE its per-group DLQ dedup entry, not
+        // leak the (group-name String + BTreeSet) once per evicted group lifecycle. We construct a
+        // RESIDUAL entry that prune_below cannot reach — a dead-letter of a HIGHER offset committed
+        // while a LOWER one is still leased, then the lower one acked through the NORMAL (non-pruning)
+        // ack path — so the entry survives to eviction time. Pre-fix it leaks; post-fix evict_group
+        // forgets it.
+        let mut e = open(config_with_idle_evict_ms(10));
+        produce(&mut e, b"a"); // offset 0
+        produce(&mut e, b"b"); // offset 1
+
+        // Lease offset 0 in "g" (stays UNCOMMITTED, so the committed watermark holds at 0).
+        let d0 = message(e.poll_in("g", 0).unwrap());
+
+        // Dead-letter the HIGHER offset 1 while offset 0 is still leased: committed stays 0, so
+        // prune_below("g", 0) keeps offset 1's exact-membership entry.
+        let rec1 = e
+            .log
+            .read_from(Offset::new(1), 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        e.dead_letter_in("g", Offset::new(1), 2, rec1).unwrap();
+        assert_eq!(
+            e.dlq_dedup_highest_for_group("g"),
+            Some(1),
+            "the dead-lettered higher offset is tracked while the lower one is still leased"
+        );
+
+        // Ack offset 0 through the NORMAL ack path: the cursor bridges past offset 1 (committed -> 2),
+        // but the normal ack path does NOT prune the dedup set, so {1} is now a residual entry above
+        // no live use — exactly the kind that would leak on eviction.
+        assert_eq!(e.ack_in("g", &d0.token), AckResult::Acked);
+        assert_eq!(
+            e.committed_offset_in("g"),
+            e.flushed_offset(),
+            "g is caught up"
+        );
+        assert_eq!(
+            e.dlq_dedup_highest_for_group("g"),
+            Some(1),
+            "the residual entry survives the normal ack (prune runs only on the dead-letter path)"
+        );
+
+        // "g" is caught up and lease-free: the explicit-Unsub reclaim evicts it now.
+        assert!(
+            e.evict_group_if_idle("g"),
+            "caught-up, lease-free -> evicted"
+        );
+        assert!(!e.has_group("g"));
+        assert_eq!(
+            e.dlq_dedup_highest_for_group("g"),
+            None,
+            "#905: evicting the group drops its DLQ dedup entry (no per-lifecycle leak)"
+        );
+        // The durable DLQ record is untouched — only the in-memory dedup key was freed.
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "the durable dead-letter record survives"
         );
     }
 
