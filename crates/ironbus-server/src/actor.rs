@@ -1513,6 +1513,11 @@ where
     // Produces appended this pass but not yet durable: each parked reply is released only after the
     // single covering `commit_batch`, so a `PubAck` never precedes its fsync (I2).
     let mut pending: Vec<PendingProduce> = Vec::new();
+    // The per-pass command batch, hoisted and reused across drains exactly like `pending` above (#828):
+    // each pass `clear()`s it and `drain(..)`s it empty, so its backing capacity is retained instead of
+    // freed and regrown-from-zero every batch. This actor is the single serialization point for all
+    // produce/control work, so removing the per-batch alloc + ~log2(N) regrowth reallocs is pure win.
+    let mut commands: Vec<Command<F, C>> = Vec::new();
     loop {
         // Block for the next command; a disconnect (the last handle dropped) ends the loop after a
         // final drain so no acked-but-not-durable record is lost. While blocked here the actor is IDLE
@@ -1528,7 +1533,11 @@ where
         // fsync HANGS, this stamp stays put while the clock advances and the health server's
         // `actor_watchdog_overran` trips once the bound is exceeded (#862).
         watchdog.mark_busy(clock.now_monotonic_nanos());
-        let mut commands = vec![first];
+        // Reuse the retained buffer: empty it (a `drain(..)` from the previous pass already left it
+        // logically empty, but a `Shutdown` early-return skips that, so `clear()` is the invariant), then
+        // seed it with the command that unblocked the `recv()`.
+        commands.clear();
+        commands.push(first);
         // Drain everything immediately available so a concurrent burst of produces forms one group.
         while let Ok(cmd) = rx.try_recv() {
             commands.push(cmd);
@@ -1538,11 +1547,12 @@ where
         if gather_micros > 0 {
             gather_commands(&mut commands, rx, gather_micros);
         }
-        // An explicit iterator (not a `for`) so the `Shutdown` arm can hand the STILL-UNPROCESSED tail
-        // of this batch to the drain, replying a closing outcome to every produce queued after the
-        // `Shutdown` instead of abandoning it reply-less (#802).
-        let mut commands = commands.into_iter();
-        while let Some(cmd) = commands.next() {
+        // An explicit `Drain` iterator (not a `for`) so the `Shutdown` arm can hand the STILL-UNPROCESSED
+        // tail of this batch to the drain, replying a closing outcome to every produce queued after the
+        // `Shutdown` instead of abandoning it reply-less (#802). Draining (rather than `into_iter`)
+        // consumes the elements by value while leaving the buffer's capacity for the next pass (#828).
+        let mut command_iter = commands.drain(..);
+        while let Some(cmd) = command_iter.next() {
             match cmd {
                 // An at-least-once (Level-1, or Level-2 falling back to Level-1) produce: do the
                 // admission + append and PARK its reply behind the covering fsync (I2). The reply is
@@ -1604,7 +1614,7 @@ where
                     // a produce submission RETAINS a co-located `tx`, its `wait()`/`recv()` never sees a
                     // disconnect and wedges forever. Reply a closing outcome to every such produce (the
                     // unprocessed tail plus the channel remainder) so no client is left waiting.
-                    drain_shutdown_replies(commands, rx);
+                    drain_shutdown_replies(command_iter, rx);
                     return engine;
                 }
             }
