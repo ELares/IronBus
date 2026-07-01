@@ -395,4 +395,89 @@ mod tests {
         assert_eq!(ProduceCapGate::new(4_096).cap(), 4_096);
         assert_eq!(ProduceCapGate::new(0).cap(), 0);
     }
+
+    #[test]
+    fn concurrent_record_and_reconcile_is_exact_and_never_cross_folds() {
+        // The load-bearing concurrency claim (docstrings lines 93 / 109): the monotonic +
+        // delta-reconciled counters are "exact under any number of concurrent connection threads with
+        // no lock and no double-count." All the other tests drive `record_*` / `take_*` sequentially
+        // from ONE thread, so a regression that makes the `reconciled` store misordered/unconditional,
+        // lets the high-water mark move backward, or FOLDS ONE COUNTER'S DELTA INTO THE OTHER would
+        // slip past them. This stress test runs the real concurrent shape: K connection threads doing
+        // relaxed `fetch_add` on BOTH counters while a single "actor" reconciler loops the
+        // load-total / subtract-HWM / store-total dance, and checks the deltas reconcile EXACTLY.
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::Arc;
+
+        const K: u64 = 8; // connection threads
+        const R: u64 = 100_000; // record_fast_reject + record_l0_shed calls per thread
+
+        let gate = Arc::new(ProduceCapGate::new(1_000));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // The single actor-side reconciler: loop folding whatever deltas have accrued so far, summing
+        // each counter's deltas SEPARATELY. If `take_unreconciled_fast_rejects` ever consumed the L0
+        // counter (or vice-versa), the two running sums would diverge from K*R.
+        let reconciler = {
+            let gate = Arc::clone(&gate);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut fast_sum: u64 = 0;
+                let mut l0_sum: u64 = 0;
+                loop {
+                    // `take_*` returns u64, so a delta is inherently >= 0; the discriminating property
+                    // is that folding one counter never advances the OTHER's high-water mark, which the
+                    // per-counter running sums (asserted == K*R below) verify.
+                    fast_sum += gate.take_unreconciled_fast_rejects();
+                    l0_sum += gate.take_unreconciled_l0_sheds();
+                    if stop.load(O::Relaxed) {
+                        // One last drain AFTER stop is observed, to fold anything recorded in the gap
+                        // between the final in-loop take and the producers finishing.
+                        fast_sum += gate.take_unreconciled_fast_rejects();
+                        l0_sum += gate.take_unreconciled_l0_sheds();
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                (fast_sum, l0_sum)
+            })
+        };
+
+        let producers: Vec<_> = (0..K)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    for _ in 0..R {
+                        gate.record_fast_reject();
+                        gate.record_l0_shed();
+                    }
+                })
+            })
+            .collect();
+
+        for p in producers {
+            p.join().expect("producer thread panicked");
+        }
+        // All records are now in the monotonic totals; tell the reconciler to do its final drain.
+        stop.store(true, O::Relaxed);
+        let (fast_sum, l0_sum) = reconciler.join().expect("reconciler thread panicked");
+
+        let expected = K * R;
+        // Every recorded fast-reject was folded exactly once across the concurrent reconciles.
+        assert_eq!(
+            fast_sum, expected,
+            "summed fast-reject deltas must equal every record_fast_reject with no under/double-count"
+        );
+        // Every recorded L0 shed was folded exactly once, and NONE of them leaked into `fast_sum`.
+        assert_eq!(
+            l0_sum, expected,
+            "summed L0 deltas must equal every record_l0_shed (no cross-fold, no under/double-count)"
+        );
+        // The monotonic totals themselves are exact under all the concurrent `fetch_add`s.
+        assert_eq!(gate.fast_reject_total(), expected);
+        assert_eq!(gate.l0_shed_total(), expected);
+        // A post-drain reconcile has nothing left: the high-water marks caught up to the totals.
+        assert_eq!(gate.take_unreconciled_fast_rejects(), 0);
+        assert_eq!(gate.take_unreconciled_l0_sheds(), 0);
+    }
 }
