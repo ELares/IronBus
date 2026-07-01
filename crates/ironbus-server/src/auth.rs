@@ -219,7 +219,14 @@ pub struct Identity {
 
 /// The additive credential set for an identity, one variant per mechanism (#631). Each carries a
 /// LIST so rotation is set-membership (add then remove), never an expiry timer.
-#[derive(Clone, Debug)]
+// NOTE: `Debug` is HAND-WRITTEN (below), NOT derived (#888): the `Bearer` variant holds raw SHA-256
+// `digests` as bare `[u8; 32]` (no `Secret` wrapper), so a derived `Debug` would print the stored
+// verifier-at-rest verbatim — and any embedding type that derives `Debug` (`Identity`, `AuthConfig`)
+// would transitively leak it. A bearer digest is the at-rest verifier and is offline
+// dictionary-attackable for a low-entropy token, so it is sensitive. The manual impl redacts the
+// digests (count only), making redaction by CONSTRUCTION like the `Password` path (whose `phc_hashes`
+// are `Secret`) — so `Identity`/`AuthConfig` inherit the redaction for free through their derived impls.
+#[derive(Clone)]
 pub enum CredentialSet {
     /// Accepted bearer-token SHA-256 hex digests (lowercase). The broker stores ONLY the digest; a
     /// presented token authenticates if its SHA-256 matches ANY digest, constant-time.
@@ -241,6 +248,38 @@ pub enum CredentialSet {
         /// The accepted SAN identity strings (URI-then-DNS precedence, CN excluded; see [`mtls_san_identity`]).
         san_identities: Vec<String>,
     },
+}
+
+impl fmt::Debug for CredentialSet {
+    /// REDACTS the bearer digests (#888): a SHA-256 digest of a bearer token is the stored
+    /// verifier-at-rest and is offline dictionary-attackable for a low-entropy token, so it is
+    /// treated as sensitive. The `Bearer` variant prints only the digest COUNT, never a digest
+    /// byte, so neither a direct `{:?}` nor a transitive `Debug` through `Identity`/`AuthConfig`
+    /// can leak the verifier. The `Password` variant's `phc_hashes` are already `Secret` (redacted
+    /// for free); the `Mtls` SAN identities are safe handles, not secrets.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CredentialSet::Bearer { digests } => f
+                .debug_struct("Bearer")
+                .field(
+                    "digests",
+                    &format_args!("<redacted; {} digests>", digests.len()),
+                )
+                .finish(),
+            CredentialSet::Password {
+                username,
+                phc_hashes,
+            } => f
+                .debug_struct("Password")
+                .field("username", username)
+                .field("phc_hashes", phc_hashes)
+                .finish(),
+            CredentialSet::Mtls { san_identities } => f
+                .debug_struct("Mtls")
+                .field("san_identities", san_identities)
+                .finish(),
+        }
+    }
 }
 
 /// The broker's complete auth configuration: the identity table plus whether mTLS is required (#631).
@@ -584,6 +623,51 @@ mod tests {
             key: Secret::new(b"another-sentinel-ABC".to_vec()),
         };
         assert!(!format!("{h:?}").contains("sentinel"));
+    }
+
+    #[test]
+    fn bearer_digests_redact_in_debug_of_credentialset_identity_and_authconfig() {
+        // #888: a bearer digest is the stored verifier-at-rest and is offline dictionary-attackable
+        // for a low-entropy token, so it must be redaction-by-construction like the password path.
+        // Build an identity with a KNOWN digest and assert the digest bytes never surface via `{:?}`
+        // of the `CredentialSet`, the embedding `Identity`, or the whole `AuthConfig`.
+        let token = b"a-32-byte-high-entropy-token!!!!";
+        let digest = parse_token_digest_hex(&sha256_hex(token)).unwrap();
+        let digest_hex = sha256_hex(token);
+        // A representative fragment of the raw digest bytes' Debug (e.g. `[123, 45, ...]`), so a
+        // derived `Debug` (which would print the byte array) is caught even if the hex is not used.
+        let first_byte_dbg = format!("{}", digest[0]);
+
+        let cred = CredentialSet::Bearer {
+            digests: vec![digest],
+        };
+        let identity = Identity {
+            name: "producer".to_string(),
+            scopes: ScopeSet::from_scopes(&[Scope::Publish]),
+            credential: cred,
+        };
+        let mut cfg = AuthConfig::new();
+        cfg.add_identity(identity.clone());
+
+        for (label, rendered) in [
+            ("CredentialSet", format!("{:?}", identity.credential)),
+            ("Identity", format!("{identity:?}")),
+            ("AuthConfig", format!("{cfg:?}")),
+        ] {
+            assert!(
+                !rendered.contains(&digest_hex),
+                "{label} debug leaked the digest hex: {rendered}"
+            );
+            // The bare byte-array form a derived Debug would emit: `digests: [[123, 45, ...]]`.
+            assert!(
+                !rendered.contains(&format!("[{first_byte_dbg}, ")),
+                "{label} debug leaked the raw digest byte array: {rendered}"
+            );
+            assert!(
+                rendered.contains("redacted"),
+                "{label} debug must mark the digests redacted: {rendered}"
+            );
+        }
     }
 
     #[test]
