@@ -950,9 +950,16 @@ pub fn execute_resync<F: Filesystem, C: Clock>(
 fn resync_fingerprint_err(e: DivergenceError) -> ReplicationError {
     match e {
         DivergenceError::Storage(s) => ReplicationError::Storage(s),
-        other => ReplicationError::Frame {
-            what: format!("resync convergence re-fingerprint failed: {other}"),
-        },
+        // `fingerprint_log` only ever surfaces `Storage`; the framing variants are carried through
+        // TYPED (not stringified) so no `FrameError` detail is lost, mirroring the peer-frame fault
+        // unification.
+        DivergenceError::Frame(fe) => ReplicationError::Frame(fe),
+        DivergenceError::UnexpectedFrameType { tag } => {
+            ReplicationError::UnexpectedFrameType { tag }
+        }
+        // The remaining (advertisement-shaped, and any future `#[non_exhaustive]`) variants cannot
+        // arise from a re-fingerprint read; fail closed as a non-convergent resync rather than panic.
+        _ => ReplicationError::ResyncDidNotConverge { remaining: 1 },
     }
 }
 

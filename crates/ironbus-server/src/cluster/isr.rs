@@ -153,11 +153,7 @@ impl AckReplicatedBody {
     /// Returns [`ReplicationError::Frame`] if the (fixed, tiny) body somehow cannot be framed.
     pub fn to_frame(&self) -> Result<Vec<u8>, ReplicationError> {
         let mut out = Vec::with_capacity(ACK_REPLICATED_LEN + 5);
-        encode_frame(FrameType::AckReplicated, &self.encode(), &mut out).map_err(|e| {
-            ReplicationError::Frame {
-                what: e.to_string(),
-            }
-        })?;
+        encode_frame(FrameType::AckReplicated, &self.encode(), &mut out)?;
         Ok(out)
     }
 
@@ -169,8 +165,8 @@ impl AckReplicatedBody {
     /// rejected before any allocation), and the type tag must be [`FrameType::AckReplicated`].
     ///
     /// # Errors
-    /// Returns [`ReplicationError::Frame`] on a framing fault or an unexpected type tag, or
-    /// [`ReplicationError::MalformedRequest`] if the body is the wrong length.
+    /// Returns [`ReplicationError::Frame`] on a framing fault, [`ReplicationError::UnexpectedFrameType`]
+    /// on an unexpected type tag, or [`ReplicationError::MalformedRequest`] if the body is the wrong length.
     pub fn decode_frame(
         buf: &[u8],
     ) -> Result<Option<(AckReplicatedBody, usize)>, ReplicationError> {
@@ -187,19 +183,13 @@ impl AckReplicatedBody {
                 Some(FrameType::AckReplicated) => {
                     Ok(Some((AckReplicatedBody::decode(body)?, consumed)))
                 }
-                _ => Err(ReplicationError::Frame {
-                    what: format!(
-                        "unexpected frame type tag {type_tag} for an AckReplicated report"
-                    ),
-                }),
+                _ => Err(ReplicationError::UnexpectedFrameType { tag: type_tag }),
             },
             Ok(FrameDecode::Incomplete { .. }) => Ok(None),
             Err(FrameError::FrameTooLarge { len }) => {
                 Err(ReplicationError::ResponseTooLarge { len })
             }
-            Err(e) => Err(ReplicationError::Frame {
-                what: e.to_string(),
-            }),
+            Err(e) => Err(ReplicationError::Frame(e)),
         }
     }
 }
@@ -648,7 +638,8 @@ mod tests {
         encode_frame(FrameType::Ping, &[0u8; ACK_REPLICATED_LEN], &mut framed).unwrap();
         assert!(matches!(
             AckReplicatedBody::decode_frame(&framed),
-            Err(ReplicationError::Frame { .. })
+            Err(ReplicationError::UnexpectedFrameType { tag })
+                if tag == FrameType::Ping.as_u8()
         ));
     }
 

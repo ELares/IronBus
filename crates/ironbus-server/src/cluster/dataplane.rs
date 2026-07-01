@@ -292,13 +292,11 @@ impl CommittedHwQueryBody {
     /// Decode a query from its body bytes.
     ///
     /// # Errors
-    /// Returns [`ReplicationError::Frame`] if `body` is not exactly the request length or its `kind`
-    /// byte is not the request discriminant — fail-closed, never guessed at.
+    /// Returns [`ReplicationError::MalformedRequest`] if `body` is not exactly the request length or its
+    /// `kind` byte is not the request discriminant — fail-closed, never guessed at.
     pub fn decode(body: &[u8]) -> Result<CommittedHwQueryBody, ReplicationError> {
         if body.len() != HW_QUERY_REQUEST_LEN || body[0] != HW_KIND_REQUEST {
-            return Err(ReplicationError::Frame {
-                what: format!("malformed CommittedHwQuery request (len {})", body.len()),
-            });
+            return Err(ReplicationError::MalformedRequest { len: body.len() });
         }
         Ok(CommittedHwQueryBody)
     }
@@ -328,13 +326,11 @@ impl CommittedHwResponseBody {
     /// Decode a response from its body bytes.
     ///
     /// # Errors
-    /// Returns [`ReplicationError::Frame`] if `body` is not exactly the response length or its `kind`
-    /// byte is not the response discriminant.
+    /// Returns [`ReplicationError::MalformedResponse`] if `body` is not exactly the response length or its
+    /// `kind` byte is not the response discriminant.
     pub fn decode(body: &[u8]) -> Result<CommittedHwResponseBody, ReplicationError> {
         if body.len() != HW_QUERY_RESPONSE_LEN || body[0] != HW_KIND_RESPONSE {
-            return Err(ReplicationError::Frame {
-                what: format!("malformed CommittedHwQuery response (len {})", body.len()),
-            });
+            return Err(ReplicationError::MalformedResponse { len: body.len() });
         }
         let mut hw = [0u8; 8];
         hw.copy_from_slice(&body[1..9]);
@@ -376,9 +372,9 @@ pub fn decode_dataplane_frame(type_tag: u8, body: &[u8]) -> Result<DataPlaneFram
             Some(EPOCH_KIND_RESPONSE) => Ok(DataPlaneFrame::EpochResponse(
                 OffsetForLeaderEpochResponse::decode(body)?,
             )),
-            _ => Err(DataPlaneError::Replication(ReplicationError::Frame {
-                what: "malformed OffsetForLeaderEpoch kind byte on a data-plane frame".to_string(),
-            })),
+            _ => Err(DataPlaneError::Replication(
+                ReplicationError::MalformedEpochQuery { len: body.len() },
+            )),
         },
         Some(FrameType::CommittedHwQuery) => match body.first().copied() {
             Some(HW_KIND_REQUEST) => Ok(DataPlaneFrame::CommittedHwQuery(
@@ -387,13 +383,13 @@ pub fn decode_dataplane_frame(type_tag: u8, body: &[u8]) -> Result<DataPlaneFram
             Some(HW_KIND_RESPONSE) => Ok(DataPlaneFrame::CommittedHwResponse(
                 CommittedHwResponseBody::decode(body)?,
             )),
-            _ => Err(DataPlaneError::Replication(ReplicationError::Frame {
-                what: "malformed CommittedHwQuery kind byte on a data-plane frame".to_string(),
-            })),
+            _ => Err(DataPlaneError::Replication(
+                ReplicationError::MalformedRequest { len: body.len() },
+            )),
         },
-        _ => Err(DataPlaneError::Replication(ReplicationError::Frame {
-            what: format!("unexpected frame type tag {type_tag} on a data-plane link"),
-        })),
+        _ => Err(DataPlaneError::Replication(
+            ReplicationError::UnexpectedFrameType { tag: type_tag },
+        )),
     }
 }
 
