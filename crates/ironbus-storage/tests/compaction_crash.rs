@@ -19,7 +19,8 @@
 
 use bytes::Bytes;
 use ironbus_core::clock::ManualClock;
-use ironbus_core::segment::SegmentHeader;
+use ironbus_core::format::{COMPACTION_META_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
+use ironbus_core::segment::{SegmentFooter, SegmentHeader};
 use ironbus_core::types::Offset;
 use ironbus_storage::compaction::CompactionConfig;
 use ironbus_storage::fault::FaultFs;
@@ -89,6 +90,172 @@ fn all_records(log: &Log<InMemoryFs, ManualClock>) -> Vec<OwnedRecord> {
     let head = log.flushed_offset().get();
     log.read_from(Offset::ZERO, usize::try_from(head).unwrap())
         .unwrap()
+}
+
+/// Builds a dirty log, FULLY compacts it on a clean disk (so the compacted segment is durable and
+/// its covered originals are unlinked — the compacted segment is now the SOLE durable copy of its
+/// survivors), and returns the disk, the pre-compaction record set, the covered survivor set, and
+/// the id of the committed compacted segment. This is the exact starting image #836 describes: a
+/// mid-body bit-flip in this segment must NOT be conflated with a crash-before-commit orphan.
+fn fully_compacted_sole_copy() -> (InMemoryFs, Vec<OwnedRecord>, Vec<OwnedRecord>, u64) {
+    let (fs, before, _head) = build_dirty_log(InMemoryFs::new());
+    let want = expected_survivors(&before);
+    let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+    let out = log.maybe_compact(&CompactionConfig::enabled()).unwrap();
+    assert!(
+        out.compacted_segment_id.is_some(),
+        "the pass produced a committed compacted segment"
+    );
+    let fs = log.into_filesystem();
+    let compacted_id = segment_ids(&fs)
+        .unwrap()
+        .into_iter()
+        .find(|&id| {
+            SegmentReader::open(fs.open(&segment_file_name(id)).unwrap())
+                .unwrap()
+                .header()
+                .is_compacted()
+        })
+        .expect("a committed compacted segment exists on disk");
+    (fs, before, want, compacted_id)
+}
+
+/// The final assertion shared by both #836 variants: after the corruption, `Log::open` must NOT
+/// silently unlink-and-lose the sole compacted copy. Acceptable outcomes are (a) fail-closed with a
+/// typed `StorageError`, or (b) recover while KEEPING the compacted file (or a `quarantine/` copy)
+/// and, if any covered survivor offset is dropped from the read, recording it in the `LossReport`.
+/// The forbidden outcome is a silent success that unlinks the file, drops survivors, and emits NO
+/// loss event — unbounded silent data loss, the worst recovery outcome.
+fn assert_not_silently_lost(fs: InMemoryFs, compacted_id: u64, want_survivors: &[OwnedRecord]) {
+    match Log::open(fs, ManualClock::new(), small_config()) {
+        Err(_) => {
+            // Fail-closed: recovery refused to interpret the structurally inconsistent committed
+            // compacted segment rather than silently discarding it. Acceptable.
+        }
+        Ok(recovered) => {
+            // Read the whole recovered log TOLERANTLY: after a silent unlink the survivors below the
+            // new oldest offset are gone, so `read_from(ZERO, ..)` itself errors `OffsetOutOfRange`
+            // — that error is already proof of loss, so treat it as "nothing recovered from origin"
+            // rather than letting an incidental unwrap mask the real assertion below.
+            let head = recovered.flushed_offset().get();
+            let got = recovered
+                .read_from(Offset::ZERO, usize::try_from(head).unwrap_or(usize::MAX))
+                .unwrap_or_default();
+            let got_offsets: std::collections::HashSet<u64> =
+                got.iter().map(|r| r.offset.get()).collect();
+            let lost: Vec<u64> = want_survivors
+                .iter()
+                .map(|r| r.offset.get())
+                .filter(|o| !got_offsets.contains(o))
+                .collect();
+            let loss_reported = !recovered.loss_report().is_empty();
+            let fs = recovered.into_filesystem();
+            let file_present = fs.exists(&segment_file_name(compacted_id)).unwrap();
+            let quarantined = fs.subdir_exists("quarantine").unwrap();
+
+            assert!(
+                lost.is_empty() || loss_reported || file_present || quarantined,
+                "SILENT SOLE-COPY DATA LOSS (#836): recovery unlinked the committed compacted \
+                 segment as if it were a crash-before-commit orphan. Survivor offsets {lost:?} \
+                 vanished with NO LossReport, the compacted file is gone (present={file_present}), \
+                 and nothing was quarantined (quarantine_dir={quarantined}). Recovery must fail \
+                 closed or quarantine, never silently drop the sole durable copy."
+            );
+        }
+    }
+}
+
+/// #836 variant 1: a mid-body survivor bit-flip in a committed compacted segment (the trailing
+/// footer + 44-byte compaction block are left intact, so they stay CRC-valid and decode). This is
+/// NOT a crash-before-commit orphan — the segment reached its commit point — yet `scan_compacted`
+/// collapses the corrupt-body case into the same `Ok(None)` a torn footer yields, and recovery then
+/// unlinks the SOLE durable copy of every survivor it covered.
+///
+/// KNOWN-FAILING / CONFIRMED BUG (#836): under the current recovery this reproduces silent
+/// sole-copy data loss — `Log::open` succeeds, the compacted file is unlinked, offsets 0..12 vanish
+/// with no `LossReport` and no quarantine. Marked `#[ignore]` so CI stays green; un-ignore it once
+/// recovery distinguishes a post-commit corrupt body (fail-closed or quarantine) from a
+/// crash-before-commit orphan. Run explicitly with `cargo test -- --ignored` to see it fail today.
+#[ignore = "#836: recovery silently unlinks a mid-body-corrupt committed compacted segment (sole-copy data loss); un-ignore once recovery fails closed / quarantines"]
+#[test]
+fn mid_body_corruption_in_a_committed_compacted_segment_is_not_silently_unlinked() {
+    let (fs, _before, want, compacted_id) = fully_compacted_sole_copy();
+
+    // Flip one byte inside a NON-TAIL survivor frame: 8 bytes past the 64-byte header lands in the
+    // first survivor's frame, well before the footer. The footer (32) + meta block (44) at the very
+    // end are untouched, so they still decode CRC-valid — the exact ambiguous shape #836 names.
+    let file = fs.open(&segment_file_name(compacted_id)).unwrap();
+    let flip_at = SEGMENT_HEADER_LEN as u64 + 8;
+    let mut b = [0u8; 1];
+    file.read_exact_at(&mut b, flip_at).unwrap();
+    b[0] ^= 0xFF;
+    file.write_all_at(&b, flip_at).unwrap();
+    file.sync_all().unwrap();
+    fs.sync_dir().unwrap();
+
+    // The flip drives `scan_compacted` down the mid-body corruption `Ok(None)` branch (footer + meta
+    // still decode, but a survivor frame fails its CRC), the precise case recovery must not conflate
+    // with an uncommitted orphan.
+    {
+        let reader =
+            SegmentReader::open(fs.open(&segment_file_name(compacted_id)).unwrap()).unwrap();
+        let scan = reader.scan_compacted();
+        assert!(
+            matches!(scan, Ok(None)) || scan.is_err(),
+            "the byte flip makes the committed compacted segment un-scannable: `Ok(None)` today \
+             (the mid-body corruption branch), or a typed error under a fail-closed fix — never a \
+             valid scan"
+        );
+    }
+
+    assert_not_silently_lost(fs, compacted_id, &want);
+}
+
+/// #836 variant 2: a footer `record_count` / body-length DISAGREEMENT past the valid trailers. The
+/// footer and meta block are re-stamped with a fresh, CRC-valid footer whose `record_count` no
+/// longer matches the survivors on disk, so `scan_compacted` decodes every frame and both trailers
+/// cleanly, then returns `Ok(None)` at the count cross-check (segment.rs) — again indistinguishable,
+/// to recovery, from a crash-before-commit orphan, and again the sole copy is unlinked.
+///
+/// KNOWN-FAILING / CONFIRMED BUG (#836), sibling of the mid-body variant: same silent sole-copy
+/// loss via the third `Ok(None)` case. `#[ignore]`d so CI stays green; un-ignore once fixed.
+#[ignore = "#836: recovery silently unlinks a footer-count-inconsistent committed compacted segment (sole-copy data loss); un-ignore once recovery fails closed / quarantines"]
+#[test]
+fn footer_count_disagreement_in_a_committed_compacted_segment_is_not_silently_unlinked() {
+    let (fs, _before, want, compacted_id) = fully_compacted_sole_copy();
+
+    // Re-stamp the trailing footer with record_count + 1 and a VALID v2 CRC, leaving the survivor
+    // frames and the meta block exactly as they are. The footer now describes one more record than
+    // the body holds, driving the footer/body-length disagreement branch.
+    let file = fs.open(&segment_file_name(compacted_id)).unwrap();
+    let file_len = file.len().unwrap();
+    let footer_start = file_len - COMPACTION_META_LEN as u64 - SEGMENT_FOOTER_LEN as u64;
+    let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+    file.read_exact_at(&mut fbuf, footer_start).unwrap();
+    let footer = SegmentFooter::decode(&fbuf).expect("the committed footer decodes");
+    let tampered = SegmentFooter {
+        record_count: footer.record_count + 1,
+        ..footer
+    };
+    file.write_all_at(&tampered.encode_v2(), footer_start)
+        .unwrap();
+    file.sync_all().unwrap();
+    fs.sync_dir().unwrap();
+
+    // The re-stamped footer is CRC-valid but disagrees with the body count, so `scan_compacted`
+    // returns `Ok(None)` at the count cross-check — the third case collapsed into the orphan branch.
+    {
+        let reader =
+            SegmentReader::open(fs.open(&segment_file_name(compacted_id)).unwrap()).unwrap();
+        let scan = reader.scan_compacted();
+        assert!(
+            matches!(scan, Ok(None)) || scan.is_err(),
+            "the count bump makes the committed compacted segment un-scannable: `Ok(None)` today \
+             (the footer/body-length disagreement branch), or a typed error under a fix"
+        );
+    }
+
+    assert_not_silently_lost(fs, compacted_id, &want);
 }
 
 #[test]
