@@ -2201,8 +2201,34 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let want = need.max((RECOVERY_WINDOW_BYTES as u64).min(remaining));
         let want = usize::try_from(want).map_err(|_| StorageError::SegmentFull)?;
         *win_start = pos;
-        win.resize(want, 0);
-        self.file.read_exact_at(win.as_mut_slice(), pos)?;
+        // Read straight into the window's uninitialized capacity instead of the grow-only zero-fill
+        // `resize(want, 0)` did (#945 applies the #813 `read_into_fresh` treatment to the recovery
+        // scan). `read_exact_at` overwrites every one of the `want` bytes before any is read, so
+        // pre-zeroing the freshly grown tail was wasted work that scaled with the window on a large
+        // recovery log; the bytes handed back are byte-for-byte identical (same region -> same
+        // bytes). Truncating to length 0 first means a mid-read error leaves NO uninitialized byte
+        // observable, and lets `reserve` grow the buffer without copying the stale window bytes.
+        win.clear();
+        win.reserve(want);
+        // SAFETY: `reserve(want)` on a now-empty `Vec` guaranteed capacity >= `want`, so
+        // `spare_capacity_mut()` yields at least `want` allocated, writable `MaybeUninit<u8>`s and the
+        // `want`-byte slice built from its pointer is in bounds (`want <= spare.len()`). The slice is
+        // only ever WRITTEN through here: `read_exact_at` writes into it and never reads its input, so
+        // handing it uninitialized `u8` memory exposes no uninitialized byte to any read.
+        #[allow(unsafe_code)]
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(win.spare_capacity_mut().as_mut_ptr().cast::<u8>(), want)
+        };
+        // Fills all `want` bytes from `pos`, or returns `Err` (leaving `win` at length 0).
+        self.file.read_exact_at(dst, pos)?;
+        // SAFETY: `read_exact_at` returned `Ok`, so it wrote EVERY one of the `want` bytes just handed
+        // to it (it loops issuing reads until the buffer is full, or errors — it cannot return `Ok`
+        // with the buffer partly unwritten). The first `want` bytes are therefore fully initialized,
+        // so setting the logical length to `want` exposes only initialized memory.
+        #[allow(unsafe_code)]
+        unsafe {
+            win.set_len(want);
+        }
         Ok(())
     }
 }
