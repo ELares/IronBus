@@ -752,7 +752,14 @@ impl AsyncClient {
                     };
                 }
                 FrameType::Err => {
-                    return Err(ClientError::Server(String::from_utf8_lossy(body).into()))
+                    // Err is a connection-preserving per-Flow terminator (the server keeps the
+                    // connection open after a fetch Err), so drain the terminating Err frame before
+                    // returning to keep the connection framed for reuse, exactly as FlowEnd and the
+                    // old `read_frame` (drain-then-return) did. Materialize the owned message first
+                    // since `body` borrows `self.buf`, which the drain then mutates.
+                    let msg = String::from_utf8_lossy(body).into_owned();
+                    self.buf.drain(..consumed);
+                    return Err(ClientError::Server(msg));
                 }
                 other => return Err(ClientError::Unexpected(other)),
             }
@@ -1967,6 +1974,77 @@ mod tests {
         assert_eq!(second[0].generation, 9);
         assert_eq!(second[0].headers, b"h2");
         assert_eq!(second[0].payload, b"second-only");
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fetch_server_err_leaves_the_connection_framed_for_reuse() {
+        // #818 regression (async port): `Err` is a CONNECTION-PRESERVING per-Flow terminator — the
+        // server keeps the connection open after a fetch `Err` — so the borrow-then-drain fetch loop
+        // must DRAIN the terminating `Err` frame before returning, exactly as it drains the sibling
+        // `FlowEnd` terminator. Response 1 ends in an `Err`; response 2 (a valid delivery + FlowEnd) is
+        // already buffered behind it. If the `Err` frame were left in the buffer, the second fetch would
+        // re-read those stale bytes and misframe (re-surfacing the server error instead of decoding
+        // response 2). That the second fetch succeeds proves the `Err` was drained and the connection
+        // stayed exactly framed for reuse.
+        use ironbus_proto::message::encode_deliver;
+        let mut d0 = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 0,
+                generation: 3,
+                flags: 0,
+                timestamp_ms: 21,
+                key: b"k0",
+                headers: b"h0",
+                payload: b"before-the-err",
+            },
+            &mut d0,
+        )
+        .unwrap();
+        let mut d1 = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 5,
+                generation: 4,
+                flags: 0,
+                timestamp_ms: 22,
+                key: b"k1",
+                headers: b"h1",
+                payload: b"after-the-err",
+            },
+            &mut d1,
+        )
+        .unwrap();
+
+        let mut script = frame(FrameType::Info, b"");
+        // Response 1: one delivery, then an Err terminator (a per-Flow server error).
+        script.extend(frame(FrameType::Deliver, &d0));
+        script.extend(frame(FrameType::Err, b"consumer fenced"));
+        // Response 2: a valid delivery + FlowEnd(1), already buffered behind the Err.
+        script.extend(frame(FrameType::Deliver, &d1));
+        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+
+        let mut c = AsyncClient::connect(addr).await.unwrap();
+        // The first fetch surfaces the server Err (and, per the fix, drains that Err frame).
+        match c.fetch(10).await.unwrap_err() {
+            ClientError::Server(msg) => assert_eq!(msg, "consumer fenced"),
+            other => panic!("expected a server error, got {other:?}"),
+        }
+        // The second response was ALREADY buffered behind the Err when the first fetch returned; that it
+        // decodes cleanly proves the Err terminator was drained and left the connection exactly framed.
+        let second = c.fetch(10).await.unwrap().messages;
+        assert_eq!(
+            second.len(),
+            1,
+            "response 2 survives the Err-terminator drain"
+        );
+        assert_eq!(second[0].offset, 5);
+        assert_eq!(second[0].generation, 4);
+        assert_eq!(second[0].key, b"k1");
+        assert_eq!(second[0].payload, b"after-the-err");
         drop(c);
         handle.join().unwrap();
     }
