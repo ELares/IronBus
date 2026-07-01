@@ -1701,6 +1701,26 @@ pub struct ReadyCheck {
 /// Prepared and is re-checked on a later scan, so nothing is lost).
 const DEFAULT_MAX_PENDING_CHECKS: usize = 65_536;
 
+/// The per-connection cap on DISTINCT `TxnListen` group listeners one connection may hold at once
+/// (#876). `group_listener` binds one owned-key entry per distinct group NAME and is freed only when
+/// the connection disconnects ([`TxnBackCheck::drop_member`]); the session itself remembers only the
+/// LATEST group, so a producer that rotates through many distinct (wire-controlled, up-to-256-byte)
+/// group names on ONE never-closing connection would otherwise pin those entries in the single-writer
+/// engine actor's shared `TxnBackCheck` without bound. This bounds that footprint: a re-register of a
+/// group the connection already holds is always accepted (idempotent, no growth), but a NEW distinct
+/// group past this cap is REFUSED with a typed [`TxnListenerCapExceeded`] (not a panic, not a silent
+/// drop) — the sibling `pending` queue is bounded the same way (drop-oldest at `max_pending`). 1024 is
+/// far above any legitimate group-rotation need (a producer uses ONE stable group; a reconnect
+/// re-registers the SAME group) yet turns an unbounded per-connection leak into a fixed ceiling.
+const MAX_GROUP_LISTENERS_PER_CONN: usize = 1024;
+
+/// A `TxnListen` registration was refused because the connection is already at its per-connection
+/// distinct-group-listener cap ([`MAX_GROUP_LISTENERS_PER_CONN`], #876). The engine leaves the
+/// connection's existing bindings intact and the session surfaces a clean protocol `Err`; nothing is
+/// dropped or corrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxnListenerCapExceeded;
+
 /// The broker-side back-check ROUTER (#640 part 2): the in-memory, session-scoped routing + delivery
 /// state that turns the durable [`ironbus_core::txn::BackCheckBook`] schedule into a `TxnCheck` pushed
 /// to the right (re)connected producer. It holds three small maps, all EMPTY until a producer both
@@ -1728,6 +1748,8 @@ pub struct TxnBackCheck {
     pending: std::collections::VecDeque<ReadyCheck>,
     /// The cap on queued-but-undrained `TxnCheck`s (drop-oldest past it).
     max_pending: usize,
+    /// The per-connection cap on distinct group listeners (#876); a NEW group past it is refused.
+    max_group_listeners_per_conn: usize,
 }
 
 impl TxnBackCheck {
@@ -1738,13 +1760,39 @@ impl TxnBackCheck {
             txn_owner: std::collections::HashMap::new(),
             pending: std::collections::VecDeque::new(),
             max_pending: DEFAULT_MAX_PENDING_CHECKS,
+            max_group_listeners_per_conn: MAX_GROUP_LISTENERS_PER_CONN,
         }
     }
 
     /// Binds `group` to the producer connection `member` (the `TxnListen` registration), superseding any
-    /// prior binding so a reconnecting producer re-points the route to its NEW connection.
-    fn register_listener(&mut self, group: &[u8], member: u64) {
+    /// prior binding so a reconnecting producer re-points the route to its NEW connection. Bounded per
+    /// connection (#876): re-registering a group THIS `member` already holds is always accepted (it does
+    /// not grow the connection's footprint), but a NEW distinct group once `member` is already at
+    /// [`MAX_GROUP_LISTENERS_PER_CONN`] is refused with [`TxnListenerCapExceeded`] — the connection's
+    /// existing bindings are left untouched so its live routes keep working.
+    fn register_listener(
+        &mut self,
+        group: &[u8],
+        member: u64,
+    ) -> Result<(), TxnListenerCapExceeded> {
+        // Idempotent / superseding re-register of a group this member already owns: no new entry, so it
+        // is always allowed even at the cap (a reconnect re-registering its OWN stable group must never
+        // be starved by the cap).
+        if self.group_listener.get(group) == Some(&member) {
+            return Ok(());
+        }
+        // A genuinely new group for this member (or one taken over from another connection): count the
+        // distinct groups this member currently holds and refuse if adding one more would exceed the cap.
+        let held = self
+            .group_listener
+            .values()
+            .filter(|m| **m == member)
+            .count();
+        if held >= self.max_group_listeners_per_conn {
+            return Err(TxnListenerCapExceeded);
+        }
         self.group_listener.insert(group.to_vec(), member);
+        Ok(())
     }
 
     /// Records that the still-`Prepared` `txn_id` is owned by the listener `group` (called at prepare),
@@ -4505,6 +4553,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.txn.as_ref().map_or(0, TxnStore::under_back_check)
     }
 
+    /// Test-only: the number of live `group_listener` entries in the back-check router (#876), used to
+    /// assert the per-connection distinct-group cap actually bounds the map.
+    #[cfg(test)]
+    fn txn_group_listener_len(&self) -> usize {
+        self.txn_back_check.group_listener.len()
+    }
+
     /// Sets the back-check tunables (#640 part 2): the timeout before a Prepared half message is first
     /// back-checked, the retry cadence, the attempt cap, and the per-pass batch cap. Server-side only
     /// (NOT on the wire), like [`Engine::set_confirm_group`]. Applied to the open txn store's book
@@ -4544,10 +4599,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// for transaction `listener_group` (#640 part 2, the `TxnListen` verb). A reconnecting producer
     /// re-sends this with the SAME group to re-point a back-check route to its NEW connection, so a
     /// `TxnCheck` for a half message the producer prepared on a now-dead connection reaches its current
-    /// connection. Superseding (not additive): one connection owns a group at a time.
-    pub fn register_txn_listener(&mut self, listener_group: &[u8], member: MemberId) {
+    /// connection. Superseding (not additive): one connection owns a group at a time. Bounded per
+    /// connection (#876): re-registering a group this connection already holds always succeeds, but a
+    /// NEW distinct group once the connection is at [`MAX_GROUP_LISTENERS_PER_CONN`] is refused with
+    /// [`TxnListenerCapExceeded`] so one connection cannot pin unbounded distinct group-listener entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnListenerCapExceeded`] if `member` already holds
+    /// [`MAX_GROUP_LISTENERS_PER_CONN`] distinct groups and `listener_group` is a NEW one; the
+    /// connection's existing bindings are left intact.
+    pub fn register_txn_listener(
+        &mut self,
+        listener_group: &[u8],
+        member: MemberId,
+    ) -> Result<(), TxnListenerCapExceeded> {
         self.txn_back_check
-            .register_listener(listener_group, member.get());
+            .register_listener(listener_group, member.get())
     }
 
     /// Removes a disconnected producer connection's back-check listener bindings and queued `TxnCheck`s
@@ -17514,12 +17582,79 @@ mod tests {
         // normal local-transaction window) is NOT back-checked.
         let clock = std::sync::Arc::new(ManualClock::new());
         let mut e = open_with_clock(config(10, 5), clock.clone());
-        e.register_txn_listener(b"svc", MemberId::new(7));
+        e.register_txn_listener(b"svc", MemberId::new(7)).unwrap();
         e.txn_prepare(b"tx1", "", &txn_half(b"v"), b"svc").unwrap();
         // Just under the timeout: nothing due, no check issued.
         clock.advance_monotonic_nanos(BC_TIMEOUT - 1);
         assert_eq!(e.txn_back_check_tick().unwrap(), 0, "not due yet");
         assert!(e.drain_txn_checks(MemberId::new(7)).is_empty());
+    }
+
+    #[test]
+    fn one_connection_cannot_pin_unbounded_distinct_group_listeners() {
+        // #876: a connection that registers many DISTINCT TxnListen groups on one never-closing session
+        // must NOT grow the engine's shared `group_listener` map without bound — it is bounded by the
+        // per-connection cap, over-cap NEW groups are refused with a typed error, and the whole footprint
+        // is reclaimed on disconnect.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock);
+        let member = MemberId::new(1);
+        // Filling exactly to the cap with distinct groups all succeeds.
+        for i in 0..MAX_GROUP_LISTENERS_PER_CONN {
+            let group = format!("group-{i}").into_bytes();
+            assert!(
+                e.register_txn_listener(&group, member).is_ok(),
+                "registration {i} is under the cap and must be accepted"
+            );
+        }
+        assert_eq!(
+            e.txn_group_listener_len(),
+            MAX_GROUP_LISTENERS_PER_CONN,
+            "the map holds exactly the cap of distinct groups"
+        );
+        // The NEXT distinct group is refused with the typed error, and the map does NOT grow.
+        assert_eq!(
+            e.register_txn_listener(b"one-too-many", member),
+            Err(TxnListenerCapExceeded),
+            "a new distinct group past the cap is rejected cleanly"
+        );
+        assert_eq!(
+            e.txn_group_listener_len(),
+            MAX_GROUP_LISTENERS_PER_CONN,
+            "a rejected registration must not grow the map"
+        );
+        // Re-registering a group the connection ALREADY holds is still accepted at the cap (idempotent /
+        // superseding re-register, e.g. a reconnect re-pointing its OWN stable group, is never starved).
+        assert!(
+            e.register_txn_listener(b"group-0", member).is_ok(),
+            "re-registering an already-held group is allowed even at the cap"
+        );
+        assert_eq!(
+            e.txn_group_listener_len(),
+            MAX_GROUP_LISTENERS_PER_CONN,
+            "an idempotent re-register does not grow the map"
+        );
+        // Many further over-cap attempts cannot grow the map either (the unbounded-leak scenario).
+        for i in 0..10_000 {
+            let group = format!("flood-{i}").into_bytes();
+            assert_eq!(
+                e.register_txn_listener(&group, member),
+                Err(TxnListenerCapExceeded),
+                "every over-cap distinct group is refused"
+            );
+        }
+        assert_eq!(
+            e.txn_group_listener_len(),
+            MAX_GROUP_LISTENERS_PER_CONN,
+            "the map stays at the cap no matter how many over-cap frames arrive"
+        );
+        // Disconnect reclaims the entire footprint.
+        e.drop_txn_listener(member);
+        assert_eq!(
+            e.txn_group_listener_len(),
+            0,
+            "disconnect frees all of the connection's group-listener entries"
+        );
     }
 
     #[test]
@@ -17532,7 +17667,7 @@ mod tests {
         let clock = std::sync::Arc::new(ManualClock::new());
         let mut e = open_with_clock(config(10, 5), clock.clone());
         // The original (soon-to-crash) connection: member 1 registers the listener and prepares.
-        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
         e.txn_prepare(b"tx1", "", &txn_half(b"order-42"), b"svc")
             .unwrap();
         assert_eq!(e.txn_under_back_check(), 1);
@@ -17548,7 +17683,7 @@ mod tests {
             "no live listener yet: nothing routed"
         );
         // The producer RECONNECTS as a NEW connection (member 2) and re-registers the SAME group.
-        e.register_txn_listener(b"svc", MemberId::new(2));
+        e.register_txn_listener(b"svc", MemberId::new(2)).unwrap();
         // The next scan (after the retry cadence) routes a TxnCheck to the reconnected listener.
         clock.advance_monotonic_nanos(ironbus_core::txn::DEFAULT_BACK_CHECK_RETRY_NANOS + 1);
         assert_eq!(
@@ -17592,7 +17727,7 @@ mod tests {
         // discarded and never delivered.
         let clock = std::sync::Arc::new(ManualClock::new());
         let mut e = open_with_clock(config(10, 5), clock.clone());
-        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
         e.txn_prepare(b"tx1", "", &txn_half(b"abort-me"), b"svc")
             .unwrap();
         clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
@@ -17622,7 +17757,7 @@ mod tests {
         let mut e = open_with_clock(config(10, 5), clock.clone());
         // No listener is ever registered (the producer crashed and never came back), but the half owns a
         // group, so it is enrolled and the bounded attempt cap still advances on each scan.
-        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
         e.txn_prepare(b"tx1", "", &txn_half(b"orphan"), b"svc")
             .unwrap();
         e.drop_txn_listener(MemberId::new(1)); // crash: no live listener
@@ -17649,7 +17784,7 @@ mod tests {
         // answer is REFUSED (the part-1 AlreadyResolved rule), never a flip, never a double-resolve.
         let clock = std::sync::Arc::new(ManualClock::new());
         let mut e = open_with_clock(config(10, 5), clock.clone());
-        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
         e.txn_prepare(b"tx1", "", &txn_half(b"late"), b"svc")
             .unwrap();
         e.drop_txn_listener(MemberId::new(1));
@@ -17690,7 +17825,7 @@ mod tests {
         // scan reschedules and the bounded cap eventually applies the terminal default.
         let clock = std::sync::Arc::new(ManualClock::new());
         let mut e = open_with_clock(config(10, 5), clock.clone());
-        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
         e.txn_prepare(b"tx1", "", &txn_half(b"pending"), b"svc")
             .unwrap();
         clock.advance_monotonic_nanos(BC_TIMEOUT + 1);
@@ -17721,7 +17856,7 @@ mod tests {
         {
             let clock = std::sync::Arc::new(ManualClock::new());
             let mut e = Engine::open(fs.clone(), clock.clone(), config(10, 5)).unwrap();
-            e.register_txn_listener(b"svc", MemberId::new(1));
+            e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
             e.txn_prepare(b"tx1", "", &txn_half(b"survive"), b"svc")
                 .unwrap();
             e.drop_txn_listener(MemberId::new(1));
@@ -17768,7 +17903,8 @@ mod tests {
         let clock = std::sync::Arc::new(ManualClock::new());
         let mut e = open_with_clock(config(10, 5), clock.clone());
         // The legitimate producer registers group "victim" and prepares under it.
-        e.register_txn_listener(b"victim", MemberId::new(1));
+        e.register_txn_listener(b"victim", MemberId::new(1))
+            .unwrap();
         e.txn_prepare(b"tx1", "", &txn_half(b"funds"), b"victim")
             .unwrap();
         assert_eq!(e.txn_prepared_count(), 1);
@@ -17831,7 +17967,7 @@ mod tests {
         // `the_headline_crash_reconnect_back_check_commit_delivers_exactly_once`.)
         let clock = std::sync::Arc::new(ManualClock::new());
         let mut e = open_with_clock(config(10, 5), clock.clone());
-        e.register_txn_listener(b"svc", MemberId::new(1));
+        e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
         e.txn_prepare(b"commit-me", "", &txn_half(b"yes"), b"svc")
             .unwrap();
         e.txn_prepare(b"abort-me", "", &txn_half(b"no"), b"svc")
@@ -17867,7 +18003,7 @@ mod tests {
         {
             let clock = std::sync::Arc::new(ManualClock::new());
             let mut e = Engine::open(fs.clone(), clock.clone(), config(10, 5)).unwrap();
-            e.register_txn_listener(b"svc", MemberId::new(1));
+            e.register_txn_listener(b"svc", MemberId::new(1)).unwrap();
             e.txn_prepare(b"tx1", "", &txn_half(b"orphan"), b"svc")
                 .unwrap();
             // CRASH IMMEDIATELY: no clock advance, no scan, so NO back-check attempt and NO BACK record.

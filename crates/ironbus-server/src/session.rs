@@ -3417,7 +3417,17 @@ impl Session {
         // owner and the per-pass scan/drain is enabled for this connection.
         let member_id = self.member_id;
         let group_for_engine = group.clone();
-        engine.with(move |e| e.register_txn_listener(&group_for_engine, member_id))?;
+        // Per-connection cap (#876): a connection may hold only a bounded number of DISTINCT group
+        // listeners (re-registering the SAME group is always fine). Past the cap the engine refuses with
+        // a typed error rather than pinning another unbounded owned-key entry; surface it as a clean
+        // protocol Err and leave the connection's prior binding untouched.
+        if engine
+            .with(move |e| e.register_txn_listener(&group_for_engine, member_id))?
+            .is_err()
+        {
+            reply_err(out, "txn-listen group listener cap exceeded");
+            return Ok(());
+        }
         self.txn_listener_group = Some(group);
         reply(out, FrameType::Ok, &[]);
         Ok(())
