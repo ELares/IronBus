@@ -185,10 +185,20 @@ pub struct FetchResponseBody {
 }
 
 impl FetchResponseBody {
-    /// Encode this response to its fixed-header + verbatim-bytes body.
+    /// The encoded body length (fixed header + verbatim frame bytes), i.e. the number of bytes
+    /// [`encode`](Self::encode) / [`encode_into`](Self::encode_into) produce. Lets the data-plane
+    /// framer size its single outbound buffer without a throw-away intermediate encode (#825).
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(FETCH_RESPONSE_HEADER_LEN + self.frame_bytes.len());
+    pub fn encoded_len(&self) -> usize {
+        FETCH_RESPONSE_HEADER_LEN + self.frame_bytes.len()
+    }
+
+    /// Append this response (fixed header then verbatim `frame_bytes`) to `out`, materializing the
+    /// zero-copy [`Bytes`] run EXACTLY ONCE. Both the standalone [`encode`](Self::encode) and the
+    /// data-plane peer framer append straight into their own outbound buffer through here, so the
+    /// leader copies the (up to 8 MiB) run a single time on egress instead of the former three
+    /// (layer body -> partition-prefixed body -> framed frame) — #825. The wire bytes are unchanged.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.high_watermark.to_le_bytes());
         out.extend_from_slice(&self.first_offset.to_le_bytes());
         out.extend_from_slice(&self.record_count.to_le_bytes());
@@ -197,6 +207,13 @@ impl FetchResponseBody {
         let frame_len = u32::try_from(self.frame_bytes.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&frame_len.to_le_bytes());
         out.extend_from_slice(&self.frame_bytes);
+    }
+
+    /// Encode this response to its fixed-header + verbatim-bytes body.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_len());
+        self.encode_into(&mut out);
         out
     }
 

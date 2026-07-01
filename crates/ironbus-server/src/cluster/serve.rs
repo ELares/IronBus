@@ -230,6 +230,14 @@ pub fn encode_dataplane_peer_frame(
     partition: u64,
     frame: &DataPlaneFrame,
 ) -> Result<Vec<u8>, DataPlaneWireError> {
+    // Fast path for the big FETCH RESPONSE: its `frame_bytes` are a zero-copy `Bytes` view of a
+    // sealed segment (#810) and can be up to 8 MiB. The generic path below would copy them THREE
+    // times on the leader (layer body -> partition-prefixed body -> framed out); instead build the
+    // final framed buffer directly so the run is materialized EXACTLY ONCE. The bytes are identical
+    // to the generic encoding (#825).
+    if let DataPlaneFrame::FetchResponse(resp) = frame {
+        return encode_fetch_response_peer_frame(partition, resp);
+    }
     let layer_body = encode_dataplane_body(frame);
     let mut body = Vec::with_capacity(PARTITION_PREFIX_LEN + layer_body.len());
     body.extend_from_slice(&partition.to_le_bytes());
@@ -244,6 +252,43 @@ pub fn encode_dataplane_peer_frame(
         FrameError::FrameTooLarge { len } => DataPlaneWireError::Oversized { len },
         e @ FrameError::EmptyFrame => DataPlaneWireError::Frame(e),
     })?;
+    Ok(out)
+}
+
+/// Frame one FETCH RESPONSE directly into its final `[len][type][partition-le][layer body]` buffer,
+/// copying the (up to 8 MiB) zero-copy `frame_bytes` run EXACTLY ONCE (#825). This is the byte-for-byte
+/// equivalent of the generic [`encode_dataplane_peer_frame`] path for a `FetchResponse`, with the same
+/// bounds and the same error values, but without the two throw-away intermediate copies of the run.
+///
+/// # Errors
+/// Returns [`DataPlaneWireError::Oversized`] if the partition-prefixed body exceeds
+/// [`MAX_DATAPLANE_FRAME_BYTES`] or the framed length would exceed [`MAX_FRAME_LEN`].
+fn encode_fetch_response_peer_frame(
+    partition: u64,
+    resp: &FetchResponseBody,
+) -> Result<Vec<u8>, DataPlaneWireError> {
+    // Body = partition prefix + the response's fixed header + verbatim frame bytes (same as the
+    // generic path's `body`), bounded by the data-plane cap before anything is materialized.
+    let body_len = PARTITION_PREFIX_LEN + resp.encoded_len();
+    if body_len as u64 > u64::from(MAX_DATAPLANE_FRAME_BYTES) {
+        return Err(DataPlaneWireError::Oversized {
+            len: body_len as u64,
+        });
+    }
+    // Envelope frame length is the type byte plus the body, matching `encode_frame`'s own check.
+    let frame_len = 1u64 + body_len as u64;
+    let Some(frame_len) = u32::try_from(frame_len)
+        .ok()
+        .filter(|&l| l <= MAX_FRAME_LEN)
+    else {
+        return Err(DataPlaneWireError::Oversized { len: frame_len });
+    };
+    let mut out = Vec::with_capacity(5 + body_len);
+    out.extend_from_slice(&frame_len.to_le_bytes());
+    out.push(FrameType::FetchResponse.as_u8());
+    out.extend_from_slice(&partition.to_le_bytes());
+    // The single copy of the run into the outbound buffer (header + verbatim frame bytes).
+    resp.encode_into(&mut out);
     Ok(out)
 }
 
@@ -1935,6 +1980,56 @@ mod tests {
             assert_eq!(consumed, bytes.len(), "exactly one frame consumed");
             assert_eq!(got_p, p, "partition prefix round-trips");
             assert_eq!(&got_frame, frame, "frame round-trips byte-faithful");
+        }
+    }
+
+    #[test]
+    fn fetch_response_single_copy_framer_is_byte_identical_to_the_generic_path() {
+        // #825: the FetchResponse fast path (`encode_fetch_response_peer_frame`) frames the run with
+        // a single copy. Prove its bytes are IDENTICAL to the generic
+        // `encode_frame(FetchResponse, [partition-le ++ resp.encode()])` encoding the follower
+        // decodes — the conformance byte-identity guarantee — across empty, tiny, and large runs.
+        for run_len in [0usize, 5, 1024, 3 * 1024 * 1024] {
+            let payload: Vec<u8> = (0..run_len)
+                .map(|i| u8::try_from(i % 251).unwrap())
+                .collect();
+            let resp = FetchResponseBody {
+                high_watermark: 987_654_321,
+                first_offset: 42,
+                record_count: 9,
+                frame_bytes: bytes::Bytes::from(payload),
+            };
+            let partition = 3u64;
+
+            // The reference (generic) encoding: partition prefix + resp body, framed.
+            let mut ref_body = partition.to_le_bytes().to_vec();
+            ref_body.extend_from_slice(&resp.encode());
+            let mut reference = Vec::new();
+            proto_encode_frame(FrameType::FetchResponse, &ref_body, &mut reference)
+                .expect("reference frames");
+
+            let fast = encode_dataplane_peer_frame(
+                partition,
+                &DataPlaneFrame::FetchResponse(resp.clone()),
+            )
+            .expect("fast-path frames");
+
+            assert_eq!(
+                fast, reference,
+                "fast-path FetchResponse framing must be byte-identical (run_len={run_len})"
+            );
+
+            // And it must still decode back to the same partition + frame.
+            let (got_p, got_frame, consumed) = decode_dataplane_peer_frame(&fast)
+                .expect("decode ok")
+                .expect("a complete frame");
+            assert_eq!(consumed, fast.len(), "exactly one frame consumed");
+            assert_eq!(got_p, partition, "partition round-trips");
+            assert_eq!(
+                got_frame,
+                DataPlaneFrame::FetchResponse(resp),
+                "frame round-trips byte-faithful"
+            );
         }
     }
 
