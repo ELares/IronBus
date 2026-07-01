@@ -740,6 +740,48 @@ pub fn validate_known_keys(keys: &RawKeyMap) -> Vec<UnknownKey> {
     unknown
 }
 
+/// Scans `keys` for entries under a reserved-but-unwired section ([`is_reserved_section`]) and
+/// returns one non-fatal WARNING per such section that carries keys.
+///
+/// The reserved sections (`[auth]`/`[observability]`/`[compression]`) are FROZEN by the #14
+/// stability contract, so [`validate_known_keys`] tolerates them: a file that carries them still
+/// STARTS instead of being rejected as unknown. But none of their keys is wired on this build —
+/// auth is configured only by `--auth-config` and compression only by `--compression`, so a key
+/// placed under one of these headings is accepted-but-IGNORED. That silent swallow is a
+/// false-confidence footgun (#898): an operator believes they enabled auth or a codec via the
+/// main config file, but the setting is dead and unannounced, and a typo that happens to land
+/// under a reserved heading is swallowed the same way. This surfaces it as a loud WARN WITHOUT
+/// failing the start, closing the gap the strict unknown-key check deliberately leaves open.
+/// PURE: consults only the key NAMES (never the values), so it stays IO-free and deterministic.
+#[must_use]
+pub fn reserved_section_warnings(keys: &RawKeyMap) -> Vec<String> {
+    let mut by_section: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for key in keys.keys() {
+        if let Some((section, _)) = key.split_once('.') {
+            if is_reserved_section(section) {
+                by_section.entry(section).or_default().push(key);
+            }
+        }
+    }
+    by_section
+        .into_iter()
+        .map(|(section, keys_in_section)| {
+            // Point at the flag that actually wires the feature, so the operator can fix the file.
+            let hint = match section {
+                "auth" => "; auth is configured via `--auth-config`",
+                "compression" => "; compression is configured via `--compression`",
+                _ => "",
+            };
+            // `keys` is a BTreeMap, so `keys_in_section` is already sorted -> deterministic text.
+            let joined = keys_in_section.join(", ");
+            format!(
+                "reserved config section `[{section}]` is accepted but IGNORED on this build: \
+                 key(s) {joined} have no effect{hint}"
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +928,42 @@ mod tests {
         assert_eq!(unknown.len(), 1, "{unknown:?}");
         assert_eq!(unknown[0].key, "storage.segmnet_size");
         assert_eq!(unknown[0].suggestion, Some("storage.segment_size"));
+    }
+
+    #[test]
+    fn reserved_section_keys_are_tolerated_but_warned_as_ignored() {
+        // #898: a reserved-but-unwired section still parses clean (validate_known_keys returns it
+        // as no unknown), but its keys are accepted-but-ignored, so they must NOT be silent.
+        let mut keys = RawKeyMap::new();
+        keys.insert("auth.require".to_string(), "true".to_string());
+        keys.insert("compression.codec".to_string(), "zstd".to_string());
+        keys.insert("observability.metrics_addr".to_string(), "x".to_string());
+        // A wired key produces no reserved-section warning.
+        keys.insert("storage.segment_size".to_string(), "64MiB".to_string());
+
+        // Still not rejected as unknown (the frozen-section contract is unchanged).
+        assert!(validate_known_keys(&keys).is_empty());
+
+        let warnings = reserved_section_warnings(&keys);
+        // One warning per reserved section that carries keys; the wired `storage` key is silent.
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("IGNORED")));
+        assert!(warnings.iter().any(|w| w.contains("[auth]")
+            && w.contains("auth.require")
+            && w.contains("--auth-config")));
+        assert!(warnings.iter().any(|w| w.contains("[compression]")
+            && w.contains("compression.codec")
+            && w.contains("--compression")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("[observability]") && w.contains("observability.metrics_addr")));
+    }
+
+    #[test]
+    fn a_file_with_no_reserved_keys_produces_no_such_warning() {
+        let mut keys = RawKeyMap::new();
+        keys.insert("storage.segment_size".to_string(), "64MiB".to_string());
+        assert!(reserved_section_warnings(&keys).is_empty());
     }
 
     // ---- coupled-set validation ----
