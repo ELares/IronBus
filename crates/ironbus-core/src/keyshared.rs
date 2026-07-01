@@ -500,6 +500,47 @@ mod tests {
     }
 
     #[test]
+    fn same_offset_redelivery_rechecks_ownership_after_a_rebalance() {
+        // The same-offset fall-through in `decide` (the outstanding record's own redelivery) does
+        // NOT short-circuit to Deliver: it still re-checks CURRENT ownership. So after a rebalance
+        // that moved the key, the redelivery of the in-flight offset routes to the NEW owner, and
+        // the departed OLD owner is refused even its own redelivery. This pins both sides of that
+        // recheck on the same-offset branch (a regression that returned Deliver unconditionally on
+        // the same-offset branch would route the stale old owner its redelivery and pass every
+        // other test).
+        let mut router = KeyRouter::new();
+        for id in 1..=4 {
+            router.join(member(id));
+        }
+        // A key currently owned by member 2, so leaving member 2 moves it.
+        let key = (0..1000)
+            .map(|k| format!("k{k}"))
+            .find(|k| router.owner(k.as_bytes()).unwrap() == member(2))
+            .expect("some key must be owned by member 2");
+        let old_owner = router.owner(key.as_bytes()).unwrap();
+        // Offset 0 is in flight for the key; the key is busy with THIS same offset.
+        router.mark_in_flight(key.as_bytes(), Offset::new(0));
+        // Member 2 leaves: the key's rendezvous owner changes.
+        router.leave(member(2));
+        let new_owner = router.owner(key.as_bytes()).unwrap();
+        assert_ne!(new_owner, old_owner, "the key's owner moved");
+        // The departed old owner no longer gets even its OWN redelivery of the same offset: the
+        // same-offset branch falls through to the ownership recheck, which now denies it.
+        assert_eq!(
+            router.decide(old_owner, key.as_bytes(), Offset::new(0)),
+            RouteDecision::NotOwner,
+            "same-offset redelivery must re-check ownership and refuse the stale old owner"
+        );
+        // The same-offset redelivery reaches the owner check and delivers to the NEW owner while
+        // the key is busy only with this same offset (busy == offset, not a higher one).
+        assert_eq!(
+            router.decide(new_owner, key.as_bytes(), Offset::new(0)),
+            RouteDecision::Deliver,
+            "same-offset redelivery must deliver to the new owner"
+        );
+    }
+
+    #[test]
     fn retain_above_prunes_committed_keys() {
         let mut router = KeyRouter::new();
         router.mark_in_flight(b"a", Offset::new(2));
