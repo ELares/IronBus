@@ -350,6 +350,38 @@ term (it is small, bounded, and not a configured buffer cap), but the per-segmen
 bound above lets an operator add it to a hand sizing when many segments are pinned by
 a replaying consumer.
 
+### 8. Prepared transactional half messages (opt-in, #909)
+
+The transactional 2PC store
+(`crates/ironbus-storage/src/txn.rs`) buffers the FULL payload of every
+prepared-but-unresolved half message in RAM — `prepared_payloads: HashMap<Vec<u8>,
+HalfMessage>`, where each `HalfMessage` holds the original record's key + headers +
+payload VERBATIM. It costs NOTHING until a producer runs transactions (a
+non-transactional broker never materializes the `txn/` store), but once in use the
+`txn_id` is wire-supplied and attacker-chosen, so a `TxnPrepare` flood of distinct
+ids can pin one full record per prepared slot, bounded ONLY by the concurrently-
+prepared cap:
+
+```
+prepared_bytes <= max_prepared * (one half message's resident bytes)
+               <= max_prepared * MAX_FRAME_LEN
+```
+
+This is the SAME class of un-summed, config-capped, attacker-bounded RAM source as
+the dedup windows (section 6): un-bounded against the configured ceiling until the
+guard charges it. The cap is `--max-prepared` (default **65,536**,
+`DEFAULT_MAX_PREPARED`, `TxnConfig::max_prepared`, floored to 1). At the shipped
+default and a maximal ~16 MiB frame the worst case is `65_536 * 16 MiB ~= 1 TiB`, so
+a bounded ceiling MUST lower it. Because each slot is a whole maximal frame, even a
+handful of slots is a large fraction of a 64 MiB ceiling, so the `edge-tiny` preset
+lowers `--max-prepared` to **2** (~32 MiB). The engine HONORS the lowered cap
+(`Engine::set_txn_max_prepared` retunes the open txn table, mirroring
+`set_back_check_config`), so the charge is a true bound rather than a paper one: a
+prepare over the cap is REFUSED (`TxnError::TooManyPrepared`), never evicting a live,
+undelivered half message. An operator who needs more concurrent transactions raises
+BOTH `--max-prepared` and the ceiling (or sizes a byte-budget follow-up); the guard
+proves the two stay consistent at boot.
+
 ## A worked tiny-profile configuration that fits under 64 MiB
 
 Choose edge-safe knob values so the steady-state total provably sums under the
@@ -366,6 +398,7 @@ ceiling. These are the values you would pass to `serve` (or set via the
 | Max segment bytes | `--max-segment-bytes` | `8388608` (8 MiB) | DISK per segment (not RSS) |
 | Dedup window depth | `--dedup-max-ids` | `256` | remembered `msg_id`s per producer (term 6) |
 | Dedup producer cap | `--dedup-max-producers` | `64` | concurrently-tracked dedup windows (term 6) |
+| Prepared txn cap | `--max-prepared` | `2` | concurrently-prepared txn half messages (term 7) |
 
 Assume a representative edge record of ~16 KiB (key + headers + payload). Then:
 
@@ -393,6 +426,12 @@ caps regardless of whether a producer opts in at runtime (the proof is from the
 config): `dedup_max_producers * dedup_max_ids * ~704 bytes = 64 * 256 * ~704 ~= 11
 MiB` (plus a few KiB of producer keys).
 
+**Term 7, the prepared transactional half messages (#909).** Charged by the guard at
+the configured cap regardless of whether a producer runs transactions at runtime (the
+proof is from the config): `max_prepared * MAX_FRAME_LEN = 2 * ~16 MiB ~= 32 MiB`.
+Each slot is a whole maximal frame, so this term dominates the tiny profile; the
+shipped default (65,536) would be ~1 TiB and refuse.
+
 **Steady-state total (the bounded-buffer worst case the guard sums):**
 
 ```
@@ -401,13 +440,17 @@ term3 (group state)    1 MiB
 term4 (active segment) ~0
 term5 (fixed)         ~4 MiB
 term6 (dedup caps)    ~11 MiB
+term7 (prepared txns) ~32 MiB
 ---------------------------
-total                 ~20 MiB   <<  64 MiB ceiling
+total                 ~52 MiB   <  64 MiB ceiling
 ```
 
-The worst case lands well under the ceiling, leaving generous headroom. (A no-dedup
-workload allocates zero of term 6 at runtime, but the guard still charges the CAP, so
-the caps must fit — they do here.)
+The worst case lands under the ceiling. (A non-transactional or no-dedup workload
+allocates zero of terms 6/7 at runtime, but the guard still charges the CAPS, so the
+caps must fit — they do here. The prepared term dominates because each slot is a full
+maximal frame; a byte-budget knob that bounds the prepared BYTES rather than the slot
+count is the natural follow-up for an edge node that needs many small concurrent
+transactions.)
 
 ### The worst-case read-buffer caveat
 
@@ -451,7 +494,7 @@ configured caps imply provably exceeds the ceiling. The footprint is a CLOSED
 formula in the config (no live RSS), summing the FIRMLY-BOUNDED terms above:
 
 ```
-worst_case = term1 + term3 + term4mem + term5 + term6
+worst_case = term1 + term3 + term4mem + term5 + term6 + term7
 
 term1 (per-connection in-flight payloads, the firm RAM bound)
      = max_connections * per_conn_inflight
@@ -471,6 +514,13 @@ term6 (the opt-in per-producer dedup windows, #878)
   producer_id is wire-supplied, so the window COUNT is bounded only by the caps,
   NOT the connection count; at the shipped 4096 * 100_000 defaults this is ~269 GiB,
   so a bounded ceiling MUST lower the dedup caps (the edge-tiny preset does).
+term7 (the prepared transactional half messages, #909)
+     = max_prepared * PREPARED_HALF_MESSAGE_BYTES (MAX_FRAME_LEN, ~16 MiB: one
+       prepared half message buffers a whole maximal record verbatim in RAM)
+  txn_id is wire-supplied, so the prepared COUNT is bounded only by the cap, NOT the
+  connection count; at the shipped 65_536 default this is ~1 TiB, so a bounded ceiling
+  MUST lower --max-prepared (the edge-tiny preset lowers it to 2). The engine honors
+  the lowered cap (Engine::set_txn_max_prepared), so this is a real bound.
 ```
 
 THE MEMORY-BACKEND STORE FOLD (#445, refs #443): on DISK the store is term 4 of

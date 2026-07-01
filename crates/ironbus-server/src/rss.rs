@@ -255,6 +255,21 @@ pub const DEDUP_ENTRY_BYTES: u64 = 2 * ironbus_core::dedup::MAX_MSG_ID_LEN as u6
 /// default cap, ~tens of KiB at edge-tiny), dominated by the per-entry term above.
 pub const DEDUP_PRODUCER_KEY_BYTES: u64 = 3 * ironbus_core::dedup::MAX_MSG_ID_LEN as u64 + 384;
 
+/// The upper bound on ONE prepared transactional half message's RESIDENT bytes, the per-slot charge of
+/// the refuse-to-boot guard's txn term (`docs/RAM_BUDGET.md` term 7, #909). A prepared half message
+/// (`ironbus_storage::txn::HalfMessage`) buffers the original record VERBATIM — its `key` + `headers` +
+/// `payload` (plus the small `txn_id` + `stream` + struct/`HashMap`-entry overhead) — and the whole
+/// original record is bounded by the protocol frame cap, so one buffered half message is at most
+/// [`MAX_FRAME_LEN`](ironbus_proto::frame::MAX_FRAME_LEN) resident. This mirrors term 1, which likewise
+/// bounds one in-flight payload at a maximal frame; the `MAX_FRAME_LEN` headroom over a 16 MiB record
+/// body (its `+64 KiB`) absorbs the `txn_id` / `stream` / struct overhead, so the constant is a true
+/// UPPER bound. The guard charges it per `max_prepared` slot, so the proof holds whatever sizes a producer
+/// prepares.
+// `u64::from` is not yet const-callable, so a widening `as` cast is the only option in a `const`; it is
+// lossless (u32 -> u64) so the `cast_lossless` pedantic lint is a false positive here.
+#[allow(clippy::cast_lossless)]
+pub const PREPARED_HALF_MESSAGE_BYTES: u64 = ironbus_proto::frame::MAX_FRAME_LEN as u64;
+
 /// The configuration the refuse-to-boot RAM guard ([`fits_under_ram_ceiling`]) reasons about: the
 /// bounded-buffer knobs from `docs/RAM_BUDGET.md` plus `max_connections` (a server-level cap that
 /// bounds the in-flight set, the read buffers, and the thread stacks). Every field is a CONFIGURED
@@ -294,6 +309,13 @@ pub struct RamFootprintConfig {
     /// `--dedup-max-ids`: the per-producer dedup window depth (the count of remembered `msg_id`s).
     /// Bounds the per-window RAM at `dedup_max_ids` * [`DEDUP_ENTRY_BYTES`].
     pub dedup_max_ids: u64,
+    /// `--max-prepared`: the cap on concurrently-PREPARED transactional half messages (#909). Each
+    /// prepared half message buffers a full producer-controlled record VERBATIM in RAM, and the
+    /// `txn_id` is wire-supplied and attacker-chosen, so a `TxnPrepare` flood can pin up to this many
+    /// maximal records — bounded ONLY by this cap, not the connection count. The guard MUST charge it
+    /// (term 7), exactly as it charges the dedup cap (#878) and `consumer_credit`, which likewise cost
+    /// nothing until used. `0` is floored to 1 by the engine, so a `0` here charges one slot.
+    pub max_prepared: u64,
 }
 
 /// The worst-case STEADY-STATE bounded-buffer footprint (in bytes) the configured caps imply,
@@ -340,6 +362,17 @@ pub struct RamFootprintConfig {
 ///   until a consumer connects). At the shipped defaults (`4096 * 100_000 * ~704 ~= 269 GiB`) this
 ///   refuses any small ceiling, so an edge profile MUST lower `--dedup-max-ids`/`--dedup-max-producers`
 ///   (the `edge-tiny` preset does).
+/// - **Term 7, the prepared transactional half messages (#909).** `max_prepared` *
+///   [`PREPARED_HALF_MESSAGE_BYTES`]. The txn 2PC store buffers the FULL payload of every
+///   prepared-but-unresolved half message in RAM (`ironbus_storage::txn`'s `prepared_payloads`), keyed
+///   by the wire-supplied, attacker-chosen `txn_id`, so a `TxnPrepare` flood can pin up to `max_prepared`
+///   maximal records — the SAME un-summed, config-capped, attacker-bounded RAM source as the dedup
+///   windows (term 6). It is bounded only by `max_prepared`, NOT the connection count, so the guard
+///   charges the cap exactly as it charges the dedup cap. At the shipped default (`65_536 * ~16 MiB` ≈
+///   1 TiB) this refuses any small ceiling, so an edge profile MUST lower `--max-prepared` (the
+///   `edge-tiny` preset does, to a handful of slots, since each slot is a full maximal frame). The
+///   engine HONORS the lowered cap (`Engine::set_txn_max_prepared` retunes the txn table), so the
+///   charge is a true bound, not a paper one.
 ///
 /// NOT counted here, and WHY (this is the honest boundary of what the guard can prove):
 ///
@@ -424,11 +457,25 @@ pub fn worst_case_buffer_bytes(config: &RamFootprintConfig) -> u64 {
                 .saturating_mul(DEDUP_PRODUCER_KEY_BYTES),
         );
 
+    // Term 7, the PREPARED transactional half messages (`docs/RAM_BUDGET.md` section 8, #909): the txn
+    // 2PC store buffers up to `max_prepared` full half-message records in RAM, keyed by the wire-supplied
+    // `txn_id`, so the worst case is every slot holding a maximal record. Bounded only by the configured
+    // cap (not the connection count), so the guard charges the cap — the txn sibling of term 6. The
+    // engine honors the lowered cap via `Engine::set_txn_max_prepared`, so this is a real bound.
+    // Saturating, so an absurd cap refuses rather than wraps. `.max(1)` mirrors the engine's floor
+    // (`Engine::set_txn_max_prepared` clamps to >= 1), so a configured `0` still charges the one slot
+    // the engine will actually admit — matching the `max_prepared` doc.
+    let term7_prepared = config
+        .max_prepared
+        .max(1)
+        .saturating_mul(PREPARED_HALF_MESSAGE_BYTES);
+
     term1
         .saturating_add(term3)
         .saturating_add(term4_memory_store)
         .saturating_add(term5)
         .saturating_add(term6_dedup)
+        .saturating_add(term7_prepared)
 }
 
 /// The verdict of the refuse-to-boot RAM guard for a configuration ([`fits_under_ram_ceiling`]).
@@ -508,6 +555,11 @@ mod tests {
             // ~269 GiB and refuse here).
             dedup_max_producers: 64,
             dedup_max_ids: 256,
+            // The edge-tiny preset LOWERS the prepared cap (#909): each prepared half message is a full
+            // maximal frame (~16 MiB), so with ~26 MiB already spent on the other terms, only a couple of
+            // prepared slots fit under 64 MiB. 2 slots is ~32 MiB — the whole worst case lands just under
+            // the ceiling. The shipped default (65_536) would imply ~1 TiB and refuse here.
+            max_prepared: 2,
         }
     }
 
@@ -580,6 +632,7 @@ mod tests {
             in_memory_store_bytes: 0,
             dedup_max_producers: 64,
             dedup_max_ids: 1024,
+            max_prepared: 2,
         };
         assert!(matches!(
             fits_under_ram_ceiling(&cfg),
@@ -606,6 +659,7 @@ mod tests {
             in_memory_store_bytes: 0,
             dedup_max_producers: 0, // dedup off: this test isolates the term-1 count charge
             dedup_max_ids: 0,
+            max_prepared: 0, // prepared cap off (floored to 1 elsewhere): isolate the term-1 charge
         };
         let worst = worst_case_buffer_bytes(&cfg);
         // Term 1 alone is `max_connections * consumer_credit * MAX_FRAME_LEN`; the whole worst case is
@@ -636,6 +690,7 @@ mod tests {
             in_memory_store_bytes: 0,
             dedup_max_producers: 64,
             dedup_max_ids: 1024,
+            max_prepared: 2,
         };
         let high_count = RamFootprintConfig {
             consumer_credit: u64::from(ironbus_core::backpressure::DEFAULT_CREDIT_CEILING),
@@ -766,6 +821,106 @@ mod tests {
             }) > baseline,
             "a dedup_max_ids bump must STRICTLY grow the worst case (term 6 is charged)"
         );
+        // #909: a prepared-cap bump must STRICTLY grow the worst case — this PINS that term 7 is summed.
+        // A `>= baseline` check would pass even if term 7 were dropped (the mutant would equal the
+        // baseline), so this asserts strict `>`. The delta is exactly one `PREPARED_HALF_MESSAGE_BYTES`.
+        assert!(
+            worst_case_buffer_bytes(&RamFootprintConfig {
+                max_prepared: base.max_prepared + 1,
+                ..base
+            }) > baseline,
+            "a max_prepared bump must STRICTLY grow the worst case (term 7 is charged)"
+        );
+    }
+
+    #[test]
+    fn the_prepared_cap_is_charged_at_one_maximal_frame_per_slot() {
+        // #909 EXACT-CHARGE DRIFT TEST. Term 7 charges EXACTLY one maximal frame per prepared slot, so
+        // bumping `max_prepared` by N grows the worst case by N * PREPARED_HALF_MESSAGE_BYTES. The delta
+        // is asserted against a HARD product of the frame constant (not the function under test), so a
+        // dropped or drifted term-7 multiplier fails here.
+        let base = edge_tiny_footprint();
+        let bumped = RamFootprintConfig {
+            max_prepared: base.max_prepared + 3,
+            ..base
+        };
+        assert_eq!(
+            worst_case_buffer_bytes(&bumped),
+            worst_case_buffer_bytes(&base) + 3 * PREPARED_HALF_MESSAGE_BYTES,
+            "each prepared slot must be charged exactly one maximal frame (term 7)"
+        );
+        // The per-slot charge is a full protocol frame, not a token estimate: a half message buffers the
+        // whole record verbatim.
+        assert_eq!(
+            PREPARED_HALF_MESSAGE_BYTES,
+            u64::from(ironbus_proto::frame::MAX_FRAME_LEN)
+        );
+    }
+
+    #[test]
+    fn the_shipped_default_prepared_cap_is_refused_under_a_tiny_ceiling() {
+        // #909: the shipped-default prepared cap (65_536 half messages) implies ~1 TiB of buffered
+        // half-message payloads in the worst case, which CANNOT fit a 64 MiB edge ceiling. Pre-#909 the
+        // guard did not charge the prepared payloads, so an edge-tiny box booted under 64 MiB yet a
+        // `TxnPrepare` flood of distinct txn_ids could pin up to 65_536 maximal records in RAM and OOM it
+        // — the same defect class as the #878 dedup gap. The guard now charges term 7 and PROVABLY
+        // refuses unless `--max-prepared` is lowered.
+        let cfg = RamFootprintConfig {
+            max_prepared: u64::try_from(ironbus_core::txn::DEFAULT_MAX_PREPARED).unwrap(),
+            ..edge_tiny_footprint()
+        };
+        match fits_under_ram_ceiling(&cfg) {
+            RamCeilingVerdict::Exceeds {
+                worst_case_bytes, ..
+            } => assert!(
+                // A hard literal floor, not a self-referential bound: 65_536 * 16 MiB is ~1 TiB, far over
+                // the 64 MiB ceiling.
+                worst_case_bytes >= 512 * 1024 * 1024 * 1024,
+                "the default prepared cap implies ~1 TiB, got {worst_case_bytes}"
+            ),
+            other => panic!(
+                "the shipped default prepared cap under a 64 MiB ceiling must be refused, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn the_edge_tiny_prepared_cap_fits_but_a_blown_override_is_refused() {
+        // #909 headline: the edge-tiny prepared cap (a handful of slots) FITS under 64 MiB, but blowing
+        // `--max-prepared` back up (even to a modest 8 slots ≈ 128 MiB of half messages) provably cannot,
+        // so the verdict flips from Fits to Exceeds purely on term 7.
+        let fits = edge_tiny_footprint();
+        assert!(matches!(
+            fits_under_ram_ceiling(&fits),
+            RamCeilingVerdict::Fits { .. }
+        ));
+        let blown = RamFootprintConfig {
+            max_prepared: 8,
+            ..fits
+        };
+        match fits_under_ram_ceiling(&blown) {
+            RamCeilingVerdict::Exceeds {
+                worst_case_bytes, ..
+            } => assert!(
+                worst_case_bytes >= 8 * u64::from(ironbus_proto::frame::MAX_FRAME_LEN),
+                "8 prepared slots is ~128 MiB of half messages, got {worst_case_bytes}"
+            ),
+            other => panic!(
+                "a blown --max-prepared under a 64 MiB ceiling must be refused, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn an_absurd_prepared_cap_saturates_rather_than_overflows() {
+        // Belt and braces (mirrors the store-cap saturation test): a u64::MAX prepared cap times the
+        // per-slot frame charge saturates to u64::MAX (the config is then refused under any real
+        // ceiling), never wraps to a small, spuriously-fitting worst case.
+        let cfg = RamFootprintConfig {
+            max_prepared: u64::MAX,
+            ..edge_tiny_footprint()
+        };
+        assert_eq!(worst_case_buffer_bytes(&cfg), u64::MAX);
     }
 
     #[test]

@@ -294,6 +294,20 @@ impl TxnTable {
         self.config
     }
 
+    /// Retunes the concurrently-PREPARED cap IN PLACE (floored to 1), so a deployment can bound the
+    /// resident prepared-half-message RAM at boot without reopening the store (#909, the transactional
+    /// sibling of the #878 dedup cap; the refuse-to-boot RAM guard charges this cap, so the engine must
+    /// actually honor the lowered value). Mirrors how [`crate::txn::BackCheckConfig`] is retuned on the
+    /// open store via the engine's `set_back_check_config`.
+    ///
+    /// Lowering the cap below the count of already-`Prepared` txns does NOT evict any live half message
+    /// — a prepared payload is durable, undelivered data that must never be dropped (the same "refuse
+    /// the new, never forget an existing" discipline `prepare` already follows). It only refuses
+    /// FURTHER prepares until the prepared backlog drains under the new cap.
+    pub fn set_max_prepared(&mut self, max_prepared: usize) {
+        self.config.max_prepared = max_prepared.max(1);
+    }
+
     /// The number of currently-`Prepared` (unresolved) transactions.
     #[must_use]
     pub fn prepared_count(&self) -> usize {
@@ -1160,6 +1174,35 @@ mod tests {
         });
         assert_eq!(t.config().max_prepared, 1);
         assert_eq!(t.config().max_resolved_tombstones, 1);
+    }
+
+    #[test]
+    fn set_max_prepared_retunes_the_cap_in_place_and_floors_to_one() {
+        // #909: the RAM guard charges the prepared cap, so a deployment retunes it at boot; the engine
+        // applies it to the open table via this setter. A lowered cap is enforced on the NEXT prepare,
+        // and a `0` floors to 1 (like `new`), never disabling the bound.
+        let mut t = TxnTable::new(TxnConfig {
+            max_prepared: 10,
+            max_resolved_tombstones: 10,
+        });
+        t.prepare(b"a", 1).unwrap();
+        t.prepare(b"b", 2).unwrap();
+        // Lower the cap below the live count: existing prepares are NOT evicted, but a further prepare is
+        // refused until the backlog drains.
+        t.set_max_prepared(2);
+        assert_eq!(t.config().max_prepared, 2);
+        assert_eq!(t.prepared_count(), 2);
+        assert_eq!(
+            t.prepare(b"c", 3),
+            Err(TxnError::TooManyPrepared { cap: 2 }),
+            "a prepare past the retuned cap is refused"
+        );
+        // Resolving one frees a slot; a fresh prepare then fits under the retuned cap.
+        t.commit(b"a", 4).unwrap();
+        t.prepare(b"c", 5).unwrap();
+        // A zero cap floors to 1 rather than disabling the bound.
+        t.set_max_prepared(0);
+        assert_eq!(t.config().max_prepared, 1);
     }
 
     #[test]
