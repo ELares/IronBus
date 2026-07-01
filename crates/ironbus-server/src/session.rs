@@ -4441,7 +4441,11 @@ fn write_pub_reply_gated<
             // record is durable on the leader but is NOT quorum-fsync'd, so acking it would be a lie).
             // The connection stays open; the producer can retry once the ISR recovers.
             Some(crate::cluster::dataplane::AckDisposition::Rejected) => {
-                reply_err(out, "not enough in-sync replicas to quorum-commit; retry");
+                reply_err_coded(
+                    out,
+                    crate::codes::ErrorCode::ERR_NOT_ENOUGH_ISR.as_str(),
+                    "not enough in-sync replicas to quorum-commit; retry",
+                );
             }
         }
         return Ok(());
@@ -7306,6 +7310,78 @@ mod tests {
         assert!(
             out.is_empty(),
             "a fire-and-forget dedup hit must send no frame: {out:?}"
+        );
+    }
+
+    /// A mock whose fresh produce clears the actor (`Appended`) but whose cluster ack gate REJECTS the
+    /// quorum-commit (the parked-ack backlog is at its cap under an unsatisfiable ISR): the reply site
+    /// must emit the RETRYABLE `ERR_NOT_ENOUGH_ISR`-coded Err, not a `PubAck`. For #965.
+    struct IsrRejectingEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for IsrRejectingEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            Ok(ProduceOutcome::Appended(Offset::new(7)))
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+        fn has_client_ack_gate(&self) -> bool {
+            true
+        }
+        fn client_ack_disposition(
+            &self,
+            _member: MemberId,
+            _offset: u64,
+            _reply_bytes: Vec<u8>,
+        ) -> Option<crate::cluster::dataplane::AckDisposition> {
+            Some(crate::cluster::dataplane::AckDisposition::Rejected)
+        }
+    }
+
+    #[test]
+    fn an_isr_rejected_produce_carries_the_stable_retryable_code() {
+        // #965: the ISR-rejected quorum-commit (`AckDisposition::Rejected`) is a genuinely RETRYABLE
+        // condition. It must reply with an Err carrying the STABLE `ERR_NOT_ENOUGH_ISR` code in front of
+        // the human message, so a client branches on the code (retry) instead of substring-matching prose
+        // — never a PubAck (the record is durable only on the leader, so acking it would be a lie).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &IsrRejectingEngine,
+            &frame(FrameType::Connect, b""),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        connect_and_pub(&mut s, &IsrRejectingEngine, &mut out);
+
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "an ISR reject must be an Err, not a PubAck"
+        );
+        let decoded = ironbus_proto::err::decode_err_body(&body);
+        assert_eq!(
+            decoded.code,
+            Some(ironbus_proto::err::ServerErrorCode::NotEnoughIsr),
+            "the ISR reject must carry the stable retryable code",
+        );
+        assert_eq!(
+            decoded.message, "not enough in-sync replicas to quorum-commit; retry",
+            "the human message is preserved verbatim",
         );
     }
 

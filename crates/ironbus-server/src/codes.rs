@@ -158,6 +158,15 @@ impl ErrorCode {
     /// at-capacity [`EngineError::Storage`].
     pub const ERR_AT_CAPACITY: ErrorCode = ErrorCode("ERR_AT_CAPACITY");
 
+    /// A clustered `C2-fsync` produce could not be quorum-committed because the partition's parked-ack
+    /// backlog is at its cap (#864/#883): an unsatisfiable ISR is already withholding the cap's worth of
+    /// acks, so the data plane refused to park another (the honest unavailable-over-unsafe signal) rather
+    /// than grow toward OOM or ack a record durable only on the leader. A genuinely RETRYABLE condition —
+    /// the producer backs off and retries once the ISR recovers. Not an `EngineError` and not an
+    /// `AppendOutcome`: it is the [`AckDisposition::Rejected`](crate::cluster::dataplane::AckDisposition)
+    /// gate outcome, tagged directly at its reply site. The contract's `ERR_NOT_ENOUGH_ISR`.
+    pub const ERR_NOT_ENOUGH_ISR: ErrorCode = ErrorCode("ERR_NOT_ENOUGH_ISR");
+
     /// The lease generation space is exhausted (unreachable in practice). Maps
     /// [`EngineError::GenerationExhausted`].
     pub const ERR_GENERATION_EXHAUSTED: ErrorCode = ErrorCode("ERR_GENERATION_EXHAUSTED");
@@ -244,7 +253,8 @@ mod tests {
     // crate's `from_token` map (the client cannot depend on this crate); this test PINS the two together
     // so a rename here that the proto map misses fails CI. Every code the server places on an `Err`
     // frame — the `EngineError` rejections plus the `AppendOutcome` signals (`ERR_AT_CAPACITY`,
-    // `ERR_PRODUCER_FENCED`, `ERR_OUT_OF_ORDER_SEQUENCE`) — must round-trip through the proto enum.
+    // `ERR_PRODUCER_FENCED`, `ERR_OUT_OF_ORDER_SEQUENCE`) plus the `AckDisposition` gate reject
+    // (`ERR_NOT_ENOUGH_ISR`) — must round-trip through the proto enum.
     fn every_wire_code_is_recognized_by_the_proto_decoder() {
         use ironbus_proto::err::ServerErrorCode;
         let wire_codes = [
@@ -269,6 +279,7 @@ mod tests {
             ErrorCode::ERR_TXN,
             ErrorCode::ERR_TXN_CHECK_UNAUTHORIZED,
             ErrorCode::ERR_AT_CAPACITY,
+            ErrorCode::ERR_NOT_ENOUGH_ISR,
             ErrorCode::ERR_PRODUCER_FENCED,
             ErrorCode::ERR_OUT_OF_ORDER_SEQUENCE,
         ];
@@ -289,6 +300,7 @@ mod tests {
             "ERR_CUMULATIVE_ACK_NOT_ALLOWED"
         );
         assert_eq!(ErrorCode::ERR_ACK_NOT_OWNED.as_str(), "ERR_ACK_NOT_OWNED");
+        assert_eq!(ErrorCode::ERR_NOT_ENOUGH_ISR.as_str(), "ERR_NOT_ENOUGH_ISR");
         assert_eq!(ErrorCode::OFFSET_TRIMMED.as_str(), "OFFSET_TRIMMED");
         assert_eq!(ErrorCode::OFFSET_COMPACTED.as_str(), "OFFSET_COMPACTED");
         assert_eq!(

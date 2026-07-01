@@ -40,6 +40,10 @@ pub enum ServerErrorCode {
     /// `ERR_AT_CAPACITY`: the durable log is at its byte cap (the drop-new shed) — a benign,
     /// retryable backpressure signal, NOT a permanent reject.
     AtCapacity,
+    /// `ERR_NOT_ENOUGH_ISR`: a clustered `C2-fsync` produce could not be quorum-committed because the
+    /// partition's parked-ack backlog is at its cap (not enough in-sync replicas) — a RETRYABLE
+    /// unavailable-over-unsafe signal, NOT a permanent reject: retry once the ISR recovers.
+    NotEnoughIsr,
     /// `ERR_STORAGE`: a generic storage fault.
     Storage,
     /// `ERR_PRODUCER_FENCED`: a produce presented a stale producer epoch (a zombie session).
@@ -94,6 +98,7 @@ impl ServerErrorCode {
     pub fn from_token(token: &str) -> Option<Self> {
         let code = match token {
             "ERR_AT_CAPACITY" => Self::AtCapacity,
+            "ERR_NOT_ENOUGH_ISR" => Self::NotEnoughIsr,
             "ERR_STORAGE" => Self::Storage,
             "ERR_PRODUCER_FENCED" => Self::ProducerFenced,
             "ERR_OUT_OF_ORDER_SEQUENCE" => Self::OutOfOrderSequence,
@@ -126,6 +131,7 @@ impl ServerErrorCode {
     pub fn as_token(self) -> &'static str {
         match self {
             Self::AtCapacity => "ERR_AT_CAPACITY",
+            Self::NotEnoughIsr => "ERR_NOT_ENOUGH_ISR",
             Self::Storage => "ERR_STORAGE",
             Self::ProducerFenced => "ERR_PRODUCER_FENCED",
             Self::OutOfOrderSequence => "ERR_OUT_OF_ORDER_SEQUENCE",
@@ -266,6 +272,7 @@ mod tests {
     fn every_variant_round_trips_through_its_token() {
         for code in [
             ServerErrorCode::AtCapacity,
+            ServerErrorCode::NotEnoughIsr,
             ServerErrorCode::Storage,
             ServerErrorCode::ProducerFenced,
             ServerErrorCode::OutOfOrderSequence,
