@@ -107,7 +107,8 @@ pub struct FileLayer {
     /// (durations/sizes as decimal-integer strings, bools as `true`/`false`, lists comma-joined,
     /// plain strings as-is), so the file value flows through the same parse path as an env value.
     by_env_name: BTreeMap<String, String>,
-    /// Non-fatal warnings to surface (unknown keys downgraded by `--allow-unknown-config`).
+    /// Non-fatal warnings to surface (unknown keys downgraded by `--allow-unknown-config`, and
+    /// reserved-but-unwired sections whose keys are accepted-but-ignored per #898).
     warnings: Vec<String>,
     /// True when the file explicitly set ANY retention key (drives the coupled-set
     /// "retention requested but all off" check, which fires only on an explicit request).
@@ -248,6 +249,12 @@ pub fn load_config_file(
             return Err(ConfigFileError::UnknownKeys(unknown));
         }
     }
+    // A reserved-but-unwired section (`[auth]`/`[observability]`/`[compression]`) parses clean but
+    // silently swallows every key (#898). Surface each such section as a non-fatal WARN so a
+    // misplaced security/codec setting is not believed-applied while being dead. This is
+    // independent of `--allow-unknown-config`: the section is tolerated by design, but its
+    // accepted-but-ignored keys still warrant a loud warning.
+    warnings.extend(config::reserved_section_warnings(&key_set));
 
     // Build the env-name override layer from the KNOWN keys only (an unknown key, if it reached
     // here, was downgraded and is ignored, never wired into a knob).
@@ -482,11 +489,22 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_section_key_is_tolerated() {
+    fn a_reserved_section_key_is_tolerated_but_warned() {
         let doc = "[observability]\nmetrics_addr = \"127.0.0.1:9000\"\n[auth]\ntoken = \"x\"\n";
         let layer = load_config_file("/x.toml", false, &reader(doc)).unwrap();
-        // No rejection, no warning: a reserved-but-unwired section is allowed.
-        assert!(layer.warnings().is_empty());
+        // NOT rejected (the frozen-section contract still starts the broker), but #898 requires a
+        // loud non-fatal WARN so the accepted-but-ignored keys are not silently swallowed.
+        let warnings = layer.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("IGNORED")));
+        assert!(warnings.iter().any(|w| w.contains("[auth]")
+            && w.contains("auth.token")
+            && w.contains("--auth-config")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("[observability]") && w.contains("observability.metrics_addr")));
+        // The reserved keys are still NOT wired into any knob.
+        assert!(layer.lookup_env_name("IRONBUS_METRICS_ADDR").is_none());
     }
 
     #[test]
