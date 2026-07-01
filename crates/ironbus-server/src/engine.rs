@@ -7219,10 +7219,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 skipped,
             });
         }
-        // Prune any in-flight key entry at or below the committed cursor: a committed offset is
-        // acked, so its key is no longer busy. This keeps the per-key map bounded to the in-flight
-        // window (mirrors how the session prunes its `leased` map past the committed cursor) and
-        // also frees a key whose owner left and whose record was committed past elsewhere.
+        // Prune any in-flight key entry strictly below the committed cursor: only an offset below
+        // it is acked, so its key is no longer busy (the entry at off == committed is not yet acked
+        // and is kept). This keeps the per-key map bounded to the in-flight window (mirrors how the
+        // session prunes its `leased` map past the committed cursor) and also frees a key whose
+        // owner left and whose record was committed past elsewhere.
         if let Some(router) = g.router.as_mut() {
             router.retain_above(Offset::new(committed));
         }

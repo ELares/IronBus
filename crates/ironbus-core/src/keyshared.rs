@@ -234,9 +234,11 @@ impl KeyRouter {
         }
     }
 
-    /// Drops every in-flight entry at or below `committed`, keeping the per-key map bounded to
+    /// Drops every in-flight entry strictly below `committed`, keeping the per-key map bounded to
     /// the in-flight window (mirrors how the session prunes its `leased` map past the committed
-    /// cursor). An offset below the committed cursor is acked, so its key is no longer busy.
+    /// cursor). Only an offset strictly below the committed cursor is acked, so the entry at
+    /// `off == committed` (the next offset to resume from, not yet acked) is KEPT and its key
+    /// stays busy.
     pub fn retain_above(&mut self, committed: Offset) {
         let floor = committed.get();
         self.in_flight.retain(|_, &mut off| off >= floor);
@@ -549,6 +551,51 @@ mod tests {
         // Committing past offset 4 frees key "a" (offset 2 < 4) but not "b" (offset 5 >= 4).
         router.retain_above(Offset::new(4));
         assert_eq!(router.busy_keys(), 1);
+    }
+
+    #[test]
+    fn retain_above_keeps_the_entry_at_exactly_the_committed_offset() {
+        // The load-bearing boundary of `retain_above`: `committed` is the NEXT offset to resume
+        // from (every offset strictly BELOW it is acked), so the record AT `off == committed` is
+        // not yet acked and its key must stay busy. The predicate keeps `off >= floor`, so a
+        // `>` vs `>=` slip would drop the commit-edge record and free its key one offset early,
+        // silently breaking per-key serialization at the commit boundary. This pins all three
+        // sides of the boundary: `<` dropped, `==` kept, `>` kept.
+        let mut router = KeyRouter::new();
+        router.mark_in_flight(b"lo", Offset::new(3)); // < committed: acked, dropped
+        router.mark_in_flight(b"eq", Offset::new(4)); // == committed: NOT acked, kept
+        router.mark_in_flight(b"hi", Offset::new(5)); // > committed: kept
+        assert_eq!(router.busy_keys(), 3);
+
+        router.retain_above(Offset::new(4));
+
+        // Only "lo" (3 < 4) is pruned; the commit-edge "eq" (4) and "hi" (5) survive.
+        assert_eq!(
+            router.busy_keys(),
+            2,
+            "the entry at off == committed must be KEPT (its record is not yet acked)"
+        );
+
+        // The commit-edge key is still BUSY, observed through `decide`: its own offset 4 is a
+        // redelivery (Deliver to its owner), but any HIGHER offset of the same key is refused
+        // KeyBusy, proving the key was not freed by the retain at `== committed`.
+        let mut router = KeyRouter::new();
+        router.join(member(1));
+        router.join(member(2));
+        router.join(member(3));
+        let owner = router.owner(b"eq").expect("a live group has an owner");
+        router.mark_in_flight(b"eq", Offset::new(4));
+        router.retain_above(Offset::new(4));
+        assert_eq!(
+            router.decide(owner, b"eq", Offset::new(4)),
+            RouteDecision::Deliver,
+            "the commit-edge record's own redelivery is allowed through"
+        );
+        assert_eq!(
+            router.decide(owner, b"eq", Offset::new(8)),
+            RouteDecision::KeyBusy,
+            "the key at off == committed is still busy: its next record must wait"
+        );
     }
 
     #[test]
