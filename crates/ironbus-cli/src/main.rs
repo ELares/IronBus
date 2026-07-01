@@ -7732,6 +7732,10 @@ fn run_dataplane_bootstrap(
         configured_level,
         leader_client_addrs,
         std::sync::Arc::clone(status),
+        // No operator override (#915): the data-plane inbound-reader cap sizes itself to this node's
+        // legitimate led-partition follower fanout, floored at the old constant — a high-fanout leader
+        // admits every real follower link while an unauthenticated flood stays bounded.
+        None,
     ) {
         Ok(r) => r,
         Err(e) => {

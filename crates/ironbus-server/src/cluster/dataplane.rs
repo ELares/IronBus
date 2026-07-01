@@ -580,6 +580,24 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         self.roles.len()
     }
 
+    /// The count of LEGITIMATE inbound data-plane links this node must admit as a LEADER: Σ over the
+    /// partitions this node leads of (that partition's configured follower count). Each led partition's
+    /// followers each hold one inbound link (their fetch/report loop) into this node's data-plane
+    /// listener, so this sum is the node's legitimate inbound-link fanout. It sizes the data-plane reader
+    /// cap (#915): a high-partition-fanout leader whose fanout exceeds the old fixed 256 must not refuse a
+    /// real follower. FOLLOWER roles contribute nothing (this node DIALS out for those, it is not their
+    /// inbound leader). Derived purely from the committed placement/roles, so it is deterministic.
+    #[must_use]
+    pub fn led_inbound_link_count(&self) -> usize {
+        self.roles
+            .values()
+            .map(|role| match role {
+                PartitionRole::Leader { isr, .. } => isr.follower_count(),
+                PartitionRole::Follower { .. } => 0,
+            })
+            .sum()
+    }
+
     /// Whether this node currently LEADS `partition`.
     #[must_use]
     pub fn is_leader(&self, partition: u64) -> bool {
