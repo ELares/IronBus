@@ -176,7 +176,17 @@ impl core::fmt::Display for ClientError {
     }
 }
 
-impl std::error::Error for ClientError {}
+impl std::error::Error for ClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ClientError::Io(e) => Some(e),
+            ClientError::Frame(e) => Some(e),
+            ClientError::Body(e) => Some(e),
+            ClientError::Decompress { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
@@ -3640,6 +3650,53 @@ pub struct FlushSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_error_source_chain_exposes_the_wrapped_inner_cause() {
+        // #892: a WRAPPING ClientError variant now overrides `source()` to return its typed inner
+        // error, so chain-walkers (`anyhow`/`eyre` `.source()` loops, structured loggers) and
+        // `downcast_ref` reach the root cause instead of stopping at the wrapper. Before the fix the
+        // impl body was empty and `source()` returned `None` for every variant.
+        use std::error::Error as _;
+
+        // Io wraps an io::Error: the source is present AND downcasts back to the concrete kind.
+        let io = ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+        let src = io
+            .source()
+            .expect("Io must expose its wrapped io::Error as source()");
+        let inner: &io::Error = src
+            .downcast_ref::<io::Error>()
+            .expect("the source downcasts back to io::Error");
+        assert_eq!(inner.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Frame wraps a FrameError.
+        let frame = ClientError::Frame(FrameError::EmptyFrame);
+        assert!(
+            frame.source().is_some(),
+            "Frame must expose its wrapped FrameError as source()"
+        );
+
+        // Decompress carries its inner cause in the `source` field.
+        let decomp = ClientError::Decompress {
+            source: DecompressError::CorruptStream,
+            offset: 7,
+            generation: 3,
+        };
+        assert!(
+            decomp.source().is_some(),
+            "Decompress must expose its wrapped DecompressError as source()"
+        );
+
+        // A LEAF / stringly variant genuinely has no inner error, so it must still return None
+        // (the discriminating half: we did NOT blanket-return Some).
+        let leaf = ClientError::BadResponse("nope");
+        assert!(
+            leaf.source().is_none(),
+            "a leaf variant carries no inner error and must return None"
+        );
+        let closed = ClientError::Closed;
+        assert!(closed.source().is_none(), "a unit variant has no source");
+    }
 
     #[test]
     fn ingest_delivery_caps_the_aggregate_decompressed_bytes() {

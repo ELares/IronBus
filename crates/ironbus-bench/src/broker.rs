@@ -44,7 +44,14 @@ impl core::fmt::Display for BrokerError {
     }
 }
 
-impl std::error::Error for BrokerError {}
+impl std::error::Error for BrokerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BrokerError::Spawn(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// A running `ironbus serve` broker on a loopback port, killed and reaped on drop.
 #[derive(Debug)]

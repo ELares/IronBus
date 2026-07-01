@@ -133,7 +133,14 @@ impl std::fmt::Display for UpgradeError {
     }
 }
 
-impl std::error::Error for UpgradeError {}
+impl std::error::Error for UpgradeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            UpgradeError::Io(_, e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// The path of the retained rollback copy for a destination binary: `<dest>.prev`.
 #[must_use]

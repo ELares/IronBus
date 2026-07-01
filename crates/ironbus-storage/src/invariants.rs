@@ -90,7 +90,14 @@ impl std::fmt::Display for InvariantViolation {
     }
 }
 
-impl std::error::Error for InvariantViolation {}
+impl std::error::Error for InvariantViolation {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            InvariantViolation::LossCapExceeded(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// I1: no acknowledged write is lost below its durability level. Every offset the producer was
 /// told is durable must be present in the recovered log.

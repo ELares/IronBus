@@ -100,7 +100,15 @@ impl From<ActorGone> for SessionError {
     }
 }
 
-impl std::error::Error for SessionError {}
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SessionError::BadFrame(e) => Some(e),
+            SessionError::EngineFatal(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// The result of one [`Session::process`] pass over a connection's input buffer: how much was
 /// consumed and the minimum buffer length before the next pass can make progress on the partial

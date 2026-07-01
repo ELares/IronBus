@@ -97,7 +97,14 @@ impl std::fmt::Display for SidecarError {
     }
 }
 
-impl std::error::Error for SidecarError {}
+impl std::error::Error for SidecarError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SidecarError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for SidecarError {
     fn from(e: io::Error) -> SidecarError {

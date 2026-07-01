@@ -442,7 +442,16 @@ impl core::fmt::Display for GeoError {
     }
 }
 
-impl std::error::Error for GeoError {}
+impl std::error::Error for GeoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GeoError::CorruptFrame { reason, .. } => Some(reason),
+            GeoError::Storage(e) => Some(e),
+            GeoError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for GeoError {
     fn from(e: io::Error) -> Self {

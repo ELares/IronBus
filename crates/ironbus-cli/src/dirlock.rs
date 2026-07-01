@@ -58,7 +58,14 @@ impl fmt::Display for DirError {
     }
 }
 
-impl std::error::Error for DirError {}
+impl std::error::Error for DirError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DirError::NotWritable(_, e) | DirError::LockIo(_, e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// The name of the lock file inside the data directory. It lives alongside the segments and the
 /// cursor checkpoints; the storage layer never reads or writes it (segment/checkpoint names are
