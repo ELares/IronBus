@@ -130,6 +130,22 @@ pub enum AuditEvent {
         /// What changed, as a non-secret summary (e.g. `"startup"`, `"reload: 2 key(s) applied"`).
         summary: String,
     },
+    /// A pre-auth `DoS` defense refused a connection at accept time, BEFORE a handler thread was
+    /// spawned or a single handshake byte was read (#887). The accept loop refuses the connection
+    /// outright, so no session-side [`AuditEvent::AuthOutcome`] can fire for it; without this event the
+    /// audit stream would go blind exactly during a lockout or an online credential-guessing attack
+    /// (its highest-signal window), while `rejected_total{reason}` keeps climbing on the metrics
+    /// transport. The `source_ip` is a safe, non-secret handle; `reason` is the SAME bounded
+    /// low-cardinality tag the metric uses ([`crate::connz::RejectReason::as_str`]).
+    PreAuthRejection {
+        /// The source IP the connection was refused from (a safe, non-secret handle — never a
+        /// credential, and never attacker-supplied content: it is the observed peer address).
+        source_ip: String,
+        /// The bounded rejection reason (`rate_limited` / `half_open_cap` / `locked_out`), the same
+        /// `RejectReason::as_str` tag as `rejected_total{reason}`, so the audit event and the metric
+        /// name the decision identically.
+        reason: &'static str,
+    },
 }
 
 impl AuditEvent {
@@ -141,6 +157,7 @@ impl AuditEvent {
             AuditEvent::AuthzDenial { .. } => "authz_denial",
             AuditEvent::SecretPermissionRefusal { .. } => "secret_permission_refusal",
             AuditEvent::ConfigChange { .. } => "config_change",
+            AuditEvent::PreAuthRejection { .. } => "preauth_rejection",
         }
     }
 
@@ -174,6 +191,10 @@ impl AuditEvent {
             }
             AuditEvent::ConfigChange { summary } => {
                 push_field(out, "summary", summary);
+            }
+            AuditEvent::PreAuthRejection { source_ip, reason } => {
+                push_field(out, "source_ip", source_ip);
+                push_static(out, "reason", reason);
             }
         }
     }
@@ -395,9 +416,13 @@ mod tests {
         emitter.emit(&AuditEvent::ConfigChange {
             summary: "startup".to_string(),
         });
+        emitter.emit(&AuditEvent::PreAuthRejection {
+            source_ip: "203.0.113.7".to_string(),
+            reason: "locked_out",
+        });
         let text = rendered(&buf);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5, "one line per event: {text}");
+        assert_eq!(lines.len(), 6, "one line per event: {text}");
 
         // The common envelope is present on every line, and the sequence is monotonic 0..5.
         for (i, line) in lines.iter().enumerate() {
@@ -423,6 +448,9 @@ mod tests {
         assert!(lines[3].contains("condition=group_world_readable"));
         assert!(lines[4].starts_with("event=config_change"));
         assert!(lines[4].contains("summary=\"startup\""));
+        assert!(lines[5].starts_with("event=preauth_rejection"));
+        assert!(lines[5].contains("source_ip=\"203.0.113.7\""));
+        assert!(lines[5].contains("reason=locked_out"));
     }
 
     #[test]
@@ -511,6 +539,11 @@ mod tests {
                 summary: String::new(),
             }
             .type_tag(),
+            AuditEvent::PreAuthRejection {
+                source_ip: String::new(),
+                reason: "locked_out",
+            }
+            .type_tag(),
         ];
         let got: std::collections::BTreeSet<&str> = all.into_iter().collect();
         let expected: std::collections::BTreeSet<&str> = [
@@ -518,6 +551,7 @@ mod tests {
             "authz_denial",
             "secret_permission_refusal",
             "config_change",
+            "preauth_rejection",
         ]
         .into_iter()
         .collect();
