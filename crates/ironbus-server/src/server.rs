@@ -349,9 +349,23 @@ where
                 let half_open_slot = match preauth.as_ref() {
                     Some(guard) => match guard.on_accept(addr.ip()) {
                         Ok(slot) => Some(slot),
-                        Err(_reason) => {
-                            // The guard already recorded `rejected_total{reason}`; refuse this
-                            // connection before it can consume a handler thread or a handshake byte.
+                        Err(reason) => {
+                            // The guard already recorded `rejected_total{reason}`. ALSO emit a
+                            // structured audit event (#887): the accept loop refuses this connection
+                            // before a handler thread spawns, so no session-side `AuthOutcome` can
+                            // fire for it — without this, the dedicated audit transport (SIEM/forensics)
+                            // goes blind exactly during a lockout/rate-limit window (the highest-signal
+                            // part of an online credential-guessing attack), while attempts keep
+                            // arriving. `source_ip` is a safe handle; `reason` is the same bounded tag
+                            // as the metric. No-op on the no-audit serve path (byte-for-byte historical).
+                            if let Some(audit) = audit.as_ref() {
+                                audit.emit(&crate::audit::AuditEvent::PreAuthRejection {
+                                    source_ip: addr.ip().to_string(),
+                                    reason: reason.as_str(),
+                                });
+                            }
+                            // Refuse this connection before it can consume a handler thread or a
+                            // handshake byte.
                             drop(stream);
                             continue;
                         }
@@ -702,6 +716,19 @@ mod tests {
         let mut v = Vec::new();
         encode_frame(ty, body, &mut v).unwrap();
         v
+    }
+
+    /// A `Write` over a shared `Vec<u8>` so a test reads back exactly what an audit emitter wrote
+    /// (#887). Module-scoped so it does not trip the `items-after-statements` lint inside a test body.
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// Reads from `stream` until one complete frame is available, returning its type and
@@ -1110,6 +1137,119 @@ mod tests {
             connz.snapshot().rejected_half_open_cap,
             0,
             "no half-open rejection (the cap is disabled here)"
+        );
+
+        drop(c1);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = recover_engine(handle, actor);
+    }
+
+    #[test]
+    fn preauth_rejection_emits_an_audit_event_not_just_a_metric() {
+        // #887 end-to-end: a pre-auth rejection at accept time must ALSO surface on the security AUDIT
+        // stream, not only the `rejected_total{reason}` metric. With a per-IP rate limit (burst 1, 1/s)
+        // and a NON-advancing injected clock, the FIRST loopback connection handshakes (spends the one
+        // token) and the SECOND from the same IP is REFUSED before a handler thread — the accept loop
+        // then emits `event=preauth_rejection reason=rate_limited`. Without the fix the audit stream is
+        // blind here (the connection never reaches a session, so no `AuthOutcome` can fire): this test
+        // fails on the old code. Deterministic — the guard clock never advances, so no token refills.
+        use crate::audit::{AuditEmitter, AuditSink};
+        use crate::preauth::{PreAuthConfig, PreAuthGuard};
+        use ironbus_core::clock::ManualClock;
+        use std::sync::Mutex;
+
+        let (handle, actor) = spawn_inmem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connz = Arc::new(ConnectionMetrics::new());
+        let audit_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let audit = AuditEmitter::new(
+            AuditSink::writer(Box::new(SharedBuf(Arc::clone(&audit_buf)))),
+            Arc::new(ManualClock::new()) as Arc<dyn ironbus_core::clock::Clock>,
+        );
+        // Burst 1 / rate 1 with a frozen guard clock: one token, no refill.
+        let guard = Arc::new(PreAuthGuard::new(
+            PreAuthConfig {
+                per_ip_rate_per_sec: 1,
+                per_ip_burst: 1,
+                half_open_cap: 0,
+                lockout_threshold: 0,
+                lockout_window_ms: 0,
+                lockout_cooldown_ms: 0,
+            },
+            Arc::new(ManualClock::new()) as Arc<dyn ironbus_core::clock::Clock>,
+            Arc::clone(&connz),
+        ));
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let connz = Arc::clone(&connz);
+            let guard = Arc::clone(&guard);
+            let audit = audit.clone();
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve_with_auth_connz_preauth_audit(
+                    &listener,
+                    &engine,
+                    &shutdown,
+                    16,
+                    &clock,
+                    &beacon,
+                    None,
+                    &connz,
+                    Some(guard),
+                    Some(audit),
+                )
+                .unwrap();
+            }
+        });
+
+        // FIRST connection: admitted, handshakes (spends the one token).
+        let mut c1 = TcpStream::connect(addr).unwrap();
+        c1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = Vec::new();
+        c1.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(read_one_frame(&mut c1, &mut buf).0, FrameType::Info);
+
+        // SECOND connection from the same loopback IP: refused before a handler. Poll the AUDIT buffer
+        // (the load-bearing #887 signal) for the structured rejection event, bounded-retry.
+        let mut audited = false;
+        for _ in 0..50 {
+            if let Ok(mut c2) = TcpStream::connect(addr) {
+                c2.set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                let _ = c2.write_all(&frame(FrameType::Connect, b""));
+                let mut b = [0u8; 16];
+                let n = c2.read(&mut b).unwrap_or(0);
+                if n == 0 {
+                    for _ in 0..50 {
+                        let text = String::from_utf8(audit_buf.lock().unwrap().clone()).unwrap();
+                        if text.contains("event=preauth_rejection")
+                            && text.contains("reason=rate_limited")
+                        {
+                            audited = true;
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            if audited {
+                break;
+            }
+        }
+        let text = String::from_utf8(audit_buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            audited,
+            "a pre-auth rejection must emit an audit event, not just a metric; audit stream was: {text:?}"
+        );
+        // The refused connection carried the safe source-IP handle (loopback here), never a credential.
+        assert!(
+            text.contains("source_ip=\"127.0.0.1\""),
+            "the rejection event records the source IP handle: {text:?}"
         );
 
         drop(c1);
