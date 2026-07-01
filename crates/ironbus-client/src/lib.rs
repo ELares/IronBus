@@ -78,8 +78,13 @@ pub enum ClientError {
     Frame(FrameError),
     /// A malformed message body from the server.
     Body(BodyError),
-    /// The server replied with an error: the UTF-8 message it sent.
-    Server(String),
+    /// The server replied with an error: the human message it sent, PLUS the stable
+    /// machine-readable [`ServerErrorCode`] the broker tagged it with when one applies (#883), so a
+    /// caller branches on [`ServerError::code`] (retry-vs-fail, backpressure-vs-permanent-reject)
+    /// instead of substring-matching prose the broker is free to reword. The code is `None` for an
+    /// uncoded rejection (a malformed-body literal, the uniform auth violation, or a code this build
+    /// predates); the human message is always present.
+    Server(ServerError),
     /// The server replied with an unexpected (but known) frame type for the request.
     Unexpected(FrameType),
     /// The server sent a frame whose type tag this client does not recognize.
@@ -176,6 +181,106 @@ impl std::error::Error for ClientError {}
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         ClientError::Io(e)
+    }
+}
+
+/// The stable, machine-readable server rejection code (#883, #35), re-exported from `ironbus-proto`.
+#[doc(no_inline)]
+pub use ironbus_proto::err::ServerErrorCode;
+
+/// A server rejection: the stable machine-readable [`ServerErrorCode`] the broker tagged it with (when
+/// one applies), plus the human message it sent (#883). Carried by [`ClientError::Server`].
+///
+/// Branch on [`ServerError::code`] for control flow (retry-vs-fail, backpressure-vs-permanent-reject)
+/// — e.g. `Some(ServerErrorCode::AtCapacity)` is a benign, retryable drop-new shed, distinct from a
+/// permanent reject — and use the message for display only. `code` is `None` for an uncoded rejection
+/// (a malformed-body literal, the uniform anti-enumeration auth violation, or a newer code this build
+/// predates); the human message is always present.
+///
+/// The type dereferences to its message `str`, so an older caller that substring-matched the message
+/// keeps compiling and working unchanged while it migrates to the code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerError {
+    /// The stable code the broker tagged this rejection with, or `None` when uncoded / unrecognized.
+    pub code: Option<ServerErrorCode>,
+    /// The human-readable message, for display.
+    pub message: String,
+}
+
+impl ServerError {
+    /// Decodes a wire `Err` frame body into its optional code and human message (#883).
+    #[must_use]
+    pub fn from_wire(body: &[u8]) -> ServerError {
+        let decoded = ironbus_proto::err::decode_err_body(body);
+        ServerError {
+            code: decoded.code,
+            message: decoded.message.into_owned(),
+        }
+    }
+
+    /// An uncoded rejection carrying only a human message (a client-synthesized error, e.g. a
+    /// `NotLeader` summary), with no stable code.
+    #[must_use]
+    pub fn uncoded(message: String) -> ServerError {
+        ServerError {
+            code: None,
+            message,
+        }
+    }
+
+    /// The stable machine-readable code the broker tagged this rejection with, or `None` when uncoded.
+    #[must_use]
+    pub fn code(&self) -> Option<ServerErrorCode> {
+        self.code
+    }
+
+    /// The human-readable message, for display.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl core::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl core::ops::Deref for ServerError {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl PartialEq<&str> for ServerError {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+impl PartialEq<str> for ServerError {
+    fn eq(&self, other: &str) -> bool {
+        self.message == other
+    }
+}
+
+impl PartialEq<String> for ServerError {
+    fn eq(&self, other: &String) -> bool {
+        &self.message == other
+    }
+}
+
+impl From<String> for ServerError {
+    fn from(message: String) -> ServerError {
+        ServerError::uncoded(message)
+    }
+}
+
+impl From<&str> for ServerError {
+    fn from(message: &str) -> ServerError {
+        ServerError::uncoded(message.to_string())
     }
 }
 
@@ -483,7 +588,7 @@ pub enum ProgressOutcome {
 enum PubReply {
     Acked(u64),
     Duplicate(u64),
-    ServerErr(String),
+    ServerErr(ServerError),
     Pong,
     /// A cluster `NotLeader` redirect (#735): the produce landed on a non-leader replica of the
     /// partition and was NOT appended/acked; the leader's CLIENT-address hint (or `None` when unknown).
@@ -530,7 +635,7 @@ struct StreamFlow {
     duplicates: u64,
     server_errors: u64,
     last_offset: Option<u64>,
-    first_server_err: Option<String>,
+    first_server_err: Option<ServerError>,
     /// The reader hit a fatal error and exited; the writer must stop waiting on it.
     reader_dead: bool,
 }
@@ -583,10 +688,10 @@ fn drain_stream_replies(
                 f.done += 1;
                 f.server_errors += 1;
                 if f.first_server_err.is_none() {
-                    f.first_server_err = Some(match hint {
+                    f.first_server_err = Some(ServerError::uncoded(match hint {
                         Some(addr) => format!("not leader: produce to the leader at {addr}"),
                         None => "not leader: the current leader is unknown".to_string(),
-                    });
+                    }));
                 }
             }
             // The terminal marker: the server's FIFO frame order guarantees every prior
@@ -750,7 +855,7 @@ fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientErro
             })?;
             Ok(PubReply::Duplicate(ack.offset))
         }
-        FrameType::Err => Ok(PubReply::ServerErr(String::from_utf8_lossy(body).into())),
+        FrameType::Err => Ok(PubReply::ServerErr(ServerError::from_wire(body))),
         FrameType::Pong => Ok(PubReply::Pong),
         // A cluster NotLeader redirect (#735): decode the leader hint (an empty hint -> `None`). The
         // produce was NOT appended/acked here; the caller reconnects/retries to the leader.
@@ -824,9 +929,11 @@ pub struct StreamSummary {
     pub duplicates: u64,
     /// Produces the server rejected with an `Err` reply (each consumed its FIFO slot).
     pub server_errors: u64,
-    /// The first server `Err` body, kept verbatim so a caller can distinguish a benign shed
-    /// (`at capacity` under `drop-new`) from a real rejection.
-    pub first_server_error: Option<String>,
+    /// The first server rejection, carrying the stable [`ServerErrorCode`] (#883) so a caller can
+    /// distinguish a benign shed (`Some(ServerErrorCode::AtCapacity)` under `drop-new`) from a real
+    /// rejection by branching on [`ServerError::code`] rather than substring-matching the message. The
+    /// human message is still available (the type dereferences to it) for display.
+    pub first_server_error: Option<ServerError>,
     /// The offset carried by the last ack observed, if any message was acked.
     pub last_offset: Option<u64>,
 }
@@ -1048,9 +1155,7 @@ impl Client {
                 client.streams_enabled = info.streams;
                 Ok(client)
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1267,9 +1372,7 @@ impl Client {
                     duplicate: true,
                 })
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             // A cluster NotLeader redirect (#735): this node is not the leader, so the produce did NOT
             // land here. Surface the typed `NotLeader` error (with the leader hint) so the caller can
             // reconnect/retry to the leader; the connection stays usable. `produce_to_leader` automates it.
@@ -1446,7 +1549,7 @@ impl Client {
                     // An Err for a Ping is not expected; surface it. Any other frame (e.g. a stray
                     // Deliver on a mixed producer/consumer connection) is not what this wait is for.
                     Some((FrameType::Err, body)) => {
-                        return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+                        return Err(ClientError::Server(ServerError::from_wire(&body)))
                     }
                     Some((other, _)) => return Err(ClientError::Unexpected(other)),
                 }
@@ -2001,9 +2104,9 @@ impl Client {
                     // returning to keep the connection framed for reuse, exactly as FlowEnd and the
                     // old `read_frame` (drain-then-return) did. Materialize the owned message first
                     // since `body` borrows `self.buf`, which the drain then mutates.
-                    let msg = String::from_utf8_lossy(body).into_owned();
+                    let err = ServerError::from_wire(body);
                     self.buf.drain(..consumed);
-                    return Err(ClientError::Server(msg));
+                    return Err(ClientError::Server(err));
                 }
                 other => return Err(ClientError::Unexpected(other)),
             }
@@ -2184,9 +2287,7 @@ impl Client {
         self.send(FrameType::StreamCommit, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2270,9 +2371,7 @@ impl Client {
                     "ack reply was not a one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2337,8 +2436,7 @@ impl Client {
                 },
                 (FrameType::Err, body) => {
                     if first_err.is_none() {
-                        first_err =
-                            Some(ClientError::Server(String::from_utf8_lossy(&body).into()));
+                        first_err = Some(ClientError::Server(ServerError::from_wire(&body)));
                     }
                 }
                 (other, _) => return Err(ClientError::Unexpected(other)),
@@ -2383,9 +2481,7 @@ impl Client {
                     "nack reply was not a one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2415,9 +2511,7 @@ impl Client {
                     "term reply was not a one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2452,9 +2546,7 @@ impl Client {
                     "progress reply was not a known one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2467,9 +2559,7 @@ impl Client {
         self.send(FrameType::Ping, &[])?;
         match self.read_frame()? {
             (FrameType::Pong, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2498,9 +2588,7 @@ impl Client {
         self.send(FrameType::Sub, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2514,9 +2602,7 @@ impl Client {
         self.send(FrameType::Unsub, &[])?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2543,9 +2629,7 @@ impl Client {
         self.send(FrameType::CumulativeAck, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2573,9 +2657,7 @@ impl Client {
         self.send(FrameType::StreamDeclare, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2606,9 +2688,7 @@ impl Client {
                     .map_err(|_| ClientError::BadResponse("malformed stream-info response"))?;
                 Ok((resp.exists, resp.head))
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2652,9 +2732,7 @@ impl Client {
                     .map_err(|_| ClientError::BadResponse("publish-to reply was not an offset"))?;
                 Ok(ack.offset)
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2713,9 +2791,7 @@ impl Client {
         self.send(FrameType::TxnPrepare, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2746,9 +2822,7 @@ impl Client {
                     .map_err(|_| ClientError::BadResponse("txn-commit reply was not an offset"))?;
                 Ok(ack.offset)
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2773,9 +2847,7 @@ impl Client {
         self.send(FrameType::TxnRollback, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2824,9 +2896,7 @@ impl Client {
         self.send(FrameType::TxnListen, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -2892,7 +2962,7 @@ impl Client {
                     // accompanies it in the same flush).
                     None | Some((FrameType::Pong, _)) => break,
                     Some((FrameType::Err, body)) => {
-                        return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+                        return Err(ClientError::Server(ServerError::from_wire(&body)))
                     }
                     // A stray frame (e.g. an Ok reply to a TxnCheckResult, or another frame on a mixed
                     // connection) is not what this loop is for: ignore it and keep draining the round.
@@ -2971,9 +3041,7 @@ impl Client {
         self.send(FrameType::SubTo, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
