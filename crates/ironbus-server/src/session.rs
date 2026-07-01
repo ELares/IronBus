@@ -1032,11 +1032,16 @@ impl Session {
                 return Err(SessionError::AuthViolation);
             };
             // Pin the identity's scopes (and the identity NAME, for a later scope-denial audit subject)
-            // for the connection lifetime. The NAME is a safe handle; no credential is retained.
-            if let crate::auth::AuthOutcome::Authenticated { identity, scopes } = &outcome {
-                self.scopes = *scopes;
-                self.identity_name.clone_from(identity);
-            }
+            // for the connection lifetime, then flip the auth flag. The NAME is a safe handle; no
+            // credential is retained. This is an IRREFUTABLE `let`: `authenticate` returns `Err` on every
+            // failure (handled by the `else` above), so an `Ok` outcome is by construction `Authenticated`.
+            // Binding here — rather than an `if let` with the flag flipped outside — couples the flag to
+            // the scope-pinning: `self.authenticated` can never be set without a resolved identity, and if
+            // a non-success variant is ever added to `AuthOutcome` this destructure fails to compile rather
+            // than silently leaving an authenticated-but-no-scope connection (#889).
+            let crate::auth::AuthOutcome::Authenticated { identity, scopes } = &outcome;
+            self.scopes = *scopes;
+            self.identity_name.clone_from(identity);
             self.authenticated = true;
             // Emit the SUCCESSFUL authn outcome to the audit stream (#635): the resolved identity NAME,
             // the mechanism, success — never the credential. Emitted AFTER the scopes are pinned, so a
