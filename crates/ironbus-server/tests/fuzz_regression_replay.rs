@@ -157,7 +157,35 @@ fn drive_target(target: &str, file: &Path, data: &[u8]) {
         "gap_marker_body" => replay(file, || {
             let _ = message::decode_gap_marker(data);
         }),
+        "deliver_batch_body" => replay(file, || replay_deliver_batch(data)),
         other => panic!("no replay wired for fuzz target {other:?}; add it to drive_target"),
+    }
+}
+
+/// Mirror `fuzz/fuzz_targets/deliver_batch_body.rs` byte-for-byte: decode the batch body, and on Ok
+/// assert the borrowed record slice is in-bounds and iterate the on-disk record codec over it
+/// exactly as the client's batch loop does. Both must be panic-free on any input.
+fn replay_deliver_batch(data: &[u8]) {
+    let Ok((_header, record_bytes)) = message::decode_deliver_batch(data) else {
+        return;
+    };
+    let base = data.as_ptr() as usize;
+    let start = record_bytes.as_ptr() as usize;
+    assert!(
+        start >= base && start + record_bytes.len() <= base + data.len(),
+        "decode_deliver_batch returned an out-of-bounds record slice",
+    );
+    let mut cursor = 0usize;
+    while cursor < record_bytes.len() {
+        match codec::decode(&record_bytes[cursor..]) {
+            Ok((_view, consumed)) => {
+                if consumed == 0 {
+                    break;
+                }
+                cursor += consumed;
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -178,6 +206,7 @@ const TARGETS: &[&str] = &[
     "connect_body",
     "info_body",
     "gap_marker_body",
+    "deliver_batch_body",
 ];
 
 /// SHA-256 the bytes to a lowercase hex string, matching the content-addressed seed file names.

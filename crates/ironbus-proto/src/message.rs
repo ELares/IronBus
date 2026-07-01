@@ -4061,6 +4061,17 @@ mod tests {
             // view, never a panic / over-read / over-allocation.
             let _ = decode_connect(&bytes);
             let _ = decode_info(&bytes);
+            // DeliverBatch (#541) is the newest client-side decoder: a hostile server's raw-framed
+            // batch header (bad version, an oversized declared field_len, a truncated block) is
+            // attack surface too, and decoding any byte string is a typed BodyError or a valid view,
+            // never a panic / over-read (#850). On Ok the borrowed record-bytes slice is ALWAYS the
+            // tail of the body (everything after the declared header block), so it is length-bounded
+            // by, and a suffix of, the input — the client's per-record decode loop can therefore
+            // never read outside the frame body.
+            if let Ok((_, record_bytes)) = decode_deliver_batch(&bytes) {
+                prop_assert!(record_bytes.len() <= bytes.len());
+                prop_assert!(bytes.ends_with(record_bytes));
+            }
             // SUB is infallible: any byte string is a valid body, and decoding it recovers the
             // exact bytes as the group, so it cannot panic either.
             prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());
