@@ -372,3 +372,103 @@ pub(crate) fn heavy_cluster_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// Handle the result of spawning a detached per-link reader thread from a cluster accept loop (#870).
+///
+/// The cluster accept loops (the metadata-plane listener, the data-plane peer listener, and the
+/// cross-cluster serve listener) spawn ONE detached reader thread per accepted link.
+/// [`std::thread::Builder::spawn`] returns `Err` on OS thread-creation refusal — EAGAIN under
+/// `RLIMIT_NPROC`, fd exhaustion, or low memory — all reachable in this thread-per-link model under a
+/// connection flood or resource pressure. Historically the `Result` was discarded with `let _ =`: the
+/// accepted stream was dropped with NO log, NO metric, and NO backpressure, and the accept loop
+/// immediately looped back to `accept()` — a tight accept-then-drop spin (a CPU-burning livelock while
+/// a remote dialer keeps reconnecting). The net effect was invisible follower/peer link loss: the
+/// leader silently stops serving a follower's fetch/ack (ISR shrink / under-replication) or drops a
+/// peer's Raft/heartbeat link (false failure detection → spurious elections), with nothing in the logs.
+///
+/// This surfaces the failure the CLUSTER way — via TRACING, not Prometheus (cluster link events use
+/// tracing) — at `warn`, ONCE per failure episode: `warned` latches so a sustained flood cannot itself
+/// become a log-volume vector, and a later SUCCESSFUL spawn resets it (the episode ended). It returns
+/// `true` to tell the caller to BACK OFF the accept loop (a bounded interruptible sleep) rather than
+/// tight-spin. On the failure path the spawn closure has already been consumed and dropped by
+/// `Builder::spawn`, which closed the accepted `TcpStream` it captured — so the link is released
+/// cleanly and no fd is leaked.
+///
+/// `link_kind` names the link for the log field (e.g. `"metadata peer"`, `"data-plane peer"`,
+/// `"cross-cluster serve"`). Generic over the join-handle type so the failure path is unit-testable
+/// without actually creating an OS thread.
+pub(crate) fn on_reader_spawn_result<H>(
+    result: &std::io::Result<H>,
+    warned: &mut bool,
+    link_kind: &str,
+) -> bool {
+    match result {
+        Ok(_) => {
+            *warned = false;
+            false
+        }
+        Err(e) => {
+            if !*warned {
+                tracing::warn!(
+                    error = %e,
+                    link_kind,
+                    "cluster: failed to spawn a per-link reader thread; accepted link dropped, backing off the accept loop"
+                );
+                *warned = true;
+            }
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod reader_spawn_tests {
+    use super::on_reader_spawn_result;
+    use std::io;
+
+    /// A spawn FAILURE must be surfaced (return `true` = "back off") and must LATCH the warn flag, so
+    /// a sustained flood logs once rather than once-per-link. Fails without the #870 fix, which
+    /// replaced the silent `let _ = ...spawn(...)` with this handling.
+    #[test]
+    fn spawn_failure_signals_backoff_and_latches_the_warning() {
+        let mut warned = false;
+        let err: io::Result<()> = Err(io::Error::from(io::ErrorKind::WouldBlock));
+
+        // First failure of an episode: back off AND latch.
+        assert!(
+            on_reader_spawn_result(&err, &mut warned, "test peer"),
+            "a spawn failure must signal the accept loop to back off rather than tight-spin"
+        );
+        assert!(
+            warned,
+            "the first failure of an episode must latch the warn flag"
+        );
+
+        // Still failing: keep backing off, but the warn stays latched (logged once per episode).
+        assert!(
+            on_reader_spawn_result(&err, &mut warned, "test peer"),
+            "a sustained failure episode must keep backing off"
+        );
+        assert!(
+            warned,
+            "a sustained episode keeps the warn latched (no per-link log flood)"
+        );
+    }
+
+    /// A subsequent successful spawn ends the episode: no back-off, and the warn flag resets so the
+    /// NEXT failure episode logs again.
+    #[test]
+    fn spawn_success_ends_the_episode_and_resets_the_warning() {
+        let mut warned = true;
+        let ok: io::Result<()> = Ok(());
+
+        assert!(
+            !on_reader_spawn_result(&ok, &mut warned, "test peer"),
+            "a successful spawn must not signal a back-off"
+        );
+        assert!(
+            !warned,
+            "a successful spawn resets the episode so the next failure warns again"
+        );
+    }
+}

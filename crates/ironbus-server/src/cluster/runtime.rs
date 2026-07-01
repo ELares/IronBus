@@ -1818,6 +1818,11 @@ fn run_listener(
     registry: Arc<Mutex<PeerRegistry>>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Latches while a reader-thread spawn-failure episode is ongoing, so the failure is logged ONCE
+    // per episode rather than once per refused link (#870): under thread/fd exhaustion the accept loop
+    // could otherwise turn a per-link warn into its own log-volume vector. Reset by the next successful
+    // spawn (see `on_reader_spawn_result`).
+    let mut spawn_warned = false;
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
@@ -1835,9 +1840,17 @@ fn run_listener(
                 let tx = inbound_tx.clone();
                 let reg = Arc::clone(&registry);
                 let sd = Arc::clone(&shutdown);
-                let _ = std::thread::Builder::new()
+                // Spawn a detached reader for this peer link. Previously the spawn `Result` was
+                // discarded with `let _ =`, silently dropping the accepted link (and tight-looping
+                // accept-then-drop) on an EAGAIN/ENOMEM spawn failure — masking peer link loss under
+                // thread/fd pressure (#870). Now surface the failure via tracing and back off.
+                let spawn_result = std::thread::Builder::new()
                     .name("ib-cluster-read".to_string())
                     .spawn(move || run_reader(PeerLink::new(stream), tx, reg, sd));
+                if super::on_reader_spawn_result(&spawn_result, &mut spawn_warned, "metadata peer")
+                {
+                    sleep_interruptible(TICK_INTERVAL, &shutdown);
+                }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 sleep_interruptible(TICK_INTERVAL, &shutdown);
