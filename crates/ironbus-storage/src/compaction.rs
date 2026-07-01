@@ -432,22 +432,54 @@ struct Candidate {
     end_offset: u64,
 }
 
+/// The resident metadata one sealed segment contributes to compaction-trigger DISCOVERY (#824): the
+/// three facts [`select_dirty_run`] needs to build a [`Candidate`] without touching disk. The Log
+/// feeds these straight from its in-memory `SegmentSlot`s (`id`, `base_offset`, `record_count`, and
+/// whether the slot is a compacted survivor), so the per-produce-commit trigger no longer re-reads +
+/// CRC-validates every sealed segment just to learn counts it already holds in RAM. Selection does
+/// NOT need body validation: the chosen run is fully re-read and re-validated by
+/// [`read_source_segment`] before any commit, so an untrusted count at selection time can only pick a
+/// different (still fully validated) run, never corrupt state.
+///
+/// For an ORDINARY sealed segment `record_count` is its dense record count, so its dense range is
+/// `[base_offset, base_offset + record_count)` — identical to the old `scan.records.len()` fact. A
+/// COMPACTED segment is flagged `is_compacted` and is never a source, so its fields are ignored.
+#[derive(Clone, Copy, Debug)]
+pub struct SealedSegmentMeta {
+    /// The segment id.
+    pub id: u64,
+    /// The dense base (lowest) offset of the segment.
+    pub base_offset: u64,
+    /// The sealed record count (the dense count for an ordinary segment).
+    pub record_count: u64,
+    /// Whether this slot is a COMPACTED (v2) survivor segment, which is never a compaction source.
+    pub is_compacted: bool,
+}
+
 /// Picks the FIRST adjacent run of up to `max_source_segments` sealed segments (the OLDEST sealed
 /// segments, never the active one) whose combined dirty ratio meets the trigger, and returns their
 /// ids (#337). Returns `None` when compaction is off, there are fewer than two segments (so nothing
 /// but the active one), or no eligible run meets `min_dirty_ratio`.
 ///
-/// This is the event-driven trigger the engine consults off the hot path: it reads the sealed
-/// segments (sealed segments the append actor never touches) and selects a bounded run, so the pass
-/// it feeds [`compact_run`] is rate-capped to `max_source_segments`.
+/// This is the event-driven trigger the engine consults off the hot path: discovery reads NOTHING
+/// from disk — it builds the candidate set from the caller's resident `sealed` slot metadata (#824)
+/// — and then reads ONLY the chosen bounded run (capped to `max_source_segments`) to score its dirty
+/// ratio, so the pass it feeds [`compact_run`] is rate-capped to `max_source_segments`.
+///
+/// `sealed` is the Log's in-memory view of every SEALED segment (the active one is excluded by the
+/// caller and, defensively, by the `id >= active_segment_id` guard here). Before #824 discovery
+/// re-opened, fully re-read and CRC-validated EVERY sealed segment on each produce commit purely to
+/// recover `base_offset` (a header fact) and the record count (the sealed footer's `record_count`,
+/// also resident in each slot), an O(total sealed records) cost per commit that grew with the log.
 ///
 /// # Errors
-/// Propagates an IO error or a segment decode error from reading the candidate segments.
+/// Propagates an IO error or a segment decode error from reading the chosen run to score it.
 pub fn select_dirty_run<F, C>(
     fs: &F,
     clock: &C,
     config: &CompactionConfig,
     active_segment_id: u64,
+    sealed: &[SealedSegmentMeta],
 ) -> Result<Option<Vec<u64>>, StorageError>
 where
     F: Filesystem,
@@ -456,29 +488,25 @@ where
     if !config.enabled || config.max_source_segments == 0 {
         return Ok(None);
     }
-    let ids = segment_ids(fs)?;
     // Candidate sources are SEALED, ORDINARY (never already-compacted), non-active segments. A
     // compacted segment is never re-compacted as a source: it is already the survivor set for its
-    // covered range. Each candidate carries its base offset and survivor record range so the run can
-    // be chosen offset-CONTIGUOUS (a clean covers a contiguous run of WHOLE source segments, so the
-    // resulting compacted segment abuts its predecessor and successor in the chain).
+    // covered range. Each candidate carries its base offset and dense record range (both resident in
+    // the slot) so the run can be chosen offset-CONTIGUOUS (a clean covers a contiguous run of WHOLE
+    // source segments, so the resulting compacted segment abuts its predecessor and successor in the
+    // chain). No disk IO: the counts come straight from RAM, not a full rescan + CRC of every sealed
+    // segment (#824).
     let mut candidates: Vec<Candidate> = Vec::new();
-    for &id in &ids {
-        if id >= active_segment_id {
+    for meta in sealed {
+        if meta.id >= active_segment_id {
             continue; // never the active segment (or anything above it, defensively)
         }
-        let reader = SegmentReader::open(fs.open(&segment_file_name(id))?)?;
-        if reader.header().is_compacted() {
+        if meta.is_compacted {
             continue; // an already-compacted segment is never a source
         }
-        let scan = reader.scan()?;
-        if scan.footer.is_none() {
-            continue; // only SEALED ordinary segments are candidates
-        }
-        let base = scan.header.base_offset.get();
-        let end = base.saturating_add(scan.records.len() as u64);
+        let base = meta.base_offset;
+        let end = base.saturating_add(meta.record_count);
         candidates.push(Candidate {
-            id,
+            id: meta.id,
             base_offset: base,
             end_offset: end,
         });
@@ -622,7 +650,82 @@ mod tests {
         assert!(!cfg.enabled);
         let out = compact_run(&fs, &clock, &cfg, &[0], 99).unwrap();
         assert_eq!(out, CompactionOutcome::default());
-        assert!(select_dirty_run(&fs, &clock, &cfg, 1).unwrap().is_none());
+        assert!(select_dirty_run(&fs, &clock, &cfg, 1, &[])
+            .unwrap()
+            .is_none());
+    }
+
+    /// Reads the resident sealed-segment metadata a Log would hold, straight from each sealed
+    /// segment's header + footer, mirroring `SegmentSlot { id, base_offset, record_count, .. }`. Test
+    /// setup only: it stands in for the in-memory slots the engine feeds `select_dirty_run` (#824).
+    fn sealed_meta(fs: &InMemoryFs, active_id: u64) -> Vec<SealedSegmentMeta> {
+        let mut out = Vec::new();
+        for id in segment_ids(fs).unwrap() {
+            if id >= active_id {
+                continue;
+            }
+            let reader = SegmentReader::open(fs.open(&segment_file_name(id)).unwrap()).unwrap();
+            let is_compacted = reader.header().is_compacted();
+            let scan = reader.scan().unwrap();
+            out.push(SealedSegmentMeta {
+                id,
+                base_offset: scan.header.base_offset.get(),
+                record_count: u64::try_from(scan.records.len()).unwrap(),
+                is_compacted,
+            });
+        }
+        out
+    }
+
+    /// #824: candidate discovery builds its set from the resident slot metadata (`SealedSegmentMeta`)
+    /// and opens ONLY the chosen run — it no longer opens + CRC-scans every sealed segment on the
+    /// per-produce path. This pins that metadata-only property: after capturing the metadata we DELETE
+    /// the highest sealed segment's file (an unselected candidate), and `select_dirty_run` still
+    /// selects the dirty LOW run (capped to `max_source_segments`, which excludes the high segment) —
+    /// had discovery opened every sealed segment, the missing high file would surface as an error.
+    ///
+    /// This is a perf change: on a valid log the SELECTION is identical to the old scan-driven path,
+    /// so a *behavioral* regression is guarded by the existing compaction / determinism suite — this
+    /// test pins the new metadata-only entry point (it does not, and cannot, discriminate against the
+    /// behavior-preserving old code).
+    #[test]
+    fn select_dirty_run_discovers_from_metadata_and_skips_unselected_segments() {
+        let fs = InMemoryFs::new();
+        let mut log = Log::open(fs.clone(), ManualClock::new(), small_config()).unwrap();
+        // Many superseding versions per key force several sealed rolls, each with dropped versions.
+        for v in 0..10u8 {
+            put(&mut log, b"alpha", &[v; 12]);
+            put(&mut log, b"beta", &[v.wrapping_add(100); 12]);
+        }
+        let active = log.active_segment_id();
+        let meta = sealed_meta(&fs, active);
+        drop(log);
+        assert!(
+            meta.len() >= 3,
+            "need several sealed segments for a low run and a distinct high one, got {}",
+            meta.len()
+        );
+
+        // Delete the HIGHEST sealed segment's file (an unselected candidate). Metadata-driven
+        // discovery opens only the chosen low run, so selection must still succeed; had it opened
+        // every sealed segment, this missing file would surface as an error.
+        let highest = meta.iter().map(|m| m.id).max().unwrap();
+        fs.remove(&segment_file_name(highest)).unwrap();
+
+        let cfg = CompactionConfig {
+            max_source_segments: 2,
+            min_dirty_ratio_permille: 1,
+            ..CompactionConfig::enabled()
+        };
+        let clock = ManualClock::new();
+        let run = select_dirty_run(&fs, &clock, &cfg, active, &meta)
+            .expect("discovery must not open the unselected high segment")
+            .expect("the dirty low run should be selected");
+        assert_eq!(run.len(), 2, "the run is capped to max_source_segments");
+        assert!(
+            !run.contains(&highest),
+            "the unselected high segment is never part of the low run"
+        );
     }
 
     #[test]

@@ -3502,8 +3502,27 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // Never compact on a frozen writer (it has no active segment to protect against, but the
         // log is degraded; do no extra IO).
         self.active()?;
-        let Some(source_ids) =
-            crate::compaction::select_dirty_run(&self.fs, &self.clock, config, self.active_id)?
+        // Feed the trigger the resident sealed-segment metadata (#824) so discovery reads the record
+        // counts already in RAM instead of re-scanning + CRC-validating every sealed segment on each
+        // produce commit. The active slot is included but skipped by `select_dirty_run`'s
+        // `id >= active_id` guard (its count is only meaningful once sealed anyway).
+        let sealed: Vec<crate::compaction::SealedSegmentMeta> = self
+            .segments
+            .iter()
+            .map(|slot| crate::compaction::SealedSegmentMeta {
+                id: slot.id,
+                base_offset: slot.base_offset,
+                record_count: slot.record_count,
+                is_compacted: slot.compacted_covered.is_some(),
+            })
+            .collect();
+        let Some(source_ids) = crate::compaction::select_dirty_run(
+            &self.fs,
+            &self.clock,
+            config,
+            self.active_id,
+            &sealed,
+        )?
         else {
             return Ok(crate::compaction::CompactionOutcome::default());
         };
