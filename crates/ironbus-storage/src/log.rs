@@ -1069,6 +1069,96 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(true)
     }
 
+    /// The upper bound on how many segment scans run concurrently during recovery (#817, #821).
+    /// Recovery is a cold path, so the pool is capped to a small fixed width regardless of core
+    /// count: it recovers most of the linear-in-cores speedup on a big box while keeping Edge RAM
+    /// (one streamed record per in-flight worker) and IO-device pressure (concurrent positioned
+    /// reads on one spinning disk) bounded. The effective width is `min(this, cores, segments)`.
+    const RECOVERY_SCAN_MAX_WORKERS: usize = 8;
+
+    /// Runs `scan` for every id across a bounded [`std::thread::scope`] worker set, returning one
+    /// result per id in the SAME order as `ids` (index-aligned to it), regardless of the order the
+    /// workers finished (#817, #821). Each id's scan is fully independent — it opens and CRC-walks
+    /// only its own file — so this is the embarrassingly-parallel MAP half of recovery; the
+    /// deterministic serial FOLD over the returned vector (chain-continuity, sealed-predecessor,
+    /// running totals) is the caller's job and is byte-for-byte the serial-path computation.
+    ///
+    /// No external threadpool (no rayon): a fixed set of scoped workers steals ids off one shared
+    /// atomic cursor, so a fast segment's worker immediately picks up the next id rather than
+    /// blocking on a slow one, and every worker borrows `fs` (`Filesystem: Send + Sync`) and reads
+    /// its own file with no shared mutable state. The width is bounded by
+    /// [`Self::RECOVERY_SCAN_MAX_WORKERS`]; a single-segment log (or a single worker) runs the
+    /// scans inline with no threads spawned.
+    fn par_scan_segments<T, S>(fs: &F, ids: &[u64], scan: S) -> Vec<Result<T, StorageError>>
+    where
+        T: Send,
+        S: Fn(&F, u64) -> Result<T, StorageError> + Send + Sync,
+    {
+        let total = ids.len();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(Self::RECOVERY_SCAN_MAX_WORKERS)
+            .min(total);
+        if workers <= 1 {
+            // One segment, one core, or a single-worker cap: run inline, no threads, no cursor.
+            return ids.iter().map(|&id| scan(fs, id)).collect();
+        }
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        // Each participant returns the (index, result) pairs it computed; we reassemble by index so
+        // the returned order is id order no matter who won which id. Helpers are spawned FALLIBLY via
+        // `Builder::spawn_scoped`: if a worker thread cannot be created (OS thread exhaustion on a
+        // cold boot) we simply run with fewer helpers, and the main thread is itself the final
+        // participant — so even if EVERY helper fails to spawn, every index is still scanned inline.
+        // Recovery therefore degrades to serial rather than panicking, matching the resilience this
+        // boot path demands (and consistent with #870).
+        let collected: Vec<(usize, Result<T, StorageError>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers.saturating_sub(1))
+                .filter_map(|k| {
+                    let cursor = &cursor;
+                    let scan = &scan;
+                    std::thread::Builder::new()
+                        .name(format!("ib-recover-scan-{k}"))
+                        .spawn_scoped(s, move || {
+                            let mut local: Vec<(usize, Result<T, StorageError>)> = Vec::new();
+                            loop {
+                                let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= total {
+                                    break;
+                                }
+                                local.push((i, scan(fs, ids[i])));
+                            }
+                            local
+                        })
+                        .ok()
+                })
+                .collect();
+            // The main thread is the final participant: drain whatever indices remain (this alone
+            // covers 0..total if no helper spawned).
+            let mut all: Vec<(usize, Result<T, StorageError>)> = Vec::with_capacity(total);
+            loop {
+                let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= total {
+                    break;
+                }
+                all.push((i, scan(fs, ids[i])));
+            }
+            for h in handles {
+                all.extend(h.join().expect("recovery scan worker panicked"));
+            }
+            all
+        });
+        let mut slots: Vec<Option<Result<T, StorageError>>> = (0..total).map(|_| None).collect();
+        for (i, r) in collected {
+            slots[i] = Some(r);
+        }
+        // Every index in 0..total is assigned exactly once (the cursor hands each out once), so no
+        // slot is None here.
+        slots
+            .into_iter()
+            .map(|r| r.expect("every recovery scan index was assigned"))
+            .collect()
+    }
+
     /// Walks every segment in ascending order from a streaming recovery scan, validating the
     /// chain (each segment's stored id matches its file name, its base continues from its
     /// predecessor, its records are a contiguous sequence run, and every NON-final segment is
@@ -1076,6 +1166,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// A corrupt or unreadable segment fails its scan here, not silently at read time. The
     /// per-segment retention metadata (record count, max timestamp) is recomputed from the scan so
     /// the reaper behaves identically after a reopen.
+    ///
+    /// The per-segment scan+CRC MAP runs across a bounded worker set ([`Self::par_scan_segments`],
+    /// #817/#821), then this deterministic serial FOLD assembles the chain in id order: the
+    /// recovered result (slots, offsets, sequence run, running totals, and every error decision) is
+    /// byte-for-byte identical to a strictly serial scan, since the fold consumes the scans in the
+    /// same id order and returns the first failing id's error exactly as the serial loop did.
     fn scan_recover_chain(fs: &F, ids: &[u64]) -> Result<RecoveredChain, StorageError> {
         let mut next_base_offset = 0u64;
         let mut next_base_seq = 0u64;
@@ -1084,8 +1180,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let mut highest: Option<RecoveryScan> = None;
         let mut slots: Vec<SegmentSlot> = Vec::with_capacity(ids.len());
         let total = ids.len();
-        for (i, &id) in ids.iter().enumerate() {
-            let scan = SegmentReader::open(fs.open(&segment_file_name(id))?)?.scan_recovery()?;
+        let scans = Self::par_scan_segments(fs, ids, |fs, id| {
+            SegmentReader::open(fs.open(&segment_file_name(id))?)?.scan_recovery()
+        });
+        for (i, (&id, scan)) in ids.iter().zip(scans).enumerate() {
+            let scan = scan?;
             let header = scan.header;
             if header.segment_id != id {
                 return Err(StorageError::SegmentIdMismatch {
@@ -1335,14 +1434,26 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         config: LogConfig,
         ids: &[u64],
     ) -> Result<Log<F, C>, StorageError> {
-        // Step 1: classify every segment.
-        let mut ordinaries: Vec<OrdinaryCandidate> = Vec::new();
-        let mut compacteds: Vec<CompactedCandidate> = Vec::new();
-        for &id in ids {
+        // Step 1: classify every segment. The per-segment scan+CRC MAP runs across the same bounded
+        // worker set as the v1 path (#817/#821): each id opens and CRC-walks only its own file, so
+        // the classification is independent. The deterministic serial FOLD below then performs the
+        // order-sensitive side effects (unlinking a crash-before-commit orphan) and pushes each
+        // candidate in id order, so the surviving set and the resulting on-disk image are identical
+        // to a strictly serial classification.
+        enum Classified {
+            /// An ordinary (v1) segment recovered to a chain candidate.
+            Ordinary(OrdinaryCandidate),
+            /// A committed compacted (v2) segment recovered to a chain candidate.
+            Compacted(CompactedCandidate),
+            /// A compacted-flagged segment with a torn/CRC-bad trailing footer or block: it did NOT
+            /// reach its commit point, so the serial fold unlinks it as a crash-before-commit orphan.
+            CompactedOrphan { id: u64 },
+        }
+        let classified = Self::par_scan_segments(&fs, ids, |fs, id| {
             let reader = SegmentReader::open(fs.open(&segment_file_name(id))?)?;
             if reader.header().is_compacted() {
                 if let Some(scan) = reader.scan_compacted()? {
-                    compacteds.push(CompactedCandidate {
+                    Ok(Classified::Compacted(CompactedCandidate {
                         id,
                         record_count: scan.records.len() as u64,
                         max_timestamp_ms: scan.max_timestamp_ms,
@@ -1353,16 +1464,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                             covered_end_seq: scan.meta.covered_end_seq,
                         },
                         valid_end: scan.valid_end,
-                    });
+                    }))
                 } else {
-                    // A compacted-flagged segment with a torn/CRC-bad trailing footer or block did
-                    // NOT reach its commit point: discard it as a crash-before-commit orphan.
-                    fs.remove(&segment_file_name(id))?;
-                    fs.sync_dir()?;
+                    Ok(Classified::CompactedOrphan { id })
                 }
             } else {
                 let scan = reader.scan_recovery()?;
-                ordinaries.push(OrdinaryCandidate {
+                Ok(Classified::Ordinary(OrdinaryCandidate {
                     id,
                     base_offset: scan.header.base_offset.get(),
                     base_seq: scan.header.base_seq.get(),
@@ -1374,7 +1482,21 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     tail_reason: scan.tail_reason,
                     last_seq: scan.last_seq,
                     header: scan.header,
-                });
+                }))
+            }
+        });
+        let mut ordinaries: Vec<OrdinaryCandidate> = Vec::new();
+        let mut compacteds: Vec<CompactedCandidate> = Vec::new();
+        for c in classified {
+            match c? {
+                Classified::Ordinary(o) => ordinaries.push(o),
+                Classified::Compacted(cc) => compacteds.push(cc),
+                Classified::CompactedOrphan { id } => {
+                    // A compacted-flagged segment with a torn/CRC-bad trailing footer or block did
+                    // NOT reach its commit point: discard it as a crash-before-commit orphan.
+                    fs.remove(&segment_file_name(id))?;
+                    fs.sync_dir()?;
+                }
             }
         }
 
@@ -5232,6 +5354,70 @@ mod tests {
 
         let err = Log::open(fs, ManualClock::new(), small_config()).unwrap_err();
         assert!(matches!(err, StorageError::Segment(_)));
+    }
+
+    #[test]
+    fn parallel_recovery_scan_is_deterministic_and_byte_identical_across_many_segments() {
+        // #817/#821: recovery fans the per-segment scan+CRC across a bounded worker set, then folds
+        // the chain deterministically in id order. Build a log with FAR more sealed segments than
+        // the worker cap, so the parallel map actually fans out and its work-stealing completion
+        // order is exercised, then assert every reopen recovers the identical chain (offsets,
+        // sequence, record count, active id) AND leaves a byte-for-byte identical on-disk image.
+        let cfg = LogConfig {
+            max_segment_bytes: 256,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        };
+        // The whole durable directory image, as a sorted (name, bytes) list, so two recoveries can
+        // be compared byte-for-byte.
+        let dir_image = |fs: &InMemoryFs| -> Vec<(String, Vec<u8>)> {
+            let mut names = fs.list().unwrap();
+            names.sort();
+            names
+                .into_iter()
+                .map(|n| {
+                    let bytes = fs.open(&n).unwrap().snapshot();
+                    (n, bytes)
+                })
+                .collect()
+        };
+
+        let fs = InMemoryFs::new();
+        let mut log = Log::open(fs.clone(), ManualClock::new(), cfg).unwrap();
+        // Roll well past the worker cap (RECOVERY_SCAN_MAX_WORKERS = 8): keep appending until the
+        // active segment id is at least 30, i.e. ~30 sealed predecessors plus the active one.
+        let mut appended = 0u64;
+        while log.active_segment_id() < 30 {
+            log.append(&rec(&[0xab; 40])).unwrap();
+            appended += 1;
+        }
+        log.sync().unwrap();
+        let expected_next_offset = log.next_offset();
+        let expected_next_seq = log.next_seq();
+        let expected_count = log.durable_record_count();
+        let expected_active = log.active_segment_id();
+        assert_eq!(expected_next_offset, Offset::new(appended));
+        assert!(expected_active >= 30, "the log rolled into many segments");
+        drop(log);
+
+        let image0 = dir_image(&fs);
+        // Every reopen re-runs the parallel scan; the recovered chain and the resulting on-disk
+        // image must be identical across repeated recoveries, proving the reassembly is order-
+        // independent and deterministic.
+        for _ in 0..5 {
+            let log = Log::open(fs.clone(), ManualClock::new(), cfg).unwrap();
+            assert_eq!(log.next_offset(), expected_next_offset);
+            assert_eq!(log.next_seq(), expected_next_seq);
+            assert_eq!(log.durable_record_count(), expected_count);
+            assert_eq!(log.active_segment_id(), expected_active);
+            assert_eq!(log.segment_count() as u64, expected_active + 1);
+            drop(log);
+            assert_eq!(
+                dir_image(&fs),
+                image0,
+                "a reopen must leave the on-disk image byte-for-byte identical"
+            );
+        }
     }
 
     #[test]
