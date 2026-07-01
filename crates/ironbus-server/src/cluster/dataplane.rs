@@ -2445,6 +2445,188 @@ mod tests {
         );
     }
 
+    // ---- #838 CI4 epoch-monotonicity oracle fed REAL post-failover committed state ----------------
+
+    /// #838: wire the CI4 epoch-monotonicity oracle
+    /// ([`check_epoch_monotonic`](ironbus_core::cluster_invariants::check_epoch_monotonic)) to the REAL
+    /// state a failover produces, matching how CI5 (`check_failover_preserves_committed`) is already
+    /// gated over real post-failover state. Before this the CI4 oracle had ZERO callers over live system
+    /// state — only its own hand-built `#[cfg(test)]` fixtures over synthetic `CommittedEpoch` arrays.
+    ///
+    /// A real ISR follower (holding the dead leader's epoch-5 committed lineage) is PROMOTED through the
+    /// genuine [`promote_follower_to_leader`](DataPlaneController::promote_follower_to_leader) seam, which
+    /// seeds the bumped epoch (6) at the committed frontier. We then PROJECT the committed log onto
+    /// [`CommittedEpoch`](ironbus_core::cluster_invariants::CommittedEpoch)`{offset, epoch}` by reading
+    /// the NEW leader's OWN epoch cache through
+    /// [`serve_epoch_query`](DataPlaneController::serve_epoch_query) /
+    /// [`end_offset_for_epoch`](ironbus_core::epoch_cache::EpochCache::end_offset_for_epoch) (the answered
+    /// epoch per offset range) and feed it to `check_epoch_monotonic`:
+    /// * positive: the real post-failover committed prefix is epoch-monotonic under the new cluster epoch;
+    /// * negative: a stale-epoch commit ABOVE the seam (a record carrying the dead leader's OLD epoch past
+    ///   where the new epoch began — the promote/epoch-seam fault of #668/#614) is caught as
+    ///   [`EpochRegressed`](ironbus_core::cluster_invariants::ClusterInvariantViolation::EpochRegressed).
+    ///
+    /// The post-promotion offsets above the seam are MODELED (this harness cannot append to the promoted
+    /// leader's read-plane-owned log), but their EPOCH is read from real state — the current epoch the
+    /// promotion seeded and the new leader advertises — so a promote-seam regression (e.g. failing to bump
+    /// the epoch, or seeding the boundary below the committed HW) flips the projection and fails the test.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one coherent failover→project→CI4 scenario
+    fn ci4_epoch_monotonic_oracle_is_fed_real_post_failover_committed_state() {
+        use ironbus_core::cluster_invariants::{
+            check_epoch_monotonic, ClusterInvariantViolation, CommittedEpoch,
+        };
+
+        const P: u64 = 0;
+        const OLD_EPOCH: u64 = 5; // the dead leader's leadership epoch
+        const NEW_EPOCH: u64 = 6; // the successor's bumped epoch (strictly fences the old leader)
+
+        // --- The dead leader's lineage: epoch 5 from offset 0 (a committed prefix an ISR member holds). --
+        let mut old_leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..18u32 {
+            old_leader_log
+                .append(&rec(format!("committed-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        old_leader_log.sync().unwrap();
+        let mut old_epochs = EpochCache::new();
+        old_epochs
+            .assign(LeaderEpoch::new(OLD_EPOCH), Offset::new(0))
+            .unwrap();
+        let old_plane = leader_plane(&old_leader_log);
+        let committed_hw = plane_served_end(&old_plane);
+        assert!(
+            committed_hw > 0,
+            "the dead leader committed a non-empty prefix"
+        );
+
+        // --- An ISR follower (node 2) replicates the dead leader's committed epoch-5 lineage fully. -----
+        let mut follower = DataPlaneController::<InMemoryFs, ManualClock>::new(2);
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+        follower
+            .assign_follower_epoch(P, LeaderEpoch::new(OLD_EPOCH), Offset::new(0))
+            .unwrap();
+        {
+            let mut old_leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+            old_leader.start_leader(P, Arc::clone(&old_plane), old_epochs, &[1, 2], quorum3());
+            for _ in 0..32 {
+                if follower.follower_high_watermark(P).unwrap() >= committed_hw {
+                    break;
+                }
+                let req = follower.make_fetch_request(P, 8, 4096).unwrap();
+                let resp = old_leader.serve_fetch(P, &req).unwrap();
+                follower.apply_fetch_response(P, &resp).unwrap();
+            }
+        } // the leader (node 1) DIES: drop its controller — no more leader serve.
+        assert_eq!(
+            follower.follower_high_watermark(P).unwrap(),
+            committed_hw,
+            "the ISR follower holds the full committed prefix pre-death"
+        );
+
+        // --- FAILOVER: promote the ISR follower through the REAL seam; it seeds epoch 6 at the frontier. -
+        follower
+            .promote_follower_to_leader(
+                P,
+                LeaderEpoch::new(NEW_EPOCH),
+                &[2],
+                IsrConfig {
+                    min_isr: 1,
+                    max_lag_records: 0,
+                },
+                committed_hw,
+            )
+            .expect("the in-sync survivor is promoted to leader");
+        let new_leader = follower; // node 2 now LEADS the partition.
+        assert!(new_leader.is_leader(P));
+
+        // --- Read the seam from the NEW leader's OWN epoch cache (real state), via serve_epoch_query. ---
+        let query = |epoch: u64| {
+            new_leader
+                .serve_epoch_query(
+                    P,
+                    &OffsetForLeaderEpochBody {
+                        epoch: LeaderEpoch::new(epoch),
+                    },
+                )
+                .expect("the new leader answers an epoch query")
+                .end_offset
+        };
+        let old_answer = query(OLD_EPOCH);
+        // The dead leader's epoch-5 range is exactly the committed prefix [0, committed_hw): the seam
+        // (where the new epoch began) is the committed frontier the promotion seeded.
+        assert_eq!(old_answer.answered_epoch, LeaderEpoch::new(OLD_EPOCH));
+        assert_eq!(
+            old_answer.end_offset.get(),
+            committed_hw,
+            "the epoch-5 lineage ends exactly at the seam the promotion seeded"
+        );
+        let new_answer = query(NEW_EPOCH);
+        assert_eq!(
+            new_answer.answered_epoch,
+            LeaderEpoch::new(NEW_EPOCH),
+            "the successor leads under the bumped epoch (the old leader is fenced)"
+        );
+
+        // --- PROJECT each committed record onto CommittedEpoch{offset, epoch} from the real cache. Every
+        // committed offset below the seam is under epoch 5; a few post-promotion appends land above the
+        // seam under the new leader's answered current epoch (6). ---
+        let epoch_at = |offset: u64| -> LeaderEpoch {
+            if offset < old_answer.end_offset.get() {
+                old_answer.answered_epoch
+            } else {
+                new_answer.answered_epoch
+            }
+        };
+        let mut committed: Vec<CommittedEpoch> = (0..committed_hw)
+            .map(|offset| CommittedEpoch {
+                offset,
+                epoch: epoch_at(offset),
+            })
+            .collect();
+        // A few post-promotion appends under the new epoch (the "cluster resumes" writes above the seam).
+        for offset in committed_hw..committed_hw + 3 {
+            committed.push(CommittedEpoch {
+                offset,
+                epoch: epoch_at(offset),
+            });
+        }
+        assert!(
+            committed
+                .iter()
+                .any(|e| e.epoch == LeaderEpoch::new(OLD_EPOCH)),
+            "the projection carries the real epoch-5 committed prefix"
+        );
+        assert!(
+            committed
+                .iter()
+                .any(|e| e.epoch == LeaderEpoch::new(NEW_EPOCH)),
+            "the projection carries the real post-promotion epoch-6 tail"
+        );
+
+        // POSITIVE: the real post-failover committed log is epoch-monotonic under the new cluster epoch.
+        check_epoch_monotonic(&committed, LeaderEpoch::new(NEW_EPOCH))
+            .expect("CI4: the real post-failover committed prefix is epoch-monotonic");
+
+        // NEGATIVE: inject a STALE-epoch commit ABOVE the seam — a committed record carrying the dead
+        // leader's OLD epoch (5) past where the new epoch (6) began. This is the promote/epoch-seam fault
+        // CI4 exists to catch (a stale leader committing under a superseded term): the oracle MUST reject
+        // it, since epoch 5 regresses below the epoch-6 records already committed above the seam.
+        let mut stale = committed.clone();
+        let next_offset = stale.last().unwrap().offset + 1;
+        stale.push(CommittedEpoch {
+            offset: next_offset,
+            epoch: LeaderEpoch::new(OLD_EPOCH),
+        });
+        match check_epoch_monotonic(&stale, LeaderEpoch::new(NEW_EPOCH)) {
+            Err(ClusterInvariantViolation::EpochRegressed { current, offending }) => {
+                assert_eq!(current, LeaderEpoch::new(NEW_EPOCH));
+                assert_eq!(offending, LeaderEpoch::new(OLD_EPOCH));
+            }
+            other => panic!("CI4 must reject a stale-epoch commit above the seam, got {other:?}"),
+        }
+    }
+
     // ---- THE produce-ack SEAM (#704): a REAL wire PubAck threaded through the QuorumAckGate ---------
 
     use ironbus_proto::frame::encode_frame;
