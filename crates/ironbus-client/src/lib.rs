@@ -42,6 +42,27 @@ use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+/// The smallest per-read scratch size. Reading at least this many bytes even when the decoder
+/// asks for fewer preserves the small-frame batching the client has always relied on: one socket
+/// read can pull several tiny frames (e.g. a released `PubAck` flushed alongside a `Pong`), so the
+/// trailing frames stay buffered rather than forcing a read apiece. Matches the historical fixed
+/// 4 KiB read chunk.
+const READ_WINDOW: usize = 4096;
+
+/// The largest per-read scratch size. Bounds the reused scratch buffer so a large frame (a ~16 MiB
+/// `DeliverBatch`) is assembled in ~64 capped reads rather than one giant allocation, while the
+/// decoder's `needed` hint still lets a single read pull as much of the frame as the socket has.
+const READ_CAP: usize = 256 * 1024;
+
+/// How many bytes to read next while completing a frame, given the decoder's `needed` total-length
+/// hint and how many valid bytes are already buffered (`filled`). Sizes the read to the outstanding
+/// deficit, clamped into `[READ_WINDOW, READ_CAP]`: never smaller than the batching window, never
+/// larger than the scratch cap. Reading past `needed` (when the deficit is under the window) is
+/// harmless — the extra bytes belong to following frames and stay buffered.
+fn frame_read_size(needed: usize, filled: usize) -> usize {
+    needed.saturating_sub(filled).clamp(READ_WINDOW, READ_CAP)
+}
+
 /// An error from the client.
 #[derive(Debug)]
 pub enum ClientError {
@@ -724,9 +745,13 @@ fn read_frame_from(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
 ) -> Result<(FrameType, Vec<u8>), ClientError> {
-    let mut chunk = [0u8; 4096];
+    // Reused scratch for each socket read. `buf` is mutated ONLY by `extend_from_slice` AFTER a read
+    // has successfully returned bytes, so `buf.len()` is always exactly the count of valid buffered
+    // bytes: a propagated read error (via `?`) leaves `buf` untouched, never polluting it with
+    // placeholder bytes that a retry would misdecode.
+    let mut scratch: Vec<u8> = Vec::new();
     loop {
-        match decode_frame(buf).map_err(ClientError::Frame)? {
+        let needed = match decode_frame(buf).map_err(ClientError::Frame)? {
             FrameDecode::Frame {
                 type_tag,
                 body,
@@ -740,13 +765,17 @@ fn read_frame_from(
                 buf.drain(..consumed);
                 return Ok((ty, body));
             }
-            FrameDecode::Incomplete { .. } => {}
+            FrameDecode::Incomplete { needed } => needed,
+        };
+        let read_size = frame_read_size(needed, buf.len());
+        if scratch.len() < read_size {
+            scratch.resize(read_size, 0);
         }
-        let n = stream.read(&mut chunk)?;
+        let n = stream.read(&mut scratch[..read_size])?;
         if n == 0 {
             return Err(ClientError::Closed);
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&scratch[..n]);
     }
 }
 
@@ -2933,17 +2962,23 @@ impl Client {
     /// On return, `decode_frame(&self.buf)` is guaranteed to yield [`FrameDecode::Frame`] (the buffer
     /// is unchanged between the last decode here and the caller's).
     fn fill_frame(&mut self) -> Result<(), ClientError> {
-        let mut chunk = [0u8; 4096];
+        // See `read_frame_from`: `self.buf` grows ONLY via `extend_from_slice` after a successful
+        // read, so a propagated read error leaves it holding exactly its valid bytes.
+        let mut scratch: Vec<u8> = Vec::new();
         loop {
-            match decode_frame(&self.buf).map_err(ClientError::Frame)? {
+            let needed = match decode_frame(&self.buf).map_err(ClientError::Frame)? {
                 FrameDecode::Frame { .. } => return Ok(()),
-                FrameDecode::Incomplete { .. } => {}
+                FrameDecode::Incomplete { needed } => needed,
+            };
+            let read_size = frame_read_size(needed, self.buf.len());
+            if scratch.len() < read_size {
+                scratch.resize(read_size, 0);
             }
-            let n = self.stream.read(&mut chunk)?;
+            let n = self.stream.read(&mut scratch[..read_size])?;
             if n == 0 {
                 return Err(ClientError::Closed);
             }
-            self.buf.extend_from_slice(&chunk[..n]);
+            self.buf.extend_from_slice(&scratch[..n]);
         }
     }
 }
@@ -3791,6 +3826,139 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    /// A connected loopback TCP pair `(client, server)`, both ends owned by the caller so a test can
+    /// drive reads and writes deterministically with no background thread. `connect` completes into
+    /// the listener backlog, so the subsequent `accept` returns the peer end.
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn read_frame_from_reassembles_a_large_frame_dribbled_in_pieces() {
+        // #819: a frame far larger than the per-read cap is completed by sizing each read from the
+        // decoder's `needed` hint (clamped at READ_CAP), so a ~1 MiB frame takes a handful of capped
+        // reads rather than one giant buffer. Dribbling it in small pieces from the peer — with the
+        // reader stitching between pieces — must reassemble the exact bytes, proving the needed-hint
+        // sizing never drops or duplicates a byte across the many partial reads.
+        let body = vec![0xABu8; 1_000_000]; // >> READ_CAP, forcing several capped reads
+        let wire = frame(FrameType::Deliver, &body);
+
+        let (mut client, mut server) = tcp_pair();
+        let wire_for_writer = wire.clone();
+        let writer = std::thread::spawn(move || {
+            // Hand the bytes over in small chunks so the reader must stitch many partial reads; the
+            // main thread consumes concurrently, so these writes drain and never block.
+            for chunk in wire_for_writer.chunks(7000) {
+                server.write_all(chunk).unwrap();
+                server.flush().unwrap();
+            }
+        });
+
+        let mut buf = Vec::new();
+        let (ty, got) = read_frame_from(&mut client, &mut buf).unwrap();
+        writer.join().unwrap();
+        assert_eq!(ty, FrameType::Deliver);
+        assert_eq!(
+            got, body,
+            "the dribbled large frame reassembles byte-for-byte"
+        );
+        assert!(
+            buf.is_empty(),
+            "the frame drained cleanly, nothing left over"
+        );
+    }
+
+    #[test]
+    fn a_read_timeout_mid_frame_leaves_the_buffer_uncorrupted_and_a_retry_completes() {
+        // #819 THE cancellation-/error-safety guarantee (sync): `buf` grows ONLY by
+        // `extend_from_slice` AFTER a read returns bytes — never pre-grown with placeholder zeros. So
+        // a read that fails mid-assembly (here a REAL socket read timeout -> WouldBlock/TimedOut,
+        // propagated via `?`) must leave `buf` holding EXACTLY the valid bytes received so far, with
+        // no zero pollution, and a retry on that SAME buffer must complete the frame with no desync
+        // (no spurious EmptyFrame, no garbage decode).
+        let body = vec![0x5Au8; 8000];
+        let wire = frame(FrameType::Deliver, &body);
+        let split = 100; // an arbitrary partial prefix, mid-frame
+
+        let (mut client, mut server) = tcp_pair();
+        client
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+
+        // Only the first `split` bytes are available; the rest is withheld so the fill loop blocks and
+        // times out mid-frame.
+        server.write_all(&wire[..split]).unwrap();
+        server.flush().unwrap();
+
+        let mut buf = Vec::new();
+        let err = read_frame_from(&mut client, &mut buf).unwrap_err();
+        assert!(
+            matches!(err, ClientError::Io(_)),
+            "an idle-socket read times out as an IO error, got {err:?}"
+        );
+        // THE INVARIANT: `buf.len()` equals the count of valid buffered bytes — no zero padding.
+        assert_eq!(
+            buf.len(),
+            split,
+            "buf.len() equals the valid buffered byte count after the timeout"
+        );
+        assert_eq!(
+            buf,
+            &wire[..split],
+            "the buffered bytes are the exact prefix, not zero pollution"
+        );
+
+        // The rest arrives; retrying on the same (pollution-free) buffer completes the frame cleanly.
+        server.write_all(&wire[split..]).unwrap();
+        server.flush().unwrap();
+        let (ty, got) = read_frame_from(&mut client, &mut buf).unwrap();
+        assert_eq!(ty, FrameType::Deliver);
+        assert_eq!(
+            got, body,
+            "the retry reassembles the full frame — no desync"
+        );
+        assert!(buf.is_empty(), "the completed frame drained cleanly");
+    }
+
+    #[test]
+    fn read_frame_from_batches_small_frames_from_a_single_read() {
+        // #819 non-regression (sync): sizing the read from the `needed` hint must NOT lose the
+        // small-frame batching the client relies on — one socket read can pull several tiny frames.
+        // Two small frames written together are pulled in one read; the first `read_frame_from`
+        // returns frame A while frame B stays BUFFERED (`buf` non-empty), and a second call returns B
+        // with no further bytes sent — proving the trailing frame was batched, not dropped.
+        let a = frame(FrameType::Info, b"alpha");
+        let b = frame(FrameType::Pong, b"");
+        let mut both = a.clone();
+        both.extend_from_slice(&b);
+
+        let (mut client, mut server) = tcp_pair();
+        client
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        server.write_all(&both).unwrap();
+        server.flush().unwrap();
+
+        let mut buf = Vec::new();
+        let (ty_a, body_a) = read_frame_from(&mut client, &mut buf).unwrap();
+        assert_eq!(ty_a, FrameType::Info);
+        assert_eq!(body_a, b"alpha");
+        assert!(
+            !buf.is_empty(),
+            "frame B was batched into the same read and stays buffered"
+        );
+
+        // No more bytes are sent; B decodes purely from the buffer.
+        let (ty_b, body_b) = read_frame_from(&mut client, &mut buf).unwrap();
+        assert_eq!(ty_b, FrameType::Pong);
+        assert!(body_b.is_empty());
+        assert!(buf.is_empty(), "both frames drained");
     }
 
     /// A one-shot listener like [`raw_server`] that ALSO captures every byte the client sends: it
