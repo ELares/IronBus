@@ -71,6 +71,10 @@ use ironbus_proto::message::{
     StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody, TxnPrepareBody,
     TxnResolveBody,
 };
+// The connection-scoped auth encoder (#631, #884): appends the auth section the broker verifies to
+// an already-encoded `Connect` body. A verbatim port of the sync client's `connect_with` auth wiring;
+// the credential itself lives on the re-exported `ClientConfig::credential`.
+use ironbus_proto::message::append_connect_auth;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -101,9 +105,9 @@ fn frame_read_size(needed: usize, filled: usize) -> usize {
 // directly. They are the SYNC client's types, shared unchanged — the wire contract is identical.
 #[doc(no_inline)]
 pub use ironbus_client::{
-    ClientConfig, ClientError, DeadLetter, Fetch, Gap, Message, ProduceAck, ProgressOutcome,
-    StreamBatch, StreamConsumerConfig, Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES,
-    DEFAULT_STREAM_FETCH_RECORDS,
+    pack_password_material, AuthCredential, AuthMechanism, ClientConfig, ClientError, DeadLetter,
+    Fetch, Gap, Message, ProduceAck, ProgressOutcome, StreamBatch, StreamConsumerConfig,
+    Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES, DEFAULT_STREAM_FETCH_RECORDS,
 };
 
 /// The proto body/codec types a caller constructs to drive [`AsyncClient`] (e.g. [`PubBody`]),
@@ -348,7 +352,10 @@ impl AsyncClient {
     /// Note: the connect/read/write TIMEOUTS in [`ClientConfig`] are a blocking-socket concept and do
     /// NOT apply here — an async caller bounds a slow broker with [`tokio::time::timeout`] around the
     /// call instead. The credit / capability fields of `config` ARE honored (they shape the `Connect`
-    /// body identically to the sync client).
+    /// body identically to the sync client), including the connection-scoped
+    /// [`ClientConfig::credential`] (#884): when set, the auth section the broker verifies is appended
+    /// to the `Connect` body exactly as the sync client does. TLS remains a follow-up (this stays plain
+    /// TCP), so a bearer/password credential is for loopback or an already-secured transport.
     ///
     /// # Errors
     /// Returns a [`ClientError`] on a connection failure or an unexpected handshake reply.
@@ -386,6 +393,13 @@ impl AsyncClient {
             },
             &mut connect_body,
         );
+        // Append the connection-scoped auth section (#631, #884) IFF the caller configured a credential,
+        // AFTER the v1 body — byte-for-byte the sync client's `connect_with` auth wiring and the exact
+        // wire the server parses with `parse_connect_auth`. With no credential (the default) nothing is
+        // appended and the body stays the pre-#631 `Connect`, so an unauthenticated connect is unchanged.
+        if let Some(cred) = &config.credential {
+            append_connect_auth(&mut connect_body, cred).map_err(ClientError::Body)?;
+        }
         client.send(FrameType::Connect, &connect_body).await?;
         match client.read_frame().await? {
             (FrameType::Info, body) => {
@@ -1930,6 +1944,111 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    /// Like [`raw_server`] but CAPTURES every byte the client sends and returns it from the join
+    /// handle, so a test can assert on the handshake bytes the client wrote (e.g. the #884 auth
+    /// section in the `Connect` frame). Writes `script` up front, then reads until the client closes.
+    fn capturing_raw_server(
+        script: Vec<u8>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(&script).unwrap();
+            let mut captured = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                captured.extend_from_slice(&chunk[..n]);
+            }
+            captured
+        });
+        (addr, handle)
+    }
+
+    /// Decodes a captured byte stream into its `(FrameType, body)` frames in order.
+    fn decode_all_frames(bytes: &[u8]) -> Vec<(FrameType, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            match decode_frame(&bytes[pos..]).unwrap() {
+                FrameDecode::Frame {
+                    type_tag,
+                    body,
+                    consumed,
+                } => {
+                    out.push((FrameType::from_u8(type_tag).unwrap(), body.to_vec()));
+                    pos += consumed;
+                }
+                FrameDecode::Incomplete { .. } => break,
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn connect_with_a_credential_appends_the_auth_section() {
+        // #884 (async port): AsyncClient::connect_with presents a configured credential — it appends
+        // the auth section the server verifies (append_connect_auth), byte-for-byte the sync client.
+        // Fails WITHOUT the fix (connect_with never appended an auth section). The credential's Debug
+        // redaction is shared with (and covered by) the sync client's ClientConfig test.
+        use ironbus_proto::message::{pack_password_material, parse_connect_auth};
+
+        let secret_user = b"alice";
+        let secret_pw = b"correct horse battery staple";
+        let material = pack_password_material(secret_user, secret_pw).unwrap();
+        let config = ClientConfig {
+            credential: Some(AuthCredential {
+                mechanism: AuthMechanism::Password,
+                material: material.clone(),
+            }),
+            ..ClientConfig::default()
+        };
+        // Redaction: the plaintext password must not appear in a Debug of the config, and the
+        // redaction marker MUST be present (a positive check, symmetric with the sync client's test).
+        let dbg = format!("{config:?}");
+        assert!(
+            !dbg.contains("correct horse"),
+            "the credential material must be redacted in Debug, got: {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "the credential Debug must carry the redaction marker, got: {dbg}"
+        );
+
+        let (addr, handle) = capturing_raw_server(frame(FrameType::Info, b""));
+        let c = AsyncClient::connect_with(addr, &config).await.unwrap();
+        drop(c);
+        let captured = handle.join().unwrap();
+        let frames = decode_all_frames(&captured);
+        assert_eq!(frames[0].0, FrameType::Connect);
+        let parsed = parse_connect_auth(&frames[0].1)
+            .expect("the auth section is well formed")
+            .expect("connect_with with a credential appends an auth section");
+        assert_eq!(parsed.mechanism, AuthMechanism::Password);
+        assert_eq!(parsed.material, material);
+    }
+
+    #[tokio::test]
+    async fn connect_with_no_credential_appends_no_auth_section() {
+        // #884 backward-compat (async port): the default config (credential = None) appends NO auth
+        // section, so an unauthenticated async connect is byte-for-byte unchanged.
+        use ironbus_proto::message::parse_connect_auth;
+
+        let (addr, handle) = capturing_raw_server(frame(FrameType::Info, b""));
+        let c = AsyncClient::connect_with(addr, &ClientConfig::default())
+            .await
+            .unwrap();
+        drop(c);
+        let captured = handle.join().unwrap();
+        let frames = decode_all_frames(&captured);
+        assert_eq!(frames[0].0, FrameType::Connect);
+        assert_eq!(parse_connect_auth(&frames[0].1).unwrap(), None);
     }
 
     /// A connected loopback tokio TCP pair `(client, server)`, both ends owned by the caller so a

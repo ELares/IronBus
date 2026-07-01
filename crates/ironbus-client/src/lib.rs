@@ -38,6 +38,12 @@ use ironbus_proto::message::{
     StreamInfoBody, SubBody, SubToBody, TxnCheckDecision, TxnCheckResultBody, TxnListenBody,
     TxnPrepareBody, TxnResolveBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
+// The connection-scoped auth wire surface (#631, #884): the credential type and the encoder that
+// appends the auth section to an already-encoded `Connect` body. Re-exported below so a caller can
+// construct a `ClientConfig::credential` without depending on `ironbus-proto` directly.
+use ironbus_proto::message::append_connect_auth;
+#[doc(no_inline)]
+pub use ironbus_proto::message::{pack_password_material, AuthCredential, AuthMechanism};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -250,6 +256,25 @@ pub struct ClientConfig {
     /// today's behavior. A caller checks [`Client::streams_enabled`] after connecting to learn whether
     /// the server confirmed it.
     pub understands_streams: bool,
+    /// The connection-scoped authentication credential this client presents in its `Connect`
+    /// handshake (#631, #884), or `None` (the default) for an unauthenticated connection. When
+    /// `Some(cred)`, `connect_with` appends the auth section the broker verifies (via
+    /// [`append_connect_auth`], the exact wire the server parses with `parse_connect_auth`) to the
+    /// `Connect` body after the v1 fields, so a client can talk to an AUTH-REQUIRED broker (bearer
+    /// token or username+password; build a `Password` credential's material with
+    /// [`pack_password_material`]). When `None` (the default, backward-compatible) NO auth section is
+    /// appended and the body is byte-for-byte the pre-#631 `Connect`, so an unauthenticated connect to
+    /// a no-auth broker is unchanged.
+    ///
+    /// This field DOES NOT log its secret: [`AuthCredential`]'s `Debug` redacts the credential
+    /// material (#882), so a `{:?}` of a `ClientConfig` — directly or transitively through any
+    /// embedding type — prints the mechanism and material LENGTH only, never the token/password bytes.
+    ///
+    /// NOTE (#884 scope): TLS is a SEPARATE follow-up. The bearer-token mechanism's threat model wants
+    /// the token presented inside an established TLS session on a non-loopback bind; this client is
+    /// still plain TCP, so a bearer/password credential is safe to use over loopback or an already-
+    /// secured transport, and a TLS-wrapped stream (and the `Mtls` mechanism) is deferred.
+    pub credential: Option<AuthCredential>,
 }
 
 impl Default for ClientConfig {
@@ -287,6 +312,11 @@ impl Default for ClientConfig {
             // only the default-stream verbs exactly as before (#588). A caller that wants to address
             // named streams opts in by setting this.
             understands_streams: false,
+            // None by default: an unconfigured client presents NO credential, so `connect_with`
+            // appends no auth section and the `Connect` body is byte-for-byte the pre-#631 layout — an
+            // unauthenticated connect to a no-auth broker is unchanged (#884). A caller opts into auth
+            // by setting this to the credential the broker verifies.
+            credential: None,
         }
     }
 }
@@ -980,6 +1010,15 @@ impl Client {
             },
             &mut connect_body,
         );
+        // Append the connection-scoped auth section (#631, #884) IFF the caller configured a
+        // credential, AFTER the v1 body (the auth section rides the trailing zone past the `field_len`
+        // block, exactly the wire the server parses with `parse_connect_auth`). With no credential (the
+        // default) nothing is appended and the body stays byte-for-byte the pre-#631 `Connect`, so an
+        // unauthenticated connect is unchanged. An oversized credential fails closed here (a typed
+        // `ClientError::Body`) rather than sending a truncated auth section.
+        if let Some(cred) = &config.credential {
+            append_connect_auth(&mut connect_body, cred).map_err(ClientError::Body)?;
+        }
         client.send(FrameType::Connect, &connect_body)?;
         match client.read_frame()? {
             (FrameType::Info, body) => {
@@ -4274,6 +4313,70 @@ mod tests {
                 "the Connect body carries the configured default ack level"
             );
         }
+    }
+
+    #[test]
+    fn connect_with_a_credential_appends_the_auth_section_and_redacts_the_secret() {
+        // #884: a ClientConfig::credential is presented in the Connect handshake — connect_with appends
+        // the auth section the server verifies (append_connect_auth), and the credential material never
+        // leaks in Debug (#882). Both halves fail WITHOUT the fix: an old ClientConfig has no credential
+        // field, and connect_with never appended an auth section.
+        use ironbus_proto::message::parse_connect_auth;
+
+        // The plaintext secret must NOT appear in a Debug render of the config (transitive redaction).
+        let secret = b"a-secret-bearer-token-of-32-byte";
+        let config = ClientConfig {
+            credential: Some(AuthCredential {
+                mechanism: AuthMechanism::Bearer,
+                material: secret.to_vec(),
+            }),
+            ..ClientConfig::default()
+        };
+        let dbg = format!("{config:?}");
+        assert!(
+            !dbg.contains("a-secret-bearer-token"),
+            "the credential material must be redacted in Debug, got: {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "the redacted marker should be present, got: {dbg}"
+        );
+
+        // The Connect frame the client sends carries the auth section the server parses.
+        let (addr, handle) = capturing_server(empty_info_frame());
+        let c = Client::connect_with(addr, &config).unwrap();
+        drop(c);
+        let captured = handle.join().unwrap();
+        let frames = decode_all_frames(&captured);
+        assert_eq!(frames[0].0, FrameType::Connect);
+        let parsed = parse_connect_auth(&frames[0].1)
+            .expect("the auth section is well formed")
+            .expect("connect_with with a credential appends an auth section");
+        assert_eq!(parsed.mechanism, AuthMechanism::Bearer);
+        assert_eq!(
+            parsed.material, secret,
+            "the exact credential material is on the wire the server verifies"
+        );
+    }
+
+    #[test]
+    fn connect_with_no_credential_appends_no_auth_section() {
+        // #884 backward-compat: the default config (credential = None) appends NO auth section, so the
+        // Connect body stays byte-for-byte the pre-#631 layout and an unauthenticated connect to a
+        // no-auth broker is unchanged. parse_connect_auth reports no auth.
+        use ironbus_proto::message::parse_connect_auth;
+
+        let (addr, handle) = capturing_server(empty_info_frame());
+        let c = Client::connect_with(addr, &ClientConfig::default()).unwrap();
+        drop(c);
+        let captured = handle.join().unwrap();
+        let frames = decode_all_frames(&captured);
+        assert_eq!(frames[0].0, FrameType::Connect);
+        assert_eq!(
+            parse_connect_auth(&frames[0].1).unwrap(),
+            None,
+            "an unconfigured client presents no credential"
+        );
     }
 
     #[test]
