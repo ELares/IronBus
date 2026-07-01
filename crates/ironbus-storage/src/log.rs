@@ -1635,9 +1635,20 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     ///    and must stitch into one offset-contiguous-at-the-segment-boundary chain; the sequence
     ///    half advances by the covered SPAN across a compacted segment, not the survivor count.
     ///
-    /// Neither reconciliation emits a `LossReport` event: a discarded orphan's data is fully present
-    /// in the originals, and an unlinked superseded original's surviving records are present in the
-    /// compacted segment, so no durable record is actually lost (the I1 to I4 invariants hold).
+    /// The orphan-discard and superseded-original reconciliations emit NO `LossReport` event: a
+    /// discarded orphan's data is fully present in the originals, and an unlinked superseded
+    /// original's surviving records are present in the compacted segment, so no durable record is
+    /// actually lost (the I1 to I4 invariants hold). The ONE exception (#836) is a COMMITTED
+    /// compacted segment (footer + meta CRC-valid) whose BODY is corrupt: it is the sole durable
+    /// copy of the survivors it covers, so it is NOT silently unlinked like a crash-before-commit
+    /// orphan — it is quarantined (a forensic copy) and its covered survivor loss IS accounted in
+    /// the `LossReport` (fail-closed + reported, never a silent drop).
+    ///
+    /// Long for the same reason [`Log::build_compacted_chain`] is: the classify MAP, the serial
+    /// side-effecting FOLD (orphan unlink, #836 committed-but-corrupt quarantine + loss accounting),
+    /// and the three overlap/supersede reconciliations are one cohesive procedure that does not
+    /// factor below the line limit without obscuring the ordering the on-disk image depends on.
+    #[allow(clippy::too_many_lines)]
     fn recover_with_compaction(
         fs: F,
         clock: C,
@@ -1658,12 +1669,32 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             /// A compacted-flagged segment with a torn/CRC-bad trailing footer or block: it did NOT
             /// reach its commit point, so the serial fold unlinks it as a crash-before-commit orphan.
             CompactedOrphan { id: u64 },
+            /// #836: a COMMITTED compacted segment (its footer AND meta block both decoded
+            /// CRC-VALID, proving it reached its commit point) whose BODY is corrupt (a survivor
+            /// frame failed its CRC, or the footer count / body length disagrees). It is the SOLE
+            /// durable copy of the survivors it covers, so it must NEVER be silently unlinked like a
+            /// crash-before-commit orphan: the serial fold QUARANTINES it (a forensic copy) and
+            /// accounts the covered survivor loss in the `LossReport`, then removes the poisoned live
+            /// copy. Carries the survivor byte region + count estimate needed to quarantine + account
+            /// the loss (the covered offset range travels on the typed error for its diagnostics).
+            CompactedCorrupt {
+                id: u64,
+                record_region_start: u64,
+                record_region_end: u64,
+                record_count_estimate: u64,
+            },
         }
         let classified = Self::par_scan_segments(&fs, ids, |fs, id| {
             let reader = SegmentReader::open(fs.open(&segment_file_name(id))?)?;
             if reader.header().is_compacted() {
-                if let Some(scan) = reader.scan_compacted()? {
-                    Ok(Classified::Compacted(CompactedCandidate {
+                // Three distinct outcomes (#836): a valid committed compacted segment (`Ok(Some)`),
+                // a crash-before-commit orphan with no valid trailer (`Ok(None)`, silently unlinked
+                // below because nothing was committed), and a COMMITTED-but-body-corrupt segment
+                // (`Err(CorruptCompacted)`: footer+meta CRC-valid but the body is bit-rotted / count
+                // -inconsistent). The last is the sole durable copy of acked survivors, so it must be
+                // QUARANTINED + reported, never conflated with the orphan unlink.
+                match reader.scan_compacted() {
+                    Ok(Some(scan)) => Ok(Classified::Compacted(CompactedCandidate {
                         id,
                         record_count: scan.records.len() as u64,
                         max_timestamp_ms: scan.max_timestamp_ms,
@@ -1674,9 +1705,22 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                             covered_end_seq: scan.meta.covered_end_seq,
                         },
                         valid_end: scan.valid_end,
-                    }))
-                } else {
-                    Ok(Classified::CompactedOrphan { id })
+                    })),
+                    Ok(None) => Ok(Classified::CompactedOrphan { id }),
+                    Err(StorageError::CorruptCompacted {
+                        segment_id: _,
+                        covered_base_offset: _,
+                        covered_end_offset: _,
+                        record_region_start,
+                        record_region_end,
+                        record_count_estimate,
+                    }) => Ok(Classified::CompactedCorrupt {
+                        id,
+                        record_region_start,
+                        record_region_end,
+                        record_count_estimate,
+                    }),
+                    Err(e) => Err(e),
                 }
             } else {
                 let scan = reader.scan_recovery()?;
@@ -1697,13 +1741,57 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         });
         let mut ordinaries: Vec<OrdinaryCandidate> = Vec::new();
         let mut compacteds: Vec<CompactedCandidate> = Vec::new();
+        // #836: loss events for any COMMITTED-but-body-corrupt compacted segment quarantined below,
+        // carried into `build_compacted_chain` so they land in the recovered log's `LossReport` and
+        // are subject to the I3 bounded-loss caps alongside any active-segment torn tail.
+        let mut corrupt_losses: Vec<LossEvent> = Vec::new();
         for c in classified {
             match c? {
                 Classified::Ordinary(o) => ordinaries.push(o),
                 Classified::Compacted(cc) => compacteds.push(cc),
                 Classified::CompactedOrphan { id } => {
                     // A compacted-flagged segment with a torn/CRC-bad trailing footer or block did
-                    // NOT reach its commit point: discard it as a crash-before-commit orphan.
+                    // NOT reach its commit point: discard it as a crash-before-commit orphan. Nothing
+                    // was committed, so the originals remain authoritative and this is not a loss.
+                    fs.remove(&segment_file_name(id))?;
+                    fs.sync_dir()?;
+                }
+                Classified::CompactedCorrupt {
+                    id,
+                    record_region_start,
+                    record_region_end,
+                    record_count_estimate,
+                } => {
+                    // #836: a COMMITTED compacted segment (footer+meta CRC-valid) whose body is
+                    // corrupt is the SOLE durable copy of the survivors it covers, so it must NEVER
+                    // be silently unlinked like a crash-before-commit orphan. Fail closed exactly as
+                    // the active-segment corruption path does: COPY the poisoned survivor region into
+                    // the forensic quarantine store, account the covered survivor loss in the
+                    // `LossReport`, THEN remove the poisoned live copy so it is neither re-triggered
+                    // every boot nor served as truth. The reason is `CorruptRecordBody` (a survivor
+                    // record can no longer be trusted): it counts as data loss and is quarantined,
+                    // the same boundary the active-segment skip uses.
+                    let event = LossEvent::span(
+                        id,
+                        record_region_start,
+                        record_region_end,
+                        record_count_estimate.max(1),
+                        ReasonCode::CorruptRecordBody,
+                    );
+                    // Forensic COPY (never a silent drop), best-effort: a quarantine IO failure never
+                    // blocks recovery, exactly like the active-segment corruption skip.
+                    if let Ok(source) = fs.open(&segment_file_name(id)) {
+                        let _ = crate::quarantine::quarantine_corrupt_span(
+                            &fs,
+                            &source,
+                            &event,
+                            config.max_quarantine_bytes,
+                        );
+                    }
+                    corrupt_losses.push(event);
+                    // Remove the poisoned live copy AFTER the forensic capture: this mirrors the
+                    // orphan unlink, but only once the loss is preserved (quarantine) and reported
+                    // (LossReport), so it is never a SILENT drop.
                     fs.remove(&segment_file_name(id))?;
                     fs.sync_dir()?;
                 }
@@ -1761,8 +1849,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
 
         // Step 4: build the reconciled, offset-ordered slot list and verify the chain stitches at
         // segment boundaries. Each entry carries its covered/actual base and end so the continuity
-        // check uses the covered span across a compacted segment.
-        Self::build_compacted_chain(fs, clock, config, keep_ordinary, keep_compacted)
+        // check uses the covered span across a compacted segment. Any #836 committed-but-corrupt
+        // loss events are threaded in so they land in the recovered log's `LossReport`.
+        Self::build_compacted_chain(
+            fs,
+            clock,
+            config,
+            keep_ordinary,
+            keep_compacted,
+            corrupt_losses,
+        )
     }
 
     /// Stitches the reconciled ordinary + compacted candidate set into the recovered [`Log`],
@@ -1780,6 +1876,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         config: LogConfig,
         ordinaries: Vec<OrdinaryCandidate>,
         compacteds: Vec<CompactedCandidate>,
+        corrupt_losses: Vec<LossEvent>,
     ) -> Result<Log<F, C>, StorageError> {
         // A reconciled chain entry, sorted by covered/actual base offset.
         enum Entry {
@@ -1927,6 +2024,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             pending_roll: None,
         };
 
+        // #836: record the covered survivor loss of any COMMITTED-but-corrupt compacted segment the
+        // reconciliation quarantined + removed above. These are real DATA-loss events (unlike the
+        // orphan/superseded unlinks, which lose nothing), so they must show up in the recovered
+        // log's `LossReport` and be subject to the I3 bounded-loss caps below, exactly like an
+        // active-segment corruption skip. The forensic bytes were already copied to `quarantine/`
+        // during the fold; `quarantined_bytes` was seeded from `persisted_bytes` above, which
+        // already reflects them.
+        for event in corrupt_losses {
+            log.loss_report.push(event);
+        }
+
         match active {
             // The highest-range entry is an UNSEALED ordinary segment: it is the active WAL. Drop
             // any torn or unsynced tail and resume appending at the valid prefix end, exactly as the
@@ -1988,8 +2096,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         }
 
         // I3 bounded-loss caps, identical to the v1 path: fail closed rather than accept unbounded
-        // silent loss. The reconciliation itself emits no loss event (no durable record was lost),
-        // so the only loss here is an active-segment torn tail, exactly as in v1 recovery.
+        // silent loss. The orphan/superseded reconciliation unlinks lose nothing (their data is
+        // present elsewhere), so the only loss events here are an active-segment torn tail and any
+        // #836 committed-but-corrupt compacted segment the reconciliation quarantined — the latter
+        // is exactly why the cap matters, so a cascade of corrupt compacted segments fails closed
+        // rather than silently dropping every survivor they covered.
         let per_event_cap = log
             .config
             .max_segment_bytes

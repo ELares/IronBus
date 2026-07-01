@@ -19,7 +19,8 @@
 
 use bytes::Bytes;
 use ironbus_core::clock::ManualClock;
-use ironbus_core::segment::SegmentHeader;
+use ironbus_core::format::{COMPACTION_META_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
+use ironbus_core::segment::{SegmentFooter, SegmentHeader};
 use ironbus_core::types::Offset;
 use ironbus_storage::compaction::CompactionConfig;
 use ironbus_storage::fault::FaultFs;
@@ -89,6 +90,213 @@ fn all_records(log: &Log<InMemoryFs, ManualClock>) -> Vec<OwnedRecord> {
     let head = log.flushed_offset().get();
     log.read_from(Offset::ZERO, usize::try_from(head).unwrap())
         .unwrap()
+}
+
+/// Builds a dirty log, FULLY compacts it on a clean disk (so the compacted segment is durable and
+/// its covered originals are unlinked — the compacted segment is now the SOLE durable copy of its
+/// survivors), and returns the disk, the pre-compaction record set, the covered survivor set, and
+/// the id of the committed compacted segment. This is the exact starting image #836 describes: a
+/// mid-body bit-flip in this segment must NOT be conflated with a crash-before-commit orphan.
+fn fully_compacted_sole_copy() -> (InMemoryFs, Vec<OwnedRecord>, Vec<OwnedRecord>, u64) {
+    let (fs, before, _head) = build_dirty_log(InMemoryFs::new());
+    let want = expected_survivors(&before);
+    let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+    let out = log.maybe_compact(&CompactionConfig::enabled()).unwrap();
+    assert!(
+        out.compacted_segment_id.is_some(),
+        "the pass produced a committed compacted segment"
+    );
+    let fs = log.into_filesystem();
+    let compacted_id = segment_ids(&fs)
+        .unwrap()
+        .into_iter()
+        .find(|&id| {
+            SegmentReader::open(fs.open(&segment_file_name(id)).unwrap())
+                .unwrap()
+                .header()
+                .is_compacted()
+        })
+        .expect("a committed compacted segment exists on disk");
+    (fs, before, want, compacted_id)
+}
+
+/// The final assertion shared by both #836 variants: after the corruption of a COMMITTED compacted
+/// segment (its footer + meta stay CRC-valid), `Log::open` must fail closed by QUARANTINING the sole
+/// durable copy and ACCOUNTING the covered survivor loss in the `LossReport` — never the silent
+/// crash-before-commit-orphan unlink that drops every survivor unreported.
+///
+/// This is the post-#836-fix expectation (the pre-fix behaviour reproduced the silent sole-copy
+/// loss). It asserts, precisely:
+/// 1. `Log::open` SUCCEEDS (recovery quarantines + reports rather than aborting the whole boot);
+/// 2. the poisoned segment is QUARANTINED — a forensic copy exists under `quarantine/`, so it is
+///    provably NOT silently gone;
+/// 3. the `LossReport` accounts the covered survivors as real DATA loss (a `CorruptRecordBody` event
+///    on the compacted segment id, with a `records_lost_estimate` covering every survivor), so the
+///    survivors that dropped out of the live read did so ACCOUNTED, never silently.
+fn assert_not_silently_lost(fs: InMemoryFs, compacted_id: u64, want_survivors: &[OwnedRecord]) {
+    let recovered = Log::open(fs, ManualClock::new(), small_config())
+        .expect("recovery must quarantine + report the committed-but-corrupt compacted segment, not fail the whole boot");
+
+    // Read every record STILL LIVE, from the recovered log's earliest retained offset (quarantining
+    // the poisoned compacted segment raises the oldest offset past its covered range, so a
+    // `read_from(ZERO, ..)` would just error `OffsetOutOfRange`). The survivors the compacted segment
+    // was the SOLE copy of are absent from this live read: they are the genuinely-lost set, distinct
+    // from a survivor that also lived in an un-compacted segment (e.g. the keyless tail).
+    let head = recovered.flushed_offset().get();
+    let got = recovered
+        .read_from(
+            recovered.earliest_offset(),
+            usize::try_from(head).unwrap_or(usize::MAX),
+        )
+        .unwrap_or_default();
+    let got_offsets: std::collections::HashSet<u64> = got.iter().map(|r| r.offset.get()).collect();
+    let lost: Vec<u64> = want_survivors
+        .iter()
+        .map(|r| r.offset.get())
+        .filter(|o| !got_offsets.contains(o))
+        .collect();
+
+    // The LossReport must ACCOUNT the covered survivor loss: a data-loss event on the poisoned
+    // compacted segment, estimating at least as many records as it held survivors.
+    let report = recovered.loss_report().clone();
+    let accounted_records =
+        report.records_lost_for(ironbus_storage::loss::ReasonCode::CorruptRecordBody);
+    let event_for_segment = report
+        .events
+        .iter()
+        .any(|e| e.segment_id == compacted_id && e.reason_code.is_data_loss());
+
+    let fs = recovered.into_filesystem();
+    let quarantined = fs.subdir_exists("quarantine").unwrap();
+
+    // (1) At least one sole-copy survivor left the LIVE log (the poisoned segment WAS the sole
+    // durable copy of the survivors it covered)...
+    assert!(
+        !lost.is_empty(),
+        "the sole-copy survivors the poisoned compacted segment covered must drop out of the live \
+         read once it is quarantined"
+    );
+    // (2) ...but the segment is QUARANTINED (a forensic copy), never silently unlinked...
+    assert!(
+        quarantined,
+        "SILENT SOLE-COPY DATA LOSS (#836): the committed compacted segment must be quarantined \
+         (a forensic copy under quarantine/), not unlinked as a crash-before-commit orphan"
+    );
+    // (3) ...and the covered survivor loss is ACCOUNTED in the LossReport (fail-closed + reported):
+    // a data-loss event on the poisoned segment, estimating at least as many lost records as
+    // vanished from the live read. The keyless tail survivor (offset 12) lives in an un-compacted
+    // segment, so it stays durable and is NOT counted here — only the compacted segment's own
+    // survivors are the sole-copy loss.
+    assert!(
+        !report.is_empty() && event_for_segment && report.data_loss_bytes() > 0,
+        "SILENT SOLE-COPY DATA LOSS (#836): recovery must emit a data-loss LossReport event for the \
+         quarantined compacted segment {compacted_id}, never drop the sole durable copy unreported \
+         (report={report:?})"
+    );
+    assert!(
+        accounted_records >= lost.len() as u64,
+        "the LossReport must account at least the {} vanished sole-copy survivors as lost records, \
+         got {accounted_records}",
+        lost.len()
+    );
+}
+
+/// #836 variant 1: a mid-body survivor bit-flip in a committed compacted segment (the trailing
+/// footer + 44-byte compaction block are left intact, so they stay CRC-valid and decode). This is
+/// NOT a crash-before-commit orphan — the segment reached its commit point — so `scan_compacted`
+/// must report it DISTINCTLY from the `Ok(None)` a torn footer yields, and recovery must quarantine
+/// + account the SOLE durable copy rather than silently unlinking it.
+///
+/// Regression guard for the fix: `scan_compacted` returns the typed `Err(CorruptCompacted)` on the
+/// mid-body corruption branch, and `Log::open` quarantines the poisoned segment and records the
+/// covered survivor loss in the `LossReport`. Before the fix this reproduced silent sole-copy data
+/// loss (the file was unlinked, offsets 10..12 vanished with no `LossReport` and no quarantine); if
+/// that silent-unlink ever regresses, `assert_not_silently_lost` fails.
+#[test]
+fn mid_body_corruption_in_a_committed_compacted_segment_is_not_silently_unlinked() {
+    let (fs, _before, want, compacted_id) = fully_compacted_sole_copy();
+
+    // Flip one byte inside a NON-TAIL survivor frame: 8 bytes past the 64-byte header lands in the
+    // first survivor's frame, well before the footer. The footer (32) + meta block (44) at the very
+    // end are untouched, so they still decode CRC-valid — the exact ambiguous shape #836 names.
+    let file = fs.open(&segment_file_name(compacted_id)).unwrap();
+    let flip_at = SEGMENT_HEADER_LEN as u64 + 8;
+    let mut b = [0u8; 1];
+    file.read_exact_at(&mut b, flip_at).unwrap();
+    b[0] ^= 0xFF;
+    file.write_all_at(&b, flip_at).unwrap();
+    file.sync_all().unwrap();
+    fs.sync_dir().unwrap();
+
+    // The flip drives `scan_compacted` down the mid-body corruption branch (footer + meta still
+    // decode CRC-valid, but a survivor frame fails its CRC). Post-fix that returns the DISTINCT typed
+    // `Err(CorruptCompacted)`, never the crash-before-commit `Ok(None)` recovery would unlink.
+    {
+        let reader =
+            SegmentReader::open(fs.open(&segment_file_name(compacted_id)).unwrap()).unwrap();
+        let scan = reader.scan_compacted();
+        assert!(
+            matches!(
+                scan,
+                Err(ironbus_storage::segment::StorageError::CorruptCompacted { .. })
+            ),
+            "a mid-body-corrupt COMMITTED compacted segment must report the distinct \
+             CorruptCompacted signal, not the crash-before-commit Ok(None) orphan"
+        );
+    }
+
+    assert_not_silently_lost(fs, compacted_id, &want);
+}
+
+/// #836 variant 2: a footer `record_count` / body-length DISAGREEMENT past the valid trailers. The
+/// footer and meta block are re-stamped with a fresh, CRC-valid footer whose `record_count` no
+/// longer matches the survivors on disk, so `scan_compacted` decodes every frame and both trailers
+/// cleanly, then hits the count cross-check (segment.rs). That segment reached its commit point, so
+/// it must be reported DISTINCTLY from a crash-before-commit orphan and quarantined, not unlinked.
+///
+/// Regression guard, sibling of the mid-body variant: the count cross-check returns the typed
+/// `Err(CorruptCompacted)` and recovery quarantines + accounts the loss. Before the fix this
+/// reproduced the same silent sole-copy loss via the third `Ok(None)` case.
+#[test]
+fn footer_count_disagreement_in_a_committed_compacted_segment_is_not_silently_unlinked() {
+    let (fs, _before, want, compacted_id) = fully_compacted_sole_copy();
+
+    // Re-stamp the trailing footer with record_count + 1 and a VALID v2 CRC, leaving the survivor
+    // frames and the meta block exactly as they are. The footer now describes one more record than
+    // the body holds, driving the footer/body-length disagreement branch.
+    let file = fs.open(&segment_file_name(compacted_id)).unwrap();
+    let file_len = file.len().unwrap();
+    let footer_start = file_len - COMPACTION_META_LEN as u64 - SEGMENT_FOOTER_LEN as u64;
+    let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+    file.read_exact_at(&mut fbuf, footer_start).unwrap();
+    let footer = SegmentFooter::decode(&fbuf).expect("the committed footer decodes");
+    let tampered = SegmentFooter {
+        record_count: footer.record_count + 1,
+        ..footer
+    };
+    file.write_all_at(&tampered.encode_v2(), footer_start)
+        .unwrap();
+    file.sync_all().unwrap();
+    fs.sync_dir().unwrap();
+
+    // The re-stamped footer is CRC-valid but disagrees with the body count, so `scan_compacted`
+    // returns the DISTINCT typed `Err(CorruptCompacted)` at the count cross-check — never the
+    // crash-before-commit `Ok(None)` orphan recovery would silently unlink.
+    {
+        let reader =
+            SegmentReader::open(fs.open(&segment_file_name(compacted_id)).unwrap()).unwrap();
+        let scan = reader.scan_compacted();
+        assert!(
+            matches!(
+                scan,
+                Err(ironbus_storage::segment::StorageError::CorruptCompacted { .. })
+            ),
+            "a footer-count-inconsistent COMMITTED compacted segment must report the distinct \
+             CorruptCompacted signal, not the crash-before-commit Ok(None) orphan"
+        );
+    }
+
+    assert_not_silently_lost(fs, compacted_id, &want);
 }
 
 #[test]
