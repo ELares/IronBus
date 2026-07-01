@@ -1472,11 +1472,11 @@ impl core::fmt::Debug for AuthCredential {
 }
 
 /// The TRAILING-section marker byte that introduces an appended auth credential in the `Connect`
-/// body (#631, V2-M7). The auth section lives ENTIRELY AFTER the `field_len` v1 block (and after any
-/// appended `default_ack_level`/`default_tier` bytes), in the "bytes past `field_len`, tolerated and
-/// ignored by an old reader" zone [`decode_connect`] documents — so it disturbs NO existing fixed
-/// offset and does NOT consume a bit of the (full) historical `flags` byte. The layout of the
-/// section is exactly: `[AUTH_SECTION_MARKER: u8][mechanism: u8][material: u16-length-prefixed]`.
+/// body (#631, V2-M7). The auth section lives ENTIRELY AFTER the `field_len` v1 block (the appended
+/// `default_ack_level`/`default_tier` bytes ride INSIDE that block, so the section follows the whole
+/// block), in the trailing zone [`decode_connect`] documents as RESERVED for auth — so it disturbs NO
+/// existing fixed offset and does NOT consume a bit of the (full) historical `flags` byte. The layout
+/// of the section is exactly: `[AUTH_SECTION_MARKER: u8][mechanism: u8][material: u16-length-prefixed]`.
 ///
 /// A body with no trailing bytes (an old client, the empty `Connect` body, a connection that does
 /// not authenticate) decodes to `auth = None`, byte-for-byte the historical body. The marker is a
@@ -1549,9 +1549,15 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
 ///
 /// An EMPTY body is the historical old-client case and decodes to an all-`None` request (the server
 /// then uses its defaults). A non-empty body MUST carry the version byte and the `u16` field-length;
-/// the v1 known fields are read from the front of the declared block and any trailing bytes (a future
-/// version's appended fields) are tolerated and ignored, so a newer client's longer body still decodes
-/// its v1 fields here. A body that is non-empty but too short to hold the `field_len` it declares is a
+/// the v1 known fields are read from the front of the declared block. Two DISTINCT extension regions
+/// follow, both tolerated and ignored here, but they are NOT interchangeable: bytes past the v1 fields
+/// yet still INSIDE the `field_len` block are a future version's ADDITIVE fields (the established
+/// in-block extension point — `default_ack_level` #494 and `default_tier` #543 already live here),
+/// while the bytes AFTER the whole block are the trailing zone RESERVED for the auth section (#631),
+/// parsed separately by [`parse_connect_auth`]. A future additive field MUST extend the in-block
+/// region, never the trailing zone, so the auth section stays the sole trailing-zone occupant. Either
+/// way a newer client's longer body still decodes its v1 fields here. A body that is non-empty but too
+/// short to hold the `field_len` it declares is a
 /// typed [`BodyError`], never a panic or an over-read (the `field_len` is bounded against the actual
 /// body by [`Reader::take`] BEFORE any read, so a hostile length cannot force an over-allocation).
 ///
@@ -1571,8 +1577,9 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     // `field_len` is the declared length of the version's known-field block; the reader takes exactly
     // that many bytes (cap-before-alloc: `take` bounds-checks it against the actual body, so a hostile
     // length is a typed Truncated, never an allocation), and only the v1 fields are parsed from the
-    // front of it. Any bytes past the v1 fields, and any bytes after the whole block, are a future
-    // version's appended fields, tolerated and ignored (forward-compat).
+    // front of it. Bytes past the v1 fields but INSIDE the block are a future version's additive fields
+    // (the in-block extension point); bytes AFTER the whole block are the trailing zone reserved for the
+    // auth section (parsed by parse_connect_auth). Both are tolerated and ignored here (forward-compat).
     let field_len = r.u16()? as usize;
     let block = r.take(field_len)?;
     let mut fr = Reader::new(block);
@@ -1643,6 +1650,14 @@ pub fn append_connect_auth(out: &mut Vec<u8>, cred: &AuthCredential) -> Result<(
 /// `default_ack_level`/`default_tier` bytes) to the trailing zone and reads the auth section IFF the
 /// trailing bytes begin with [`CONNECT_AUTH_SECTION_MARKER`].
 ///
+/// The trailing zone (the bytes AFTER the whole `field_len` block) is RESERVED for the auth section and
+/// holds nothing else: every additive `Connect` field to date rides INSIDE the block (`default_ack_level`
+/// #494, `default_tier` #543), and [`decode_connect`]'s doc freezes that a future additive field MUST
+/// extend the in-block region, never this zone. So the auth section, when present, is the FIRST byte of
+/// the trailing zone — this reader relies on that invariant, and it agrees with the `decode_connect`
+/// model rather than contradicting it. A leading trailing byte that is not the marker is treated as
+/// no-auth (a stray/foreign byte), which the server fails CLOSED on when auth is required.
+///
 /// Returns `Ok(None)` for the no-auth cases that MUST stay byte-for-byte compatible: an empty body,
 /// an old-client body with no trailing bytes, or trailing bytes that do not begin with the auth
 /// marker. Returns `Ok(Some(cred))` when a well-formed auth section is present. This is decoupled
@@ -1673,8 +1688,11 @@ pub fn parse_connect_auth(body: &[u8]) -> Result<Option<AuthCredential>, BodyErr
     // appended bytes is needed (they live inside the block, not after it).
     let field_len = r.u16()? as usize;
     let _block = r.take(field_len)?;
-    // The trailing zone. No bytes, or a leading byte that is not the auth marker, is the no-auth
-    // case (an old body, or some other future trailing field): ignore and report no auth.
+    // The trailing zone is reserved for the auth section and holds nothing else — future additive
+    // fields live INSIDE the field_len block (the #494/#543 pattern), so the auth section, when present,
+    // is the FIRST byte here. No bytes, or a leading byte that is not the auth marker, is the no-auth
+    // case (an old body, or a stray/foreign trailing byte): ignore and report no auth. When auth is
+    // required the server maps this None to the uniform Authorization Violation, i.e. fail-closed.
     if r.at_end() {
         return Ok(None);
     }
@@ -4614,8 +4632,9 @@ mod tests {
 
     #[test]
     fn connect_non_marker_trailing_byte_is_ignored_as_no_auth() {
-        // Forward-compat: a trailing byte that is not the auth marker (a hypothetical future trailing
-        // field) leaves auth = None and never errors, exactly as the tolerate-trailing rule requires.
+        // Forward-compat: a leading trailing byte that is not the auth marker (a stray/foreign byte;
+        // the trailing zone is reserved for the auth section, so no legitimate non-auth field lives
+        // here) leaves auth = None and never errors, exactly as the tolerate-trailing rule requires.
         let mut buf = Vec::new();
         encode_connect(&ConnectBody::default(), &mut buf);
         buf.push(0x01); // not CONNECT_AUTH_SECTION_MARKER
