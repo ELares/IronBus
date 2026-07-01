@@ -423,6 +423,15 @@ pub struct SegmentWriter<F: RandomAccessFile> {
 /// reaches this size, bounding the writer's heap at a constant instead of the unsynced window.
 const PENDING_SPILL_BYTES: usize = 256 * 1024;
 
+/// The read window the streaming recovery walk ([`SegmentReader::scan_body_streaming`]) fills per
+/// `read_exact_at` (#816). The body is validated one frame at a time, but frames are decoded out of
+/// this reused window instead of issuing two preads PER RECORD, so the recovery read-syscall count
+/// drops from `2 * record_count` to roughly `body_bytes / RECOVERY_WINDOW_BYTES` (plus one small
+/// re-read per frame that straddles a window boundary). Peak recovery heap stays bounded by this
+/// window, except that a single frame larger than the window grows it just enough to fit that one
+/// frame — the same one-record bound the previous per-record path already tolerated.
+const RECOVERY_WINDOW_BYTES: usize = 256 * 1024;
+
 impl<F: RandomAccessFile> SegmentWriter<F> {
     /// Creates a new segment, writing the header at offset 0. The file should be
     /// freshly created (see [`crate::io::StdFile::create_new`]).
@@ -1876,13 +1885,20 @@ impl<F: RandomAccessFile> SegmentReader<F> {
 
     /// Streams `[start, end)` one record at a time, validating each frame and the
     /// sequence run, stopping at the first torn or corrupt frame. Peak memory is one
-    /// record (a reused scratch buffer), never the whole region. Returns the valid
+    /// bounded read window (`RECOVERY_WINDOW_BYTES`), or a single over-window frame,
+    /// never the whole region. Returns the valid
     /// record count, the maximum record timestamp, the last valid sequence, the bytes
     /// consumed, and whether the region decoded cleanly. A valid frame with an
     /// out-of-order sequence is a hard error, the same structural check `Log::recover`
     /// applies to a buffered scan.
     fn scan_body_streaming(&self, start: u64, end: u64) -> Result<BodyWalk, StorageError> {
-        let mut scratch: Vec<u8> = Vec::new();
+        // The reused read window: `win` holds the file bytes `[win_start, win_start + win.len())`.
+        // Frames are decoded out of this window (byte-for-byte the same header/body/CRC/sequence
+        // decisions the per-record path made), refilling only when the next frame's header or body
+        // straddles the window edge, so recovery issues ~`body_bytes / RECOVERY_WINDOW_BYTES` reads
+        // instead of two per record (#816).
+        let mut win: Vec<u8> = Vec::new();
+        let mut win_start = start;
         let mut pos = start;
         let mut count = 0u64;
         let mut max_timestamp_ms = 0u64;
@@ -1895,10 +1911,18 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 tail_reason = Some(ReasonCode::TornTail);
                 break;
             }
-            // Read just the header to learn the frame length without buffering the body.
-            scratch.resize(RECORD_HEADER_LEN, 0);
-            self.file.read_exact_at(&mut scratch, pos)?;
-            let Ok(total) = codec::decoded_len(&scratch) else {
+            // Ensure the window holds this frame's header, then learn the frame length. `need` is
+            // widened to a full window (bounded by the region) so one read serves many frames.
+            self.fill_window(
+                &mut win,
+                &mut win_start,
+                pos,
+                RECORD_HEADER_LEN as u64,
+                remaining,
+            )?;
+            let mut rel =
+                usize::try_from(pos - win_start).map_err(|_| StorageError::SegmentFull)?;
+            let Ok(total) = codec::decoded_len(&win[rel..]) else {
                 // A bad magic, version, or header CRC: a corrupt header ends the valid prefix.
                 tail_reason = Some(ReasonCode::CorruptRecordHeader);
                 break;
@@ -1909,13 +1933,12 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 tail_reason = Some(ReasonCode::TornTail);
                 break;
             }
-            // Read the rest of the frame after the header, then validate the whole record.
-            scratch.resize(total, 0);
-            self.file.read_exact_at(
-                &mut scratch[RECORD_HEADER_LEN..],
-                pos + RECORD_HEADER_LEN as u64,
-            )?;
-            let Ok((view, consumed)) = codec::decode(&scratch) else {
+            // Ensure the whole frame is in the window (a straddling frame triggers a refill from
+            // `pos`, growing the window only for a single frame larger than the window), then
+            // validate it out of the window slice.
+            self.fill_window(&mut win, &mut win_start, pos, total as u64, remaining)?;
+            rel = usize::try_from(pos - win_start).map_err(|_| StorageError::SegmentFull)?;
+            let Ok((view, consumed)) = codec::decode(&win[rel..rel + total]) else {
                 // The header was intact but the body or trailer failed: a corrupt body.
                 tail_reason = Some(ReasonCode::CorruptRecordBody);
                 break;
@@ -1951,6 +1974,40 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             clean: tail_reason.is_none(),
             tail_reason,
         })
+    }
+
+    /// Ensures the reused read window `win` (covering `[*win_start, *win_start + win.len())`)
+    /// contains at least `need` bytes starting at `pos`, refilling with a single `read_exact_at`
+    /// anchored at `pos` when it does not. `remaining` is `end - pos`, the bytes left in the walk
+    /// region; the caller guarantees `need <= remaining`, so the read never runs past the region
+    /// (and, in the footer-candidate case, never into the trailing footer bytes). The window is
+    /// filled to `RECOVERY_WINDOW_BYTES` where the region allows, but grows to `need` for a single
+    /// frame larger than the window, matching the one-record bound the per-record path tolerated.
+    fn fill_window(
+        &self,
+        win: &mut Vec<u8>,
+        win_start: &mut u64,
+        pos: u64,
+        need: u64,
+        remaining: u64,
+    ) -> Result<(), StorageError> {
+        // Already buffered: `pos` never rewinds, so `pos >= *win_start` holds.
+        let have = if pos >= *win_start {
+            (win.len() as u64).saturating_sub(pos - *win_start)
+        } else {
+            0
+        };
+        if have >= need {
+            return Ok(());
+        }
+        // Refill from `pos`: read a full window where the region allows, but never fewer than
+        // `need` bytes and never past the region end (`need <= remaining`).
+        let want = need.max((RECOVERY_WINDOW_BYTES as u64).min(remaining));
+        let want = usize::try_from(want).map_err(|_| StorageError::SegmentFull)?;
+        *win_start = pos;
+        win.resize(want, 0);
+        self.file.read_exact_at(win.as_mut_slice(), pos)?;
+        Ok(())
     }
 }
 
@@ -2748,6 +2805,56 @@ mod tests {
         bytes[last] ^= 0xff;
         corrupt.write_all_at(&bytes, 0).unwrap();
         assert_scans_agree(&corrupt);
+    }
+
+    #[test]
+    fn scan_recovery_walks_records_across_read_windows() {
+        // #816: the streaming walk decodes frames out of a bounded reused read window instead of
+        // two preads per record. This body deliberately spans several `RECOVERY_WINDOW_BYTES`
+        // windows so many frames straddle a window edge (forcing the refill-from-`pos` path), and
+        // includes one frame LARGER than the window (forcing the grow-to-fit-one-frame path). The
+        // recovered result must stay byte-for-byte identical to the buffered scan across every
+        // window boundary, both unsealed and sealed (the footer-candidate re-walk must not read
+        // into the trailing footer). Small frames alone already exceed one window several times
+        // over, so a straddle is guaranteed; the oversized frame pins the grow branch.
+        let oversized = vec![0xa5u8; RECOVERY_WINDOW_BYTES + 4096];
+        for seal in [false, true] {
+            let file = Arc::new(InMemoryFile::new());
+            let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+            let mut seq = 0u64;
+            // Enough small records that the body crosses several 256 KiB windows.
+            for _ in 0..12_000u64 {
+                // Vary the payload length so frame sizes are not a uniform stride, letting frame
+                // boundaries land at arbitrary offsets relative to the window edge.
+                let n = 8 + usize::try_from(seq % 40).unwrap();
+                let payload = vec![u8::try_from(seq & 0xff).unwrap(); n];
+                w.append(&rec(seq, &payload)).unwrap();
+                seq += 1;
+                // Drop one over-window frame partway through to exercise the grow branch.
+                if seq == 6_000 {
+                    w.append(&rec(seq, &oversized)).unwrap();
+                    seq += 1;
+                }
+            }
+            if seal {
+                w.seal().unwrap();
+            } else {
+                w.sync().unwrap();
+            }
+            let streamed = SegmentReader::open(Arc::clone(&file))
+                .unwrap()
+                .scan_recovery()
+                .unwrap();
+            assert_eq!(streamed.record_count, seq, "count (seal={seal})");
+            assert_eq!(
+                streamed.last_seq,
+                Seq::new(seq - 1),
+                "last_seq (seal={seal})"
+            );
+            assert!(streamed.clean, "clean (seal={seal})");
+            assert_eq!(streamed.footer.is_some(), seal, "footer (seal={seal})");
+            assert_scans_agree(&file);
+        }
     }
 
     #[test]
