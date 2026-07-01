@@ -8,8 +8,12 @@
 //! a hard cap BEFORE any allocation, so a hostile or corrupt length cannot force a large
 //! reservation. Decoding is a streaming parser: it reports how many bytes a complete frame
 //! consumed, or how many it still needs, so a connection can frame a byte stream without
-//! over-reading. Unknown type tags decode at the envelope level (the length lets a reader
-//! skip a frame it does not understand), which keeps the protocol forward-compatible.
+//! over-reading. An unknown type tag decodes at the envelope level (the length prefix still
+//! reports the frame's full size, so a reader always knows where the next frame begins), but the
+//! reference clients do NOT skip it: an unrecognized tag is a TERMINAL, connection-ending error
+//! (`ClientError::UnknownFrameType`), not a benign forward-compatible skip. On the pre-adoption
+//! plaintext wire an unknown tag from a peer is treated as suspicious rather than as a future
+//! extension to be ignored.
 //!
 //! Layout: `[ len: u32 LE ][ type: u8 ][ body: len - 1 bytes ]`, where `len` counts the
 //! type byte plus the body.
@@ -391,8 +395,10 @@ pub enum FrameType {
     /// the committed leader's CLIENT-facing address — so the client need not re-discover it. It is an
     /// ADDITIVE, server→client tag a single-node broker NEVER emits (the redirect path is cluster-gated):
     /// an off-cluster produce is byte-for-byte today's `PubAck`/`Err`, so this tag never appears on a
-    /// non-cluster wire. A client that does not understand the tag treats it as an unknown frame (a
-    /// `ClientError`), exactly the forward-compatible skip the envelope already guarantees; tags 1-41 are
+    /// non-cluster wire. A client that does not understand the tag treats it as an unknown frame — a
+    /// TERMINAL, connection-ending `ClientError::UnknownFrameType`, NOT a skip (the envelope's length
+    /// prefix still reports the frame's size, but the reference clients deliberately fail the call
+    /// rather than ignore an unrecognized server tag on the pre-adoption plaintext wire); tags 1-41 are
     /// byte-for-byte unchanged. Body: a [`crate::message::NotLeaderBody`] — `body_version: u8`, then the
     /// leader-hint address as a u16-length-prefixed UTF-8 string (EMPTY when the current leader's client
     /// address is not yet known, e.g. mid-failover; the client then re-discovers / retries its known
@@ -550,8 +556,9 @@ impl FrameType {
         }
     }
 
-    /// Parses a wire tag, returning `None` for an unknown type (which a forward-compatible
-    /// reader skips using the frame length rather than failing the connection).
+    /// Parses a wire tag, returning `None` for an unknown type. The envelope's length prefix still
+    /// reports the frame's full size, but the reference clients treat a `None` here as a TERMINAL,
+    /// connection-ending `ClientError::UnknownFrameType` rather than skipping the frame.
     #[must_use]
     pub fn from_u8(tag: u8) -> Option<FrameType> {
         Some(match tag {
