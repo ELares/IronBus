@@ -723,3 +723,204 @@ fn rejects_an_unsealed_non_final_ordinary_after_a_compacted_segment() {
         other => panic!("expected UnsealedPredecessor, got {other:?}"),
     }
 }
+
+// --- #857: the all-compacted roll-forward branch of build_compacted_chain (active_ordinary == None).
+// Normal operation NEVER reaches this arm: compaction never compacts the active segment and reap
+// never deletes it, so a surviving ordinary segment is always present and active_ordinary is always
+// Some. We construct the compacted-only directory artificially (delete the sole surviving ordinary
+// segment, leaving only the committed compacted segment) so the None arm — which derives the resume
+// id and base INDEPENDENTLY of the other two arms — actually executes, locking its forward invariant
+// (ADR-0002 ids never reused, I5 offsets strictly increasing) before compaction of the active segment
+// ever makes the arm reachable in production.
+
+/// The highest covered end `(offset, seq)` and the highest segment id across every COMPACTED segment
+/// on the disk, plus the count of ordinary vs compacted segments present. The None arm resumes the
+/// log at the highest covered end and mints a fresh active id of `max(all ids) + 1`.
+fn compacted_only_summary(fs: &InMemoryFs) -> (u64, u64, u64, usize, usize) {
+    let mut max_id = 0u64;
+    let mut covered_end_offset = 0u64;
+    let mut covered_end_seq = 0u64;
+    let mut ordinary = 0usize;
+    let mut compacted = 0usize;
+    for id in segment_ids(fs).unwrap() {
+        max_id = max_id.max(id);
+        let reader = SegmentReader::open(fs.open(&segment_file_name(id)).unwrap()).unwrap();
+        if reader.header().is_compacted() {
+            compacted += 1;
+            let scan = reader
+                .scan_compacted()
+                .unwrap()
+                .expect("committed compacted scans");
+            covered_end_offset = covered_end_offset.max(scan.meta.covered_end_offset);
+            covered_end_seq = covered_end_seq.max(scan.meta.covered_end_seq);
+        } else {
+            ordinary += 1;
+        }
+    }
+    (
+        max_id,
+        covered_end_offset,
+        covered_end_seq,
+        ordinary,
+        compacted,
+    )
+}
+
+/// Fully compact a dirty log, then DELETE every surviving ordinary segment file, leaving a directory
+/// that holds only the committed compacted segment(s). Returns the compacted-only disk plus the
+/// pre-deletion `(max_id, covered_end_offset, covered_end_seq)` the None arm must derive its resume
+/// point from.
+fn compacted_only_directory() -> (InMemoryFs, u64, u64, u64) {
+    let (fs, _before, _want, _cid) = fully_compacted_sole_copy();
+    let (max_id, covered_end_offset, covered_end_seq, ordinary, compacted) =
+        compacted_only_summary(&fs);
+    assert!(
+        ordinary >= 1 && compacted >= 1,
+        "the fully-compacted image holds the active ordinary AND the committed compacted segment"
+    );
+
+    // Delete every ordinary segment file (each with a dir-fsync, mirroring a real unlink), leaving
+    // ONLY the committed compacted segment(s): the compacted-only directory the None arm reconciles.
+    for id in segment_ids(&fs).unwrap() {
+        let reader = SegmentReader::open(fs.open(&segment_file_name(id)).unwrap()).unwrap();
+        if !reader.header().is_compacted() {
+            fs.remove(&segment_file_name(id)).unwrap();
+            fs.sync_dir().unwrap();
+        }
+    }
+
+    let (_m, _o, _s, ordinary_after, compacted_after) = compacted_only_summary(&fs);
+    assert_eq!(
+        ordinary_after, 0,
+        "no ordinary segment survives the deletion"
+    );
+    assert!(
+        compacted_after >= 1,
+        "the committed compacted segment(s) remain"
+    );
+    (fs, max_id, covered_end_offset, covered_end_seq)
+}
+
+/// #857: recovery of an ALL-COMPACTED directory (no surviving ordinary segment) rolls forward into a
+/// fresh active segment via `build_compacted_chain`'s `active_ordinary == None` arm. This arm is
+/// unreachable in normal operation (the active segment is never compacted nor reaped), so this test
+/// constructs the compacted-only image directly and pins the arm's INDEPENDENTLY-derived resume
+/// point: the fresh active id is `max(compacted ids) + 1` (ADR-0002, ids never reused), and
+/// `next_offset`/`next_seq` equal the highest covered end, so the first append lands EXACTLY there
+/// with a strictly-increasing offset (I5) and reopen recovers cleanly with the same head.
+///
+/// Discriminating: every asserted quantity is derived by the None arm alone. Break the arm's id
+/// derivation (`max(ids)+1` -> reuse a compacted id) or its base (`next_offset`/`next_seq` -> any
+/// other value) and the id-reuse / resume-point / append-lands assertions below fail; a positive
+/// nothing-here control is implicit because the untampered `fully_compacted_sole_copy` image (with
+/// its active ordinary intact) recovers through the OTHER arm in the sibling tests.
+#[test]
+fn all_compacted_directory_rolls_forward_into_a_fresh_active_segment() {
+    let (fs, max_compacted_id, covered_end_offset, covered_end_seq) = compacted_only_directory();
+    let expected_active_id = max_compacted_id + 1;
+
+    let mut log = Log::open(fs, ManualClock::new(), small_config()).expect(
+        "an all-compacted directory recovers by rolling forward into a fresh active segment",
+    );
+
+    // (1) A FRESH active ordinary segment was minted at max(compacted ids)+1 — never a reused id
+    // (ADR-0002). The compacted id(s) still exist on disk, so reuse would be a real collision.
+    assert_eq!(
+        log.active_segment_id(),
+        expected_active_id,
+        "the None arm mints a fresh active id one past the highest segment id"
+    );
+    assert!(
+        log.filesystem()
+            .subdir_exists("quarantine")
+            .map_or(true, |q| !q),
+        "a clean all-compacted roll-forward quarantines nothing"
+    );
+
+    // (2) The resume base is the highest covered end, derived independently of the sealed/ordinary
+    // arms.
+    assert_eq!(
+        log.next_offset(),
+        Offset::new(covered_end_offset),
+        "next_offset resumes at the highest covered end offset"
+    );
+    assert_eq!(
+        log.next_seq(),
+        ironbus_core::types::Seq::new(covered_end_seq),
+        "next_seq resumes at the highest covered end seq"
+    );
+
+    // (3) A subsequent append lands EXACTLY at the covered end offset (strictly greater than every
+    // covered offset: I5 monotonic, never reused), in the fresh active segment.
+    let landed = log
+        .append(&Append {
+            timestamp_ms: 0,
+            flags: ironbus_core::types::RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"post-rollforward",
+        })
+        .unwrap();
+    log.sync().unwrap();
+    assert_eq!(
+        landed,
+        Offset::new(covered_end_offset),
+        "the first post-roll-forward append lands at the covered end offset"
+    );
+    assert!(
+        landed.get() >= covered_end_offset,
+        "the appended offset is strictly beyond the covered range (I5)"
+    );
+    assert_eq!(
+        log.active_segment_id(),
+        expected_active_id,
+        "the append went into the freshly-minted active segment, not a reused one"
+    );
+    let head = log.flushed_offset();
+    assert_eq!(
+        head,
+        Offset::new(covered_end_offset + 1),
+        "the head advanced by exactly the one appended record"
+    );
+
+    // (4) Reopen: the roll-forward is durable and idempotent — the same head recovers, the active id
+    // is still strictly above every compacted id (no reuse), and the appended record reads back at
+    // the covered end offset.
+    let fs = log.into_filesystem();
+    let (max_id_after, _ceo, _ces, ordinary_after, _compacted_after) = compacted_only_summary(&fs);
+    assert!(
+        ordinary_after >= 1,
+        "the roll-forward created a durable ordinary active segment on disk"
+    );
+    assert!(max_id_after >= expected_active_id, "the fresh id persisted");
+
+    let reopened = Log::open(fs, ManualClock::new(), small_config())
+        .expect("the rolled-forward log reopens cleanly");
+    assert_eq!(
+        reopened.flushed_offset(),
+        head,
+        "reopen recovers the same head (idempotent roll-forward)"
+    );
+    assert!(
+        reopened.active_segment_id() > max_compacted_id,
+        "the active id stays strictly above every compacted id across reopen (no id reuse)"
+    );
+    let tail = reopened
+        .read_from(reopened.earliest_offset(), usize::MAX)
+        .unwrap();
+    assert!(
+        tail.iter()
+            .any(|r| r.offset == Offset::new(covered_end_offset)
+                && r.payload.as_ref() == b"post-rollforward"),
+        "the post-roll-forward record persists at the covered end offset across reopen"
+    );
+    // I5: the recovered offsets are strictly increasing and unique.
+    let offs: Vec<u64> = tail.iter().map(|r| r.offset.get()).collect();
+    let mut sorted = offs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        offs, sorted,
+        "recovered offsets strictly increasing and unique (I5)"
+    );
+}
