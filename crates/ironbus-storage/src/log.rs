@@ -877,6 +877,105 @@ struct ReadBounds {
     max_bytes: Option<usize>,
 }
 
+/// The peak number of concurrent [`Log::open`] recoveries a multi-stream / multi-partition boot
+/// runs across (#822): the OUTER, cross-subtree recovery width. Each inner `Log::open` SEPARATELY
+/// bounds its own per-segment scan to [`Log::RECOVERY_SCAN_MAX_WORKERS`] (#817), so the peak live
+/// thread count is at most `RECOVERY_OPEN_MAX_WORKERS * RECOVERY_SCAN_MAX_WORKERS` — a CONSTANT,
+/// INDEPENDENT of the stream/partition/segment counts on disk. So `streams * partitions * segments`
+/// recovery work never explodes into that many threads: both levels are bounded worker sets, never
+/// one-thread-per-item.
+pub(crate) const RECOVERY_OPEN_MAX_WORKERS: usize = 8;
+
+/// Runs `open` for every item across a bounded [`std::thread::scope`] worker set, returning one
+/// result per item in the SAME order as `items` (index-aligned to it), regardless of the order the
+/// workers finished. This is the OUTER, cross-subtree half of recovery (#822): each item is an
+/// independent, byte-isolated stream/partition subtree, so opening them is embarrassingly parallel;
+/// the caller then folds the index-aligned results into its `BTreeMap` / `Vec` in deterministic
+/// key/index order, byte-for-byte identical to the strictly serial open (including WHICH item's
+/// error surfaces first — the caller `?`-propagates in item order).
+///
+/// Mirrors [`Log::par_scan_segments`] (the INNER per-segment pattern): a fixed set of scoped workers
+/// steals items off one shared atomic cursor, so a fast subtree's worker immediately picks up the
+/// next item rather than blocking on a slow one. Helpers are spawned FALLIBLY via
+/// `Builder::spawn_scoped` and the MAIN thread is itself the final participant, so a cold-boot OS
+/// thread exhaustion degrades to fewer helpers (or fully serial) instead of panicking. No external
+/// threadpool (no rayon). The effective width is `min(max_workers, cores, items)`; a single item
+/// (or a single-worker cap) runs inline with no threads spawned — so the common single-log
+/// deployment (one default stream, `count == 1`) opens on the calling thread exactly as before.
+pub(crate) fn par_recover_open<W, T, S>(
+    items: &[W],
+    max_workers: usize,
+    open: S,
+) -> Vec<Result<T, StorageError>>
+where
+    W: Sync,
+    T: Send,
+    S: Fn(&W) -> Result<T, StorageError> + Send + Sync,
+{
+    let total = items.len();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(max_workers)
+        .min(total);
+    if workers <= 1 {
+        // One subtree, one core, or a single-worker cap: run inline, no threads, no cursor.
+        return items.iter().map(&open).collect();
+    }
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    // Each participant returns the (index, result) pairs it computed; we reassemble by index so the
+    // returned order is item order no matter who won which item. Helpers are spawned FALLIBLY via
+    // `Builder::spawn_scoped`: if a worker thread cannot be created (OS thread exhaustion on a cold
+    // boot) we simply run with fewer helpers, and the main thread is itself the final participant —
+    // so even if EVERY helper fails to spawn, every index is still opened inline. Recovery therefore
+    // degrades to serial rather than panicking, matching the resilience this boot path demands.
+    let collected: Vec<(usize, Result<T, StorageError>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers.saturating_sub(1))
+            .filter_map(|k| {
+                let cursor = &cursor;
+                let open = &open;
+                std::thread::Builder::new()
+                    .name(format!("ib-recover-open-{k}"))
+                    .spawn_scoped(s, move || {
+                        let mut local: Vec<(usize, Result<T, StorageError>)> = Vec::new();
+                        loop {
+                            let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= total {
+                                break;
+                            }
+                            local.push((i, open(&items[i])));
+                        }
+                        local
+                    })
+                    .ok()
+            })
+            .collect();
+        // The main thread is the final participant: drain whatever indices remain (this alone covers
+        // 0..total if no helper spawned).
+        let mut all: Vec<(usize, Result<T, StorageError>)> = Vec::with_capacity(total);
+        loop {
+            let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= total {
+                break;
+            }
+            all.push((i, open(&items[i])));
+        }
+        for h in handles {
+            all.extend(h.join().expect("recovery open worker panicked"));
+        }
+        all
+    });
+    let mut slots: Vec<Option<Result<T, StorageError>>> = (0..total).map(|_| None).collect();
+    for (i, r) in collected {
+        slots[i] = Some(r);
+    }
+    // Every index in 0..total is assigned exactly once (the cursor hands each out once), so no slot
+    // is None here.
+    slots
+        .into_iter()
+        .map(|r| r.expect("every recovery open index was assigned"))
+        .collect()
+}
+
 impl<F: Filesystem, C: Clock> Log<F, C> {
     /// Opens the log in `fs`, recovering the active segment or creating a fresh one.
     ///
@@ -8609,5 +8708,56 @@ mod tests {
         // It still works normally.
         log.append(&rec(b"still")).unwrap();
         assert_eq!(log.next_offset(), Offset::new(7));
+    }
+
+    /// #822 discriminator for the OUTER cross-subtree recovery pool: [`par_recover_open`] MUST return
+    /// results index-aligned to `items`, regardless of the order the workers finish — the whole
+    /// determinism guarantee of parallel recovery rests on this reassembly. The closure deliberately
+    /// finishes EARLIER indices LATER (a descending artificial delay), so a naive impl that collected
+    /// in completion order would scramble the vector; the correct by-index reassembly stays ordered.
+    /// (On a single-core box the pool runs inline in item order — still index-aligned — so this test
+    /// is not flaky either way.)
+    #[test]
+    fn par_recover_open_returns_results_in_item_order_regardless_of_completion() {
+        let items: Vec<usize> = (0..64).collect();
+        let out = par_recover_open(&items, RECOVERY_OPEN_MAX_WORKERS, |&i| {
+            // Earlier indices sleep LONGER, so completion order tends to be the REVERSE of item
+            // order under real concurrency. Micros keep the test fast.
+            std::thread::sleep(std::time::Duration::from_micros((64 - i as u64) * 4));
+            Ok::<_, StorageError>(i * 10)
+        });
+        let values: Result<Vec<usize>, _> = out.into_iter().collect();
+        let values = values.expect("no item errored");
+        assert_eq!(
+            values,
+            items.iter().map(|&i| i * 10).collect::<Vec<_>>(),
+            "results are index-aligned to the input, not to completion order"
+        );
+    }
+
+    /// #822: [`par_recover_open`] surfaces the FIRST failing item's error in ITEM order (the caller
+    /// `?`-propagates the index-aligned vector in order), so which error wins is deterministic and
+    /// matches the serial loop — never whichever worker happened to fail first.
+    #[test]
+    fn par_recover_open_first_error_is_the_lowest_failing_index() {
+        let items: Vec<usize> = (0..32).collect();
+        let out = par_recover_open(&items, RECOVERY_OPEN_MAX_WORKERS, |&i| {
+            if i == 7 || i == 20 {
+                return Err(StorageError::SegmentIdMismatch {
+                    file_id: i as u64,
+                    header_id: 999,
+                });
+            }
+            Ok::<_, StorageError>(i)
+        });
+        // Fold in item order exactly as the recovery callers do.
+        let first_err = out.into_iter().collect::<Result<Vec<_>, _>>().unwrap_err();
+        match first_err {
+            StorageError::SegmentIdMismatch { file_id, .. } => assert_eq!(
+                file_id, 7,
+                "the lowest failing index wins, deterministically"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
