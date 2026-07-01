@@ -75,6 +75,32 @@ pub enum StorageError {
         /// The sequence actually stored.
         found: u64,
     },
+    /// A COMMITTED compacted (v2) segment was found to have a corrupt BODY on a later recovery
+    /// (#836). Its trailing v2 footer AND its 44-byte compaction-meta block BOTH decoded
+    /// CRC-VALID, which proves the segment reached its compaction commit point, yet a survivor
+    /// frame failed its CRC (bit-rot of committed data) or the footer's `record_count` / body
+    /// length disagrees with the decoded survivors. This is DELIBERATELY DISTINCT from the
+    /// crash-before-commit orphan that [`SegmentReader::scan_compacted`] reports as `Ok(None)`
+    /// (no valid trailer at all): a committed compacted segment is the SOLE durable copy of the
+    /// survivors it covers, so recovery must NEVER silently unlink it as an orphan — it
+    /// QUARANTINES the poisoned segment (a forensic copy) and accounts the covered survivor loss
+    /// in the [`crate::loss::LossReport`], rather than dropping acked data unreported.
+    CorruptCompacted {
+        /// The compacted segment's id.
+        segment_id: u64,
+        /// The lowest covered SOURCE offset, from the CRC-valid compaction-meta block.
+        covered_base_offset: u64,
+        /// One past the highest covered SOURCE offset, from the CRC-valid compaction-meta block.
+        covered_end_offset: u64,
+        /// The byte offset where the survivor record region begins (the segment header end).
+        record_region_start: u64,
+        /// The byte offset where the survivor record region ends (the footer start). The span
+        /// `[record_region_start, record_region_end)` is the corrupt survivor region to quarantine.
+        record_region_end: u64,
+        /// The survivor count the CRC-valid footer claims: a best-effort lower bound on the
+        /// records lost, for the loss report's `records_lost_estimate`.
+        record_count_estimate: u64,
+    },
     /// The log writer is frozen: a fatal IO error left it without a valid active
     /// segment, so it refuses further writes rather than risk corruption.
     WriterFrozen,
@@ -183,6 +209,17 @@ impl core::fmt::Display for StorageError {
             } => write!(
                 f,
                 "record {index} has sequence {found}, expected {expected}"
+            ),
+            StorageError::CorruptCompacted {
+                segment_id,
+                covered_base_offset,
+                covered_end_offset,
+                ..
+            } => write!(
+                f,
+                "committed compacted segment {segment_id} (covering offsets \
+                 [{covered_base_offset}, {covered_end_offset})) has a corrupt body past its \
+                 CRC-valid footer/meta; quarantining rather than silently unlinking"
             ),
             StorageError::WriterFrozen => write!(f, "log writer is frozen after a fatal error"),
             StorageError::OffsetOutOfRange { requested, oldest } => write!(
@@ -1688,10 +1725,22 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let mut prev_seq: Option<u64> = None;
         while cursor < body.len() {
             let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
-                // A torn or corrupt frame inside a committed compacted segment is corruption, not a
-                // torn tail (the footer+block are present and CRC-valid past this point), so the
-                // segment is structurally inconsistent: refuse it rather than serve a partial set.
-                return Ok(None);
+                // A torn or corrupt frame inside a COMMITTED compacted segment is bit-rot of acked
+                // data, NOT a crash-before-commit torn tail: the trailing footer AND meta block both
+                // decoded CRC-VALID above (~line 1663-1670), which PROVES this segment reached its
+                // compaction commit point. It is the SOLE durable copy of the survivors it covers, so
+                // it must NEVER be conflated with the `Ok(None)` orphan (which recovery silently
+                // unlinks). Signal the committed-but-corrupt case DISTINCTLY (#836), carrying the
+                // covered range (from the CRC-valid meta) and the survivor byte region, so recovery
+                // QUARANTINES it and accounts the loss instead of dropping it unreported.
+                return Err(StorageError::CorruptCompacted {
+                    segment_id: self.header.segment_id,
+                    covered_base_offset: meta.covered_base_offset,
+                    covered_end_offset: meta.covered_end_offset,
+                    record_region_start: header_end,
+                    record_region_end: footer_start,
+                    record_count_estimate: u64::from(footer.record_count),
+                });
             };
             let seq = view.seq.get();
             // Strictly increasing and within the covered sequence span.
@@ -1720,9 +1769,20 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         if u64::from(footer.record_count) != records.len() as u64
             || cursor as u64 != footer_start - header_end
         {
-            // The footer's record count or the body length disagrees with the decoded survivors:
-            // the segment is not a self-consistent compacted segment.
-            return Ok(None);
+            // The footer's record count or the body length disagrees with the decoded survivors.
+            // The footer AND meta block both decoded CRC-VALID above, so this is a COMMITTED
+            // compacted segment (past its commit point), not a crash-before-commit orphan: its
+            // survivors are the sole durable copy. Signal the committed-but-corrupt case DISTINCTLY
+            // (#836) so recovery quarantines it and accounts the loss, rather than the silent
+            // `Ok(None)` orphan unlink that would drop acked data unreported.
+            return Err(StorageError::CorruptCompacted {
+                segment_id: self.header.segment_id,
+                covered_base_offset: meta.covered_base_offset,
+                covered_end_offset: meta.covered_end_offset,
+                record_region_start: header_end,
+                record_region_end: footer_start,
+                record_count_estimate: u64::from(footer.record_count),
+            });
         }
         Ok(Some(CompactedScan {
             header: self.header,
