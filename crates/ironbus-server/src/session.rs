@@ -27,6 +27,7 @@ use crate::engine::{
 use bytes::Bytes;
 use ironbus_core::binding::{single_home, Resolution};
 use ironbus_core::clock::Clock;
+use ironbus_core::codec::BodyChecksums;
 use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
 use ironbus_core::confirm::{ConfirmStatus, ReadyConfirm};
 use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
@@ -1417,6 +1418,10 @@ impl Session {
             key: Bytes::copy_from_slice(msg.key),
             headers: Bytes::copy_from_slice(msg.headers),
             payload: Bytes::copy_from_slice(msg.payload),
+            // Offload the per-record body CRC32C (and xxh3-64 for a large body) onto THIS producing
+            // connection thread (#830), over the same wire slices copied above, so the single-writer
+            // actor stores the checksum instead of computing it on its serialized path.
+            body_checksums: Some(BodyChecksums::compute(msg.key, msg.headers, msg.payload)),
             dedup,
             // Stamp the ENQUEUE instant from the engine's clock seam (a LOCAL read, no actor
             // round-trip), so the engine can measure the admission SOJOURN for the CoDel shed (#68).
@@ -3137,6 +3142,11 @@ impl Session {
             key: Bytes::copy_from_slice(msg.key),
             headers: Bytes::copy_from_slice(msg.headers),
             payload: Bytes::copy_from_slice(msg.payload),
+            // The named-stream produce routes through `produce_in_stream` (its own StreamSet log),
+            // NOT the default-stream actor append path that consumes the offloaded checksum (#830), so
+            // computing one here would be discarded work: leave it `None` and let that path checksum as
+            // before.
+            body_checksums: None,
             dedup,
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
             fire_and_forget: false,
@@ -3716,6 +3726,10 @@ impl Session {
             key: Bytes::copy_from_slice(msg.key),
             headers: Bytes::copy_from_slice(msg.headers),
             payload: Bytes::copy_from_slice(msg.payload),
+            // The subject-routed produce resolves to a stream and appends via `produce_in_stream` (its
+            // own StreamSet log), NOT the default-stream actor append path that consumes the offloaded
+            // checksum (#830), so leave it `None` rather than compute a value that path discards.
+            body_checksums: None,
             dedup,
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
             fire_and_forget: false,
@@ -9964,6 +9978,7 @@ mod tests {
                 key: Bytes::new(),
                 headers: Bytes::new(),
                 payload: Bytes::from_static(b"primer"),
+                body_checksums: None,
                 dedup: None,
                 enqueue_monotonic_nanos: 0,
                 fire_and_forget: false,

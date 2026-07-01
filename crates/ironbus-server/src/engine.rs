@@ -24,6 +24,7 @@ use ironbus_core::attempt::{
 use ironbus_core::backpressure::{AimdLimiter, Codel, FsyncHeadroom, RetryBudget, TokenBucket};
 use ironbus_core::binding::{single_home, Resolution};
 use ironbus_core::clock::Clock;
+use ironbus_core::codec::BodyChecksums;
 use ironbus_core::compress::{
     compress_payload, Codec, CompressConfig, DEFAULT_MAX_DECOMPRESSED_BYTES,
 };
@@ -5266,6 +5267,27 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// rejection and increments `produce_rejected`; any other storage error propagates. Nothing is
     /// written and no statistic moves on an error.
     pub fn append_no_sync(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
+        self.append_no_sync_checked(message, None)
+    }
+
+    /// The body-checksum-offload variant of [`Engine::append_no_sync`] (issue #830): `precomputed`
+    /// carries the record's body CRC32C (and, for a large body, xxh3-64) computed OFF this
+    /// single-writer actor, on the producing connection thread that already held the body bytes.
+    ///
+    /// The precomputed value describes the PRODUCER-SUPPLIED body (`key ++ headers ++ payload`). It is
+    /// therefore trusted ONLY when the record is stored with that exact body — i.e. the pass-through
+    /// path. When the write-path compression seam below REWRITES the body (it stores `comp.stored`
+    /// instead of the original payload), the precomputed checksum no longer describes the stored bytes,
+    /// so it is DROPPED and the codec recomputes over the compressed body. Compression is opt-in and
+    /// off by default, so the common produce path takes the offload.
+    ///
+    /// # Errors
+    /// Same as [`Engine::append_no_sync`].
+    pub fn append_no_sync_checked(
+        &mut self,
+        message: &Append<'_>,
+        precomputed: Option<BodyChecksums>,
+    ) -> Result<Offset, EngineError> {
         // The write-path compression seam (#430, ADR-0003). The pass-through guard on an ALREADY
         // COMPRESSED message is load-bearing: the wire legally delivers bit 0 set (a producer may
         // publish a pre-compressed stored object), and compressing it again would wrap a
@@ -5310,7 +5332,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 _ => message,
             }
         };
-        let offset = match self.append_with_policy(to_append) {
+        // Trust the off-actor precomputed checksum ONLY when the stored body IS the producer's
+        // original body (the pass-through path). If the compression seam substituted `to_append =
+        // &stored`, the body differs, so drop the precomputed value and let the codec recompute over
+        // the compressed bytes. `ptr::eq` distinguishes the pass-through (`to_append == message`) from
+        // the compressed store (`to_append == &stored`).
+        let effective_precomputed = if core::ptr::eq(to_append, message) {
+            precomputed
+        } else {
+            None
+        };
+        let offset = match self.append_with_policy(to_append, effective_precomputed) {
             Ok(offset) => offset,
             Err(e) => {
                 // A drop-new shed: count the rejection (a shed-rate signal) but advance no produce
@@ -5386,16 +5418,37 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         message: &Append<'_>,
         dedup: Option<DedupRequest<'_>>,
     ) -> Result<AppendOutcome, EngineError> {
+        self.append_no_sync_dedup_checked(message, dedup, None)
+    }
+
+    /// The body-checksum-offload variant of [`Engine::append_no_sync_dedup`] (issue #830):
+    /// `precomputed` carries the body CRC32C (and, for a large body, xxh3-64) computed OFF this
+    /// single-writer actor on the producing connection thread. It is threaded to whichever internal
+    /// append path this dedup decision reaches (no-dedup, `msg_id` window, or idempotent sequence);
+    /// every fresh append ultimately funnels through [`Engine::append_no_sync_checked`], which trusts
+    /// the value only when the stored body equals the producer's body. A dedup hit, fence, or
+    /// out-of-order rejection appends nothing and ignores it.
+    ///
+    /// # Errors
+    /// Same as [`Engine::append_no_sync_dedup`].
+    pub fn append_no_sync_dedup_checked(
+        &mut self,
+        message: &Append<'_>,
+        dedup: Option<DedupRequest<'_>>,
+        precomputed: Option<BodyChecksums>,
+    ) -> Result<AppendOutcome, EngineError> {
         let Some(req) = dedup else {
             // No dedup requested: identical to the historical no-dedup append.
-            return self.append_no_sync(message).map(AppendOutcome::Appended);
+            return self
+                .append_no_sync_checked(message, precomputed)
+                .map(AppendOutcome::Appended);
         };
         // The idempotent-producer SEQUENCE path (V2-M8): when the publish carried a `seq`, route
         // through the DURABLE per-producer sequence high-water (effectively-once across a restart + a
         // long offline gap) INSTEAD of the time-bounded `msg_id` window. This is the Kafka-style
         // dedup-to-exactly-once-append + zombie-epoch fencing + out-of-order rejection.
         if let Some(seq) = req.seq {
-            return self.append_no_sync_seq(message, req.producer_id, req.epoch, seq);
+            return self.append_no_sync_seq(message, req.producer_id, req.epoch, seq, precomputed);
         }
         let now = self.log.now_monotonic();
         match self
@@ -5417,7 +5470,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     self.counters.dedup_out_of_window =
                         self.counters.dedup_out_of_window.saturating_add(1);
                 }
-                let offset = self.append_no_sync(message)?;
+                let offset = self.append_no_sync_checked(message, precomputed)?;
                 // Record the mapping at append time (offset assigned), so a same-batch duplicate is
                 // caught before the covering fsync. The reply is still parked behind that fsync, so a
                 // dedup hit never returns an offset that is not (or will not be) durable.
@@ -5461,6 +5514,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         producer_id: &[u8],
         epoch: u64,
         seq: u64,
+        precomputed: Option<BodyChecksums>,
     ) -> Result<AppendOutcome, EngineError> {
         let now = self.log.now_monotonic();
         match self.producer_seq.check(producer_id, epoch, seq, now) {
@@ -5483,7 +5537,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 // sequenced produce's high-water can be persisted on the next checkpoint tick (and a
                 // file-creation IO error fails the produce rather than silently losing durability).
                 self.ensure_producer_seq_checkpoint()?;
-                let offset = self.append_no_sync(message)?;
+                let offset = self.append_no_sync_checked(message, precomputed)?;
                 // Advance the high-water at append time (offset assigned), so a same-batch retry of
                 // this seq dedups before the covering fsync. The reply is still parked behind that
                 // fsync, so a duplicate never returns an offset that is not (or will not be) durable.
@@ -6093,17 +6147,35 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// segment-by-segment without ever admitting the produce. It is therefore a FINAL drop-new
     /// rejection under EVERY policy (it propagates straight back, the same as under `DropNew`), so
     /// the producer is told to back off and the flash-wear governor protects the disk it is meant to.
-    fn append_with_policy(&mut self, message: &Append<'_>) -> Result<Offset, StorageError> {
-        match self.log.append(message) {
+    fn append_with_policy(
+        &mut self,
+        message: &Append<'_>,
+        precomputed: Option<BodyChecksums>,
+    ) -> Result<Offset, StorageError> {
+        match self.log_append(message, precomputed) {
             Ok(offset) => Ok(offset),
             // Only the genuine disk-full byte-cap shed is reclaimable by a reap, so only it may drive
             // the `DropOldest` reclaim-then-retry loop. The daily-write-budget shed and any other
             // storage error (a frozen writer, an oversized record) propagate unchanged; under DropNew
             // every rejection is final too.
             Err(e) if e.is_at_capacity() && self.disk_full_policy == DiskFullPolicy::DropOldest => {
-                self.make_room_then_append(message, e)
+                self.make_room_then_append(message, precomputed, e)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Dispatches to [`Log::append`] or [`Log::append_precomputed`] (#830): when the producing
+    /// connection thread precomputed the body checksums off the actor, trust them; otherwise compute
+    /// them on the append path as before. The on-disk frame is byte-identical either way.
+    fn log_append(
+        &mut self,
+        message: &Append<'_>,
+        precomputed: Option<BodyChecksums>,
+    ) -> Result<Offset, StorageError> {
+        match precomputed {
+            Some(checksums) => self.log.append_precomputed(message, checksums),
+            None => self.log.append(message),
         }
     }
 
@@ -6115,6 +6187,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     fn make_room_then_append(
         &mut self,
         message: &Append<'_>,
+        precomputed: Option<BodyChecksums>,
         at_capacity: StorageError,
     ) -> Result<Offset, StorageError> {
         let mut last = at_capacity;
@@ -6155,7 +6228,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // Retry the append now that space was freed. A success ends the loop; another
             // at-capacity means one freed segment was not enough, so loop and free more (the loop
             // terminates because each pass either frees a segment or hits the active-only guard).
-            match self.log.append(message) {
+            match self.log_append(message, precomputed) {
                 Ok(offset) => return Ok(offset),
                 Err(e) if e.is_at_capacity() => {
                     last = e;

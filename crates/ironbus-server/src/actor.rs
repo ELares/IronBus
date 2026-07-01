@@ -131,6 +131,14 @@ pub struct OwnedAppend {
     pub headers: Bytes,
     /// The record payload.
     pub payload: Bytes,
+    /// The record's body checksums (CRC32C, plus xxh3-64 for a large body), PRE-COMPUTED off the
+    /// single-writer append actor on the producing connection thread that built this `OwnedAppend`
+    /// (issue #830). `Some` carries the offloaded value so the actor stores it without re-hashing the
+    /// body; `None` (the default for test/replay/re-injection constructors) makes the actor compute
+    /// the checksum on the append path exactly as before. The value describes the producer-supplied
+    /// body (`key ++ headers ++ payload`); the engine trusts it only when the record is stored with
+    /// that exact body (it is dropped when the write-path compression seam rewrites the body).
+    pub body_checksums: Option<ironbus_core::codec::BodyChecksums>,
     /// The OPT-IN dedup identity (#3, #33): `Some` iff the publish carried a `msg_id` (the dedup
     /// opt-in), owned so it can cross the channel. `None` is the default no-dedup produce.
     pub dedup: Option<OwnedDedup>,
@@ -1253,7 +1261,7 @@ fn produce_once<F: Filesystem, C: Clock + Clone>(
         headers: &append.headers,
         payload: &append.payload,
     };
-    match engine.append_no_sync_dedup(&view, dedup_request(append)) {
+    match engine.append_no_sync_dedup_checked(&view, dedup_request(append), append.body_checksums) {
         // A fresh append: the covering fsync decides durability (I2). A fire-and-forget produce is
         // made durable identically but maps to the no-ack outcome (#11), so the direct path matches
         // the real actor's QoS-0 contract.
@@ -1817,7 +1825,7 @@ fn process_produce<F, C>(
         headers: &append.headers,
         payload: &append.payload,
     };
-    match engine.append_no_sync_dedup(&view, dedup_request(append)) {
+    match engine.append_no_sync_dedup_checked(&view, dedup_request(append), append.body_checksums) {
         Ok(crate::engine::AppendOutcome::Appended(offset)) => {
             // An accepted produce feeds the broker-side retry-budget accept count (#69), so the
             // observed retry ratio stays meaningful under load.
@@ -2052,6 +2060,12 @@ mod tests {
             key: Bytes::new(),
             headers: Bytes::new(),
             payload: Bytes::copy_from_slice(payload),
+            // Carry the REAL offloaded body checksum (#830) as the session does, so every actor produce
+            // test drives the `encode_precomputed` path; the codec's debug_assert then pins that the
+            // off-actor incremental value matches the actor-computed one across the whole suite.
+            body_checksums: Some(ironbus_core::codec::BodyChecksums::compute(
+                b"", b"", payload,
+            )),
             dedup: None,
             enqueue_monotonic_nanos: 0,
             fire_and_forget: false,
@@ -2078,6 +2092,9 @@ mod tests {
             key: Bytes::new(),
             headers: Bytes::new(),
             payload: Bytes::copy_from_slice(payload),
+            body_checksums: Some(ironbus_core::codec::BodyChecksums::compute(
+                b"", b"", payload,
+            )),
             dedup: Some(OwnedDedup {
                 producer_id: Bytes::copy_from_slice(producer_id),
                 epoch,

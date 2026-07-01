@@ -22,7 +22,58 @@ use crate::format::{
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{RecordFlags, Seq};
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{xxh3_64, Xxh3};
+
+/// Pre-computed per-record body checksums (issue #830), produced OFF the single-writer append
+/// actor on the producing connection thread that already holds the body bytes, then trusted by
+/// [`encode_precomputed`].
+///
+/// `body_crc` is the CRC32C over the contiguous stored body (`key ++ headers ++ payload`), the exact
+/// byte range [`encode`] would checksum. `xxh3` is `Some` iff the stored body reaches
+/// [`XXH3_PAYLOAD_THRESHOLD`] — the SAME condition [`encode`] uses to decide whether the second
+/// xxh3-64 field is present — so a `BodyChecksums` computed by [`BodyChecksums::compute`] over the
+/// same three slices always agrees with the frame [`encode`] emits.
+///
+/// This is safe to offload because the checksums are CORRUPTION-detection values RE-VALIDATED on
+/// every read: a wrong value here is not a trust boundary — it only makes the record fail its own
+/// CRC on read and surface as corrupt — so moving the COMPUTATION off the serialized actor cannot
+/// weaken any integrity guarantee. The on-disk bytes are byte-identical to the actor-computed frame
+/// whenever the precomputed values match the stored body (which [`encode_precomputed`] debug-asserts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyChecksums {
+    /// CRC32C (Castagnoli) over the contiguous body `key ++ headers ++ payload`.
+    pub body_crc: u32,
+    /// xxh3-64 over the same body byte range, `Some` iff the stored body reaches
+    /// [`XXH3_PAYLOAD_THRESHOLD`] (matching [`encode`]'s `HAS_XXH3` condition), else `None`.
+    pub xxh3: Option<u64>,
+}
+
+impl BodyChecksums {
+    /// Computes the body checksums over the contiguous body `key ++ headers ++ payload`
+    /// INCREMENTALLY, with no intermediate concatenation buffer, producing exactly the values
+    /// [`encode`] computes over the bytes it lays down. CRC32C is folded across the three slices
+    /// (`crc32c(key)`, then `crc32c_append` over headers then payload — equal to a single pass over
+    /// the concatenation), and the xxh3-64 streaming hasher is fed the same three slices in order.
+    /// The xxh3-64 is present under the identical [`XXH3_PAYLOAD_THRESHOLD`] rule [`encode`] applies,
+    /// measured on the STORED body length (the bytes actually written).
+    #[must_use]
+    pub fn compute(key: &[u8], headers: &[u8], payload: &[u8]) -> BodyChecksums {
+        let body_len = key.len() + headers.len() + payload.len();
+        let mut body_crc = crc32c::crc32c(key);
+        body_crc = crc32c::crc32c_append(body_crc, headers);
+        body_crc = crc32c::crc32c_append(body_crc, payload);
+        let xxh3 = if body_len >= XXH3_PAYLOAD_THRESHOLD as usize {
+            let mut hasher = Xxh3::new();
+            hasher.update(key);
+            hasher.update(headers);
+            hasher.update(payload);
+            Some(hasher.digest())
+        } else {
+            None
+        };
+        BodyChecksums { body_crc, xxh3 }
+    }
+}
 
 /// A borrowed view of a record, used both as the input to [`encode`] and the
 /// output of [`decode`]. It owns no memory; slices borrow the caller's buffer.
@@ -112,6 +163,42 @@ impl std::error::Error for DecodeError {}
 /// Returns [`EncodeError::TooLarge`] if the total framed size would exceed the
 /// 1 GiB format ceiling.
 pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeError> {
+    encode_impl(rec, None, out)
+}
+
+/// Encodes `rec` like [`encode`], but TRUSTS the caller-supplied `checksums` for the body instead of
+/// computing them on this thread (issue #830). The body CRC32C (and, for a large body, the xxh3-64)
+/// are lifted off the single-writer append actor and onto the producing connection thread, which
+/// already holds the body bytes; the actor then only memcpys the body and writes the precomputed
+/// trailer.
+///
+/// `checksums` MUST have been computed by [`BodyChecksums::compute`] over the SAME
+/// `key`/`headers`/`payload` slices this `rec` carries, i.e. the exact stored body. When they match,
+/// the emitted frame is byte-identical to [`encode`]'s. A mismatch is not a memory- or trust-safety
+/// hazard — the checksum is re-validated on read, so a wrong value only makes the record fail its own
+/// CRC on read (surfaced as corrupt) — but it would durably store an unreadable record, so this is a
+/// caller contract a debug build asserts. Callers that re-inject or rewrite the body (compression,
+/// DLQ redrive, replication apply) must use [`encode`], which recomputes.
+///
+/// # Errors
+/// Returns [`EncodeError::TooLarge`] if the total framed size would exceed the 1 GiB format ceiling.
+pub fn encode_precomputed(
+    rec: &RecordView<'_>,
+    checksums: BodyChecksums,
+    out: &mut Vec<u8>,
+) -> Result<usize, EncodeError> {
+    encode_impl(rec, Some(checksums), out)
+}
+
+/// The shared framing core behind [`encode`] and [`encode_precomputed`]. When `precomputed` is
+/// `Some`, the body checksums are trusted (computed off-actor, #830); when `None`, they are computed
+/// here over the body bytes just laid down, exactly as before. Either way the emitted frame layout is
+/// identical.
+fn encode_impl(
+    rec: &RecordView<'_>,
+    precomputed: Option<BodyChecksums>,
+    out: &mut Vec<u8>,
+) -> Result<usize, EncodeError> {
     let key_len = u32::try_from(rec.key.len()).map_err(|_| EncodeError::TooLarge)?;
     let hdr_len = u32::try_from(rec.headers.len()).map_err(|_| EncodeError::TooLarge)?;
     let payload_len = u32::try_from(rec.payload.len()).map_err(|_| EncodeError::TooLarge)?;
@@ -162,14 +249,34 @@ pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeEr
     out.extend_from_slice(rec.headers);
     out.extend_from_slice(rec.payload);
     let body = &out[body_start..body_start + body_len];
-    let body_crc = crc32c::crc32c(body);
+    // Trust the off-actor precomputed checksums when supplied (#830), else compute them here over the
+    // body just laid down. A debug build re-derives them from the body to pin the caller contract that
+    // the precomputed values describe the exact stored bytes; a mismatch would durably store a record
+    // that fails its own CRC on read, so it is a bug, not a silent divergence.
+    let checksums = match precomputed {
+        Some(c) => {
+            debug_assert_eq!(
+                c,
+                BodyChecksums::compute(rec.key, rec.headers, rec.payload),
+                "precomputed body checksums must match the stored body (#830)"
+            );
+            c
+        }
+        None => BodyChecksums {
+            body_crc: crc32c::crc32c(body),
+            xxh3: if has_xxh3 { Some(xxh3_64(body)) } else { None },
+        },
+    };
     // The xxh3-64 covers the same body byte range as `body_crc`, and the field precedes
-    // the trailer so the 8-byte trailer (`body_crc` then `total_len`) is unchanged.
+    // the trailer so the 8-byte trailer (`body_crc` then `total_len`) is unchanged. `has_xxh3` is
+    // derived from the stored body length above and always agrees with `checksums.xxh3` for a
+    // correctly-computed `BodyChecksums`; the `unwrap_or_else` recomputes rather than panic if a
+    // caller passed an inconsistent value, keeping the frame well-formed.
     if has_xxh3 {
-        let xxh3 = xxh3_64(body);
+        let xxh3 = checksums.xxh3.unwrap_or_else(|| xxh3_64(body));
         out.extend_from_slice(&xxh3.to_le_bytes());
     }
-    out.extend_from_slice(&body_crc.to_le_bytes());
+    out.extend_from_slice(&checksums.body_crc.to_le_bytes());
     out.extend_from_slice(&total_u32.to_le_bytes());
     Ok(total)
 }
@@ -350,6 +457,88 @@ mod tests {
         let n = encode(&rec, &mut buf).unwrap();
         assert_eq!(n, buf.len());
         buf
+    }
+
+    // #830: the off-actor incremental body checksums must equal the one-shot checksums the actor path
+    // computes over the contiguous stored body, at and around the xxh3 threshold and with empty
+    // components. If this diverges, `encode_precomputed` would store an unreadable record.
+    #[test]
+    fn precomputed_body_checksums_match_one_shot() {
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (b"", b"", b""),
+            (b"k", b"", b"payload"),
+            (b"", b"headers", b""),
+            (b"key", b"headers", b"payload"),
+        ];
+        for &(key, headers, payload) in cases {
+            let mut body = Vec::new();
+            body.extend_from_slice(key);
+            body.extend_from_slice(headers);
+            body.extend_from_slice(payload);
+            let got = BodyChecksums::compute(key, headers, payload);
+            assert_eq!(got.body_crc, crc32c::crc32c(&body), "crc {key:?}");
+            assert_eq!(got.xxh3, None, "sub-threshold has no xxh3 {key:?}");
+        }
+        // A body at the threshold: the incremental xxh3-64 must equal the one-shot over the concat.
+        let big_key = vec![0x11u8; 100];
+        let big_hdr = vec![0x22u8; 100];
+        let big_pay = vec![0x33u8; XXH3_PAYLOAD_THRESHOLD as usize];
+        let mut body = Vec::new();
+        body.extend_from_slice(&big_key);
+        body.extend_from_slice(&big_hdr);
+        body.extend_from_slice(&big_pay);
+        let got = BodyChecksums::compute(&big_key, &big_hdr, &big_pay);
+        assert_eq!(got.body_crc, crc32c::crc32c(&body));
+        assert_eq!(got.xxh3, Some(xxh3_64(&body)));
+    }
+
+    // #830: `encode_precomputed` with the correct off-actor checksums must produce a frame BYTE-FOR-BYTE
+    // identical to `encode`, both below and at/above the xxh3 threshold, and both must decode cleanly.
+    #[test]
+    fn encode_precomputed_is_byte_identical_to_encode() {
+        for payload_len in [0usize, 5, XXH3_PAYLOAD_THRESHOLD as usize] {
+            let payload = vec![0xA5u8; payload_len];
+            let rec = RecordView {
+                seq: Seq::new(9),
+                timestamp_ms: 42,
+                flags: RecordFlags::EMPTY,
+                key: b"key",
+                headers: b"hdr",
+                payload: &payload,
+            };
+            let mut baseline = Vec::new();
+            let n0 = encode(&rec, &mut baseline).unwrap();
+            let checks = BodyChecksums::compute(rec.key, rec.headers, rec.payload);
+            let mut offloaded = Vec::new();
+            let n1 = encode_precomputed(&rec, checks, &mut offloaded).unwrap();
+            assert_eq!(n0, n1, "len at payload_len={payload_len}");
+            assert_eq!(baseline, offloaded, "bytes at payload_len={payload_len}");
+            decode(&offloaded).expect("offloaded frame decodes");
+        }
+    }
+
+    // #830: `encode_precomputed` TRUSTS the caller's value — a deliberately wrong body_crc lands
+    // verbatim in the trailer (release build), and the record then fails its own CRC on read, i.e. a
+    // wrong offloaded checksum degrades to detected corruption, never a silent accept. Guarded off
+    // debug builds because the caller-contract debug_assert would (correctly) fire there.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn encode_precomputed_wrong_crc_is_caught_as_corrupt_on_read() {
+        let rec = RecordView {
+            seq: Seq::new(1),
+            timestamp_ms: 1,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"body",
+        };
+        let bad = BodyChecksums {
+            body_crc: 0xDEAD_BEEF,
+            xxh3: None,
+        };
+        let mut buf = Vec::new();
+        encode_precomputed(&rec, bad, &mut buf).unwrap();
+        assert_eq!(decode(&buf), Err(DecodeError::BadBodyCrc));
     }
 
     #[test]
