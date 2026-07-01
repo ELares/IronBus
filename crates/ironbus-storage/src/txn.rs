@@ -101,6 +101,45 @@ pub struct HalfMessage {
     pub flags: RecordFlags,
 }
 
+impl HalfMessage {
+    /// The RESIDENT heap bytes this buffered half message costs (#958), via [`prepared_resident_bytes`]
+    /// over its producer-controlled parts. The per-prepare charge the byte budget meters.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        prepared_resident_bytes(
+            &self.txn_id,
+            &self.stream,
+            &self.key,
+            &self.headers,
+            &self.payload,
+        )
+    }
+}
+
+/// The RESIDENT heap bytes one buffered prepared half message costs (#958): the sum of its
+/// variable-length, producer-controlled parts (`txn_id` + `stream` + `key` + `headers` + `payload`),
+/// which is the RAM a `TxnPrepare` pins while the txn stays `Prepared`. This is the exact per-prepare
+/// charge the optional byte budget (`--max-prepared-bytes`, #909 follow-up) meters and the refuse-to-
+/// boot guard's term 7 bounds when the budget is set — the honest analog of the worst-case
+/// `PREPARED_HALF_MESSAGE_BYTES` count-charge. The small fixed per-entry struct/`HashMap` overhead is
+/// not counted, exactly as term 1's `consumer_credit_bytes` charges payload bytes, not the slot
+/// bookkeeping; each `len` is a bounded (`u16`-framed) wire quantity, but the adds SATURATE so the
+/// measure can never wrap.
+#[must_use]
+pub fn prepared_resident_bytes(
+    txn_id: &[u8],
+    stream: &str,
+    key: &[u8],
+    headers: &[u8],
+    payload: &[u8],
+) -> u64 {
+    (txn_id.len() as u64)
+        .saturating_add(stream.len() as u64)
+        .saturating_add(key.len() as u64)
+        .saturating_add(headers.len() as u64)
+        .saturating_add(payload.len() as u64)
+}
+
 /// The fixed-size prefix of a HALF record's metadata blob: `magic`(4) + `version`(1) +
 /// `txn_id_len`(2) + `stream_len`(2) + `orig_headers_len`(2) + `orig_flags`(1).
 const HALF_FIXED_LEN: usize = 4 + 1 + 2 + 2 + 2 + 1;
@@ -377,6 +416,12 @@ pub struct TxnStore<F: Filesystem, C: Clock> {
     /// fresh prepare and removed on resolve (commit OR rollback). Bounded by the table's
     /// `max_prepared` cap (a prepare over the cap is refused), so this never grows without bound.
     prepared_payloads: HashMap<Vec<u8>, HalfMessage>,
+    /// The running sum of [`prepared_resident_bytes`] over every CURRENTLY-buffered prepared payload
+    /// (#958): kept in lockstep with `prepared_payloads` (added on a fresh half buffer, subtracted on
+    /// resolve, recomputed on replay). The engine meters a fresh prepare against the optional
+    /// `--max-prepared-bytes` budget using this sum, so the byte budget is an EXACT charge rather than
+    /// the worst-case `max_prepared * maximal frame`. Zero whenever no txn is prepared.
+    prepared_bytes: u64,
     /// The number of half records durably written across this store's lifetime (for observability).
     half_records: u64,
     /// The number of op markers durably written across this store's lifetime (for observability).
@@ -459,6 +504,7 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
             table: TxnTable::new(txn_config),
             back_check: BackCheckBook::new(back_check_config),
             prepared_payloads: HashMap::new(),
+            prepared_bytes: 0,
             half_records: 0,
             op_records: 0,
             back_records: 0,
@@ -490,6 +536,7 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
         self.table = TxnTable::new(self.table.config());
         self.back_check = BackCheckBook::new(self.back_check.config());
         self.prepared_payloads.clear();
+        self.prepared_bytes = 0;
         self.half_records = 0;
         self.op_records = 0;
         self.back_records = 0;
@@ -585,6 +632,15 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
             let attempts = restored_attempts.get(&txn_id).copied().unwrap_or(0);
             self.back_check.restore(&txn_id, attempts, 0);
         }
+        // Rebuild the resident-byte sum (#958) from the recovered buffered payloads. Replay never
+        // ENFORCES the byte budget — a durable prepared payload is undelivered data that must survive a
+        // restart even if the operator later lowered `--max-prepared-bytes` below the recovered total,
+        // exactly as replay bypasses the `max_prepared` count cap via `TxnTable::restore` (the budget
+        // only refuses FURTHER prepares until the backlog drains).
+        self.prepared_bytes = self
+            .prepared_payloads
+            .values()
+            .fold(0u64, |acc, h| acc.saturating_add(h.resident_bytes()));
         Ok(())
     }
 
@@ -663,19 +719,31 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
         // fsync the half record BEFORE returning: a prepared half message is never lost.
         self.log.sync()?;
         self.half_records = self.half_records.saturating_add(1);
-        self.prepared_payloads.insert(
-            txn_id.to_vec(),
-            HalfMessage {
-                txn_id: txn_id.to_vec(),
-                stream: stream.to_string(),
-                timestamp_ms: message.timestamp_ms,
-                key: message.key.to_vec(),
-                headers: message.headers.to_vec(),
-                payload: message.payload.to_vec(),
-                flags: message.flags,
-            },
-        );
+        let half = HalfMessage {
+            txn_id: txn_id.to_vec(),
+            stream: stream.to_string(),
+            timestamp_ms: message.timestamp_ms,
+            key: message.key.to_vec(),
+            headers: message.headers.to_vec(),
+            payload: message.payload.to_vec(),
+            flags: message.flags,
+        };
+        // Track the resident-byte sum (#958) in lockstep with the buffer insert. The caller (the
+        // engine) has ALREADY metered this fresh prepare against the optional `--max-prepared-bytes`
+        // budget before reaching here (a re-prepare of a still-prepared id never calls this), so the
+        // sum stays under the budget by construction.
+        self.prepared_bytes = self.prepared_bytes.saturating_add(half.resident_bytes());
+        self.prepared_payloads.insert(txn_id.to_vec(), half);
         Ok(())
+    }
+
+    /// The running sum of the buffered prepared payloads' [`prepared_resident_bytes`] (#958), the RAM a
+    /// `TxnPrepare` flood currently pins. The engine meters a fresh prepare against the optional
+    /// `--max-prepared-bytes` budget with this, and it is a true bound on the term-7 RAM the refuse-to-
+    /// boot guard charges (`docs/RAM_BUDGET.md` term 7).
+    #[must_use]
+    pub fn prepared_bytes(&self) -> u64 {
+        self.prepared_bytes
     }
 
     /// Durably appends a COMMITTED op-marker for `txn_id` (recording the `real_offset` the payload
@@ -722,7 +790,12 @@ impl<F: Filesystem, C: Clock> TxnStore<F, C> {
         // fsync the op marker BEFORE returning: a resolution, once acked, survives a restart.
         self.log.sync()?;
         self.op_records = self.op_records.saturating_add(1);
-        self.prepared_payloads.remove(txn_id);
+        // Drop the buffered payload and release its resident-byte charge (#958), keeping the sum in
+        // lockstep with the buffer. A resolve of an id with no buffered payload (an idempotent
+        // re-resolve reaching the store, or a payload already dropped) subtracts nothing.
+        if let Some(half) = self.prepared_payloads.remove(txn_id) {
+            self.prepared_bytes = self.prepared_bytes.saturating_sub(half.resident_bytes());
+        }
         Ok(())
     }
 
@@ -959,6 +1032,50 @@ mod tests {
         assert_eq!(hm.key, b"k");
         assert_eq!(hm.headers, b"orig-hdr");
         assert_eq!(reopened.table().state(b"tx1"), Some(TxnState::Prepared));
+    }
+
+    #[test]
+    fn prepared_bytes_tracks_the_buffer_and_is_rebuilt_on_replay() {
+        // #958: the running resident-byte sum is kept in lockstep with the buffered payloads (added on a
+        // fresh half buffer, released on resolve) and RECOMPUTED on replay, so it is a true bound on the
+        // term-7 RAM the refuse-to-boot guard charges under the exact byte budget.
+        let fs = InMemoryFs::new();
+        let tx1_bytes = prepared_resident_bytes(b"tx1", "orders", b"k", b"orig-hdr", b"hello");
+        let tx2_bytes = prepared_resident_bytes(b"tx2", "orders", b"k", b"orig-hdr", b"worldwide");
+        {
+            let mut s = store(&fs);
+            assert_eq!(s.prepared_bytes(), 0, "empty store charges nothing");
+            s.table_mut().prepare(b"tx1", 1).unwrap();
+            s.append_half(b"tx1", "orders", &half(b"hello")).unwrap();
+            assert_eq!(
+                s.prepared_bytes(),
+                tx1_bytes,
+                "one buffered half's resident bytes"
+            );
+            s.table_mut().prepare(b"tx2", 2).unwrap();
+            s.append_half(b"tx2", "orders", &half(b"worldwide"))
+                .unwrap();
+            assert_eq!(
+                s.prepared_bytes(),
+                tx1_bytes + tx2_bytes,
+                "both halves summed"
+            );
+            // Resolving tx1 releases exactly its bytes; tx2's charge remains.
+            s.table_mut().commit(b"tx1", 3).unwrap();
+            s.mark_committed(b"tx1", 99).unwrap();
+            assert_eq!(
+                s.prepared_bytes(),
+                tx2_bytes,
+                "commit frees exactly tx1's bytes"
+            );
+        }
+        // Replay rebuilds the sum from the recovered buffered payloads (only tx2 is still Prepared).
+        let reopened = store(&fs);
+        assert_eq!(
+            reopened.prepared_bytes(),
+            tx2_bytes,
+            "replay rebuilds the resident-byte sum from the recovered prepared payloads"
+        );
     }
 
     #[test]

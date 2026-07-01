@@ -186,6 +186,16 @@ pub enum TxnError {
         /// The configured cap on concurrently-prepared transactions.
         cap: usize,
     },
+    /// A fresh prepare would push the resident prepared-payload byte sum past the optional
+    /// `--max-prepared-bytes` budget (#909 follow-up, #958). Like [`TxnError::TooManyPrepared`] a live
+    /// half message is NEVER evicted to make room — the new prepare is refused instead, so the
+    /// per-prepare byte accounting keeps the term-7 RAM under the exact configured ceiling rather than
+    /// the worst-case `max_prepared * maximal frame`. The producer retries after some in-flight txns
+    /// resolve and free bytes.
+    TooManyPreparedBytes {
+        /// The configured resident-byte budget the prepare would exceed.
+        budget: u64,
+    },
     /// The supplied `txn_id` exceeds [`MAX_TXN_ID_LEN`]. Rejected at the boundary before it is stored.
     TxnIdTooLong {
         /// The rejected id length.
@@ -215,6 +225,12 @@ impl core::fmt::Display for TxnError {
                 write!(
                     f,
                     "too many prepared transactions (cap {cap}); retry after some resolve"
+                )
+            }
+            TxnError::TooManyPreparedBytes { budget } => {
+                write!(
+                    f,
+                    "prepared transactions exceed the {budget}-byte budget; retry after some resolve"
                 )
             }
             TxnError::TxnIdTooLong { len } => {
@@ -486,6 +502,22 @@ impl TxnTable {
                 },
             );
             self.prepared_by_age.insert((now, txn_id.to_vec()));
+        }
+    }
+
+    /// Undoes a fresh prepare THIS call just recorded (a [`PrepareDecision::Prepared`]) whose caller then
+    /// declined to durably buffer it — the byte-budget refusal (#909 follow-up, #958). It removes the
+    /// `Prepared` entry and its age-index WITHOUT leaving a resolved tombstone, so the id is left FULLY
+    /// UNTRACKED and retryable, exactly as a [`TxnError::TooManyPrepared`] count refusal leaves it (that
+    /// refusal never records the id at all, because it rejects before the insert). This is the RIGHT
+    /// undo for a refusal taken AFTER the pure decision but BEFORE any durable effect: the opposite of
+    /// [`TxnTable::rollback`], which moves the id to a SPENT `Resolved(RolledBack)` tombstone (used when
+    /// a DURABLE half-append then fails, so the id is genuinely consumed). A no-op if `txn_id` is not
+    /// currently `Prepared`, so a double cancel is harmless.
+    pub fn cancel_prepared(&mut self, txn_id: &[u8]) {
+        if let Some(entry) = self.prepared.remove(txn_id) {
+            self.prepared_by_age
+                .remove(&(entry.instant, txn_id.to_vec()));
         }
     }
 
@@ -907,6 +939,32 @@ mod tests {
             Some(TxnState::Resolved(TxnOutcome::RolledBack))
         );
         assert_eq!(t.prepared_count(), 0);
+    }
+
+    #[test]
+    fn cancel_prepared_leaves_the_id_untracked_and_retryable_unlike_rollback() {
+        // #958: `cancel_prepared` undoes a fresh prepare WITHOUT leaving a spent tombstone (the byte-
+        // budget refusal path), so the id is fully UNTRACKED and can be re-prepared — unlike `rollback`,
+        // which moves it to a SPENT `Resolved(RolledBack)` tombstone that a re-prepare would reject as
+        // `TxnIdSpent`. This is the discriminating difference the byte-budget refusal relies on.
+        let mut t = table();
+        assert_eq!(t.prepare(b"tx1", 10), Ok(PrepareDecision::Prepared));
+        t.cancel_prepared(b"tx1");
+        assert_eq!(
+            t.state(b"tx1"),
+            None,
+            "cancel leaves NO tombstone (untracked)"
+        );
+        assert_eq!(t.prepared_count(), 0);
+        assert_eq!(t.resolved_tombstone_count(), 0);
+        // The id is retryable: a fresh prepare of the same id succeeds (a rollback would have made it
+        // `TxnIdSpent` here).
+        assert_eq!(t.prepare(b"tx1", 11), Ok(PrepareDecision::Prepared));
+        // And it does not leave a stale age-index entry: unresolved_before finds exactly the re-prepare.
+        assert_eq!(t.unresolved_before(u64::MAX), vec![(b"tx1".to_vec(), 11)]);
+        // A cancel of an unknown / already-cancelled id is a harmless no-op.
+        t.cancel_prepared(b"nope");
+        assert_eq!(t.prepared_count(), 1);
     }
 
     #[test]

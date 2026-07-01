@@ -316,6 +316,14 @@ pub struct RamFootprintConfig {
     /// (term 7), exactly as it charges the dedup cap (#878) and `consumer_credit`, which likewise cost
     /// nothing until used. `0` is floored to 1 by the engine, so a `0` here charges one slot.
     pub max_prepared: u64,
+    /// `--max-prepared-bytes`: the OPTIONAL exact resident-byte budget for the prepared half messages
+    /// (#909 follow-up, #958). `0` = OFF (only the count cap `max_prepared` binds, so term 7 charges the
+    /// worst case `max_prepared * PREPARED_HALF_MESSAGE_BYTES`). When SET, the engine's per-prepare byte
+    /// accounting refuses any prepare that would push the resident sum past this budget, so it is the
+    /// FIRM byte bound on term 7 — exactly as `consumer_credit_bytes` is the firm byte bound on term 1
+    /// (a maximal-frame count charge otherwise). Lets an operator tune the prepared-payload RAM ceiling
+    /// precisely instead of paying a full maximal frame per slot.
+    pub max_prepared_bytes: u64,
 }
 
 /// The worst-case STEADY-STATE bounded-buffer footprint (in bytes) the configured caps imply,
@@ -372,7 +380,11 @@ pub struct RamFootprintConfig {
 ///   1 TiB) this refuses any small ceiling, so an edge profile MUST lower `--max-prepared` (the
 ///   `edge-tiny` preset does, to a handful of slots, since each slot is a full maximal frame). The
 ///   engine HONORS the lowered cap (`Engine::set_txn_max_prepared` retunes the txn table), so the
-///   charge is a true bound, not a paper one.
+///   charge is a true bound, not a paper one. With the OPTIONAL exact byte budget set
+///   (`--max-prepared-bytes`, #958) the engine's per-prepare byte accounting instead holds the resident
+///   sum under that budget, so term 7 charges `max_prepared_bytes` directly — the firm byte bound, the
+///   txn sibling of term 1's `consumer_credit_bytes`, letting an operator tune the ceiling precisely
+///   rather than paying a full maximal frame per slot.
 ///
 /// NOT counted here, and WHY (this is the honest boundary of what the guard can prove):
 ///
@@ -465,10 +477,18 @@ pub fn worst_case_buffer_bytes(config: &RamFootprintConfig) -> u64 {
     // Saturating, so an absurd cap refuses rather than wraps. `.max(1)` mirrors the engine's floor
     // (`Engine::set_txn_max_prepared` clamps to >= 1), so a configured `0` still charges the one slot
     // the engine will actually admit — matching the `max_prepared` doc.
-    let term7_prepared = config
-        .max_prepared
-        .max(1)
-        .saturating_mul(PREPARED_HALF_MESSAGE_BYTES);
+    // With the exact byte budget SET (#958), the engine's per-prepare accounting holds the resident sum
+    // under `max_prepared_bytes`, so that is the FIRM byte bound and term 7 charges it directly — the
+    // txn sibling of term 1's `consumer_credit_bytes`. With it OFF (`0`) only the count cap binds, so the
+    // provable worst case is every slot a maximal frame (`max_prepared * PREPARED_HALF_MESSAGE_BYTES`).
+    let term7_prepared = if config.max_prepared_bytes == 0 {
+        config
+            .max_prepared
+            .max(1)
+            .saturating_mul(PREPARED_HALF_MESSAGE_BYTES)
+    } else {
+        config.max_prepared_bytes
+    };
 
     term1
         .saturating_add(term3)
@@ -560,6 +580,8 @@ mod tests {
             // prepared slots fit under 64 MiB. 2 slots is ~32 MiB — the whole worst case lands just under
             // the ceiling. The shipped default (65_536) would imply ~1 TiB and refuse here.
             max_prepared: 2,
+            // The exact byte budget is OFF (#958): edge-tiny fits via the lowered count cap alone.
+            max_prepared_bytes: 0,
         }
     }
 
@@ -633,6 +655,7 @@ mod tests {
             dedup_max_producers: 64,
             dedup_max_ids: 1024,
             max_prepared: 2,
+            max_prepared_bytes: 0,
         };
         assert!(matches!(
             fits_under_ram_ceiling(&cfg),
@@ -660,6 +683,7 @@ mod tests {
             dedup_max_producers: 0, // dedup off: this test isolates the term-1 count charge
             dedup_max_ids: 0,
             max_prepared: 0, // prepared cap off (floored to 1 elsewhere): isolate the term-1 charge
+            max_prepared_bytes: 0, // byte budget OFF: isolate the term-1 charge
         };
         let worst = worst_case_buffer_bytes(&cfg);
         // Term 1 alone is `max_connections * consumer_credit * MAX_FRAME_LEN`; the whole worst case is
@@ -691,6 +715,7 @@ mod tests {
             dedup_max_producers: 64,
             dedup_max_ids: 1024,
             max_prepared: 2,
+            max_prepared_bytes: 0,
         };
         let high_count = RamFootprintConfig {
             consumer_credit: u64::from(ironbus_core::backpressure::DEFAULT_CREDIT_CEILING),
@@ -909,6 +934,40 @@ mod tests {
                 "a blown --max-prepared under a 64 MiB ceiling must be refused, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn the_exact_byte_budget_binds_term_seven_independent_of_the_count_cap() {
+        // #958 FIRM-BYTE-BOUND DRIFT TEST (the txn sibling of the term-1 `consumer_credit_bytes` test
+        // above). With the exact byte budget SET, term 7 is `max_prepared_bytes` NO MATTER how high the
+        // count cap is: two configs that differ ONLY in `max_prepared` but share the byte budget have the
+        // IDENTICAL worst case, because the engine's per-prepare accounting holds the resident sum under
+        // the byte budget. This pins the byte-budget branch so a change that reverts term 7 to the
+        // count charge (a silent ceiling loosening) FAILS here.
+        let low_count = RamFootprintConfig {
+            max_prepared_bytes: 8 * 1024 * 1024,
+            ..edge_tiny_footprint()
+        };
+        let high_count = RamFootprintConfig {
+            max_prepared: u64::try_from(ironbus_core::txn::DEFAULT_MAX_PREPARED).unwrap(),
+            ..low_count
+        };
+        assert_eq!(
+            worst_case_buffer_bytes(&low_count),
+            worst_case_buffer_bytes(&high_count),
+            "with a byte budget set, the count cap must not change the worst case (the byte budget is \
+             the firm term-7 RAM bound)"
+        );
+        // And the byte budget is ACTUALLY charged: with it set, term 7 is exactly the budget, strictly
+        // smaller than the count charge the same slots would otherwise cost (2 * a maximal frame).
+        let count_charged = RamFootprintConfig {
+            max_prepared_bytes: 0,
+            ..low_count
+        };
+        assert!(
+            worst_case_buffer_bytes(&low_count) < worst_case_buffer_bytes(&count_charged),
+            "the exact byte budget (8 MiB) must charge less than 2 maximal frames of count charge"
+        );
     }
 
     #[test]

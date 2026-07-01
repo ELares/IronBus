@@ -2697,6 +2697,14 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// (the txn sibling of the #878 dedup cap). Defaults to [`ironbus_core::txn::DEFAULT_MAX_PREPARED`]
     /// (`65_536`); an edge profile LOWERS it so the guard's term-7 charge fits its RAM ceiling.
     txn_max_prepared: usize,
+    /// The OPTIONAL exact resident-byte budget for the prepared half messages (#909 follow-up, #958):
+    /// `Some(budget)` meters each FRESH prepare against the running sum of buffered payload bytes (the
+    /// store's `prepared_bytes`) and REFUSES one that would push the sum past `budget`, so the term-7
+    /// RAM is bounded by the exact configured byte ceiling rather than the worst-case
+    /// `max_prepared * maximal frame`. `None` (the default) leaves only the count cap
+    /// (`txn_max_prepared`) in force. Applied at store open and whenever set via
+    /// [`Engine::set_txn_max_prepared_bytes`].
+    txn_max_prepared_bytes: Option<u64>,
     /// The per-STREAM default message TTL (V2-M4, #549): a record reached on the poll path whose
     /// EFFECTIVE TTL (the lower of this and the record's own per-message TTL) has passed against the
     /// WALL-clock seam (anchored to the record's durable producer `timestamp_ms`) is EXPIRED — skipped
@@ -3128,6 +3136,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // fits its ceiling). An eager-recovered txn store above opened with the default cap is
             // retuned to this value by the boot-time setter, exactly like `back_check_config`.
             txn_max_prepared: ironbus_core::txn::DEFAULT_MAX_PREPARED,
+            // No exact byte budget by default (#958): only the count cap binds until an operator sets
+            // `--max-prepared-bytes` via `set_txn_max_prepared_bytes`, matching the pre-#958 behavior.
+            txn_max_prepared_bytes: None,
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
@@ -4233,6 +4244,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         listener_group: &[u8],
     ) -> Result<(), EngineError> {
         let now = self.log.now_monotonic();
+        // The optional exact byte budget (#958), read before the store borrow so the gate below is a
+        // plain local compare.
+        let max_prepared_bytes = self.txn_max_prepared_bytes;
         let back_check_timeout = {
             let store = self.ensure_txn_store()?;
             store.back_check().config().timeout
@@ -4253,6 +4267,33 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 Ok(())
             }
             ironbus_core::txn::PrepareDecision::Prepared => {
+                // Exact byte-budget gate (#909 follow-up, #958): if an operator set
+                // `--max-prepared-bytes`, meter this FRESH prepare's resident cost against the running
+                // sum and REFUSE it if buffering it would push the sum past the budget — the byte-side
+                // sibling of the `TooManyPrepared` count refusal, so the term-7 RAM stays under the
+                // exact configured ceiling. A live half message is never evicted to make room; we undo
+                // the in-memory prepare (nothing durable was written yet) and refuse. Metered only on a
+                // FRESH prepare: a benign duplicate (`AlreadyPrepared`) is already counted in the sum.
+                if let Some(budget) = max_prepared_bytes {
+                    let need = ironbus_storage::txn::prepared_resident_bytes(
+                        txn_id,
+                        stream,
+                        message.key,
+                        message.headers,
+                        message.payload,
+                    );
+                    if store.prepared_bytes().saturating_add(need) > budget {
+                        // Undo the in-memory prepare the pure table just recorded, leaving the id FULLY
+                        // UNTRACKED (not a spent tombstone) — the same "never recorded" state a
+                        // `TooManyPrepared` count refusal leaves, so the producer can RETRY the same
+                        // `txn_id` after some in-flight txns resolve and free bytes. No durable half
+                        // record exists yet, so nothing on disk needs undoing.
+                        store.table_mut().cancel_prepared(txn_id);
+                        return Err(EngineError::Txn(
+                            ironbus_core::txn::TxnError::TooManyPreparedBytes { budget },
+                        ));
+                    }
+                }
                 // Durably append + fsync the half record. If the durable write fails, ROLL BACK the
                 // in-memory prepared state so the table and the durable log stay consistent (the
                 // prepare did not happen), and surface the error.
@@ -4594,6 +4635,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn txn_max_prepared(&self) -> usize {
         self.txn_max_prepared
+    }
+
+    /// Sets the OPTIONAL exact resident-byte budget for prepared half messages (#909 follow-up, #958):
+    /// `Some(budget)` meters each FRESH `TxnPrepare` against the running sum of buffered payload bytes
+    /// and refuses one that would push the sum past `budget`, so the term-7 RAM is bounded by the exact
+    /// configured byte ceiling rather than the worst-case `max_prepared * maximal frame`; `None`
+    /// disables the byte budget, leaving only the count cap. Server-side only (NOT on the wire), like
+    /// [`Engine::set_txn_max_prepared`]. Remembered for a later lazy open and applied to the running
+    /// meter immediately (the store already tracks `prepared_bytes`, so there is nothing to retune on
+    /// the store). Lowering it below the current resident sum never drops a live half message; it only
+    /// refuses further prepares until the backlog drains under the budget.
+    pub fn set_txn_max_prepared_bytes(&mut self, budget: Option<u64>) {
+        self.txn_max_prepared_bytes = budget;
+    }
+
+    /// The active exact resident-byte budget for prepared half messages (#958), or `None` when only the
+    /// count cap binds. For the refuse-to-boot guard's accounting and tests.
+    #[must_use]
+    pub fn txn_max_prepared_bytes(&self) -> Option<u64> {
+        self.txn_max_prepared_bytes
     }
 
     /// Registers (or re-registers, after a reconnect) producer connection `member` as the live listener
@@ -17157,6 +17218,43 @@ mod tests {
         assert_eq!(e.txn_prepared_count(), 1);
         e.txn_rollback(b"tx1").unwrap();
         assert_eq!(e.txn_prepared_count(), 0);
+    }
+
+    #[test]
+    fn set_txn_max_prepared_bytes_meters_the_exact_resident_byte_budget() {
+        // #958 HONESTY LINK: with the OPTIONAL exact byte budget set, the refuse-to-boot guard charges
+        // `max_prepared_bytes` for term 7 (not `max_prepared * a maximal frame`), so the engine MUST
+        // hold the resident prepared-payload sum under that budget — else the guard's tighter proof is a
+        // lie. Each half here costs `txn_id.len() + payload.len()` resident bytes (`txn_half` has an
+        // empty stream/key/headers): "tx1"/"tx2" (3) + a 10-byte payload = 13 bytes. A 20-byte budget
+        // admits ONE but REFUSES the second (13 + 13 = 26 > 20), and a resolve frees the bytes so a fresh
+        // prepare fits again.
+        let mut e = open(config(10, 5));
+        e.set_txn_max_prepared_bytes(Some(20));
+        assert_eq!(e.txn_max_prepared_bytes(), Some(20));
+        // First prepare (13 bytes) fits under the 20-byte budget.
+        e.txn_prepare(b"tx1", "", &txn_half(&[b'a'; 10]), b"")
+            .unwrap();
+        assert_eq!(e.txn_prepared_count(), 1);
+        // The second prepare would push the resident sum to 26 > 20: REFUSED on bytes, naming the budget.
+        match e.txn_prepare(b"tx2", "", &txn_half(&[b'b'; 10]), b"") {
+            Err(EngineError::Txn(ironbus_core::txn::TxnError::TooManyPreparedBytes { budget })) => {
+                assert_eq!(budget, 20, "the refusal names the configured byte budget");
+            }
+            other => panic!("a prepare past the byte budget must be refused, got {other:?}"),
+        }
+        // The refused txn left NO residue: the one prepared half is untouched and still resolvable.
+        assert_eq!(e.txn_prepared_count(), 1);
+        // Resolving tx1 releases its 13 bytes, so tx2 now fits under the budget.
+        e.txn_rollback(b"tx1").unwrap();
+        assert_eq!(e.txn_prepared_count(), 0);
+        e.txn_prepare(b"tx2", "", &txn_half(&[b'b'; 10]), b"")
+            .unwrap();
+        assert_eq!(
+            e.txn_prepared_count(),
+            1,
+            "the freed bytes let a fresh prepare fit again"
+        );
     }
 
     #[test]
