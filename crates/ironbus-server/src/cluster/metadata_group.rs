@@ -129,6 +129,18 @@ pub struct MetadataRaftGroup<F: Filesystem, C: Clock> {
     /// The cluster leader epoch + the local leadership lease, advanced from the raft term and the
     /// monotonic clock on every ready cycle. The epoch is the cluster-wide fencing token (C1-I3).
     leadership: LeadershipTracker,
+    /// #872 FAIL-STOP LATCH: set true the first time [`Self::drive_ready`] fails AFTER it has taken
+    /// the raft-rs `Ready` (a persist / fsync error). Such a failure leaves the `Ready` UN-ADVANCED
+    /// — a raft-rs advance-after-ready contract violation — and, for a metadata-log fsync error, the
+    /// log FREEZES its writer read-only (every later append/sync then also fails), so the node can
+    /// never make safe Raft progress again. Rather than log-and-continue into a SILENT DEAD VOTER
+    /// (re-taking a never-advanced `Ready` every tick, re-applying the same committed entries, and
+    /// dropping outbound heartbeats/votes while still advertising as a healthy voter), we FAIL-STOP
+    /// this node's Raft role: once latched, [`Self::drive_ready`] NEVER re-enters the `Ready` path,
+    /// [`Self::tick`]/[`Self::step`] become no-ops (stop ticking), and [`Self::is_leader`] /
+    /// [`Self::can_act_as_leader`] report false (step down). The condition is unrecoverable in-process
+    /// (the frozen writer) — the node must be repaired/replaced — so the latch is deliberately sticky.
+    health_failed: bool,
 }
 
 impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
@@ -267,6 +279,7 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
             state,
             clock,
             leadership,
+            health_failed: false,
         })
     }
 
@@ -277,9 +290,23 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
     }
 
     /// True if this node currently believes itself the leader.
+    ///
+    /// A FAIL-STOPPED node ([`Self::is_health_failed`]) always reports false here: on a metadata-log
+    /// persist/fsync failure it has stepped down and stopped ticking (#872), so it must never be
+    /// observed as a healthy leader even if the (now-frozen) raft core last held the leader role.
     #[must_use]
     pub fn is_leader(&self) -> bool {
-        self.node.raft.state == StateRole::Leader
+        !self.health_failed && self.node.raft.state == StateRole::Leader
+    }
+
+    /// True once this node's metadata-Raft role has FAIL-STOPPED (#872): a [`Self::drive_ready`]
+    /// persist/fsync failure left the raft-rs `Ready` un-advanced and (for an fsync error) froze the
+    /// metadata log's writer, so the node can never make safe Raft progress again. A health-failed
+    /// node has stepped down, stopped ticking, and drops peer messages — it is the LOUD signal that
+    /// replaces the old silent-dead-voter wedge. Sticky: once set it never clears in-process.
+    #[must_use]
+    pub fn is_health_failed(&self) -> bool {
+        self.health_failed
     }
 
     /// The metadata log's COMMITTED high-watermark (the raft committed index): every entry at or
@@ -358,8 +385,12 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
     /// clock, never the wall clock.
     #[must_use]
     pub fn can_act_as_leader(&self) -> bool {
-        self.leadership
-            .can_act_as_leader(self.clock.now_monotonic_nanos())
+        // A fail-stopped node (#872) has stepped down: it may never act as leader regardless of any
+        // still-valid lease the (now-frozen) core last held.
+        !self.health_failed
+            && self
+                .leadership
+                .can_act_as_leader(self.clock.now_monotonic_nanos())
     }
 
     /// Whether a write/commit stamped with `epoch` is FENCED right now: its epoch is below the
@@ -393,6 +424,11 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
     /// elect itself. The leadership lease is refreshed off the monotonic clock so a leader
     /// renews (and a stale leader's lapsed lease is observed) on the heartbeat cadence.
     pub fn tick(&mut self) -> bool {
+        if self.health_failed {
+            // #872 FAIL-STOP: a fail-stopped node STOPS TICKING — it drives no more elections or
+            // heartbeats, so it cannot campaign or masquerade as a live leader. No new work.
+            return false;
+        }
         let work = self.node.tick();
         self.refresh_leadership();
         work
@@ -417,6 +453,12 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
     ///
     /// Returns [`GroupError::Raft`] if the core rejects the message.
     pub fn step(&mut self, msg: Message) -> Result<(), GroupError> {
+        if self.health_failed {
+            // #872 FAIL-STOP: a fail-stopped node touches the frozen core no further — drop the peer
+            // message (benignly, like a message to a node mid-membership-change). It votes for no one
+            // and replicates nothing.
+            return Ok(());
+        }
         self.node.step(msg)?;
         self.refresh_leadership();
         Ok(())
@@ -520,11 +562,40 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
     /// Returns [`GroupError::Storage`] on a durable append / fsync failure, [`GroupError::Raft`]
     /// on a core error, or [`GroupError::Decode`] if a committed entry's bytes are not a valid
     /// metadata command.
+    ///
+    /// # Fail-stop (#872)
+    ///
+    /// ANY error returned AFTER the `Ready` has been taken (`self.node.ready()`) leaves that `Ready`
+    /// UN-ADVANCED — a raft-rs advance-after-ready contract violation — and, for a metadata-log fsync
+    /// error, freezes the log's writer permanently. Re-entering with that same never-advanced `Ready`
+    /// every tick would re-apply the same committed entries and drop the cycle's outbound
+    /// heartbeats/votes while the node still advertised as a healthy voter (a silent dead voter). So
+    /// such a failure LATCHES [`Self::is_health_failed`]: the node FAIL-STOPS its Raft role (steps
+    /// down, stops ticking) and this method NEVER re-enters the `Ready` path again — every later call
+    /// returns `Ok(empty)` without touching the frozen core. The caller (the driver loop) surfaces the
+    /// latched failure as a loud health-failed status.
     pub fn drive_ready(&mut self) -> Result<Vec<Message>, GroupError> {
-        if !self.node.has_ready() {
+        // #872: a fail-stopped node NEVER takes another `Ready`. Taking one would re-apply the same
+        // committed entries (the last cycle's un-advanced `Ready` is still pending) and accumulate more
+        // un-advanced state against the frozen writer. Report no outbound work and make no progress.
+        if self.health_failed || !self.node.has_ready() {
             return Ok(Vec::new());
         }
+        // Any error from here — AFTER `ready()` is taken below — leaves the `Ready` un-advanced, so
+        // LATCH the fail-stop before propagating it. From now on the guard above short-circuits.
+        match self.drive_ready_inner() {
+            Ok(outbound) => Ok(outbound),
+            Err(e) => {
+                self.health_failed = true;
+                Err(e)
+            }
+        }
+    }
 
+    /// The fallible body of one `Ready` cycle (see [`Self::drive_ready`] for the full contract). Split
+    /// out so [`Self::drive_ready`] can LATCH the #872 fail-stop on ANY error the moment the `Ready`
+    /// has been taken (an un-advanced `Ready` is unrecoverable), rather than log-and-continue.
+    fn drive_ready_inner(&mut self) -> Result<Vec<Message>, GroupError> {
         let mut ready = self.node.ready();
 
         // 1. Outbound messages to peers (none at n=1) — collected for the caller.
@@ -1892,5 +1963,215 @@ mod tests {
             mesh.nodes[&leader].applied_index(),
             "the learner's applied frontier matches the leader's (no gap, no dup)"
         );
+    }
+
+    // --- #872: metadata-Raft FAIL-STOP on a persist/fsync failure in `drive_ready`. ---
+    //
+    // A metadata-log fsync error inside `drive_ready` leaves the raft-rs `Ready` UN-ADVANCED (a
+    // contract violation) and freezes the log's writer read-only. The pre-#872 behavior re-took that
+    // never-advanced `Ready` every tick — re-applying committed entries and dropping outbound
+    // heartbeats/votes — while the node still advertised as a healthy voter (a silent dead voter).
+    // The fix FAIL-STOPS the node's Raft role: it steps down, stops ticking, latches a loud
+    // health-failed status, and NEVER re-enters `drive_ready` on the un-advanced `Ready`.
+    mod fail_stop_872 {
+        use super::{log_config, MetadataCommand, MetadataRaftGroup, NodeRole};
+        use ironbus_core::clock::ManualClock;
+        use ironbus_storage::fs::{Filesystem, InMemoryFs};
+        use ironbus_storage::io::RandomAccessFile;
+        use std::io;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        /// A filesystem wrapping [`InMemoryFs`] whose file fsyncs (`sync_data`/`sync_all`) FAIL once
+        /// `fail_sync` is armed — the deterministic ENOSPC/EIO-on-fsync seam. A subdir shares the
+        /// SAME `fail_sync` flag, so the metadata group's `metaraft/` view faults too.
+        #[derive(Clone)]
+        struct FaultFs {
+            inner: InMemoryFs,
+            fail_sync: Arc<AtomicBool>,
+        }
+
+        /// A file over [`InMemoryFs`]'s file whose durability barrier fails while `fail_sync` is armed.
+        struct FaultFile {
+            inner: Arc<ironbus_storage::io::InMemoryFile>,
+            fail_sync: Arc<AtomicBool>,
+        }
+
+        impl FaultFile {
+            fn barrier(&self) -> io::Result<()> {
+                if self.fail_sync.load(Ordering::SeqCst) {
+                    return Err(io::Error::other(
+                        "injected fsync failure (#872 fail-stop test): ENOSPC/EIO on the barrier",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        impl RandomAccessFile for FaultFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn sync_data(&self) -> io::Result<()> {
+                self.barrier()?;
+                self.inner.sync_data()
+            }
+            fn sync_all(&self) -> io::Result<()> {
+                self.barrier()?;
+                self.inner.sync_all()
+            }
+            fn len(&self) -> io::Result<u64> {
+                self.inner.len()
+            }
+            fn set_len(&self, len: u64) -> io::Result<()> {
+                self.inner.set_len(len)
+            }
+        }
+
+        impl Filesystem for FaultFs {
+            type File = FaultFile;
+            fn open(&self, name: &str) -> io::Result<Self::File> {
+                Ok(FaultFile {
+                    inner: self.inner.open(name)?,
+                    fail_sync: Arc::clone(&self.fail_sync),
+                })
+            }
+            fn create_new(&self, name: &str) -> io::Result<Self::File> {
+                Ok(FaultFile {
+                    inner: self.inner.create_new(name)?,
+                    fail_sync: Arc::clone(&self.fail_sync),
+                })
+            }
+            fn remove(&self, name: &str) -> io::Result<()> {
+                self.inner.remove(name)
+            }
+            fn list(&self) -> io::Result<Vec<String>> {
+                self.inner.list()
+            }
+            fn exists(&self, name: &str) -> io::Result<bool> {
+                self.inner.exists(name)
+            }
+            fn sync_dir(&self) -> io::Result<()> {
+                self.inner.sync_dir()
+            }
+            fn subdir(&self, name: &str) -> io::Result<Self> {
+                Ok(FaultFs {
+                    inner: self.inner.subdir(name)?,
+                    fail_sync: Arc::clone(&self.fail_sync),
+                })
+            }
+            fn subdir_exists(&self, name: &str) -> io::Result<bool> {
+                self.inner.subdir_exists(name)
+            }
+            fn list_subdirs(&self) -> io::Result<Vec<String>> {
+                self.inner.list_subdirs()
+            }
+        }
+
+        type FaultGroup = MetadataRaftGroup<FaultFs, ManualClock>;
+
+        fn settle(group: &mut FaultGroup) {
+            for _ in 0..256 {
+                let _ = group.drive_ready().expect("drive ready (fault not armed)");
+                if !group.is_health_failed() && !group.has_pending_ready() {
+                    break;
+                }
+                if group.is_health_failed() {
+                    break;
+                }
+            }
+        }
+
+        /// The #872 acceptance test. A single-voter metadata group elects itself and applies a
+        /// command healthily. Then the metadata-log fsync barrier is armed to FAIL: the next
+        /// `drive_ready` (persisting a proposed command) errors AFTER taking the raft-rs `Ready`,
+        /// leaving it un-advanced. The node MUST fail-stop — assert (a) it is no longer a healthy
+        /// voter/leader, (b) it does not re-enter `drive_ready` on the un-advanced `Ready` (a later
+        /// call returns Ok, never re-erroring and never re-applying), and (c) it surfaces the
+        /// health-failed status. WITHOUT the fix the node would keep re-taking the never-advanced
+        /// `Ready`, re-erroring every tick, and still report `is_leader()`.
+        #[test]
+        fn a_persist_fsync_failure_fail_stops_the_node_instead_of_silently_wedging() {
+            let fail_sync = Arc::new(AtomicBool::new(false));
+            let fs = FaultFs {
+                inner: InMemoryFs::new(),
+                fail_sync: Arc::clone(&fail_sync),
+            };
+            let mut group = MetadataRaftGroup::open(1, &[1], &fs, ManualClock::new(), log_config())
+                .expect("open durable group");
+
+            // Elect + apply a first command HEALTHILY (the fault is not yet armed).
+            group.campaign().expect("campaign");
+            settle(&mut group);
+            assert!(group.is_leader(), "lone voter self-elects while healthy");
+            group
+                .propose(&MetadataCommand::AddNode {
+                    node: 1,
+                    role: NodeRole::Voter,
+                })
+                .expect("propose while healthy");
+            settle(&mut group);
+            let applied_before = group.applied_index();
+            assert!(applied_before > 0, "the first command applied healthily");
+            assert!(!group.is_health_failed(), "healthy before the fault");
+
+            // ARM the fsync fault, then propose a command whose persist barrier will fail.
+            fail_sync.store(true, Ordering::SeqCst);
+            group
+                .propose(&MetadataCommand::AssignPartition {
+                    partition: 7,
+                    leader: 1,
+                    epoch: group.term(),
+                })
+                .expect("propose (append succeeds; the fsync barrier is what fails)");
+
+            // The cycle takes the `Ready`, then the fsync barrier fails -> Err, leaving the `Ready`
+            // un-advanced. The group must LATCH the fail-stop.
+            let first = group.drive_ready();
+            assert!(
+                first.is_err(),
+                "the armed fsync barrier must fail the ready cycle"
+            );
+            assert!(
+                group.is_health_failed(),
+                "(c) the node latches a HEALTH-FAILED status on the persist/fsync failure"
+            );
+            assert!(
+                !group.is_leader(),
+                "(a) a fail-stopped node STEPS DOWN — it is no longer a healthy leader/voter"
+            );
+            assert!(
+                !group.can_act_as_leader(),
+                "(a) a fail-stopped node may never act as leader"
+            );
+
+            // (b) It NEVER re-enters `drive_ready` on the un-advanced `Ready`: even with the fault
+            // still armed, a later call returns Ok(empty) (it does not re-take the `Ready`, so it
+            // neither re-errors against the frozen writer nor re-applies committed entries).
+            let applied_after_faults = group.applied_index();
+            for _ in 0..8 {
+                let again = group.drive_ready();
+                assert!(
+                    again.is_ok(),
+                    "(b) a fail-stopped node never re-enters the un-advanced ready path"
+                );
+                assert!(
+                    again.expect("ok").is_empty(),
+                    "(b) a fail-stopped node produces no outbound work"
+                );
+            }
+            assert_eq!(
+                group.applied_index(),
+                applied_after_faults,
+                "(b) no committed entries are re-applied after fail-stop"
+            );
+
+            // Ticking is a no-op: a fail-stopped node drives no elections/heartbeats.
+            assert!(!group.tick(), "a fail-stopped node stops ticking");
+            assert!(!group.is_leader(), "still stepped down after a tick");
+        }
     }
 }

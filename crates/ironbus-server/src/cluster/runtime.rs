@@ -330,6 +330,14 @@ pub struct ClusterStatus {
     /// above it. Observability: it RISES as the driver snapshots + compacts on its cadence, which is the
     /// witness that the metadata log is being bounded (not growing forever).
     pub snapshot_index: u64,
+    /// #872 FAIL-STOP witness: set true (and latched) once this node's metadata-Raft role has
+    /// FAIL-STOPPED because a `drive_ready` persist/fsync failure left the raft-rs `Ready` un-advanced
+    /// (and, for an fsync error, froze the metadata log's writer read-only). A health-failed node has
+    /// STEPPED DOWN (`is_leader` reads false), stopped ticking, and makes no further Raft progress — it
+    /// must be repaired/replaced. This is the LOUD control-plane signal that replaces the old
+    /// silent-dead-voter wedge (a node that kept advertising as a healthy voter while wedged): the
+    /// control plane fail-stops LOUDLY instead of degrading silently.
+    pub health_failed: bool,
 }
 
 /// A command for the driver to propose to the metadata group on behalf of the broker (or a test):
@@ -1292,7 +1300,30 @@ fn run_driver<F, C>(
         match group.drive_ready() {
             Ok(outbound) => route_outbound(outbound, &shared.outbound_tx),
             Err(e) => {
-                tracing::error!(error = %e, "cluster: drive_ready failed");
+                // #872 FAIL-STOP: the failure came AFTER `drive_ready` took the raft-rs `Ready`, which
+                // is now UN-ADVANCED (a contract violation) and — for a metadata-log fsync error — froze
+                // the log's writer read-only, so this node can never make safe Raft progress again. The
+                // group has already LATCHED its fail-stop (it stepped down, stops ticking, and will never
+                // re-enter `drive_ready` on the un-advanced `Ready`). The OLD behavior here was
+                // log-and-continue, which re-took the never-advanced `Ready` every tick, re-applied the
+                // same committed entries, and dropped this cycle's outbound heartbeats/votes while the
+                // node STILL advertised as a healthy voter — a silent dead voter wedged forever. Instead,
+                // surface a LOUD health-failed status and STOP the driver: the node has fail-stopped and
+                // must be repaired/replaced (a survivor's F1 detector then converts its silence into a
+                // committed membership shrink + failover).
+                tracing::error!(
+                    error = %e,
+                    node_id,
+                    "cluster: metadata-Raft drive_ready failed to persist/fsync — FAIL-STOPPING this \
+                     node's Raft role (health-failed: stepping down, no longer a healthy voter). The \
+                     metadata log froze its writer; this node must be repaired/replaced."
+                );
+                if let Ok(mut s) = shared.status.lock() {
+                    s.health_failed = true;
+                    // Step down in the published view: a fail-stopped node is never a healthy leader.
+                    s.is_leader = false;
+                }
+                return;
             }
         }
 
