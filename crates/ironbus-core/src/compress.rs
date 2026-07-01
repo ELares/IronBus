@@ -498,7 +498,8 @@ fn zstd_decompress(stream: &[u8], dict: &[u8], out_len: usize) -> Result<Vec<u8>
 ///
 /// This is the dictionary-lifecycle SEAM (#357, `docs/DICTIONARY_LIFECYCLE.md` §3-§4): a
 /// real resolver looks up the on-disk `dicts/<dict_id>.zstd` sidecar first, then the
-/// embedded active set, and validates the content hash. The IO-free core carries only the
+/// embedded active set, keyed by the (32-bit-truncated) `dict_id` content-address — that id
+/// is an identifier, NOT an integrity check (the full 32-byte BLAKE3 is the real check). The IO-free core carries only the
 /// seam; the sidecar IO and the embed live above it. `dict_id == 0` is never passed here
 /// (it is the no-dictionary sentinel).
 pub trait DictResolver {

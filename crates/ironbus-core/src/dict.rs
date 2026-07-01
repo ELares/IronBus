@@ -4,7 +4,7 @@
 //! content-addressed `dict_id` derivation. Compiled ONLY on the OPT-IN `zstd` feature.
 //!
 //! What lives HERE (pure compute, no IO): the `ZDICT_trainFromBuffer` call (via the `zstd` crate),
-//! the corpus floors (min/target sample counts and a min-distinct-bytes diversity floor), the
+//! the corpus floors (min/target sample counts and a de-duplicated-record-bytes floor), the
 //! `dict_id = truncate_u32(BLAKE3-256(dict_bytes))` derivation, and the dict_id `0`-sentinel
 //! refusal. What lives ABOVE this (in `ironbus-storage`/`ironbus-cli`, NOT here): the sidecar file
 //! IO (`dicts/<dict_id>.zstd`), the embedded active set, the resolver. Keeping the IO out preserves
@@ -25,9 +25,12 @@ pub const MIN_SAMPLES: usize = 1000;
 /// it by the caller, not a hard floor here).
 pub const TARGET_SAMPLES: usize = 10_000;
 
-/// The minimum total distinct sample bytes the corpus must span, so a corpus of N identical
-/// records does not pass the count floor while carrying no diversity. A diversity floor, not a
-/// size cap.
+/// The minimum total bytes across the corpus's DE-DUPLICATED records: identical records are
+/// collapsed and the byte LENGTHS of the surviving unique records are summed, and that sum must
+/// reach this floor. This is a coarse proxy for redundancy — it stops N copies of a single record
+/// from passing the count floor (they collapse to one record's length) — NOT a byte-level or
+/// entropy measure of diversity (it never inspects which byte VALUES occur, only unique-record
+/// lengths). A floor on de-duplicated corpus size, not a size cap.
 pub const MIN_DISTINCT_BYTES: usize = 8 * 1024;
 
 /// The default requested dictionary size in bytes (110 KiB, zstd's own `ZDICT` default).
@@ -53,12 +56,14 @@ pub enum TrainError {
         /// The required minimum.
         need: usize,
     },
-    /// The corpus spans fewer than [`MIN_DISTINCT_BYTES`] of distinct bytes (the diversity floor):
-    /// many identical records carry no redundancy to learn.
+    /// The corpus's de-duplicated records sum to fewer than [`MIN_DISTINCT_BYTES`] bytes (the
+    /// de-duplicated-record-bytes floor): after collapsing identical records, too little unique
+    /// material remains for zstd to learn any redundancy. (The name is historical; the check sums
+    /// unique-record lengths, it does not measure byte-level diversity.)
     TooLittleDiversity {
-        /// The distinct-byte span the corpus actually covered.
+        /// The summed byte length of the corpus's de-duplicated (unique) records.
         have: usize,
-        /// The required minimum distinct-byte span.
+        /// The required minimum de-duplicated-record byte total.
         need: usize,
     },
     /// The `ZDICT_trainFromBuffer` C call returned an error (for example the corpus was too small
@@ -80,7 +85,7 @@ impl core::fmt::Display for TrainError {
             ),
             TrainError::TooLittleDiversity { have, need } => write!(
                 f,
-                "corpus carries too little diversity: {have} distinct bytes, need at least {need}"
+                "corpus has too few de-duplicated record bytes: {have}, need at least {need}"
             ),
             TrainError::ZdictFailed => {
                 write!(f, "ZDICT training failed (corpus too small or too uniform)")
@@ -98,8 +103,19 @@ impl std::error::Error for TrainError {}
 
 /// Derives the content-addressed `dict_id` for a dictionary blob:
 /// `truncate_u32(BLAKE3-256(bytes))`, taking the first 4 bytes of the 32-byte BLAKE3 digest as a
-/// little-endian `u32` (`docs/DICTIONARY_LIFECYCLE.md` §2). A cryptographic hash (not a CRC) so a
-/// same-prefix collision cannot be engineered cheaply; the id is the immutability guarantee.
+/// little-endian `u32` (`docs/DICTIONARY_LIFECYCLE.md` §2).
+///
+/// The id is a 32-bit TRUNCATION of BLAKE3, so BLAKE3's collision and second-preimage resistance
+/// (which hold for the full 256-bit output) do NOT carry over to the id: a birthday collision
+/// between two blobs costs ~2^16 trials and a chosen-target second-preimage (forging a blob that
+/// hashes to a specific id) costs ~2^32 hashes — both cheap on commodity hardware. So the `dict_id`
+/// is a compact content-addressed IDENTIFIER, NOT a tamper-proof integrity or immutability
+/// guarantee; do not treat "same `dict_id`" as proof of "same bytes" against an adversary. That is
+/// acceptable here because minting and installing dictionaries is an operator/filesystem-trusted
+/// flow (`docs/DICTIONARY_LIFECYCLE.md` §3-§4), not an untrusted-input path: the id only needs to
+/// disambiguate honestly-produced dictionaries and give a stable registry-free name. If integrity
+/// against a motivated adversary is ever required, the resolver must verify the FULL BLAKE3 digest
+/// (store/compare all 32 bytes), not this 32-bit id.
 ///
 /// This is a pure function of the bytes alone, so the same dictionary always derives the same id
 /// everywhere with no coordination (the registry-free, never-reuse property). It can legitimately
@@ -114,10 +130,10 @@ pub fn derive_dict_id(bytes: &[u8]) -> u32 {
 
 /// Trains a zstd dictionary from a per-type `samples` corpus (each element one raw, uncompressed
 /// record of one message type), targeting `target_dict_bytes`, using the default sample-count and
-/// diversity floors.
+/// distinct-record-bytes floors.
 ///
 /// # Errors
-/// Returns a [`TrainError`] if the corpus fails the count or diversity floors, the `ZDICT` call
+/// Returns a [`TrainError`] if the corpus fails the count or distinct-record-bytes floors, the `ZDICT` call
 /// fails, or the derived `dict_id` is the `0` sentinel. Never panics.
 pub fn train_dictionary(
     samples: &[Vec<u8>],
@@ -126,7 +142,7 @@ pub fn train_dictionary(
     train_dictionary_with_floors(samples, target_dict_bytes, MIN_SAMPLES, MIN_DISTINCT_BYTES)
 }
 
-/// Like [`train_dictionary`] but with explicit count and diversity floors, for an operator who
+/// Like [`train_dictionary`] but with explicit count and distinct-record-bytes floors, for an operator who
 /// knowingly accepts a smaller corpus (the CLI `--min-samples`).
 ///
 /// # Errors
@@ -144,13 +160,15 @@ pub fn train_dictionary_with_floors(
         });
     }
 
-    // Diversity floor: count the DISTINCT sample bytes the corpus spans (deduplicating identical
-    // records), so 1000 copies of one record cannot pass on count alone.
-    let distinct: std::collections::BTreeSet<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-    let distinct_bytes: usize = distinct.iter().map(|s| s.len()).sum();
-    if distinct_bytes < min_distinct_bytes {
+    // De-duplicated-record-bytes floor: collapse identical records to a set, then sum the byte
+    // LENGTHS of the surviving unique records (this measures unique-record volume, not byte-level
+    // diversity), so 1000 copies of one record cannot pass on count alone.
+    let unique_records: std::collections::BTreeSet<&[u8]> =
+        samples.iter().map(Vec::as_slice).collect();
+    let unique_record_bytes: usize = unique_records.iter().map(|s| s.len()).sum();
+    if unique_record_bytes < min_distinct_bytes {
         return Err(TrainError::TooLittleDiversity {
-            have: distinct_bytes,
+            have: unique_record_bytes,
             need: min_distinct_bytes,
         });
     }
