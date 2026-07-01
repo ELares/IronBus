@@ -1043,9 +1043,21 @@ pub(crate) fn par_sync_data_only<F: Filesystem, C: Clock>(
                     .name(format!("ib-commit-fsync-{k}"))
                     .spawn_scoped(s, move || {
                         let mut local: Vec<(usize, Result<(), StorageError>)> = Vec::new();
-                        while let Some((tag, log)) =
-                            queue.lock().expect("commit barrier queue poisoned").pop()
-                        {
+                        loop {
+                            // Drop the queue `MutexGuard` right after the O(1) `pop` — BEFORE the
+                            // blocking `fdatasync` below — so the K barriers actually overlap. Under
+                            // edition-2021 temporary scoping, a guard created in a `while let`
+                            // SCRUTINEE lives until the END of the loop body, which would hold the
+                            // shared queue lock across `sync_data_only` and force every barrier
+                            // strictly SERIAL (the #823 regression: tick latency becomes sum, not
+                            // max). The explicit block scopes the guard to the pop alone, so the
+                            // fdatasync runs with the lock released and the participants run
+                            // concurrently.
+                            let Some((tag, log)) =
+                                ({ queue.lock().expect("commit barrier queue poisoned").pop() })
+                            else {
+                                break;
+                            };
                             local.push((tag, log.sync_data_only()));
                         }
                         local
@@ -1056,7 +1068,14 @@ pub(crate) fn par_sync_data_only<F: Filesystem, C: Clock>(
         // The main thread is the final participant: drain whatever barriers remain (this alone covers
         // the whole set if no helper spawned).
         let mut all: Vec<(usize, Result<(), StorageError>)> = Vec::with_capacity(total);
-        while let Some((tag, log)) = queue.lock().expect("commit barrier queue poisoned").pop() {
+        loop {
+            // Same guard-scoping as the helpers above: drop the queue lock right after the `pop` so
+            // this final participant's `fdatasync` overlaps the helpers' rather than running under a
+            // held lock (which would serialize the whole fan-out — the #823 regression).
+            let Some((tag, log)) = ({ queue.lock().expect("commit barrier queue poisoned").pop() })
+            else {
+                break;
+            };
             all.push((tag, log.sync_data_only()));
         }
         // JOIN every helper before returning: no barrier result — and so no ack — is released until
@@ -4526,6 +4545,99 @@ mod tests {
             headers: b"",
             payload,
         }
+    }
+
+    /// Builds `k` independent logs, each rooted in its OWN in-memory disk but SHARING one
+    /// [`FaultControl`](crate::fault::FaultControl), each with a record appended and
+    /// flushed-but-not-synced — so every log owes exactly one covering `fdatasync`
+    /// ([`has_unsynced_records`](Log::has_unsynced_records)). The shared control lets the sync
+    /// rendezvous count barriers across all K fds (a barrier per fd). No sync fires here (open runs
+    /// while the rendezvous is disarmed; `flush_no_sync` never syncs).
+    fn build_dirtied_logs(
+        control: &crate::fault::FaultControl,
+        k: usize,
+    ) -> Vec<Log<crate::fault::FaultFs<InMemoryFs>, ManualClock>> {
+        (0..k)
+            .map(|_| {
+                let fs = crate::fault::FaultFs::with_control(InMemoryFs::new(), control.clone());
+                let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+                log.append(&rec(b"payload")).unwrap();
+                log.flush_no_sync().unwrap();
+                assert!(
+                    log.has_unsynced_records(),
+                    "a dirtied log must owe exactly one barrier"
+                );
+                log
+            })
+            .collect()
+    }
+
+    #[test]
+    fn group_commit_barriers_overlap_and_do_not_serialize() {
+        use crate::fault::FaultControl;
+        // #823 regression: `par_sync_data_only` must run its K per-fd `fdatasync` barriers
+        // CONCURRENTLY (tick latency = max(barrier), not sum). If the shared work-queue's MutexGuard
+        // is held across the blocking `fdatasync` (the edition-2021 `while let`-scrutinee drop trap),
+        // the barriers SERIALIZE and this test fails — the froze/synced-SET tests can never catch that
+        // because the results are identical whether the fdatasyncs overlapped or not.
+        //
+        // How it proves overlap: every barrier's `fdatasync` joins a rendezvous in the fault fs. The
+        // group is released only once `width` barriers are inside their `fdatasync` AT THE SAME TIME.
+        // A serial fan-out can never get more than one barrier in at once (the in-flight one holds the
+        // queue lock, so no sibling can even reach its `fdatasync`), so the rendezvous is never
+        // reached; after a bounded deadline this thread force-drains and the assertion FAILS. A
+        // concurrent fan-out reaches it in microseconds and PASSES.
+        const K: usize = 4;
+        // The fan-out's effective width = min(cores, cap, K): at most this many barriers are ever
+        // inside a `fdatasync` at once, so the rendezvous must expect exactly this many, not K.
+        let width = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(COMMIT_BARRIER_MAX_WORKERS)
+            .min(K);
+
+        if width < 2 {
+            // Single-core (or single-worker) CI: `par_sync_data_only` runs the fdatasyncs INLINE with
+            // no threads, so there is NO overlap to observe. Prove the fan-out still completes every
+            // barrier, but SKIP the strict overlap assertion (it would be meaningless with one worker,
+            // and a width-1 rendezvous would trivially "reach" on the first entrant).
+            let control = FaultControl::default();
+            let mut logs = build_dirtied_logs(&control, K);
+            let barriers = logs.iter_mut().enumerate().collect();
+            let results = par_sync_data_only(barriers);
+            assert_eq!(results.len(), K);
+            assert!(results.iter().all(|(_, r)| r.is_ok()));
+            return;
+        }
+
+        let control = FaultControl::default();
+        let mut logs = build_dirtied_logs(&control, K);
+        // Arm the rendezvous to the effective worker width, then run the REAL fan-out on a driver
+        // thread while THIS thread enforces a bounded deadline — so a serial fan-out fails fast
+        // instead of hanging the suite forever.
+        control.arm_sync_rendezvous(width);
+        let reached = std::thread::scope(|s| {
+            let barriers = logs.iter_mut().enumerate().collect();
+            let driver = s.spawn(move || par_sync_data_only(barriers));
+            // The deadline is enormous versus the microseconds a concurrent rendezvous needs (a
+            // correct fan-out returns on the rendezvous notify, never waiting the full timeout), so
+            // this is NOT timing-flaky; the deadline only bites — failing fast — when the fan-out has
+            // serialized.
+            let reached =
+                control.wait_for_rendezvous_or_release(std::time::Duration::from_secs(10));
+            let results = driver.join().expect("fan-out driver panicked");
+            assert_eq!(results.len(), K, "every barrier ran");
+            assert!(
+                results.iter().all(|(_, r)| r.is_ok()),
+                "no barrier should freeze under a clean fs"
+            );
+            reached
+        });
+        assert!(
+            reached,
+            "the {width} group-commit fdatasync barriers must OVERLAP (>= {width} inside a fdatasync \
+             at once); a failure here means they serialized — the queue MutexGuard is held across the \
+             blocking fdatasync (#823)"
+        );
     }
 
     // A record carrying an explicit producer timestamp, for the age-retention tests.
