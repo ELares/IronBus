@@ -27,6 +27,9 @@ use std::path::{Path, PathBuf};
 
 use ironbus_core::codec;
 use ironbus_core::cursor::AckCursor;
+use ironbus_core::format::{SEGMENT_FLAG_COMPACTED, SEGMENT_HEADER_LEN};
+use ironbus_core::segment::SegmentHeader;
+use ironbus_core::types::{Offset, Seq};
 use ironbus_proto::frame;
 use ironbus_proto::message;
 use ironbus_storage::io::{InMemoryFile, RandomAccessFile};
@@ -84,6 +87,55 @@ fn drive_target(target: &str, file: &Path, data: &[u8]) {
                 let _ = reader.scan_recovery();
             }
         }),
+        "segment_scan_compacted" => replay(file, || {
+            // Mirror fuzz/fuzz_targets/segment_scan_compacted.rs byte-for-byte: prepend a valid v2
+            // COMPACTED header, then treat the input as `[ 12-byte control ][ trailing region ]`,
+            // and drive the three v2 compacted parsers over it. Each must return a typed result,
+            // never panic, on any trailing region.
+            let mut ctrl = [0u8; 12];
+            let split = data.len().min(12);
+            ctrl[..split].copy_from_slice(&data[..split]);
+            let body = &data[split..];
+
+            let base_seq = 1u64;
+            let base_off = 1u64;
+            let header = SegmentHeader {
+                segment_id: 1,
+                base_seq: Seq::new(base_seq),
+                base_offset: Offset::new(base_off),
+                created_unix_ms: 0,
+                flags: SEGMENT_FLAG_COMPACTED,
+            };
+
+            let f = InMemoryFile::new();
+            if f.write_all_at(&header.encode(), 0).is_err() {
+                return;
+            }
+            if f.write_all_at(body, SEGMENT_HEADER_LEN as u64).is_err() {
+                return;
+            }
+            let Ok(reader) = SegmentReader::open(f) else {
+                return;
+            };
+
+            let _ = reader.scan_compacted();
+            let _ = reader.compacted_byte_positions();
+
+            let file_len = SEGMENT_HEADER_LEN as u64 + body.len() as u64;
+            let start_byte = u64::from(u32::from_le_bytes([ctrl[0], ctrl[1], ctrl[2], ctrl[3]]))
+                % (file_len + 1);
+            let read_end = u64::from(u32::from_le_bytes([ctrl[4], ctrl[5], ctrl[6], ctrl[7]]))
+                % (file_len + 1);
+            let max = usize::from(u16::from_le_bytes([ctrl[8], ctrl[9]]) % 64);
+            let mb_raw = u16::from_le_bytes([ctrl[10], ctrl[11]]);
+            let max_bytes = if mb_raw == 0 {
+                None
+            } else {
+                Some(usize::from(mb_raw) % (body.len() + 1))
+            };
+            let _ = reader
+                .scan_compacted_range(start_byte, base_off, base_seq, read_end, max, max_bytes);
+        }),
         "pub_body" => replay(file, || {
             let _ = message::decode_pub(data);
         }),
@@ -118,6 +170,7 @@ const TARGETS: &[&str] = &[
     "cursor_snapshot",
     "seq_snapshot",
     "segment_scan",
+    "segment_scan_compacted",
     "pub_body",
     "ack_body",
     "deliver_body",

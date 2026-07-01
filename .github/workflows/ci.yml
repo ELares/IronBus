@@ -635,7 +635,7 @@ jobs:
           MAX_TOTAL_TIME: "15"
         run: |
           set -euo pipefail
-          for target in record_codec frame_decode cursor_snapshot seq_snapshot segment_scan pub_body ack_body deliver_body dead_letter_body; do
+          for target in record_codec frame_decode cursor_snapshot seq_snapshot segment_scan segment_scan_compacted pub_body ack_body deliver_body dead_letter_body; do
             echo "::group::fuzz-smoke ${target}"
             corpus="corpus-regression/${target}"
             # FIRST replay the committed regression seeds deterministically (-runs=0: execute each
