@@ -239,6 +239,49 @@ mod tests {
     use ironbus_storage::segment::StorageError;
 
     #[test]
+    // #883: the wire `Err` frame now carries the frozen `ErrorCode` token, which the client decodes to
+    // a typed `ironbus_proto::err::ServerErrorCode`. The token spellings are duplicated in the proto
+    // crate's `from_token` map (the client cannot depend on this crate); this test PINS the two together
+    // so a rename here that the proto map misses fails CI. Every code the server places on an `Err`
+    // frame — the `EngineError` rejections plus the `AppendOutcome` signals (`ERR_AT_CAPACITY`,
+    // `ERR_PRODUCER_FENCED`, `ERR_OUT_OF_ORDER_SEQUENCE`) — must round-trip through the proto enum.
+    fn every_wire_code_is_recognized_by_the_proto_decoder() {
+        use ironbus_proto::err::ServerErrorCode;
+        let wire_codes = [
+            ErrorCode::ERR_CUMULATIVE_ACK_NOT_ALLOWED,
+            ErrorCode::ERR_CUMULATIVE_ACK_OUT_OF_RANGE,
+            ErrorCode::ERR_BROADCAST_GROUP_BUSY,
+            ErrorCode::ERR_BROADCAST_GROUP_NOT_NAMED,
+            ErrorCode::ERR_TOO_MANY_GROUPS,
+            ErrorCode::ERR_TOO_MANY_STREAMS,
+            ErrorCode::ERR_INVALID_GROUP_NAME,
+            ErrorCode::ERR_INVALID_STREAM_NAME,
+            ErrorCode::ERR_UNKNOWN_STREAM,
+            ErrorCode::ERR_MIRROR_READ_ONLY,
+            ErrorCode::ERR_INVALID_SUBJECT,
+            ErrorCode::ERR_BIND_REJECTED,
+            ErrorCode::ERR_NO_STREAM_FOR_SUBJECT,
+            ErrorCode::ERR_AMBIGUOUS_SUBJECT,
+            ErrorCode::ERR_GENERATION_EXHAUSTED,
+            ErrorCode::ERR_MISSING_RECORD,
+            ErrorCode::ERR_ZERO_MAX_IN_FLIGHT,
+            ErrorCode::ERR_STORAGE,
+            ErrorCode::ERR_TXN,
+            ErrorCode::ERR_TXN_CHECK_UNAUTHORIZED,
+            ErrorCode::ERR_AT_CAPACITY,
+            ErrorCode::ERR_PRODUCER_FENCED,
+            ErrorCode::ERR_OUT_OF_ORDER_SEQUENCE,
+        ];
+        for code in wire_codes {
+            assert!(
+                ServerErrorCode::from_token(code.as_str()).is_some(),
+                "the proto decoder does not recognize the wire code `{}`",
+                code.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn the_named_codes_have_their_frozen_spelling() {
         // The vectors and external clients pin these exact strings: a rename must fail here.
         assert_eq!(

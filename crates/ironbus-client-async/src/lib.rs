@@ -106,8 +106,9 @@ fn frame_read_size(needed: usize, filled: usize) -> usize {
 #[doc(no_inline)]
 pub use ironbus_client::{
     pack_password_material, AuthCredential, AuthMechanism, ClientConfig, ClientError, DeadLetter,
-    Fetch, Gap, Message, ProduceAck, ProgressOutcome, StreamBatch, StreamConsumerConfig,
-    Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES, DEFAULT_STREAM_FETCH_RECORDS,
+    Fetch, Gap, Message, ProduceAck, ProgressOutcome, ServerError, ServerErrorCode, StreamBatch,
+    StreamConsumerConfig, Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES,
+    DEFAULT_STREAM_FETCH_RECORDS,
 };
 
 /// The proto body/codec types a caller constructs to drive [`AsyncClient`] (e.g. [`PubBody`]),
@@ -143,7 +144,7 @@ fn not_leader_error(body: &[u8]) -> ClientError {
 enum PubReply {
     Acked(u64),
     Duplicate(u64),
-    ServerErr(String),
+    ServerErr(ServerError),
     Pong,
     /// A cluster `NotLeader` redirect (#735): the produce landed on a non-leader replica and was NOT
     /// appended/acked; the leader's CLIENT-address hint (or `None` when unknown).
@@ -167,7 +168,7 @@ fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientErro
             })?;
             Ok(PubReply::Duplicate(ack.offset))
         }
-        FrameType::Err => Ok(PubReply::ServerErr(String::from_utf8_lossy(body).into())),
+        FrameType::Err => Ok(PubReply::ServerErr(ServerError::from_wire(body))),
         FrameType::Pong => Ok(PubReply::Pong),
         // A cluster NotLeader redirect (#735): decode the leader hint (an empty hint -> `None`). The
         // produce was NOT appended/acked here; the caller reconnects/retries to the leader.
@@ -415,9 +416,7 @@ impl AsyncClient {
                 client.streams_enabled = info.streams;
                 Ok(client)
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -526,9 +525,7 @@ impl AsyncClient {
                     duplicate: true,
                 })
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             // A cluster NotLeader redirect: this node is not the leader, so the produce did NOT land
             // here. Surface the typed `NotLeader` error; the connection stays usable.
             (FrameType::NotLeader, body) => Err(not_leader_error(&body)),
@@ -802,9 +799,9 @@ impl AsyncClient {
                     // returning to keep the connection framed for reuse, exactly as FlowEnd and the
                     // old `read_frame` (drain-then-return) did. Materialize the owned message first
                     // since `body` borrows `self.buf`, which the drain then mutates.
-                    let msg = String::from_utf8_lossy(body).into_owned();
+                    let err = ServerError::from_wire(body);
                     self.buf.drain(..consumed);
-                    return Err(ClientError::Server(msg));
+                    return Err(ClientError::Server(err));
                 }
                 other => return Err(ClientError::Unexpected(other)),
             }
@@ -839,9 +836,7 @@ impl AsyncClient {
                     "ack reply was not a one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -893,8 +888,7 @@ impl AsyncClient {
                 },
                 (FrameType::Err, body) => {
                     if first_err.is_none() {
-                        first_err =
-                            Some(ClientError::Server(String::from_utf8_lossy(&body).into()));
+                        first_err = Some(ClientError::Server(ServerError::from_wire(&body)));
                     }
                 }
                 (other, _) => return Err(ClientError::Unexpected(other)),
@@ -939,9 +933,7 @@ impl AsyncClient {
                     "nack reply was not a one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -972,9 +964,7 @@ impl AsyncClient {
                     "term reply was not a one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1010,9 +1000,7 @@ impl AsyncClient {
                     "progress reply was not a known one-byte status",
                 )),
             },
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1025,9 +1013,7 @@ impl AsyncClient {
         self.send(FrameType::Ping, &[]).await?;
         match self.read_frame().await? {
             (FrameType::Pong, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1049,9 +1035,7 @@ impl AsyncClient {
         self.send(FrameType::Sub, &body).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1065,9 +1049,7 @@ impl AsyncClient {
         self.send(FrameType::Unsub, &[]).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1091,9 +1073,7 @@ impl AsyncClient {
         self.send(FrameType::CumulativeAck, &body).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1158,9 +1138,7 @@ impl AsyncClient {
         self.send(FrameType::StreamDeclare, &body).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1191,9 +1169,7 @@ impl AsyncClient {
                     .map_err(|_| ClientError::BadResponse("malformed stream-info response"))?;
                 Ok((resp.exists, resp.head))
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1240,9 +1216,7 @@ impl AsyncClient {
                     .map_err(|_| ClientError::BadResponse("publish-to reply was not an offset"))?;
                 Ok(ack.offset)
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1272,9 +1246,7 @@ impl AsyncClient {
         self.send(FrameType::SubTo, &body).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1387,9 +1359,7 @@ impl AsyncClient {
         self.send(FrameType::StreamCommit, &body).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1481,9 +1451,7 @@ impl AsyncClient {
         self.send(FrameType::TxnPrepare, &body).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1511,9 +1479,7 @@ impl AsyncClient {
                     .map_err(|_| ClientError::BadResponse("txn-commit reply was not an offset"))?;
                 Ok(ack.offset)
             }
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1537,9 +1503,7 @@ impl AsyncClient {
         self.send(FrameType::TxnRollback, &body).await?;
         match self.read_frame().await? {
             (FrameType::Ok, _) => Ok(()),
-            (FrameType::Err, body) => {
-                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
-            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }

@@ -1716,7 +1716,7 @@ impl Session {
             // recoverable rejections: surface the engine's typed reason so the client learns why and
             // the connection stays open.
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -2587,7 +2587,7 @@ impl Session {
             // recoverable rejections: surface the engine's typed reason and keep the connection open. Do
             // NOT also send a FlowEnd (the Err is the terminator), matching the Fetch error path.
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(None)
             }
         }
@@ -2677,7 +2677,7 @@ impl Session {
                 Err(SessionError::EngineFatal(e))
             }
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(None)
             }
         }
@@ -2732,7 +2732,7 @@ impl Session {
             // The wrong-mode reject and the out-of-range reject are client-visible, recoverable
             // rejections: surface the engine's typed reason and keep the connection open.
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -2843,7 +2843,7 @@ impl Session {
                 // `subscribe_in` only ever returns this rejection (name/cap are still validated on
                 // the first FLOW, as before), so SUB stays infallible for the name/cap checks.
                 Err(e) => {
-                    reply_err(out, &e.to_string());
+                    reply_err_coded(out, e.code().as_str(), &e.to_string());
                     return Ok(());
                 }
             }
@@ -2964,7 +2964,7 @@ impl Session {
             // Idempotent: a first declare (`true`) and a re-declare (`false`) both reply a body-less Ok.
             Ok(_) => reply(out, FrameType::Ok, &[]),
             // A malformed/over-long NAMED name fails closed with the engine's typed reason.
-            Err(e) => reply_err(out, &e.to_string()),
+            Err(e) => reply_err_coded(out, e.code().as_str(), &e.to_string()),
         }
         Ok(())
     }
@@ -3182,7 +3182,7 @@ impl Session {
             // A malformed name or a non-fatal storage error (e.g. a byte-cap shed) is a typed,
             // connection-preserving reject, never a panic.
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -3270,7 +3270,7 @@ impl Session {
                 Err(SessionError::EngineFatal(e))
             }
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -3322,7 +3322,7 @@ impl Session {
                 Err(SessionError::EngineFatal(e))
             }
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -3367,7 +3367,7 @@ impl Session {
                 Err(SessionError::EngineFatal(e))
             }
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -3472,7 +3472,7 @@ impl Session {
                 // A conflicting flip (a Commit after the terminal default already rolled it back, or a
                 // racing producer-driven resolve) is refused by the part-1 path — surfaced as an Err, not
                 // a flip. The producer's listener treats this as "already settled", which is correct.
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -3595,7 +3595,7 @@ impl Session {
             Ok(_generation) => reply(out, FrameType::Ok, &[]),
             // A malformed pattern/name or a fork-bound rejection fails closed with the engine's typed
             // reason (and stable code); the previous binding table stays installed on a rejection.
-            Err(e) => reply_err(out, &e.to_string()),
+            Err(e) => reply_err_coded(out, e.code().as_str(), &e.to_string()),
         }
         Ok(())
     }
@@ -3746,7 +3746,7 @@ impl Session {
             // subject, or a non-fatal storage shed is a typed, connection-preserving reject — never a
             // panic and (critically) NEVER a silent drop.
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
             }
         }
@@ -3814,7 +3814,7 @@ impl Session {
         let stream = match resolved {
             Ok(id) => id,
             Err(e) => {
-                reply_err(out, &e.to_string());
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
                 return Ok(());
             }
         };
@@ -4072,6 +4072,19 @@ fn reply(out: &mut Vec<u8>, frame_type: FrameType, body: &[u8]) {
 
 fn reply_err(out: &mut Vec<u8>, message: &str) {
     reply(out, FrameType::Err, message.as_bytes());
+}
+
+/// Writes an `Err` frame that carries the STABLE machine-readable code `token` (#883) in front of the
+/// human `message`, so a client branches on the code rather than substring-matching prose the broker
+/// is free to reword. `token` is the NORMATIVE [`ErrorCode`](crate::codes::ErrorCode) spelling
+/// (e.g. `error.code().as_str()`); the human message is preserved verbatim for display. An UNCODED
+/// [`reply_err`] stays byte-identical to the pre-#883 body (the coded shape is marked by a leading
+/// sentinel a UTF-8 message never begins with), so the uniform auth violation and the malformed-body
+/// literals are untouched.
+fn reply_err_coded(out: &mut Vec<u8>, code_token: &str, message: &str) {
+    let mut body = Vec::with_capacity(2 + code_token.len() + message.len());
+    ironbus_proto::err::encode_err_body(Some(code_token), message, &mut body);
+    reply(out, FrameType::Err, &body);
 }
 
 /// Writes the single UNIFORM "Authorization Violation" `Err` frame (#631, V2-M7,
@@ -4437,7 +4450,11 @@ fn write_pub_reply(
         // connection stays open so the producer can re-handshake with a fresh epoch.
         ProduceOutcome::Fenced => {
             if !fire_and_forget {
-                reply_err(out, "fenced: stale producer epoch");
+                reply_err_coded(
+                    out,
+                    crate::codes::ErrorCode::ERR_PRODUCER_FENCED.as_str(),
+                    "fenced: stale producer epoch",
+                );
             }
             Ok(())
         }
@@ -4447,7 +4464,11 @@ fn write_pub_reply(
         // message; the connection stays open so the producer can resync from the expected sequence.
         ProduceOutcome::OutOfOrder => {
             if !fire_and_forget {
-                reply_err(out, "out-of-order producer sequence");
+                reply_err_coded(
+                    out,
+                    crate::codes::ErrorCode::ERR_OUT_OF_ORDER_SEQUENCE.as_str(),
+                    "out-of-order producer sequence",
+                );
             }
             Ok(())
         }
@@ -4467,7 +4488,11 @@ fn write_pub_reply(
         // retention frees space).
         ProduceOutcome::AtCapacity => {
             if !fire_and_forget {
-                reply_err(out, "at capacity");
+                reply_err_coded(
+                    out,
+                    crate::codes::ErrorCode::ERR_AT_CAPACITY.as_str(),
+                    "at capacity",
+                );
             }
             Ok(())
         }
@@ -8120,7 +8145,15 @@ mod tests {
         // generic "produce failed". The session did NOT end (pub_reply asserts process is Ok).
         let (ty, body) = pub_reply(&mut s, &e, payload);
         assert_eq!(ty, FrameType::Err);
-        assert_eq!(body, b"at capacity");
+        // #883: the shed now carries the STABLE `ERR_AT_CAPACITY` code in front of the human message,
+        // so a client branches on the code instead of substring-matching "at capacity". The message is
+        // preserved verbatim.
+        let decoded = ironbus_proto::err::decode_err_body(&body);
+        assert_eq!(
+            decoded.code,
+            Some(ironbus_proto::err::ServerErrorCode::AtCapacity)
+        );
+        assert_eq!(decoded.message, "at capacity");
         assert_ne!(
             body, b"produce failed",
             "a shed must be distinguishable from a transient failure"
@@ -8134,7 +8167,15 @@ mod tests {
         assert_eq!(one_response(&out).0, FrameType::Pong);
         let (ty, body) = pub_reply(&mut s, &e, payload);
         assert_eq!(ty, FrameType::Err);
-        assert_eq!(body, b"at capacity");
+        // #883: the shed now carries the STABLE `ERR_AT_CAPACITY` code in front of the human message,
+        // so a client branches on the code instead of substring-matching "at capacity". The message is
+        // preserved verbatim.
+        let decoded = ironbus_proto::err::decode_err_body(&body);
+        assert_eq!(
+            decoded.code,
+            Some(ironbus_proto::err::ServerErrorCode::AtCapacity)
+        );
+        assert_eq!(decoded.message, "at capacity");
         // The shed counter reflects both rejections; the one success was counted once.
         assert_eq!(e.engine_mut().counters().produce_rejected, 2);
         assert_eq!(e.engine_mut().counters().produced, 1);
