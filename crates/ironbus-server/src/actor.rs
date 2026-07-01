@@ -1538,7 +1538,11 @@ where
         if gather_micros > 0 {
             gather_commands(&mut commands, rx, gather_micros);
         }
-        for cmd in commands {
+        // An explicit iterator (not a `for`) so the `Shutdown` arm can hand the STILL-UNPROCESSED tail
+        // of this batch to the drain, replying a closing outcome to every produce queued after the
+        // `Shutdown` instead of abandoning it reply-less (#802).
+        let mut commands = commands.into_iter();
+        while let Some(cmd) = commands.next() {
             match cmd {
                 // An at-least-once (Level-1, or Level-2 falling back to Level-1) produce: do the
                 // admission + append and PARK its reply behind the covering fsync (I2). The reply is
@@ -1594,6 +1598,13 @@ where
                     flush_pending(&mut engine, &mut pending);
                     let result = engine.checkpoint_all_groups();
                     let _ = reply.send(result);
+                    // #802: with concurrent senders on the one shared channel the reachable order
+                    // `[Produce, Shutdown, Produce]` puts a produce AFTER the `Shutdown` in this drained
+                    // batch (and more may still be buffered). Abandoning it drops the reply, and because
+                    // a produce submission RETAINS a co-located `tx`, its `wait()`/`recv()` never sees a
+                    // disconnect and wedges forever. Reply a closing outcome to every such produce (the
+                    // unprocessed tail plus the channel remainder) so no client is left waiting.
+                    drain_shutdown_replies(commands, rx);
                     return engine;
                 }
             }
@@ -1625,6 +1636,43 @@ where
         // store just above it, so a `/readyz` reader that sees the cleared wedge (Acquire) also sees the
         // frozen flag — never a transient stale-healthy 200 on a weakly-ordered arch. Do not reorder.
         watchdog.mark_idle();
+    }
+}
+
+/// Replies a CLOSING outcome to every produce that was queued but not processed when the actor exits on
+/// a `Command::Shutdown` (#802): the still-unprocessed `tail` of the drained batch AND everything still
+/// buffered in the channel. Without this, a produce that landed AFTER the `Shutdown` (reachable under
+/// concurrent senders on the one shared channel) is dropped reply-less; and because a produce submission
+/// keeps a co-located `tx` alive alongside its `rx`, that `rx.recv()` never observes a disconnect and the
+/// waiting producer wedges FOREVER (the lost-reply + deadlock this closes).
+///
+/// The closing reply is [`ProduceOutcome::AtCapacity`]: a non-fatal, already wire-mapped "rejected, retry"
+/// outcome. It is an EXPLICIT rejection, never a false ack — the record was NOT durably committed (the
+/// actor is exiting after its final checkpoint), so the producer learns the produce did not land rather
+/// than silently believing it did. No-reply produces (`ProduceNoReply`/`ProduceNoReplyBatch`) drop
+/// silently by their fire-and-forget contract; a `Run` job or a second `Shutdown` drops its reply channel,
+/// which its caller already reads as the typed [`ActorGone`] (a clean error, never a hang).
+fn drain_shutdown_replies<F, C>(
+    tail: impl Iterator<Item = Command<F, C>>,
+    rx: &Receiver<Command<F, C>>,
+) where
+    F: Filesystem,
+    C: Clock,
+{
+    let reply_closing = |cmd: Command<F, C>| {
+        if let Command::Produce { reply, .. } = cmd {
+            let _ = reply.send(ProduceOutcome::AtCapacity);
+        }
+    };
+    // The unprocessed tail of THIS drained batch first (it holds the produces that raced ahead of a
+    // still-buffered remainder), then the channel remainder. Draining the channel once is enough: once
+    // this function returns, `run_actor` returns and its `Receiver` drops, so any LATER send fails at the
+    // sender with `ActorGone` rather than buffering a reply-less command.
+    for cmd in tail {
+        reply_closing(cmd);
+    }
+    while let Ok(cmd) = rx.try_recv() {
+        reply_closing(cmd);
     }
 }
 
@@ -2765,6 +2813,55 @@ mod tests {
             1,
             "the record stayed durable"
         );
+    }
+
+    #[test]
+    fn a_produce_queued_after_shutdown_gets_a_closing_reply_never_wedges() {
+        // #802: with concurrent senders on the one shared actor channel, the order
+        // `[Produce, Shutdown, Produce]` is reachable, so a produce can land AFTER the `Shutdown` in the
+        // SAME drained batch. The `Shutdown` arm used to `return` the instant it was reached, abandoning
+        // that trailing produce with NO reply; because a produce submission keeps a co-located `tx`
+        // alive, its receiver never sees a disconnect and the waiting producer wedges FOREVER. Assert the
+        // trailing produce instead gets a closing reply (an explicit rejection, never a false ack).
+        let (handle, actor, control) = rig();
+        // Park the actor mid-fsync on a PRIMER so the following commands stage deterministically behind
+        // it (they buffer in the channel while the actor is stalled, so ONE later drain sees them all).
+        control.close_sync_gate();
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        // Stage, IN ORDER, all buffered while the actor is parked: a produce, then a raw non-blocking
+        // `Shutdown` (the blocking `EngineHandle::shutdown` would deadlock here — it awaits its own
+        // reply), then a TRAILING produce that lands after the `Shutdown`.
+        let before_shutdown = handle.produce_async(append(b"before-shutdown")).unwrap();
+        let (sd_tx, sd_rx) = sync_channel::<Result<(), EngineError>>(1);
+        handle.tx.send(Command::Shutdown(sd_tx)).unwrap();
+        let after_shutdown = handle.produce_async(append(b"after-shutdown")).unwrap();
+        // Release the primer's fsync: the actor acks the primer, then drains
+        // `[before-shutdown, Shutdown, after-shutdown]` as one batch.
+        control.open_sync_gate();
+        // The primer and the pre-shutdown produce are durable (both flushed at/before the shutdown drain).
+        assert!(
+            matches!(primer.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0),
+            "the primer appended at offset 0"
+        );
+        assert!(
+            matches!(before_shutdown.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 1),
+            "the pre-shutdown produce is flushed by the shutdown drain at offset 1"
+        );
+        // The shutdown itself completes its flush + checkpoint.
+        sd_rx.recv().unwrap().unwrap();
+        // THE FIX: the produce queued AFTER the shutdown is NOT abandoned — it gets an explicit closing
+        // reply within a timeout instead of hanging forever. Without the fix `recv` blocks (the
+        // co-located `tx` keeps the channel open), so the timeout fires and the test fails loudly rather
+        // than wedging the suite.
+        match after_shutdown
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the shutdown-queued produce must get a reply, not wedge forever (#802)")
+        {
+            ProduceOutcome::AtCapacity => {}
+            other => panic!("expected a closing AtCapacity reply, got {other:?}"),
+        }
+        actor.join().unwrap();
     }
 
     #[test]
