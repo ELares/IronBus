@@ -1914,6 +1914,21 @@ impl Client {
         self.read_fetch_response(limit)
     }
 
+    /// Derives the AGGREGATE materialized-payload-bytes ceiling for one fetch window (#938). The default
+    /// [`MAX_FETCH_DECOMPRESSED_BYTES`] (256 MiB) is a generous FLOOR, not an absolute cap: when this
+    /// consumer negotiated a LARGER per-consumer byte budget (`negotiated_credit_bytes`, itself
+    /// `min(client-request, server-cap)`), the server may legitimately stream a window that big, so
+    /// bounding it at the floor would falsely trip [`ClientError::BadResponse`]. The ceiling is thus
+    /// `max(negotiated_credit_bytes, MAX_FETCH_DECOMPRESSED_BYTES)`: a consumer that negotiated a bigger
+    /// window is honored, while an un-negotiated (`None`) or hostile fetch stays fail-closed at 256 MiB.
+    fn fetch_decompressed_cap(&self) -> usize {
+        self.negotiated_credit_bytes
+            .and_then(|b| usize::try_from(b).ok())
+            .map_or(MAX_FETCH_DECOMPRESSED_BYTES, |b| {
+                b.max(MAX_FETCH_DECOMPRESSED_BYTES)
+            })
+    }
+
     /// Reads and decodes a batch delivery response (the shared tail of [`Client::fetch`] and
     /// [`Client::fetch_batch`]): a run of `Deliver` frames (transparently decompressed, #430), with any
     /// interleaved `DeadLetter` / `Truncated` / `GapMarker` advisories, terminated by exactly one
@@ -1942,9 +1957,11 @@ impl Client {
         // server-side, so it counts here too, as does every frame drained after a decompression
         // failure (a buggy or hostile server cannot stream any of them without bound).
         let mut frames = 0usize;
-        // #879: the running total of materialized payload bytes across this fetch window, capped at
-        // [`MAX_FETCH_DECOMPRESSED_BYTES`] so a credit-bounded fetch of a tiny wire response cannot
-        // expand to credit x the per-record 8 MiB cap of resident RAM.
+        // #879/#938: the running total of materialized payload bytes across this fetch window, capped at
+        // the negotiated byte budget (floored at [`MAX_FETCH_DECOMPRESSED_BYTES`]) so a credit-bounded
+        // fetch of a tiny wire response cannot expand to credit x the per-record 8 MiB cap of resident
+        // RAM, while a consumer that negotiated a larger byte window is not falsely rejected.
+        let max_aggregate = self.fetch_decompressed_cap();
         let mut decompressed_bytes = 0usize;
         loop {
             // Buffer one complete frame, then decode its body by BORROWING it out of `self.buf`
@@ -1985,7 +2002,7 @@ impl Client {
                         &mut messages,
                         &mut poison,
                         &mut decompressed_bytes,
-                        MAX_FETCH_DECOMPRESSED_BYTES,
+                        max_aggregate,
                     );
                 }
                 // A raw-framed batch (#541): ONE frame carrying a contiguous run of records as their
@@ -2042,7 +2059,7 @@ impl Client {
                             &mut messages,
                             &mut poison,
                             &mut decompressed_bytes,
-                            MAX_FETCH_DECOMPRESSED_BYTES,
+                            max_aggregate,
                         );
                         offset = offset.saturating_add(1);
                         decoded = decoded.saturating_add(1);
@@ -5567,6 +5584,70 @@ mod tests {
             ClientError::BadResponse(_) => {}
             other => panic!("expected BadResponse, got {other:?}"),
         }
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    /// An `Info` body advertising a per-consumer negotiated BYTE budget of `negotiated` (#938).
+    fn info_with_credit_bytes(negotiated: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_info(
+            &ironbus_proto::message::InfoBody {
+                credit: None,
+                credit_bytes: Some(ironbus_proto::message::CreditAdvert {
+                    negotiated,
+                    cap: negotiated,
+                }),
+                gap_marker: false,
+                default_ack_level: None,
+                streaming: false,
+                default_tier: None,
+                deliver_batch: false,
+                streams: false,
+            },
+            &mut body,
+        );
+        frame(FrameType::Info, &body)
+    }
+
+    #[test]
+    fn the_fetch_decompressed_cap_is_derived_from_the_negotiated_byte_budget() {
+        // #938: the AGGREGATE materialized-payload ceiling for a fetch window is the LARGER of the
+        // negotiated per-consumer byte budget and the 256 MiB floor, so a consumer that negotiated a
+        // window bigger than 256 MiB is not falsely tripped with BadResponse, while an un-negotiated or
+        // smaller budget stays fail-closed at the 256 MiB default.
+        let floor = MAX_FETCH_DECOMPRESSED_BYTES;
+
+        // A budget ABOVE the floor raises the ceiling to the negotiated value.
+        let big = u64::try_from(floor).unwrap() + 4096;
+        let (addr, handle) = raw_server(info_with_credit_bytes(big));
+        let c = Client::connect(addr).unwrap();
+        assert_eq!(c.negotiated_credit_bytes(), Some(big));
+        assert_eq!(
+            c.fetch_decompressed_cap(),
+            usize::try_from(big).unwrap(),
+            "a negotiated budget above the floor raises the aggregate ceiling"
+        );
+        drop(c);
+        handle.join().unwrap();
+
+        // A budget BELOW the floor keeps the 256 MiB default (fail-closed).
+        let (addr, handle) = raw_server(info_with_credit_bytes(4096));
+        let c = Client::connect(addr).unwrap();
+        assert_eq!(c.negotiated_credit_bytes(), Some(4096));
+        assert_eq!(
+            c.fetch_decompressed_cap(),
+            floor,
+            "a negotiated budget below the floor keeps the 256 MiB default"
+        );
+        drop(c);
+        handle.join().unwrap();
+
+        // No advertisement (an old/empty Info) -> the 256 MiB default.
+        let (addr, handle) = raw_server(frame(FrameType::Info, b""));
+        let c = Client::connect(addr).unwrap();
+        assert_eq!(c.negotiated_credit_bytes(), None);
+        assert_eq!(c.fetch_decompressed_cap(), floor);
         drop(c);
         handle.join().unwrap();
     }
