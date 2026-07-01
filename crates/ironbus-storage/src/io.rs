@@ -31,6 +31,14 @@ pub trait RandomAccessFile: Send + Sync {
     /// if the file ends first. This is the primitive sealed-segment readers use to
     /// read fixed-size headers and footers.
     ///
+    /// # Contract
+    /// On `Ok(())` EVERY byte of `buf` has been written. An implementation must only
+    /// WRITE `buf` (never read it) and must not return `Ok` with any byte left unwritten:
+    /// [`SegmentReader::read_into_fresh`](crate::segment) reads straight into uninitialized
+    /// reserved capacity and relies on both halves of this contract for soundness. The
+    /// default implementation upholds it (it loops issuing positioned reads until the buffer
+    /// is full or errors); any override must too.
+    ///
     /// # Errors
     /// Propagates the underlying IO error, or `UnexpectedEof` on a short file.
     fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {

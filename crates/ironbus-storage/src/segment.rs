@@ -1024,6 +1024,56 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         &self.header
     }
 
+    /// Reads `len` bytes starting at file byte position `start` into a FRESH shared [`Bytes`]
+    /// buffer WITHOUT pre-zeroing it (#813 / #815).
+    ///
+    /// The single-pass consume read primitives ([`scan_range`](SegmentReader::scan_range),
+    /// [`raw_byte_range`](SegmentReader::raw_byte_range), their compacted siblings, and the
+    /// recovery body scans) allocate a `len`-byte buffer and then immediately fill EVERY byte with
+    /// one [`RandomAccessFile::read_exact_at`]. The former code first zero-filled that buffer
+    /// (`BytesMut::zeroed(len)`, a full `len`-byte `memset`), but `read_exact_at` overwrites all
+    /// `len` bytes before the buffer is ever read (or errors without exposing it), so the zero-fill
+    /// was 100% wasted per-fetch work that scaled with the read window (up to an ~8 MiB fetch). This
+    /// reads straight into uninitialized reserved capacity instead, dropping that `memset` while
+    /// producing a byte-for-byte identical result. `len == 0` yields an empty `Bytes` (matching both
+    /// the old `BytesMut::zeroed(0).freeze()` and a no-op `read_exact_at` on an empty slice), so a
+    /// caller need not special-case an empty region.
+    ///
+    /// # Errors
+    /// Propagates the IO error from the read (including `UnexpectedEof` on a short region); on any
+    /// error the buffer is dropped with length 0, so no uninitialized byte is ever observable.
+    fn read_into_fresh(&self, len: usize, start: u64) -> Result<Bytes, StorageError> {
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        let mut buf = BytesMut::with_capacity(len);
+        // View the first `len` bytes of the reserved-but-uninitialized spare capacity as the
+        // `&mut [u8]` write target for the positioned read.
+        //
+        // SAFETY: `with_capacity(len)` reserved at least `len` contiguous bytes, so
+        // `spare_capacity_mut()` yields `len`-or-more allocated, writable `MaybeUninit<u8>`s and the
+        // `len`-byte slice built from its pointer is in bounds (`len <= spare.len()`). The slice is
+        // only ever WRITTEN through here: `read_exact_at` writes into `buf` and never reads its
+        // input, so handing it uninitialized `u8` memory exposes no uninitialized byte to any read.
+        #[allow(unsafe_code)]
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(buf.spare_capacity_mut().as_mut_ptr().cast::<u8>(), len)
+        };
+        // Fills all `len` bytes from `start`, or returns `Err` (leaving `buf` at length 0, dropped
+        // before any byte is exposed).
+        self.file.read_exact_at(dst, start)?;
+        // SAFETY: `read_exact_at` returned `Ok`, and its contract is that it wrote EVERY one of the
+        // `len` bytes just handed to it (it loops issuing reads until the buffer is full, or errors
+        // — it cannot return `Ok` with the buffer partly unwritten). The first `len` bytes are
+        // therefore fully initialized, so advancing the logical length to `len` exposes only
+        // initialized memory.
+        #[allow(unsafe_code)]
+        unsafe {
+            buf.set_len(len);
+        }
+        Ok(buf.freeze())
+    }
+
     /// Scans the segment: reads the record region, decodes records in order, and
     /// stops at the first torn or corrupt frame, returning the records before that
     /// point as the durable valid prefix.
@@ -1110,11 +1160,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         // walk materializes takes refcounted slices of `body` instead of three per-record `Vec`
         // copies, so the whole scan is one allocation + refcount bumps. The frozen buffer outlives the
         // returned records (each holds a ref), so it is freed only when the last record drops.
-        let mut buf = BytesMut::zeroed(body_len);
-        if body_len > 0 {
-            self.file.read_exact_at(&mut buf, start)?;
-        }
-        let body = buf.freeze();
+        let body = self.read_into_fresh(body_len, start)?;
         let mut records = Vec::new();
         let mut cursor = 0usize;
         let mut clean = true;
@@ -1444,9 +1490,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         // ONE read into a shared `Bytes` buffer; each materialized record refcount-slices it (#480),
         // so a seek-and-read-forward is one allocation + refcounted slices on the consume hot path,
         // not O(records) allocations + O(bytes) copied. The buffer outlives the returned records.
-        let mut buf = BytesMut::zeroed(len);
-        self.file.read_exact_at(&mut buf, start_byte)?;
-        let body = buf.freeze();
+        // Read straight into fresh (unzeroed) capacity: the read fully overwrites it (#813 / #815).
+        let body = self.read_into_fresh(len, start_byte)?;
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
         let mut byte_total = 0usize;
@@ -1534,9 +1579,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         // ONE read into a shared `Bytes` buffer — the same single allocation `scan_range` makes. The
         // returned run slices THIS buffer (a refcount bump), so a seek-and-read-forward of N frames is
         // one syscall + one allocation + zero per-record allocations and zero body decodes.
-        let mut buf = BytesMut::zeroed(len);
-        self.file.read_exact_at(&mut buf, start_byte)?;
-        let body = buf.freeze();
+        // Read straight into fresh (unzeroed) capacity: the read fully overwrites it (#813 / #815).
+        let body = self.read_into_fresh(len, start_byte)?;
         let mut cursor = 0usize;
         let mut byte_total = 0usize;
         let mut count = 0usize;
@@ -1636,12 +1680,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             .map_err(|_| StorageError::SegmentFull)?;
         // The survivor region is read into ONE shared `Bytes` buffer and each survivor refcount-slices
         // it (#480), the same one-alloc + refcounted-slices win as the dense path. The buffer outlives
-        // the returned survivors.
-        let mut bbuf = BytesMut::zeroed(body_len);
-        if body_len > 0 {
-            self.file.read_exact_at(&mut bbuf, header_end)?;
-        }
-        let body = bbuf.freeze();
+        // the returned survivors. Read straight into fresh (unzeroed) capacity (#813 / #815).
+        let body = self.read_into_fresh(body_len, header_end)?;
         let mut records: Vec<OwnedRecord> = Vec::new();
         let mut cursor = 0usize;
         let mut max_timestamp_ms = 0u64;
@@ -1849,9 +1889,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             .map_err(|_| StorageError::SegmentFull)?;
         // ONE read into a shared `Bytes` buffer; each survivor refcount-slices it (#480), the same
         // one-alloc + refcounted-slices win as the dense `scan_from`. The buffer outlives the records.
-        let mut buf = BytesMut::zeroed(len);
-        self.file.read_exact_at(&mut buf, start_byte)?;
-        let body = buf.freeze();
+        // Read straight into fresh (unzeroed) capacity: the read fully overwrites it (#813 / #815).
+        let body = self.read_into_fresh(len, start_byte)?;
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
         let mut byte_total = 0usize;
@@ -2180,6 +2219,49 @@ mod tests {
         assert_eq!(scan.records.len(), 1);
         assert_eq!(scan.records[0].payload.as_ref(), b"good1");
         assert_eq!(scan.valid_end, after_first);
+    }
+
+    #[test]
+    fn read_primitives_return_the_exact_on_disk_region() {
+        // #813 / #815: the single-pass consume read primitives now read straight into UNZEROED
+        // reserved capacity instead of `BytesMut::zeroed` + overwrite. The bytes they return must be
+        // EXACTLY the on-disk region — a length/capacity regression or a leaked uninitialized byte
+        // would diverge from the raw file slice, and the decoded payloads would not round-trip.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"alpha")).unwrap();
+        w.append(&rec(1, b"bravo")).unwrap();
+        w.append(&rec(2, b"charlie")).unwrap();
+        w.sync().unwrap();
+
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let scan = reader.scan().unwrap();
+        let start = SEGMENT_HEADER_LEN as u64;
+        let valid_end = scan.valid_end;
+
+        // `raw_byte_range` (zero-copy path) hands back the record region verbatim: it must equal the
+        // exact on-disk bytes `[start, valid_end)`.
+        let run = reader
+            .raw_byte_range(start, Offset::new(0), valid_end, usize::MAX, None)
+            .unwrap();
+        assert_eq!(run.record_count, 3);
+        let snap = file.snapshot();
+        let lo = usize::try_from(start).unwrap();
+        let hi = usize::try_from(valid_end).unwrap();
+        assert_eq!(
+            run.bytes.as_ref(),
+            &snap[lo..hi],
+            "raw bytes are the exact on-disk region, fully populated by the read"
+        );
+
+        // `scan_range` decodes the SAME region into records whose payloads round-trip unchanged.
+        let recs = reader
+            .scan_range(start, Offset::new(0), valid_end, usize::MAX, None)
+            .unwrap();
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].payload.as_ref(), b"alpha");
+        assert_eq!(recs[1].payload.as_ref(), b"bravo");
+        assert_eq!(recs[2].payload.as_ref(), b"charlie");
     }
 
     // ---- #483 seek-index primitives: record_byte_positions + scan_from ----
