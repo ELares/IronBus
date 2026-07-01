@@ -2627,6 +2627,75 @@ mod tests {
         }
     }
 
+    // ---- KIP-101 backward-epoch fail-closed at the promotion boundary (#839) ----------------------
+
+    #[test]
+    fn promote_aborts_fail_closed_when_the_failover_epoch_did_not_bump_backward_epoch() {
+        // The SECOND fail-closed branch of `promote_follower_to_leader` (the epoch-cache `assign` at
+        // dataplane.rs:~1297): a failover proposal that carries a NON-INCREASING leader epoch must be
+        // rejected here — this is the CI4/KIP-101 "a stale leader cannot un-fence itself" enforcement at
+        // promotion, the last line against creating a leader at an already-superseded epoch (split-brain).
+        // The HW-bar branch has its own test (`promote_aborts_...behind_the_committed_hw_bar`); THIS pins
+        // the backward-epoch branch: the typed error mapping AND the resulting role disposition.
+        const P: u64 = 0;
+
+        let mut follower = DataPlaneController::<InMemoryFs, ManualClock>::new(2);
+        // An EMPTY follower log: its durable frontier is offset 0, so the committed-HW bar (0 below) is
+        // satisfied and the self-verify does NOT short-circuit — we reach the epoch `assign` branch.
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+        let frontier = follower
+            .with_follower_log(P, |log| log.next_offset().get())
+            .expect("follower log");
+        assert_eq!(frontier, 0, "an empty follower starts at offset 0");
+
+        // Seed the follower's epoch cache at a HIGH epoch (7). A subsequent promotion at epoch 6 is a
+        // backward step the cache must reject.
+        follower
+            .assign_follower_epoch(P, LeaderEpoch::new(7), Offset::new(0))
+            .expect("seed epoch 7 at offset 0");
+
+        // Promote at epoch 6 (< the cache's current 7). Bar 0 clears the HW self-verify (0 >= 0), so the
+        // abort MUST come from the epoch-cache `assign`, not the HW bar.
+        let err = follower
+            .promote_follower_to_leader(P, LeaderEpoch::new(6), &[2], quorum3(), 0)
+            .expect_err("a promotion whose failover epoch did not bump must fail closed");
+        match err {
+            DataPlaneError::Replication(ReplicationError::EpochCache(
+                ironbus_core::epoch_cache::EpochCacheError::EpochWentBackward {
+                    attempted,
+                    current,
+                },
+            )) => {
+                assert_eq!(
+                    attempted,
+                    LeaderEpoch::new(6),
+                    "the offending (attempted) epoch is surfaced"
+                );
+                assert_eq!(
+                    current,
+                    LeaderEpoch::new(7),
+                    "the cache's current (higher) epoch is surfaced"
+                );
+            }
+            other => panic!("expected Replication(EpochCache(EpochWentBackward)), got {other:?}"),
+        }
+
+        // CRITICAL: no false leader at a stale epoch was created — the split-brain guard held.
+        assert!(
+            !follower.is_leader(P),
+            "the aborted promotion did NOT create a leader at a superseded epoch"
+        );
+        // PIN the current role disposition: unlike the HW-bar branch (which RESTORES the follower), the
+        // backward-epoch branch consumed the role and did NOT restore it, so the partition is left
+        // ORPHANED here — neither leader nor follower. This asymmetry is undocumented; pinning it makes any
+        // future change (e.g. restoring the follower for symmetry) a DELIBERATE, test-visible decision
+        // rather than a silent drift. Either way the fail-closed guarantee (no stale-epoch leader) holds.
+        assert!(
+            !follower.is_follower(P),
+            "the backward-epoch abort currently leaves the partition orphaned (no follower restored)"
+        );
+    }
+
     // ---- THE produce-ack SEAM (#704): a REAL wire PubAck threaded through the QuorumAckGate ---------
 
     use ironbus_proto::frame::encode_frame;
