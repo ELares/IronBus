@@ -10,7 +10,7 @@
 use crate::io::RandomAccessFile;
 use crate::loss::{CapViolation, ReasonCode};
 use bytes::{Bytes, BytesMut};
-use ironbus_core::codec::{self, DecodeError, RecordView};
+use ironbus_core::codec::{self, BodyChecksums, DecodeError, RecordView};
 use ironbus_core::format::{
     COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_TRAILER_LEN, RECORD_XXH3_LEN,
     SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, XXH3_PAYLOAD_THRESHOLD,
@@ -689,6 +689,37 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     /// overflow, [`StorageError::Record`] if the record is too large to frame, or an
     /// IO error from the write.
     pub fn append(&mut self, record: &RecordView<'_>) -> Result<Offset, StorageError> {
+        self.append_encoded(record, None)
+    }
+
+    /// Appends one record whose body checksums were PRE-COMPUTED off the single-writer actor on the
+    /// producing connection thread (issue #830). Identical to [`SegmentWriter::append`] except the
+    /// body CRC32C (and, for a large body, the xxh3-64) come from `checksums` instead of being
+    /// computed here on the serialized append path. The caller GUARANTEES `checksums` describes this
+    /// `record`'s exact stored body (`key ++ headers ++ payload`), so the on-disk frame is
+    /// byte-identical to what [`SegmentWriter::append`] would produce; a mismatch is not a safety
+    /// hazard (the checksum is re-validated on read) but would durably store a self-corrupt record,
+    /// which a debug build asserts against in the codec.
+    ///
+    /// # Errors
+    /// Same as [`SegmentWriter::append`].
+    pub fn append_precomputed(
+        &mut self,
+        record: &RecordView<'_>,
+        checksums: BodyChecksums,
+    ) -> Result<Offset, StorageError> {
+        self.append_encoded(record, Some(checksums))
+    }
+
+    /// The shared body behind [`SegmentWriter::append`] and [`SegmentWriter::append_precomputed`]:
+    /// frames `record` into the pending buffer, trusting `precomputed` body checksums when `Some`
+    /// (#830) or computing them in the codec when `None`. The on-disk bytes and all writer bookkeeping
+    /// are identical either way.
+    fn append_encoded(
+        &mut self,
+        record: &RecordView<'_>,
+        precomputed: Option<BodyChecksums>,
+    ) -> Result<Offset, StorageError> {
         if self.record_count == u32::MAX {
             return Err(StorageError::SegmentFull);
         }
@@ -704,7 +735,11 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         // intermediate copy. The bytes reach the file at the next flush point; on encode failure
         // the buffer is truncated back so a rejected record leaves no partial frame behind.
         let before = self.pending.len();
-        if codec::encode(record, &mut self.pending).is_err() {
+        let encoded = match precomputed {
+            Some(checksums) => codec::encode_precomputed(record, checksums, &mut self.pending),
+            None => codec::encode(record, &mut self.pending),
+        };
+        if encoded.is_err() {
             self.pending.truncate(before);
             return Err(StorageError::SegmentFull);
         }

@@ -19,7 +19,7 @@ use crate::segment::{
 };
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
-use ironbus_core::codec::RecordView;
+use ironbus_core::codec::{BodyChecksums, RecordView};
 use ironbus_core::format::{
     RECORD_HEADER_LEN, RECORD_TRAILER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
 };
@@ -249,8 +249,15 @@ pub struct Append<'a> {
 /// the per-record write into the segment writer differs, so the on-disk bytes are identical either way.
 #[derive(Clone, Copy)]
 enum AppendSource<'a> {
-    /// Re-frame + re-checksum the record through [`codec::encode`] (via [`SegmentWriter::append`]).
-    Encode(&'a Append<'a>),
+    /// Re-frame the record through the codec (via [`SegmentWriter::append`] /
+    /// [`SegmentWriter::append_precomputed`]). `precomputed` carries the body checksums computed OFF
+    /// the single-writer actor on the producing connection thread (issue #830) when present, so the
+    /// actor skips the serialized body CRC32C/xxh3 pass; `None` computes them on the append path
+    /// exactly as before. Either way the on-disk frame is byte-identical.
+    Encode {
+        record: &'a Append<'a>,
+        precomputed: Option<BodyChecksums>,
+    },
     /// Copy an already-sealed, already-validated frame verbatim (via
     /// [`SegmentWriter::append_verbatim`]), skipping the redundant re-encode + re-checksum. `frame`
     /// is one complete on-disk record frame the caller decoded in place; `view` is that decode's
@@ -2559,7 +2566,38 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// space is exhausted or the record is too large to frame, [`StorageError::WriterFrozen`] if a
     /// prior fatal error froze the writer, or an IO error from the write.
     pub fn append(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
-        self.append_inner(AppendSource::Encode(record), true)
+        self.append_inner(
+            AppendSource::Encode {
+                record,
+                precomputed: None,
+            },
+            true,
+        )
+    }
+
+    /// Appends one record whose body checksums were PRE-COMPUTED off the single-writer append actor,
+    /// on the producing connection thread that already held the body bytes (issue #830). Identical to
+    /// [`Log::append`] in every observable effect — the same cap/budget/roll prologue, id reservation,
+    /// seek-index and write-amplification accounting, and the SAME on-disk frame bytes — except the
+    /// body CRC32C (and, for a large body, the xxh3-64) come from `checksums` rather than being
+    /// computed on the serialized append path. The caller GUARANTEES `checksums` describes `record`'s
+    /// exact stored body; a mismatch is not a safety hazard (the checksum is re-validated on read) but
+    /// would durably store a self-corrupt record.
+    ///
+    /// # Errors
+    /// Same as [`Log::append`].
+    pub fn append_precomputed(
+        &mut self,
+        record: &Append<'_>,
+        checksums: BodyChecksums,
+    ) -> Result<Offset, StorageError> {
+        self.append_inner(
+            AppendSource::Encode {
+                record,
+                precomputed: Some(checksums),
+            },
+            true,
+        )
     }
 
     /// Appends an already-sealed, already-VALIDATED frame VERBATIM — the follower replication ingest
@@ -2599,7 +2637,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// Same as [`append`](Log::append) (byte-cap / daily-budget sheds, `SegmentFull`, `WriterFrozen`, IO),
     /// minus anything roll-specific.
     pub fn append_without_roll(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
-        self.append_inner(AppendSource::Encode(record), false)
+        self.append_inner(
+            AppendSource::Encode {
+                record,
+                precomputed: None,
+            },
+            false,
+        )
     }
 
     /// Force-seal the active segment and start a fresh one — exactly the seal the implicit soft-cap roll
@@ -2650,7 +2694,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         seq: Seq,
     ) -> Result<(Offset, u64, u64), StorageError> {
         let (offset, pos_before) = match source {
-            AppendSource::Encode(record) => {
+            AppendSource::Encode {
+                record,
+                precomputed,
+            } => {
                 let view = RecordView {
                     seq,
                     timestamp_ms: record.timestamp_ms,
@@ -2661,7 +2708,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 };
                 let writer = self.active.as_mut().ok_or(StorageError::WriterFrozen)?;
                 let pos_before = writer.write_pos();
-                let offset = writer.append(&view)?;
+                // Offload the body checksum onto the producing connection thread when it precomputed
+                // it (#830); otherwise the codec computes it here as before. The framed bytes are
+                // identical.
+                let offset = match precomputed {
+                    Some(checksums) => writer.append_precomputed(&view, checksums)?,
+                    None => writer.append(&view)?,
+                };
                 (offset, pos_before)
             }
             AppendSource::Verbatim { frame, view } => {
@@ -2698,7 +2751,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // the write-amplification meters below and are the ONLY per-source difference before the
         // write. Reading them once up front keeps the cap / budget / roll prologue source-agnostic.
         let (key_len, headers_len, payload_len) = match &source {
-            AppendSource::Encode(record) => {
+            AppendSource::Encode { record, .. } => {
                 (record.key.len(), record.headers.len(), record.payload.len())
             }
             AppendSource::Verbatim { view, .. } => {
