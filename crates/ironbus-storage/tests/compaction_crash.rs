@@ -541,3 +541,185 @@ fn the_invariant_checkers_pass_across_a_compaction_and_crash() {
     let acked: Vec<u64> = dense.iter().map(|r| r.offset.get()).collect();
     check_no_acked_loss(&dense, &acked).expect("I1 no acked loss holds");
 }
+
+// --- #846: build_compacted_chain's continuity guards, exercised WITH a real compacted segment
+// mid-chain (the covered-span advance path), which every all-ordinary guard test misses.
+
+/// The v2 compacted segment's covered end `(offset, seq)` — the span `build_compacted_chain`
+/// advances the chain expectation by across a compacted entry (`next_base_offset = covered_end`),
+/// the load-bearing difference from the v1 dense-record-count advance.
+fn compacted_covered_end(fs: &InMemoryFs, compacted_id: u64) -> (u64, u64) {
+    let reader = SegmentReader::open(fs.open(&segment_file_name(compacted_id)).unwrap()).unwrap();
+    let scan = reader
+        .scan_compacted()
+        .unwrap()
+        .expect("the committed compacted segment scans");
+    (scan.meta.covered_end_offset, scan.meta.covered_end_seq)
+}
+
+/// The decoded header of segment `id`.
+fn header_of(fs: &InMemoryFs, id: u64) -> SegmentHeader {
+    *SegmentReader::open(fs.open(&segment_file_name(id)).unwrap())
+        .unwrap()
+        .header()
+}
+
+/// Builds a durable log whose offset-ordered segment layout is exactly
+/// `[compacted][sealed-ordinary][active-ordinary]`: a real v2 compacted segment (covering the
+/// dense original prefix at its ORIGINAL sparse offsets), followed by a NON-final SEALED ordinary
+/// segment, then the unsealed active tail. This is the mixed ordinary+compacted, offset-sorted
+/// chain [`Log::build_compacted_chain`] reconciles — the shape the all-ordinary guard tests
+/// (`corruption_corpus`, the inline `rejects_*` cases) never reach, because they route through the
+/// v1 [`Log::recover`] scan instead. Returns the disk, the compacted segment id, and the id of the
+/// mid sealed ordinary segment (the one directly succeeding the compacted entry in offset order).
+fn compacted_then_sealed_then_active() -> (InMemoryFs, u64, u64) {
+    let (fs, _before, _want, compacted_id) = fully_compacted_sole_copy();
+    // Fully compacted, the sole ordinary is the active (highest-range) tail. Append keyless records
+    // (each a guaranteed survivor) until that tail SEALS and rolls to a fresh active segment, so a
+    // sealed ordinary now sits BETWEEN the compacted segment and the new active tail.
+    let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+    for _ in 0..4 {
+        put(&mut log, b"", b"tail");
+    }
+    let fs = log.into_filesystem();
+    let (covered_end_offset, _) = compacted_covered_end(&fs, compacted_id);
+    // The mid entry is the sealed ordinary whose base_offset stitches onto the compacted covered
+    // end; the active tail is the unsealed ordinary with the highest base_offset above it.
+    let mut sealed_mid: Option<u64> = None;
+    let mut has_active_above = false;
+    for id in segment_ids(&fs).unwrap() {
+        let reader = SegmentReader::open(fs.open(&segment_file_name(id)).unwrap()).unwrap();
+        if reader.header().is_compacted() {
+            continue;
+        }
+        let scan = reader.scan_recovery().unwrap();
+        let base = scan.header.base_offset.get();
+        if scan.footer.is_some() && base == covered_end_offset {
+            sealed_mid = Some(id);
+        } else if scan.footer.is_none() && base > covered_end_offset {
+            has_active_above = true;
+        }
+    }
+    let mid = sealed_mid.expect("a sealed ordinary directly succeeds the compacted segment");
+    assert!(
+        has_active_above,
+        "an unsealed active tail sits above the mid sealed ordinary, so mid is NON-final"
+    );
+    (fs, compacted_id, mid)
+}
+
+/// #846 part 1 (`SegmentChainBroken` across a compacted segment). The offset-ordered chain is
+/// `[compacted][sealed-ordinary][active]`; header-surgery the mid sealed ordinary's `base_offset`
+/// to be one SHORT of the compacted segment's `covered_end_offset`, planting a one-offset hole
+/// right at the compacted->ordinary boundary. `Log::open` must fail
+/// [`StorageError::SegmentChainBroken`], and the diagnostic must name the mid segment with
+/// `expected_base_offset` = the compacted covered end (the covered-span advance, NOT the survivor
+/// count) and `found_base_offset` = the planted short value. The sequence expectation is untouched,
+/// so `expected_base_seq == found_base_seq` isolates the failure to the offset arithmetic.
+///
+/// Discriminating: the base-gap guard at the covered->ordinary boundary is the ONLY thing that
+/// rejects this disk; with the guard removed the hole is silently stitched into the durable offset
+/// order (I5). A positive control (the same builder, untampered) proves the layout otherwise
+/// recovers cleanly, so the failure is the planted gap and nothing else.
+#[test]
+fn rejects_a_base_gap_at_the_compacted_to_ordinary_boundary() {
+    // Positive control: the untampered [compacted][sealed][active] chain recovers cleanly.
+    let (clean_fs, _cid, _mid) = compacted_then_sealed_then_active();
+    Log::open(clean_fs, ManualClock::new(), small_config())
+        .expect("the untampered mixed chain recovers");
+
+    let (fs, compacted_id, mid) = compacted_then_sealed_then_active();
+    let (covered_end_offset, covered_end_seq) = compacted_covered_end(&fs, compacted_id);
+    let mid_hdr = header_of(&fs, mid);
+    assert_eq!(
+        mid_hdr.base_offset.get(),
+        covered_end_offset,
+        "the untampered mid ordinary stitches onto the compacted covered end"
+    );
+    assert_eq!(mid_hdr.base_seq.get(), covered_end_seq);
+
+    // Plant the gap: rewrite the mid segment header with base_offset one SHORT of the covered end
+    // (its record_count keeps its end above the covered end, so it is NOT superseded by step 2).
+    // The re-encode recomputes the header CRC, so it decodes clean — a pure continuity gap.
+    let short = covered_end_offset - 1;
+    let tampered = SegmentHeader {
+        base_offset: Offset::new(short),
+        ..mid_hdr
+    };
+    let file = fs.open(&segment_file_name(mid)).unwrap();
+    file.write_all_at(&tampered.encode(), 0).unwrap();
+    file.sync_all().unwrap();
+    fs.sync_dir().unwrap();
+
+    let err = Log::open(fs, ManualClock::new(), small_config())
+        .expect_err("a base gap at the compacted->ordinary boundary must fail SegmentChainBroken");
+    match err {
+        ironbus_storage::segment::StorageError::SegmentChainBroken {
+            segment_id,
+            expected_base_offset,
+            found_base_offset,
+            expected_base_seq,
+            found_base_seq,
+        } => {
+            assert_eq!(segment_id, mid, "the diagnostic names the gapping segment");
+            assert_eq!(
+                expected_base_offset, covered_end_offset,
+                "expectation advances by the compacted COVERED span, not the survivor count"
+            );
+            assert_eq!(
+                found_base_offset, short,
+                "the planted one-short base offset"
+            );
+            assert_eq!(
+                expected_base_seq, found_base_seq,
+                "the seq expectation is intact; the break is purely the offset gap"
+            );
+        }
+        other => panic!("expected SegmentChainBroken, got {other:?}"),
+    }
+}
+
+/// #846 part 2 (`UnsealedPredecessor` across a compacted segment). The offset-ordered chain is
+/// `[compacted][sealed-ordinary][active]`; corrupt the mid sealed ordinary's footer CRC so it scans
+/// as UNSEALED while the active tail above it remains the highest-range entry. A NON-final unsealed
+/// ordinary would leave two segments simultaneously appendable, so `Log::open` must fail
+/// [`StorageError::UnsealedPredecessor`] naming the mid segment.
+///
+/// Discriminating: the mid-chain unsealed guard is the only rejection; with it removed the log
+/// boots with a non-final unsealed segment. A positive control (untampered) proves the sealed mid
+/// segment recovers cleanly, so the failure is the un-seal and nothing else.
+#[test]
+fn rejects_an_unsealed_non_final_ordinary_after_a_compacted_segment() {
+    // Positive control: the untampered chain (mid SEALED) recovers cleanly.
+    let (clean_fs, _cid, _mid) = compacted_then_sealed_then_active();
+    Log::open(clean_fs, ManualClock::new(), small_config())
+        .expect("the untampered mixed chain recovers");
+
+    let (fs, _compacted_id, mid) = compacted_then_sealed_then_active();
+
+    // Un-seal the mid ordinary: flip a byte in its trailing footer so `SegmentFooter::decode` fails
+    // its CRC. `scan_recovery` then finds no valid footer (`footer: None`) and reports the segment
+    // UNSEALED, its records recovered as the torn-free prefix. The header (hence base_offset) is
+    // untouched, so continuity still stitches and the UNSEALED guard — not the base-gap guard — is
+    // what fires.
+    let file = fs.open(&segment_file_name(mid)).unwrap();
+    let len = file.len().unwrap();
+    let mut b = [0u8; 1];
+    file.read_exact_at(&mut b, len - 1).unwrap();
+    b[0] ^= 0xFF;
+    file.write_all_at(&b, len - 1).unwrap();
+    file.sync_all().unwrap();
+    fs.sync_dir().unwrap();
+
+    let err = Log::open(fs, ManualClock::new(), small_config())
+        .expect_err("a non-final unsealed ordinary after a compacted segment must fail closed");
+    match err {
+        ironbus_storage::segment::StorageError::UnsealedPredecessor { segment_id } => {
+            assert_eq!(
+                segment_id, mid,
+                "the diagnostic names the unsealed non-final ordinary"
+            );
+        }
+        other => panic!("expected UnsealedPredecessor, got {other:?}"),
+    }
+}
