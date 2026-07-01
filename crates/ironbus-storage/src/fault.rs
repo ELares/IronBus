@@ -94,6 +94,13 @@ pub struct FaultControl {
     /// rather than permanently freezing the writer (#867): arm 1, drive a roll, then assert a later
     /// append succeeds once the fault has cleared. `0` disables it.
     fail_create_new: Arc<AtomicU64>,
+    /// A test-only fast-path flag (#823): `true` ONLY while a sync rendezvous is armed. A disarmed
+    /// sync therefore pays a single atomic load (no lock) — the common case for every other fault
+    /// test — before short-circuiting the rendezvous below.
+    rendezvous_armed: Arc<AtomicBool>,
+    /// The condvar-backed sync rendezvous used to PROVE the group-commit fdatasync fan-out (#823)
+    /// runs its K per-fd barriers CONCURRENTLY rather than serially. See [`RendezvousGate`].
+    rendezvous: Arc<RendezvousGate>,
 }
 
 /// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
@@ -115,6 +122,38 @@ impl Default for SyncGate {
             cv: Condvar::new(),
         }
     }
+}
+
+/// A test-only rendezvous latch (#823) that PROVES the group-commit fdatasync fan-out runs its `K`
+/// per-fd barriers CONCURRENTLY rather than serially. While armed (`width > 0`), every
+/// `sync_data`/`sync_all` entry JOINS the rendezvous: it bumps `entered`, wakes waiters, and BLOCKS
+/// until either `entered` reaches `width` (all `width` barriers are inside their `fdatasync` AT THE
+/// SAME TIME — the overlap #823 promises, which latches the sticky `reached` proof) or `release` is
+/// set (the test's bounded deadline elapsed, so a SERIALIZED fan-out — which can never get more than
+/// one barrier inside at once — drains instead of hanging forever). Everything is condvar-based; the
+/// syncing threads never wall-clock-sleep, so the check is deterministic.
+#[derive(Debug, Default)]
+struct RendezvousGate {
+    state: Mutex<RendezvousState>,
+    cv: Condvar,
+}
+
+/// The mutable state behind a [`RendezvousGate`].
+#[derive(Debug, Default)]
+struct RendezvousState {
+    /// The rendezvous width: how many barriers must be inside a `fdatasync` at once before the group
+    /// is released. `0` disarms the rendezvous (entries pass straight through).
+    width: usize,
+    /// How many syncs are CURRENTLY inside the rendezvous (bumped on entry, dropped on exit). A
+    /// serial fan-out never gets this above 1, because the sole in-flight barrier holds the shared
+    /// work-queue lock and no sibling can even reach its `sync_data`.
+    entered: usize,
+    /// Sticky proof that `entered` reached `width` at least once — i.e. the barriers genuinely
+    /// overlapped. This is the assertion the overlap test reads.
+    reached: bool,
+    /// Force-drain: once the test's deadline sets this, every parked (or subsequently entering) sync
+    /// passes straight through, so a serialized fan-out RETURNS instead of hanging the test forever.
+    release: bool,
 }
 
 impl FaultControl {
@@ -320,6 +359,61 @@ impl FaultControl {
         self.sync_count.load(Ordering::SeqCst)
     }
 
+    /// Arms the sync rendezvous (#823) to `width`: while armed, every `sync_data`/`sync_all` entry
+    /// joins a rendezvous of `width` participants (see [`RendezvousGate`]) so the group-commit
+    /// fdatasync fan-out overlap test can PROVE `width` barriers were inside their `fdatasync` at the
+    /// same time. Pass `0` to disarm. Arm this ONLY immediately before the fan-out under test, so no
+    /// unrelated sync (segment creation, an earlier flush) joins the rendezvous by accident.
+    pub fn arm_sync_rendezvous(&self, width: usize) {
+        let mut st = self
+            .rendezvous
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.width = width;
+        st.entered = 0;
+        st.reached = false;
+        st.release = false;
+        // The fast-path flag: a disarmed sync (`width == 0`) short-circuits on one atomic load.
+        self.rendezvous_armed.store(width != 0, Ordering::SeqCst);
+        // Wake anything left parked from a prior group so it cannot wedge a later one.
+        self.rendezvous.cv.notify_all();
+    }
+
+    /// Blocks (on the condvar, bounded by `timeout`, no busy-wait) until the armed sync rendezvous is
+    /// REACHED — all `width` barriers were inside their `fdatasync` simultaneously — then force-drains
+    /// the gate so any still-parked syncs proceed and the fan-out can return. Returns whether the
+    /// rendezvous was reached within the deadline: `true` PROVES the barriers overlapped (a concurrent
+    /// fan-out); `false` means the fan-out serialized (only ever one barrier inside at once) and the
+    /// deadline elapsed. The unconditional force-drain guarantees the caller never hangs on a serial
+    /// fan-out — it fails the assertion instead.
+    #[must_use]
+    pub fn wait_for_rendezvous_or_release(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut st = self
+            .rendezvous
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !st.reached {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let (guard, _timed_out) = self
+                .rendezvous
+                .cv
+                .wait_timeout(st, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st = guard;
+        }
+        let reached = st.reached;
+        // Force-drain unconditionally: a serial fan-out is still parked (or about to enter) and must
+        // proceed so the fan-out returns and the test can join it and assert (rather than hang).
+        st.release = true;
+        self.rendezvous.cv.notify_all();
+        reached
+    }
+
     /// Closes the READ gate (#809): the NEXT positioned `read_at` blocks until [`open_read_gate`], so a
     /// test can park a fetch-serve mid-read. Already-passed reads are unaffected.
     ///
@@ -408,6 +502,39 @@ impl FaultControl {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
+    }
+
+    /// The rendezvous hook (#823) at the top of the data-sync path: if a sync rendezvous is armed,
+    /// join it. Bumps `entered`, wakes waiters, and BLOCKS until `entered` reaches `width` (all
+    /// barriers inside a `fdatasync` at once — latches `reached`) or the test force-releases the gate.
+    /// Disarmed, it is a single atomic load and returns. A serialized fan-out never gets `entered`
+    /// above 1 (the sole in-flight barrier holds the shared work-queue lock, so no sibling can reach
+    /// here), so `reached` stays false and the overlap test fails.
+    fn enter_sync_rendezvous(&self) {
+        if !self.rendezvous_armed.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut st = self
+            .rendezvous
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if st.width == 0 {
+            return;
+        }
+        st.entered = st.entered.saturating_add(1);
+        if st.entered >= st.width {
+            st.reached = true;
+        }
+        self.rendezvous.cv.notify_all();
+        while !st.reached && !st.release {
+            st = self
+                .rendezvous
+                .cv
+                .wait(st)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        st.entered = st.entered.saturating_sub(1);
     }
 
     fn sync_should_fail(&self) -> bool {
@@ -670,6 +797,10 @@ impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     }
 
     fn sync_data(&self) -> io::Result<()> {
+        // Join the group-commit rendezvous FIRST (#823, top of the data-sync path): the overlap test
+        // arms it so all K fan-out barriers must be inside their `fdatasync` at once to proceed —
+        // disarmed (every other test) this is one atomic load and a return.
+        self.control.enter_sync_rendezvous();
         // Count the sync and, if the gate is closed, park here until it opens (the stalled-disk model,
         // #177). Done BEFORE the fail check so a test can either stall a sync (gate) or fail it.
         self.control.enter_sync_gate();
@@ -680,6 +811,7 @@ impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     }
 
     fn sync_all(&self) -> io::Result<()> {
+        self.control.enter_sync_rendezvous();
         self.control.enter_sync_gate();
         if self.control.sync_should_fail() {
             return Err(injected_sync_error());
