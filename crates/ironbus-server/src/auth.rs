@@ -190,10 +190,17 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-/// The internal, audit-side reason an auth attempt failed or succeeded (#635, the "Authn outcome" /
-/// "Authz denial" audit events). This is the TRUSTED-side distinction the operator may see; it is
-/// NEVER sent to the client (which always gets the uniform [`AuthError`]). Carries only safe handles
-/// (the mechanism, the resolved identity name where known), never a credential.
+/// The internal, audit-side detail of a SUCCESSFUL auth (#635, the "Authn outcome" audit event). This
+/// is the TRUSTED-side distinction the operator may see; it is NEVER sent to the client (which always
+/// gets the uniform [`AuthError`]). Carries only safe handles (the resolved identity name, the pinned
+/// scope set), never a credential.
+///
+/// FAILURE is NOT a variant here: [`AuthConfig::authenticate`] returns [`Err(AuthError)`] on every
+/// failure, so an `Ok(AuthOutcome)` is by construction a success. Keeping this a value that can ONLY
+/// mean "authenticated" is deliberate: the session handshake destructures it with an irrefutable
+/// `let`, so the connection's `authenticated` flag can never be set without pinning a real identity's
+/// scopes, and adding any non-success variant here becomes a compile error at that call site rather
+/// than a silently-skipped bind (#889).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthOutcome {
     /// Authentication succeeded; the connection is this identity with this pinned scope set.
@@ -202,11 +209,6 @@ pub enum AuthOutcome {
         identity: String,
         /// The pinned scope set.
         scopes: ScopeSet,
-    },
-    /// Authentication failed. The reason is the trusted-side detail; the wire sees only [`AuthError`].
-    Failed {
-        /// Which mechanism the client selected (`bearer` / `password` / `mtls`), or `unknown`.
-        mechanism: &'static str,
     },
 }
 
@@ -722,12 +724,20 @@ mod tests {
         let (id, outcome) = cfg.authenticate(&good, None).unwrap();
         assert_eq!(id.name, "producer");
         assert!(id.scopes.has(Scope::Publish) && !id.scopes.has(Scope::Subscribe));
-        assert!(matches!(outcome, AuthOutcome::Authenticated { .. }));
+        // #889: an `Ok` outcome is by construction `Authenticated` and CARRIES the real pinned state —
+        // the identity name and the identity's actual (non-empty) scope set, exactly what the session
+        // handshake flips `authenticated` on. A success outcome can never be a no-scope shell.
+        let AuthOutcome::Authenticated { identity, scopes } = &outcome;
+        assert_eq!(identity, "producer");
+        assert_eq!(*scopes, id.scopes);
+        assert!(scopes.has(Scope::Publish) && !scopes.has(Scope::Subscribe));
 
         let bad = AuthCredential {
             mechanism: WireMechanism::Bearer,
             material: b"the-wrong-token-entirely-here!!!".to_vec(),
         };
+        // The failure path is `Err(AuthError)`, NEVER `Ok(some-failed-outcome)` — the reason there is no
+        // `AuthOutcome::Failed` for an `Ok` to smuggle a decoupled auth state through (#889).
         assert_eq!(cfg.authenticate(&bad, None).unwrap_err(), AuthError);
     }
 
