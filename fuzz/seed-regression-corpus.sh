@@ -164,6 +164,18 @@ printf '\377\377\377\377\377\377\377\377' | place seq_snapshot      # all-ones h
 printf '\001\001\000\000\000\377\377\000\000\000\000\000' | place seq_snapshot  # v1, count=1, plen=0xffff overruns
 printf '\001\000\000\000\000\000\000\000\000' | place seq_snapshot  # v1, count=0, lone stub byte before crc
 
+# segment_scan_compacted (#847): the target PREPENDS a valid v2 COMPACTED header, then treats the
+# input as `[ 12-byte control ][ trailing survivor-body + footer + meta ]`, where the control drives
+# the arbitrary `scan_compacted_range` args (start_byte/read_end u32 LE, max/max_bytes u16 LE). The
+# short seeds (empty, all-ones control, control + stub) leave the trailing region SHORTER than the
+# 32-byte footer + 44-byte meta block, so they land squarely in the length-guard / underflow
+# arithmetic (`block_start - footer_len`, `footer_start.saturating_sub(header_end)`) that must
+# short-circuit to Ok(None) rather than panic.
+printf '' | place segment_scan_compacted                                             # empty: header-only file
+printf '\377\377\377\377\377\377\377\377\377\377\377\377' | place segment_scan_compacted  # all-ones control, no body
+printf '\000\000\000\000\000\000\000\000\000\000\000\000' | place segment_scan_compacted  # zero control, no body
+printf '\000\000\000\000\100\000\000\000\010\000\001\000\001\002\003\004\005' | place segment_scan_compacted  # control + 5 garbage body bytes
+
 # Final report / drift check.
 if [ "$mode" = check ]; then
   committed=$fuzz_dir/corpus-regression

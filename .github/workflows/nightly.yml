@@ -57,7 +57,7 @@ jobs:
           tool: cargo-fuzz@0.13.1
       - name: soak each parser fuzz target
         env:
-          # Per-target wall-clock budget; 12 targets => ~36 min of fuzzing per nightly run. The #385
+          # Per-target wall-clock budget; 13 targets => ~39 min of fuzzing per nightly run. The #385
           # plan is to raise this toward 30 min/target; it is a single knob so deepening the soak is
           # a one-line change once the nightly runner-time budget allows.
           MAX_TOTAL_TIME: "180"
@@ -66,7 +66,7 @@ jobs:
           # sanitizer (-Zsanitizer=address). dtolnay/rust-toolchain does run `rustup default
           # nightly`, but that step is continue-on-error, so the `+nightly` makes the
           # toolchain unambiguous and matches the documented local command in fuzz/README.md.
-          for target in record_codec frame_decode cursor_snapshot seq_snapshot segment_scan pub_body ack_body deliver_body dead_letter_body connect_body info_body gap_marker_body; do
+          for target in record_codec frame_decode cursor_snapshot seq_snapshot segment_scan segment_scan_compacted pub_body ack_body deliver_body dead_letter_body connect_body info_body gap_marker_body; do
             echo "::group::fuzz ${target}"
             # Pin the fuzz build to the rustc HOST target (gnu), not cargo-fuzz's self-detected
             # default. cargo-fuzz infers its default --target from its OWN binary triple, and

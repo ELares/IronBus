@@ -57,6 +57,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "segment_scan_compacted"
+path = "fuzz_targets/segment_scan_compacted.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pub_body"
 path = "fuzz_targets/pub_body.rs"
 test = false
