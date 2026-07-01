@@ -79,7 +79,7 @@ use ironbus_proto::frame::{
     decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType, MAX_FRAME_LEN,
 };
 use ironbus_storage::fs::Filesystem;
-use ironbus_storage::log::{Append, Log, TruncateOutcome};
+use ironbus_storage::log::{Log, TruncateOutcome};
 use ironbus_storage::read_plane::ReadPlane;
 use ironbus_storage::segment::StorageError;
 
@@ -377,6 +377,20 @@ pub enum ReplicationError {
         /// The number of complete frames actually decoded from the bytes.
         actual: u32,
     },
+    /// A validated frame's EMBEDDED (already-CRC'd) sequence number did not equal the follower's
+    /// POSITIONAL next sequence (#820). The verbatim-append fast path copies the leader's sealed
+    /// frame byte-for-byte, which is only byte-identical to a local re-encode when the follower would
+    /// have assigned that exact seq. A mismatch means the lineages diverged (a leader-epoch fork the
+    /// deferred C2-I4 reconciliation, #599, would handle), so the follower fails CLOSED before
+    /// appending rather than write a frame whose embedded seq contradicts its position.
+    SeqMismatch {
+        /// The log offset the frame would have been appended at.
+        at_offset: u64,
+        /// The sequence embedded in the (validated) frame.
+        embedded: u64,
+        /// The sequence the follower would have assigned positionally (its current `next_seq`).
+        expected: u64,
+    },
     /// An [`FrameType::OffsetForLeaderEpoch`] (#599) request/response body was malformed: a wrong
     /// length or a bad `kind` discriminant byte. Fail closed; the epoch handshake never guesses.
     MalformedEpochQuery {
@@ -443,6 +457,14 @@ impl core::fmt::Display for ReplicationError {
             ReplicationError::RecordCountMismatch { claimed, actual } => write!(
                 f,
                 "replication fetch response record_count {claimed} != {actual} complete frames decoded"
+            ),
+            ReplicationError::SeqMismatch {
+                at_offset,
+                embedded,
+                expected,
+            } => write!(
+                f,
+                "replication frame at offset {at_offset} carries embedded seq {embedded} != follower positional seq {expected}; fail-closed"
             ),
             ReplicationError::MalformedEpochQuery { len } => {
                 write!(f, "malformed leader-epoch offset query body ({len} bytes)")
@@ -787,16 +809,21 @@ impl<F: Filesystem, C: Clock> Follower<F, C> {
     ///
     /// This is the security-critical core. The leader's `frame_bytes` are UNTRUSTED peer bytes. They
     /// are walked front-to-back; each frame is decoded with the intact-record predicate
-    /// ([`ironbus_core::codec::decode`]); a frame that passes is re-appended (reproducing the leader's
-    /// byte-identical frame); a frame that FAILS is rejected and the apply stops there with a typed
-    /// [`ReplicationError::CorruptFrame`] — **nothing from the bad frame onward is appended**. The
-    /// records validated-and-appended before a bad frame are kept and synced (the longest valid
-    /// prefix of this response), exactly the I1 / I3 fail-at-first-bad-frame discipline the local
-    /// recovery path already holds.
+    /// ([`ironbus_core::codec::decode`]); a frame that passes is appended VERBATIM (#820) — the origin
+    /// already produced the canonical sealed frame and the follower is at the identical seq/offset, so
+    /// the validated bytes ARE the byte-identical frame, and copying them straight in skips the
+    /// redundant re-encode + re-checksum. A frame that FAILS decode is rejected and the apply stops
+    /// there with a typed [`ReplicationError::CorruptFrame`] — **nothing from the bad frame onward is
+    /// appended**. The records validated-and-appended before a bad frame are kept and synced (the
+    /// longest valid prefix of this response), exactly the I1 / I3 fail-at-first-bad-frame discipline
+    /// the local recovery path already holds. The CRC is still fully VALIDATED on receipt; only the
+    /// redundant re-ENCODE the follower used to perform is removed.
     ///
     /// # Errors
     /// - [`ReplicationError::NonContiguous`] if the response does not continue the follower's log.
     /// - [`ReplicationError::CorruptFrame`] if any frame fails CRC re-validation (fail-closed).
+    /// - [`ReplicationError::SeqMismatch`] if a validated frame's embedded seq does not match the
+    ///   follower's positional seq (a diverged lineage) — fail-closed before appending it.
     /// - [`ReplicationError::RecordCountMismatch`] if the byte run does not hold the claimed count.
     /// - [`ReplicationError::Storage`] if a local append / sync fails.
     pub fn apply_fetch_response(
@@ -843,17 +870,29 @@ impl<F: Filesystem, C: Clock> Follower<F, C> {
                     return Err(ReplicationError::CorruptFrame { at_offset, reason });
                 }
             };
-            // Re-append the validated record's content. The follower's log assigns the SAME offset /
-            // sequence positionally (both logs advance from 0 in order), so re-encoding through the
-            // identical codec reproduces the leader's frame byte-for-byte.
-            let append = Append {
-                timestamp_ms: view.timestamp_ms,
-                flags: view.flags,
-                key: view.key,
-                headers: view.headers,
-                payload: view.payload,
-            };
-            self.log.append(&append)?;
+            // Byte-identity guard (#820): the follower assigns the offset/sequence POSITIONALLY (both
+            // logs advance from 0 in order), and the validated frame carries the leader's embedded,
+            // already-CRC'd seq. They MUST agree, or copying the frame verbatim would NOT reproduce
+            // what a local re-encode would have produced. Fail CLOSED before appending if they differ
+            // (a diverged lineage the deferred epoch-truncation reconciliation, #599, would handle);
+            // the validated-and-appended prefix is synced below before we return.
+            let expected_seq = self.log.next_seq().get();
+            if view.seq.get() != expected_seq {
+                self.log.sync()?;
+                return Err(ReplicationError::SeqMismatch {
+                    at_offset,
+                    embedded: view.seq.get(),
+                    expected: expected_seq,
+                });
+            }
+            // Append the leader's VALIDATED frame VERBATIM (#820). `codec::decode` above already
+            // verified this frame's header CRC32C, body CRC32C, and (for large bodies) xxh3-64; the
+            // origin already produced the canonical sealed frame and the follower is at the identical
+            // seq/offset, so the bytes are byte-for-byte what the old re-encode path emitted. Copying
+            // them straight in skips the redundant re-frame + re-checksum (the same crc32c/xxh3 the
+            // decode just computed) — only the re-ENCODE is removed, the validation stays on decode.
+            self.log
+                .append_frame_verbatim(&bytes[cursor..cursor + frame_len], &view)?;
             appended += 1;
             cursor += frame_len;
         }
@@ -1254,6 +1293,7 @@ mod tests {
     use ironbus_core::types::RecordFlags;
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::io::RandomAccessFile;
+    use ironbus_storage::log::Append;
     use ironbus_storage::log::LogConfig;
 
     /// A small segment cap so a handful of records rolls to multiple segments — proving replication
@@ -1384,6 +1424,60 @@ mod tests {
         let follower_recs = follower.log().read_from(Offset::ZERO, 1000).unwrap();
         assert_eq!(follower_recs, leader_recs);
         assert_eq!(follower_recs.len(), 40);
+    }
+
+    // ----- fail-closed: the verbatim-append byte-identity guard (#820) -----
+
+    /// A validated frame whose EMBEDDED (already-CRC'd) seq does not match the follower's POSITIONAL
+    /// `next_seq` must be rejected BEFORE it is appended verbatim (#820): copying such a frame would
+    /// write on-disk bytes a local re-encode at that position would never have produced, so the
+    /// follower fails CLOSED. This exercises the `SeqMismatch` guard added with the verbatim-append
+    /// fast path — the check that upholds byte-identity now that the frame is copied, not re-encoded.
+    #[test]
+    fn follower_rejects_a_frame_whose_embedded_seq_diverges_from_its_position() {
+        use ironbus_core::codec::RecordView;
+        use ironbus_core::types::Seq;
+
+        // Hand-encode ONE valid frame (its CRCs are correct, so it passes decode) that carries seq 7,
+        // even though a fresh follower assigns position 0 (offset 0 / seq 0) to its first record.
+        let view = RecordView {
+            seq: Seq::new(7),
+            timestamp_ms: 1,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"diverged",
+        };
+        let mut frame = Vec::new();
+        codec::encode(&view, &mut frame).expect("encode a valid frame");
+
+        // first_offset 0 continues a fresh follower's log contiguously (so this is NOT a NonContiguous
+        // rejection), but the embedded seq 7 != the follower's positional seq 0.
+        let resp = FetchResponseBody {
+            high_watermark: 1,
+            first_offset: 0,
+            record_count: 1,
+            frame_bytes: Bytes::from(frame),
+        };
+
+        let mut follower = Follower::new(open_log(InMemoryFs::new(), small_config()));
+        let err = follower
+            .apply_fetch_response(&resp)
+            .expect_err("a frame with a diverged embedded seq must be rejected");
+        match err {
+            ReplicationError::SeqMismatch {
+                at_offset,
+                embedded,
+                expected,
+            } => {
+                assert_eq!(at_offset, 0);
+                assert_eq!(embedded, 7);
+                assert_eq!(expected, 0);
+            }
+            other => panic!("expected SeqMismatch, got {other:?}"),
+        }
+        // Fail-closed: nothing was appended, the follower's log is untouched.
+        assert_eq!(follower.next_fetch_offset().get(), 0);
     }
 
     // ----- fail-closed: a follower REJECTS a corrupted / tampered fetched frame -----

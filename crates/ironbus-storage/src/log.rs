@@ -242,6 +242,26 @@ pub struct Append<'a> {
     pub payload: &'a [u8],
 }
 
+/// How [`Log::append_inner`] lays one record into the active segment: RE-ENCODE a producer-supplied
+/// [`Append`] into a fresh canonical frame (the produce path), or copy a PRE-VALIDATED verbatim frame
+/// the follower already CRC-checked on ingest (#820). Both share the identical cap / daily-budget /
+/// roll prologue, id reservation, seek-index maintenance, and write-amplification accounting — only
+/// the per-record write into the segment writer differs, so the on-disk bytes are identical either way.
+#[derive(Clone, Copy)]
+enum AppendSource<'a> {
+    /// Re-frame + re-checksum the record through [`codec::encode`] (via [`SegmentWriter::append`]).
+    Encode(&'a Append<'a>),
+    /// Copy an already-sealed, already-validated frame verbatim (via
+    /// [`SegmentWriter::append_verbatim`]), skipping the redundant re-encode + re-checksum. `frame`
+    /// is one complete on-disk record frame the caller decoded in place; `view` is that decode's
+    /// result. The caller GUARANTEES `view.seq` equals the log's positional `next_seq`, so the copied
+    /// bytes are byte-identical to what the `Encode` path would have produced (a debug assert checks it).
+    Verbatim {
+        frame: &'a [u8],
+        view: &'a RecordView<'a>,
+    },
+}
+
 /// The three composable retention bounds the segment reaper enforces (refs #13, #80). A sealed
 /// segment is eligible to delete when ANY ENABLED bound says it should be (the log is over the
 /// byte bound, OR over the count bound, OR the segment is older than the age bound); each bound is
@@ -2096,7 +2116,32 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// space is exhausted or the record is too large to frame, [`StorageError::WriterFrozen`] if a
     /// prior fatal error froze the writer, or an IO error from the write.
     pub fn append(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
-        self.append_inner(record, true)
+        self.append_inner(AppendSource::Encode(record), true)
+    }
+
+    /// Appends an already-sealed, already-VALIDATED frame VERBATIM — the follower replication ingest
+    /// fast path (#820). `frame` is one complete on-disk record frame the caller has just decoded in
+    /// place with the intact-record predicate ([`codec::decode`]); `view` is that decode's result.
+    /// The leader already produced the canonical frame and the follower assigns the SAME
+    /// `seq`/offset positionally, so the frame is byte-identical to what [`Log::append`] would
+    /// re-encode from `view` — copying it verbatim skips the redundant re-frame + re-checksum (the
+    /// crc32c-over-header, crc32c-over-body, and, for large bodies, xxh3-64 that the decode just
+    /// verified). Everything else — the byte-cap and daily-write-budget sheds, the soft-size-cap
+    /// roll, id reservation, the resident seek index, and the write-amplification meters — is
+    /// IDENTICAL to [`Log::append`].
+    ///
+    /// The caller MUST guarantee `view.seq == self.next_seq()` (the frame's embedded, already-CRC'd
+    /// sequence matches the follower's positional assignment); a debug assert checks it. This method
+    /// does NOT re-validate `frame` — validation is the caller's decode step.
+    ///
+    /// # Errors
+    /// Identical to [`Log::append`] (byte-cap / daily-budget sheds, `SegmentFull`, `WriterFrozen`, IO).
+    pub fn append_frame_verbatim(
+        &mut self,
+        frame: &[u8],
+        view: &RecordView<'_>,
+    ) -> Result<Offset, StorageError> {
+        self.append_inner(AppendSource::Verbatim { frame, view }, true)
     }
 
     /// Like [`append`](Log::append) but NEVER triggers the implicit soft-size-cap roll: the record
@@ -2111,7 +2156,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// Same as [`append`](Log::append) (byte-cap / daily-budget sheds, `SegmentFull`, `WriterFrozen`, IO),
     /// minus anything roll-specific.
     pub fn append_without_roll(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
-        self.append_inner(record, false)
+        self.append_inner(AppendSource::Encode(record), false)
     }
 
     /// Force-seal the active segment and start a fresh one — exactly the seal the implicit soft-cap roll
@@ -2150,11 +2195,73 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(active.write_pos() >= self.config.max_segment_bytes && active.record_count() > 0)
     }
 
+    /// Write ONE record into the active segment, either RE-ENCODING it through the codec or copying
+    /// an already-validated verbatim frame (#820). `seq` is the id the log reserved for it. Returns
+    /// `(offset, pos_before, frame_len)`: the assigned log offset, the byte position the frame starts
+    /// at in the segment, and its encoded byte length. Either path advances the writer's `write_pos`
+    /// by exactly the frame length, so `frame_len` (the write-position delta) is measured identically
+    /// and equals `frame.len()` on the verbatim path.
+    fn write_source(
+        &mut self,
+        source: AppendSource<'_>,
+        seq: Seq,
+    ) -> Result<(Offset, u64, u64), StorageError> {
+        let (offset, pos_before) = match source {
+            AppendSource::Encode(record) => {
+                let view = RecordView {
+                    seq,
+                    timestamp_ms: record.timestamp_ms,
+                    flags: record.flags,
+                    key: record.key,
+                    headers: record.headers,
+                    payload: record.payload,
+                };
+                let writer = self.active.as_mut().ok_or(StorageError::WriterFrozen)?;
+                let pos_before = writer.write_pos();
+                let offset = writer.append(&view)?;
+                (offset, pos_before)
+            }
+            AppendSource::Verbatim { frame, view } => {
+                // Byte-identity invariant: the follower assigns `seq` positionally, and the copied
+                // frame carries the leader's embedded (already-CRC'd) `seq`. They MUST match, or the
+                // verbatim bytes would diverge from what the encode path produces. The caller
+                // (replication ingest) enforces this with a typed error; assert it here too.
+                debug_assert_eq!(
+                    view.seq, seq,
+                    "verbatim frame seq must equal the follower's positional next_seq (#820)"
+                );
+                let writer = self.active.as_mut().ok_or(StorageError::WriterFrozen)?;
+                let pos_before = writer.write_pos();
+                let offset = writer.append_verbatim(frame, seq, view.timestamp_ms)?;
+                (offset, pos_before)
+            }
+        };
+        // The FRAME length is the writer's write-position delta across the append (the segment writer
+        // advances `write_pos` by exactly the encoded record's byte length: header + body + trailer).
+        // Measuring the delta avoids re-encoding the record just to size it.
+        let frame_len = self
+            .active
+            .as_ref()
+            .map_or(0, |w| w.write_pos().saturating_sub(pos_before));
+        Ok((offset, pos_before, frame_len))
+    }
+
     fn append_inner(
         &mut self,
-        record: &Append<'_>,
+        source: AppendSource<'_>,
         allow_roll: bool,
     ) -> Result<Offset, StorageError> {
+        // The producer-supplied logical content lengths (key + headers + payload, no framing) drive
+        // the write-amplification meters below and are the ONLY per-source difference before the
+        // write. Reading them once up front keeps the cap / budget / roll prologue source-agnostic.
+        let (key_len, headers_len, payload_len) = match &source {
+            AppendSource::Encode(record) => {
+                (record.key.len(), record.headers.len(), record.payload.len())
+            }
+            AppendSource::Verbatim { view, .. } => {
+                (view.key.len(), view.headers.len(), view.payload.len())
+            }
+        };
         // Hard durable-log byte cap (the drop-new shed): when the log is at or over the cap,
         // reject the produce and write nothing, advancing no offset or sequence. The check is
         // at-or-over BEFORE the append (like the segment cap), so the log overshoots by at most
@@ -2222,24 +2329,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             .next_offset
             .checked_next()
             .ok_or(StorageError::SegmentFull)?;
-        let view = RecordView {
-            seq,
-            timestamp_ms: record.timestamp_ms,
-            flags: record.flags,
-            key: record.key,
-            headers: record.headers,
-            payload: record.payload,
-        };
-        let writer = self.active.as_mut().ok_or(StorageError::WriterFrozen)?;
-        // The encoded FRAME length is the writer's write-position delta across the append (the
-        // segment writer advances `write_pos` by exactly the encoded record's byte length: header +
-        // body + trailer). Measuring the delta avoids re-encoding the record just to size it.
-        let pos_before = writer.write_pos();
-        let offset = writer.append(&view)?;
-        let frame_len = self
-            .active
-            .as_ref()
-            .map_or(0, |w| w.write_pos().saturating_sub(pos_before));
+        // Lay the record into the active segment (encode-and-checksum, or copy the already-validated
+        // verbatim frame). Returns the assigned offset, the frame's start byte position, and its
+        // encoded length — the seek-index maintenance below needs all three.
+        let (offset, pos_before, frame_len) = self.write_source(source, seq)?;
         // The ids advance only after the write returns Ok.
         self.next_seq = next_seq;
         self.next_offset = next_offset;
@@ -2280,11 +2373,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // written to the segment. `physical / logical` over the run is the flash write-amplification
         // ratio, defined over stored bytes: under the default codec it can inflate for small
         // compressible payloads even as the real flash wear per user byte falls.
-        let logical = record
-            .key
-            .len()
-            .saturating_add(record.headers.len())
-            .saturating_add(record.payload.len());
+        let logical = key_len
+            .saturating_add(headers_len)
+            .saturating_add(payload_len);
         self.logical_bytes_written = self
             .logical_bytes_written
             .saturating_add(u64::try_from(logical).unwrap_or(u64::MAX));
