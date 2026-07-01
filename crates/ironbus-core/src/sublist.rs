@@ -158,7 +158,14 @@ impl fmt::Display for SublistError {
     }
 }
 
-impl std::error::Error for SublistError {}
+impl std::error::Error for SublistError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SublistError::InvalidPattern(e) => Some(e),
+            SublistError::ForkLimitExceeded { .. } => None,
+        }
+    }
+}
 
 impl From<SubjectError> for SublistError {
     fn from(e: SubjectError) -> SublistError {

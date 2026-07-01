@@ -398,7 +398,15 @@ impl core::fmt::Display for RuntimeError {
     }
 }
 
-impl std::error::Error for RuntimeError {}
+impl std::error::Error for RuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RuntimeError::Group(e) => Some(e),
+            RuntimeError::Listen(e) => Some(e),
+            RuntimeError::Config(_) => None,
+        }
+    }
+}
 
 impl From<GroupError> for RuntimeError {
     fn from(e: GroupError) -> Self {

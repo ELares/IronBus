@@ -143,7 +143,15 @@ impl core::fmt::Display for MetadataStorageError {
     }
 }
 
-impl std::error::Error for MetadataStorageError {}
+impl std::error::Error for MetadataStorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MetadataStorageError::Storage(e) => Some(e),
+            MetadataStorageError::Codec(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<StorageError> for MetadataStorageError {
     fn from(e: StorageError) -> Self {

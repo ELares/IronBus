@@ -214,7 +214,14 @@ impl core::fmt::Display for DataPlaneError {
     }
 }
 
-impl std::error::Error for DataPlaneError {}
+impl std::error::Error for DataPlaneError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DataPlaneError::Replication(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<ReplicationError> for DataPlaneError {
     fn from(e: ReplicationError) -> Self {

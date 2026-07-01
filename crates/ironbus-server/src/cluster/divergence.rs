@@ -449,7 +449,15 @@ impl core::fmt::Display for DivergenceError {
     }
 }
 
-impl std::error::Error for DivergenceError {}
+impl std::error::Error for DivergenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DivergenceError::Storage(e) => Some(e),
+            DivergenceError::Frame(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<StorageError> for DivergenceError {
     fn from(e: StorageError) -> Self {

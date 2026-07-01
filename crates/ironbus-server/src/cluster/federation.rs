@@ -137,7 +137,14 @@ impl core::fmt::Display for FederationError {
     }
 }
 
-impl std::error::Error for FederationError {}
+impl std::error::Error for FederationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FederationError::Domain(e) => Some(e),
+            FederationError::Config { .. } => None,
+        }
+    }
+}
 
 impl From<DomainError> for FederationError {
     fn from(e: DomainError) -> Self {

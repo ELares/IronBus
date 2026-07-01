@@ -278,7 +278,16 @@ impl core::fmt::Display for LeafError {
     }
 }
 
-impl std::error::Error for LeafError {}
+impl std::error::Error for LeafError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LeafError::CorruptFrame { reason, .. } => Some(reason),
+            LeafError::Storage(e) => Some(e),
+            LeafError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for LeafError {
     fn from(e: io::Error) -> Self {

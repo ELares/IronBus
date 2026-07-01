@@ -176,7 +176,16 @@ impl core::fmt::Display for PeerWireError {
     }
 }
 
-impl std::error::Error for PeerWireError {}
+impl std::error::Error for PeerWireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PeerWireError::Frame(e) => Some(e),
+            PeerWireError::Decode(e) => Some(e),
+            PeerWireError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for PeerWireError {
     fn from(e: io::Error) -> Self {

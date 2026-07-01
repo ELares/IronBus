@@ -84,7 +84,17 @@ impl core::fmt::Display for GroupError {
     }
 }
 
-impl std::error::Error for GroupError {}
+impl std::error::Error for GroupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GroupError::Raft(e) => Some(e),
+            GroupError::Decode(e) => Some(e),
+            GroupError::Storage(e) => Some(e),
+            GroupError::PeerId(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<raft::Error> for GroupError {
     fn from(e: raft::Error) -> Self {

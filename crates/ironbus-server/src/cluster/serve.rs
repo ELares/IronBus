@@ -180,7 +180,16 @@ impl core::fmt::Display for DataPlaneWireError {
     }
 }
 
-impl std::error::Error for DataPlaneWireError {}
+impl std::error::Error for DataPlaneWireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DataPlaneWireError::Frame(e) => Some(e),
+            DataPlaneWireError::Decode(e) => Some(e),
+            DataPlaneWireError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for DataPlaneWireError {
     fn from(e: io::Error) -> Self {
