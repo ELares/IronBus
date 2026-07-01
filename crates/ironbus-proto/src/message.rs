@@ -4072,6 +4072,44 @@ mod tests {
                 prop_assert!(record_bytes.len() <= bytes.len());
                 prop_assert!(bytes.ends_with(record_bytes));
             }
+            // #852: the variable-length, Reader-framed decoders for the primary untrusted-input verbs
+            // (explicit-stream pub/sub, txn 2PC, subject bind/pub/sub, the streaming verbs) and the
+            // hostile-SERVER responses (not_leader, produce_confirm, stream_info_response, deliver_batch).
+            // Each parses `version + u16 field_len + length-prefixed sub-fields`; a bounds slip that
+            // swaps a checked `Reader` read for unchecked indexing (or miscomputes a `take`/`var` length)
+            // reintroduces an over-read/over-alloc. proptest fails on any panic automatically, so calling
+            // each on the SAME arbitrary `bytes` is the randomized net these paths otherwise lack.
+            let _ = decode_pub_to(&bytes);
+            let _ = decode_sub_to(&bytes);
+            let _ = decode_txn_prepare(&bytes);
+            let _ = decode_txn_resolve(&bytes);
+            let _ = decode_txn_check_result(&bytes);
+            let _ = decode_txn_listen(&bytes);
+            let _ = decode_bind_subject(&bytes);
+            let _ = decode_pub_subject(&bytes);
+            let _ = decode_sub_subject(&bytes);
+            let _ = decode_stream_fetch(&bytes);
+            let _ = decode_stream_commit(&bytes);
+            let _ = decode_stream_declare(&bytes);
+            let _ = decode_stream_info(&bytes);
+            let _ = decode_stream_info_response(&bytes);
+            let _ = decode_not_leader(&bytes);
+            let _ = decode_produce_confirm(&bytes);
+            // The VERBATIM carriers frame an inner codec's bytes as their remainder tail; feeding that
+            // recovered tail back through the inner codec covers the SECOND-stage parse a raw call
+            // stops one level short of (the tail a hostile client fully controls).
+            if let Ok(b) = decode_pub_to(&bytes) {
+                let _ = decode_pub(b.pub_body);
+            }
+            if let Ok(b) = decode_pub_subject(&bytes) {
+                let _ = decode_pub(b.pub_body);
+            }
+            if let Ok(b) = decode_txn_prepare(&bytes) {
+                let _ = decode_pub(b.pub_body);
+            }
+            if let Ok((_, recs)) = decode_deliver_batch(&bytes) {
+                let _ = recs;
+            }
             // SUB is infallible: any byte string is a valid body, and decoding it recovers the
             // exact bytes as the group, so it cannot panic either.
             prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());
