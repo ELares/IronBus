@@ -72,7 +72,7 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +106,39 @@ impl Drop for HealthHandlerSlot<'_> {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// The per-server count of health connections SHED — dropped without a handler — broken out by the two
+/// shed sites the accept loop has (#953): `at_cap`, already at [`MAX_CONCURRENT_HEALTH_HANDLERS`]
+/// in-flight handlers, and `spawn_refused`, the OS refusing a handler thread (#866). Shedding was
+/// SILENT before #953 (unlike the wire server's `ConnectionMetrics` refused count), so an operator
+/// could not see health probes being dropped under a flood; these render as the labeled counter
+/// `ironbus_health_shed_total{reason}` on `/metrics`. Lives on the accept loop's stack alongside the
+/// in-flight gauge — health-owned, deliberately NOT folded into the wire `connz` set (health probes
+/// were never in connz) — and is read by the `/metrics` handler under the same thread scope.
+#[derive(Debug, Default)]
+struct HealthShedCounters {
+    at_cap: AtomicU64,
+    spawn_refused: AtomicU64,
+}
+
+impl HealthShedCounters {
+    /// Reads a relaxed snapshot of the two shed counters for the `/metrics` scrape.
+    fn snapshot(&self) -> HealthShedSnapshot {
+        HealthShedSnapshot {
+            at_cap: self.at_cap.load(Ordering::Relaxed),
+            spawn_refused: self.spawn_refused.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A plain `Copy` snapshot of [`HealthShedCounters`], carried into the metric renderer.
+#[derive(Clone, Copy, Debug, Default)]
+struct HealthShedSnapshot {
+    /// Connections shed because the in-flight cap was full (`reason="at_cap"`).
+    at_cap: u64,
+    /// Connections shed because the OS refused a handler thread (`reason="spawn_refused"`, #866).
+    spawn_refused: u64,
 }
 
 /// Serves the health endpoints over `listener` until `shutdown` is set. Connections are
@@ -241,6 +274,9 @@ where
     // `MAX_CONCURRENT_HEALTH_HANDLERS` (#874). Lives on this loop's stack; the scoped handler threads
     // borrow it and the scope joins every one of them before this function returns.
     let in_flight = AtomicUsize::new(0);
+    // The health-shed counters (#953), health-owned on this loop's stack (like `in_flight`): the
+    // accept loop increments them on a shed and the `/metrics` handler reads them under the scope.
+    let shed = HealthShedCounters::default();
     // A THREAD SCOPE, so each handler may borrow the loop's `engine`/`clock`/beacons by reference
     // (no `'static`/clone required) while the scope GUARANTEES every outstanding handler is joined
     // before `serve_health_connz_draining` returns — preserving graceful shutdown: when `shutdown`
@@ -254,11 +290,13 @@ where
                     // in-flight handlers. At the cap, SHED the connection (drop the stream, which
                     // closes it) rather than spawn an unbounded thread — so a slow/stalled probe
                     // client (or a `health_allow_public` flood) occupies at most one slot and can
-                    // NEVER starve a liveness/readiness probe nor exhaust threads/fds. The load is a
-                    // single relaxed-ish atomic; a benign over-admit race across the check and the
-                    // `fetch_add` can only transiently exceed the cap by the number of concurrent
-                    // accepts (one, since accept is single-threaded here), well within safety.
+                    // NEVER starve a liveness/readiness probe nor exhaust threads/fds. The cap is
+                    // EXACT: this loop is the SOLE incrementer and accept is single-threaded, so the
+                    // check and the `fetch_add` below never race each other (only the handlers ever
+                    // DECREMENT, which can only free a slot); the cap is never even transiently
+                    // exceeded. A shed is COUNTED (#953) so a flood is observable on `/metrics`.
                     if in_flight.load(Ordering::Acquire) >= MAX_CONCURRENT_HEALTH_HANDLERS {
+                        shed.at_cap.fetch_add(1, Ordering::Relaxed);
                         drop(stream); // shed: closes the connection immediately
                         continue;
                     }
@@ -274,6 +312,7 @@ where
                         .name("ironbus-health".to_string())
                         .spawn_scoped(scope, {
                             let in_flight = &in_flight;
+                            let shed = &shed;
                             move || {
                                 // Release the reserved slot on EVERY exit (return or unwind).
                                 let _slot = HealthHandlerSlot { in_flight };
@@ -290,6 +329,7 @@ where
                                     clock,
                                     connz,
                                     data_dir,
+                                    shed,
                                 );
                             }
                         });
@@ -297,6 +337,8 @@ where
                         // The OS refused thread creation: the closure (and its `stream`) was dropped,
                         // closing the connection, and the `HealthHandlerSlot` was never built — so
                         // UNDO the reserve here and keep serving, shedding like the at-cap branch.
+                        // COUNT it (#953) so a thread-creation flood is observable on `/metrics`.
+                        shed.spawn_refused.fetch_add(1, Ordering::Relaxed);
                         in_flight.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
@@ -324,6 +366,7 @@ fn handle<F, C, E>(
     clock: &C,
     connz: &Arc<ConnectionMetrics>,
     data_dir: Option<&Path>,
+    shed: &HealthShedCounters,
 ) -> std::io::Result<()>
 where
     F: Filesystem + 'static,
@@ -433,7 +476,7 @@ where
                 respond(&mut stream, 503, "Service Unavailable", "writer frozen")
             }
         }
-        "/metrics" => match metrics_snapshot(engine, connz, data_dir) {
+        "/metrics" => match metrics_snapshot(engine, connz, data_dir, shed.snapshot()) {
             Ok(snapshot) => respond(&mut stream, 200, "OK", &metrics_body(snapshot)),
             Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
         },
@@ -648,6 +691,7 @@ fn metrics_snapshot<F, C, E>(
     engine: &E,
     connz: &ConnectionMetrics,
     data_dir: Option<&Path>,
+    health_shed: HealthShedSnapshot,
 ) -> Result<MetricsSnapshot, crate::actor::ActorGone>
 where
     F: Filesystem + 'static,
@@ -717,6 +761,9 @@ where
             // `df`/atomic read inside the actor job. The defaults are the not-yet-read placeholders.
             connz: ConnectionMetricsSnapshot::default(),
             disk_free: crate::rss::UNAVAILABLE,
+            // The health-shed counts (#953) are OFF-lock health-server state, not engine state, so
+            // they are the not-yet-set placeholder here and filled in below (like connz / disk-free).
+            health_shed: HealthShedSnapshot::default(),
             groups: g.group_consumer_stats(),
             // The bounded metric registry (#97) is rendered into a String inside the actor job (it walks
             // only the bounded series set and the fixed histograms, so the work is O(number of series),
@@ -734,6 +781,9 @@ where
     // Read the CONNECTION SIGNALS (#572) off-lock: a consistent-enough snapshot of the shared connz
     // atomics (accept/close/refuse/open/auth), recorded by the wire server off the engine lock.
     snapshot.connz = connz.snapshot();
+    // Attach the health-probe SHED counts (#953): health-server state the handler passed in, not
+    // engine state, so like connz it is set here rather than read under the engine lock.
+    snapshot.health_shed = health_shed;
     // Read the DISK-FREE bytes (#573) off-lock on the filesystem the durable log lives on, when a data
     // dir is known. An in-memory broker (no data dir) and a platform where `df` is unavailable both
     // report the `-1` unavailable sentinel rather than a misleading zero, exactly like the RAM gauges.
@@ -907,6 +957,11 @@ struct MetricsSnapshot {
     /// engine state). On the legacy `serve_health` path (an un-shared fresh metric) this is the at-rest
     /// all-zero block — the series exist (the frozen taxonomy requires them) but report the honest zero.
     connz: ConnectionMetricsSnapshot,
+    /// The health-probe SHED counts (#953): connections the health accept loop dropped without a
+    /// handler, by reason (`at_cap` / `spawn_refused`). Health-owned off-lock state (not engine, not
+    /// connz), so it is passed in by the handler rather than read under the engine lock. Rendered as
+    /// the labeled counter `ironbus_health_shed_total{reason}`; zero when the surface has never shed.
+    health_shed: HealthShedSnapshot,
     /// The FREE bytes on the filesystem the durable log lives on (#573), or the `-1` unavailable
     /// sentinel for an in-memory broker (no data dir), a platform where `df` is unavailable, or the
     /// legacy `serve_health` path (no data dir threaded). Read OUTSIDE the engine lock (a process-level
@@ -1059,6 +1114,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         backpressure,
         rss,
         connz,
+        health_shed,
         disk_free,
         groups,
         registry,
@@ -1082,6 +1138,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&edge_metric_lines(&edge, rss, disk_free));
     body.push_str(&connz_metric_lines(connz));
+    body.push_str(&health_shed_lines(health_shed));
     body.push_str(&durability_metric_lines(&durability));
     body.push_str(&cluster_ack_metric_lines(&cluster_ack));
     body.push_str(&backpressure_metric_lines(&backpressure));
@@ -1412,6 +1469,29 @@ fn connz_metric_lines(connz: ConnectionMetricsSnapshot) -> String {
         auth_failed = connz.rejected_auth_failed,
     );
     s
+}
+
+/// Renders the HEALTH-PROBE shed counter (#953): `ironbus_health_shed_total{reason}`, one LABELED
+/// counter per shed site the health accept loop has — `at_cap` (already at
+/// [`MAX_CONCURRENT_HEALTH_HANDLERS`] in-flight handlers) and `spawn_refused` (the OS refused a
+/// handler thread, #866). Before this the health surface shed SILENTLY, so an operator could not see
+/// probes being dropped under a flood; this makes the flood observable, the health twin of the wire
+/// server's connz `refused` signal (#865) — but deliberately its OWN series, since health probes were
+/// never in connz. Being a LABELED `_total`, its sample lines are excluded from the unlabeled-`_total`
+/// resilience-taxonomy test by construction (exactly like `ironbus_connections_total{state}`) and the
+/// family is pinned only in `FROZEN_METRIC_TYPES`: a health-probe shed is a flood-protection signal,
+/// NOT a record-loss resilience SHED, so it does not belong in the loss/shed taxonomy. The `reason`
+/// label is a fixed two-value enum, so the cardinality is bounded by construction; both samples are
+/// zero on a broker whose health surface has never shed.
+fn health_shed_lines(shed: HealthShedSnapshot) -> String {
+    format!(
+        "# HELP ironbus_health_shed_total Health-probe connections shed (dropped without a handler) by the health accept loop, by reason (#953); the `reason` label is one of at_cap|spawn_refused (at_cap = the MAX_CONCURRENT_HEALTH_HANDLERS in-flight cap was full; spawn_refused = the OS refused a handler thread). A flood-protection signal, 0 on a broker whose health surface has never shed.\n\
+         # TYPE ironbus_health_shed_total counter\n\
+         ironbus_health_shed_total{{reason=\"at_cap\"}} {at_cap}\n\
+         ironbus_health_shed_total{{reason=\"spawn_refused\"}} {spawn_refused}\n",
+        at_cap = shed.at_cap,
+        spawn_refused = shed.spawn_refused,
+    )
 }
 
 /// Renders a per-mille ratio gauge (#574) WITHOUT floating point: a value in `[0, 1000]` is printed
@@ -2411,7 +2491,56 @@ fn respond_with(
          {body}",
         body.len()
     );
-    stream.write_all(response.as_bytes())
+    // Write the WHOLE response under ONE monotonic deadline (#953), not the per-syscall
+    // `set_write_timeout` the handler armed: that timeout RESETS on every partial write, so a slow
+    // READER dribbling one byte per window could hold this handler — and thus one of the
+    // MAX_CONCURRENT_HEALTH_HANDLERS slots — for ~response-size × REQUEST_TIMEOUT. A whole-response
+    // budget bounds the write to at most REQUEST_TIMEOUT regardless of body size (the /metrics and
+    // /admin bodies are the large ones), so a stalled reader frees its slot strictly on time. Each
+    // response is a single write (Connection: close), so this deadline is the handler's write budget.
+    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+    write_all_by_deadline(stream, response.as_bytes(), deadline)
+}
+
+/// Writes `bytes` in full under a WHOLE-RESPONSE monotonic `deadline` (#953). Unlike the socket's
+/// `set_write_timeout` — a PER-SYSCALL budget that RESETS on every partial write, so a slow reader
+/// making one byte of progress per window can stretch the total to ~response-size × `REQUEST_TIMEOUT` —
+/// this bounds the ENTIRE write regardless of body size: before each `write` the per-syscall timeout
+/// is trimmed to the REMAINING budget, and once the budget is spent the write fails `TimedOut` rather
+/// than blocking anew. That strictly caps how long a stalled reader can pin one handler (hence one of
+/// the [`MAX_CONCURRENT_HEALTH_HANDLERS`] slots). An `Interrupted` (`EINTR`) write is retried; a
+/// short write advances and loops.
+fn write_all_by_deadline(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "health response write deadline exceeded",
+            ));
+        }
+        // Trim the per-syscall timeout to what remains of the whole-response budget, so a blocking
+        // write can never outlast the deadline. `now < deadline` here, so the remaining budget is
+        // strictly positive — never the zero-duration timeout `set_write_timeout` rejects.
+        stream.set_write_timeout(Some(deadline.saturating_duration_since(now)))?;
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "health response write returned zero",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2614,6 +2743,121 @@ mod tests {
 
         // Release the stalled clients (frees their handlers), then shut down and join the scope.
         drop(stalled);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    // Unix-only: staging the stall requires the Unix send-buffer-fills-then-blocks semantics. On
+    // Windows loopback a 16 MiB write to a never-reading peer does not reliably block (the kernel
+    // buffers/accepts it), so `write_all_by_deadline` returns `Ok` and the stall cannot be forced;
+    // the assertion `expect_err` then fails there. The production `write_all_by_deadline` deadline is
+    // wall-clock and platform-independent (and is exercised by the health server on all platforms);
+    // the mutation reasoning in the body documents the guarantee it enforces.
+    #[cfg(unix)]
+    #[test]
+    fn write_all_by_deadline_bounds_a_stalled_reader_regardless_of_body_size() {
+        // #953: the whole-response write deadline must give up at the deadline even when the peer
+        // never reads (so the OS send buffer fills and the write blocks), instead of blocking the
+        // socket's per-syscall write timeout (REQUEST_TIMEOUT = 5s) on the full buffer. A body far
+        // larger than any send buffer forces a blocking write; a 300ms deadline must cap it. Mutation
+        // check: a `write_all_by_deadline` that ignored `deadline` (fell back to the 5s per-syscall
+        // timeout) would return only after ~5s, failing the sub-2s ceiling below.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Connect a peer that NEVER reads, so the server-side send buffer fills and the write stalls.
+        let _peer = TcpStream::connect(addr).unwrap();
+        let (mut server, _a) = listener.accept().unwrap();
+        // Far larger than any socket send buffer, so the write cannot drain and MUST block.
+        let big = vec![b'x'; 16 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let err = write_all_by_deadline(&mut server, &big, deadline)
+            .expect_err("a never-read peer must make the deadlined write fail, not succeed");
+        let elapsed = started.elapsed();
+        // The OS surfaces a fired write timeout as WouldBlock (EAGAIN) or TimedOut; either is fine.
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected a timeout-shaped error, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the write must be bounded by the whole-response deadline (~300ms), took {elapsed:?}; \
+             a per-syscall-only timeout would block ~5s on the full send buffer"
+        );
+    }
+
+    #[test]
+    fn health_shed_lines_render_both_reasons() {
+        // #953: the shed counter renders one labeled sample per reason with its exact value. A LABELED
+        // `_total`, so its sample lines are excluded from the unlabeled resilience-taxonomy filter (they
+        // end in `}`) and it is pinned only in FROZEN_METRIC_TYPES.
+        let out = health_shed_lines(HealthShedSnapshot {
+            at_cap: 7,
+            spawn_refused: 3,
+        });
+        assert!(
+            out.contains("# TYPE ironbus_health_shed_total counter\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ironbus_health_shed_total{reason=\"at_cap\"} 7\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ironbus_health_shed_total{reason=\"spawn_refused\"} 3\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn health_probes_shed_at_the_cap_are_counted_on_metrics() {
+        // #953: shedding at MAX_CONCURRENT_HEALTH_HANDLERS was SILENT; now it increments
+        // `ironbus_health_shed_total{reason="at_cap"}`, so a flood is observable. Open MORE than the cap
+        // of stalled connections SIMULTANEOUSLY (each dribbles a headless request line so its handler
+        // blocks in `read_request_head`), so by pigeonhole at least (count - cap) are shed at the cap.
+        // Then release them (freeing the slots) and scrape /metrics, which must report a non-zero
+        // at_cap. Mutation check: dropping the `shed.at_cap.fetch_add` leaves it 0 and fails here.
+        let (addr, shutdown, handle, _engine) = start();
+
+        // Comfortably above MAX_CONCURRENT_HEALTH_HANDLERS (32), held open in a Vec so all are
+        // concurrently in flight before any handler frees (a dropped socket would EOF and free early).
+        let mut stalled = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_HEALTH_HANDLERS + 12) {
+            if let Ok(mut c) = TcpStream::connect(addr) {
+                let _ = c.write_all(b"GET /metrics HTTP/1.1"); // no '\n': the handler blocks
+                let _ = c.flush();
+                stalled.push(c);
+            }
+        }
+        // Let the accept loop take every pending connection: it admits the cap and SHEDS the rest.
+        std::thread::sleep(Duration::from_millis(500));
+        // Free the slots so the scrape below can be served, then let the handlers exit.
+        drop(stalled);
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Scrape /metrics (retry a little in case a slot has not freed yet) and read the at_cap count.
+        let mut at_cap = 0i64;
+        for _ in 0..10 {
+            let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+            if m.starts_with("HTTP/1.1 200 OK") {
+                at_cap = metric_value(&m, "ironbus_health_shed_total{reason=\"at_cap\"}");
+                if at_cap > 0 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            at_cap >= 1,
+            "opening {} > cap {} concurrent probes must shed at least one at the cap, counted on \
+             ironbus_health_shed_total{{reason=\"at_cap\"}}, got {at_cap}",
+            MAX_CONCURRENT_HEALTH_HANDLERS + 12,
+            MAX_CONCURRENT_HEALTH_HANDLERS
+        );
+
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -5070,6 +5314,14 @@ mod tests {
         // `_total` is pinned ONLY here (its labeled sample lines are excluded from the unlabeled-`_total`
         // resilience-taxonomy test by construction, exactly like `ironbus_connections_total{state}`).
         ("ironbus_connections_rejected_total", "counter"),
+        // Health-probe shed counter (#953): one LABELED counter family
+        // `ironbus_health_shed_total{reason}` whose `reason` label is a fixed two-value enum
+        // (at_cap|spawn_refused — never a per-connection value), so the cardinality is bounded by
+        // construction. A health-probe shed is a flood-protection signal, NOT a record-loss resilience
+        // SHED, so — like `ironbus_connections_total{state}` — the labeled `_total` is pinned ONLY here
+        // (its labeled sample lines are excluded from the unlabeled-`_total` resilience-taxonomy test by
+        // construction). Health probes were never in connz, so this is its own series, not folded in.
+        ("ironbus_health_shed_total", "counter"),
         // Disk-free + durable-storage telemetry (#573): the free bytes on the log's filesystem, the
         // on-disk record footprint it is measured against, and the segment-file count. All GAUGES.
         ("ironbus_disk_free_bytes", "gauge"),
