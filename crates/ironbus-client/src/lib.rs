@@ -1766,7 +1766,26 @@ impl Client {
         // expand to credit x the per-record 8 MiB cap of resident RAM.
         let mut decompressed_bytes = 0usize;
         loop {
-            let (frame_type, body) = self.read_frame()?;
+            // Buffer one complete frame, then decode its body by BORROWING it out of `self.buf`
+            // (#818) rather than copying it into a throwaway owned `Vec` as `read_frame` does. Every
+            // byte that survives into a `Message` is copied exactly once, while the borrow is live;
+            // the frame is drained only after all surviving copies are made (`self.buf.drain` at the
+            // loop bottom / before each terminal return), so the borrow-then-drain ordering holds.
+            self.fill_frame()?;
+            let FrameDecode::Frame {
+                type_tag,
+                body,
+                consumed,
+            } = decode_frame(&self.buf).map_err(ClientError::Frame)?
+            else {
+                // `fill_frame` returns only once `decode_frame` yielded a complete `Frame`, and
+                // `self.buf` is unchanged since, so a re-decode here cannot be `Incomplete`.
+                unreachable!("fill_frame guarantees a complete frame at the front of the buffer");
+            };
+            // An unknown tag (e.g. from a newer server) has no client handler; name the raw tag
+            // rather than pretending it was some known frame.
+            let frame_type =
+                FrameType::from_u8(type_tag).ok_or(ClientError::UnknownFrameType(type_tag))?;
             // The credit check binds every batch frame uniformly (deliveries, advisories, and
             // the post-poison drain); FlowEnd and Err terminate the batch and are exempt.
             if !matches!(frame_type, FrameType::FlowEnd | FrameType::Err) {
@@ -1777,9 +1796,9 @@ impl Client {
                 }
                 frames += 1;
             }
-            match (frame_type, body) {
-                (FrameType::Deliver, body) => {
-                    let d = decode_deliver(&body).map_err(ClientError::Body)?;
+            match frame_type {
+                FrameType::Deliver => {
+                    let d = decode_deliver(body).map_err(ClientError::Body)?;
                     ingest_delivery(
                         &d,
                         &mut messages,
@@ -1797,9 +1816,9 @@ impl Client {
                 // VERIFIED here by `codec::decode` (header and body), so integrity is checked end-to-end;
                 // a corrupt frame is a typed error, never silently accepted. Only seen on a
                 // batch-capable connection; an old server never sends this tag.
-                (FrameType::DeliverBatch, body) => {
+                FrameType::DeliverBatch => {
                     let (header, record_bytes) =
-                        decode_deliver_batch(&body).map_err(ClientError::Body)?;
+                        decode_deliver_batch(body).map_err(ClientError::Body)?;
                     // A batch carries N records but counted as ONE frame at the loop top; charge the
                     // remaining (N - 1) records against the credit bound so a hostile server cannot
                     // smuggle an unbounded run of records inside one batch frame. The server bounds a
@@ -1859,8 +1878,8 @@ impl Client {
                 }
                 // An in-band dead-letter advisory for an offset skipped as poison (#63). It is
                 // not a delivery, so it carries its own offset and does not ack.
-                (FrameType::DeadLetter, body) => {
-                    let dl = decode_dead_letter(&body).map_err(ClientError::Body)?;
+                FrameType::DeadLetter => {
+                    let dl = decode_dead_letter(body).map_err(ClientError::Body)?;
                     dead_letters.push(DeadLetter {
                         offset: dl.offset,
                         reason: dl.reason,
@@ -1870,8 +1889,8 @@ impl Client {
                 // retained record because the disk-full drop-oldest policy reaped its records
                 // (#82, #84). It is not a delivery and does not ack; it names where delivery
                 // resumed and how many records were skipped.
-                (FrameType::Truncated, body) => {
-                    let t = decode_truncated(&body).map_err(ClientError::Body)?;
+                FrameType::Truncated => {
+                    let t = decode_truncated(body).map_err(ClientError::Body)?;
                     truncations.push(Truncation {
                         earliest_retained: t.earliest_retained,
                         skipped: t.skipped,
@@ -1881,8 +1900,8 @@ impl Client {
                 // Truncated advisory. A skipped offset span `[from, to)` is permanently absent, so a
                 // reader tracking contiguity learns the jump is a bounded, reported gap rather than
                 // loss. Only seen on a gap-marker-capable connection; an old server never sends it.
-                (FrameType::GapMarker, body) => {
-                    let g = decode_gap_marker(&body).map_err(ClientError::Body)?;
+                FrameType::GapMarker => {
+                    let g = decode_gap_marker(body).map_err(ClientError::Body)?;
                     gaps.push(Gap {
                         from: g.from,
                         to: g.to,
@@ -1894,7 +1913,10 @@ impl Client {
                 // pending decompression failure is surfaced HERE, after the whole batch
                 // (including this FlowEnd) has been consumed, so the connection is left exactly
                 // where a successful fetch would leave it.
-                (FrameType::FlowEnd, _) => {
+                FrameType::FlowEnd => {
+                    // Drain the terminating FlowEnd before returning so the connection is left framed
+                    // for the next request, exactly as the old `read_frame` (drain-then-return) did.
+                    self.buf.drain(..consumed);
                     return match poison {
                         Some(e) => Err(e),
                         None => Ok(Fetch {
@@ -1903,13 +1925,24 @@ impl Client {
                             truncations,
                             gaps,
                         }),
-                    }
+                    };
                 }
-                (FrameType::Err, body) => {
-                    return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+                FrameType::Err => {
+                    // Err is a connection-preserving per-Flow terminator (the server keeps the
+                    // connection open after a fetch Err), so drain the terminating Err frame before
+                    // returning to keep the connection framed for reuse, exactly as FlowEnd and the
+                    // old `read_frame` (drain-then-return) did. Materialize the owned message first
+                    // since `body` borrows `self.buf`, which the drain then mutates.
+                    let msg = String::from_utf8_lossy(body).into_owned();
+                    self.buf.drain(..consumed);
+                    return Err(ClientError::Server(msg));
                 }
-                (other, _) => return Err(ClientError::Unexpected(other)),
+                other => return Err(ClientError::Unexpected(other)),
             }
+            // A non-terminating frame (delivery / batch / advisory) was fully ingested above; every
+            // surviving byte is now owned by a `Message`, so the borrow is dead and the frame can be
+            // dropped from the buffer.
+            self.buf.drain(..consumed);
         }
     }
 
@@ -2887,6 +2920,31 @@ impl Client {
     /// Reads one complete frame, buffering leftover bytes for the next call.
     fn read_frame(&mut self) -> Result<(FrameType, Vec<u8>), ClientError> {
         read_frame_from(&mut self.stream, &mut self.buf)
+    }
+
+    /// Buffers bytes from the socket until at least one complete frame sits at the front of
+    /// `self.buf`, WITHOUT consuming it. The borrowing counterpart to [`Client::read_frame`] (#818):
+    /// the delivery fan-in ([`Client::read_fetch_response`]) decodes each `Deliver` / `DeliverBatch`
+    /// body directly out of `self.buf` and copies each surviving payload exactly once into its
+    /// `Message`, then drains — avoiding the throwaway owned `Vec` (a heap alloc plus a full-body
+    /// memcpy, a whole-batch copy for `DeliverBatch`) that `read_frame` materializes per frame. The
+    /// decoded `Message`s handed to the caller are byte-for-byte identical either way.
+    ///
+    /// On return, `decode_frame(&self.buf)` is guaranteed to yield [`FrameDecode::Frame`] (the buffer
+    /// is unchanged between the last decode here and the caller's).
+    fn fill_frame(&mut self) -> Result<(), ClientError> {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match decode_frame(&self.buf).map_err(ClientError::Frame)? {
+                FrameDecode::Frame { .. } => return Ok(()),
+                FrameDecode::Incomplete { .. } => {}
+            }
+            let n = self.stream.read(&mut chunk)?;
+            if n == 0 {
+                return Err(ClientError::Closed);
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
     }
 }
 
@@ -5761,6 +5819,161 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].payload, original);
         assert_eq!(messages[0].flags & RecordFlags::COMPRESSED.bits(), 0);
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn back_to_back_fetch_responses_stay_framed_across_the_borrowing_drain() {
+        // #818: the delivery fan-in now decodes each frame body by BORROWING it out of the client
+        // buffer and drains only AFTER every surviving byte is copied into its `Message`. The reordered
+        // drain must consume EXACTLY one frame each iteration (and the terminating FlowEnd). Two complete
+        // fetch responses are buffered back-to-back (raw_server writes the whole script up front), so the
+        // SECOND response is already sitting in the client's buffer when the FIRST fetch returns. If any
+        // per-frame or FlowEnd drain were off by a byte, the second fetch would misframe. Each fetch must
+        // decode its own records byte-for-byte, and the two deliveries buffered together in response 1
+        // prove the per-frame drain length is exact.
+        let mut d0 = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 0,
+                generation: 7,
+                flags: 0,
+                timestamp_ms: 11,
+                key: b"k0",
+                headers: b"h0",
+                payload: b"first-a",
+            },
+            &mut d0,
+        )
+        .unwrap();
+        let mut d1 = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 1,
+                generation: 7,
+                flags: 0,
+                timestamp_ms: 12,
+                key: b"k1",
+                headers: b"",
+                payload: b"first-b",
+            },
+            &mut d1,
+        )
+        .unwrap();
+        let mut d2 = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 2,
+                generation: 9,
+                flags: 0,
+                timestamp_ms: 13,
+                key: b"",
+                headers: b"h2",
+                payload: b"second-only",
+            },
+            &mut d2,
+        )
+        .unwrap();
+
+        let mut script = frame(FrameType::Info, b"");
+        // Response 1: two deliveries + FlowEnd(2).
+        script.extend(frame(FrameType::Deliver, &d0));
+        script.extend(frame(FrameType::Deliver, &d1));
+        script.extend(frame(FrameType::FlowEnd, &2u32.to_le_bytes()));
+        // Response 2: one delivery + FlowEnd(1), already buffered behind response 1.
+        script.extend(frame(FrameType::Deliver, &d2));
+        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+
+        let mut c = Client::connect(addr).unwrap();
+        let first = c.fetch(10).unwrap().messages;
+        assert_eq!(first.len(), 2, "response 1 yields both buffered deliveries");
+        assert_eq!(first[0].offset, 0);
+        assert_eq!(first[0].key, b"k0");
+        assert_eq!(first[0].headers, b"h0");
+        assert_eq!(first[0].payload, b"first-a");
+        assert_eq!(first[1].offset, 1);
+        assert_eq!(first[1].key, b"k1");
+        assert_eq!(first[1].payload, b"first-b");
+        // The second response was ALREADY in the buffer when the first fetch returned; that it decodes
+        // cleanly proves the reordered borrow-then-drain left the connection exactly framed.
+        let second = c.fetch(10).unwrap().messages;
+        assert_eq!(second.len(), 1, "response 2 survives the reordered drain");
+        assert_eq!(second[0].offset, 2);
+        assert_eq!(second[0].generation, 9);
+        assert_eq!(second[0].headers, b"h2");
+        assert_eq!(second[0].payload, b"second-only");
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_fetch_server_err_leaves_the_connection_framed_for_reuse() {
+        // #818 regression: `Err` is a CONNECTION-PRESERVING per-Flow terminator — the server keeps the
+        // connection open after a fetch `Err` — so the borrow-then-drain fetch loop must DRAIN the
+        // terminating `Err` frame before returning, exactly as it drains the sibling `FlowEnd`
+        // terminator. Response 1 ends in an `Err`; response 2 (a valid delivery + FlowEnd) is already
+        // buffered behind it. If the `Err` frame were left in the buffer, the second fetch would re-read
+        // those stale bytes and misframe (re-surfacing the server error instead of decoding response 2).
+        // That the second fetch succeeds proves the `Err` was drained and the connection stayed exactly
+        // framed for reuse.
+        let mut d0 = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 0,
+                generation: 3,
+                flags: 0,
+                timestamp_ms: 21,
+                key: b"k0",
+                headers: b"h0",
+                payload: b"before-the-err",
+            },
+            &mut d0,
+        )
+        .unwrap();
+        let mut d1 = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 5,
+                generation: 4,
+                flags: 0,
+                timestamp_ms: 22,
+                key: b"k1",
+                headers: b"h1",
+                payload: b"after-the-err",
+            },
+            &mut d1,
+        )
+        .unwrap();
+
+        let mut script = frame(FrameType::Info, b"");
+        // Response 1: one delivery, then an Err terminator (a per-Flow server error).
+        script.extend(frame(FrameType::Deliver, &d0));
+        script.extend(frame(FrameType::Err, b"consumer fenced"));
+        // Response 2: a valid delivery + FlowEnd(1), already buffered behind the Err.
+        script.extend(frame(FrameType::Deliver, &d1));
+        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+
+        let mut c = Client::connect(addr).unwrap();
+        // The first fetch surfaces the server Err (and, per the fix, drains that Err frame).
+        match c.fetch(10).unwrap_err() {
+            ClientError::Server(msg) => assert_eq!(msg, "consumer fenced"),
+            other => panic!("expected a server error, got {other:?}"),
+        }
+        // The second response was ALREADY buffered behind the Err when the first fetch returned; that it
+        // decodes cleanly proves the Err terminator was drained and left the connection exactly framed.
+        let second = c.fetch(10).unwrap().messages;
+        assert_eq!(
+            second.len(),
+            1,
+            "response 2 survives the Err-terminator drain"
+        );
+        assert_eq!(second[0].offset, 5);
+        assert_eq!(second[0].generation, 4);
+        assert_eq!(second[0].key, b"k1");
+        assert_eq!(second[0].payload, b"after-the-err");
         drop(c);
         handle.join().unwrap();
     }
