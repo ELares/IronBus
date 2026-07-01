@@ -1152,6 +1152,10 @@ fn run_dataplane_listener<F, C>(
     // connection flood, and a per-link warn under that flood would itself be an unbounded log-volume
     // vector. Reset the moment the loop next admits a link (the episode ended).
     let mut cap_warned = false;
+    // Latches while a reader-thread spawn-failure episode is ongoing, so the failure is logged ONCE per
+    // episode (like `cap_warned`) and the loop backs off instead of tight-looping accept-then-drop
+    // under thread/fd exhaustion (#870). Reset by the next successful spawn.
+    let mut spawn_warned = false;
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
@@ -1202,15 +1206,17 @@ fn run_dataplane_listener<F, C>(
                         let _slot = slot;
                         run_dataplane_reader(DataPlaneLink::new(stream), &server, &release, &sd);
                     });
-                if spawn_result.is_err() {
-                    // The OS refused thread creation (EAGAIN/ENOMEM): the failed closure was dropped,
-                    // which released the reserved reader slot (`slot`'s drop) and closed the stream.
-                    // Previously the spawn result was discarded with `let _ =`, swallowing the failure
-                    // silently (#865). Log it so an operator sees the thread/fd pressure, then keep
-                    // accepting rather than wedging the listener.
-                    tracing::warn!(
-                        "data plane: failed to spawn an inbound peer reader thread; link dropped"
-                    );
+                // The OS may refuse thread creation (EAGAIN/ENOMEM): the failed closure is dropped,
+                // which releases the reserved reader slot (`slot`'s drop) and closes the stream.
+                // Previously (#865) the failure was logged but the loop kept tight-looping
+                // accept-then-drop; surface it via tracing (once per episode) AND back off so a
+                // transient thread/fd exhaustion cannot become a hot accept-spin (#870).
+                if super::on_reader_spawn_result(
+                    &spawn_result,
+                    &mut spawn_warned,
+                    "data-plane peer",
+                ) {
+                    sleep_interruptible(DATAPLANE_POLL, &shutdown);
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {

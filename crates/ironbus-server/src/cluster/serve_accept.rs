@@ -235,6 +235,10 @@ fn run_serve_listener<F, C>(
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
 {
+    // Latches while a reader-thread spawn-failure episode is ongoing, so the failure is logged ONCE per
+    // episode rather than once per refused link (#870): under thread/fd exhaustion a per-link warn would
+    // itself be a log-volume vector. Reset by the next successful spawn (see `on_reader_spawn_result`).
+    let mut spawn_warned = false;
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
@@ -250,11 +254,22 @@ fn run_serve_listener<F, C>(
                 let serve_plane = config.serve_plane.clone();
                 let hub_receiver = config.hub_receiver.clone();
                 let sd = Arc::clone(shutdown);
-                let _ = std::thread::Builder::new()
+                // Spawn a detached reader for this cross-cluster link. Previously the spawn `Result` was
+                // discarded with `let _ =`, silently dropping the accepted link (and tight-looping
+                // accept-then-drop) on an EAGAIN/ENOMEM spawn failure (#870). Now surface it via tracing
+                // and back off.
+                let spawn_result = std::thread::Builder::new()
                     .name("ib-xcluster-read".to_string())
                     .spawn(move || {
                         run_serve_reader(stream, serve_plane.as_ref(), hub_receiver.as_ref(), &sd);
                     });
+                if super::on_reader_spawn_result(
+                    &spawn_result,
+                    &mut spawn_warned,
+                    "cross-cluster serve",
+                ) {
+                    sleep_interruptible(SERVE_ACCEPT_POLL, shutdown);
+                }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 sleep_interruptible(SERVE_ACCEPT_POLL, shutdown);
