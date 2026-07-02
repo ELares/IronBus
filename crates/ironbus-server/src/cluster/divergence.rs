@@ -187,6 +187,107 @@ pub fn suspect_uncommitted_tail(
         && follower_next_offset > committed_floor
 }
 
+// ---- #873 Phase 3: BELOW-FRONTIER content-mismatch DETECTION (a C4 content-hash compare over an
+//      overlapping fetched run, reusing the EXISTING fetch wire — no FetchResponse change) -----------
+//
+// Phase 1/2 catch the case where the new leader is BEHIND the follower's fsynced tail (an EMPTY run
+// above the leader frontier). This is the COMPLEMENTARY case Phase 1/2 deliberately do NOT catch: the
+// new leader has ALREADY advanced its flush frontier PAST the follower's divergent tail, so it serves a
+// NON-empty run at offsets the follower already holds but with a DIFFERENT payload (the canonical Raft
+// below-HW log conflict). The follower's forward fetch never reveals it — the conflict is BELOW the
+// fetch point, and `apply_fetch_response` checks only offset-contiguity + POSITIONAL seq (both of which
+// still match a same-offset/same-seq/different-body substitution). It is caught here by the SAME C4
+// content-hash primitive (the verbatim on-disk record-frame bytes), sourced over the EXISTING fetch path
+// (a backward probe from the committed floor — `serve_fetch` reads from ANY offset), so NO new wire
+// field/frame is added. The heal REUSES the merged Phase 2 machinery (truncate to the committed floor).
+
+/// The FIRST offset at which the leader's served run and the follower's OWN held frames DIVERGE in
+/// CONTENT — the below-frontier content-mismatch divergence point (#873 Phase 3), or `None` if every
+/// overlapping frame is byte-identical (no false positive).
+///
+/// Both byte runs are the verbatim on-disk CRC-framed records for the SAME `base_offset`-anchored range
+/// (the leader's `FetchResponse::frame_bytes` from a backward probe, and the follower's own
+/// [`ironbus_storage::log::Log::read_range_raw`] run from the same offset). They are walked FRAME-BY-FRAME
+/// in lockstep; each frame's offset is `base_offset + i`. A byte-for-byte difference of the two frames at
+/// the same positional offset IS a content divergence (same offset + seq, DIFFERENT payload — exactly the
+/// conflict the offset-contiguity + positional-seq guards cannot see). Comparing the raw frame bytes is
+/// the C4 `content_hash` compare at full fidelity (a 64-bit hash would only summarize these same bytes).
+///
+/// PURE + side-effect-free. Returns `None` (conservative, never a false-positive heal) when the overlap
+/// is byte-identical OR when EITHER run has a frame that fails to decode (a torn/short run is a transport
+/// artifact, not a content signal) OR when a run ends before a divergence is found (the compared window
+/// simply held no conflict — a MISS here is safe: nothing is truncated on a `None`).
+#[must_use]
+pub fn first_content_divergence(
+    base_offset: u64,
+    leader_bytes: &[u8],
+    follower_bytes: &[u8],
+) -> Option<u64> {
+    let mut lc = 0usize;
+    let mut fc = 0usize;
+    let mut offset = base_offset;
+    while lc < leader_bytes.len() && fc < follower_bytes.len() {
+        // Decode ONE frame from each run. A decode failure on either side aborts the compare
+        // CONSERVATIVELY (return `None`): the leader bytes are untrusted (a torn run is not a content
+        // signal), and the follower's own bytes failing is a local-corruption concern handled elsewhere.
+        let (_, ll) = ironbus_core::codec::decode(&leader_bytes[lc..]).ok()?;
+        let (_, fl) = ironbus_core::codec::decode(&follower_bytes[fc..]).ok()?;
+        // A malformed length that would over-run the slice is caught here (decode returns the frame's
+        // length; the slices are bounded), so the compare below is panic-free.
+        if lc + ll > leader_bytes.len() || fc + fl > follower_bytes.len() {
+            return None;
+        }
+        if leader_bytes[lc..lc + ll] != follower_bytes[fc..fc + fl] {
+            return Some(offset);
+        }
+        lc += ll;
+        fc += fl;
+        offset += 1;
+    }
+    None
+}
+
+/// The action a #873 Phase 3 below-frontier content-mismatch reconcile takes, decided PURELY from the
+/// first divergent offset ([`first_content_divergence`]) and the follower's OWN quorum-committed floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentReconcile {
+    /// The overlapping run is byte-identical: no content divergence (NO false positive). Do nothing — the
+    /// follower shares the leader's lineage and only needs ordinary forward catch-up.
+    Clean,
+    /// A content divergence AT or ABOVE the committed floor: the divergent region is UNCOMMITTED, so the
+    /// EXISTING Phase 2 loss-free heal ([`crate::cluster::dataplane::DataPlaneController::heal_divergent_follower`])
+    /// truncates the follower's tail down to the committed floor and re-fetches the clean lineage forward.
+    /// LOSS-FREE: only uncommitted bytes are dropped, and the clean leader restores them.
+    HealToCommittedFloor,
+    /// CRITICAL INVARIANT VIOLATION: a content divergence STRICTLY BELOW the committed floor — a
+    /// quorum-COMMITTED record disagrees between replicas. The committed-HW invariant says this is
+    /// impossible; if it is ever observed the caller FAILS CLOSED (logs it loudly, bumps a metric, and
+    /// NEVER truncates below the committed floor), because a truncation to the floor would leave the
+    /// divergent committed record live and a truncation below it would drop committed data.
+    CriticalBelowCommittedFloor {
+        /// The offset of the divergent COMMITTED record.
+        offset: u64,
+    },
+}
+
+/// Classify a #873 Phase 3 content-mismatch (the pure decision the adopt-seam caller acts on): given the
+/// first divergent offset and the follower's committed floor, decide whether to do nothing (byte-identical
+/// overlap), heal to the committed floor (an above-floor uncommitted conflict), or fail closed loudly (a
+/// below-floor committed conflict — a broken invariant). It NEVER selects a truncation below the floor.
+#[must_use]
+pub fn classify_content_divergence(
+    first_divergent_offset: Option<u64>,
+    committed_floor: u64,
+) -> ContentReconcile {
+    match first_divergent_offset {
+        None => ContentReconcile::Clean,
+        Some(offset) if offset < committed_floor => {
+            ContentReconcile::CriticalBelowCommittedFloor { offset }
+        }
+        Some(_) => ContentReconcile::HealToCommittedFloor,
+    }
+}
+
 /// The hard maximum number of per-segment fingerprints a single advertisement may carry. Bounds the
 /// untrusted peer bytes the decode path will buffer and trust: a replica with more sealed segments
 /// than this advertises in batches (the cap is generous head-room — a 64 MiB-segment log at this many
@@ -1967,5 +2068,73 @@ mod tests {
         // A log compared against ITSELF detects nothing — a single replica is never self-divergent.
         let fp = fingerprint_log(&log).expect("fp");
         assert!(compare_fingerprints(&fp, &fp).is_clean());
+    }
+
+    // ===== #873 Phase 3: BELOW-FRONTIER content-mismatch DETECTION + classification =====
+
+    /// Read a log's verbatim on-disk frame bytes for the run starting at `from` (the same primitive the
+    /// Phase 3 backward probe compares over) — bounded to one segment window, which is all the small-log
+    /// scenarios here need (every record fits the first segment).
+    fn raw_bytes_from(log: &Log<InMemoryFs, ManualClock>, from: u64) -> Vec<u8> {
+        log.read_range_raw(Offset::new(from), 1024, None)
+            .expect("raw read")
+            .0
+            .bytes
+            .to_vec()
+    }
+
+    #[test]
+    fn phase3_first_content_divergence_finds_the_first_differing_frame() {
+        // Two same-length lineages that agree on [0,2) and DIFFER at offset 2 (same offset + positional
+        // seq, DIFFERENT payload — the below-HW conflict `apply_fetch_response` cannot see). The compare
+        // returns EXACTLY the first divergent offset.
+        let leader = log_with(&[b"aaa", b"bbb", b"XXX", b"ddd"]);
+        let follower = log_with(&[b"aaa", b"bbb", b"ccc", b"ddd"]);
+        let lb = raw_bytes_from(&leader, 0);
+        let fb = raw_bytes_from(&follower, 0);
+        assert_eq!(
+            first_content_divergence(0, &lb, &fb),
+            Some(2),
+            "the first divergent frame is at offset 2"
+        );
+        // A base-offset shift is carried through: comparing the SAME runs anchored at 10 reports 12.
+        assert_eq!(first_content_divergence(10, &lb, &fb), Some(12));
+    }
+
+    #[test]
+    fn phase3_first_content_divergence_is_none_on_a_byte_identical_overlap() {
+        // Byte-identical lineages: NO false positive (the compare finds nothing, so nothing is healed).
+        let a = log_with(&[b"aaa", b"bbb", b"ccc", b"ddd"]);
+        let b = log_with(&[b"aaa", b"bbb", b"ccc", b"ddd"]);
+        let ab = raw_bytes_from(&a, 0);
+        let bb = raw_bytes_from(&b, 0);
+        assert_eq!(first_content_divergence(0, &ab, &bb), None);
+        // A torn/short leader run (a truncated frame) is a transport artifact, never a content signal.
+        assert_eq!(first_content_divergence(0, &ab[..ab.len() - 3], &bb), None);
+    }
+
+    #[test]
+    fn phase3_classify_heals_above_the_floor_and_fails_closed_below_it() {
+        // No divergence => CLEAN (nothing to do).
+        assert_eq!(
+            classify_content_divergence(None, 10),
+            ContentReconcile::Clean
+        );
+        // A divergence AT the floor (the first uncommitted record) => heal to the floor (loss-free).
+        assert_eq!(
+            classify_content_divergence(Some(10), 10),
+            ContentReconcile::HealToCommittedFloor
+        );
+        // A divergence ABOVE the floor => heal to the floor (drop only the uncommitted divergent tail).
+        assert_eq!(
+            classify_content_divergence(Some(15), 10),
+            ContentReconcile::HealToCommittedFloor
+        );
+        // A divergence STRICTLY BELOW the floor => a quorum-COMMITTED record disagrees: CRITICAL
+        // invariant violation, FAIL CLOSED (never truncate below the committed floor).
+        assert_eq!(
+            classify_content_divergence(Some(5), 10),
+            ContentReconcile::CriticalBelowCommittedFloor { offset: 5 }
+        );
     }
 }
