@@ -29,14 +29,16 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
     decode_not_leader, decode_produce_confirm, decode_pub_ack, decode_stream_info_response,
-    decode_truncated, decode_txn_resolve, encode_ack, encode_connect, encode_cumulative_ack,
-    encode_fetch, encode_pub, encode_pub_to, encode_stream_commit, encode_stream_declare,
-    encode_stream_fetch, encode_stream_info, encode_sub, encode_sub_to, encode_txn_check_result,
-    encode_txn_listen, encode_txn_prepare, encode_txn_resolve, produce_confirm_status, AckBody,
-    AckLevel, AckOp, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody,
-    FetchBody, PubBody, PubToBody, StreamCommitBody, StreamDeclareBody, StreamFetchBody,
-    StreamInfoBody, SubBody, SubToBody, TxnCheckDecision, TxnCheckResultBody, TxnListenBody,
-    TxnPrepareBody, TxnResolveBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    decode_truncated, decode_txn_resolve, encode_ack, encode_bind_subject, encode_connect,
+    encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_subject, encode_pub_to,
+    encode_stream_commit, encode_stream_declare, encode_stream_fetch, encode_stream_info,
+    encode_sub, encode_sub_subject, encode_sub_to, encode_txn_check_result, encode_txn_listen,
+    encode_txn_prepare, encode_txn_resolve, produce_confirm_status, AckBody, AckLevel, AckOp,
+    BindSubjectBody, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody,
+    FetchBody, PubBody, PubSubjectBody, PubToBody, StreamCommitBody, StreamDeclareBody,
+    StreamFetchBody, StreamInfoBody, SubBody, SubSubjectBody, SubToBody, TxnCheckDecision,
+    TxnCheckResultBody, TxnListenBody, TxnPrepareBody, TxnResolveBody, PUB_FLAG_ACK_LEVEL_MASK,
+    PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 // The connection-scoped auth wire surface (#631, #884): the credential type and the encoder that
 // appends the auth section to an already-encoded `Connect` body. Re-exported below so a caller can
@@ -3079,6 +3081,130 @@ impl Client {
         )
         .map_err(ClientError::Body)?;
         self.send(FrameType::SubTo, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    // ---- subject-addressed routing (#585, M2-I9) ----
+
+    /// BINDs a subject PATTERN to a NAMED stream (#585, M2-I9): the `BindSubject` verb, the routing
+    /// half of the subjects story. The broker validates the pattern through the #567 grammar
+    /// (dot-separated tokens; `*` matches exactly one token, `>` matches one-or-more trailing tokens
+    /// and is legal only as the final token), DECLARES `stream` if it does not exist yet (a
+    /// subject-addressed publish needs a log to land in), registers `(pattern -> stream)` in the
+    /// routing trie, and replies `Ok`. Idempotent — re-binding the same pattern to the same stream is
+    /// a benign success. Requires the stream-addressing capability
+    /// ([`ClientConfig::understands_streams`] confirmed via [`Client::streams_enabled`]); on an
+    /// auth-enabled broker the verb additionally requires the `admin` scope (it mutates routing
+    /// state, #631).
+    ///
+    /// After the bind, a [`Client::publish_subject`] whose literal subject the pattern covers routes
+    /// to `stream`, and a [`Client::subscribe_subject`] resolves through the same trie. The
+    /// resolution is FAIL-CLOSED single-home: a subject covered by ZERO bindings is rejected
+    /// ([`ServerErrorCode`] `NoStreamForSubject` — the explicit beat over a silent NATS-style drop)
+    /// and one covered by TWO OR MORE streams is rejected as ambiguous (`AmbiguousSubject`).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the bind (capability not negotiated, a
+    /// malformed pattern/name, a missing `admin` scope, or a fork-bound rejection),
+    /// [`ClientError::Body`] on an over-large field, or a frame/connection error.
+    pub fn bind_subject(&mut self, stream: &str, pattern: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_bind_subject(
+            &BindSubjectBody {
+                stream_id: stream.as_bytes(),
+                pattern: pattern.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::BindSubject, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Publishes a message BY SUBJECT (#585, M2-I9): the `PubSubject` verb, the subject-addressed
+    /// twin of [`Client::publish_to`]. The broker resolves the LITERAL `subject` (wildcards live only
+    /// on the bind/subscribe side, never in a published subject) through the routing trie under the
+    /// fail-closed single-home rule — exactly ONE bound stream routes the append there, ZERO is a
+    /// `NoStreamForSubject` reject, two-or-more is an `AmbiguousSubject` reject — and replies a
+    /// `PubAck` with the offset assigned in the RESOLVED stream's own offset space. The publish body
+    /// is the SAME [`PubBody`] every other produce carries, and the publish is at-least-once
+    /// (server-ack, Level 1; the ack implies the covering fsync), exactly like [`Client::publish_to`].
+    /// Requires the stream-addressing capability (see [`Client::bind_subject`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the publish (capability not negotiated,
+    /// an unbound/ambiguous/malformed subject, or a non-server-ack level), [`ClientError::Body`] on
+    /// an over-large field, [`ClientError::BadResponse`] on a malformed ack, or a frame/connection
+    /// error.
+    pub fn publish_subject(
+        &mut self,
+        subject: &str,
+        message: &PubBody<'_>,
+    ) -> Result<u64, ClientError> {
+        // Force at-least-once server-ack (Level 1) on the carried body, exactly like `publish_to`:
+        // the subject-addressed path accepts only that level this phase, and an old caller never set
+        // a level bit, so this is a no-op for them and a guard against a mismatched method/wire.
+        let at_least_once = PubBody {
+            fire_and_forget: false,
+            ..*message
+        };
+        let mut pub_body = Vec::new();
+        encode_pub(&at_least_once, &mut pub_body).map_err(ClientError::Body)?;
+        let mut body = Vec::new();
+        encode_pub_subject(
+            &PubSubjectBody {
+                subject: subject.as_bytes(),
+                pub_body: &pub_body,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::PubSubject, &body)?;
+        match self.read_frame()? {
+            (FrameType::PubAck, body) => {
+                let ack = decode_pub_ack(&body).map_err(|_| {
+                    ClientError::BadResponse("publish-subject reply was not an offset")
+                })?;
+                Ok(ack.offset)
+            }
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Subscribes this connection's consume path BY SUBJECT (#585, M2-I9): the `SubSubject` verb,
+    /// the subject-addressed twin of [`Client::subscribe_to`]. The broker resolves the LITERAL
+    /// `subject` through the routing trie under the fail-closed single-home rule and binds this
+    /// connection's subsequent [`Client::fetch`] / [`Client::ack`] to the RESOLVED stream's own
+    /// competing work-`group`. An unbound subject is a `NoStreamForSubject` reject and one covered
+    /// by two-or-more streams an `AmbiguousSubject` reject. Wildcards live on the BIND side
+    /// ([`Client::bind_subject`] patterns): a wildcard in the SUBSCRIBED subject is an
+    /// `InvalidSubject` reject this phase (the multi-stream wildcard fan-out subscribe is a flagged
+    /// follow-up). Requires the stream-addressing capability (see [`Client::bind_subject`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the subscription (capability not
+    /// negotiated, an unbound/ambiguous/malformed/wildcard subject), [`ClientError::Body`] on an
+    /// over-large field, or a frame/connection error.
+    pub fn subscribe_subject(&mut self, subject: &str, group: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_sub_subject(
+            &SubSubjectBody {
+                subject: subject.as_bytes(),
+                group: group.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::SubSubject, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
             (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
@@ -7210,6 +7336,94 @@ mod tests {
             c.fetch(10).unwrap().messages.is_empty(),
             "the named stream's committed cursor advanced past both acked records"
         );
+
+        drop(c);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn bind_publish_subscribe_consume_ack_by_subject_end_to_end() {
+        // TEETH (#585): the whole subject-addressed round-trip over the REAL wire server — a
+        // streams-capable client BINDS a wildcard pattern to a stream, PUBLISHES two records by
+        // LITERAL subjects the pattern covers, SUBSCRIBES by a literal subject (which single-home-
+        // resolves to the bound stream), CONSUMES both records via the resolved stream's
+        // work-group, and ACKS them. An UNBOUND subject publish is the typed fail-closed reject
+        // (`NoStreamForSubject`), never a silent drop, and a WILDCARD subscribe subject is the
+        // typed `InvalidSubject` reject (wildcards live on the bind side this phase).
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect_with(addr, &config_understanding_streams()).unwrap();
+        assert!(c.streams_enabled());
+
+        // Bind `orders.*` -> `orders`; the bind DECLARES the target stream (declare-on-bind), and a
+        // re-bind is a benign idempotent success.
+        c.bind_subject("orders", "orders.*").unwrap();
+        c.bind_subject("orders", "orders.*").unwrap();
+        let (exists, _head) = c.stream_info("orders").unwrap();
+        assert!(exists, "the bind declared its target stream");
+
+        // Publish by two LITERAL subjects the pattern covers: both land in `orders`' own log.
+        let body = |p: &'static [u8]| PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        };
+        let off0 = c.publish_subject("orders.us", &body(b"order-US")).unwrap();
+        let off1 = c.publish_subject("orders.eu", &body(b"order-EU")).unwrap();
+        assert_eq!(
+            (off0, off1),
+            (0, 1),
+            "both covered subjects route to the SAME bound stream's offset space"
+        );
+
+        // An UNBOUND subject is the typed fail-closed reject, never a silent drop.
+        let err = c
+            .publish_subject("invoices.us", &body(b"nope"))
+            .unwrap_err();
+        match err {
+            ClientError::Server(e) => assert_eq!(
+                e.code(),
+                Some(ServerErrorCode::NoStreamForSubject),
+                "an unbound subject publish carries the stable NoStreamForSubject code"
+            ),
+            other => panic!("expected a typed server reject, got {other:?}"),
+        }
+
+        // Subscribe BY SUBJECT (a literal the pattern covers) and consume + ack both records.
+        c.subscribe_subject("orders.us", "workers").unwrap();
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            let messages = c.fetch(10).unwrap().messages;
+            for m in &messages {
+                got.push(m.payload.clone());
+                assert!(c.ack(m.offset, m.generation).unwrap());
+            }
+            if got.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got,
+            vec![b"order-US".to_vec(), b"order-EU".to_vec()],
+            "the subject-resolved consumer received the bound stream's records, in order"
+        );
+
+        // Wildcards live on the BIND side only: a wildcard in the SUBSCRIBED subject is the typed
+        // fail-closed `InvalidSubject` reject this phase (the fan-out subscribe is a follow-up).
+        let err = c.subscribe_subject("orders.*", "workers").unwrap_err();
+        match err {
+            ClientError::Server(e) => assert_eq!(
+                e.code(),
+                Some(ServerErrorCode::InvalidSubject),
+                "a wildcard subscribe subject is the typed InvalidSubject reject"
+            ),
+            other => panic!("expected a typed server reject, got {other:?}"),
+        }
 
         drop(c);
         shutdown.store(true, Ordering::Release);
