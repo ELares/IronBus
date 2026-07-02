@@ -6,7 +6,7 @@
 
 **A single durable, crash-safe message queue for the edge, in one static Rust binary.**
 
-> Status: active development. The single-node broker, multi-stream + subjects + wildcards, a real multi-node cluster, idempotent + transactional produce, auth, and the observability tooling have all shipped; the remaining v2 items (partitions, TLS, routing richness) are tracked with a per-capability status in [docs/MISSION.md](docs/MISSION.md) §2. Code lands one small, reviewed, CI-gated PR at a time. Start at the [vision EPIC (#1)](https://github.com/ELares/IronBus/issues/1).
+> Status: active development, with most of the mission shipped. The single-node broker, multi-stream + subjects + wildcards, a real multi-node cluster (C1–C7), idempotent + transactional produce, three-mechanism auth, and the observability + recovery tooling are all built, wired, and CI-gated. The remaining gaps are tracked per item: partitions through the engine ([#693](https://github.com/ELares/IronBus/issues/693)), the TLS transport ([#766](https://github.com/ELares/IronBus/issues/766)), and routing richness ([#553](https://github.com/ELares/IronBus/issues/553), [#555](https://github.com/ELares/IronBus/issues/555), [#764](https://github.com/ELares/IronBus/issues/764)). Code lands one small, reviewed, CI-gated PR at a time. Start at the [vision EPIC (#1)](https://github.com/ELares/IronBus/issues/1).
 >
 > **Where this is going:** the v2 mission is for IronBus to be feature-rich and decisively better than NATS on every front, **single node or clustered**, with clustering a first-class goal (not post-1.0) — and most of it has shipped. Read **[docs/MISSION.md](docs/MISSION.md)** — it is scrupulously explicit, in three tiers, about what is measured today, what is shipped and wired (with scope edges), and what is still target.
 
@@ -36,7 +36,7 @@ We rank the tenets, and when two conflict we resolve in this order: **Resilient 
 | --- | --- |
 | **Simple** | One logical queue, one binary, one config file with safe defaults, a tiny length-framed binary wire protocol whose stored records you can decode with the built-in `ironbus peek` and `ironbus dump` commands. Install to first message in under a minute (see the [Quick start](#quick-start-from-install-to-many-producers-and-consumers)). No ZooKeeper, no JVM, no external dependencies. |
 | **Resilient** | Every acknowledged durable write survives power loss. Startup always recovers a consistent prefix. A torn tail or a poison record or segment is skipped, never fatal, with loss bounded and reported as a number. |
-| **HyperScale** | High per-core throughput on edge hardware (not horizontal scale-out): a bounded ring-buffer core with structural backpressure, group-commit `fdatasync`, and zero-copy fan-out, sustaining tens of thousands of small messages per second per core. |
+| **HyperScale** | High per-core throughput on edge hardware (not horizontal scale-out): a bounded ring-buffer core with structural backpressure, group-commit `fdatasync`, and zero-copy fan-out. Measured head-to-head against NATS, Kafka, and Redpanda in the [Benchmarks](#benchmarks) section — not asserted. |
 | **Edge First** | RAM ceilings, flash-wear budgets, and brownout behavior are first-class configuration, not afterthoughts. The queue spills to disk and sheds load rather than blocking producers or running out of memory. |
 | **Cross Platform** | One static musl binary per architecture (aarch64, armv7, x86_64), kernel-only dependency, reproducible builds, embedded SBOM. |
 
@@ -71,10 +71,61 @@ zero-config default the cluster degrades to, not the ceiling:
 
 **IronBus is explicitly NOT (these are durable non-goals):**
 
-- Not exactly-once. At-least-once is the contract, with an optional fire-and-forget fast path. No exactly-once handshake.
+- Not exactly-once. At-least-once is the contract, with an optional fire-and-forget fast path. No exactly-once handshake. Effectively-once is available via the opt-in [idempotent producer](#idempotent-producer-effectively-once).
 - Not a key/value store. A KV store (the NATS JetStream KV analog) is a different product category; IronBus stays a pure message bus.
 - Not an object store. Chunked object storage is out of scope. (Tiered storage of cold log segments to an object-storage backend is core log infrastructure and stays on the roadmap, which is distinct from being an object store.)
 - Not a Kafka wire-protocol clone, and not a Windows product in v1 (Windows fsync and path semantics differ enough to threaten the durability guarantee).
+
+---
+
+## Benchmarks
+
+Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted. The numbers below are the **measured 3-run medians** from the July 2026 cross-broker study ([#1023](https://github.com/ELares/IronBus/issues/1023)): IronBus (current main) vs **Kafka 4.3.1** (KRaft, Temurin 21) vs **Redpanda v26.1.12** vs **NATS 2.14.3** (JetStream and Core), single node each, on one quiet Apple M4 Pro (14 cores, 48 GB, macOS 26.5). Every row pins each broker to a **matched durability tier** and labels it; the full methodology, the pinned per-broker configs, every cell, and the reproducible harness live in **[docs/benchmarks/CROSS_BROKER_2026_07.md](docs/benchmarks/CROSS_BROKER_2026_07.md)**.
+
+### Throughput (msg/s, single node, medians of 3)
+
+| Row (durability label) | Size | IronBus | NATS JetStream | Kafka | Redpanda (VM)\* |
+| --- | --- | ---: | ---: | ---: | ---: |
+| **P1** sync-per-message produce (fsync before **every** ack) | 128 B | 250 | 253 | 242 † | *(2,547)* |
+| | 1 KiB | 250 | 250 | 221 † | *(2,322)* |
+| **P2** group-commit produce (fsync-before-ack, coalesced) | 128 B | 88,348 | — ‡ | 352,089 † | *(1,085,634)* |
+| | 1 KiB | 15,262 | — ‡ | 193,669 † | *(196,834)* |
+| **P3** relaxed produce (page-cache ack, NOT power-loss-safe) | 128 B | 1.60 M | 285 k | 2.34 M | *(1.73 M)* |
+| | 1 KiB | **1.04 M** | 229 k | 582 k | *(296 k)* |
+| **P4** in-memory produce (ephemeral) | 128 B | **1.89 M** | 409 k | n/a | n/a |
+| | 1 KiB | **1.20 M** | 372 k | n/a | n/a |
+| **C1** consume / replay (single-consumer drain, durable log) | 128 B | 1.65 M | 394 k | 6.24 M | *(2.75 M)* |
+| | 1 KiB | 1.17 M | 371 k | 2.02 M | *(428 k)* |
+
+### Produce→ack latency (µs, single in-flight, medians of 3)
+
+| Row (durability label) | Size | IronBus p50 / p99 | NATS JetStream p50 / p99 | Kafka p50 / p99 † | Redpanda (VM) p50 / p99 \* |
+| --- | --- | --- | --- | --- | --- |
+| **L1** durable ack (fsync before ack) | 128 B | 4,002 / 4,994 | 3,996 / 5,045 | 5,000 / 13,000 | *(3,000 / 9,000)* |
+| | 1 KiB | 3,998 / 4,185 | 4,001 / 4,987 | 5,000 / 13,000 | *(3,000 / 9,000)* |
+| **L2** in-memory ack (no fsync) | 128 B | **20.6 / 28.1** | 32.8 / 69.1 | n/a | n/a |
+| | 1 KiB | **22.4 / 28.9** | 33.3 / 69.8 | n/a | n/a |
+
+What the table says, factually:
+
+- **IronBus beats or ties NATS on every row.** The P1/L1 durable rows are a tie inside noise — IronBus and NATS `sync_interval=always` are the only native entrants whose ack means the bytes survived power loss on this host, and both sit at the ~4 ms macOS `F_FULLFSYNC` wall (~250 msg/s), with IronBus carrying the tighter p99 (4,994 µs vs 5,045 µs). Every other row is an outright win: relaxed produce 5.6x / 4.6x, in-memory produce 4.6x / 3.2x, consume 4.2x / 3.1x.
+- **The L2 latency row flipped.** Before [#1032](https://github.com/ELares/IronBus/issues/1032) IronBus lost this row ~5x (163 µs vs 33 µs p50 — a double cross-thread wake-up chain). The spin-assisted produce-reply handoff turned it into a win: **21 µs p50 / 28 µs p99** vs NATS JetStream memory 33 / 69 — and it also beats NATS Core request-reply on its home turf (61 / 106 µs, an extra non-durable datapoint; see the methodology doc).
+- **P3 at 1 KiB and P4 at both sizes are the fastest entrants outright** (P4 has only two honest entrants: Kafka and Redpanda have no true in-memory mode).
+- **P2 is a durability-label mismatch, not a like-for-like loss.** Kafka's `flush.messages` issues `fsync(2)`, which macOS does **not** translate into a drive-cache flush (`F_FULLFSYNC` is a separate, ~4 ms-per-call fcntl that IronBus and NATS-sync pay). IronBus's 88 k/15 k is the only native P2 number whose ack means bytes-on-durable-media on this host. NATS JetStream has no ack-after-fsync group-commit mode at all (its honest durable peer number is the P1 row).
+- **Two acknowledged architecture-class gaps vs Kafka**, each with a filed design issue: the consumer drain (C1: 1.65 M vs 6.24 M @128 B — Kafka's consumer rides `sendfile(2)` zero-copy; [#1034](https://github.com/ELares/IronBus/issues/1034)) and small-record page-cache produce (P3 @128 B: 1.60 M vs 2.34 M — Kafka pipelines 5 in-flight 128 KiB batch requests; [#1035](https://github.com/ELares/IronBus/issues/1035)).
+
+> **Disclosures — read before quoting any number.**
+> - One machine, single-node brokers, loopback TCP, serial execution (one broker at a time), fresh data dirs per cell, pilot-run→frozen-count→3-timed-runs→median protocol, Kafka given an extra unrecorded JVM warm-up run per cell.
+> - \* **Redpanda ran inside a lima VM** (it is Linux-only; vz VM, production mode, `write_caching=false` on the durable tiers). A guest `fsync` through a virtual disk is **not power-loss-comparable** to a host `F_FULLFSYNC`, and the VM adds a user-space port-forward hop — so Redpanda's numbers are shown *(parenthesized)* as an appendix datapoint and excluded from the native rankings, in both directions: its wins and losses here prove nothing about bare-metal Redpanda.
+> - † **Kafka's "fsync" rows are not power-loss-comparable on macOS**: `log.flush.interval.messages` calls `fsync(2)`, which macOS satisfies from the drive cache; it does not issue the `F_FULLFSYNC` barrier IronBus and NATS-sync pay. Kafka's L1 latencies are additionally quantized by its tool's whole-millisecond resolution.
+> - ‡ NATS JetStream has no group-commit (ack-after-coalesced-fsync) mode — a structural gap, marked rather than faked.
+> - IronBus ran its **shipped defaults, including lz4 compression on by default** (`--compression lz4`) with realistic (compressible) payloads; the peers ran their own defaults with `compression.type=none` producer configs. IronBus's codec is part of its shipped configuration and is disclosed rather than disabled.
+> - C1 measures a drain of a pre-filled durable log (throughput only; per-fetch latencies are not comparable across tools and are omitted).
+> - These are single-node numbers. The **cluster** benchmarks are not yet CI-gated ([#636](https://github.com/ELares/IronBus/issues/636)) — no cluster performance claim is made here.
+
+### Performance targets
+
+The measured table above does not retire the SLO discipline: the provisional marquee **target** (a floor, not a measurement) remains 256-byte messages, a single consumer, durable group-commit `fdatasync`, sustaining at least 60,000 messages per second with p99 latency under 6 ms **on a Raspberry Pi 4**. Every published SLO is a measured floor (the on-device p99 minus a 20 percent margin), recorded with an HdrHistogram against a single monotonic clock, and gated against regression on a rolling baseline. See [docs/SLO.md](docs/SLO.md) and [docs/PERF_LEDGER.md](docs/PERF_LEDGER.md) for the on-device (t4g / edge) measured history, including the ~80x-NATS durable-produce and ~6–8x consume results that predate this cross-broker study.
 
 ---
 
@@ -135,7 +186,7 @@ The only required flag is `--data-dir` (the durable log, the consumer cursors, a
 ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny
 ```
 
-- `--profile edge-tiny` selects the small-RAM preset (8 MiB segments, tiny credits, 32 connections) plus a **64 MiB RAM ceiling that refuses to boot if the configured caps cannot fit**, so the broker can never surprise you by growing past its budget.
+- `--profile edge-tiny` selects the small-RAM preset (8 MiB segments, tiny credits, 32 connections) plus a **64 MiB RAM ceiling that refuses to boot if the configured caps cannot fit**, so the broker can never surprise you by growing past its budget. `balanced` (the default) and `throughput` are the other two presets; any env var or flag still overrides an individual knob, and `--config <file>` slots a strictly-validated TOML file into the precedence chain (see the [config feature](#config-file-profiles-and-hot-reload) and [docs/CONFIG.md](docs/CONFIG.md)).
 - By default the broker binds **loopback only** (`127.0.0.1:7777`) and acknowledges a write **only after `fdatasync`**, so a power cut loses zero acknowledged messages. To let producers and consumers on **other machines** reach it, bind the device's address (mind the security note above):
 
   ```sh
@@ -143,7 +194,7 @@ ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny
   ```
 
 - Optional health and metrics: add `--health-addr 127.0.0.1:9090` to expose `GET /healthz`, `/readyz`, and `/metrics`.
-- `Ctrl-C` (or `SIGINT` / `SIGTERM`) stops gracefully: it flushes every consumer cursor and exits cleanly, and a restart resumes from the durable log. `SIGHUP` (or `systemctl reload`) now re-reads `--config` and applies the live-reloadable subset (the consumer-safe retention bounds + the disk-full policy) without stopping the broker (#380); a change to a restart-required key is reported but needs a restart. Mind that the unit ships `Restart=on-failure`: a clean stop (`SIGTERM`) stays down until you `systemctl start ironbus` again. For an always-on node, run it under systemd (the `.deb` ships a ready unit, so `sudo systemctl enable --now ironbus` is all you need once it is installed).
+- `Ctrl-C` (or `SIGINT` / `SIGTERM`) stops gracefully: it flushes every consumer cursor and exits cleanly, and a restart resumes from the durable log. `SIGHUP` (or `systemctl reload`) re-reads `--config` and applies the live-reloadable subset (the consumer-safe retention bounds + the disk-full policy) without stopping the broker (#380); a change to a restart-required key is reported but needs a restart. Mind that the unit ships `Restart=on-failure`: a clean stop (`SIGTERM`) stays down until you `systemctl start ironbus` again. For an always-on node, run it under systemd (the `.deb` ships a ready unit, so `sudo systemctl enable --now ironbus` is all you need once it is installed).
 
 ### 3. Producers: one, or many
 
@@ -167,7 +218,7 @@ read_sensor | ironbus pub --key sensor-12
 for i in $(seq 1 1000); do ironbus pub "event-$i"; done
 ```
 
-(For a long-lived, high-rate producer, link the `ironbus-client` Rust crate instead of forking a process per message.)
+(For a long-lived, high-rate producer, link the [`ironbus-client` Rust crate](#client-sdks) or the [Go SDK](#go) instead of forking a process per message.)
 
 ### 4. Consumers: one, or many
 
@@ -184,29 +235,7 @@ Each message prints as `#<offset> gen=<token> key=<key> payload=<payload>`, foll
 ironbus sub --group orders --max 5
 ```
 
-**Many consumers** is where the work-group model matters. You pick the pattern when you start the broker and the group:
-
-- **Competing (a shared work queue, the default for a named group).** Run several consumers on the same group at once and the broker hands each a disjoint slice, exactly like several SQS workers draining one queue. Just start more of them:
-
-  ```sh
-  # In three terminals (or three services), all on the same group:
-  ironbus sub --group orders --max 100 --ack
-  ```
-
-- **Key-shared (parallel, but the same key stays in order).** Start the broker with `--key-shared-group orders`; then every record for a given key always goes to one member (ordered per key) while different keys drain in parallel across members:
-
-  ```sh
-  ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny --key-shared-group orders
-  ```
-
-- **Broadcast (fan-out, every consumer sees everything).** Start the broker with `--broadcast-group audit`; a broadcast group is a group-of-one tap that sees every record in order. Commit its cursor in one move with `cumulative-ack`:
-
-  ```sh
-  ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny --broadcast-group audit
-  # then, from the consumer side:
-  ironbus sub --group audit --max 100                    # observe the stream
-  ironbus cumulative-ack --group audit --up-to <offset>  # commit up to (exclusive) <offset>
-  ```
+**Many consumers** is where the work-group model matters — see [Work-groups](#work-groups-competing--key-shared--broadcast) in the feature tour for the three patterns (competing, key-shared, broadcast).
 
 ### 5. Inspect the data directly (no running broker)
 
@@ -219,6 +248,412 @@ ironbus scrub --data-dir /var/lib/ironbus   # read-only integrity scan that repo
 ```
 
 For every flag, default, and exit code, see the [CLI reference (docs/CLI.md)](docs/CLI.md); for a longer narrative walkthrough see [docs/USAGE.md](docs/USAGE.md).
+
+---
+
+## Feature tour
+
+Everything below is **shipped and wired** — every command in this tour was verified against the current binary. Each subsection names its scope edge where one exists. (What is *not* built is consolidated in [What is NOT shipped](#what-is-not-shipped-the-roadmap-and-the-non-goals).)
+
+### The durable ordered log
+
+One crash-safe append-only log per instance — `fdatasync` before ack, so a printed offset means the record is on disk — consumed by many consumers at-least-once.
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus
+ironbus pub 'hello edge'
+ironbus sub --group orders --max 10 --ack
+```
+
+### Durability levels
+
+The operator picks the ack/durability tradeoff per broker. `sync` (fsync-before-ack, zero acked loss) is the default; the relaxed levels (`interval`, `async`, `none`) are strictly opt-in and gated behind an explicit `--async-loss-ack` consent flag so a config typo can never silently weaken the contract. See [docs/DURABILITY.md](docs/DURABILITY.md).
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --durability-level sync
+```
+
+### Multi-stream, subjects, and wildcards
+
+N named independent logs plus subject routing with `*` / `>` wildcards, wired end-to-end (engine → wire frames → CLI). An unbound subject is a typed, fail-closed reject — never a silent drop. Scope edge: named-stream consume parity (DLQ / key-shared / Tier-S / metrics on named streams) is in progress ([#681](https://github.com/ELares/IronBus/issues/681)).
+
+```sh
+ironbus stream create events --data-dir /var/lib/ironbus
+ironbus stream bind 'sensors.>' events --data-dir /var/lib/ironbus
+ironbus stream ls --data-dir /var/lib/ironbus
+```
+
+### Work-groups: competing / key-shared / broadcast
+
+SQS-style competing consumers by default, per-key ordered fan-out (`--key-shared-group`), or a group-of-one broadcast tap (`--broadcast-group`) — all three over one ordered log with durable cursors, pickable per group at serve time.
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --key-shared-group orders --broadcast-group audit
+# competing (default): run N of these and each gets a disjoint slice
+ironbus sub --group workers --max 100 --ack
+# broadcast: observe everything, then commit the cursor in one move
+ironbus sub --group audit --max 100
+ironbus cumulative-ack --group audit --up-to 5000
+```
+
+### Tier-S streaming consume (consumer-managed offsets)
+
+The Kafka-style high-throughput consume tier: zero-copy `DeliverBatch` delivery over a resident sparse byte index, with consumer-managed offsets and cumulative commits — the 1.65 M msg/s row in the [benchmarks](#benchmarks) (4.2x NATS). The lease-rich work-queue tier (Tier-W) stays the default for per-message semantics.
+
+```sh
+ironbus bench --count 100000 --mode subscribe --consume-tier streaming
+```
+
+### Idempotent producer (effectively-once)
+
+PID + epoch + sequence dedup (`Fresh` / `Duplicate` / `Fenced` / `OutOfOrder`) that survives a broker restart and an arbitrarily long offline gap. Off by default; opt-in per producer.
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --dedup-window-ms 120000 --dedup-max-ids 100000
+```
+
+```rust
+// Rust: produce_dedup returns the typed ack (Fresh / Duplicate / Fenced / OutOfOrder).
+let ack = client.produce_dedup(&message)?;
+```
+
+### Transactional half-messages
+
+RocketMQ-style two-phase produce: prepare a half message (invisible to consumers), run your local transaction, then commit or roll back — with a crash-safe broker back-check (`TxnCheck`) so a producer that dies mid-transaction never wedges the log. Client-driven via the Rust API (`prepare` / `commit` / `rollback` / `transact`, plus `register_transaction_listener` for the back-check).
+
+```rust
+let txn = client.prepare("events", &message)?;
+// ... local work ...
+let offset = client.commit(&txn)?;   // or client.rollback(&txn)?
+```
+
+### Fire-and-forget fast path
+
+An optional un-acked produce path with its own rate/byte budget, for telemetry-style throughput where at-most-once is acceptable.
+
+```sh
+ironbus bench --count 100000 --mode publish --fire-and-forget
+```
+
+### Multi-node clustering and replication
+
+See the dedicated [Clustering](#clustering) section — a metadata Raft group, ISR pull replication, quorum-fsync acks, and divergence self-heal, behind two flags.
+
+### Security: authentication, pre-auth DoS defenses, graceful drain
+
+See the dedicated [Security](#security) section.
+
+### Observability: Prometheus, health, live views
+
+Built-in `/metrics` (no sidecar — NATS needs one), split `/healthz` + `/readyz` liveness/readiness, latency histograms and recovery counters, a live TUI, operator reports, and an optional read-only `/admin` snapshot.
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --health-addr 127.0.0.1:9090 --enable-admin
+ironbus top --health-addr 127.0.0.1:9090
+ironbus report groups --health-addr 127.0.0.1:9090
+ironbus server check --health-addr 127.0.0.1:9090   # Nagios-style one-liner, frozen exit codes
+```
+
+Scope edge: OpenTelemetry tracing is the one observability piece not built ([#770](https://github.com/ELares/IronBus/issues/770)).
+
+### Recovery as a feature: verify / repair / backup / restore
+
+The recovery tooling NATS lacks: an offline fsck (`verify`), an explicit mutating repair (quarantine-by-copy + longest-valid-prefix truncate, under the exclusive data-dir lock, `--apply --force` required), and point-consistent backup/restore with a CRC'd manifest and fail-closed validation.
+
+```sh
+ironbus verify  --data-dir /var/lib/ironbus
+ironbus repair  --data-dir /var/lib/ironbus                 # read-only plan
+ironbus repair  --data-dir /var/lib/ironbus --apply --force # the actual repair
+ironbus backup  --data-dir /var/lib/ironbus --out /backups/ib-2026-07-01
+ironbus restore --from /backups/ib-2026-07-01 --data-dir /var/lib/ironbus
+```
+
+### Bounded, reported, fail-closed corruption recovery
+
+Longest-valid-prefix startup recovery, stop-at-first-bad-frame, per-event loss caps (≤1 segment or 64 MiB, ≤1% of durable bytes), quarantine-by-copy, and a typed LossReport (log line + report file + Prometheus counter). Exceeding a cap freezes the log read-only rather than guessing. See [Resilience](#resilience-designed-for-failure-first).
+
+```sh
+ironbus scrub --data-dir /var/lib/ironbus   # read-only: report what recovery would do
+```
+
+### Dead-letter queue + crash-safe redrive
+
+Poison messages past `--max-deliver` (default 5) are dead-lettered into a durable DLQ sink you can inspect and idempotently re-inject onto the main log — a feature NATS lacks.
+
+```sh
+ironbus dlq ls --data-dir /var/lib/ironbus
+ironbus dlq peek --limit 20 --data-dir /var/lib/ironbus
+ironbus dlq redrive --data-dir /var/lib/ironbus
+```
+
+### Backpressure and credit-based flow control
+
+An auto-tuning per-connection credit window (message count + byte budget), per-group max-in-flight, CoDel sojourn control, and spill-to-disk-then-shed — producers are never blocked by default. See [docs/BACKPRESSURE.md](docs/BACKPRESSURE.md).
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --consumer-credit 2048 --consumer-credit-bytes 8388608 --max-in-flight 1024
+```
+
+### Retention: size / age / count
+
+Three composable, consumer-safe bounds (each 0 = off) reap whole old **fully-consumed sealed** segments — never below the slowest consumer's committed offset, never the active segment. (Flag values are raw numbers; the config file additionally accepts `KiB`/`MiB`/`GiB` units.)
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus \
+  --max-retained-bytes 1073741824 --max-age-ms 604800000 --max-messages 1000000
+```
+
+### Compression: lz4 by default, zstd opt-in
+
+Per-record, self-describing lz4 compression on the default path (pure Rust `lz4_flex`), transparent to every client — deliveries are decompressed before hand-off. zstd + trained dictionaries are an **opt-in build feature** (`--features zstd`) only, never on the default path (ADR-0003).
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --compression lz4   # the default, shown explicitly
+```
+
+### In-memory (ephemeral) storage backend
+
+The same engine over an in-memory filesystem — no files, no fsync, explicitly no restart durability — for hot-path fan-out and test rigs. It refuses to boot without the explicit loss consent **and** a RAM cap (`0 = unlimited` would OOM the device, so it is rejected).
+
+```sh
+ironbus serve --storage memory --ephemeral-loss-ack --max-total-bytes 268435456
+```
+
+### Checkpoints
+
+Crash-safe dual-slot consumer-cursor checkpointing at a configurable interval, so work-groups resume exactly where they committed after a restart or power cut.
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --checkpoint-interval 1000
+```
+
+### Offline data inspection: peek / dump
+
+Decode the durable log and the DLQ straight from the data directory, with no broker running, bounded to one segment of memory at a time. `dump --raw` shows the on-disk frame, compression descriptor included.
+
+```sh
+ironbus peek --data-dir /var/lib/ironbus --limit 20
+ironbus dump --data-dir /var/lib/ironbus --json     # NDJSON, one record per line
+ironbus dump --data-dir /var/lib/ironbus --dlq      # the dead-letter sink
+```
+
+### Group and stream management + offline consumer reset
+
+Offline management verbs over a stopped broker's data dir (they take the same exclusive lock `serve` holds, so they can never race a live writer): list/inspect/reset/purge/rm work-groups and streams, rewrite a durable cursor, redrive the DLQ. Destructive verbs refuse without `--force`.
+
+```sh
+ironbus group ls --data-dir /var/lib/ironbus
+ironbus group reset orders --data-dir /var/lib/ironbus --to earliest
+ironbus admin consumer-reset --data-dir /var/lib/ironbus --group orders --to latest
+```
+
+### Config file, profiles, and hot reload
+
+A strictly-validated TOML config (`--config`; an unknown key is a **fatal error with a did-you-mean suggestion**), versioned `edge-tiny` / `balanced` / `throughput` profiles, `flag > env > file > default` precedence, and SIGHUP live-reload of the consumer-safe subset. Durations and byte sizes in the file carry required units (`8MiB`, `500ms`). See [docs/CONFIG.md](docs/CONFIG.md).
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --config /etc/ironbus/ironbus.toml --profile edge-tiny
+```
+
+### CLI ergonomics: contexts, JSON envelope, completion, cheat sheet
+
+Named connection profiles (address + token + data-dir; the token file must be `chmod 0600` — a group- or world-readable secret is refused), a **frozen** machine-readable `ironbus.cli.v1` `--json` envelope with frozen exit codes (0 clean, 1 usage, 2 not found, 3 handled corruption, 4 corrupt data, 5 broker unreachable, 70 internal), shell completion, and a cheat sheet.
+
+```sh
+ironbus context create edge --addr 10.0.0.1:7777 --token-file /etc/ironbus/token --use
+ironbus --json verify --data-dir /var/lib/ironbus
+ironbus completion zsh
+ironbus cheat
+```
+
+### Zero-downtime upgrade / rollback / migrate
+
+An atomic staged binary swap (a power cut mid-upgrade leaves the old or the new binary, never a truncated one) with one-command rollback, a systemd-consulted failed-start counter, and a never-silent on-disk format migration gate.
+
+```sh
+ironbus upgrade --new-binary ./ironbus-new --dest /usr/local/bin/ironbus
+ironbus rollback --dest /usr/local/bin/ironbus
+ironbus migrate --data-dir /var/lib/ironbus
+```
+
+### Load generator: bench
+
+A production-safe benchmark: by default it spawns its own **isolated** broker over a fresh throwaway data dir (it refuses to target a live broker without an explicit consent flag) and reports throughput, p50/p99/p999 latency, produce-ack RTT percentiles, and fsync cost. This is the driver the [cross-broker study](docs/benchmarks/CROSS_BROKER_2026_07.md) used.
+
+```sh
+ironbus bench --duration 30 --mode round-trip --payload-bytes 256 --pubwindow 64 --json
+```
+
+---
+
+## Client SDKs
+
+The wire protocol is a small, versioned, length-framed binary protocol ([docs/TRANSPORT.md](docs/TRANSPORT.md)); the official clients speak it natively — no HTTP, no protobuf.
+
+### Rust
+
+Two first-party crates in this workspace, sharing every wire codec and type: [`ironbus-client`](crates/ironbus-client/) (blocking, minimal, edge-first) and [`ironbus-client-async`](crates/ironbus-client-async/) (its tokio twin — same API surface, `.await`ed). Broker-side lz4 compression is transparent in both; auth rides `ClientConfig::credential` (`AuthCredential` bearer/password). Runnable examples live in [`crates/ironbus-client/examples/`](https://github.com/ELares/IronBus/tree/main/crates/ironbus-client/examples).
+
+```rust
+use ironbus_client::Client;
+use ironbus_proto::message::PubBody;
+
+let mut client = Client::connect("127.0.0.1:7777")?;
+
+// Produce: the returned offset means the record is fsync'd durable.
+let offset = client.produce(&PubBody {
+    flags: 0,
+    timestamp_ms: 0,
+    key: b"sensor-12",
+    headers: b"",
+    dedup: None,
+    fire_and_forget: false,
+    payload: br#"{"temp":21.4}"#,
+})?;
+
+// Consume: join a work-group, fetch a batch, ack each message.
+client.subscribe("workers")?;
+let fetched = client.fetch(10)?;
+for m in &fetched.messages {
+    client.ack(m.offset, m.generation)?;
+}
+
+// Named streams + Tier-S streaming consume (consumer-managed offsets).
+client.declare_stream("events")?;
+let mut consumer = client.streaming_consumer("replay");
+let batch = consumer.next_batch()?;
+```
+
+The async twin is the same call surface with `.await`:
+
+```rust
+use ironbus_client_async::AsyncClient;
+use ironbus_client_async::proto::PubBody;
+
+let mut client = AsyncClient::connect("127.0.0.1:7777").await?;
+let offset = client
+    .produce(&PubBody {
+        flags: 0,
+        timestamp_ms: 0,
+        key: b"key",
+        headers: b"",
+        dedup: None,
+        fire_and_forget: false,
+        payload: b"hello",
+    })
+    .await?;
+client.subscribe("workers").await?;
+let fetched = client.fetch(10).await?;
+for m in &fetched.messages {
+    client.ack(m.offset, m.generation).await?;
+}
+```
+
+Both clients are one-connection, request-response FIFO: drive concurrency with one client per thread/task. `produce_to_leader` handles the cluster `NotLeader` redirect transparently.
+
+### Go
+
+The official Go SDK lives at [`sdk/go`](https://github.com/ELares/IronBus/tree/main/sdk/go) (module `github.com/ELares/IronBus/sdk/go`, [#1021](https://github.com/ELares/IronBus/issues/1021)): the same versioned wire, byte-identical framing, transparent lz4 deliveries, bearer/password auth, contexts on every call. Like the Rust clients, a `*Client` owns one connection and is used from one goroutine. Runnable examples live in [`sdk/go/examples/`](https://github.com/ELares/IronBus/tree/main/sdk/go/examples).
+
+```go
+import (
+	"context"
+
+	ironbus "github.com/ELares/IronBus/sdk/go"
+)
+
+ctx := context.Background()
+client, err := ironbus.Connect(ctx, ironbus.Config{Addr: "127.0.0.1:7777"})
+if err != nil { /* ... */ }
+defer client.Close()
+
+// Produce: the returned offset means the record is fsync'd durable (server ack).
+offset, err := client.Produce(ctx, &ironbus.Message{
+	Key:     []byte("sensor-12"),
+	Payload: []byte(`{"temp":21.4}`),
+})
+_ = offset
+
+// Consume: join a work-group, fetch a batch, ack each by (offset, generation).
+if err := client.Subscribe(ctx, "workers"); err != nil { /* ... */ }
+res, err := client.Fetch(ctx, ironbus.FetchOptions{MaxRecords: 10})
+for _, m := range res.Messages {
+	// handle m.Payload ...
+	_, _ = client.Ack(ctx, m.Offset, m.Generation)
+}
+```
+
+---
+
+## Clustering
+
+A real multi-node cluster ships today, behind two flags — and it degrades to the zero-config single node at n=1:
+
+```sh
+# on each of three nodes (adjust --cluster-id and the addresses):
+ironbus serve --data-dir /var/lib/ironbus --cluster-id 1 \
+  --cluster-peer 1=10.0.0.1:7900 --cluster-peer 2=10.0.0.2:7900 --cluster-peer 3=10.0.0.3:7900
+```
+
+What runs behind those flags (V2-C1 through V2-C7, all merged — see [docs/MISSION.md](docs/MISSION.md) §2b):
+
+- **One KRaft-style metadata Raft group** (tikv/raft-rs) owns membership, placement, leadership epochs, and config — and nothing on the hot data path. This is explicitly **not** Raft-per-asset: no per-stream heartbeat storm, no ~2000-asset ceiling, no meta single point of failure.
+- **Kafka-ISR-style per-partition pull replication** of the existing CRC-framed log: followers fetch the leader's already-framed segment byte ranges and re-validate every frame.
+- **The default cluster ack is `C2-fsync`**: the wire `PubAck` is withheld until the record is `fdatasync`'d on a **quorum** — strictly stronger than NATS R3 (quorum page-cache) and Kafka `acks=all` (which trades fsync for replication), affordable because IronBus group-commits one `fdatasync` per batch on leader and followers alike.
+- **Leader-epoch fencing + footer/CRC divergence self-heal**: silent replica drift and minority-corruption faults become bounded, reported, automatically repaired events (the cluster recovery invariants CI1–CI4 extend the single-node I1–I3 discipline). A produce to a non-leader returns a typed `NotLeader` redirect with a leader hint; the clients follow it.
+- **Follower reads** (consume scales with replicas) and **async geo**: mirror/source links, leaf-spoke edge links, gateway federation.
+
+Scope edges, stated plainly: replication covers the single default log today (multi-partition replication awaits the #693 partition wiring), and the cluster benchmarks are not yet CI-gated ([#636](https://github.com/ELares/IronBus/issues/636)) — the [benchmark table](#benchmarks) above is single-node only.
+
+---
+
+## Security
+
+Security ([#18](https://github.com/ELares/IronBus/issues/18)) is shaped for devices on untrusted networks. What ships today, and what does not:
+
+- **Authentication ships and is enforced**: three mechanisms (bearer token, username + Argon2id password, and mTLS — the latter wired but **inert/fails-closed** until the TLS transport lands) × three independent scopes (**publish, subscribe, admin**), configured via `--auth-config` and managed with `ironbus passwd`:
+
+  ```sh
+  ironbus passwd --auth-config /etc/ironbus/auth.toml --user alice --scopes publish,subscribe
+  ironbus serve --data-dir /var/lib/ironbus --auth-config /etc/ironbus/auth.toml \
+    --addr 0.0.0.0:7777 --insecure-plaintext-wire
+  ```
+
+- **TLS 1.3 is the designed transport, but it is NOT yet implemented ([#766](https://github.com/ELares/IronBus/issues/766)): the wire is plaintext today.** No TLS stack is linked, and any `--tls-*` material is reserved and refused at startup (the broker will not boot with it set). A **non-loopback bind is therefore an explicit decision**: `--insecure-plaintext-wire` is the loud opt-in for running auth-on-plaintext beyond loopback — for TLS-terminated-upstream, service-mesh, or VPN/WireGuard patterns. Without it, keep the broker on loopback or behind a tunnel.
+- **Encryption at rest is designed but NOT yet built** ([#780](https://github.com/ELares/IronBus/issues/780)) — no AEAD provider is linked; the on-disk format reserves a nonce and an at-rest flag for AES-256-GCM / ChaCha20-Poly1305, but data on disk is unencrypted today.
+- **Fail-closed secret handling**: IronBus refuses to start (and `passwd`/`context` refuse to read) if a secret-bearing file is group- or world-readable — `chmod 0600` your token and password files.
+- **Pre-auth DoS defenses**: half-open connection caps, per-source connection rate limits, and failed-auth lockout, so a handshake flood cannot exhaust a small device; plus graceful drain (SIGTERM flips readiness, lets in-flight work finish) and a secret-free audit stream.
+
+---
+
+## Resilience: designed for failure first
+
+Resilience is the top tenet, so failure is planned, not patched. Every subsystem carries a failure-mode and mitigation matrix, aggregated into a [consolidated FMEA (#129)](https://github.com/ELares/IronBus/issues/129); the invariants every subsystem must uphold are tracked in [shared invariants and glossary (#131)](https://github.com/ELares/IronBus/issues/131):
+
+- No acknowledged write is ever lost below its configured durability level.
+- Recovery never reads past a torn or partially written tail record.
+- Loss from a corruption skip is bounded (at most one segment or 64 MiB per event, at most 1 percent of durable bytes per recovery) and is always reported, never silent and never partial within a record.
+- The log preserves a single total durable order.
+
+Concretely, IronBus treats a failed `fsync` as fatal and freezes the writer read-only (the PostgreSQL fsyncgate lesson), checksums every record so a flipped bit on an SD card is caught on read, quarantines unreadable segments by copy rather than move into a capped store, and resynchronizes to the next valid record boundary so one bad region does not poison the rest of the log. And recovery is not only automatic — it is a **first-class operator feature**: `verify` (offline fsck), `repair` (explicit, locked, plan-first), `backup` / `restore` (point-consistent, manifest-validated), and `scrub` (read-only scan) make every recovery path inspectable and drivable on demand (see the [feature tour](#recovery-as-a-feature-verify--repair--backup--restore)).
+
+These claims are not taken on faith. Verification ([#21](https://github.com/ELares/IronBus/issues/21)) is built around a bespoke, in-tree deterministic simulation (a single seeded PRNG threaded through every IO, clock, and scheduling decision) so a power cut can be replayed bit for bit. Five crash classes are hard release gates: `kill -9`, simulated power cut with write reordering, a one-shot `fsync` error, and block-layer fault injection for dropped writes and per-block read errors. Every pull request runs a 256-seed sweep, the record and segment parsers are continuously fuzzed, a tiered corpus of deliberately corrupted files is asserted on, and a sim-versus-real conformance gate on a reference edge device keeps the simulation honest.
+
+---
+
+## The CLI
+
+The same binary that runs the broker is the CLI, in the spirit of the NATS CLI but with a real view into the stored data. The shipped verbs, grouped:
+
+- **Interact**: `pub`, `sub`, `cumulative-ack`, and `bench` (the production-safe load generator).
+- **Observe**: `top` (live TUI or offline file-derived view), `report groups|streams|storage|recovery|connections`, `server info|healthz|ready|check`, and the read-only `admin` snapshot.
+- **Recover**: `verify`, `repair`, `backup`, `restore`, `scrub` — the [recovery-as-a-feature](#recovery-as-a-feature-verify--repair--backup--restore) set.
+- **Inspect offline**: `peek`, `dump` (`--json`, `--dlq`, `--raw`), straight from the data directory with no broker running.
+- **Manage**: `group ls|info|reset|purge|rm`, `stream ls|info|create|bind|purge|rm`, `dlq ls|peek|redrive`, `admin consumer-reset|dlq-redrive`, `passwd`.
+- **Operate**: `upgrade`, `rollback`, `record-start`, `migrate`.
+- **Ergonomics**: `context` (named connection profiles), `completion`, `cheat`, and the global `--json` flag — one frozen `ironbus.cli.v1` envelope per command, with frozen exit codes, safe to script against forever.
+
+Every command speaks human-readable output by default and `--json` for machines. The full contract is [docs/CLI.md](docs/CLI.md) and [docs/CLI_CONTRACT.md](docs/CLI_CONTRACT.md).
 
 ---
 
@@ -256,7 +691,7 @@ producer ─▶ wire protocol ─▶ ring buffer + credit-based backpressure
 | Compression | [#12](https://github.com/ELares/IronBus/issues/12) | lz4_flex default (pure Rust), per-record self-describing descriptor; zstd and trained dictionaries opt-in behind the `zstd` feature, never on the default path (#139, ADR-0003) |
 | Retention | [#13](https://github.com/ELares/IronBus/issues/13) | Time, size, and count retention, whole-segment deletion, lifecycle |
 | Configuration | [#14](https://github.com/ELares/IronBus/issues/14) | Layered config, hot reload, profiles, safe zero-config defaults |
-| CLI | [#15](https://github.com/ELares/IronBus/issues/15) | pub, sub, bench, info, lag, offline data inspection, scrub, live TUI |
+| CLI | [#15](https://github.com/ELares/IronBus/issues/15) | pub, sub, bench, offline data inspection, scrub, live TUI, management verbs |
 | Observability | [#16](https://github.com/ELares/IronBus/issues/16) | Prometheus metrics, tracing, health, structured introspection |
 | Build and distribution | [#17](https://github.com/ELares/IronBus/issues/17) | Single static binary, cross-compilation, packaging, supply chain |
 | Security | [#18](https://github.com/ELares/IronBus/issues/18) | AuthN and authZ, TLS, encryption at rest, edge threat model |
@@ -280,86 +715,45 @@ A fresh-eyes second pass over every issue resolved over one hundred design quest
 | Durability default | Group-committed `fdatasync` of the active log before ack. The commit thread syncs whatever appends arrived during the previous sync (cap 1 MiB, no proactive linger by default). Levels (`--durability-level`): `sync` (default, ack-after-`fdatasync`, I2, zero acked loss), `interval` (bounded by the flush window), `async`/`none` (relaxed, gated behind `--async-loss-ack`). |
 | Checksum | CRC32C (Castagnoli) on every record, using the hardware instruction with a software fallback. Payloads over 64 KiB carry a second independent xxh3-64 checksum. CRC32C gates resync. |
 | Record and segment sizes | Default max record 16 MiB (hard cap, configurable up to 1 GiB), 64 MiB segments (8 MiB on the edge profile). A record never spans two segments. |
-| Backpressure | Credit-based pull (default 64 messages or 8 MiB in-flight per consumer). Durable topics spill to disk then shed (drop_new past the spill cap, always reported); telemetry topics drop_oldest. `block` is opt-in only, never a default. CoDel sojourn control plus a hard depth backstop. |
-| Dedup | Off by default. Opt-in per-producer window (100,000 ids or 2 minutes). An optional stable producer-id and epoch persists the high-watermark so dedup can survive a restart and an arbitrarily long offline gap. |
+| Backpressure | Credit-based pull (auto-tuning window, default ceiling 2048 messages / 8 MiB in-flight per connection). Durable topics spill to disk then shed (drop_new past the spill cap, always reported); telemetry topics drop_oldest. `block` is opt-in only, never a default. CoDel sojourn control plus a hard depth backstop. |
+| Dedup | Off by default. Opt-in per-producer window (100,000 ids or 2 minutes). An optional stable producer-id and epoch persists the high-watermark so dedup survives a restart and an arbitrarily long offline gap. |
 | Bounded loss report | After any skip, report (records_lost, bytes_lost, segments_affected) plus the offset range and a reason enum, via a log line, a recovery report file, and a Prometheus counter. Loss is capped at one segment or 64 MiB per event and 1 percent of durable bytes per recovery; exceeding either freezes the log read-only and alerts. |
 | Runtime | tokio (multi-threaded), with the durability commit on a dedicated thread. io_uring is a deferred, feature-flagged, Linux 5.10 and newer optimization, never the foundation, to protect the Cross Platform tenet. |
 | Targets | First-class: aarch64, x86_64, armv7 musl static binaries, kernel floor Linux 4.19. Best-effort, CI-built: macOS. Windows is a non-goal for v1. |
-| Replication | A real multi-node cluster ships today (leader/follower ISR replication, `fsync`'d-on-a-quorum ack default, leader-epoch fencing, divergence self-heal) behind `--cluster-id / --cluster-peer`, preserving the single-node durability/recovery/edge guarantees. Default-log replication today; multi-partition awaits #693 and the cluster benchmarks are not yet CI-gated (#636) — see [docs/MISSION.md](docs/MISSION.md). |
+| Replication | A real multi-node cluster ships today (metadata Raft + leader/follower ISR pull replication, `fsync`'d-on-a-quorum ack default, leader-epoch fencing, divergence self-heal) behind `--cluster-id / --cluster-peer`, preserving the single-node durability/recovery/edge guarantees. Default-log replication today; multi-partition awaits #693 and the cluster benchmarks are not yet CI-gated (#636) — see [docs/MISSION.md](docs/MISSION.md). |
 | License | Dual `MIT OR Apache-2.0` across the whole workspace. |
 | MSRV | Rust 1.78, may rise only in a minor release, new floor always at least 6 months old. |
 
-The full, immutable record of these decisions will live in an [ADR index (#130)](https://github.com/ELares/IronBus/issues/130) and as `rfcs/NNNN-slug.md` files as the project is built out.
+The full, immutable record of these decisions lives in the [ADR index (#130)](https://github.com/ELares/IronBus/issues/130) and as ADR files as they are ratified.
 
 ---
 
-## Resilience: designed for failure first
+## What is NOT shipped: the roadmap, and the non-goals
 
-Resilience is the top tenet, so failure is planned, not patched. Every issue carries a failure-mode and mitigation matrix, and they are aggregated into a [consolidated FMEA (#129)](https://github.com/ELares/IronBus/issues/129). The invariants every subsystem must uphold are tracked in [shared invariants and glossary (#131)](https://github.com/ELares/IronBus/issues/131):
+The honesty section, mirroring [docs/MISSION.md](docs/MISSION.md) §2c — everything here is genuinely not built and is marked as such everywhere it appears:
 
-- No acknowledged write is ever lost below its configured durability level.
-- Recovery never reads past a torn or partially written tail record.
-- Loss from a corruption skip is bounded (at most one segment or 64 MiB per event, at most 1 percent of durable bytes per recovery) and is always reported, never silent and never partial within a record.
-- The log preserves a single total durable order.
+| Not built yet | Tracking | Note |
+| --- | --- | --- |
+| Partitions through the engine | [#693](https://github.com/ELares/IronBus/issues/693) | Partition math exists in storage only; not wired through engine/wire/CLI. Cluster replication covers the single default log until this lands. |
+| TLS 1.3 / mTLS transport | [#766](https://github.com/ELares/IronBus/issues/766) | The wire is plaintext today; `--tls-*` material is refused at startup; the mTLS auth mechanism is inert (fails closed) until this lands. |
+| Encryption at rest | [#780](https://github.com/ELares/IronBus/issues/780) | No AEAD provider linked; the on-disk format reserves the fields. |
+| Priorities / delayed messages / request-reply RPC | [#553](https://github.com/ELares/IronBus/issues/553) / [#555](https://github.com/ELares/IronBus/issues/555) / [#764](https://github.com/ELares/IronBus/issues/764) | The V2-M4 routing-richness set. (Per-message TTL enforcement exists in the engine; its operator surface is open, [#710](https://github.com/ELares/IronBus/issues/710).) |
+| OpenTelemetry tracing | [#770](https://github.com/ELares/IronBus/issues/770) | The one observability gap — metrics, health, histograms, and recovery counters did ship. |
+| Named-stream consume parity | [#681](https://github.com/ELares/IronBus/issues/681) | DLQ / key-shared / Tier-S / metrics on **named** streams — in progress; the default log has it all. |
+| Tiered storage (post-1.0) | [#643](https://github.com/ELares/IronBus/issues/643) | Offloading cold sealed segments to object storage — core log infrastructure, distinct from an object store. |
+| CI-gated cluster benchmarks | [#636](https://github.com/ELares/IronBus/issues/636) | The cluster code ships; the head-to-head cluster benches and the 3-node edge-fit run are open. |
 
-Concretely, IronBus treats a failed `fsync` as fatal and freezes the writer read-only (the PostgreSQL fsyncgate lesson), checksums every record so a flipped bit on an SD card is caught on read, quarantines unreadable segments by copy rather than move into a capped store, and resynchronizes to the next valid record boundary so one bad region does not poison the rest of the log.
-
-These claims are not taken on faith. Verification ([#21](https://github.com/ELares/IronBus/issues/21)) is built around a bespoke, in-tree deterministic simulation (a single seeded PRNG threaded through every IO, clock, and scheduling decision) so a power cut can be replayed bit for bit. Five crash classes are hard release gates: `kill -9`, simulated power cut with write reordering, a one-shot `fsync` error, and block-layer fault injection for dropped writes and per-block read errors. Every pull request runs a 256-seed sweep, the record and segment parsers are continuously fuzzed, a tiered corpus of deliberately corrupted files is asserted on, and a sim-versus-real conformance gate on a reference edge device keeps the simulation honest.
-
----
-
-## Secure by default
-
-Security ([#18](https://github.com/ELares/IronBus/issues/18)) is shaped for devices on untrusted networks:
-
-- **TLS 1.3 is the designed transport, but it is NOT yet implemented ([#766](https://github.com/ELares/IronBus/issues/766)): the wire is plaintext today.** No TLS stack is linked, and any `--tls-*` material is reserved and refused at startup (the broker will not boot with it set). Until TLS lands, bind to loopback or run behind an SSH / WireGuard tunnel on a trusted network, with auth enabled. The design intent (TLS 1.3 only, mandatory on non-loopback, the binary carrying its own modern TLS stack so the oldest target still gets 1.3) is tracked in [docs/MISSION.md](docs/MISSION.md) and #766.
-- **Three explicit scopes**: publish, subscribe, admin. Auth **ships today and is enforced**: bearer token or username and password (Argon2id, edge-tuned). The **mTLS** mechanism is wired but inert (it fails closed) until the TLS transport (#766) lands, so it cannot be used yet.
-- **Safe by default**: IronBus refuses to start if a secret-bearing file is group or world readable, and ships bounded pre-auth defenses (half-open connection caps, per-source connection rate limits, failed-auth backoff) so a handshake flood cannot exhaust a small device.
-- **Encryption at rest is designed but NOT yet built** — the same root cause as TLS: no AEAD provider is linked yet. The on-disk format reserves a nonce and an at-rest flag for AES-256-GCM or ChaCha20-Poly1305 (CPU-feature-selected), but data on disk is unencrypted today (#18).
-
----
-
-## The CLI you actually want
-
-The same binary that runs the broker is the CLI, in the spirit of the NATS CLI but with a real view into the stored data:
-
-- `pub` and `sub` for quick interaction, `bench` for load generation.
-- `top` for live state (throughput, lag, fsync latency, backpressure, and corruption events); the finer-grained `info`, `consumer ls`, and `lag` views are planned.
-- `peek` and `dump` to decode and display stored records straight from the data directory, even with no server running.
-- `repair` and `scrub` to drive corruption recovery on demand.
-- `top`, a live TUI showing throughput, lag, fsync latency, backpressure, and corruption events.
-
-Every command speaks human-readable output by default and `--json` for scripting.
-
----
-
-## Performance targets
-
-Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted. The provisional marquee target is 256-byte messages, a single consumer, durable group-commit `fdatasync`, sustaining at least 60,000 messages per second with p99 latency under 6 ms on a Raspberry Pi 4. Every published SLO is a measured floor (the on-device p99 minus a 20 percent margin), recorded with an HdrHistogram against a single monotonic clock, and gated against regression on a rolling baseline.
-
----
-
-## Roadmap
-
-The v1 design work was grouped into three milestones, and the single-node broker is now being built from them. The design issues come first because no code is written until the design is vetted.
-
-- **M0: Vision and Scope.** The problem, the tenets, the committed scope, the prior-art evidence base, the invariants, and the ADR index.
-- **M1: Architecture Specification.** Vetted specs for every core subsystem: semantics, storage, record format, durability, recovery, corruption skip, consumers, backpressure, protocol, compression, retention, configuration, and the CLI.
-- **M2: Prototype-Ready Design.** The cross-cutting concerns that gate coding: observability, build and distribution, security, performance, edge constraints, verification, governance, and the end-to-end golden-path acceptance scenario.
-
-**Beyond the single node — the v2 mission.** IronBus's goal is to be feature-rich and decisively better than NATS on every front, single node **or clustered**, with clustering a first-class goal rather than a post-1.0 afterthought. The v2 single-node milestones (consume-beats-NATS, multi-stream + subjects, routing richness) and the first-class clustering milestones (metadata consensus, per-partition pull replication, `fsync`'d-on-a-quorum cluster acks, bounded self-healing divergence) are laid out — with an explicit achieved-vs-target honesty split — in **[docs/MISSION.md](docs/MISSION.md)**.
+And the **permanent non-goals**, deliberately never built: exactly-once (at-least-once is the contract; effectively-once via the idempotent producer), a KV store, an object store, a Kafka wire-protocol clone, and Windows in v1. zstd stays an opt-in build feature, never the default codec.
 
 ---
 
 ## How this repository is organized
 
-This is a documentation-first project. The backlog is the design.
+The design came first and still anchors the code: issues [#3](https://github.com/ELares/IronBus/issues/3)–[#22](https://github.com/ELares/IronBus/issues/22) are the 20 vetted subsystem designs, [#1](https://github.com/ELares/IronBus/issues/1) is the vision EPIC and index, and [#2](https://github.com/ELares/IronBus/issues/2) is the comparative prior-art analysis. The implementation now lives in a small Rust workspace built from those designs:
 
-- **[#1](https://github.com/ELares/IronBus/issues/1)** is the vision EPIC and the index of everything.
-- **[#2](https://github.com/ELares/IronBus/issues/2)** is the comparative prior-art analysis (what we borrow and reject).
-- **[#3](https://github.com/ELares/IronBus/issues/3) through [#22](https://github.com/ELares/IronBus/issues/22)** are the 20 subsystem design issues.
-- Each design issue carries a fresh-eyes review comment (resolved decisions, gaps, and a failure-mode matrix) and is broken into smaller `[TASK]` sub-issues with a tracked checklist in its body.
-- **Meta issues** tie it together: [consolidated FMEA (#129)](https://github.com/ELares/IronBus/issues/129), [ADR index (#130)](https://github.com/ELares/IronBus/issues/130), [invariants and glossary (#131)](https://github.com/ELares/IronBus/issues/131), [compatibility and versioning policy (#132)](https://github.com/ELares/IronBus/issues/132), and the [golden-path acceptance scenario (#133)](https://github.com/ELares/IronBus/issues/133).
+- `crates/ironbus-core` — I/O-free types and logic; `crates/ironbus-storage` — the segmented log; `crates/ironbus-proto` — the frozen wire codecs; `crates/ironbus-server` — the broker; `crates/ironbus-client` / `crates/ironbus-client-async` — the Rust clients; `crates/ironbus-cli` — the CLI; `crates/ironbus-bench` — bench internals; `sdk/go` — the Go SDK.
+- `docs/` — the contracts (durability, recovery, invariants, config, CLI, transport, mission) plus [docs/benchmarks/](docs/benchmarks/) for the measured studies; `fuzz/` — the fuzz targets; `scripts/ci/` — the CI gates (including the docs link-integrity checks).
+- Meta issues tie it together: [consolidated FMEA (#129)](https://github.com/ELares/IronBus/issues/129), [ADR index (#130)](https://github.com/ELares/IronBus/issues/130), [invariants and glossary (#131)](https://github.com/ELares/IronBus/issues/131), [compatibility and versioning policy (#132)](https://github.com/ELares/IronBus/issues/132), and the [golden-path acceptance scenario (#133)](https://github.com/ELares/IronBus/issues/133).
 
 Browse by [milestone](https://github.com/ELares/IronBus/milestones) or by [label](https://github.com/ELares/IronBus/labels) (for example `area:storage`, `area:recovery`, `area:backpressure`, or `sub-issue`).
 
@@ -367,12 +761,12 @@ Browse by [milestone](https://github.com/ELares/IronBus/milestones) or by [label
 
 ## Project status and how to get involved
 
-IronBus is in early implementation. The architecture was vetted in the design issues before code began, and the code now lands as small, reviewed, CI-gated pull requests. The best way to help right now is to read the design issues and challenge the decisions: every decision states the alternative it rejected and why, so disagreement is easy to ground.
+The architecture was vetted in the design issues before code began, and the implementation is now broad: the durable single-node broker, multi-stream + subjects + wildcards, the multi-node cluster, idempotent + transactional produce, auth, and the full observability/recovery tooling are merged, each landed as a small, reviewed, CI-gated pull request. The best ways to help right now: challenge the design decisions (every decision states the alternative it rejected and why, so disagreement is easy to ground), reproduce the [benchmarks](#benchmarks) (the harness is in the repo), and kick the tires on the [feature tour](#feature-tour) against your own edge hardware.
 
-The codebase is a small Rust workspace: `ironbus-core` (I/O-free types and logic), `ironbus-storage`, `ironbus-proto`, `ironbus-server`, `ironbus-client`, and `ironbus-cli`. Releases are planned to be reproducible, signed (cosign keyless plus an offline signature), and shipped with an embedded SBOM and a fail-closed verifying installer. Contribution, security, and code-of-conduct policies are defined in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22), including a Developer Certificate of Origin sign-off, a Contributor Covenant code of conduct, and private security disclosure through GitHub Security Advisories.
+Releases are reproducible, signed (cosign keyless plus an offline signature), and shipped with an embedded SBOM and a fail-closed verifying installer. Contribution, security, and code-of-conduct policies are defined in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22) and [CONTRIBUTING.md](CONTRIBUTING.md), including a Developer Certificate of Origin sign-off, a Contributor Covenant code of conduct, and private security disclosure through GitHub Security Advisories.
 
 ---
 
 ## License
 
-IronBus will be dual-licensed under your choice of [MIT](https://opensource.org/license/mit) or [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), as decided in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22). See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+IronBus is dual-licensed under your choice of [MIT](https://opensource.org/license/mit) or [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), as decided in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22). See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
