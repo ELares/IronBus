@@ -457,6 +457,7 @@ fn run_publish_autopipe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, Cl
         Err(e) => return Err(classify(addr, "flushing the auto-pipelined tail to", &e)),
     }
     let elapsed = started.elapsed();
+    // The flush attribution is amortized across the window, so no per-op ack RTT is claimed.
     Ok(finish_report(
         cfg,
         produced,
@@ -464,7 +465,10 @@ fn run_publish_autopipe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, Cl
         &[],
         &fsync_samples,
         elapsed,
-        cfg.fsync_is_measured(),
+        SampleAttribution {
+            fsync_measured: cfg.fsync_is_measured(),
+            acks_awaited: false,
+        },
     ))
 }
 
@@ -529,7 +533,8 @@ fn run_publish_stream(
     let produced = summary.acked;
     let elapsed = started.elapsed();
     // No per-produce fsync attribution: the overlap makes a per-message share dishonest, so
-    // the histogram stays empty and the report's fsync_measured flag is forced off.
+    // the histogram stays empty, the report's fsync_measured flag is forced off, and no per-op
+    // ack RTT is claimed either.
     Ok(finish_report(
         cfg,
         produced,
@@ -537,7 +542,10 @@ fn run_publish_stream(
         &[],
         &[],
         elapsed,
-        false,
+        SampleAttribution {
+            fsync_measured: false,
+            acks_awaited: false,
+        },
     ))
 }
 
@@ -591,8 +599,9 @@ fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliErro
         .flush()
         .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
     let elapsed = started.elapsed();
-    // At-most-once: no ack and no read-back, so no latency and no durable-write cost to attribute
-    // (the broker may even have shed sends under its token bucket). fsync is forced not-measured.
+    // At-most-once: no ack and no read-back, so no latency, no durable-write cost to attribute
+    // (the broker may even have shed sends under its token bucket), and certainly no ack RTT.
+    // fsync is forced not-measured.
     Ok(finish_report(
         cfg,
         produced,
@@ -600,7 +609,10 @@ fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliErro
         &[],
         &[],
         elapsed,
-        false,
+        SampleAttribution {
+            fsync_measured: false,
+            acks_awaited: false,
+        },
     ))
 }
 
@@ -689,7 +701,9 @@ fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
     let elapsed = started.elapsed();
     // Publish has no read-back, so no end-to-end latency; but the per-produce durable cost IS
     // measured (the produce call returns after the fdatasync), so the fsync cost is honest unless
-    // --no-fsync batched the checkpoints.
+    // --no-fsync batched the checkpoints. The ack RTT percentiles (#1024) are claimed only on the
+    // plain awaited-per-produce path (`--pubwindow 1`), never from the windowed loop's amortized
+    // per-op shares.
     Ok(finish_report(
         cfg,
         produced,
@@ -697,7 +711,10 @@ fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
         &[],
         &fsync_samples,
         elapsed,
-        cfg.fsync_is_measured(),
+        SampleAttribution {
+            fsync_measured: cfg.fsync_is_measured(),
+            acks_awaited: cfg.publish_acks_are_awaited(),
+        },
     ))
 }
 
@@ -763,7 +780,10 @@ fn run_subscribe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError>
         &latencies,
         &[],
         drain_start.elapsed(),
-        false,
+        SampleAttribution {
+            fsync_measured: false,
+            acks_awaited: false,
+        },
     ))
 }
 
@@ -840,7 +860,9 @@ fn run_round_trip(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError
     };
 
     // The honest fsync cost is the median produce-call latency (ack-after-fsync, I2), measured only
-    // when the durable path was exercised per produce, i.e. NOT in the --no-fsync dry run.
+    // when the durable path was exercised per produce, i.e. NOT in the --no-fsync dry run. The
+    // producer leg awaits EVERY produce individually, so the same samples are honest produce-to-ack
+    // RTTs (#1024) on any backend.
     Ok(finish_report(
         cfg,
         produced,
@@ -848,7 +870,10 @@ fn run_round_trip(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError
         &latencies,
         &fsync_samples,
         elapsed,
-        cfg.fsync_is_measured(),
+        SampleAttribution {
+            fsync_measured: cfg.fsync_is_measured(),
+            acks_awaited: true,
+        },
     ))
 }
 
@@ -1037,12 +1062,29 @@ fn drain_streaming(
     Ok((recorded, latencies))
 }
 
+/// How the per-produce-call samples (`fsync_samples`) may honestly be attributed in the report.
+/// The two flags are ORTHOGONAL: a plain awaited publish on the memory backend has an honest ack
+/// RTT (`acks_awaited`) but no durable-write cost (`fsync_measured` off), while a `--pubwindow 8`
+/// disk publish has an honest amortized fsync cost but NO per-op ack RTT.
+#[derive(Clone, Copy)]
+struct SampleAttribution {
+    /// The per-op DURABLE path was exercised (disk backend, not the `--no-fsync` dry run), so the
+    /// median sample is an honest per-op fsync cost ([`BenchConfig::fsync_is_measured`]).
+    fsync_measured: bool,
+    /// EVERY produce was individually awaited (plain `--pubwindow 1` publish, or the round-trip
+    /// producer leg), so the samples are honest produce-to-ack RTTs REGARDLESS of storage backend
+    /// (#1024). Off on the pipelined/fire-and-forget paths, whose per-op shares are amortized.
+    acks_awaited: bool,
+}
+
 /// Assembles a [`BenchReport`] from the run tallies, the end-to-end LATENCY samples (read-back, in
 /// the latency modes), and the per-produce-call samples (`fsync_samples`). The reported fsync cost
 /// is the MEDIAN produce-call latency, not the round-trip p50: a `Pub` returns its `PubAck` only
 /// after the covering group-commit `fdatasync` (invariant I2), so the produce-call median isolates
 /// the durable-write cost from the queue-wait that inflates round-trip latency. It is reported only
-/// when `fsync_measured` (not in the `--no-fsync` dry run, which batches cursor checkpoints).
+/// when `fsync_measured` (not in the `--no-fsync` dry run, which batches cursor checkpoints). The
+/// same samples yield the produce-to-ack RTT percentiles (#1024) — but only when `acks_awaited`
+/// (every produce individually awaited), and then on ANY backend.
 fn finish_report(
     cfg: &BenchConfig,
     produced: u64,
@@ -1050,7 +1092,7 @@ fn finish_report(
     latencies: &[u64],
     fsync_samples: &[u64],
     elapsed: Duration,
-    fsync_measured: bool,
+    attribution: SampleAttribution,
 ) -> BenchReport {
     let elapsed_secs = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     // Throughput counts the messages the MEASURED side moved: recorded for a latency mode, produced
@@ -1075,7 +1117,7 @@ fn finish_report(
         msgs_per_sec,
         mb_per_sec,
         bytes_per_op,
-        fsync_measured,
+        fsync_measured: attribution.fsync_measured,
         ..BenchReport::default()
     };
     if let Some((p50, p99, p999, max)) = percentiles_us(latencies) {
@@ -1084,10 +1126,21 @@ fn finish_report(
         report.p999_us = Some(p999);
         report.max_us = Some(max);
     }
+    // The produce-to-ack RTT percentiles (#1024): honest only when EVERY produce was individually
+    // awaited (each sample is one full produce-call round trip), and then on any backend — an ack
+    // RTT on the memory engine is a real RTT, it is just not a durable-write cost.
+    if attribution.acks_awaited {
+        if let Some((p50, p99, p999, max)) = percentiles_us(fsync_samples) {
+            report.ack_p50_us = Some(p50);
+            report.ack_p99_us = Some(p99);
+            report.ack_p999_us = Some(p999);
+            report.ack_max_us = Some(max);
+        }
+    }
     // The honest per-op fsync cost: the median produce-call latency, which an ack-after-fsync broker
     // (I2) cannot return before the durable write completes. Reported only when measured through the
     // per-produce durable path.
-    if fsync_measured {
+    if attribution.fsync_measured {
         if let Some((fsync_p50, _, _, _)) = percentiles_us(fsync_samples) {
             report.fsync_cost_us = Some(fsync_p50);
         }
@@ -1240,6 +1293,134 @@ fn stamp_send_time(payload: &mut [u8], started: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parses a bench arg list with the deterministic test suffix, mirroring `bench.rs`'s helper.
+    fn cfg_of(args: &[&str]) -> BenchConfig {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        crate::bench::parse_bench(&owned, "deadbeef").expect("valid bench args")
+    }
+
+    /// 1000 per-produce samples of 1..=1000 us (in nanoseconds), so the expected percentiles are
+    /// known exactly: max = 1000 us and p50 <= p99 <= p999 <= max.
+    fn awaited_samples() -> Vec<u64> {
+        (1..=1000u64).map(|us| us * 1_000).collect()
+    }
+
+    #[test]
+    fn awaited_publish_samples_yield_ack_percentiles_on_disk_and_memory() {
+        let samples = awaited_samples();
+        // DISK, plain --pubwindow 1 publish: BOTH the #1024 ack RTT percentiles and the honest
+        // fsync cost come from the same awaited per-produce samples, so the ack p50 must equal
+        // the reported fsync cost exactly.
+        let disk = cfg_of(&["--count", "1000", "--mode", "publish"]);
+        let report = finish_report(
+            &disk,
+            1000,
+            1000,
+            &[],
+            &samples,
+            Duration::from_secs(1),
+            SampleAttribution {
+                fsync_measured: disk.fsync_is_measured(),
+                acks_awaited: disk.publish_acks_are_awaited(),
+            },
+        );
+        let p50 = report.ack_p50_us.expect("disk ack p50");
+        let p99 = report.ack_p99_us.expect("disk ack p99");
+        let p999 = report.ack_p999_us.expect("disk ack p999");
+        let max = report.ack_max_us.expect("disk ack max");
+        assert!(p50 <= p99 && p99 <= p999 && p999 <= max, "ordered tail");
+        assert!((max - 1000.0).abs() < 1e-9, "max is the 1000 us sample");
+        let fsync = report.fsync_cost_us.expect("disk fsync cost");
+        assert!(
+            (fsync - p50).abs() < 1e-9,
+            "same samples, same median: fsync {fsync} vs ack p50 {p50}"
+        );
+        // MEMORY, same plain publish: the ack RTT is STILL honest (#1024, backend-agnostic), but
+        // no fsync cost may be claimed (the in-memory engine issues no fsync).
+        let memory = cfg_of(&[
+            "--count",
+            "1000",
+            "--mode",
+            "publish",
+            "--storage",
+            "memory",
+        ]);
+        let report = finish_report(
+            &memory,
+            1000,
+            1000,
+            &[],
+            &samples,
+            Duration::from_secs(1),
+            SampleAttribution {
+                fsync_measured: memory.fsync_is_measured(),
+                acks_awaited: memory.publish_acks_are_awaited(),
+            },
+        );
+        assert!(report.ack_p50_us.is_some(), "memory ack p50 is honest");
+        assert!(report.ack_max_us.is_some(), "memory ack max is honest");
+        assert!(!report.fsync_measured, "no fsync exists in memory mode");
+        assert!(report.fsync_cost_us.is_none(), "so none may be claimed");
+    }
+
+    #[test]
+    fn amortized_publish_never_claims_ack_percentiles() {
+        // A windowed publish's per-op shares are amortized (one flush covers the window), so the
+        // #1024 gate holds them out of the ack fields — even though the amortized fsync cost is
+        // still honestly attributed on disk. This FAILS if the awaited-only gate is dropped.
+        let cfg = cfg_of(&["--count", "1000", "--mode", "publish", "--pubwindow", "8"]);
+        let samples = awaited_samples();
+        let report = finish_report(
+            &cfg,
+            1000,
+            1000,
+            &[],
+            &samples,
+            Duration::from_secs(1),
+            SampleAttribution {
+                fsync_measured: cfg.fsync_is_measured(),
+                acks_awaited: cfg.publish_acks_are_awaited(),
+            },
+        );
+        assert!(report.ack_p50_us.is_none(), "amortized: no ack p50");
+        assert!(report.ack_p99_us.is_none(), "amortized: no ack p99");
+        assert!(report.ack_p999_us.is_none(), "amortized: no ack p999");
+        assert!(report.ack_max_us.is_none(), "amortized: no ack max");
+        assert!(
+            report.fsync_cost_us.is_some(),
+            "the amortized disk fsync cost is still reported"
+        );
+    }
+
+    #[test]
+    fn round_trip_producer_leg_populates_ack_percentiles() {
+        // The round-trip producer leg awaits every produce (produce_one), so its samples carry the
+        // #1024 ack percentiles alongside — and independent of — the e2e delivery percentiles.
+        let cfg = cfg_of(&["--count", "1000", "--mode", "round-trip"]);
+        let latencies: Vec<u64> = (1..=1000u64).map(|us| us * 5_000).collect(); // 5..5000 us e2e
+        let samples = awaited_samples();
+        let report = finish_report(
+            &cfg,
+            1000,
+            1000,
+            &latencies,
+            &samples,
+            Duration::from_secs(1),
+            SampleAttribution {
+                fsync_measured: cfg.fsync_is_measured(),
+                acks_awaited: true,
+            },
+        );
+        let ack_max = report.ack_max_us.expect("round-trip ack max");
+        let e2e_max = report.max_us.expect("round-trip e2e max");
+        assert!(report.ack_p50_us.is_some(), "round-trip ack p50");
+        assert!(
+            ack_max < e2e_max,
+            "the ack RTT ({ack_max}) is the produce leg only, strictly below the e2e delivery \
+             tail ({e2e_max}) here"
+        );
+    }
 
     #[test]
     fn drain_stops_on_full_count_and_on_shed_but_not_before_caught_up() {
