@@ -109,6 +109,19 @@ pub trait Filesystem: Send + Sync {
     /// # Errors
     /// Propagates the underlying IO error.
     fn list_subdirs(&self) -> io::Result<Vec<String>>;
+
+    /// Whether this backend's sync operations are REAL durability barriers — an actual device
+    /// flush (or a faithful model of one, like [`InMemoryFs`]'s durable-image commit) with a
+    /// per-call cost worth amortizing across a batch. `false` only for a backend whose syncs are
+    /// NO-OPS by construction ([`EphemeralFs`], #492: there is no durable image at all), so a
+    /// group-commit scheduler (the append actor's bounded gather, #454/#1026) knows there is
+    /// nothing to amortize and must not delay acks to batch them. Defaults to `true` — the
+    /// conservative answer for an unknown backend (assume its syncs cost something). A WRAPPER
+    /// filesystem should delegate to its inner backend so the answer reflects where the bytes
+    /// actually land.
+    fn sync_is_real_barrier(&self) -> bool {
+        true
+    }
 }
 
 /// Validates that `name` is a single, safe path component (no separator, no `.`/`..`, no NUL),
@@ -469,6 +482,14 @@ impl Filesystem for EphemeralFs {
             }
         }
         Ok(dirs.into_iter().collect())
+    }
+
+    // The whole point of the ephemeral backend (#492): its file and directory syncs are no-ops by
+    // construction (no durable image, nothing to flush), so there is NO per-sync cost for a
+    // group-commit gather to amortize — a scheduler that delayed acks to batch these syncs would
+    // pay latency for nothing (#1026).
+    fn sync_is_real_barrier(&self) -> bool {
+        false
     }
 }
 

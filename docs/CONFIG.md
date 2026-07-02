@@ -289,7 +289,7 @@ specific — add them from the table above). Practical sizing:
 | `durability_level` | `--durability-level` / `IRONBUS_DURABILITY_LEVEL` | enum | `sync` (`DEFAULT_DURABILITY_LEVEL`) | -- | `sync \| interval \| async \| none` | COLD (coupled with the flush knobs and `async_loss_ack`) |
 | `flush_interval_ms` | `--flush-interval-ms` / `IRONBUS_FLUSH_INTERVAL_MS` | u64 | `1000` (`DEFAULT_FLUSH_INTERVAL_MS`) | ms | `>= 0` (`0` disables the time trigger) | COLD (coupled with `durability_level`) |
 | `flush_max_bytes` | `--flush-max-bytes` / `IRONBUS_FLUSH_MAX_BYTES` | size | `1048576` (1 MiB, `DEFAULT_FLUSH_MAX_BYTES`) | bytes | `>= 0` (`0` disables the byte trigger) | COLD (coupled with `durability_level`) |
-| (no file key: flag/env ONLY) | `--commit-gather-us` / `IRONBUS_COMMIT_GATHER_US` | u64 | `200` (`DEFAULT_COMMIT_GATHER_US`) | us | `0..=1000000` (`0` disables the gather) | COLD (an actor-spawn decision) (#454, #472) |
+| (no file key: flag/env ONLY) | `--commit-gather-us` / `IRONBUS_COMMIT_GATHER_US` | u64 | `200` (`DEFAULT_COMMIT_GATHER_US`) | us | `0..=1000000` (`0` disables the gather) | COLD (an actor-spawn decision) (#454, #472). Engages only when an ack waits on a covering fsync (durability `sync` on disk, #1026); memory-backend and `interval`/`async`/`none` acks are never parked by it. |
 | `async_loss_ack` | `--async-loss-ack` / `IRONBUS_ASYNC_LOSS_ACK` | bool | `false` | -- | `true` to enable `async` / `none` | COLD (coupled with `durability_level`) |
 
 The durability `durability_level` enum is now IMPLEMENTED (#341, #379). The DEFAULT
