@@ -101,6 +101,15 @@ pub struct FaultControl {
     /// The condvar-backed sync rendezvous used to PROVE the group-commit fdatasync fan-out (#823)
     /// runs its K per-fd barriers CONCURRENTLY rather than serially. See [`RendezvousGate`].
     rendezvous: Arc<RendezvousGate>,
+    /// A monotonic count of every `remove` (segment unlink) that ran, so a test can assert a
+    /// multi-segment unlink loop genuinely reached the Nth removal (no false pass).
+    remove_count: Arc<AtomicU64>,
+    /// While non-zero, the `remove` whose 1-based ordinal EQUALS this threshold fails with an
+    /// injected IO error WITHOUT unlinking; every other `remove` (before and after) succeeds. `0`
+    /// disables it. This models a real-FS crash mid-multi-segment unlink loop firing on one specific
+    /// removal, so a test can prove `truncate_to` unlinks its divergent tail HIGHEST-id-first — the
+    /// order that leaves a contiguous, always-openable prefix at every crash point (#873).
+    fail_remove_on: Arc<AtomicU64>,
 }
 
 /// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
@@ -209,6 +218,36 @@ impl FaultControl {
         }
         let threshold = self.fail_sync_dir_after.load(Ordering::SeqCst);
         threshold != 0 && self.sync_dir_count.load(Ordering::SeqCst) >= threshold
+    }
+
+    /// Arms a single-shot `remove` (segment unlink) failure on the `ordinal`-th removal (#873): the
+    /// `ordinal`-th `remove` since arming fails WITHOUT unlinking, while every removal before and
+    /// after it succeeds. Used to crash a `truncate_to` (or `reap`) mid-multi-segment unlink loop on
+    /// one exact segment, so a test can prove the surviving segments are always a contiguous,
+    /// openable prefix. `0` disables it. Counts the CURRENT `remove_count` as the baseline, so call
+    /// it just before the pass under test.
+    pub fn fail_remove_on(&self, ordinal: u64) {
+        let base = self.remove_count.load(Ordering::SeqCst);
+        // Store the ABSOLUTE ordinal (baseline + relative), so the check below is a plain equality
+        // against the running count regardless of how many removals ran before arming.
+        self.fail_remove_on.store(
+            if ordinal == 0 { 0 } else { base + ordinal },
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The number of `remove` (unlink) calls that have run, so a test can assert the unlink loop
+    /// genuinely reached the Nth removal and a crash injected there is not a false pass.
+    #[must_use]
+    pub fn remove_count(&self) -> u64 {
+        self.remove_count.load(Ordering::SeqCst)
+    }
+
+    fn remove_should_fail(&self) -> bool {
+        let target = self.fail_remove_on.load(Ordering::SeqCst);
+        // `remove_count` is bumped BEFORE this check (see the `remove` impl), so equality fires on
+        // exactly the target ordinal's own call.
+        target != 0 && self.remove_count.load(Ordering::SeqCst) == target
     }
 
     /// Arms a TRANSIENT `create_new` failure (#867): the next `count` calls to `create_new` fail with
@@ -683,6 +722,15 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
+        // Count the unlink BEFORE the fault check so a threshold arm fires on the exact Nth removal,
+        // then, if that ordinal is armed, fail WITHOUT unlinking — the mid-loop crash point a
+        // multi-segment `truncate_to`/`reap` unlink must degrade to a contiguous prefix across (#873).
+        self.control.remove_count.fetch_add(1, Ordering::SeqCst);
+        if self.control.remove_should_fail() {
+            return Err(io::Error::other(
+                "injected fault: remove (segment unlink) failed",
+            ));
+        }
         self.inner.remove(name)
     }
 

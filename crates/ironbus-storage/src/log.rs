@@ -3864,10 +3864,24 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
 
         // Unlink every WHOLE segment strictly ABOVE the kept one (its base_offset >= target, so its
         // entire range is in the divergent suffix). `split_off` keeps `[0, keep_idx]` and yields the
-        // tail to unlink. Unlink them (the iteration order does not matter — each is wholly dropped),
-        // then a single dir-sync below makes every removal durable together.
+        // tail to unlink. Iterate the tail HIGHEST-id-first (reverse order): the single trailing
+        // dir-sync below still batches every removal durable together, so under the InMemoryFs
+        // canonical crash model (durable reverts to the last sync barrier atomically) the final state
+        // is unchanged. On a REAL FS a crash MID-loop can leave only a PREFIX of the ISSUED unlink
+        // sequence durable — same-directory metadata ops complete in issue order under ordered
+        // journaling (the prefix-durability this storage layer already relies on), and the single
+        // trailing dir-sync batches the rest. Removing highest-first makes that surviving prefix
+        // `{highest, highest-1, ...}` drop the TOP of the chain, so the survivors are always a
+        // CONTIGUOUS prefix `[0, kept..k]` (never [kept, <gap>, higher]) — always openable, in the
+        // same spirit as `Log::reap`. A later reconcile then re-runs this truncation idempotently over
+        // the valid, over-long prefix. (Lowest-first could leave a durable low-unlink with a surviving
+        // higher segment -> a gap -> `scan_recover_chain` fails `SegmentChainBroken` -> an UNOPENABLE
+        // log. NOTE: under truly ARBITRARY unlink reorder highest-first alone would not suffice — that
+        // needs a per-unlink dir-sync as `Log::reap` does; here we rely on same-dir prefix-durability
+        // plus the trailing sync_dir.)
         let mut segments_dropped = 0u64;
-        for slot in self.segments.split_off(keep_idx + 1) {
+        let mut tail = self.segments.split_off(keep_idx + 1);
+        while let Some(slot) = tail.pop() {
             self.fs.remove(&segment_file_name(slot.id))?;
             self.evict_segment_index(slot.id);
             segments_dropped += 1;
@@ -9076,6 +9090,202 @@ mod tests {
         // It still works normally.
         log.append(&rec(b"still")).unwrap();
         assert_eq!(log.next_offset(), Offset::new(7));
+    }
+
+    #[test]
+    fn truncate_to_crash_mid_surgery_reopens_to_a_valid_prefix_never_torn() {
+        // #873 Phase 5 gap (i): a crash MID-`truncate_to` must reopen to a VALID, contiguous prefix —
+        // never a torn/gapped chain, never losing a record below the truncation target. The
+        // unlink-then-truncate order (whole tail segments unlinked FIRST, then the kept segment cut)
+        // keeps every intermediate durable state valid-prefix-recoverable; this proves it across the two
+        // interior crash windows, both reopened from the surviving durable bytes (a pure function, I4).
+        use crate::fault::FaultFs;
+
+        // WINDOW A: crash AFTER the whole tail segments are unlinked but BEFORE the kept segment's
+        // `set_len` — the exact "segments unlinked, set_len not completed" window. The kept segment's
+        // `record_byte_positions` read (which computes the cut boundary, run after the unlinks and before
+        // `set_len`) faults, aborting the surgery with the kept segment still holding records above the
+        // target.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let durable = fs.inner().clone();
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            log.append(&rec(format!("t{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(
+            log.segment_count() >= 3,
+            "the log must span several segments so the truncate unlinks whole ones"
+        );
+        let files_before = durable.list().unwrap().len();
+
+        control.set_fail_read(true);
+        assert!(
+            log.truncate_to(Offset::new(13)).is_err(),
+            "the mid-surgery read fault aborts the truncate"
+        );
+        // Prove we are genuinely in the "unlinked but not yet set_len" window: the whole tail segments
+        // were already removed from the durable store before the read fault fired.
+        assert!(
+            durable.list().unwrap().len() < files_before,
+            "the divergent tail segments were unlinked before the mid-surgery fault"
+        );
+        drop(log); // crash: the in-memory handles are gone; only the durable bytes survive.
+
+        // Reopen from the surviving bytes (no fault): recovery reconstructs a valid prefix, never torn.
+        let reopened = Log::open(durable, ManualClock::new(), small_config()).unwrap();
+        let next = reopened.next_offset().get();
+        assert!(
+            (13..=30).contains(&next),
+            "reopen recovered a valid prefix in [target, original] (got {next}), never short of the \
+             target (no committed loss) and never a torn/over-long chain"
+        );
+        // The recovered prefix is DENSE and contiguous — no gap, no committed loss below the target, no
+        // fabricated bytes leaking from the dropped suffix.
+        let recs = reopened.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(
+            recs.len() as u64,
+            next,
+            "the recovered prefix is dense and contiguous"
+        );
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(
+                r.payload.as_ref(),
+                format!("t{i:02}").as_bytes(),
+                "record {i} survived the aborted surgery intact"
+            );
+        }
+        // The recovered log is fully writable: the aborted surgery left a clean state, not a frozen one.
+        let mut reopened = reopened;
+        reopened.append(&rec(b"afterA")).unwrap();
+        reopened.sync().unwrap();
+        assert_eq!(reopened.next_offset().get(), next + 1);
+
+        // WINDOW B: crash AFTER the kept segment's `set_len` but BEFORE the final directory `sync_dir`
+        // (the kept segment is already cut to the target on disk). Recovery lands on EXACTLY the target —
+        // the fully-formed truncated prefix, no torn tail.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let durable = fs.inner().clone();
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            log.append(&rec(format!("t{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        // The kept segment's `sync_all` (issued immediately after its `set_len`) faults, aborting the
+        // surgery after the byte-cut is durable but before the directory publish.
+        control.set_fail_sync(true);
+        assert!(
+            log.truncate_to(Offset::new(13)).is_err(),
+            "the post-set_len sync fault aborts the truncate"
+        );
+        drop(log);
+        let reopened = Log::open(durable, ManualClock::new(), small_config()).unwrap();
+        let next = reopened.next_offset().get();
+        // The kept segment's byte-cut is already durable here (the fault fired on the sync AFTER the
+        // `set_len`), so recovery lands on EXACTLY the truncation target — not merely somewhere in the
+        // valid `[target, original]` band. (Tightened from a range check per review: this window's
+        // outcome is deterministic.)
+        assert_eq!(
+            next, 13,
+            "window B recovers to exactly the truncation target"
+        );
+        let recs = reopened.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(recs.len() as u64, next, "window B is dense and contiguous");
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("t{i:02}").as_bytes());
+        }
+    }
+
+    #[test]
+    fn truncate_to_crash_mid_multi_segment_unlink_reopens_to_a_contiguous_prefix() {
+        // #873 Phase 5 gap: the divergent-tail unlink loop removes MANY whole segments under a single
+        // trailing `sync_dir`. On a real FS, directory writeback can reorder unlinks across that fsync
+        // barrier, so a crash mid-loop can leave only SOME removals durable. `truncate_to` unlinks
+        // HIGHEST-id-first so whatever partial subset survives is always a CONTIGUOUS prefix
+        // `[0, kept..k]` — always openable — never `[kept, <gap>, higher]` (which `scan_recover_chain`
+        // rejects `SegmentChainBroken` -> an UNOPENABLE log). This models that exact reordered crash:
+        // FaultFs fails the SECOND unlink, then we reopen the LIVE (most-flushed) store — the stronger
+        // model than `simulate_power_loss` (which would revert the whole batch atomically and hide the
+        // ordering entirely) — and assert recovery SUCCEEDS to a dense, contiguous prefix.
+        //
+        // Mutation check: reverting the unlink to lowest-id-first makes the surviving set
+        // `[kept, <gap>, higher...]`, so `Log::open` below fails `SegmentChainBroken` and this test
+        // fails — the fix is load-bearing.
+        use crate::fault::FaultFs;
+
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        // `durable` aliases the SAME in-memory disk (Arc-backed), so it observes every unlink the
+        // aborted truncate made durable — the live, most-flushed image, NOT a power-loss revert.
+        let durable = fs.inner().clone();
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            log.append(&rec(format!("t{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        // A low target keeps only the first segment(s), so the divergent tail is MANY (>=3) whole
+        // segments — enough that a SECOND unlink genuinely runs (the mid-loop crash point).
+        let seg_count = log.segment_count();
+        assert!(
+            seg_count >= 4,
+            "need a >=3-segment divergent tail so a second unlink runs (got {seg_count} segments)"
+        );
+        let files_before = durable.list().unwrap().len();
+
+        // Arm the crash on the SECOND unlink AFTER this point. `fail_remove_on` is RELATIVE to the
+        // current `remove_count` (segment rolls already issued their own unlinks during the appends),
+        // so this pins the second unlink of the truncate's own tail loop. Highest-first, that loop's
+        // 1st unlink drops the TOP segment durably; its 2nd faults, so the loop aborts with the
+        // surviving set still a contiguous prefix.
+        let removes_before = control.remove_count();
+        control.fail_remove_on(2);
+        assert!(
+            log.truncate_to(Offset::new(3)).is_err(),
+            "the mid-loop unlink fault aborts the truncate"
+        );
+        // Prove we genuinely reached the second removal (no false pass) and that exactly ONE segment
+        // was unlinked before the fault — the highest, leaving a contiguous prefix.
+        assert_eq!(
+            control.remove_count() - removes_before,
+            2,
+            "the truncate reached (and faulted on) the second unlink"
+        );
+        assert_eq!(
+            durable.list().unwrap().len(),
+            files_before - 1,
+            "exactly the top divergent segment was unlinked before the crash"
+        );
+        drop(log); // crash: only the durable/live bytes survive.
+
+        // Reopen the LIVE store: highest-first leaves `[0, kept..k-1]`, a valid contiguous prefix, so
+        // recovery SUCCEEDS. (Lowest-first would leave a gap here and this `unwrap` would panic.)
+        let reopened = Log::open(durable, ManualClock::new(), small_config()).unwrap();
+        let next = reopened.next_offset().get();
+        // No committed loss below the truncation target, and never an over-short chain: recovery lands
+        // in the valid `[target, original]` band (the kept segments were never cut, so the surviving
+        // prefix is over-long — a later reconcile re-truncates it idempotently).
+        assert!(
+            (3..=30).contains(&next),
+            "recovered a valid over-long prefix in [target, original] (got {next})"
+        );
+        let recs = reopened.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(
+            recs.len() as u64,
+            next,
+            "the recovered prefix is dense and contiguous — no gap, no torn tail"
+        );
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(
+                r.payload.as_ref(),
+                format!("t{i:02}").as_bytes(),
+                "record {i} survived the aborted multi-segment unlink intact"
+            );
+        }
+        // The recovered log is fully writable: the aborted surgery left a clean prefix, not a frozen
+        // or torn state.
+        let mut reopened = reopened;
+        reopened.append(&rec(b"after")).unwrap();
+        reopened.sync().unwrap();
+        assert_eq!(reopened.next_offset().get(), next + 1);
     }
 
     /// #822 discriminator for the OUTER cross-subtree recovery pool: [`par_recover_open`] MUST return

@@ -3027,6 +3027,293 @@ mod tests {
     }
 
     // ============================================================================================
+    //  #873 Phase 5: crash-window + adopt-seam idempotency HARDENING. Prove the whole adopt-seam
+    //  reconcile is a PURE, RETRYABLE function of durable state: re-running it after a clean heal
+    //  touches nothing (idempotency), and a crash AFTER the truncate but BEFORE the forward fetch
+    //  resumes reopens to the truncated committed prefix and RE-ADOPTS as a no-op (no double-heal, no
+    //  loss) — for BOTH the P2 uncommitted-tail path AND the P3 below-frontier content-mismatch path.
+    //  A shared-Arc `InMemoryFs` durable store models the crash: drop the in-memory handles, reopen a
+    //  fresh follower `Log` from the surviving bytes, and re-drive `reconcile_on_adopt`.
+    // ============================================================================================
+
+    /// Serve the follower's CURRENT probe fetch on `leader` and return the encoded `FetchResponse`
+    /// frame bytes — a re-adopt probe from wherever the follower's frontier now sits (unlike
+    /// [`scripted_probe`], which asserts the divergent empty-run shape a first adopt sees).
+    fn serve_probe_bytes(
+        partition: u64,
+        server: &Arc<Mutex<DataPlaneServer<InMemoryFs, ManualClock>>>,
+        leader: &DataPlaneController<InMemoryFs, ManualClock>,
+    ) -> Vec<u8> {
+        let req = server
+            .lock()
+            .unwrap()
+            .seam()
+            .controller()
+            .make_fetch_request(partition, FULL_CATCHUP_RECORDS, FULL_CATCHUP_BYTES)
+            .unwrap();
+        let resp = leader.serve_fetch(partition, &req).unwrap();
+        encode_dataplane_peer_frame(partition, &DataPlaneFrame::FetchResponse(resp)).unwrap()
+    }
+
+    /// The shared-Arc `InMemoryFs` backing the follower's partition log — cloning it shares the SAME
+    /// durable store, so a fresh `Log::open` after a "crash" (dropping the server) recovers from the
+    /// exact post-truncate bytes.
+    fn follower_fs(
+        partition: u64,
+        server: &Arc<Mutex<DataPlaneServer<InMemoryFs, ManualClock>>>,
+    ) -> InMemoryFs {
+        server
+            .lock()
+            .unwrap()
+            .seam()
+            .controller()
+            .with_follower_log(partition, |log| log.filesystem().clone())
+            .unwrap()
+    }
+
+    /// Reopen a FOLLOWER `DataPlaneServer` (node 2, empty epoch cache) over the durable bytes in `fs` —
+    /// the post-crash recovery: a fresh `Log::open` re-derives the follower state as a pure function of
+    /// the surviving durable bytes.
+    fn reopened_follower_server(
+        partition: u64,
+        fs: InMemoryFs,
+    ) -> Arc<Mutex<DataPlaneServer<InMemoryFs, ManualClock>>> {
+        let log = Log::open(fs, ManualClock::new(), small_config()).expect("follower log reopens");
+        let mut follower: DataPlaneController<InMemoryFs, ManualClock> =
+            DataPlaneController::new(2);
+        follower.start_follower(partition, log);
+        Arc::new(Mutex::new(DataPlaneServer::new(
+            2,
+            ProduceAckSeam::new(follower),
+        )))
+    }
+
+    #[test]
+    fn adopt_seam_p2_reconcile_is_idempotent_after_a_clean_heal() {
+        // Gap (iii), P2 path: after the adopt seam truncates a divergent uncommitted tail to the floor, a
+        // SECOND adopt (a reconnect re-probe) against the same present floor must touch NOTHING — no
+        // second truncation, no metric bump. The heal is idempotent on the adopt seam, not just on the
+        // controller (`heal_is_idempotent_on_retry` covers the controller in isolation).
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let (leader, _served) = short_new_leader(P, 18);
+        let (probe, _frontier, leader_hw) = scripted_probe(P, &server, &leader);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        let floor = leader_hw / 2;
+        assert!(floor > 0 && floor < leader_hw && floor < frontier);
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        // First adopt: heals down to the floor.
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "first adopt heals to the floor"
+        );
+        assert_eq!(divergence.uncommitted_tail_healed_total(), 1);
+
+        // Second adopt (same process, a reconnect re-probe from the now-healed frontier): a genuine
+        // no-op. The follower's LEO now equals the floor, so nothing sits above it to truncate.
+        let probe2 = serve_probe_bytes(P, &server, &leader);
+        let mut link2 = DataPlaneLink::new(ScriptedStream::new(probe2));
+        reconcile_on_adopt(P, &mut link2, &server, Some(&status), &divergence);
+
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "the idempotent re-adopt truncates nothing (the frontier is unchanged)"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_healed_total(),
+            1,
+            "the re-adopt performs NO second heal (the healed counter is unchanged)"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_heal_refused_total(),
+            0,
+            "the idempotent re-adopt is not a refusal either"
+        );
+    }
+
+    #[test]
+    fn adopt_seam_p3_reconcile_is_idempotent_after_a_clean_heal() {
+        // Gap (iii), P3 path: the same adopt-seam idempotency for the below-frontier CONTENT-mismatch
+        // heal. After it truncates the content-divergent tail to the floor, a second adopt touches
+        // nothing (the follower LEO == floor, so the content-mismatch path returns before it even probes).
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let floor = 20u64;
+        let (leader, served) = content_divergent_leader(P, u32::try_from(floor).unwrap(), 60);
+        assert!(served > frontier);
+        let (probe, _leo, _hw) = scripted_content_probe(P, &server, &leader, floor);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        // First adopt: the Phase 3 content-mismatch heal truncates down to the floor.
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "first adopt heals to the floor"
+        );
+        assert_eq!(divergence.content_mismatch_healed_total(), 1);
+
+        // Second adopt from the healed frontier: a no-op (nothing above the floor to reconcile).
+        let probe2 = serve_probe_bytes(P, &server, &leader);
+        let mut link2 = DataPlaneLink::new(ScriptedStream::new(probe2));
+        reconcile_on_adopt(P, &mut link2, &server, Some(&status), &divergence);
+
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "the idempotent P3 re-adopt truncates nothing"
+        );
+        assert_eq!(
+            divergence.content_mismatch_healed_total(),
+            1,
+            "the re-adopt performs NO second content-mismatch heal"
+        );
+        assert_eq!(
+            divergence.content_mismatch_critical_total(),
+            0,
+            "the re-adopt is never a CRITICAL below-committed violation"
+        );
+        assert_eq!(
+            divergence.content_mismatch_heal_refused_total(),
+            0,
+            "the re-adopt is not a refusal either"
+        );
+    }
+
+    #[test]
+    fn crash_after_a_p2_adopt_heal_reopens_to_the_floor_and_re_adopts_as_a_no_op() {
+        // Gap (ii), P2 path: crash AFTER the adopt-seam truncate but BEFORE the forward fetch resumes.
+        // The truncate fsync'd (set_len + sync_all + sync_dir), so a reopen from the shared durable store
+        // recovers EXACTLY the truncated committed prefix — no divergent tail residue, no committed loss.
+        // Re-adopting the reopened follower re-runs the whole reconcile as a no-op (no double-heal).
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let (leader, _served) = short_new_leader(P, 18);
+        let (probe, _frontier, leader_hw) = scripted_probe(P, &server, &leader);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        let floor = leader_hw / 2;
+        assert!(floor > 0 && floor < leader_hw && floor < frontier);
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "the adopt heal truncated to the floor"
+        );
+
+        // CRASH: capture the shared durable store, drop the server (all in-memory handles gone), reopen.
+        let fs = follower_fs(P, &server);
+        drop(server);
+        let reopened = reopened_follower_server(P, fs);
+        assert_eq!(
+            follower_frontier(P, &reopened),
+            floor,
+            "recovery after the crash lands on EXACTLY the truncated committed prefix (no loss, no \
+             torn tail)"
+        );
+
+        // RE-ADOPT the reopened follower: the whole reconcile re-runs as a no-op — no second heal, no
+        // refusal, no further truncation. The adopt seam converges across the crash window.
+        let probe2 = serve_probe_bytes(P, &reopened, &leader);
+        let mut link2 = DataPlaneLink::new(ScriptedStream::new(probe2));
+        let divergence2 = FollowerDivergenceMetrics::default();
+        reconcile_on_adopt(P, &mut link2, &reopened, Some(&status), &divergence2);
+
+        assert_eq!(
+            follower_frontier(P, &reopened),
+            floor,
+            "the post-crash re-adopt truncates nothing (the recovered frontier is unchanged)"
+        );
+        assert_eq!(
+            divergence2.uncommitted_tail_healed_total(),
+            0,
+            "the re-adopt after the crash performs NO heal (no double-heal across the crash window)"
+        );
+        assert_eq!(
+            divergence2.uncommitted_tail_heal_refused_total(),
+            0,
+            "the post-crash re-adopt is not a refusal either"
+        );
+    }
+
+    #[test]
+    fn crash_after_a_p3_adopt_heal_reopens_to_the_floor_and_re_adopts_as_a_no_op() {
+        // Gap (ii), P3 path: the same crash-window convergence for the below-frontier content-mismatch
+        // heal. Crash after the content-mismatch truncate, reopen from the durable bytes to exactly the
+        // floor, and re-adopt as a no-op.
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let floor = 20u64;
+        let (leader, served) = content_divergent_leader(P, u32::try_from(floor).unwrap(), 60);
+        assert!(served > frontier);
+        let (probe, _leo, _hw) = scripted_content_probe(P, &server, &leader, floor);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "the P3 adopt heal truncated to the floor"
+        );
+        assert_eq!(divergence.content_mismatch_healed_total(), 1);
+
+        // CRASH + reopen from the shared durable store.
+        let fs = follower_fs(P, &server);
+        drop(server);
+        let reopened = reopened_follower_server(P, fs);
+        assert_eq!(
+            follower_frontier(P, &reopened),
+            floor,
+            "recovery lands on exactly the content-heal truncated committed prefix"
+        );
+
+        // RE-ADOPT: a no-op across the crash window.
+        let probe2 = serve_probe_bytes(P, &reopened, &leader);
+        let mut link2 = DataPlaneLink::new(ScriptedStream::new(probe2));
+        let divergence2 = FollowerDivergenceMetrics::default();
+        reconcile_on_adopt(P, &mut link2, &reopened, Some(&status), &divergence2);
+
+        assert_eq!(
+            follower_frontier(P, &reopened),
+            floor,
+            "the post-crash P3 re-adopt truncates nothing"
+        );
+        assert_eq!(
+            divergence2.content_mismatch_healed_total(),
+            0,
+            "no double content-mismatch heal across the crash window"
+        );
+        assert_eq!(
+            divergence2.content_mismatch_critical_total(),
+            0,
+            "the post-crash re-adopt is never a CRITICAL below-committed violation"
+        );
+    }
+
+    // ============================================================================================
     //  Codec tests: the data-plane peer codec round-trips + stays bounded on untrusted input.
     // ============================================================================================
 

@@ -2727,6 +2727,88 @@ mod tests {
         );
     }
 
+    /// Fetch forward from `leader` into `follower` until the follower's HW covers `target` (the shared
+    /// in-process serve->apply loop the other reconcile tests use). Deterministic: bounded, no clock.
+    fn converge_follower(
+        follower: &mut DataPlaneController<InMemoryFs, ManualClock>,
+        leader: &DataPlaneController<InMemoryFs, ManualClock>,
+        partition: u64,
+        target: u64,
+    ) {
+        for _ in 0..80 {
+            if follower.follower_high_watermark(partition).unwrap() >= target {
+                break;
+            }
+            let req = follower.make_fetch_request(partition, 8, 4096).unwrap();
+            let resp = leader.serve_fetch(partition, &req).unwrap();
+            follower.apply_fetch_response(partition, &resp).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_healed_replica_image_is_byte_identical_to_a_clean_from_scratch_replica() {
+        // #873 Phase 5 gap (iv): the DETERMINISM/byte-identity apex — a replica that DIVERGED and then
+        // self-healed (truncate the uncommitted tail to the committed floor + re-fetch the new lineage
+        // forward) must end BYTE-FOR-BYTE identical to a replica that only ever replicated the clean new
+        // lineage from scratch. The heal path is a pure, retryable function of durable state: it leaves
+        // no seam artifact (no stale segment, no off-by-one seal boundary, no divergent tail residue).
+        const P: u64 = 0;
+        const FLOOR: u64 = 6;
+
+        // The HEALED replica: it fsynced an old divergent lineage [0, old_served), heals down to the
+        // committed floor against the new leader, then converges forward over the clean new lineage.
+        let (mut healed, old_served) = divergent_follower_holding(P, InMemoryFs::new(), 18);
+        assert!(
+            old_served > FLOOR,
+            "the healed replica held a divergent tail"
+        );
+        let (new_leader, _new_log, new_served) =
+            new_divergent_leader(P, u32::try_from(FLOOR).unwrap(), 20);
+        healed
+            .heal_divergent_follower(P, Offset::new(FLOOR), new_served, no_query)
+            .expect("the divergent replica self-heals to the committed floor");
+        converge_follower(&mut healed, &new_leader, P, new_served);
+
+        // The CLEAN replica: an independent node that only ever replicated the SAME new lineage from an
+        // empty log — never diverged, never healed. Its leader is an independent build of the identical
+        // lineage (deterministic bytes), so any difference is a real heal-path artifact, not input skew.
+        let (clean_leader, _clean_log, clean_served) =
+            new_divergent_leader(P, u32::try_from(FLOOR).unwrap(), 20);
+        assert_eq!(
+            new_served, clean_served,
+            "the two independent leaders build the identical lineage bytes"
+        );
+        let mut clean = DataPlaneController::<InMemoryFs, ManualClock>::new(2);
+        clean.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+        converge_follower(&mut clean, &clean_leader, P, clean_served);
+
+        // Both converged to the same frontier, and their on-disk images are byte-for-byte identical.
+        assert_eq!(
+            healed
+                .with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            clean
+                .with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            "both replicas converged to the same frontier"
+        );
+        let healed_img: std::collections::BTreeMap<String, Vec<u8>> = healed
+            .with_follower_log(P, dump_segments)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let clean_img: std::collections::BTreeMap<String, Vec<u8>> = clean
+            .with_follower_log(P, dump_segments)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            healed_img, clean_img,
+            "a healed replica image is byte-identical to a clean from-scratch replica (the heal leaves \
+             no seam artifact)"
+        );
+    }
+
     // ---- single-node / single-replica = the local-fsync ack, byte-identical ----------------------
 
     #[test]
