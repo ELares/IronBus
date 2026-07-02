@@ -105,8 +105,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ironbus_core::clock::Clock;
-use ironbus_core::epoch_cache::EpochCache;
+use ironbus_core::epoch_cache::{EpochCache, LeaderEpochEndOffset};
 use ironbus_core::leader_lease::LeaderEpoch;
+use ironbus_core::types::Offset;
 use ironbus_proto::frame::{
     decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType, MAX_FRAME_LEN,
 };
@@ -122,7 +123,9 @@ use super::dataplane::{
 };
 use super::divergence::{empty_run_above_leader_frontier, suspect_uncommitted_tail};
 use super::isr::IsrConfig;
-use super::replication::{FetchRecordsBody, FetchResponseBody};
+use super::replication::{
+    FetchRecordsBody, FetchResponseBody, OffsetForLeaderEpochBody, ReplicationError,
+};
 use super::rereplication::{
     FetchBudget, ReReplicationThrottle, FULL_CATCHUP_BYTES, FULL_CATCHUP_RECORDS,
 };
@@ -1643,6 +1646,227 @@ fn note_suspected_uncommitted_tail(
     true
 }
 
+/// The outcome of a #873 Phase 2 reconcile-on-adopt heal driven over the live leader link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdoptHeal {
+    /// A divergent uncommitted tail was TRUNCATED down to the committed floor (a durable, loss-free
+    /// self-heal). The caller re-fetches the clean lineage forward.
+    Healed,
+    /// Nothing to heal (a clean no-op reconcile), or the wire / role failed. The caller reconnects and
+    /// re-fetches rather than hot-looping.
+    NoneOrFailed,
+    /// FAIL CLOSED: the adopted leader is BEHIND the follower's committed floor (the `ResyncLeaderBehind`
+    /// guard). The follower was left UNTOUCHED (never truncated) for a retry against a complete leader.
+    Refused,
+}
+
+/// #873 Phase 2 RECONCILE-ON-ADOPT (the adopt seam). Run ONCE at the top of the follower fetch loop —
+/// BEFORE the first forward fetch could apply anything — probe the newly-adopted leader and, if this
+/// follower holds a divergent uncommitted tail (the Phase 1 detector fires against the follower's OWN
+/// quorum-committed floor, `ClusterStatus::last_committed_hw` — NEVER `resp.high_watermark`), TRUNCATE
+/// that tail away down to (never below) the committed floor. This closes the silent-stitch hazard: with
+/// the stale uncommitted bytes gone, no forward fetch can graft the new leader's lineage onto them.
+///
+/// It is PURE DETECTION until it acts: the probe response is NEVER applied to the log (a divergent
+/// follower's probe is by construction an empty run above the leader frontier), so "before the first
+/// forward fetch" holds. A refusal (`ResyncLeaderBehind`) leaves the follower untouched — the safe,
+/// fail-closed outcome. On any wire / role failure it simply returns; the caller reconnects.
+fn reconcile_on_adopt<S, F, C>(
+    partition: u64,
+    link: &mut DataPlaneLink<S>,
+    server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+    status: Option<&Arc<Mutex<ClusterStatus>>>,
+    divergence: &FollowerDivergenceMetrics,
+) where
+    S: Read + Write,
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    // Build a PROBE fetch from the follower's current frontier under a short lock (never held across
+    // the wire). Its `from_offset` IS the follower's next offset — the LEO the detector compares.
+    let req = {
+        let Ok(srv) = server.lock() else {
+            return; // poisoned: tearing down
+        };
+        match srv.seam().controller().make_fetch_request(
+            partition,
+            FULL_CATCHUP_RECORDS,
+            FULL_CATCHUP_BYTES,
+        ) {
+            Ok(req) => req,
+            Err(_) => return, // not a follower of this partition
+        }
+    };
+    let follower_next_offset = req.from_offset;
+    // Send the probe and read exactly one response. A wire failure / stray frame aborts the adopt
+    // reconcile; the caller reconnects and retries (idempotent — a fresh adopt re-probes).
+    if link
+        .send(partition, &DataPlaneFrame::FetchRequest(req))
+        .is_err()
+    {
+        return;
+    }
+    let resp = match link.recv() {
+        Ok(Some((p, DataPlaneFrame::FetchResponse(resp)))) if p == partition => resp,
+        _ => return,
+    };
+    // Read the follower's OWN quorum-committed floor from the replicated metadata snapshot. It is
+    // AUTHORITATIVE only once the metadata group has published a `CheckpointCommittedHw` for this
+    // partition; before that the map has NO entry for it. We MUST distinguish an ABSENT floor from a
+    // genuine committed HW of `0`: the pre-fix code resolved the floor as `.unwrap_or(0)`, which
+    // CONFLATED the two — on a leader change BEFORE the first checkpoint it would truncate the WHOLE
+    // follower log (committed prefix INCLUDED) down to `0`, and a crash mid-heal would leave it empty
+    // (the `ResyncLeaderBehind` guard is vacuous at floor `0`). NEVER `resp.high_watermark` (the
+    // leader's flush HW). Resolve it as an `Option` and FAIL CLOSED on the absent case below.
+    let committed_floor: Option<u64> = status.and_then(|s| {
+        s.lock()
+            .ok()
+            .and_then(|st| st.last_committed_hw.get(&partition).copied())
+    });
+    let Some(committed_floor) = committed_floor else {
+        // ABSENT authoritative floor: the committed prefix length is UNKNOWN, so ANY truncation could
+        // durably drop committed data. If the follower nonetheless LOOKS divergent (an empty run above
+        // the leader frontier over a non-empty log — exactly what `suspect_uncommitted_tail` would have
+        // flagged against a bogus floor of `0`), REFUSE the heal entirely: leave the log UNTOUCHED,
+        // bump the heal-refused metric, and WARN. A retry once the metadata group publishes the floor
+        // heals normally. A caught-up / empty follower is not divergent and stays silent (no spam).
+        if empty_run_above_leader_frontier(follower_next_offset, &resp) && follower_next_offset > 0
+        {
+            divergence.record_uncommitted_tail_heal_refused();
+            tracing::warn!(
+                partition,
+                follower_next_offset,
+                leader_high_watermark = resp.high_watermark,
+                "data plane: reconcile-on-adopt REFUSED (#873 Phase 2) — no authoritative committed \
+                 floor yet (the metadata group has not published a CheckpointCommittedHw for this \
+                 partition), so the committed prefix length is UNKNOWN and any truncation could drop \
+                 committed data. FAIL CLOSED: refusing to truncate — the follower log is left \
+                 untouched. Retrying after the floor is published heals normally."
+            );
+        }
+        return;
+    };
+    // Only act on a SUSPECTED uncommitted-tail divergence (the empty-run-above-frontier discriminator).
+    // A caught-up / healthy follower short-circuits here and enters the steady loop untouched.
+    if !suspect_uncommitted_tail(follower_next_offset, committed_floor, &resp) {
+        return;
+    }
+    let leader_hw = resp.high_watermark;
+    match heal_divergent_follower_on_link(partition, committed_floor, leader_hw, link, server) {
+        AdoptHeal::Healed => {
+            divergence.record_uncommitted_tail_healed();
+            tracing::warn!(
+                partition,
+                follower_next_offset,
+                committed_floor,
+                leader_high_watermark = leader_hw,
+                "data plane: RECONCILED-ON-ADOPT (#873 Phase 2) — truncated a divergent uncommitted \
+                 tail down to the quorum-committed floor before the first forward fetch, so the new \
+                 leader lineage cannot stitch onto stale uncommitted bytes. Committed data was never \
+                 dropped (the truncation floor is the replicated committed HW). Re-fetching the clean \
+                 lineage forward."
+            );
+        }
+        AdoptHeal::Refused => {
+            divergence.record_uncommitted_tail_heal_refused();
+            tracing::warn!(
+                partition,
+                follower_next_offset,
+                committed_floor,
+                leader_high_watermark = leader_hw,
+                "data plane: reconcile-on-adopt REFUSED (#873 Phase 2, ResyncLeaderBehind) — the \
+                 adopted leader's frontier is BELOW this follower's committed floor, so it cannot \
+                 restore the committed data a truncation would drop. FAIL CLOSED: the follower is \
+                 left untouched for a retry against a complete leader."
+            );
+        }
+        AdoptHeal::NoneOrFailed => {}
+    }
+}
+
+/// #873 Phase 2: drive the divergence heal for `partition` over the live leader `link`. Pre-collects
+/// the follower's learned leader epochs OFF the server lock, queries the leader's `OffsetForLeaderEpoch`
+/// end-offset for each over the SAME link (none in the common case — an empty epoch cache), then drives
+/// the controller's [`DataPlaneController::heal_divergent_follower`] to truncate the divergent suffix
+/// down to `committed_hw` (never below). `leader_hw` is the adopted leader's advertised frontier; the
+/// controller FAILS CLOSED with `ResyncLeaderBehind` if it is below `committed_hw`. No wire I/O ever
+/// happens under the server lock: the epoch answers are collected off-lock first, then the heal runs
+/// under a short lock with a PURE closure over them.
+fn heal_divergent_follower_on_link<S, F, C>(
+    partition: u64,
+    committed_hw: u64,
+    leader_hw: u64,
+    link: &mut DataPlaneLink<S>,
+    server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+) -> AdoptHeal
+where
+    S: Read + Write,
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    // Pre-collect the follower's learned leader epochs under a SHORT lock, released before any wire I/O.
+    let epochs = {
+        let Ok(srv) = server.lock() else {
+            return AdoptHeal::NoneOrFailed; // poisoned: tearing down
+        };
+        match srv.seam().controller().follower_epochs(partition) {
+            Some(epochs) => epochs,
+            None => return AdoptHeal::NoneOrFailed, // no longer a follower of this partition
+        }
+    };
+    // Query the leader for each learned epoch's end-offset over the SAME link, OFF the server lock. A
+    // wire failure aborts the heal (reconnect); a missing answer maps to the committed-HW floor below
+    // so the reconcile never truncates on an answer it did not receive.
+    let mut answers: BTreeMap<u64, LeaderEpochEndOffset> = BTreeMap::new();
+    for epoch in epochs {
+        if link
+            .send(
+                partition,
+                &DataPlaneFrame::EpochQuery(OffsetForLeaderEpochBody { epoch }),
+            )
+            .is_err()
+        {
+            return AdoptHeal::NoneOrFailed;
+        }
+        match link.recv() {
+            Ok(Some((p, DataPlaneFrame::EpochResponse(resp)))) if p == partition => {
+                answers.insert(epoch.get(), resp.end_offset);
+            }
+            _ => return AdoptHeal::NoneOrFailed,
+        }
+    }
+    // Drive the heal under a SHORT lock with a PURE closure over the pre-collected answers (no wire I/O
+    // under the lock). A queried epoch with no answer falls back to the committed-HW floor.
+    let committed = Offset::new(committed_hw);
+    let Ok(mut srv) = server.lock() else {
+        return AdoptHeal::NoneOrFailed;
+    };
+    let outcome = srv.seam_mut().controller_mut().heal_divergent_follower(
+        partition,
+        committed,
+        leader_hw,
+        |epoch: LeaderEpoch| {
+            answers
+                .get(&epoch.get())
+                .copied()
+                .unwrap_or(LeaderEpochEndOffset {
+                    requested_epoch: epoch,
+                    answered_epoch: epoch,
+                    end_offset: committed,
+                })
+        },
+    );
+    match outcome {
+        Ok(truncation) if !truncation.is_no_op() => AdoptHeal::Healed,
+        Err(DataPlaneError::Replication(ReplicationError::ResyncLeaderBehind { .. })) => {
+            AdoptHeal::Refused
+        }
+        // A clean no-op reconcile, or any other truncation / epoch-cache fault: nothing was healed;
+        // the caller reconnects and re-fetches rather than hot-looping.
+        Ok(_) | Err(_) => AdoptHeal::NoneOrFailed,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn follower_fetch_loop<F, C>(
     partition: u64,
@@ -1671,6 +1895,15 @@ fn follower_fetch_loop<F, C>(
             None => return, // not a follower of this partition
         }
     };
+    // #873 Phase 2 RECONCILE-ON-ADOPT: at the adopt seam — BEFORE the first forward fetch below — probe
+    // the newly-adopted leader once and, on a detected divergent uncommitted tail, TRUNCATE it away down
+    // to the follower's own quorum-committed floor. This runs per fetch-link session (a fresh adopt is a
+    // new session); it is idempotent (a clean follower / an already-healed one no-ops) and never applies
+    // the probe response, so the steady loop below always fetches a clean lineage forward.
+    if shutdown.load(Ordering::Acquire) {
+        return;
+    }
+    reconcile_on_adopt(partition, link, server, status, divergence);
     // The budget the throttle decided for the NEXT fetch. Seeded full-rate: the first fetch of a
     // freshly-dialed link runs at full budget (the backlog is not known until the first response), and
     // the throttle shapes every subsequent fetch from the observed backlog + service delay.
@@ -2120,6 +2353,299 @@ mod tests {
         ) -> Result<Log<InMemoryFs, ManualClock>, String> {
             Ok(open_log())
         }
+    }
+
+    // ============================================================================================
+    //  #873 Phase 2 SERVE-SEAM wiring: `reconcile_on_adopt` / `heal_divergent_follower_on_link` driven
+    //  over an IN-MEMORY link (no socket, no thread — fully deterministic, InMemoryFs + ManualClock).
+    //  The review flagged these seam functions as having ZERO direct coverage. Each test scripts the
+    //  adopt handshake — a single probe (FetchRequest -> an empty-run FetchResponse above the leader
+    //  frontier) with an EMPTY follower epoch cache, so the whole reconcile runs off ONE response — and
+    //  asserts the CRITICAL fix: an ABSENT authoritative committed floor REFUSES (log untouched), a
+    //  PRESENT floor + a divergent tail TRUNCATES to the floor, and a PRESENT floor with the leader
+    //  behind REFUSES (`ResyncLeaderBehind`).
+    // ============================================================================================
+
+    fn min_isr1() -> IsrConfig {
+        IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        }
+    }
+
+    /// A synchronous IN-MEMORY duplex stream for a [`DataPlaneLink`]: `recv` reads pre-scripted leader
+    /// response bytes out of `inbound`; `send` captures the follower's outbound frames in `outbound`
+    /// (inspectable, though these tests only assert on the log + metrics). Single-threaded and fully
+    /// deterministic — no socket, no clock. Reading past the scripted bytes returns `0` (a clean EOF),
+    /// which the link surfaces as a benign end-of-stream the reconcile treats as "nothing more to do".
+    struct ScriptedStream {
+        inbound: Vec<u8>,
+        read_pos: usize,
+        outbound: Vec<u8>,
+    }
+    impl ScriptedStream {
+        fn new(inbound: Vec<u8>) -> Self {
+            Self {
+                inbound,
+                read_pos: 0,
+                outbound: Vec::new(),
+            }
+        }
+    }
+    impl std::io::Read for ScriptedStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = (self.inbound.len() - self.read_pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.inbound[self.read_pos..self.read_pos + n]);
+            self.read_pos += n;
+            Ok(n)
+        }
+    }
+    impl std::io::Write for ScriptedStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.outbound.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a FOLLOWER `DataPlaneServer` (node 2, EMPTY epoch cache — the common post-failover shape)
+    /// that fully replicated a throwaway old leader's `old_len`-record shared lineage over the read-plane
+    /// serve path, so it now holds `[0, frontier)` fsynced with NO learned epoch boundaries. Returns the
+    /// server behind the `Arc<Mutex>` the seam wiring takes, plus the follower's frontier offset (its
+    /// over-extended, mostly-uncommitted tail).
+    fn divergent_follower_server(
+        partition: u64,
+        old_len: u32,
+    ) -> (Arc<Mutex<DataPlaneServer<InMemoryFs, ManualClock>>>, u64) {
+        let mut old_leader_log = open_log();
+        for i in 0..old_len {
+            old_leader_log
+                .append(&rec(format!("rec-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        old_leader_log.sync().unwrap();
+        let old_plane = leader_plane(&old_leader_log);
+        let old_served = plane_served_end(&old_plane);
+        let mut old_leader: DataPlaneController<InMemoryFs, ManualClock> =
+            DataPlaneController::new(1);
+        old_leader.start_leader(partition, old_plane, EpochCache::new(), &[1, 2], min_isr1());
+        let mut follower: DataPlaneController<InMemoryFs, ManualClock> =
+            DataPlaneController::new(2);
+        follower.start_follower(partition, open_log());
+        for _ in 0..80 {
+            if follower.follower_high_watermark(partition).unwrap() >= old_served {
+                break;
+            }
+            let req = follower.make_fetch_request(partition, 8, 4096).unwrap();
+            let resp = old_leader.serve_fetch(partition, &req).unwrap();
+            follower.apply_fetch_response(partition, &resp).unwrap();
+        }
+        let frontier = follower
+            .with_follower_log(partition, |log| log.next_offset().get())
+            .unwrap();
+        assert_eq!(
+            frontier, old_served,
+            "the follower holds the full old prefix as its uncommitted tail"
+        );
+        assert!(
+            frontier >= 8,
+            "the follower holds a usable tail (got {frontier})"
+        );
+        (
+            Arc::new(Mutex::new(DataPlaneServer::new(
+                2,
+                ProduceAckSeam::new(follower),
+            ))),
+            frontier,
+        )
+    }
+
+    /// A SHORTER new leader (node 1, `new_len` records of the SAME shared lineage) whose served frontier
+    /// sits BELOW a divergent follower's over-extended tail, so a probe from the follower's frontier is
+    /// an empty run above the leader frontier — exactly the Phase-1 uncommitted-tail discriminator. The
+    /// backing log is leaked so the `Arc`-shared read plane keeps serving. Returns the leader controller
+    /// and its served frontier (the leader's advertised HW to the probe).
+    fn short_new_leader(
+        partition: u64,
+        new_len: u32,
+    ) -> (DataPlaneController<InMemoryFs, ManualClock>, u64) {
+        let mut log = open_log();
+        for i in 0..new_len {
+            log.append(&rec(format!("rec-{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let log: &'static Log<InMemoryFs, ManualClock> = Box::leak(Box::new(log));
+        let plane = leader_plane(log);
+        let served = plane_served_end(&plane);
+        let mut leader: DataPlaneController<InMemoryFs, ManualClock> = DataPlaneController::new(1);
+        leader.start_leader(partition, plane, EpochCache::new(), &[1, 2], min_isr1());
+        (leader, served)
+    }
+
+    /// Script the adopt PROBE: serve the follower's exact probe fetch (same `FULL_CATCHUP_*` params
+    /// `reconcile_on_adopt` uses) on the short leader, assert it is an empty run above the leader
+    /// frontier, and return the encoded `FetchResponse` frame + the follower frontier + the leader HW.
+    fn scripted_probe(
+        partition: u64,
+        server: &Arc<Mutex<DataPlaneServer<InMemoryFs, ManualClock>>>,
+        leader: &DataPlaneController<InMemoryFs, ManualClock>,
+    ) -> (Vec<u8>, u64, u64) {
+        let probe = server
+            .lock()
+            .unwrap()
+            .seam()
+            .controller()
+            .make_fetch_request(partition, FULL_CATCHUP_RECORDS, FULL_CATCHUP_BYTES)
+            .unwrap();
+        let frontier = probe.from_offset;
+        let resp = leader.serve_fetch(partition, &probe).unwrap();
+        assert!(
+            empty_run_above_leader_frontier(frontier, &resp),
+            "the probe from the divergent follower is an empty run above the leader frontier"
+        );
+        let leader_hw = resp.high_watermark;
+        assert!(
+            leader_hw < frontier,
+            "the leader HW ({leader_hw}) is below the follower's tail ({frontier})"
+        );
+        let bytes =
+            encode_dataplane_peer_frame(partition, &DataPlaneFrame::FetchResponse(resp)).unwrap();
+        (bytes, frontier, leader_hw)
+    }
+
+    fn follower_frontier(
+        partition: u64,
+        server: &Arc<Mutex<DataPlaneServer<InMemoryFs, ManualClock>>>,
+    ) -> u64 {
+        server
+            .lock()
+            .unwrap()
+            .seam()
+            .controller()
+            .with_follower_log(partition, |log| log.next_offset().get())
+            .unwrap()
+    }
+
+    #[test]
+    fn adopt_reconcile_refuses_when_the_committed_floor_is_absent() {
+        // THE FIX: with NO `ClusterStatus::last_committed_hw` entry for the partition (the metadata group
+        // has not yet published a committed HW), the committed-prefix length is UNKNOWN. The pre-fix code
+        // resolved the floor as `.unwrap_or(0)` and would have durably truncated the WHOLE follower log
+        // (committed prefix INCLUDED) down to 0. The fix FAILS CLOSED: the log is left UNTOUCHED and the
+        // heal-refused metric is bumped.
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let (leader, _served) = short_new_leader(P, 18);
+        let (probe, _frontier, _hw) = scripted_probe(P, &server, &leader);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        // An EMPTY cluster status: no committed HW published for P → the floor is ABSENT.
+        let status = Arc::new(Mutex::new(ClusterStatus::default()));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+
+        assert_eq!(
+            follower_frontier(P, &server),
+            frontier,
+            "an absent floor must leave the follower log UNTOUCHED (never truncated to 0)"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_heal_refused_total(),
+            1,
+            "the absent-floor refusal bumps the heal-refused metric"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_healed_total(),
+            0,
+            "no heal was performed on an absent floor"
+        );
+    }
+
+    #[test]
+    fn adopt_reconcile_truncates_a_divergent_tail_down_to_the_present_floor() {
+        // The traced two-node scenario over an in-memory link: a follower holds a divergent uncommitted
+        // tail; an AUTHORITATIVE committed floor is present and the adopted leader's frontier is at/above
+        // it. probe -> suspect_uncommitted_tail -> heal: the tail is truncated down to EXACTLY the floor.
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let (leader, _served) = short_new_leader(P, 18);
+        let (probe, _frontier, leader_hw) = scripted_probe(P, &server, &leader);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        // A genuine committed floor STRICTLY below both the leader HW (so the leader-behind guard passes)
+        // and the follower's tail (so the tail is above the floor and the heal fires).
+        let floor = leader_hw / 2;
+        assert!(
+            floor > 0 && floor < leader_hw && floor < frontier,
+            "the floor is a genuine committed bar below the leader HW and the tail"
+        );
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "the divergent uncommitted tail was truncated down to EXACTLY the committed floor"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_healed_total(),
+            1,
+            "a divergent adopt-seam heal bumps the healed metric"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_heal_refused_total(),
+            0,
+            "a healed adopt is never a refusal"
+        );
+    }
+
+    #[test]
+    fn adopt_reconcile_refuses_when_the_present_floor_is_above_the_leader() {
+        // A PRESENT floor, but the adopted leader's frontier is BELOW it: the leader cannot restore the
+        // committed data a truncation would drop. The `ResyncLeaderBehind` guard FAILS CLOSED — the
+        // follower log is left untouched and the heal-refused metric is bumped.
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let (leader, _served) = short_new_leader(P, 18);
+        let (probe, _frontier, leader_hw) = scripted_probe(P, &server, &leader);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        // A floor ABOVE the leader HW but still below the follower tail (so the divergence is suspected
+        // and the heal is attempted, then refused by the leader-behind guard).
+        let floor = leader_hw + (frontier - leader_hw) / 2;
+        assert!(
+            floor > leader_hw && floor < frontier,
+            "the floor sits above the leader HW (guard refuses) yet below the tail (suspected)"
+        );
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+
+        assert_eq!(
+            follower_frontier(P, &server),
+            frontier,
+            "a leader-behind refusal never truncates: the follower log is untouched"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_heal_refused_total(),
+            1,
+            "the ResyncLeaderBehind refusal bumps the heal-refused metric"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_healed_total(),
+            0,
+            "a refused adopt performs no heal"
+        );
     }
 
     // ============================================================================================
