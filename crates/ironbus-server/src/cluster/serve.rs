@@ -121,7 +121,10 @@ use super::dataplane::{
     decode_dataplane_frame, role_for_placement, DataPlaneAction, DataPlaneController,
     DataPlaneError, DataPlaneFrame, PlacementRole, ProduceAckSeam,
 };
-use super::divergence::{empty_run_above_leader_frontier, suspect_uncommitted_tail};
+use super::divergence::{
+    classify_content_divergence, empty_run_above_leader_frontier, first_content_divergence,
+    suspect_uncommitted_tail, ContentReconcile,
+};
 use super::isr::IsrConfig;
 use super::replication::{
     FetchRecordsBody, FetchResponseBody, OffsetForLeaderEpochBody, ReplicationError,
@@ -1746,41 +1749,240 @@ fn reconcile_on_adopt<S, F, C>(
         }
         return;
     };
-    // Only act on a SUSPECTED uncommitted-tail divergence (the empty-run-above-frontier discriminator).
-    // A caught-up / healthy follower short-circuits here and enters the steady loop untouched.
-    if !suspect_uncommitted_tail(follower_next_offset, committed_floor, &resp) {
+    // Phase 2: a SUSPECTED uncommitted-tail divergence (the empty-run-above-frontier discriminator — the
+    // adopted leader is BEHIND the follower's tail). Truncate the tail down to the committed floor.
+    if suspect_uncommitted_tail(follower_next_offset, committed_floor, &resp) {
+        let leader_hw = resp.high_watermark;
+        match heal_divergent_follower_on_link(partition, committed_floor, leader_hw, link, server) {
+            AdoptHeal::Healed => {
+                divergence.record_uncommitted_tail_healed();
+                tracing::warn!(
+                    partition,
+                    follower_next_offset,
+                    committed_floor,
+                    leader_high_watermark = leader_hw,
+                    "data plane: RECONCILED-ON-ADOPT (#873 Phase 2) — truncated a divergent \
+                     uncommitted tail down to the quorum-committed floor before the first forward \
+                     fetch, so the new leader lineage cannot stitch onto stale uncommitted bytes. \
+                     Committed data was never dropped (the truncation floor is the replicated \
+                     committed HW). Re-fetching the clean lineage forward."
+                );
+            }
+            AdoptHeal::Refused => {
+                divergence.record_uncommitted_tail_heal_refused();
+                tracing::warn!(
+                    partition,
+                    follower_next_offset,
+                    committed_floor,
+                    leader_high_watermark = leader_hw,
+                    "data plane: reconcile-on-adopt REFUSED (#873 Phase 2, ResyncLeaderBehind) — the \
+                     adopted leader's frontier is BELOW this follower's committed floor, so it cannot \
+                     restore the committed data a truncation would drop. FAIL CLOSED: the follower is \
+                     left untouched for a retry against a complete leader."
+                );
+            }
+            AdoptHeal::NoneOrFailed => {}
+        }
         return;
     }
-    let leader_hw = resp.high_watermark;
-    match heal_divergent_follower_on_link(partition, committed_floor, leader_hw, link, server) {
-        AdoptHeal::Healed => {
-            divergence.record_uncommitted_tail_healed();
-            tracing::warn!(
+    // Phase 3: the adopted leader is AT OR ABOVE the follower's tail (it already advanced its flush
+    // frontier past the divergent tail — so the probe was NOT an empty run above the frontier). If the
+    // follower holds an uncommitted tail above its committed floor, that tail may hold a BELOW-FRONTIER
+    // CONTENT mismatch (same offsets, DIFFERENT payload) the offset-contiguity + positional-seq checks
+    // cannot see. Probe the overlapping range and, on a real content divergence, reuse the Phase 2 heal.
+    reconcile_content_mismatch_on_adopt(
+        partition,
+        link,
+        server,
+        committed_floor,
+        follower_next_offset,
+        &resp,
+        divergence,
+    );
+}
+
+/// #873 Phase 3 BELOW-FRONTIER content-mismatch reconcile (the adopt seam, run only when the adopted
+/// leader is AT OR ABOVE the follower's tail — the case Phase 1/2 deliberately do NOT catch). The new
+/// leader has already advanced its flush frontier past the follower's divergent tail, so it serves a
+/// NON-empty run at offsets the follower already holds but with a DIFFERENT payload (the canonical Raft
+/// below-HW log conflict). A forward fetch never reveals it — the conflict is BELOW the fetch point — and
+/// `apply_fetch_response` checks only offset-contiguity + POSITIONAL seq, both of which still match a
+/// same-offset/same-seq/different-body substitution.
+///
+/// The detection reuses the EXISTING fetch wire (NO `FetchResponse` change): it issues a BACKWARD probe
+/// from the committed floor (`serve_fetch` reads from ANY offset), reads the leader's verbatim frames for
+/// the overlapping range, and compares them FRAME-BY-FRAME against the follower's OWN held frames (the C4
+/// content-hash compare at full byte fidelity). On a real content divergence AT OR ABOVE the committed
+/// floor it triggers the EXISTING Phase 2 loss-free heal (truncate the tail to the committed floor); a
+/// divergence STRICTLY BELOW the floor is a CRITICAL committed-HW invariant violation the seam logs
+/// loudly and FAILS CLOSED on (never truncates below the floor). A byte-identical overlap is a clean
+/// shared lineage — NO false positive, nothing is touched.
+fn reconcile_content_mismatch_on_adopt<S, F, C>(
+    partition: u64,
+    link: &mut DataPlaneLink<S>,
+    server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+    committed_floor: u64,
+    follower_next_offset: u64,
+    initial_resp: &FetchResponseBody,
+    divergence: &FollowerDivergenceMetrics,
+) where
+    S: Read + Write,
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    // Nothing above the committed floor => no uncommitted tail to reconcile (any committed-region
+    // conflict is the auto-resync's domain, not the adopt seam's). The leader must also be at/above the
+    // follower's tail here (guaranteed: an empty run above the frontier was the Phase 2 case, already
+    // handled), so the leader-behind guard the heal applies is not vacuous.
+    if follower_next_offset <= committed_floor {
+        return;
+    }
+    // BACKWARD probe: fetch the leader's OVERLAPPING run from the committed floor over the EXISTING fetch
+    // wire (no new frame/field). The leader serves its verbatim on-disk frames from that offset.
+    let probe = FetchRecordsBody {
+        from_offset: committed_floor,
+        max_records: FULL_CATCHUP_RECORDS,
+        max_bytes: FULL_CATCHUP_BYTES,
+    };
+    if link
+        .send(partition, &DataPlaneFrame::FetchRequest(probe))
+        .is_err()
+    {
+        return;
+    }
+    let leader_resp = match link.recv() {
+        Ok(Some((p, DataPlaneFrame::FetchResponse(resp)))) if p == partition => resp,
+        _ => return,
+    };
+    // The leader must actually serve FROM the committed floor for the compare to align. If it clamped
+    // higher (its oldest retained record is above the floor, or it served nothing), we cannot compare the
+    // overlap here — abort (a conservative miss, never a wrong truncation). Prefer this probe's freshly
+    // advertised HW as the leader-behind floor for the heal.
+    if leader_resp.record_count == 0 || leader_resp.first_offset != committed_floor {
+        return;
+    }
+    let leader_hw = leader_resp.high_watermark.max(initial_resp.high_watermark);
+    // Read the follower's OWN held frames for the SAME range under a short lock (no wire I/O under it).
+    let own = {
+        let Ok(srv) = server.lock() else {
+            return; // poisoned: tearing down
+        };
+        srv.seam().controller().with_follower_log(partition, |log| {
+            log.read_range_raw(
+                Offset::new(committed_floor),
+                FULL_CATCHUP_RECORDS as usize,
+                Some(FULL_CATCHUP_BYTES as usize),
+            )
+        })
+    };
+    // `with_follower_log` returns `None` if no longer a follower; the raw read returns an error only on a
+    // local IO / out-of-range fault. Either way we cannot compare — abort conservatively.
+    let Some(Ok((own_run, _tail))) = own else {
+        return;
+    };
+    if own_run.first_offset.get() != committed_floor {
+        return;
+    }
+    // Compare the two verbatim frame runs FRAME-BY-FRAME (the C4 content-hash compare at full fidelity),
+    // classify the divergence against the committed floor, and act (fail-closed below the floor; reuse the
+    // Phase 2 heal above it).
+    let divergence_offset =
+        first_content_divergence(committed_floor, &leader_resp.frame_bytes, &own_run.bytes);
+    act_on_content_reconcile(
+        classify_content_divergence(divergence_offset, committed_floor),
+        partition,
+        link,
+        server,
+        committed_floor,
+        follower_next_offset,
+        leader_hw,
+        divergence_offset,
+        divergence,
+    );
+}
+
+/// Act on a #873 Phase 3 content-mismatch [`ContentReconcile`] decision: nothing on `Clean`, a LOUD
+/// fail-closed log + metric on the CRITICAL below-committed case (NEVER a truncation), and the EXISTING
+/// Phase 2 loss-free heal (truncate to the committed floor) on the healable above-floor case.
+#[allow(clippy::too_many_arguments)]
+fn act_on_content_reconcile<S, F, C>(
+    decision: ContentReconcile,
+    partition: u64,
+    link: &mut DataPlaneLink<S>,
+    server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+    committed_floor: u64,
+    follower_next_offset: u64,
+    leader_hw: u64,
+    divergence_offset: Option<u64>,
+    divergence: &FollowerDivergenceMetrics,
+) where
+    S: Read + Write,
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    match decision {
+        ContentReconcile::Clean => {
+            // Byte-identical overlap: the follower shares the leader's lineage. No false positive; the
+            // steady loop catches up forward. Nothing is touched.
+        }
+        ContentReconcile::CriticalBelowCommittedFloor { offset } => {
+            // A quorum-COMMITTED record disagrees between replicas — the committed-HW invariant is broken.
+            // FAIL CLOSED: never truncate below the committed floor. Log it LOUDLY and page.
+            divergence.record_content_mismatch_critical();
+            tracing::error!(
                 partition,
                 follower_next_offset,
                 committed_floor,
+                divergent_offset = offset,
                 leader_high_watermark = leader_hw,
-                "data plane: RECONCILED-ON-ADOPT (#873 Phase 2) — truncated a divergent uncommitted \
-                 tail down to the quorum-committed floor before the first forward fetch, so the new \
-                 leader lineage cannot stitch onto stale uncommitted bytes. Committed data was never \
-                 dropped (the truncation floor is the replicated committed HW). Re-fetching the clean \
-                 lineage forward."
+                "data plane: CRITICAL below-frontier content mismatch (#873 Phase 3) — a \
+                 quorum-COMMITTED record disagrees with the adopted leader BELOW the committed floor. \
+                 The committed-HW invariant should make this impossible. FAILING CLOSED: refusing to \
+                 truncate below the committed floor (a truncation to the floor would leave the \
+                 divergent committed record live; below it would drop committed data). Operator \
+                 attention required."
             );
         }
-        AdoptHeal::Refused => {
-            divergence.record_uncommitted_tail_heal_refused();
-            tracing::warn!(
+        ContentReconcile::HealToCommittedFloor => {
+            match heal_divergent_follower_on_link(
                 partition,
-                follower_next_offset,
                 committed_floor,
-                leader_high_watermark = leader_hw,
-                "data plane: reconcile-on-adopt REFUSED (#873 Phase 2, ResyncLeaderBehind) — the \
-                 adopted leader's frontier is BELOW this follower's committed floor, so it cannot \
-                 restore the committed data a truncation would drop. FAIL CLOSED: the follower is \
-                 left untouched for a retry against a complete leader."
-            );
+                leader_hw,
+                link,
+                server,
+            ) {
+                AdoptHeal::Healed => {
+                    divergence.record_content_mismatch_healed();
+                    tracing::warn!(
+                        partition,
+                        follower_next_offset,
+                        committed_floor,
+                        divergent_offset = divergence_offset,
+                        leader_high_watermark = leader_hw,
+                        "data plane: RECONCILED-ON-ADOPT (#873 Phase 3) — detected a BELOW-FRONTIER \
+                         content mismatch (same offsets, different payload above the committed floor) \
+                         the offset-contiguity + positional-seq checks cannot see, and truncated the \
+                         divergent tail down to the quorum-committed floor (reusing the Phase 2 \
+                         loss-free heal). Committed data was never dropped. Re-fetching the clean \
+                         lineage forward."
+                    );
+                }
+                AdoptHeal::Refused => {
+                    divergence.record_content_mismatch_heal_refused();
+                    tracing::warn!(
+                        partition,
+                        follower_next_offset,
+                        committed_floor,
+                        leader_high_watermark = leader_hw,
+                        "data plane: reconcile-on-adopt REFUSED (#873 Phase 3, ResyncLeaderBehind) — a \
+                         below-frontier content mismatch was detected but the adopted leader's frontier \
+                         is BELOW this follower's committed floor, so it cannot restore the committed \
+                         data a truncation would drop. FAIL CLOSED: the follower is left untouched."
+                    );
+                }
+                AdoptHeal::NoneOrFailed => {}
+            }
         }
-        AdoptHeal::NoneOrFailed => {}
     }
 }
 
@@ -2645,6 +2847,182 @@ mod tests {
             divergence.uncommitted_tail_healed_total(),
             0,
             "a refused adopt performs no heal"
+        );
+    }
+
+    // ============================================================================================
+    //  #873 Phase 3 SERVE-SEAM wiring: the BELOW-FRONTIER content-mismatch reconcile driven over the
+    //  same IN-MEMORY link. The adopted leader has ALREADY advanced its flush frontier PAST the
+    //  follower's divergent tail (so the probe is a NON-empty run, NOT the Phase 1/2 empty-run case),
+    //  and serves a DIFFERENT payload at offsets the follower already holds. Detection = a backward
+    //  probe from the committed floor + a frame-by-frame content compare against the follower's own
+    //  held frames (NO FetchResponse wire change); the heal REUSES the Phase 2 machinery.
+    // ============================================================================================
+
+    /// A LONGER new leader (node 1) of the SAME lineage whose flush frontier sits ABOVE a divergent
+    /// follower's tail: records `[0, divergent_from)` are byte-for-byte the follower's `rec-NN` (the
+    /// shared committed prefix) and records `[divergent_from, total_len)` hold a DIFFERENT `NEW-NN`
+    /// payload — the below-frontier CONTENT mismatch. With `divergent_from == total_len` the leader is
+    /// byte-identical over the whole overlap (the no-false-positive control). `NEW-NN` and `rec-NN` are
+    /// the SAME length, so the frames stay offset-aligned (only the body bytes differ). The backing log is
+    /// leaked so the Arc-shared read plane keeps serving.
+    fn content_divergent_leader(
+        partition: u64,
+        divergent_from: u32,
+        total_len: u32,
+    ) -> (DataPlaneController<InMemoryFs, ManualClock>, u64) {
+        let mut log = open_log();
+        for i in 0..total_len {
+            let body = if i < divergent_from {
+                format!("rec-{i:02}")
+            } else {
+                format!("NEW-{i:02}")
+            };
+            log.append(&rec(body.as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let log: &'static Log<InMemoryFs, ManualClock> = Box::leak(Box::new(log));
+        let plane = leader_plane(log);
+        let served = plane_served_end(&plane);
+        let mut leader: DataPlaneController<InMemoryFs, ManualClock> = DataPlaneController::new(1);
+        leader.start_leader(partition, plane, EpochCache::new(), &[1, 2], min_isr1());
+        (leader, served)
+    }
+
+    /// Script the Phase 3 adopt handshake against a leader whose frontier is ABOVE the follower's tail:
+    /// (1) the INITIAL probe from the follower's LEO (a NON-empty forward run — the leader has advanced),
+    /// then (2) the BACKWARD probe from the committed `floor` (the overlapping run the seam compares).
+    /// Returns the concatenated response bytes + the follower LEO + the leader HW.
+    fn scripted_content_probe(
+        partition: u64,
+        server: &Arc<Mutex<DataPlaneServer<InMemoryFs, ManualClock>>>,
+        leader: &DataPlaneController<InMemoryFs, ManualClock>,
+        floor: u64,
+    ) -> (Vec<u8>, u64, u64) {
+        let probe1 = server
+            .lock()
+            .unwrap()
+            .seam()
+            .controller()
+            .make_fetch_request(partition, FULL_CATCHUP_RECORDS, FULL_CATCHUP_BYTES)
+            .unwrap();
+        let leo = probe1.from_offset;
+        let resp1 = leader.serve_fetch(partition, &probe1).unwrap();
+        assert!(
+            resp1.record_count > 0,
+            "the adopted leader advanced past the follower tail: the LEO probe is a NON-empty run"
+        );
+        let probe2 = FetchRecordsBody {
+            from_offset: floor,
+            max_records: FULL_CATCHUP_RECORDS,
+            max_bytes: FULL_CATCHUP_BYTES,
+        };
+        let resp2 = leader.serve_fetch(partition, &probe2).unwrap();
+        assert_eq!(
+            resp2.first_offset, floor,
+            "the backward probe serves the overlap FROM the committed floor"
+        );
+        let leader_hw = resp2.high_watermark;
+        let mut bytes =
+            encode_dataplane_peer_frame(partition, &DataPlaneFrame::FetchResponse(resp1)).unwrap();
+        bytes.extend(
+            encode_dataplane_peer_frame(partition, &DataPlaneFrame::FetchResponse(resp2)).unwrap(),
+        );
+        (bytes, leo, leader_hw)
+    }
+
+    #[test]
+    fn adopt_reconcile_heals_a_below_frontier_content_mismatch_to_the_committed_floor() {
+        // The follower fsynced [0,45) `rec-NN` from a dead leader; only [0,floor) ever committed. The NEW
+        // leader shares that committed prefix but holds a DIFFERENT `NEW-NN` payload from `floor` upward
+        // AND has advanced its frontier to 60 (past the follower's tail) — the below-frontier CONTENT
+        // mismatch the offset-contiguity + positional-seq checks cannot see. The seam detects it via the
+        // backward-probe content compare and truncates the divergent tail down to EXACTLY the floor.
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let floor = 20u64;
+        // `divergent_from == floor`: the very first uncommitted record already differs, so the compare
+        // fires on the first overlapping frame (robust to the tiny-segment read window).
+        let (leader, served) = content_divergent_leader(P, u32::try_from(floor).unwrap(), 60);
+        assert!(
+            served > frontier,
+            "the leader frontier is above the follower tail"
+        );
+        let (probe, _leo, _hw) = scripted_content_probe(P, &server, &leader, floor);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+
+        assert_eq!(
+            follower_frontier(P, &server),
+            floor,
+            "the below-frontier content-divergent tail was truncated down to EXACTLY the committed floor"
+        );
+        assert_eq!(
+            divergence.content_mismatch_healed_total(),
+            1,
+            "a below-frontier content-mismatch heal bumps the Phase 3 healed metric"
+        );
+        assert_eq!(
+            divergence.content_mismatch_critical_total(),
+            0,
+            "an above-floor conflict is never a CRITICAL below-committed violation"
+        );
+        assert_eq!(
+            divergence.uncommitted_tail_healed_total(),
+            0,
+            "the Phase 3 path does not touch the Phase 2 counter"
+        );
+    }
+
+    #[test]
+    fn adopt_reconcile_does_not_flag_a_matching_run_below_the_frontier() {
+        // The NO-FALSE-POSITIVE control: the NEW leader holds the SAME `rec-NN` payload over the whole
+        // overlap and has merely advanced its frontier past the follower's tail (a clean lagging
+        // follower). The content compare finds nothing, so NOTHING is truncated and no heal fires.
+        const P: u64 = 0;
+        let (server, frontier) = divergent_follower_server(P, 45);
+        let floor = 20u64;
+        // `divergent_from == total_len` => byte-identical over the whole log; just longer than the tail.
+        let (leader, served) = content_divergent_leader(P, 60, 60);
+        assert!(
+            served > frontier,
+            "the leader frontier is above the follower tail"
+        );
+        let (probe, _leo, _hw) = scripted_content_probe(P, &server, &leader, floor);
+        let mut link = DataPlaneLink::new(ScriptedStream::new(probe));
+
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(P, floor);
+        let status = Arc::new(Mutex::new(status));
+        let divergence = FollowerDivergenceMetrics::default();
+
+        reconcile_on_adopt(P, &mut link, &server, Some(&status), &divergence);
+
+        assert_eq!(
+            follower_frontier(P, &server),
+            frontier,
+            "a byte-identical overlap is a clean shared lineage: the follower log is left UNTOUCHED"
+        );
+        assert_eq!(
+            divergence.content_mismatch_healed_total(),
+            0,
+            "no content-mismatch heal fires on a matching run (no false positive)"
+        );
+        assert_eq!(
+            divergence.content_mismatch_heal_refused_total(),
+            0,
+            "a clean run is not a refusal either"
+        );
+        assert_eq!(
+            divergence.content_mismatch_critical_total(),
+            0,
+            "a clean run is never a CRITICAL violation"
         );
     }
 

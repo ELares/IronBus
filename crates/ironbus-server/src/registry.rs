@@ -78,6 +78,25 @@ pub struct FollowerDivergenceMetrics {
     /// (the `ResyncLeaderBehind` guard) — the follower was left untouched (never truncated) for a retry
     /// against a complete leader. A refusal is the safe outcome, never a data loss.
     uncommitted_tail_heal_refused: AtomicU64,
+    /// `ironbus_follower_content_mismatch_healed_total` (#873 Phase 3): the number of times a
+    /// reconcile-on-adopt detected a BELOW-FRONTIER CONTENT mismatch — the adopted leader had already
+    /// advanced its flush frontier past the follower's divergent tail and served a NON-empty run at
+    /// offsets the follower already held but with a DIFFERENT payload (the canonical below-HW log
+    /// conflict) — and RECONCILED it by truncating the divergent tail down to the quorum-committed floor
+    /// (reusing the Phase 2 loss-free heal) before the first forward fetch. A durable, loss-free self-heal
+    /// of a class the offset-contiguity + positional-seq checks cannot see.
+    content_mismatch_healed: AtomicU64,
+    /// `ironbus_follower_content_mismatch_heal_refused_total` (#873 Phase 3): the number of times a
+    /// below-frontier content-mismatch heal FAILED CLOSED because the adopted leader was BEHIND the
+    /// follower's committed floor (the `ResyncLeaderBehind` guard) — the follower was left untouched for a
+    /// retry against a complete leader. The safe outcome, never a data loss.
+    content_mismatch_heal_refused: AtomicU64,
+    /// `ironbus_follower_content_mismatch_critical_total` (#873 Phase 3): the number of times a
+    /// below-frontier content mismatch was detected STRICTLY BELOW the committed floor — a
+    /// quorum-COMMITTED record disagreed between replicas. The committed-HW invariant says this is
+    /// impossible; it is a CRITICAL invariant violation the seam logs loudly and FAILS CLOSED on (it NEVER
+    /// truncates below the committed floor). A non-zero value is an operator page, not a routine heal.
+    content_mismatch_critical: AtomicU64,
 }
 
 impl FollowerDivergenceMetrics {
@@ -120,6 +139,49 @@ impl FollowerDivergenceMetrics {
     #[must_use]
     pub fn uncommitted_tail_heal_refused_total(&self) -> u64 {
         self.uncommitted_tail_heal_refused.load(Ordering::Relaxed)
+    }
+
+    /// Records one below-frontier content-mismatch HEAL (#873 Phase 3): a divergent tail whose payload
+    /// disagreed with the adopted leader's above the committed floor was truncated down to the floor.
+    /// Lock-free; callable from any data-plane follower thread.
+    pub fn record_content_mismatch_healed(&self) {
+        self.content_mismatch_healed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of below-frontier content-mismatch heals performed
+    /// (`ironbus_follower_content_mismatch_healed_total`).
+    #[must_use]
+    pub fn content_mismatch_healed_total(&self) -> u64 {
+        self.content_mismatch_healed.load(Ordering::Relaxed)
+    }
+
+    /// Records one below-frontier content-mismatch heal REFUSED by the leader-behind guard (#873 Phase 3):
+    /// the follower was left untouched. Lock-free; callable from any data-plane follower thread.
+    pub fn record_content_mismatch_heal_refused(&self) {
+        self.content_mismatch_heal_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of below-frontier content-mismatch heals refused by the leader-behind guard
+    /// (`ironbus_follower_content_mismatch_heal_refused_total`).
+    #[must_use]
+    pub fn content_mismatch_heal_refused_total(&self) -> u64 {
+        self.content_mismatch_heal_refused.load(Ordering::Relaxed)
+    }
+
+    /// Records one CRITICAL below-committed content mismatch (#873 Phase 3): a quorum-committed record
+    /// disagreed between replicas (a broken committed-HW invariant). The seam FAILS CLOSED — never
+    /// truncates below the floor. Lock-free; callable from any data-plane follower thread.
+    pub fn record_content_mismatch_critical(&self) {
+        self.content_mismatch_critical
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of CRITICAL below-committed content mismatches
+    /// (`ironbus_follower_content_mismatch_critical_total`). A non-zero value is an operator page.
+    #[must_use]
+    pub fn content_mismatch_critical_total(&self) -> u64 {
+        self.content_mismatch_critical.load(Ordering::Relaxed)
     }
 }
 
