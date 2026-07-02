@@ -180,6 +180,109 @@ fn publish_mode_run_nulls_latency_and_still_cleans_up() {
 }
 
 #[test]
+fn awaited_publish_reports_ack_percentiles_on_disk_and_memory_but_windowed_does_not() {
+    // #1024 ACCEPTANCE: a plain `--mode publish --pubwindow 1` run awaits every produce, so the
+    // additive ack RTT percentile fields are POPULATED — on the disk backend AND on the memory
+    // backend (an ack RTT is honest without an fsync; it is just not a durable-write cost) — while
+    // a pipelined window (>1) amortizes its flushes and must emit null for all four.
+    let tmp = PrivateTmp::new();
+    let out = run_bench_in(&tmp, &["--count", "200", "--mode", "publish", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for field in ["ack_p50_us", "ack_p99_us", "ack_p999_us", "ack_max_us"] {
+        assert!(
+            json_number(&stdout, field).is_some(),
+            "{field} should be measured for an awaited disk publish: {stdout}"
+        );
+    }
+    // The ack tail is ordered, and on disk the ack p50 IS the produce-call median the fsync cost
+    // reports (same awaited samples).
+    let ack_p50 = json_number(&stdout, "ack_p50_us").expect("ack_p50_us");
+    let ack_max = json_number(&stdout, "ack_max_us").expect("ack_max_us");
+    let fsync_cost = json_number(&stdout, "fsync_cost_us").expect("fsync_cost_us");
+    assert!(ack_p50 <= ack_max, "ordered: {stdout}");
+    assert!(
+        (ack_p50 - fsync_cost).abs() < f64::EPSILON,
+        "disk window=1: ack p50 ({ack_p50}) and fsync cost ({fsync_cost}) share the samples"
+    );
+    // MEMORY: ack percentiles populated, fsync cost honestly null.
+    let out = run_bench_in(
+        &tmp,
+        &[
+            "--count",
+            "200",
+            "--mode",
+            "publish",
+            "--storage",
+            "memory",
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        json_number(&stdout, "ack_p50_us").is_some(),
+        "memory ack p50 should be measured: {stdout}"
+    );
+    assert!(stdout.contains("\"fsync_cost_us\":null"), "json: {stdout}");
+    // WINDOWED (>1): amortized attribution, so every ack field is null.
+    let out = run_bench_in(
+        &tmp,
+        &[
+            "--count",
+            "200",
+            "--mode",
+            "publish",
+            "--pubwindow",
+            "8",
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for field in [
+        "\"ack_p50_us\":null",
+        "\"ack_p99_us\":null",
+        "\"ack_p999_us\":null",
+        "\"ack_max_us\":null",
+    ] {
+        assert!(stdout.contains(field), "missing {field} in json: {stdout}");
+    }
+}
+
+#[test]
+fn round_trip_reports_ack_percentiles_from_the_awaited_producer_leg() {
+    // #1024: round-trip's producer leg awaits every produce, so the ack RTT percentiles are
+    // populated alongside the (strictly harder) e2e delivery percentiles.
+    let tmp = PrivateTmp::new();
+    let out = run_bench_in(&tmp, &["--count", "300", "--mode", "round-trip", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for field in ["ack_p50_us", "ack_p99_us", "ack_p999_us", "ack_max_us"] {
+        assert!(
+            json_number(&stdout, field).is_some(),
+            "{field} should be measured for a round trip: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn no_fsync_dry_run_flags_the_cost_not_measured() {
     let out = run_bench(&["--count", "100", "--no-fsync", "--json"]);
     let stdout = String::from_utf8_lossy(&out.stdout);

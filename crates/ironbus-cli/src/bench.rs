@@ -330,6 +330,20 @@ impl BenchConfig {
     pub fn fsync_is_measured(&self) -> bool {
         !self.no_fsync && self.storage == StorageArg::Disk
     }
+
+    /// Whether PUBLISH mode awaits EVERY produce individually (#1024): the plain half-duplex path,
+    /// `--pubwindow 1` without `--stream`, `--autopipe`, or `--faf`. Only then is each per-produce
+    /// sample an honest produce-to-ack RTT, the number the cross-broker study compares against a
+    /// Kafka/NATS synchronous publish. The pipelined paths (window > 1, stream, autopipe) amortize
+    /// a flush across many messages, so a per-op share would be dishonest, and fire-and-forget
+    /// awaits nothing at all. INDEPENDENT of the storage backend: an ack RTT is honest on the
+    /// memory engine too (it is just not a durable-write cost), unlike [`Self::fsync_is_measured`].
+    /// Unix-gated callers, exactly like [`Self::fsync_is_measured`].
+    #[cfg_attr(not(unix), allow(dead_code))]
+    #[must_use]
+    pub fn publish_acks_are_awaited(&self) -> bool {
+        self.pub_window == 1 && !self.stream && !self.auto_pipeline && !self.fire_and_forget
+    }
 }
 
 /// A bench run's measured result, independent of how it is rendered. The latency fields are present
@@ -356,6 +370,18 @@ pub struct BenchReport {
     pub p999_us: Option<f64>,
     /// Max observed latency, microseconds (latency modes only).
     pub max_us: Option<f64>,
+    /// p50 produce-to-ack RTT, microseconds (#1024): present ONLY when every produce was
+    /// individually awaited (plain `--pubwindow 1` publish, or the round-trip producer leg),
+    /// regardless of storage backend. `None` on the pipelined/fire-and-forget paths, where a
+    /// per-op attribution would be amortized and dishonest.
+    pub ack_p50_us: Option<f64>,
+    /// p99 produce-to-ack RTT, microseconds (#1024). Same presence rule as [`Self::ack_p50_us`].
+    pub ack_p99_us: Option<f64>,
+    /// p999 produce-to-ack RTT, microseconds (#1024). Same presence rule as [`Self::ack_p50_us`].
+    pub ack_p999_us: Option<f64>,
+    /// Max observed produce-to-ack RTT, microseconds (#1024). Same presence rule as
+    /// [`Self::ack_p50_us`].
+    pub ack_max_us: Option<f64>,
     /// Mean per-op fsync cost, microseconds, attributed from the round-trip latency through the
     /// real durable path (latency modes only, and only when `fsync_measured`).
     pub fsync_cost_us: Option<f64>,
@@ -884,6 +910,15 @@ pub fn write_human<W: Write + ?Sized>(
         write_latency_line(out, "latency p999", report.p999_us)?;
         write_latency_line(out, "latency max", report.max_us)?;
     }
+    // The produce-to-ack RTT percentiles (#1024): printed only when the run awaited every produce
+    // individually (plain `--pubwindow 1` publish, or the round-trip producer leg), so a reader
+    // never sees an amortized pipelined number dressed up as a per-op ack RTT.
+    if report.ack_p50_us.is_some() {
+        write_latency_line(out, "ack p50", report.ack_p50_us)?;
+        write_latency_line(out, "ack p99", report.ack_p99_us)?;
+        write_latency_line(out, "ack p999", report.ack_p999_us)?;
+        write_latency_line(out, "ack max", report.ack_max_us)?;
+    }
     if report.fsync_measured {
         write_latency_line(out, "fsync cost", report.fsync_cost_us)?;
     } else if cfg.storage == StorageArg::Memory {
@@ -923,7 +958,9 @@ fn write_latency_line<W: Write + ?Sized>(
 /// `latency_p999_us`, `latency_max_us`), null when the mode does not measure them. The `storage`
 /// field (#445) is ADDITIVE (schema version unchanged, the #439 `payload_entropy` precedent), so
 /// a recorded run self-describes which backend it measured and a RAM-path number is never
-/// mistaken for a disk number. Written to `out`.
+/// mistaken for a disk number. The produce-to-ack RTT percentile fields (#1024,
+/// `ack_p50_us`/`ack_p99_us`/`ack_p999_us`/`ack_max_us`) are likewise ADDITIVE, null unless every
+/// produce was individually awaited. Written to `out`.
 ///
 /// # Errors
 /// Returns [`CliError`] if writing to `out` fails.
@@ -951,6 +988,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
+         \"ack_p50_us\":{},\"ack_p99_us\":{},\"ack_p999_us\":{},\"ack_max_us\":{},\
          \"fsync_cost_us\":{},\"fsync_measured\":{}}}}}",
         BENCH_JSON_SCHEMA_VERSION,
         cfg.mode.as_str(),
@@ -979,6 +1017,10 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         opt_f64_json(report.p99_us),
         opt_f64_json(report.p999_us),
         opt_f64_json(report.max_us),
+        opt_f64_json(report.ack_p50_us),
+        opt_f64_json(report.ack_p99_us),
+        opt_f64_json(report.ack_p999_us),
+        opt_f64_json(report.ack_max_us),
         opt_f64_json(report.fsync_cost_us),
         report.fsync_measured,
     );
@@ -1278,6 +1320,10 @@ mod tests {
             p99_us: Some(800.0),
             p999_us: Some(2500.0),
             max_us: Some(3000.0),
+            ack_p50_us: Some(880.0),
+            ack_p99_us: Some(1500.0),
+            ack_p999_us: Some(1900.0),
+            ack_max_us: Some(2100.0),
             fsync_cost_us: Some(900.0),
             fsync_measured: true,
         };
@@ -1289,6 +1335,11 @@ mod tests {
         assert!(json.contains("\"latency_p99_us\":800"), "json: {json}");
         assert!(json.contains("\"latency_p999_us\":2500"), "json: {json}");
         assert!(json.contains("\"latency_max_us\":3000"), "json: {json}");
+        // The ADDITIVE produce-to-ack RTT percentile fields (#1024), explicitly named.
+        assert!(json.contains("\"ack_p50_us\":880"), "json: {json}");
+        assert!(json.contains("\"ack_p99_us\":1500"), "json: {json}");
+        assert!(json.contains("\"ack_p999_us\":1900"), "json: {json}");
+        assert!(json.contains("\"ack_max_us\":2100"), "json: {json}");
         // fsync cost present and flagged honest.
         assert!(json.contains("\"fsync_cost_us\":900"), "json: {json}");
         assert!(json.contains("\"fsync_measured\":true"), "json: {json}");
@@ -1312,6 +1363,111 @@ mod tests {
         let json = bench_json(&cfg, &report);
         assert!(json.contains("\"latency_p50_us\":null"), "json: {json}");
         assert!(json.contains("\"latency_p999_us\":null"), "json: {json}");
+    }
+
+    #[test]
+    fn ack_rtt_is_claimed_only_on_the_awaited_per_produce_publish_path() {
+        // The #1024 gating condition, pinned: a per-produce ack RTT is honest ONLY when every
+        // produce is individually awaited — the plain half-duplex `--pubwindow 1` publish. This
+        // test FAILS if any amortized path (window > 1, --stream, --autopipe) or the un-awaited
+        // --faf path starts claiming ack percentiles, or if the plain path stops claiming them.
+        let plain = parse(&["--count", "10", "--mode", "publish"]).unwrap();
+        assert!(
+            plain.publish_acks_are_awaited(),
+            "plain --pubwindow 1 publish awaits every produce"
+        );
+        // MUTATION TEETH for `pub_window == 1`: an explicit window of exactly 1 stays awaited,
+        // while ANY window above 1 is amortized.
+        let window_one =
+            parse(&["--count", "10", "--mode", "publish", "--pubwindow", "1"]).unwrap();
+        assert!(window_one.publish_acks_are_awaited());
+        let windowed = parse(&["--count", "10", "--mode", "publish", "--pubwindow", "2"]).unwrap();
+        assert!(
+            !windowed.publish_acks_are_awaited(),
+            "a pipelined window amortizes; no per-op ack RTT may be claimed"
+        );
+        let stream = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "publish",
+            "--stream",
+            "--pubwindow",
+            "8",
+        ])
+        .unwrap();
+        assert!(!stream.publish_acks_are_awaited(), "full-duplex overlap");
+        let autopipe = parse(&["--count", "10", "--mode", "publish", "--autopipe"]).unwrap();
+        assert!(
+            !autopipe.publish_acks_are_awaited(),
+            "auto-pipelined flushes"
+        );
+        let faf = parse(&["--count", "10", "--mode", "publish", "--faf"]).unwrap();
+        assert!(!faf.publish_acks_are_awaited(), "no ack is awaited at all");
+        // STORAGE-INDEPENDENT (unlike the fsync cost): an ack RTT is honest on memory too.
+        let memory = parse(&["--count", "10", "--mode", "publish", "--storage", "memory"]).unwrap();
+        assert!(
+            memory.publish_acks_are_awaited(),
+            "ack RTT is backend-agnostic"
+        );
+        assert!(!memory.fsync_is_measured(), "but the fsync cost is not");
+    }
+
+    #[test]
+    fn ack_percentiles_land_in_the_json_and_null_when_not_awaited() {
+        // Present: the four ADDITIVE #1024 fields carry numbers when the report has them.
+        let cfg = parse(&["--count", "5", "--mode", "publish"]).unwrap();
+        let report = BenchReport {
+            produced: 5,
+            elapsed_secs: 1.0,
+            ack_p50_us: Some(150.0),
+            ack_p99_us: Some(400.0),
+            ack_p999_us: Some(650.0),
+            ack_max_us: Some(700.0),
+            ..BenchReport::default()
+        };
+        let json = bench_json(&cfg, &report);
+        assert!(json.contains("\"ack_p50_us\":150"), "json: {json}");
+        assert!(json.contains("\"ack_max_us\":700"), "json: {json}");
+        // Absent (an amortized/un-awaited path): the same fields are null, never omitted.
+        let json = bench_json(&cfg, &BenchReport::default());
+        for field in [
+            "\"ack_p50_us\":null",
+            "\"ack_p99_us\":null",
+            "\"ack_p999_us\":null",
+            "\"ack_max_us\":null",
+        ] {
+            assert!(json.contains(field), "missing {field} in json: {json}");
+        }
+    }
+
+    #[test]
+    fn human_view_prints_ack_percentiles_only_when_present() {
+        let cfg = parse(&["--count", "5", "--mode", "publish"]).unwrap();
+        let report = BenchReport {
+            produced: 5,
+            elapsed_secs: 1.0,
+            ack_p50_us: Some(150.0),
+            ack_p99_us: Some(400.0),
+            ack_p999_us: Some(650.0),
+            ack_max_us: Some(700.0),
+            fsync_measured: true,
+            ..BenchReport::default()
+        };
+        let mut human = Vec::new();
+        write_human(&cfg, &report, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains("ack p50:     150.0 us"), "human: {human}");
+        assert!(human.contains("ack p99:     400.0 us"), "human: {human}");
+        assert!(human.contains("ack p999:     650.0 us"), "human: {human}");
+        assert!(human.contains("ack max:     700.0 us"), "human: {human}");
+        // An un-awaited run prints NO ack lines at all (no noisy n/a rows for a metric the mode
+        // cannot honestly measure).
+        let mut human = Vec::new();
+        write_human(&cfg, &BenchReport::default(), &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(!human.contains("ack p"), "human: {human}");
+        assert!(!human.contains("ack max"), "human: {human}");
     }
 
     #[test]
