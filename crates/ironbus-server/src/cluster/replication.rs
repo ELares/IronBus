@@ -1167,6 +1167,36 @@ impl<F: Filesystem, C: Clock> EpochAwareFollower<F, C> {
             truncation,
         })
     }
+
+    /// Truncate the follower's log DOWN to the committed high-watermark `committed_hw` — the
+    /// NO-EPOCH-INFO divergence self-heal (#873 Phase 2). When a follower holds an uncommitted tail
+    /// ABOVE the leader's committed frontier after a leader change but has NOT learned the leader's
+    /// epoch boundaries (so [`reconcile_with_leader`](Self::reconcile_with_leader) cannot locate a
+    /// shared-epoch divergence point — its epoch cache is empty), the uncommitted suffix is
+    /// unverifiable: drop it down to the committed frontier and re-fetch the clean lineage forward.
+    /// It NEVER drops below `committed_hw` (committed data is fsync'd on a quorum, #691), so this is
+    /// loss-free for committed data by construction. Mirrors the truncation in the epoch cache and
+    /// resets the observed leader HW, exactly as [`reconcile_with_leader`](Self::reconcile_with_leader)
+    /// does after an epoch-based truncation, and reports the same typed [`DivergenceTruncation`] (never
+    /// a silent drop).
+    ///
+    /// # Errors
+    /// [`ReplicationError::Storage`] if the underlying [`Log::truncate_to`] fails.
+    pub fn truncate_to_committed(
+        &mut self,
+        committed_hw: Offset,
+    ) -> Result<DivergenceTruncation, ReplicationError> {
+        let truncation = self.follower.log.truncate_to(committed_hw)?;
+        self.epochs.truncate_to(committed_hw);
+        self.follower.leader_high_watermark = committed_hw.get();
+        Ok(DivergenceTruncation {
+            divergence_point: DivergencePoint {
+                truncate_to: committed_hw,
+                diverged_at_epoch: LeaderEpoch::GENESIS,
+            },
+            truncation,
+        })
+    }
 }
 
 /// A bidirectional REPLICATION peer link over any byte stream (`Read + Write`): a real `TcpStream`

@@ -55,6 +55,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// metric label), so no adversarial or buggy input can grow this block. Nothing here ever touches the
 /// durable log, the wire format, or any behavior — it is pure observation.
 #[derive(Debug, Default)]
+// The shared `uncommitted_tail_` prefix is deliberate: every counter names one lifecycle stage of the
+// SAME #873 uncommitted-tail hazard (suspected -> healed / heal-refused), so the prefix is the domain,
+// not incidental repetition; dropping it would make the field names ambiguous in isolation.
+#[allow(clippy::struct_field_names)]
 pub struct FollowerDivergenceMetrics {
     /// `ironbus_follower_uncommitted_tail_suspected_total`: the number of times a follower fetch loop
     /// SUSPECTED (detection only — never acted) that it holds an fsynced UNCOMMITTED tail above its own
@@ -63,6 +67,17 @@ pub struct FollowerDivergenceMetrics {
     /// latches it), so a wedged follower that empty-no-op loops does not inflate the counter — it stays
     /// a bounded, once-per-episode operator signal, not a per-poll spam.
     uncommitted_tail_suspected: AtomicU64,
+    /// `ironbus_follower_uncommitted_tail_healed_total`: the number of times a follower fetch loop
+    /// RECONCILED-ON-ADOPT (#873 Phase 2) — truncated a divergent uncommitted tail down to its own
+    /// quorum-committed floor before the first forward fetch could stitch a new lineage onto the stale
+    /// bytes. A durable, loss-free self-heal actually performed. Incremented once per divergent
+    /// adopt-seam heal (a clean no-op reconcile does NOT bump it).
+    uncommitted_tail_healed: AtomicU64,
+    /// `ironbus_follower_uncommitted_tail_heal_refused_total`: the number of times a reconcile-on-adopt
+    /// heal FAILED CLOSED because the adopted leader was BEHIND the follower's quorum-committed floor
+    /// (the `ResyncLeaderBehind` guard) — the follower was left untouched (never truncated) for a retry
+    /// against a complete leader. A refusal is the safe outcome, never a data loss.
+    uncommitted_tail_heal_refused: AtomicU64,
 }
 
 impl FollowerDivergenceMetrics {
@@ -78,6 +93,33 @@ impl FollowerDivergenceMetrics {
     #[must_use]
     pub fn uncommitted_tail_suspected_total(&self) -> u64 {
         self.uncommitted_tail_suspected.load(Ordering::Relaxed)
+    }
+
+    /// Records one reconcile-on-adopt HEAL (#873 Phase 2): a divergent uncommitted tail was truncated
+    /// down to the committed floor. Lock-free; callable from any data-plane follower thread.
+    pub fn record_uncommitted_tail_healed(&self) {
+        self.uncommitted_tail_healed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of reconcile-on-adopt heals performed
+    /// (`ironbus_follower_uncommitted_tail_healed_total`).
+    #[must_use]
+    pub fn uncommitted_tail_healed_total(&self) -> u64 {
+        self.uncommitted_tail_healed.load(Ordering::Relaxed)
+    }
+
+    /// Records one reconcile-on-adopt heal REFUSED by the leader-behind guard (#873 Phase 2): the
+    /// follower was left untouched. Lock-free; callable from any data-plane follower thread.
+    pub fn record_uncommitted_tail_heal_refused(&self) {
+        self.uncommitted_tail_heal_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of reconcile-on-adopt heals refused by the leader-behind guard
+    /// (`ironbus_follower_uncommitted_tail_heal_refused_total`).
+    #[must_use]
+    pub fn uncommitted_tail_heal_refused_total(&self) -> u64 {
+        self.uncommitted_tail_heal_refused.load(Ordering::Relaxed)
     }
 }
 

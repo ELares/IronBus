@@ -1093,6 +1093,109 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
         }
     }
 
+    /// The leader epochs the follower of `partition` has learned (its epoch-cache boundary epochs, in
+    /// cache order), so the follower fetch loop can pre-collect the leader's `OffsetForLeaderEpoch`
+    /// answers OFF the server lock before driving a divergence heal (#873 Phase 2). Follower-only;
+    /// `None` otherwise. It is EMPTY in the common case (a follower learns epoch boundaries only over an
+    /// epoch-aware fetch path), which makes [`heal_divergent_follower`](Self::heal_divergent_follower)
+    /// fall back to the committed-HW truncation.
+    #[must_use]
+    pub fn follower_epochs(&self, partition: u64) -> Option<Vec<LeaderEpoch>> {
+        match self.roles.get(&partition) {
+            Some(PartitionRole::Follower { follower }) => Some(
+                lock_follower(follower)
+                    .epochs()
+                    .entries()
+                    .iter()
+                    .map(|e| e.epoch)
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// SELF-HEAL a divergent follower of `partition` on the PRODUCTION adopt path (#873 Phase 2): when
+    /// the follower holds an uncommitted tail ABOVE its own quorum-committed frontier `committed_hw`
+    /// (the replicated `CheckpointCommittedHw` bar — NEVER the leader's flush HW) after a leader change,
+    /// drop the divergent/uncommitted suffix and KEEP the committed prefix; the caller then re-fetches
+    /// the clean lineage forward.
+    ///
+    /// ## Fail-closed leader-behind guard
+    ///
+    /// `leader_end_hw` is the adopted leader's advertised end frontier (its flushed HW). If it is BELOW
+    /// `committed_hw` the adopted leader does not even hold all the committed data this heal must be able
+    /// to restore, so truncating the follower's tail and re-fetching from it would risk dropping
+    /// committed data the leader cannot serve back. FAIL CLOSED with
+    /// [`ReplicationError::ResyncLeaderBehind`] BEFORE any truncation, leaving the (still-complete)
+    /// follower untouched for a retry against a complete leader — the same defense-in-depth guard the
+    /// full auto-resync uses (#798).
+    ///
+    /// ## Truncation
+    ///
+    /// It first runs the KIP-101 epoch reconcile
+    /// ([`reconcile_follower`](Self::reconcile_follower)): if the follower has learned the leader's
+    /// epoch boundaries it truncates to the PRECISE divergence point (which may keep shared-lineage
+    /// records above the committed HW). If that resolves nothing — the common case, the follower's
+    /// epoch cache is empty — yet the follower still holds a tail above `committed_hw`, it truncates
+    /// that unverifiable suffix down to `committed_hw` via
+    /// [`EpochAwareFollower::truncate_to_committed`]. Either path NEVER drops below `committed_hw`, so
+    /// committed data (quorum-fsync'd, #691) is never dropped. Returns the typed
+    /// [`DivergenceTruncation`] (a clean no-op only when nothing above the committed frontier existed).
+    /// It is IDEMPOTENT: a retry after a clean heal finds no tail above `committed_hw` and reports a
+    /// no-op. Follower-only.
+    ///
+    /// `leader_end_offset` answers the leader's end-offset for a queried epoch — in production a map of
+    /// the leader's `OffsetForLeaderEpoch` answers pre-collected off the wire (only consulted when the
+    /// follower's cache is non-empty); in a test it calls the leader's
+    /// [`serve_epoch_query`](Self::serve_epoch_query) directly.
+    ///
+    /// # Errors
+    /// [`DataPlaneError::WrongRole`] on a leader; [`DataPlaneError::UnknownPartition`] if absent;
+    /// [`DataPlaneError::Replication`] with [`ReplicationError::ResyncLeaderBehind`] if the leader is
+    /// behind the committed frontier, or on a truncation / epoch-cache fault.
+    pub fn heal_divergent_follower<L>(
+        &mut self,
+        partition: u64,
+        committed_hw: Offset,
+        leader_end_hw: u64,
+        leader_end_offset: L,
+    ) -> Result<DivergenceTruncation, DataPlaneError>
+    where
+        L: FnMut(LeaderEpoch) -> LeaderEpochEndOffset,
+    {
+        // FAIL CLOSED before touching durable bytes: never truncate to re-fetch from a leader that does
+        // not even hold the committed frontier this heal must preserve (#798 leader-behind guard).
+        if leader_end_hw < committed_hw.get() {
+            return Err(DataPlaneError::Replication(
+                ReplicationError::ResyncLeaderBehind {
+                    leader_hw: leader_end_hw,
+                    committed_hw: committed_hw.get(),
+                },
+            ));
+        }
+        let healed = self.reconcile_follower(partition, committed_hw, leader_end_offset)?;
+        if !healed.is_no_op() {
+            return Ok(healed);
+        }
+        // The epoch reconcile resolved nothing (an empty / prefix epoch cache). If the follower still
+        // holds an uncommitted tail above the committed frontier, truncate it down to the committed HW.
+        match self.roles.get(&partition) {
+            Some(PartitionRole::Follower { follower }) => {
+                let mut guard = lock_follower(follower);
+                if guard.follower().next_fetch_offset().get() > committed_hw.get() {
+                    Ok(guard.truncate_to_committed(committed_hw)?)
+                } else {
+                    Ok(healed)
+                }
+            }
+            Some(PartitionRole::Leader { .. }) => Err(DataPlaneError::WrongRole {
+                partition,
+                needed: "follower",
+            }),
+            None => Err(DataPlaneError::UnknownPartition { partition }),
+        }
+    }
+
     /// The follower's current visible high-watermark for `partition` (`min(its durable prefix, the
     /// leader's last-observed HW)`) — only committed-and-replicated data is visible below it.
     /// Follower-only; `None` otherwise.
@@ -2275,6 +2378,353 @@ mod tests {
                 assert_replicated_byte_identical(log, &new_leader_log, new_served);
             })
             .unwrap();
+    }
+
+    // ---- #873 Phase 2: reconcile-on-adopt truncation (empty-epoch-cache fallback) -----------------
+
+    /// The shared committed-prefix record content (both a divergent follower and a clean new leader hold
+    /// byte-identical records here) — 6 bytes, so a small segment cap rolls identically on both.
+    fn shared_rec(i: u32) -> String {
+        format!("rec-{i:02}")
+    }
+    /// The DIVERGENT new-lineage record content (same 6-byte width so segment rolls stay aligned).
+    fn new_rec(i: u32) -> String {
+        format!("new-{i:02}")
+    }
+
+    fn min1() -> IsrConfig {
+        IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        }
+    }
+
+    /// Build a FOLLOWER (node 2, EMPTY epoch cache — the common post-failover shape) that fully
+    /// replicated a throwaway old leader's `old_len`-record `shared_rec` lineage over the read-plane
+    /// serve path; it now holds `[0, old_served)` fsynced with NO learned epoch boundaries. `fs` backs
+    /// the follower log so a caller can reopen it (crash-recovery model). Returns the follower + the
+    /// old leader's sealed-served end (the follower's frontier).
+    fn divergent_follower_holding(
+        partition: u64,
+        fs: InMemoryFs,
+        old_len: u32,
+    ) -> (DataPlaneController<InMemoryFs, ManualClock>, u64) {
+        let mut old_leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..old_len {
+            old_leader_log
+                .append(&rec(shared_rec(i).as_bytes()))
+                .unwrap();
+        }
+        old_leader_log.sync().unwrap();
+        let old_plane = leader_plane(&old_leader_log);
+        let old_served = plane_served_end(&old_plane);
+        let mut old_leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+        old_leader.start_leader(
+            partition,
+            Arc::clone(&old_plane),
+            EpochCache::new(),
+            &[1, 2],
+            min1(),
+        );
+        let mut follower = DataPlaneController::<InMemoryFs, ManualClock>::new(2);
+        follower.start_follower(partition, open_log(fs, small_config()));
+        for _ in 0..40 {
+            if follower.follower_high_watermark(partition).unwrap() >= old_served {
+                break;
+            }
+            let req = follower.make_fetch_request(partition, 8, 4096).unwrap();
+            let resp = old_leader.serve_fetch(partition, &req).unwrap();
+            follower.apply_fetch_response(partition, &resp).unwrap();
+        }
+        assert!(
+            old_served >= 8,
+            "old leader must seal a usable prefix (got {old_served})"
+        );
+        assert_eq!(
+            follower
+                .with_follower_log(partition, |log| log.next_offset().get())
+                .unwrap(),
+            old_served,
+            "the follower holds the full old prefix as its uncommitted tail"
+        );
+        (follower, old_served)
+    }
+
+    /// Build a NEW leader (node 1) whose lineage shares `[0, floor)` with the followers (`shared_rec`)
+    /// and DIVERGES over `[floor, total)` (`new_rec`). Returns the leader, its owned log, and its
+    /// sealed-served end.
+    fn new_divergent_leader(
+        partition: u64,
+        floor: u32,
+        total: u32,
+    ) -> (
+        DataPlaneController<InMemoryFs, ManualClock>,
+        Log<InMemoryFs, ManualClock>,
+        u64,
+    ) {
+        let mut log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..floor {
+            log.append(&rec(shared_rec(i).as_bytes())).unwrap();
+        }
+        for i in floor..total {
+            log.append(&rec(new_rec(i).as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let plane = leader_plane(&log);
+        let served = plane_served_end(&plane);
+        let mut leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+        leader.start_leader(
+            partition,
+            Arc::clone(&plane),
+            EpochCache::new(),
+            &[1, 2],
+            min1(),
+        );
+        (leader, log, served)
+    }
+
+    /// An epoch-answer closure that must never be consulted (an empty follower epoch cache locates no
+    /// divergence point, so the heal falls back to the committed-HW truncation without any query).
+    fn no_query(_epoch: LeaderEpoch) -> LeaderEpochEndOffset {
+        panic!("an empty follower epoch cache must never query the leader");
+    }
+
+    #[test]
+    fn heal_truncates_a_divergent_uncommitted_tail_down_to_the_committed_floor() {
+        const P: u64 = 0;
+        const FLOOR: u64 = 6;
+        let (mut follower, old_served) = divergent_follower_holding(P, InMemoryFs::new(), 18);
+        assert!(
+            old_served > FLOOR,
+            "the follower must hold a tail above the floor"
+        );
+
+        // The new leader's lineage diverges after the committed floor; its frontier is at/above FLOOR,
+        // so the leader-behind guard passes and the heal truncates the unverifiable tail to FLOOR.
+        let (new_leader, new_leader_log, new_served) =
+            new_divergent_leader(P, u32::try_from(FLOOR).unwrap(), 20);
+        let healed = follower
+            .heal_divergent_follower(P, Offset::new(FLOOR), new_served, no_query)
+            .expect("the follower self-heals to the committed floor");
+        assert!(
+            !healed.is_no_op(),
+            "the divergent uncommitted tail was truncated"
+        );
+        assert_eq!(
+            healed.divergence_point.truncate_to.get(),
+            FLOOR,
+            "it truncated to EXACTLY the committed floor, never below"
+        );
+        assert_eq!(
+            follower
+                .with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            FLOOR,
+            "the follower's frontier is now the committed floor — the uncommitted tail is gone"
+        );
+
+        // Re-fetch the CLEAN new lineage forward; the follower converges byte-identical (its kept
+        // [0,FLOOR) committed prefix + the new [FLOOR,new_served) lineage).
+        for _ in 0..40 {
+            if follower.follower_high_watermark(P).unwrap() >= new_served {
+                break;
+            }
+            let req = follower.make_fetch_request(P, 8, 4096).unwrap();
+            let resp = new_leader.serve_fetch(P, &req).unwrap();
+            follower.apply_fetch_response(P, &resp).unwrap();
+        }
+        follower
+            .with_follower_log(P, |log| {
+                assert_replicated_byte_identical(log, &new_leader_log, new_served);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn heal_refuses_when_the_new_leader_is_behind_the_committed_floor() {
+        const P: u64 = 0;
+        const FLOOR: u64 = 10;
+        let (mut follower, old_served) = divergent_follower_holding(P, InMemoryFs::new(), 18);
+
+        // The adopted leader's frontier is BELOW the committed floor: it cannot restore the committed
+        // data a truncation would drop. The heal FAILS CLOSED and leaves the follower UNTOUCHED.
+        let leader_behind_hw = FLOOR - 1;
+        let err = follower
+            .heal_divergent_follower(P, Offset::new(FLOOR), leader_behind_hw, no_query)
+            .expect_err("a leader behind the committed floor must be refused");
+        match err {
+            DataPlaneError::Replication(ReplicationError::ResyncLeaderBehind {
+                leader_hw,
+                committed_hw,
+            }) => {
+                assert_eq!(leader_hw, leader_behind_hw);
+                assert_eq!(committed_hw, FLOOR);
+            }
+            other => panic!("expected ResyncLeaderBehind, got {other:?}"),
+        }
+        assert_eq!(
+            follower
+                .with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            old_served,
+            "REFUSED heals never truncate: the follower's log is untouched for a retry"
+        );
+    }
+
+    #[test]
+    fn heal_never_drops_a_committed_record_and_preserves_the_prefix_byte_for_byte() {
+        const P: u64 = 0;
+        const FLOOR: u64 = 8;
+        let fs = InMemoryFs::new();
+        let (mut follower, old_served) = divergent_follower_holding(P, fs, 18);
+        assert!(old_served > FLOOR);
+
+        // Snapshot the committed-prefix bytes [0, FLOOR) BEFORE the heal (the segment files wholly below
+        // the floor), so we can prove the heal drops ONLY the suffix and never a committed record.
+        let prefix_before: std::collections::BTreeMap<String, Vec<u8>> = follower
+            .with_follower_log(P, dump_segments)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        // A leader with a frontier well above the floor: the heal truncates to exactly FLOOR.
+        follower
+            .heal_divergent_follower(P, Offset::new(FLOOR), old_served, no_query)
+            .expect("heals to the floor");
+        assert_eq!(
+            follower
+                .with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            FLOOR
+        );
+
+        // Every surviving follower segment file is a byte-identical PREFIX of the pre-heal file of the
+        // same name (a wholly-below-floor segment is byte-for-byte unchanged; the segment straddling the
+        // floor is a truncated prefix). No committed record below the floor was altered or dropped.
+        let after = follower.with_follower_log(P, dump_segments).unwrap();
+        for (name, bytes) in after {
+            let before = prefix_before
+                .get(&name)
+                .unwrap_or_else(|| panic!("heal fabricated a new segment file {name}"));
+            assert!(
+                before.starts_with(&bytes),
+                "surviving segment {name} is not a byte-identical prefix of its pre-heal bytes"
+            );
+        }
+
+        // A DECODE of the survivor confirms records [0, FLOOR) are intact and unmodified.
+        follower
+            .with_follower_log(P, |log| {
+                let records = log
+                    .read_from(Offset::new(0), usize::try_from(FLOOR).unwrap())
+                    .expect("committed prefix reads back");
+                assert_eq!(records.len(), usize::try_from(FLOOR).unwrap());
+                for (i, got) in records.iter().enumerate() {
+                    assert_eq!(
+                        got.payload.as_ref(),
+                        shared_rec(u32::try_from(i).unwrap()).as_bytes(),
+                        "committed record {i} was altered by the heal"
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn heal_is_idempotent_on_retry() {
+        const P: u64 = 0;
+        const FLOOR: u64 = 6;
+        let (mut follower, old_served) = divergent_follower_holding(P, InMemoryFs::new(), 18);
+
+        let first = follower
+            .heal_divergent_follower(P, Offset::new(FLOOR), old_served, no_query)
+            .expect("first heal truncates");
+        assert!(!first.is_no_op(), "the first heal drops the divergent tail");
+        assert_eq!(
+            follower
+                .with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            FLOOR
+        );
+
+        // A RETRY (e.g. after a reconnect) finds nothing above the floor: a clean no-op that drops
+        // nothing. Idempotent — re-running the heal never double-truncates or errors.
+        let second = follower
+            .heal_divergent_follower(P, Offset::new(FLOOR), old_served, no_query)
+            .expect("retry is a clean no-op");
+        assert!(second.is_no_op(), "the retry truncates nothing");
+        assert_eq!(
+            follower
+                .with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            FLOOR,
+            "the frontier is unchanged after the idempotent retry"
+        );
+    }
+
+    #[test]
+    fn heal_survives_a_reopen_recovering_to_the_truncated_prefix() {
+        const P: u64 = 0;
+        const FLOOR: u64 = 6;
+        // A SHARED fs (Arc-backed) so a fresh Log::open after the heal recovers from the SAME durable
+        // bytes — the crash-consistency model: recovery is a pure function of the post-truncate bytes.
+        let fs = InMemoryFs::new();
+        let (mut follower, old_served) = divergent_follower_holding(P, fs.clone(), 18);
+        follower
+            .heal_divergent_follower(P, Offset::new(FLOOR), old_served, no_query)
+            .expect("heals to the floor");
+        // The truncate fsync'd (set_len + sync_all + sync_dir); a reopen from the shared durable store
+        // must recover EXACTLY the truncated prefix — never the dropped suffix, never short of the floor.
+        let reopened = open_log(fs, small_config());
+        assert_eq!(
+            reopened.next_offset().get(),
+            FLOOR,
+            "recovery after the heal lands on exactly the truncated committed prefix"
+        );
+        let records = reopened
+            .read_from(Offset::new(0), usize::try_from(FLOOR).unwrap())
+            .expect("prefix reads back after reopen");
+        assert_eq!(records.len(), usize::try_from(FLOOR).unwrap());
+        for (i, got) in records.iter().enumerate() {
+            assert_eq!(
+                got.payload.as_ref(),
+                shared_rec(u32::try_from(i).unwrap()).as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn two_replicas_heal_to_the_same_prefix_deterministically() {
+        const P: u64 = 0;
+        const FLOOR: u64 = 7;
+        let (mut a, a_served) = divergent_follower_holding(P, InMemoryFs::new(), 18);
+        let (mut b, b_served) = divergent_follower_holding(P, InMemoryFs::new(), 18);
+        assert_eq!(a_served, b_served, "identical setups replicate identically");
+
+        a.heal_divergent_follower(P, Offset::new(FLOOR), a_served, no_query)
+            .expect("A heals");
+        b.heal_divergent_follower(P, Offset::new(FLOOR), b_served, no_query)
+            .expect("B heals");
+
+        let a_bytes: std::collections::BTreeMap<String, Vec<u8>> = a
+            .with_follower_log(P, dump_segments)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let b_bytes: std::collections::BTreeMap<String, Vec<u8>> = b
+            .with_follower_log(P, dump_segments)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            a_bytes, b_bytes,
+            "two replicas healing to the same committed floor produce byte-identical prefixes"
+        );
+        assert_eq!(
+            a.with_follower_log(P, |log| log.next_offset().get())
+                .unwrap(),
+            FLOOR
+        );
     }
 
     // ---- single-node / single-replica = the local-fsync ack, byte-identical ----------------------
