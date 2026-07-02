@@ -379,6 +379,9 @@ where
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+    // Disable Nagle (#1028): a health/metrics response is one small write a poller round-trips on,
+    // and probe timeout budgets are often tight. Best-effort — latency-only, never fails the request.
+    crate::server::set_nodelay_best_effort(&stream);
 
     // Read the request HEAD (request line + headers) under a bounded byte and total-time budget; the
     // outcome is either a parsed head or an already-sent error response (414/408) or a clean close.

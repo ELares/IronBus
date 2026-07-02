@@ -32,6 +32,24 @@ const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// on the connection cap.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sets `TCP_NODELAY` on a broker-side socket, BEST-EFFORT (#1028).
+///
+/// The data plane and the cluster peer links are small-frame request-response traffic (per-message
+/// acks, single-in-flight producers, fetch round-trips, raft heartbeats), exactly the pattern where
+/// Nagle + delayed-ACK stacks an RTT-scale stall onto every small write on a real network. Every
+/// serious broker (NATS, Kafka, Redis) disables Nagle on both ends, so IronBus does too — on every
+/// accepted connection and every outbound peer link.
+///
+/// BEST-EFFORT because a failed `setsockopt` degrades LATENCY only, never correctness (the bytes
+/// still flow, just possibly delayed by Nagle): it must never kill an otherwise-healthy connection.
+/// The failure is surfaced at debug (it is environmental — an exotic stack or a socket already
+/// closing — and bounded to once per connection, so it is not a log-volume vector).
+pub(crate) fn set_nodelay_best_effort(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, "TCP_NODELAY setsockopt failed; continuing without it");
+    }
+}
+
 /// Decrements the active-connection count on drop, so the count is released on both a
 /// normal handler return and a panic unwind. Also records the connection CLOSE on the shared connz
 /// metric (#572), so the close is accounted on every exit path (normal return AND panic unwind),
@@ -496,6 +514,10 @@ where
                                     // write that makes no progress within the window errors out and closes the connection.
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
+    // Disable Nagle on the accepted data-plane connection (#1028): small-frame request-response
+    // traffic (acks, single-in-flight produces) must not wait out delayed-ACK. Best-effort — a
+    // failed setsockopt costs latency, never correctness, so it does not close the connection.
+    set_nodelay_best_effort(&stream);
     // Pin the auth requirement onto the session: with a configured table the `Connect` handshake must
     // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev). No TLS
     // peer certificate is available in this PR (the TLS handshake is the flagged follow-up), so the
@@ -751,6 +773,27 @@ mod tests {
             assert!(n > 0, "connection closed before a full frame");
             buf.extend_from_slice(&chunk[..n]);
         }
+    }
+
+    #[test]
+    fn set_nodelay_best_effort_disables_nagle_on_a_live_socket() {
+        // #1028: the shared helper every accepted data-plane connection and cluster peer link runs
+        // through must actually flip TCP_NODELAY on (read back via getsockopt on BOTH ends of a live
+        // loopback pair), and must be callable on either an accepted or a dialed socket.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dialed = TcpStream::connect(addr).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        set_nodelay_best_effort(&accepted);
+        set_nodelay_best_effort(&dialed);
+        assert!(
+            accepted.nodelay().expect("read TCP_NODELAY back"),
+            "the accepted socket must have TCP_NODELAY set"
+        );
+        assert!(
+            dialed.nodelay().expect("read TCP_NODELAY back"),
+            "the dialed socket must have TCP_NODELAY set"
+        );
     }
 
     #[test]

@@ -251,6 +251,10 @@ fn run_serve_listener<F, C>(
                 // A short read timeout so a reader's blocking read re-checks shutdown promptly and an
                 // idle inbound link never wedges a stop.
                 let _ = stream.set_read_timeout(Some(SERVE_ACCEPT_POLL));
+                // Disable Nagle on the accepted cross-cluster link (#1028): mirror-pull and leaf-push
+                // are request-response, and the small response/ack frames written back on this side
+                // gate the remote's next round. Best-effort (latency-only, never drops the link).
+                crate::server::set_nodelay_best_effort(&stream);
                 let serve_plane = config.serve_plane.clone();
                 let hub_receiver = config.hub_receiver.clone();
                 let sd = Arc::clone(shutdown);

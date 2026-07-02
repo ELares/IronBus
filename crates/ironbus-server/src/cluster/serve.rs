@@ -461,6 +461,9 @@ pub fn query_leader_committed_hw(
     let stream = TcpStream::connect_timeout(&leader_data_addr, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
+    // Disable Nagle (#1028): this is a single tiny query frame awaiting a tiny response — the exact
+    // shape Nagle + delayed-ACK penalizes. Best-effort (latency-only), so it never fails the query.
+    crate::server::set_nodelay_best_effort(&stream);
     let mut link = DataPlaneLink::new(stream);
     link.send(
         partition,
@@ -1316,6 +1319,10 @@ fn run_dataplane_listener<F, C>(
                 // A short read timeout so a reader's blocking `recv` re-checks shutdown promptly and an
                 // idle inbound link never wedges a stop.
                 let _ = stream.set_read_timeout(Some(DATAPLANE_POLL));
+                // Disable Nagle on the accepted peer data-plane link (#1028): fetch/report round-trips
+                // are small frames, and the follower's next fetch waits on this side's small response.
+                // Best-effort — latency-only, never drops the link.
+                crate::server::set_nodelay_best_effort(&stream);
                 let server = Arc::clone(&server);
                 let release = release.clone();
                 let sd = Arc::clone(&shutdown);
@@ -1563,6 +1570,10 @@ fn run_follower_fetch<F, C>(
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(DATAPLANE_POLL));
                 let _ = stream.set_write_timeout(Some(DATAPLANE_POLL));
+                // Disable Nagle on the follower's fetch link (#1028): each catch-up round is a small
+                // fetch request that must reach the leader before the (possibly large) response can
+                // start, so a Nagle-delayed request stalls the whole round. Best-effort (latency-only).
+                crate::server::set_nodelay_best_effort(&stream);
                 let mut link = DataPlaneLink::new(stream);
                 follower_fetch_loop(
                     partition,
