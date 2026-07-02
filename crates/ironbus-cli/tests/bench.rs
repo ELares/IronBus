@@ -286,17 +286,40 @@ fn round_trip_reports_ack_percentiles_from_the_awaited_producer_leg() {
 fn no_fsync_dry_run_flags_the_cost_not_measured() {
     let out = run_bench(&["--count", "100", "--no-fsync", "--json"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
     assert!(stdout.contains("\"no_fsync\":true"), "json: {stdout}");
     assert!(
         stdout.contains("\"fsync_measured\":false"),
         "json: {stdout}"
     );
     assert!(stdout.contains("\"fsync_cost_us\":null"), "json: {stdout}");
+    // #1027 TEETH: the spawned broker must MATERIALIZE the relaxed tier, not just batch the
+    // checkpoints — the stderr materialized-config line names the effective durability level the
+    // dry run really measured. This FAILS on the pre-#1027 code (which stayed on `sync` and
+    // emitted no materialized-config line at all).
+    assert!(
+        stderr.contains("materialized-config")
+            && stderr.contains("durability_level=interval")
+            && stderr.contains("power_loss_safe=false"),
+        "the --no-fsync spawned broker must run (and report) interval durability; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn the_default_spawned_broker_reports_the_sync_tier_on_its_materialized_config_line() {
+    // The #1027 counterpart: WITHOUT --no-fsync the spawned broker stays on the power-loss-safe
+    // per-ack sync tier, and its stderr materialized-config line says so, so an honest run's
+    // numbers are auditable as sync-tier numbers.
+    let out = run_bench(&["--count", "50", "--mode", "publish", "--json"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("materialized-config")
+            && stderr.contains("durability_level=sync")
+            && stderr.contains("power_loss_safe=true"),
+        "the default spawned broker must run (and report) sync durability; stderr: {stderr}"
+    );
 }
 
 #[test]

@@ -1862,6 +1862,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_default_streaming_fetch_window_is_pinned_at_2048() {
+        // #1027 PIN (async port): the re-exported sync-client default is the peer-comparable 2048
+        // window (the measured ~1M rec/s streaming-drain plateau point, and the broker's default
+        // per-consumer credit ceiling); 256 left a tight drain loop round-trip-latency-bound. This
+        // FAILS if the re-export drifts from the pinned sizing.
+        assert_eq!(DEFAULT_STREAM_FETCH_RECORDS, 2048);
+        assert_eq!(
+            StreamConsumerConfig::default().max_records,
+            DEFAULT_STREAM_FETCH_RECORDS,
+            "the config default rides the pinned constant"
+        );
+    }
+
+    #[test]
     fn ingest_delivery_caps_the_aggregate_decompressed_bytes() {
         // #879 (async port): the running aggregate of materialized payload bytes is bounded across a
         // fetch window, not just per-record. Once the running total would exceed the ceiling the batch
