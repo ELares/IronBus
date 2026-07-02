@@ -774,6 +774,14 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     fn list_subdirs(&self) -> io::Result<Vec<String>> {
         self.inner.list_subdirs()
     }
+
+    fn sync_is_real_barrier(&self) -> bool {
+        // Delegate: the fault layer adds test hooks, not durability — whether a sync is a real
+        // barrier is decided by where the bytes actually land (#1026). A `FaultFs<InMemoryFs>` test
+        // rig thus keeps the real-barrier gather behavior; a `FaultFs<EphemeralFs>` reports no-op
+        // syncs exactly like the bare ephemeral backend.
+        self.inner.sync_is_real_barrier()
+    }
 }
 
 /// A [`RandomAccessFile`] that wraps another and injects faults while the shared

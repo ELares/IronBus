@@ -6176,6 +6176,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.durability_level.waives_i2()
     }
 
+    /// Whether this engine's commit path issues a REAL covering fsync BEFORE a produce is acked
+    /// (#1026): true only under the default [`DurabilityLevel::Sync`] on a backend whose syncs are
+    /// real barriers ([`Filesystem::sync_is_real_barrier`]). This is the exact condition under
+    /// which the append actor's bounded group-commit gather (#454) has a cost to amortize — ONE
+    /// covering `fdatasync` over the gathered batch. Everywhere else — the ephemeral memory
+    /// backend (its syncs are no-ops), or a relaxed level (`interval`/`async`/`none` ack on the
+    /// page-cache write, before any fsync) — an ack waits on no barrier, so pacing produces to
+    /// batch one is pure added latency and the gather must not engage. Both inputs are fixed for
+    /// the engine's life (the durability level is not live-reloadable and the backend type is
+    /// static), so a caller may read this once at spawn.
+    #[must_use]
+    pub fn commit_syncs_before_ack(&self) -> bool {
+        self.durability_level == DurabilityLevel::Sync
+            && self.log.filesystem().sync_is_real_barrier()
+    }
+
     /// The current UNSYNCED exposure in RECORD BYTES: the durable-record bytes that are VISIBLE
     /// (acked) but NOT yet covered by a returned `fdatasync` (#341, #379). Always `0` under `sync`
     /// (the visible and durable heads are equal); under a relaxed level it is the live bytes-at-risk a
@@ -15160,6 +15176,36 @@ mod tests {
             assert_eq!(DurabilityLevel::parse(name), Some(level));
         }
         assert_eq!(DurabilityLevel::parse("bogus"), None);
+    }
+
+    #[test]
+    fn commit_syncs_before_ack_is_true_only_for_sync_on_a_real_barrier_backend() {
+        // The gather discriminant (#1026): the append actor's group-commit gather engages only when
+        // an ack actually waits on a covering fsync. That is `sync` on a real-barrier backend —
+        // `InMemoryFs` counts (it MODELS the barrier for the crash sim), the ephemeral memory
+        // backend does not (its syncs are no-ops by construction, #492), and every relaxed level
+        // acks on the page-cache write regardless of backend.
+        assert!(open(config(10, 5)).commit_syncs_before_ack());
+        let ephemeral = Engine::open(
+            ironbus_storage::fs::EphemeralFs::new(),
+            ManualClock::new(),
+            config(10, 5),
+        )
+        .unwrap();
+        assert!(
+            !ephemeral.commit_syncs_before_ack(),
+            "the ephemeral backend's syncs are no-ops: nothing to amortize before an ack"
+        );
+        for level in [
+            DurabilityLevel::Interval,
+            DurabilityLevel::Async,
+            DurabilityLevel::None,
+        ] {
+            assert!(
+                !open(config_durability(level, 1_000, 1024)).commit_syncs_before_ack(),
+                "{level:?} acks on the page-cache write, before any fsync"
+            );
+        }
     }
 
     // ---- #378 fsync-headroom admission credit ----

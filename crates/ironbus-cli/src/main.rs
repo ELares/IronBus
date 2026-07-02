@@ -322,6 +322,13 @@ const DEFAULT_FLUSH_MAX_BYTES: u64 = 1024 * 1024;
 ///   `PostgreSQL` `commit_delay` precedent (tens to a few hundred microseconds). An operator may set
 ///   `0` to restore the byte-identical historical actor, or raise it (bounded to 1 s) for fewer,
 ///   larger barriers.
+///
+/// The window engages ONLY where there is an fsync to amortize (#1026): durability `sync` on the
+/// disk backend, where an ack waits on the covering `fdatasync`. On `--storage memory` (no-op
+/// syncs) or a relaxed `--durability-level` (`interval`/`async`/`none` ack on the page-cache
+/// write) the actor runs as if the window were `0` — parking produces there amortizes nothing and
+/// only quantizes acks to the window (measured 10x+ throughput loss). The knob itself is
+/// unchanged: it configures the sync-on-disk gather.
 const DEFAULT_COMMIT_GATHER_US: u64 = 200;
 
 /// The default CoDel TARGET (ms) for `serve` (#68), aliased to the engine's default so the CLI and

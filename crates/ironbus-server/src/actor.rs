@@ -1329,6 +1329,12 @@ where
 /// commit latency under produce bursts for fewer, larger barriers (the `MySQL`
 /// `binlog_group_commit_sync_delay` / `PostgreSQL` `commit_delay` precedent).
 ///
+/// The window engages ONLY when the engine's commit path issues a real covering fsync before ack
+/// ([`crate::engine::Engine::commit_syncs_before_ack`], #1026): durability `sync` on a real-barrier
+/// backend. On the ephemeral memory backend, or under a relaxed durability level
+/// (`interval`/`async`/`none`), an ack waits on no barrier, so there is nothing to amortize and the
+/// actor runs as if the window were 0 (no produce is ever parked to fill a batch).
+///
 /// # Panics
 /// Panics if the OS refuses to spawn the actor thread, exactly as [`spawn_actor`]: a STARTUP step,
 /// not a request path, so the no-panic bar for the library hot paths is untouched.
@@ -1518,6 +1524,18 @@ where
     F: Filesystem,
     C: Clock + Clone,
 {
+    // The gather engages ONLY when the commit path issues a real covering fsync before ack (#1026):
+    // durability `sync` on a real-barrier backend. Everywhere else — the ephemeral memory backend
+    // (no-op syncs) or a relaxed level (`interval`/`async`/`none` ack on the page-cache write) — an
+    // ack waits on NO barrier, so parking produces to batch one amortizes nothing and only quantizes
+    // the ack pipeline to the window (measured 10x+ throughput loss at the 200us default). Both
+    // inputs are fixed for the engine's life (the level is not live-reloadable, the backend type is
+    // static), so the effective window is resolved ONCE here, exactly as `--commit-gather-us 0`.
+    let gather_micros = if engine.commit_syncs_before_ack() {
+        gather_micros
+    } else {
+        0
+    };
     // Produces appended this pass but not yet durable: each parked reply is released only after the
     // single covering `commit_batch`, so a `PubAck` never precedes its fsync (I2).
     let mut pending: Vec<PendingProduce> = Vec::new();
@@ -2962,6 +2980,88 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(control.sync_count() - before, 1, "one produce, one fsync");
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn a_memory_backend_pipelined_batch_is_never_parked_by_the_commit_gather() {
+        // #1026: the ephemeral memory backend's syncs are no-ops, so a produce ack waits on NO
+        // covering fsync and the gather has nothing to amortize — a pipelined batch must ack
+        // immediately, never parked to fill the window. The sync gate makes the pipelining
+        // deterministic exactly as in the positive gather test above: a primer parks the actor on
+        // its (no-op-at-the-bottom, but still gated) covering sync, TWO produces queue behind it,
+        // and the gate opens — the next drain pass then provably holds >= 2 produces, the exact
+        // shape that engages the gather on a real-barrier backend. With an 800 ms window, a
+        // gathered pass could not ack in under 800 ms; the bound proves the gather never engaged.
+        let (fs, control) = FaultFs::new(ironbus_storage::fs::EphemeralFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, 800_000);
+        control.close_sync_gate();
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        let queued_a = handle.produce_async(append(b"queued-a")).unwrap();
+        let queued_b = handle.produce_async(append(b"queued-b")).unwrap();
+        control.open_sync_gate();
+        match primer.recv().unwrap() {
+            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 0),
+            other => panic!("expected Appended primer, got {other:?}"),
+        }
+        let started = std::time::Instant::now();
+        for (reply, expected) in [(queued_a, 1), (queued_b, 2)] {
+            match reply.recv().unwrap() {
+                ProduceOutcome::Appended(o) => assert_eq!(o.get(), expected),
+                other => panic!("expected Appended, got {other:?}"),
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "a memory-backend pipelined batch must ack without the 800 ms gather park, took {:?}",
+            started.elapsed()
+        );
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn a_relaxed_durability_pipelined_batch_is_never_parked_by_the_commit_gather() {
+        // #1026: under `interval` durability an ack is released on the page-cache write — the
+        // fsync (when the window is due) bounds loss, it is not what the ack waits to amortize —
+        // so the gather must not park produces. The byte trigger is set to 1 so EVERY batch's
+        // interval window is due and force-syncs (deterministically parking in the sync gate, the
+        // same primer choreography as the positive gather test), which is the WORST case for the
+        // old behavior: a real-barrier fs, real fsyncs each batch, yet the level says acks are
+        // page-cache acks. With an 800 ms window, a gathered pass could not ack in under 800 ms.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let cfg = EngineConfig {
+            durability_level: crate::engine::DurabilityLevel::Interval,
+            flush_max_bytes: 1,
+            ..config()
+        };
+        let engine = Engine::open(fs, ManualClock::new(), cfg).unwrap();
+        let (handle, actor) = spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, 800_000);
+        control.close_sync_gate();
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        let queued_a = handle.produce_async(append(b"queued-a")).unwrap();
+        let queued_b = handle.produce_async(append(b"queued-b")).unwrap();
+        control.open_sync_gate();
+        match primer.recv().unwrap() {
+            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 0),
+            other => panic!("expected Appended primer, got {other:?}"),
+        }
+        let started = std::time::Instant::now();
+        for (reply, expected) in [(queued_a, 1), (queued_b, 2)] {
+            match reply.recv().unwrap() {
+                ProduceOutcome::Appended(o) => assert_eq!(o.get(), expected),
+                other => panic!("expected Appended, got {other:?}"),
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "an interval-durability pipelined batch must ack without the 800 ms gather park, took {:?}",
+            started.elapsed()
+        );
         drop(handle);
         actor.join().unwrap();
     }
