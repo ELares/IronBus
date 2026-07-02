@@ -1168,7 +1168,10 @@ Notes:
     instead of n (#450). Every ack keeps its fsynced-durable meaning; only WHEN the publisher
     awaits changes. 1 is the historical one-awaited-ack-per-publish path.
     <secs> or --count <n> is REQUIRED (no unbounded default), and --no-fsync is a dry run that
-    batches the bench broker's cursor checkpoints (the fsync cost is then reported as not measured).
+    runs the spawned isolated broker at INTERVAL durability (bounded-loss page-cache acks, the
+    honest relaxed tier a real serve --durability-level interval runs, #1027) and batches its
+    cursor checkpoints (the fsync cost is then reported as not measured); the spawned broker's
+    materialized-config line on stderr names the effective tier either way.
     round-trip mode (the default) measures producer-to-consumer latency through the real durable
     path, so the fsync-cost number is honest. Payloads are realistic (compressible, codec-friendly)
     by default; --payload-shape random uses incompressible noise. bench --storage memory spawns the

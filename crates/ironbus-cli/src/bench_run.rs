@@ -13,7 +13,10 @@ use crate::bench::{
     fill_payload, percentiles_us, AckMode, BenchConfig, BenchReport, Bound, ConsumeTier, Mode,
     BENCH_NAMESPACE_PREFIX, ROUND_TRIP_TOKEN_LEN,
 };
-use crate::{open_disk_engine, open_memory_engine, CliError, ServeConfig, StorageArg};
+use crate::{
+    materialized_config_line, open_disk_engine, open_memory_engine, CliError, DurabilityLevelArg,
+    ServeConfig, StorageArg,
+};
 use ironbus_client::{Client, ClientConfig, ClientError, StreamConsumerConfig};
 use ironbus_core::clock::Clock; // the monotonic seam the serve loop's liveness beacon (#95) reads
 use ironbus_proto::message::{ConsumeTier as ProtoConsumeTier, PubBody};
@@ -63,6 +66,7 @@ fn execute_isolated(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
         StorageArg::Disk => execute_isolated_disk(cfg, &config),
         StorageArg::Memory => {
             let broker = IsolatedBroker::spawn_memory(&config)?;
+            log_spawned_config(&config, broker.addr(), None);
             let result = drive_load(cfg, broker.addr());
             broker.shutdown();
             result
@@ -84,6 +88,7 @@ fn execute_isolated_disk(cfg: &BenchConfig, config: &ServeConfig) -> Result<Benc
     let mut dir_guard = DataDirGuard::arm(data_dir.clone());
 
     let broker = IsolatedBroker::spawn_disk(&data_dir, config)?;
+    log_spawned_config(config, broker.addr(), Some(&data_dir));
     let run_result = drive_load(cfg, broker.addr());
     // Tear the broker down BEFORE deleting the directory, so no writer races the cleanup.
     broker.shutdown();
@@ -307,20 +312,44 @@ const BENCH_MEMORY_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Builds the `ServeConfig` for the isolated bench broker: the compiled defaults, except the
 /// checkpoint interval, which is `1` (durable cursor write per ack, honest fsync) normally and a
-/// large batch under `--no-fsync` (spare flash, fsync cost not measured). Under
-/// `--storage memory` (#445) it carries the memory backend plus the two boot-gate requirements
-/// the real serve path enforces: the explicit ephemeral consent (bench's synthetic broker and its
-/// data are disposable by design, so bench supplies the consent the way it already owns the
-/// auto-delete of its synthetic disk dir) and the default in-RAM byte cap above.
+/// large batch under `--no-fsync` (spare flash, fsync cost not measured). `--no-fsync` (#1027)
+/// ALSO relaxes the spawned broker's PRODUCE durability to `interval` (ack on the page-cache
+/// write, a bounded-loss forced-fdatasync window — the honest "relaxed / page-cache" tier a real
+/// `serve --durability-level interval` runs): before #1027 only the checkpoint interval was
+/// raised, so the "page-cache dry run" silently still measured the per-ack `sync` fsync tier.
+/// Under `--storage memory` (#445) it carries the memory backend plus the two boot-gate
+/// requirements the real serve path enforces: the explicit ephemeral consent (bench's synthetic
+/// broker and its data are disposable by design, so bench supplies the consent the way it already
+/// owns the auto-delete of its synthetic disk dir) and the default in-RAM byte cap above.
 fn bench_serve_config(cfg: &BenchConfig) -> ServeConfig {
     let mut config = ServeConfig::bench_default();
     config.checkpoint_interval = if cfg.no_fsync { 1_000_000 } else { 1 };
+    if cfg.no_fsync {
+        // The dry run's produce path must ALSO leave the per-ack fsync tier (#1027): `interval`
+        // is the bounded-loss page-cache level (the default flush window still forces periodic
+        // fdatasyncs, so the loss stays bounded exactly as a real relaxed broker's would). The
+        // `sync` default is kept for every honest run, so `fsync_measured` claims stay true.
+        config.durability_level = DurabilityLevelArg::Interval;
+    }
     if cfg.storage == StorageArg::Memory {
         config.storage = StorageArg::Memory;
         config.ephemeral_loss_ack = true;
         config.max_total_bytes = BENCH_MEMORY_CAP_BYTES;
     }
     config
+}
+
+/// Writes the spawned isolated broker's MATERIALIZED-CONFIG line (#87) to stderr, exactly the
+/// audit surface `serve` emits at startup (#1027): one structured `key=value` line with every
+/// resolved knob, so an operator (or a probe) reads the EFFECTIVE durability tier the bench broker
+/// really ran — `durability_level=interval` under `--no-fsync`, `durability_level=sync` otherwise —
+/// straight off the run's stderr, never inferring it from the flag. stderr, not stdout, so the
+/// `--json` single-object stdout contract is untouched.
+fn log_spawned_config(config: &ServeConfig, addr: &str, data_dir: Option<&Path>) {
+    eprintln!(
+        "bench: {}",
+        materialized_config_line(config, addr, data_dir)
+    );
 }
 
 /// Drives the load against the broker at `addr` and returns the measured report. Dispatches on the
@@ -1419,6 +1448,43 @@ mod tests {
             ack_max < e2e_max,
             "the ack RTT ({ack_max}) is the produce leg only, strictly below the e2e delivery \
              tail ({e2e_max}) here"
+        );
+    }
+
+    #[test]
+    fn no_fsync_spawns_an_interval_durability_broker_and_the_default_stays_sync() {
+        // #1027 DISCRIMINATOR: `--no-fsync` must relax the spawned broker's PRODUCE durability to
+        // `interval` (the bounded-loss page-cache tier) IN ADDITION to batching the cursor
+        // checkpoints. This FAILS on the pre-#1027 code, where only the checkpoint interval moved
+        // and the "page-cache dry run" silently measured the per-ack `sync` fsync tier.
+        let dry = bench_serve_config(&cfg_of(&["--count", "10", "--no-fsync"]));
+        assert_eq!(
+            dry.durability_level,
+            DurabilityLevelArg::Interval,
+            "--no-fsync must materialize interval durability on the spawned broker"
+        );
+        assert_eq!(
+            dry.checkpoint_interval, 1_000_000,
+            "the checkpoint relaxation is kept alongside the durability relaxation"
+        );
+        // The relaxed level must still pass the REAL serve boot gates (interval needs at least one
+        // positive flush trigger and is not `--async-loss-ack`-gated), or the spawn would refuse.
+        crate::validate_serve_config(&dry).expect("the --no-fsync bench config boots");
+        // And the audit surface says so: the materialized-config line the run logs names the tier.
+        let line = materialized_config_line(&dry, "127.0.0.1:0", None);
+        assert!(
+            line.contains("durability_level=interval") && line.contains("power_loss_safe=false"),
+            "the materialized-config line must name the interval tier: {line}"
+        );
+        // WITHOUT the flag the honest default is untouched: per-ack sync durability, per-ack
+        // checkpoint, and the line says so.
+        let honest = bench_serve_config(&cfg_of(&["--count", "10"]));
+        assert_eq!(honest.durability_level, DurabilityLevelArg::Sync);
+        assert_eq!(honest.checkpoint_interval, 1);
+        let line = materialized_config_line(&honest, "127.0.0.1:0", None);
+        assert!(
+            line.contains("durability_level=sync") && line.contains("power_loss_safe=true"),
+            "the default bench broker stays on the power-loss-safe sync tier: {line}"
         );
     }
 

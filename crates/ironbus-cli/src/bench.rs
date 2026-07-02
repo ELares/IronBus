@@ -25,10 +25,12 @@
 //!
 //! FLASH-ENDURANCE. A run MUST be bounded: exactly one of `--duration` or `--count` is required, so
 //! there is no unbounded default that burns edge flash write endurance. A `--no-fsync` dry-run mode
-//! batches the bench-spawned broker's cursor checkpoints instead of forcing one durable cursor write
-//! per ack, cutting the bench's own flash writes for a quick capacity probe; in that mode the
-//! reported fsync cost is flagged not-measured, because the honest fsync number requires the
-//! per-ack durable path.
+//! runs the bench-spawned broker at `interval` durability (ack on the page-cache write, a
+//! bounded-loss forced-fdatasync window — the honest "relaxed" tier a real
+//! `serve --durability-level interval` broker runs, #1027) and batches its cursor checkpoints
+//! instead of forcing one durable cursor write per ack, cutting the bench's own flash writes for a
+//! quick capacity probe; in that mode the reported fsync cost is flagged not-measured, because the
+//! honest fsync number requires the per-ack durable path.
 //!
 //! # Why this lives in `ironbus-cli`, not the `ironbus-bench` crate
 //!
@@ -251,8 +253,11 @@ pub struct BenchConfig {
     /// populated when the operator passed `--i-understand-this-is-live` (the parse-time guard), so
     /// its presence alone means a deliberately-acknowledged live run.
     pub live_addr: Option<String>,
-    /// Dry-run: batch the bench broker's cursor checkpoints instead of one durable write per ack,
-    /// to spare edge flash. In this mode the fsync cost is not measured.
+    /// Dry-run (#1027): run the spawned isolated broker at `interval` durability (ack on the
+    /// page-cache write, bounded-loss forced-fdatasync window — the honest "relaxed" tier a real
+    /// `serve --durability-level interval` runs) AND batch its cursor checkpoints instead of one
+    /// durable write per ack, to spare edge flash. In this mode the fsync cost is not measured
+    /// (the per-ack durable path is not exercised).
     pub no_fsync: bool,
     /// The pipelined publish window (#450): how many un-acked PUBs the publisher keeps in flight
     /// per produce call. `1` (the default) is the historical one-awaited-ack-per-publish path;
@@ -321,7 +326,8 @@ impl BenchConfig {
     /// Whether the run measures the HONEST per-op fsync cost (#445): only on the DISK backend
     /// (the in-memory engine issues NO fsync at all, so there is no durable-write cost to
     /// attribute; reporting one would be dishonest) and only outside the `--no-fsync` dry run
-    /// (which batches the cursor checkpoints, so the per-ack durable path is not exercised).
+    /// (which runs the spawned broker at `interval` durability and batches the cursor
+    /// checkpoints, #1027, so the per-ack durable path is not exercised).
     /// The callers live in `bench_run.rs` behind `cfg(unix)` (the bench broker is the real
     /// `serve` path, Unix-only in v1), so on a non-unix build this method is otherwise dead
     /// code and `-D warnings` refuses the build (the Windows CI lane caught exactly that).
@@ -919,6 +925,19 @@ pub fn write_human<W: Write + ?Sized>(
         write_latency_line(out, "ack p999", report.ack_p999_us)?;
         write_latency_line(out, "ack max", report.ack_max_us)?;
     }
+    write_fsync_cost_line(cfg, report, out)?;
+    Ok(())
+}
+
+/// Writes the fsync-cost line with the tier-honest wording for every non-measured case (#445,
+/// #1027): measured -> the per-ack cost; memory -> no fsync exists; --no-fsync isolated -> the
+/// spawned broker really ran INTERVAL durability; --no-fsync live -> no tier claim; otherwise ->
+/// overlapped publishes make per-op attribution dishonest (and no dry run may be claimed).
+fn write_fsync_cost_line<W: Write + ?Sized>(
+    cfg: &BenchConfig,
+    report: &BenchReport,
+    out: &mut W,
+) -> Result<(), CliError> {
     if report.fsync_measured {
         write_latency_line(out, "fsync cost", report.fsync_cost_us)?;
     } else if cfg.storage == StorageArg::Memory {
@@ -930,11 +949,31 @@ pub fn write_human<W: Write + ?Sized>(
             "fsync cost:     not measured (--storage memory: the in-memory engine issues no \
              fsync, so there is no durable-write cost to attribute)"
         )?;
-    } else {
+    } else if cfg.no_fsync && cfg.is_isolated() {
+        // The #1027 dry-run wording: the SPAWNED broker really ran the interval tier, so the
+        // reader knows the numbers above are bounded-loss page-cache acks, not the sync tier.
+        writeln!(
+            out,
+            "fsync cost:     not measured (--no-fsync dry run: the spawned broker ran INTERVAL \
+             durability — bounded-loss page-cache acks, not the power-loss-safe sync tier; the \
+             honest fsync number needs the per-ack durable path)"
+        )?;
+    } else if cfg.no_fsync {
+        // LIVE mode never spawns (or reconfigures) a broker, so no tier claim may be made; the
+        // flag only withholds the fsync attribution.
         writeln!(
             out,
             "fsync cost:     not measured (--no-fsync dry run; the honest fsync number needs the \
              per-ack durable path)"
+        )?;
+    } else {
+        // Overlapped disk paths without --no-fsync (windowed/stream/autopipe/faf): the durable
+        // cost EXISTS but no single produce owns a covering fsync, so per-op attribution would be
+        // dishonest. Never claim a dry run that was not requested (#1027).
+        writeln!(
+            out,
+            "fsync cost:     not attributed (overlapped publishes share covering fsyncs; use \
+             --pubwindow 1 for the honest per-ack cost)"
         )?;
     }
     Ok(())
@@ -1089,8 +1128,17 @@ pub const ROUND_TRIP_TOKEN_LEN: usize = 16;
 /// The default per-message payload size.
 const DEFAULT_PAYLOAD_BYTES: usize = 256;
 
-/// The default receiver fetch credit window.
-const DEFAULT_FETCH_BATCH: u32 = 256;
+/// The default receiver fetch credit window (`--fetch-batch`), shared by the Tier-W work-queue
+/// fetch and the Tier-S streaming window. 2048, not 256 (#1027): at 256 the streaming drain is
+/// round-trip-latency-bound (~700 fetch RTTs/s of ~1.4 ms each, zero CPU hotspots — 128 B records
+/// drained at ~180k msg/s on the baseline rig), while 2048 reaches the ~1M rec/s per-record
+/// plateau there (969k-1217k msg/s at 128 B; 8192 measured 931k, so a larger window buys nothing —
+/// the ~0.5 us/record cost is the real ceiling). 2048 is also PEER-COMPARABLE consumer sizing (a
+/// stock Kafka consumer fetches ~50 MB / 500+ records per poll, so a 256-record default is not a
+/// fair head-to-head) and exactly the broker's default per-consumer credit ceiling
+/// (`DEFAULT_CONSUMER_CREDIT` = 2048), which every fetch is capped at anyway. `--fetch-batch`
+/// still overrides.
+const DEFAULT_FETCH_BATCH: u32 = 2048;
 
 /// Fills `payload` with the chosen shape AFTER the round-trip token, leaving `payload[..token_len]`
 /// untouched for the caller to stamp. `realistic` writes a repetitive, codec-friendly pattern (so
@@ -1227,6 +1275,20 @@ mod tests {
         // The default group is a fresh synthetic namespace.
         assert!(cfg.group.starts_with(BENCH_NAMESPACE_PREFIX));
         assert_eq!(cfg.group, "ironbus-bench-deadbeef");
+    }
+
+    #[test]
+    fn the_default_fetch_batch_is_pinned_at_2048_and_the_flag_still_overrides() {
+        // #1027 PIN: 2048 is peer-comparable consumer sizing (a stock Kafka consumer pulls 500+
+        // records per poll) and the measured ~1M rec/s plateau point of the streaming drain; 256
+        // was round-trip-latency-bound (~180k msg/s at 128 B). This FAILS if the default drifts.
+        let cfg = parse(&["--count", "1"]).unwrap();
+        assert_eq!(
+            cfg.fetch_batch, 2048,
+            "the default fetch window is pinned at the 2048 plateau point (#1027)"
+        );
+        let cfg = parse(&["--count", "1", "--fetch-batch", "256"]).unwrap();
+        assert_eq!(cfg.fetch_batch, 256, "--fetch-batch still overrides");
     }
 
     #[test]

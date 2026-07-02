@@ -622,11 +622,16 @@ const STREAM_FLUSH_BYTES: usize = 32 * 1024;
 pub const DEFAULT_PIPELINE_WINDOW: usize = 64;
 
 /// The default streaming-consumer fetch window (Tier-S, #550): the `max_records` a
-/// [`StreamingConsumer`]'s [`StreamingConsumer::next_batch`] pulls per `StreamFetch`. Sized to
-/// amortize the per-round-trip cost across a healthy batch while staying within a typical negotiated
-/// per-consumer credit (the actual pull is capped at the negotiated credit, #292). Configurable via
+/// [`StreamingConsumer`]'s [`StreamingConsumer::next_batch`] pulls per `StreamFetch`. 2048, not
+/// 256 (#1027): at 256 a tight drain loop is round-trip-latency-bound (~700 fetch RTTs/s of
+/// ~1.4 ms each drained 128 B records at ~180k msg/s on the baseline rig, even with read-ahead),
+/// while 2048 reaches the ~1M rec/s per-record plateau there (969k-1217k msg/s at 128 B; 8192
+/// measured 931k, no further gain). 2048 is PEER-COMPARABLE consumer sizing (a stock Kafka
+/// consumer fetches ~50 MB / 500+ records per poll) and exactly the broker's default per-consumer
+/// credit ceiling, which the actual pull is capped at anyway (the negotiated credit, #292), so the
+/// default never over-asks a default broker. Configurable via
 /// [`StreamConsumerConfig::max_records`].
-pub const DEFAULT_STREAM_FETCH_RECORDS: u32 = 256;
+pub const DEFAULT_STREAM_FETCH_RECORDS: u32 = 2048;
 
 /// The default periodic-commit cadence (Tier-S, #550): a [`StreamingConsumer`] auto-commits its
 /// cumulative offset once every this-many fetched windows (and always when the stream drains or the
@@ -3667,6 +3672,20 @@ pub struct FlushSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_streaming_fetch_window_is_pinned_at_2048() {
+        // #1027 PIN: 2048 is peer-comparable consumer sizing (a stock Kafka consumer pulls 500+
+        // records / ~50 MB per poll), the measured ~1M rec/s streaming-drain plateau point, and
+        // exactly the broker's default per-consumer credit ceiling the pull is capped at; 256 left
+        // a tight drain loop round-trip-latency-bound. This FAILS if the default drifts.
+        assert_eq!(DEFAULT_STREAM_FETCH_RECORDS, 2048);
+        assert_eq!(
+            StreamConsumerConfig::default().max_records,
+            DEFAULT_STREAM_FETCH_RECORDS,
+            "the config default rides the pinned constant"
+        );
+    }
 
     #[test]
     fn client_error_source_chain_exposes_the_wrapped_inner_cause() {
