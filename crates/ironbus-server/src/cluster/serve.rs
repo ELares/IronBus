@@ -114,15 +114,19 @@ use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Log;
 use ironbus_storage::read_plane::ReadPlane;
 
+use crate::registry::FollowerDivergenceMetrics;
+
 use super::dataplane::{
     decode_dataplane_frame, role_for_placement, DataPlaneAction, DataPlaneController,
     DataPlaneError, DataPlaneFrame, PlacementRole, ProduceAckSeam,
 };
+use super::divergence::{empty_run_above_leader_frontier, suspect_uncommitted_tail};
 use super::isr::IsrConfig;
 use super::replication::{FetchRecordsBody, FetchResponseBody};
 use super::rereplication::{
     FetchBudget, ReReplicationThrottle, FULL_CATCHUP_BYTES, FULL_CATCHUP_RECORDS,
 };
+use super::runtime::ClusterStatus;
 use super::state_machine::Placement;
 
 /// The hard maximum size, in bytes, of a single inbound DATA-plane peer frame (the partition prefix
@@ -922,6 +926,11 @@ pub struct DataPlaneRuntime<F: Filesystem, C: Clock> {
     listener: Option<JoinHandle<()>>,
     /// One FOLLOWER fetch thread per followed partition (dials the leader, fetch + apply + report).
     followers: Vec<JoinHandle<()>>,
+    /// The #873 Phase 1 follower-divergence telemetry (`Arc`-shared with every follower fetch thread):
+    /// a bounded, lock-free counter block the fetch loops bump on a SUSPECTED uncommitted-tail divergence
+    /// (detection only — no mutation). Exposed via [`Self::follower_divergence_metrics`] for the metrics
+    /// scrape to read, mirroring how the connz / health-shed off-engine signals are surfaced.
+    follower_divergence: Arc<FollowerDivergenceMetrics>,
 }
 
 /// How a leader-side data-plane reader RELEASES a quorum-fsync'd produce ack from a follower's
@@ -1094,6 +1103,14 @@ where
             effective_dataplane_reader_cap(dataplane_reader_cap, server.led_inbound_link_count());
         let server = Arc::new(Mutex::new(server));
         let shutdown = Arc::new(AtomicBool::new(false));
+        // #873 Phase 1: the shared committed-HW status snapshot (the follower's OWN quorum-committed
+        // floor source — the replicated `CheckpointCommittedHw` bar in `ClusterStatus::last_committed_hw`)
+        // and the bounded divergence telemetry, both cloned into every follower fetch thread below for
+        // OBSERVATION only. The status is cloned OUT of `client_cfg` before it is moved into the gate.
+        // Both are `None`/empty-safe: a runtime started without a status handle detects on clause 2 alone
+        // (the leader-frontier comparison), which is the safety-critical gate.
+        let follower_status = client_cfg.as_ref().and_then(|cfg| cfg.status.clone());
+        let follower_divergence = Arc::new(FollowerDivergenceMetrics::default());
         // Build the client produce-ack gate around the SAME server Arc when a config was given (#719/#735).
         // The gate and every leader-side reader share this one Arc, so the seam's parked state is one
         // source of truth. The #735 wiring (the `NOT_LEADER` leader-hint advertise map + the follower-read
@@ -1156,10 +1173,19 @@ where
             };
             let shutdown_f = Arc::clone(&shutdown);
             let server_f = Arc::clone(&server);
+            let status_f = follower_status.clone();
+            let divergence_f = Arc::clone(&follower_divergence);
             let handle = std::thread::Builder::new()
                 .name(format!("ib-dataplane-fetch-{partition}"))
                 .spawn(move || {
-                    run_follower_fetch(partition, leader_addr, server_f, &shutdown_f);
+                    run_follower_fetch(
+                        partition,
+                        leader_addr,
+                        server_f,
+                        &shutdown_f,
+                        status_f.as_ref(),
+                        &divergence_f,
+                    );
                 })
                 .expect("spawn data-plane follower fetch thread");
             followers.push(handle);
@@ -1171,6 +1197,7 @@ where
             shutdown,
             listener: Some(listener_handle),
             followers,
+            follower_divergence,
         })
     }
 
@@ -1187,6 +1214,15 @@ where
     #[must_use]
     pub fn client_gate(&self) -> Option<&Arc<super::client_ack::ClientAckGate<F, C>>> {
         self.client_gate.as_ref()
+    }
+
+    /// The #873 Phase 1 follower-divergence telemetry this runtime's fetch threads bump (the bounded
+    /// `ironbus_follower_uncommitted_tail_suspected_total` counter). The metrics scrape reads it to
+    /// surface the suspected-divergence signal alongside the operator WARN log. Detection only — reading
+    /// or incrementing it never mutates any durable / cluster state.
+    #[must_use]
+    pub fn follower_divergence_metrics(&self) -> &Arc<FollowerDivergenceMetrics> {
+        &self.follower_divergence
     }
 
     /// Signal shutdown and join every data-plane thread. Idempotent. Called by the broker's serve teardown
@@ -1503,6 +1539,8 @@ fn run_follower_fetch<F, C>(
     leader_addr: SocketAddr,
     server: Arc<Mutex<DataPlaneServer<F, C>>>,
     shutdown: &AtomicBool,
+    status: Option<&Arc<Mutex<ClusterStatus>>>,
+    divergence: &FollowerDivergenceMetrics,
 ) where
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
@@ -1527,6 +1565,8 @@ fn run_follower_fetch<F, C>(
                     shutdown,
                     &mut throttle,
                     origin,
+                    status,
+                    divergence,
                 );
             }
             Err(_) => {
@@ -1558,6 +1598,52 @@ fn run_follower_fetch<F, C>(
 /// untouched). The budget floors at [`MIN_CATCHUP_RECORDS`] and the backoff is capped, so the catch-up
 /// always makes forward progress and converges. `origin` is the monotonic instant the partition's
 /// throttle clock is measured from.
+/// #873 Phase 1: check the just-received fetch response for a SUSPECTED uncommitted-tail divergence
+/// and, on detection, emit the operator WARN + bump the bounded metric. Returns `true` iff it fired, so
+/// the caller LATCHES it to once per fetch-link session.
+///
+/// PURE OBSERVATION: it reads the follower's OWN quorum-committed floor from the replicated metadata
+/// snapshot (`ClusterStatus::last_committed_hw`, NEVER `resp.high_watermark`) and the fetch response,
+/// and mutates nothing durable — no truncation, no ISR change, no wire change. With no status handle the
+/// floor is `0` and detection rests on the leader-frontier comparison alone (the safety-critical gate).
+fn note_suspected_uncommitted_tail(
+    partition: u64,
+    follower_next_offset: u64,
+    resp: &FetchResponseBody,
+    status: Option<&Arc<Mutex<ClusterStatus>>>,
+    divergence: &FollowerDivergenceMetrics,
+) -> bool {
+    // Cheap, lock-free gate (clauses 1-2, the safety-critical leader-frontier discriminator) BEFORE
+    // paying for the shared-status lock that yields the committed floor: the hot streaming path (a
+    // non-empty run) short-circuits here without ever touching the `ClusterStatus` mutex.
+    if !empty_run_above_leader_frontier(follower_next_offset, resp) {
+        return false;
+    }
+    let committed_floor = status
+        .and_then(|s| {
+            s.lock()
+                .ok()
+                .and_then(|st| st.last_committed_hw.get(&partition).copied())
+        })
+        .unwrap_or(0);
+    if !suspect_uncommitted_tail(follower_next_offset, committed_floor, resp) {
+        return false;
+    }
+    divergence.record_uncommitted_tail_suspected();
+    tracing::warn!(
+        partition,
+        follower_next_offset,
+        leader_high_watermark = resp.high_watermark,
+        committed_floor,
+        "data plane: SUSPECTED uncommitted-tail divergence (#873) — this follower holds fsynced \
+         records above its committed floor that the incoming leader lineage excludes; the leader \
+         serves nothing at the follower's offset. DETECTION ONLY (no truncation / no self-heal in \
+         this phase). Investigate a post-failover divergent replica."
+    );
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn follower_fetch_loop<F, C>(
     partition: u64,
     link: &mut DataPlaneLink<TcpStream>,
@@ -1565,6 +1651,8 @@ fn follower_fetch_loop<F, C>(
     shutdown: &AtomicBool,
     throttle: &mut ReReplicationThrottle,
     origin: Instant,
+    status: Option<&Arc<Mutex<ClusterStatus>>>,
+    divergence: &FollowerDivergenceMetrics,
 ) where
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
@@ -1590,6 +1678,11 @@ fn follower_fetch_loop<F, C>(
         max_records: FULL_CATCHUP_RECORDS,
         max_bytes: FULL_CATCHUP_BYTES,
     };
+    // #873 Phase 1: latch the suspected-uncommitted-tail signal to ONCE per fetch-link session. A
+    // divergent follower wedges on empty no-op fetches (the bug), so an un-latched WARN + metric bump
+    // would fire every poll — an unbounded log/metric-volume vector. One signal per session keeps it a
+    // bounded, actionable operator event; a fresh adopt (reconnect) is a new session and may re-fire.
+    let mut divergence_suspected = false;
     while !shutdown.load(Ordering::Acquire) {
         // Build the next fetch request under a short lock (the follower's current frontier + the
         // throttle's current budget — capped below the historical full budget only while catching up
@@ -1658,6 +1751,20 @@ fn follower_fetch_loop<F, C>(
                     {
                         return;
                     }
+                }
+                // #873 Phase 1 DETECTION (observation only). Latch the first suspected uncommitted-tail
+                // signal of this fetch-link session; the helper reads the committed floor + predicate and
+                // emits the operator WARN + bumps the bounded metric. Nothing durable is mutated.
+                if !divergence_suspected
+                    && note_suspected_uncommitted_tail(
+                        partition,
+                        next_offset,
+                        &resp,
+                        status,
+                        divergence,
+                    )
+                {
+                    divergence_suspected = true;
                 }
                 // Drive the throttle from this fetch's NETWORK round-trip + the follower's backlog. The
                 // throttle internally treats a near-the-head backlog as steady-state (full-rate, no

@@ -41,6 +41,45 @@
 
 use ironbus_proto::message::AckLevel;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The cross-thread, bounded CLUSTER-follower divergence telemetry (#873 Phase 1): a fixed set of
+/// process-lifetime monotonic counters the data-plane FOLLOWER fetch threads bump and the metrics
+/// scrape reads. It is a separate `Arc`-shared atomic block (the SAME shape the connz / health-shed
+/// signals use) rather than a field of [`MetricRegistry`], because the follower fetch loops run on
+/// their own data-plane threads with no access to the single-threaded engine-owned registry — a
+/// lock-free atomic counter is the only sound bridge from those threads to the scrape.
+///
+/// It is BOUNDED by construction: a FIXED, tiny set of `u64` counters with NO per-partition / per-label
+/// cardinality (a divergence event names its partition + offsets in the operator WARN LOG, not in a
+/// metric label), so no adversarial or buggy input can grow this block. Nothing here ever touches the
+/// durable log, the wire format, or any behavior — it is pure observation.
+#[derive(Debug, Default)]
+pub struct FollowerDivergenceMetrics {
+    /// `ironbus_follower_uncommitted_tail_suspected_total`: the number of times a follower fetch loop
+    /// SUSPECTED (detection only — never acted) that it holds an fsynced UNCOMMITTED tail above its own
+    /// quorum-committed floor that the incoming leader lineage excludes (the #873 silent post-failover
+    /// stitch hazard). Incremented at most ONCE per divergent fetch-link session (the follower loop
+    /// latches it), so a wedged follower that empty-no-op loops does not inflate the counter — it stays
+    /// a bounded, once-per-episode operator signal, not a per-poll spam.
+    uncommitted_tail_suspected: AtomicU64,
+}
+
+impl FollowerDivergenceMetrics {
+    /// Records one SUSPECTED uncommitted-tail divergence episode (#873 Phase 1). Lock-free; callable
+    /// from any data-plane follower thread.
+    pub fn record_uncommitted_tail_suspected(&self) {
+        self.uncommitted_tail_suspected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of suspected uncommitted-tail divergence episodes
+    /// (`ironbus_follower_uncommitted_tail_suspected_total`).
+    #[must_use]
+    pub fn uncommitted_tail_suspected_total(&self) -> u64 {
+        self.uncommitted_tail_suspected.load(Ordering::Relaxed)
+    }
+}
 
 /// The frozen registry-histogram bucket upper bounds, in NANOSECONDS, ascending, matching the
 /// fixed second-valued set the issue pins: `{0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
@@ -1027,6 +1066,26 @@ pub fn registry_memory_ceiling_bytes() -> usize {
 mod tests {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
+
+    #[test]
+    fn follower_divergence_counter_starts_zero_and_increments_once_per_episode() {
+        // #873 Phase 1: the bounded suspected-uncommitted-tail counter is monotonic and starts at zero.
+        let m = FollowerDivergenceMetrics::default();
+        assert_eq!(
+            m.uncommitted_tail_suspected_total(),
+            0,
+            "a fresh telemetry block reports the honest zero"
+        );
+        m.record_uncommitted_tail_suspected();
+        assert_eq!(
+            m.uncommitted_tail_suspected_total(),
+            1,
+            "recording a suspected episode increments the counter (mutation check)"
+        );
+        m.record_uncommitted_tail_suspected();
+        m.record_uncommitted_tail_suspected();
+        assert_eq!(m.uncommitted_tail_suspected_total(), 3);
+    }
 
     // -- The allocation-counting global allocator (scoped so it never makes unrelated tests flaky).
     //
