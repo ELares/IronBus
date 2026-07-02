@@ -11,6 +11,11 @@ authors.workspace = true
 [dev-dependencies]
 proptest = "1"
 criterion = "0.5"
+# TEST-ONLY (#1021): the Go-SDK golden-vector exporter compresses one deliver-path payload with the
+# SAME pure-Rust lz4 block codec ironbus-core stores with (ADR-0003), so the exported
+# `deliver_compressed` vector is byte-for-byte what a broker delivers. Kept on the ironbus-core
+# version line; never a runtime dependency of the proto crate.
+lz4_flex = { version = "0.10", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
 
 [lints]
 workspace = true

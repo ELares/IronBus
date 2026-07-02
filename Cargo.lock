@@ -931,6 +931,7 @@ name = "ironbus-proto"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "lz4_flex",
  "proptest",
 ]
 
