@@ -1251,7 +1251,15 @@ impl Client {
                 None => TcpStream::connect(sa),
             };
             match attempt {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    // Disable Nagle (#1028): the client's produce/ack and fetch paths are small-frame
+                    // request-response, where Nagle + the broker's delayed ACK stacks an RTT-scale
+                    // stall onto every awaited round-trip on a real network. BEST-EFFORT: a failed
+                    // setsockopt degrades latency only, never correctness, so it must not fail an
+                    // otherwise-successful connect.
+                    let _ = stream.set_nodelay(true);
+                    return Ok(stream);
+                }
                 Err(e) => last_err = Some(e),
             }
         }
@@ -5667,6 +5675,22 @@ mod tests {
         let c = Client::connect(addr).unwrap();
         assert_eq!(c.negotiated_credit_bytes(), None);
         assert_eq!(c.fetch_decompressed_cap(), floor);
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn connect_disables_nagle_on_the_client_socket() {
+        // #1028: the connect path sets TCP_NODELAY on the dialed socket — the produce/ack and fetch
+        // paths are small-frame request-response, where Nagle + the broker's delayed ACK stacks an
+        // RTT-scale stall onto every awaited round-trip on a real network. Read the option back via
+        // getsockopt on the LIVE connection, so this pins the real socket state, not the call site.
+        let (addr, handle) = raw_server(frame(FrameType::Info, b""));
+        let c = Client::connect(addr).unwrap();
+        assert!(
+            c.stream.nodelay().expect("read TCP_NODELAY back"),
+            "the connected client socket must have TCP_NODELAY set"
+        );
         drop(c);
         handle.join().unwrap();
     }

@@ -1802,6 +1802,10 @@ fn run_dialer(peer_id: u64, addr: SocketAddr, inbox: PeerInbox, shutdown: &Atomi
             Ok(stream) => {
                 // A short write timeout so a stalled peer doesn't wedge the dialer past a stop.
                 let _ = stream.set_write_timeout(Some(DIALER_RECONNECT_BACKOFF));
+                // Disable Nagle on the outbound raft peer link (#1028): heartbeats and votes are tiny
+                // frames whose delivery latency IS the election/commit latency — they must not sit in
+                // a Nagle buffer waiting for the peer's delayed ACK. Best-effort (latency-only).
+                crate::server::set_nodelay_best_effort(&stream);
                 let mut link = PeerLink::new(stream);
                 pump_outbound_to_link(peer_id, &mut link, &inbox, shutdown);
             }
@@ -1876,6 +1880,11 @@ fn run_listener(
                 // A short read timeout so a reader's blocking `recv` re-checks shutdown promptly and
                 // an idle inbound link never wedges a stop.
                 let _ = stream.set_read_timeout(Some(TICK_INTERVAL));
+                // Disable Nagle on the accepted raft peer link (#1028). Today this side only READS
+                // (replies go out over this node's own dialer link), so it is cheap insurance: if a
+                // write is ever added to the accepted side it will not silently pick up Nagle stalls.
+                // Best-effort (latency-only, never drops the link).
+                crate::server::set_nodelay_best_effort(&stream);
                 let tx = inbound_tx.clone();
                 let reg = Arc::clone(&registry);
                 let sd = Arc::clone(&shutdown);

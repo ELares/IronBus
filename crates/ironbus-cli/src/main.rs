@@ -7250,6 +7250,10 @@ fn run_geo_puller(
         if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, GEO_POLL) {
             let _ = stream.set_read_timeout(Some(GEO_POLL));
             let _ = stream.set_write_timeout(Some(GEO_POLL));
+            // Disable Nagle on the outbound geo pull link (#1028): each pull round is a small request
+            // frame the origin's response waits on, and geo links cross REAL networks (the exact case
+            // Nagle + delayed-ACK penalizes). Best-effort — latency-only, never drops the link.
+            let _ = stream.set_nodelay(true);
             let mut link = GeoLink::new(stream);
             // The pull loop owns the read/apply cadence; it reads the cursor + applies under the mutex
             // (off the socket IO), so the applier is never borrowed across a wire op.
@@ -7472,6 +7476,10 @@ fn run_leaf_forwarder(
         if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, LEAF_PUSH_POLL) {
             let _ = stream.set_read_timeout(Some(LEAF_PUSH_POLL));
             let _ = stream.set_write_timeout(Some(LEAF_PUSH_POLL));
+            // Disable Nagle on the outbound leaf push link (#1028): each push round is a request the
+            // hub's ack gates, and leaf-to-hub links cross REAL networks (the exact case Nagle +
+            // delayed-ACK penalizes). Best-effort — latency-only, never drops the link.
+            let _ = stream.set_nodelay(true);
             let mut link = LeafLink::new(stream);
             push_loop(
                 &mut link,
