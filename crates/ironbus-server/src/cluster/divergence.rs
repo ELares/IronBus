@@ -106,7 +106,86 @@ use ironbus_storage::loss::{LossEvent, ReasonCode};
 use ironbus_storage::quarantine::QuarantineStore;
 use ironbus_storage::segment::StorageError;
 
-use crate::cluster::replication::{Follower, ReplicationError, ReplicationLeader};
+use crate::cluster::replication::{
+    FetchResponseBody, Follower, ReplicationError, ReplicationLeader,
+};
+
+// ---- #873 Phase 1: FETCH-SEAM uncommitted-tail divergence DETECTION (observation only) ----------
+//
+// This is a DISTINCT, complementary detector to the C4 SEGMENT-FINGERPRINT compare above. C4 catches
+// silent BODY drift between replicas that SHARE a lineage (same offsets, different bytes) by comparing
+// durable segment hashes. THIS predicate catches the #873 hazard at the FOLLOWER FETCH SEAM: a follower
+// that fsynced an UNCOMMITTED tail from a DEAD leader's epoch and, on failover, is about to (or has)
+// stitched the NEW leader's forward run onto that divergent tail — a permanently divergent replica that
+// passes every offset-contiguity check and never self-heals. Detection here is PURE OBSERVATION: it
+// mutates nothing (no truncate, no ISR change, no wire change), emits only an operator WARN + a bounded
+// metric, and a conservative MISS is by design safe (never data loss) since nothing acts on it yet.
+
+/// Does this follower hold an fsynced UNCOMMITTED tail that the INCOMING leader lineage EXCLUDES — the
+/// #873 silent post-failover stitch hazard? A PURE, side-effect-free predicate (Phase 1 = detection
+/// only); the caller emits the operator WARN + metric.
+///
+/// # The three-clause discriminator (false-positive-free by construction)
+///
+/// It fires ONLY when ALL hold:
+/// 1. **The leader served an EMPTY run** (`record_count == 0` and no frame bytes): the leader has
+///    NOTHING at the follower's fetch offset. A NON-empty run is ordinary forward catch-up, never this.
+/// 2. **The follower's LEO strictly EXCEEDS the leader's advertised frontier**
+///    (`follower_next_offset > resp_high_watermark`): the follower holds records ABOVE what the current
+///    leader has. This is THE discriminator versus a fully-caught-up follower, whose LEO EQUALS the
+///    leader's frontier (the empty run is then a benign steady-state poll). `resp_high_watermark` is the
+///    leader's advertised FLUSH frontier ([`FetchResponseBody::high_watermark`]) and is used ONLY as
+///    that positional signal — it is EXPLICITLY NOT the committed floor (see the ban below).
+/// 3. **That excess tail is genuinely ABOVE the follower's OWN quorum-committed floor**
+///    (`follower_next_offset > committed_floor`): the tail is truly UNCOMMITTED (not merely a lagging
+///    checkpoint of already-committed data). A fresh / empty follower (`LEO == floor == 0`) never fires.
+///
+/// # BANNED: `resp.high_watermark` is NEVER the floor
+///
+/// `committed_floor` MUST be the follower's OWN quorum-committed floor — the replicated
+/// `CheckpointCommittedHw` bar (`ClusterStatus::last_committed_hw`), a value applied from replicated
+/// metadata. It MUST NOT be `resp.high_watermark`, which is the leader's LOCAL flush frontier
+/// (`Log::flushed_offset`) and can sit ARBITRARILY relative to the follower's own committed state.
+///
+/// # Why the floor's freshness is not safety-critical for DETECTION
+///
+/// Clause 2 (LEO > leader frontier on an empty run) is the safety-critical gate and is INDEPENDENT of
+/// `committed_floor`. A STALE-LOW floor only makes clause 3 easier, but clause 2 still gates, so it
+/// cannot manufacture a false positive; a STALE-HIGH floor only makes the detector MORE conservative
+/// (a missed signal — safe, since nothing acts on it). So even an imperfect / not-fresh-across-restart
+/// `last_committed_hw` keeps this detector false-positive-free.
+///
+/// # In scope / out of scope
+///
+/// This catches the UNCOMMITTED-TAIL case where the leader has NOT yet advanced its flush frontier past
+/// the follower's LEO (the leader serves nothing at the follower's offset). It deliberately does NOT try
+/// to catch the below-frontier CONTENT-mismatch case (the leader already advanced past the divergent
+/// tail and serves a NON-empty conflicting run) — that is the C4 fingerprint compare's job (a later
+/// phase). A miss there is a conservative, by-design gap, never data loss.
+/// The floor-INDEPENDENT, lock-free gate of [`suspect_uncommitted_tail`] (clauses 1-2): the leader
+/// served nothing at the follower's offset (an empty run) AND the follower's LEO sits strictly above the
+/// leader's advertised frontier. This is the safety-critical discriminator and needs no committed floor,
+/// so a caller can evaluate it BEFORE paying for the shared-status lock that yields the floor (the hot
+/// streaming path — a non-empty run — then short-circuits without touching the mutex).
+#[must_use]
+pub fn empty_run_above_leader_frontier(
+    follower_next_offset: u64,
+    resp: &FetchResponseBody,
+) -> bool {
+    resp.record_count == 0
+        && resp.frame_bytes.is_empty()
+        && follower_next_offset > resp.high_watermark
+}
+
+#[must_use]
+pub fn suspect_uncommitted_tail(
+    follower_next_offset: u64,
+    committed_floor: u64,
+    resp: &FetchResponseBody,
+) -> bool {
+    empty_run_above_leader_frontier(follower_next_offset, resp)
+        && follower_next_offset > committed_floor
+}
 
 /// The hard maximum number of per-segment fingerprints a single advertisement may carry. Bounds the
 /// untrusted peer bytes the decode path will buffer and trust: a replica with more sealed segments
@@ -1123,6 +1202,95 @@ mod tests {
         }
         log.sync().unwrap();
         log
+    }
+
+    // ===== #873 Phase 1: FETCH-SEAM uncommitted-tail DETECTION (observation only) =====
+
+    #[test]
+    fn phase1_uncommitted_tail_detector_discriminates_divergence_from_lag() {
+        // A DEAD leader's uncommitted tail: this follower fsynced 12 records, but only the first 8 ever
+        // quorum-committed. The NEW leader's lineage reaches only offset 8 (it never held 8..12). This
+        // is the #873 silent-stitch setup, staged on real InMemoryFs/ManualClock logs.
+        let follower_log = log_with(&[
+            b"0", b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8", b"9", b"10", b"11",
+        ]);
+        let follower = Follower::new(follower_log);
+        // The follower's OWN quorum-committed floor (the replicated `CheckpointCommittedHw` bar) — NOT
+        // the leader flush HW. Only [0,8) was ever committed; [8,12) is the dead leader's uncommitted tail.
+        let committed_floor = 8u64;
+
+        // The NEW leader has only the 8 committed records.
+        let new_leader = log_with(&[b"0", b"1", b"2", b"3", b"4", b"5", b"6", b"7"]);
+        let leader = ReplicationLeader::new(&new_leader);
+
+        // --- (A) FIRES: the divergent uncommitted tail. A fetch from the follower's LEO (12) serves an
+        //     EMPTY run advertising HW=8 < LEO=12 — the leader's lineage excludes the follower's tail. ---
+        let leo = follower.next_fetch_offset().get();
+        assert_eq!(leo, 12, "the follower fsynced a 12-record log");
+        let resp = leader
+            .serve_fetch(&follower.fetch_request(64, 0))
+            .expect("leader serves an empty run above its HW");
+        assert_eq!(
+            resp.record_count, 0,
+            "the leader has nothing at the follower's ahead LEO"
+        );
+        assert!(
+            suspect_uncommitted_tail(leo, committed_floor, &resp),
+            "the divergent uncommitted tail (LEO {leo} > leader HW {} and > committed floor \
+             {committed_floor}) MUST be detected",
+            resp.high_watermark
+        );
+        // Mutation check on the BANNED floor: had we (wrongly) used resp.high_watermark AS the floor, the
+        // clause-3 comparison would be `LEO > resp.high_watermark` — still true here — so this positive
+        // case alone cannot catch the ban violation; the (B2) stale-floor case below is what pins it.
+
+        // --- (B) does NOT fire on a fully-caught-up follower (clean catch-up): its LEO EQUALS the
+        //     leader frontier, so the empty run is a benign steady-state poll, not divergence. ---
+        let caught_up = Follower::new(log_with(&[b"0", b"1", b"2", b"3", b"4", b"5", b"6", b"7"]));
+        let cu_leo = caught_up.next_fetch_offset().get();
+        assert_eq!(cu_leo, 8);
+        let cu_resp = leader
+            .serve_fetch(&caught_up.fetch_request(64, 0))
+            .expect("serve");
+        assert_eq!(cu_resp.record_count, 0);
+        assert!(
+            !suspect_uncommitted_tail(cu_leo, committed_floor, &cu_resp),
+            "a fully-caught-up follower (LEO == leader HW) must NOT be flagged (no false positive)"
+        );
+
+        // --- (B2) stale checkpoint: a caught-up follower whose committed floor LAGS its (committed) LEO
+        //     STILL does not fire — clause 2 (LEO > leader HW) gates independently of the floor, so a
+        //     stale-LOW `last_committed_hw` can never manufacture a false positive. This is the Q1
+        //     robustness guarantee: the detector is sound even if the floor is not fresh across restart. ---
+        assert!(
+            !suspect_uncommitted_tail(cu_leo, 5, &cu_resp),
+            "a stale-low committed floor must not cause a false positive on a caught-up follower"
+        );
+
+        // --- (C) does NOT fire on a simply-BEHIND follower (normal replication lag): the leader serves a
+        //     NON-empty forward run — ordinary catch-up, never the divergence signal. ---
+        let behind = Follower::new(log_with(&[b"0", b"1", b"2", b"3"]));
+        let behind_resp = leader
+            .serve_fetch(&behind.fetch_request(64, 0))
+            .expect("serve a forward run");
+        assert!(
+            behind_resp.record_count > 0,
+            "the leader serves the lagging follower forward records"
+        );
+        assert!(
+            !suspect_uncommitted_tail(behind.next_fetch_offset().get(), 0, &behind_resp),
+            "a follower that is simply behind must NOT be flagged"
+        );
+
+        // --- (D) does NOT fire on a fresh / empty follower (LEO 0). ---
+        let empty_follower = Follower::new(open_log(InMemoryFs::new()));
+        let empty_resp = leader
+            .serve_fetch(&empty_follower.fetch_request(64, 0))
+            .expect("serve");
+        assert!(
+            !suspect_uncommitted_tail(empty_follower.next_fetch_offset().get(), 0, &empty_resp),
+            "a fresh/empty follower must NOT be flagged"
+        );
     }
 
     // ===== C4-I1 DETECTION =====
