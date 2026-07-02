@@ -270,7 +270,56 @@ pub enum ProduceSubmission {
         channel: ReplyChannel,
         /// The connection's reply-channel pool to return the drained channel to on `wait` (#475).
         pool: ReplyPool,
+        /// SPIN-ASSISTED reply handoff (#1032): when set, `wait` busy-polls the reply channel for a
+        /// bounded window ([`REPLY_SPIN_MICROS`]) before parking in the blocking `recv`, shaving the
+        /// cross-thread wake-up (measured ~10us hot, with a 100us+ jitter tail under macOS
+        /// scheduling) off the actor->session reply hop. Snapshotted from `!commit_syncs_before_ack()` at `spawn_actor` time (#1026): it is set
+        /// ONLY where the ack waits on no pre-ack fsync barrier (the ephemeral memory backend, or a
+        /// relaxed `interval`/`async`/`none` durability level), where the reply arrives within tens of
+        /// microseconds and the spin converts a scheduler wake into a near-immediate observation. On
+        /// durability `sync` over a real-barrier backend the reply is fsync-dominated (milliseconds),
+        /// so spinning would burn CPU for nothing — the flag stays `false` and `wait` parks exactly as
+        /// before, BY CONSTRUCTION leaving the I2 sync path's wait mechanics untouched. The spin
+        /// changes only WHEN the session OBSERVES the outcome, never when the actor SENDS it (still
+        /// strictly after the covering commit), and each recycled channel carries exactly one outcome,
+        /// so FIFO ack order (#917) and ack-implies-durable (I2) are unaffected by construction.
+        spin: bool,
     },
+}
+
+/// The bounded busy-poll window for a spin-assisted produce-reply wait (#1032), in microseconds.
+/// Sized to cover the whole session->actor->session round trip on the no-pre-ack-fsync tiers — one
+/// cross-thread wake (measured ~10us hot, but with a scheduler-jitter tail well past 100us) plus the
+/// in-memory append (a few us) — so the reply is observed DURING the spin in the common case and the
+/// second wake is eliminated (measured: closed-loop single-in-flight wire ack p99 81us -> 35us, p50
+/// 23.6us -> 22.0us, and +3-14% throughput on the memory produce paths; the quiet-machine probes on
+/// #1032). Small
+/// enough that the fallback park (a reply slower than the window: a deep pipelined batch mid-drain, a
+/// preempted actor) wastes at most this much CPU before blocking exactly as the historical path did.
+const REPLY_SPIN_MICROS: u64 = 100;
+
+/// Receives the one produce outcome with a bounded spin BEFORE parking (#1032): busy-poll `try_recv`
+/// for up to [`REPLY_SPIN_MICROS`], then fall back to the blocking `recv`. Semantically identical to a
+/// plain `recv` — the channel carries exactly ONE outcome, sent by the actor only after the covering
+/// commit (I2), so polling cannot reorder, duplicate, or early-observe anything; only the WAKE
+/// mechanics differ (a poll hit skips the scheduler wake a park would need).
+fn recv_spin_then_park(rx: &Receiver<ProduceOutcome>) -> Result<ProduceOutcome, ActorGone> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(REPLY_SPIN_MICROS);
+    loop {
+        match rx.try_recv() {
+            Ok(outcome) => return Ok(outcome),
+            // Unreachable in practice (the submission retains a co-located `tx`, so the channel cannot
+            // disconnect while it waits — the #802 invariant), but map it exactly like `wait`'s recv.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err(ActorGone),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            // Window exhausted (the reply is slower than a wake is worth spinning for): park in the
+            // blocking recv, byte-for-byte the historical wait.
+            return rx.recv().map_err(|_| ActorGone);
+        }
+        std::hint::spin_loop();
+    }
 }
 
 impl ProduceSubmission {
@@ -284,12 +333,22 @@ impl ProduceSubmission {
     pub fn wait(self) -> Result<ProduceOutcome, ActorGone> {
         match self {
             ProduceSubmission::Ready(outcome) => Ok(outcome),
-            ProduceSubmission::Pending { channel, pool } => {
+            ProduceSubmission::Pending {
+                channel,
+                pool,
+                spin,
+            } => {
                 // Recv the ONE outcome the actor sent after the covering fsync (I2); the original `tx`
                 // half still lives in `channel`, so a clean recv yields the value rather than seeing a
                 // spurious disconnect. ActorGone only if the actor dropped its cloned `tx` un-sent
-                // (it exited before replying), which closes the channel.
-                let outcome = channel.rx.recv().map_err(|_| ActorGone)?;
+                // (it exited before replying), which closes the channel. On the no-pre-ack-fsync tiers
+                // (`spin`, #1032) the recv is spin-assisted: a bounded busy-poll observes the reply
+                // without the second scheduler wake, then falls back to the identical blocking recv.
+                let outcome = if spin {
+                    recv_spin_then_park(&channel.rx)?
+                } else {
+                    channel.rx.recv().map_err(|_| ActorGone)?
+                };
                 // The channel is now drained and ready: return the intact pair to the pool so the next
                 // publish reuses it instead of allocating a fresh one (#475).
                 pool_return(&pool, channel);
@@ -408,6 +467,16 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// only; the actor's own byte-cap check stays authoritative (I2 / ordering), and the gate is
     /// engineered to NEVER false-reject (see [`crate::produce_gate`]).
     cap_gate: Arc<ProduceCapGate>,
+    /// Whether a produce reply wait should SPIN before parking (#1032): the negation of
+    /// [`crate::engine::Engine::commit_syncs_before_ack`] (#1026), snapshotted at `spawn_actor` time
+    /// exactly like `consumer_credit_caps` (both inputs — the durability level and the backend type —
+    /// are fixed for the engine's life, so the snapshot never drifts). `true` on the ephemeral memory
+    /// backend and the relaxed `interval`/`async`/`none` levels, where an ack waits on no fsync
+    /// barrier and the reply round trip is tens of microseconds — there a bounded busy-poll in
+    /// [`ProduceSubmission::wait`] observes the reply without the second scheduler wake. `false` on
+    /// durability `sync` over a real-barrier backend: the reply is fsync-dominated, so the wait parks
+    /// immediately, byte-for-byte the historical path (the I2 sync tier is untouched by construction).
+    reply_spin: bool,
     /// The CLUSTER produce-ack gate slot (#719, V2-C2): `None` on a SINGLE-NODE / no-cluster broker
     /// (the slot is never even created, so the produce-ack hot path never consults it and is
     /// byte-for-byte today's — the single-node guarantee, owned by this `Option`). On a clustered serve
@@ -446,6 +515,8 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // The SAME shared gate (#476): every connection reads the one byte-cap snapshot the actor
             // publishes, so the `Arc` is shared on clone (NOT freshened like `reply_pool`).
             cap_gate: Arc::clone(&self.cap_gate),
+            // The same fixed-for-the-engine's-life spin discriminant (#1032): a plain copy.
+            reply_spin: self.reply_spin,
             // The SAME shared cluster produce-ack slot (#719): every connection reads the one slot the
             // data-plane bootstrap fills, so the `Arc<OnceLock>` is shared on clone. `None` off-cluster.
             client_ack: self.client_ack.clone(),
@@ -568,6 +639,9 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
         Ok(ProduceSubmission::Pending {
             channel,
             pool: Arc::clone(&self.reply_pool),
+            // The no-pre-ack-fsync tiers get the spin-assisted wait (#1032); the sync tier parks
+            // exactly as before (fixed at spawn time, see the field's doc).
+            spin: self.reply_spin,
         })
     }
 
@@ -1355,6 +1429,12 @@ where
     // Snapshot the static per-consumer credit caps (#292) BEFORE the engine moves into the actor, so
     // the Connect handshake can negotiate them off the actor's hot path (no round-trip, #177).
     let consumer_credit_caps = (engine.consumer_credit(), engine.consumer_credit_bytes());
+    // Snapshot the produce-reply spin discriminant (#1032) BEFORE the engine moves: a reply wait
+    // spins only where the ack waits on NO pre-ack fsync barrier (#1026) — the memory backend or a
+    // relaxed durability level — where the round trip is tens of microseconds. Both inputs are fixed
+    // for the engine's life (the level is not live-reloadable, the backend type is static), so the
+    // snapshot is exact, mirroring the actor's own gather-window resolution.
+    let reply_spin = !engine.commit_syncs_before_ack();
     // Build the connection-thread byte-cap fast-reject gate (#476) BEFORE the engine moves into the
     // actor. The cap is fixed for the engine's life (not live-reloadable), so it is snapshotted once
     // here; the live byte total and the policy sentinel are published by the actor as it runs. The
@@ -1403,6 +1483,8 @@ where
             reply_pool: Arc::new(Mutex::new(Vec::new())),
             // The shared fast-reject gate (#476); every connection `clone` shares this same `Arc`.
             cap_gate,
+            // The spin discriminant snapshotted above (#1032); copied into every connection clone.
+            reply_spin,
             // No cluster produce-ack slot by default (#719): the single-node / no-cluster broker never
             // creates one. A clustered serve installs the shared slot via
             // [`EngineHandle::with_client_ack_slot`] right after this returns, BEFORE any connection's
@@ -2435,7 +2517,7 @@ mod tests {
                 ProduceSubmission::Ready(ProduceOutcome::AtCapacity) => fast_reject_seen = true,
                 ProduceSubmission::Ready(other) => panic!("unexpected Ready outcome: {other:?}"),
                 // The normal, authoritative path: drain the outcome so its reply channel recycles.
-                ProduceSubmission::Pending { channel, pool } => {
+                ProduceSubmission::Pending { channel, pool, .. } => {
                     if matches!(channel.rx.recv(), Ok(ProduceOutcome::Appended(_))) {
                         appended += 1;
                     }
@@ -3019,6 +3101,85 @@ mod tests {
             "a memory-backend pipelined batch must ack without the 800 ms gather park, took {:?}",
             started.elapsed()
         );
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn the_reply_wait_spin_is_gated_to_no_pre_ack_fsync_tiers() {
+        // #1032: the spin-assisted reply wait engages ONLY where an ack waits on no pre-ack fsync
+        // barrier (#1026). On durability `sync` over a real-barrier backend the submission must carry
+        // `spin: false` — the wait parks exactly as before, so the I2 sync path's mechanics are
+        // untouched BY CONSTRUCTION. On the ephemeral memory backend the same submission carries
+        // `spin: true` (the reply is tens of microseconds away, so the bounded busy-poll pays off).
+        let (handle, actor, _control) = rig();
+        let submission = handle.produce_submit(append(b"sync-tier")).unwrap();
+        assert!(
+            matches!(submission, ProduceSubmission::Pending { spin: false, .. }),
+            "durability sync on a real-barrier backend must NOT spin: {submission:?}"
+        );
+        assert!(matches!(
+            submission.wait().unwrap(),
+            ProduceOutcome::Appended(_)
+        ));
+        drop(handle);
+        actor.join().unwrap();
+
+        let (fs, _control) = FaultFs::new(ironbus_storage::fs::EphemeralFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let submission = handle.produce_submit(append(b"memory-tier")).unwrap();
+        assert!(
+            matches!(submission, ProduceSubmission::Pending { spin: true, .. }),
+            "the memory backend's ack waits on no barrier, so the wait spins: {submission:?}"
+        );
+        assert!(matches!(
+            submission.wait().unwrap(),
+            ProduceOutcome::Appended(_)
+        ));
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn spin_assisted_waits_preserve_fifo_ack_order_across_a_pipelined_window() {
+        // #1032 x #917: the spin-assisted wait must yield outcomes in SUBMISSION order with the
+        // position-correlated offsets, through BOTH of its paths — the spin-exhausted fallback park (a
+        // reply slower than the window) AND the busy-poll hit (a reply already sent). The sync gate
+        // stalls the actor's covering commit well past the 100us spin window, so the FIRST wait
+        // provably exhausts its spin and parks (the fallback path); by the time it returns, the whole
+        // batch's replies are sent, so the remaining waits are poll hits. Offsets must be 0,1,2 in
+        // submission order — the #917 position correlation.
+        let (fs, control) = FaultFs::new(ironbus_storage::fs::EphemeralFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        control.close_sync_gate();
+        let first = handle.produce_submit(append(b"first")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        let second = handle.produce_submit(append(b"second")).unwrap();
+        let third = handle.produce_submit(append(b"third")).unwrap();
+        // Open the gate from a helper thread AFTER the first wait has provably out-spun its window:
+        // the gate stays closed for 10ms (100x the spin window), so the first wait's busy-poll
+        // exhausts and it parks in the blocking recv before the reply is released.
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            control.open_sync_gate();
+        });
+        for (submission, expected) in [(first, 0u64), (second, 1), (third, 2)] {
+            assert!(
+                matches!(submission, ProduceSubmission::Pending { spin: true, .. }),
+                "every memory-tier submission spins: {submission:?}"
+            );
+            match submission.wait().unwrap() {
+                ProduceOutcome::Appended(o) => assert_eq!(
+                    o.get(),
+                    expected,
+                    "acks arrive in submission order with position-correlated offsets (#917)"
+                ),
+                other => panic!("expected Appended({expected}), got {other:?}"),
+            }
+        }
+        opener.join().unwrap();
         drop(handle);
         actor.join().unwrap();
     }
