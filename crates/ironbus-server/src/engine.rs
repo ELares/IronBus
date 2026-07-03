@@ -48,13 +48,14 @@ use ironbus_storage::checkpoint::{
 };
 use ironbus_storage::dlq::{DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
-use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
+use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds, SyncTicket};
 use ironbus_storage::loss::LossReport;
 use ironbus_storage::naming::MAX_STREAM_NAME_LEN;
 use ironbus_storage::segment::{OwnedRecord, RawByteRun, StorageError};
 use ironbus_storage::streamset::{CommitOutcome, StreamError, StreamId, StreamSet};
 use ironbus_storage::txn::{TxnStore, TxnStoreError};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// What the engine does with a produce that would exceed the durable-log byte cap
 /// ([`LogConfig::max_total_bytes`]): the overflow policy (#82). The default, [`DiskFullPolicy::DropNew`],
@@ -511,6 +512,20 @@ pub struct EngineConfig {
     /// empty backlog always admits the next record). See [`ironbus_core::backpressure::FsyncHeadroom`]
     /// and `docs/BACKPRESSURE.md`.
     pub wal_fsync_headroom_bytes: u64,
+    /// The PIPELINED sync tier's dirty-byte admission bound (#1040): once the append actor's
+    /// pipelined branch decouples the covering `fdatasync` from the append path, this bounds the
+    /// UNSYNCED record bytes ([`Engine::unsynced_bytes`], the log's own meter — no shadow state)
+    /// that may accumulate behind the one in-flight barrier before a new produce is THROTTLED
+    /// (block for one completion; dispatch-before-block, never shed — today's sync-tier
+    /// semantics), with the one-record floor so an oversized produce never wedges. Distinct from
+    /// [`EngineConfig::wal_fsync_headroom_bytes`] (#378), which keeps its drain-then-admit
+    /// semantics unchanged.
+    ///
+    /// The default is [`DEFAULT_SYNC_MAX_DIRTY_BYTES`] (16 MiB); `0` DISABLES the bound. CONFIG
+    /// PLUMBING ONLY in this change: the value is snapshotted at spawn by the pipelined actor
+    /// branch (the #1040 activation PR) and NOTHING enforces it until then, so any value is inert
+    /// today and a zero-config broker is byte-for-byte unchanged.
+    pub sync_max_dirty_bytes: u64,
     /// The PER-RECORD payload compression codec for NEW writes (#430, refs #387, #12, #75; ADR-0003):
     /// the produce path compresses each record's payload into the self-describing stored object
     /// (the 9-byte descriptor then the codec stream) behind [`RecordFlags::COMPRESSED`], applied at
@@ -553,6 +568,29 @@ pub struct EngineConfig {
     /// is configured; with no DLX an expired message is always reclaimed by retention.
     pub dead_letter_expired: bool,
 }
+
+/// One PIPELINED async commit in flight (#1040): the engine-level pairing of the storage
+/// [`SyncTicket`] staged by [`Engine::begin_async_commit`] with the #570 produce->ack window
+/// stamp taken at dispatch. The append actor's pipelined branch carries it OPAQUELY across the
+/// flusher's `fdatasync` and hands it back to [`Engine::complete_async_commit`] once the barrier
+/// has RETURNED successfully — never before (I2: an ack must imply durable). On a FAILED barrier
+/// it is dropped and [`Engine::fail_async_commit`] freezes the writer instead.
+#[derive(Clone, Copy, Debug)]
+pub struct AsyncCommit {
+    /// The staged storage-barrier snapshot ([`ironbus_storage::log::SyncTicket`]), applied
+    /// all-or-nothing by the log on completion (a stale ticket is a FULL no-op).
+    pub(crate) ticket: SyncTicket,
+    /// The clock-seam instant [`Engine::begin_async_commit`] stamped, so the produce->ack
+    /// histogram's window includes the barrier's queueing, the flight, AND the completion
+    /// delivery — the honest producer-visible ack latency on this tier (#570 semantics).
+    produce_ack_start: u64,
+}
+
+/// What [`Engine::begin_async_commit`] stages for a DIRTIED log (#1040): the SHARED
+/// active-segment fd the flusher's `fdatasync` runs on, paired with the opaque [`AsyncCommit`]
+/// to hand back on completion. `None` = the log is CLEAN (no barrier owed) — distinct by
+/// construction from a FROZEN writer, which is an `Err`, never a clean `None`.
+pub type StagedAsyncCommit<F> = Option<(Arc<F>, AsyncCommit)>;
 
 /// An error from the engine.
 #[derive(Debug)]
@@ -1916,6 +1954,16 @@ pub const DEFAULT_CONSUMER_CREDIT: u32 = ironbus_core::backpressure::DEFAULT_CRE
 /// guard). See [`EngineConfig::consumer_credit_bytes`].
 pub const DEFAULT_CONSUMER_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The default pipelined-sync-tier dirty-byte admission bound (#1040): the most UNSYNCED record
+/// bytes the append actor's pipelined branch lets accumulate behind an in-flight `fdatasync`
+/// before it throttles new produces (block for one completion, never shed). 16 MiB: deep enough
+/// that a healthy disk's one-flight window (a few ms of appends) never touches it, small enough
+/// to bound both the actor-side parked-ack memory and a producer's worst-case unacked exposure on
+/// a wedged disk. `0` disables the bound. CONFIG PLUMBING ONLY today: the value is carried and
+/// exposed ([`Engine::sync_max_dirty_bytes`]) but NOTHING enforces it until the pipelined actor
+/// loop lands (the #1040 activation PR). See [`EngineConfig::sync_max_dirty_bytes`].
+pub const DEFAULT_SYNC_MAX_DIRTY_BYTES: u64 = 16 * 1024 * 1024;
+
 /// The default cap on the number of live work-groups per engine, INCLUDING the durable default
 /// (refs #240, #9, #10): bounds total consumer-state memory once the wire can name groups, so an
 /// unauthenticated client cannot exhaust memory by naming endless groups. A non-zero, defensible
@@ -2778,6 +2826,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// `commit_batch` forces an `fdatasync`. `0` disables the byte trigger. Only consulted under
     /// [`DurabilityLevel::Interval`]. See [`EngineConfig::flush_max_bytes`].
     flush_max_bytes: u64,
+    /// The pipelined sync tier's dirty-byte admission bound (#1040), carried from
+    /// [`EngineConfig::sync_max_dirty_bytes`] so the append actor's pipelined branch can snapshot
+    /// it at spawn ([`Engine::sync_max_dirty_bytes`]). `0` disables. PLUMBING ONLY today: nothing
+    /// in the engine enforces it (the throttle lives in the #1040 activation PR's actor loop).
+    sync_max_dirty_bytes: u64,
     /// The monotonic-clock instant (nanoseconds, via the clock seam, never a raw `Instant::now`) of
     /// the LAST completed `fdatasync` under a relaxed level, the time-window anchor for `interval`
     /// (#341). Seeded to the engine's open instant (a fresh broker's first record is at most one
@@ -3166,6 +3219,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             durability_level: config.durability_level,
             flush_interval_nanos: config.flush_interval_ms.saturating_mul(1_000_000),
             flush_max_bytes: config.flush_max_bytes,
+            // The pipelined tier's dirty-byte bound (#1040): carried for the actor's spawn-time
+            // snapshot; nothing enforces it until the pipelined actor loop lands.
+            sync_max_dirty_bytes: config.sync_max_dirty_bytes,
             last_sync_monotonic_nanos: opened_at,
             last_fsync_nanos: 0,
             // The runtime backpressure controllers (#68, #69), prebuilt above. Held outside the
@@ -6115,6 +6171,141 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
     }
 
+    /// BEGINS a pipelined async commit (#1040): stages the log's covering barrier
+    /// ([`Log::prepare_async_sync`] — pending bytes into the file, NEITHER head advanced) and
+    /// returns the shared fd handle for the flusher's off-actor `fdatasync` plus the opaque
+    /// [`AsyncCommit`] to hand back to [`Engine::complete_async_commit`] once that barrier has
+    /// RETURNED successfully. `Ok(None)` means the log is CLEAN (no barrier owed) — distinct by
+    /// construction from a FROZEN writer, which is an `Err` (fatal for the caller's reply
+    /// fan-out), never a clean `None`.
+    ///
+    /// The #570 produce->ack window stamp is taken here, BEFORE the barrier is dispatched,
+    /// exactly where [`Engine::commit_batch`] stamps before its inline barrier — so on this tier
+    /// the recorded window honestly includes the flight and the completion delivery.
+    ///
+    /// # Errors
+    /// Returns the fatal [`StorageError::WriterFrozen`] if the writer is frozen (or froze while
+    /// staging), or the raw transient error from a deferred-roll retry (#867), exactly as the
+    /// inline `commit_batch` barrier surfaces them.
+    pub fn begin_async_commit(&mut self) -> Result<StagedAsyncCommit<F::File>, EngineError> {
+        let produce_ack_start = self.log.now_monotonic();
+        let staged = self.log.prepare_async_sync()?;
+        Ok(staged.map(|(file, ticket)| {
+            (
+                file,
+                AsyncCommit {
+                    ticket,
+                    produce_ack_start,
+                },
+            )
+        }))
+    }
+
+    /// Step 1 of completing a pipelined async commit (#1040), run on the actor the moment the
+    /// flusher reports the barrier RETURNED `Ok`: applies the staged ticket to the log (both
+    /// heads to the snapshotted target, byte meter, seek index, read-plane frontier — with the
+    /// log's all-or-nothing staleness guard, so a stale completion touches NOTHING) and records
+    /// the barrier into the fsync / append-latency / produce->ack histograms, exactly the
+    /// bookkeeping [`Engine::commit_batch`] does inline for a real barrier. `fsync_nanos` is the
+    /// flusher's measured wall-clock barrier duration (the sim never runs the flusher thread).
+    /// Also re-anchors the `interval` window ([`Engine::commit_durability_barrier`]'s
+    /// `last_sync_monotonic_nanos`) to this completed barrier, keeping the anchor coherent with
+    /// "the last completed fdatasync".
+    ///
+    /// Cheap and infallible; the caller dispatches the NEXT barrier and releases the covered
+    /// acks before running the heavier [`Engine::commit_tail_after_async_completion`].
+    pub fn complete_async_commit(&mut self, commit: &AsyncCommit, fsync_nanos: u64) {
+        self.log.complete_async_sync(&commit.ticket);
+        // A real fsync covered this window: record it exactly as `commit_batch` records an
+        // inline barrier (one sample per barrier into each histogram, allocation-free).
+        self.last_fsync_nanos = fsync_nanos;
+        self.fsync.observe(fsync_nanos);
+        self.registry.observe_fsync_nanos(fsync_nanos);
+        self.registry.observe_append_nanos(fsync_nanos);
+        // The produce->ack window (#570): from the dispatch stamp to NOW, so it includes the
+        // flight and the completion delivery — the honest producer-visible ack latency.
+        let now = self.log.now_monotonic();
+        self.registry
+            .observe_produce_ack_nanos(now.saturating_sub(commit.produce_ack_start));
+        // Interval-anchor coherence: the next window measures from the last COMPLETED barrier.
+        self.last_sync_monotonic_nanos = now;
+    }
+
+    /// Step 2 of completing a pipelined async commit (#1040), run AFTER the caller dispatched
+    /// the next barrier and released the covered acks (bookkeeping must never idle the disk or
+    /// the producers): the once-per-commit tail of [`Engine::commit_batch`], split out verbatim —
+    /// the consumer-safe retention reap, the idle-group sweep, and the L2 confirm-timeout sweep.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the retention reap or the idle-group sweep, exactly as
+    /// `commit_batch` does; the caller treats it as fatal (freeze + fan out), noting the acks
+    /// already released were covered by a RETURNED barrier, so I2 still holds.
+    pub fn commit_tail_after_async_completion(&mut self) -> Result<(), EngineError> {
+        // Consumer-safe retention (refs #13, #80): reclaim disk once per completed barrier (the
+        // pipelined tier's once-per-group-commit cadence), never a segment a consumer needs.
+        self.reap_for_retention()?;
+        // Idle named-group eviction sweep (#277) on the same deterministic produce-seam tick.
+        let now = self.log.now_monotonic();
+        self.sweep_idle_groups(now)?;
+        // The Level-2 confirm-timeout sweep (#497), riding the same tick.
+        self.sweep_l2_confirm_timeouts();
+        Ok(())
+    }
+
+    /// The pipelined async commit's barrier FAILED on the flusher (#1040): freeze the writer
+    /// into the exact terminal state a failed inline [`Log::sync`] leaves (fatal, never retried,
+    /// un-resurrectable), and return the fatal error for the caller's reply fan-out. After this,
+    /// every later append/sync/stage surfaces [`StorageError::WriterFrozen`], no new barrier can
+    /// ever be staged ([`Engine::begin_async_commit`] errors), and no ack is ever released past
+    /// the failed barrier. Idempotent.
+    #[must_use]
+    pub fn fail_async_commit(&mut self) -> EngineError {
+        self.log.freeze_after_external_sync_failure();
+        EngineError::Storage(StorageError::WriterFrozen)
+    }
+
+    /// Whether the log has appended records not yet covered by a RETURNED `fdatasync` (#1040):
+    /// the pipelined dispatch gate — a dirtied log owes a barrier. A FROZEN writer reports
+    /// `false` (it can never be made durable), so a dispatch seam must distinguish frozen from
+    /// clean via [`Engine::begin_async_commit`]'s `Err`, never via this predicate alone.
+    #[must_use]
+    pub fn has_unsynced_records(&self) -> bool {
+        self.log.has_unsynced_records()
+    }
+
+    /// Whether the log's writer is still LIVE (not permanently frozen by a failed durability
+    /// barrier) (#1040): the freeze-reconcile predicate the pipelined actor branch consults at
+    /// its reconcile points. A transiently-deferred roll (#867) reports `true` (resumable).
+    #[must_use]
+    pub fn log_is_writable(&self) -> bool {
+        self.log.is_writable()
+    }
+
+    /// The DURABLE head: the first offset NOT yet covered by a RETURNED `fdatasync`
+    /// ([`Log::synced_offset`]) (#1040). The pipelined ack rule releases a parked produce reply
+    /// only once its covering target is at or below this head (ack-implies-durable, I2).
+    #[must_use]
+    pub fn durable_offset(&self) -> Offset {
+        self.log.synced_offset()
+    }
+
+    /// The APPENDED head: the offset the NEXT appended record will receive
+    /// ([`Log::next_offset`]) (#1040). The pipelined branch stamps each parked produce reply
+    /// with this head AFTER its append — the reply's covering target.
+    #[must_use]
+    pub fn append_head(&self) -> Offset {
+        self.log.next_offset()
+    }
+
+    /// The configured pipelined-tier dirty-byte admission bound (#1040):
+    /// [`EngineConfig::sync_max_dirty_bytes`], for the append actor's spawn-time snapshot. `0`
+    /// means DISABLED. Fixed for the engine's life (not live-reloadable). PLUMBING ONLY today:
+    /// nothing enforces it until the pipelined actor loop lands.
+    #[must_use]
+    pub fn sync_max_dirty_bytes(&self) -> u64 {
+        self.sync_max_dirty_bytes
+    }
+
     /// Whether the `interval` level's flush window is DUE this commit (#341): true when the time
     /// window has elapsed since the last completed `fdatasync` OR the accumulated unsynced record
     /// bytes have reached the byte budget. A trigger of `0` is DISABLED (that dimension never fires),
@@ -8700,6 +8891,7 @@ mod tests {
             fire_and_forget_refill_ms: 0,
             egress_limit: 0,
             wal_fsync_headroom_bytes: 0,
+            sync_max_dirty_bytes: 0,
             // Compression OFF in the shared test config (#430), so every existing test's disk
             // image stays byte-identical to the pre-compression broker; the compression tests
             // build a config with `Codec::Lz4` explicitly.
@@ -8740,6 +8932,137 @@ mod tests {
             Poll::Message(d) => d,
             other => panic!("expected a message, got {other:?}"),
         }
+    }
+
+    // --- The pipelined async-commit API (#1040): begin/complete/tail/fail + passthroughs ---
+
+    #[test]
+    fn an_async_commit_cycle_stages_completes_and_advances_the_durable_head() {
+        use ironbus_storage::io::RandomAccessFile as _;
+        let mut e = open(config(10, 5));
+        e.append_no_sync(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"record",
+        })
+        .unwrap();
+        // Appended but not committed: the passthroughs report one barrier owed.
+        assert!(e.has_unsynced_records());
+        assert!(e.log_is_writable());
+        assert_eq!(e.durable_offset(), Offset::ZERO);
+        assert_eq!(e.append_head(), Offset::new(1));
+
+        let fsyncs_before = e.fsync_histogram().count();
+        let (file, commit) = e.begin_async_commit().unwrap().expect("one barrier owed");
+        // Staging touches NEITHER head and records no histogram sample: nothing is durable (or
+        // visible) until the external barrier RETURNS.
+        assert_eq!(e.durable_offset(), Offset::ZERO);
+        assert_eq!(e.flushed_offset(), Offset::ZERO);
+        assert_eq!(e.fsync_histogram().count(), fsyncs_before);
+
+        // The flusher's half: the covering fdatasync on the shared handle, then the completion.
+        file.sync_data().unwrap();
+        e.complete_async_commit(&commit, 1_234);
+        assert_eq!(e.durable_offset(), Offset::new(1));
+        assert_eq!(e.flushed_offset(), Offset::new(1));
+        assert!(!e.has_unsynced_records());
+        assert_eq!(e.unsynced_bytes(), 0);
+        // Exactly ONE real barrier was recorded, with the flusher's measured duration.
+        assert_eq!(e.fsync_histogram().count(), fsyncs_before + 1);
+        // The split-out commit tail (reap + sweeps) runs cleanly after the completion.
+        e.commit_tail_after_async_completion().unwrap();
+        // Clean now: no further barrier owed.
+        assert!(e.begin_async_commit().unwrap().is_none());
+    }
+
+    #[test]
+    fn begin_async_commit_on_a_clean_engine_is_none() {
+        let mut e = open(config(10, 5));
+        // A fresh engine owes no barrier...
+        assert!(e.begin_async_commit().unwrap().is_none());
+        // ...and one whose produce committed inline (the synchronous path) owes none either.
+        produce(&mut e, b"a");
+        assert!(!e.has_unsynced_records());
+        assert!(e.begin_async_commit().unwrap().is_none());
+    }
+
+    #[test]
+    fn fail_async_commit_freezes_the_writer_and_begin_becomes_an_error() {
+        let mut e = open(config(10, 5));
+        e.append_no_sync(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"doomed",
+        })
+        .unwrap();
+        // The barrier failed on the flusher: the engine freezes the writer and hands back the
+        // fatal error for the reply fan-out.
+        let err = e.fail_async_commit();
+        assert!(
+            err.is_fatal(),
+            "a failed external barrier is the fatal class"
+        );
+        assert!(!e.log_is_writable());
+        // Frozen is an ERROR at the dispatch seam, never a clean None (the L1 conflation): the
+        // pipeline can never re-arm against the frozen writer.
+        assert!(e.begin_async_commit().is_err());
+        // A frozen writer reports no unsynced records — which is exactly why the dispatch seam
+        // must use `begin_async_commit`'s Err, never this predicate alone.
+        assert!(!e.has_unsynced_records());
+        // Idempotent.
+        let again = e.fail_async_commit();
+        assert!(again.is_fatal());
+    }
+
+    #[test]
+    fn a_stale_async_completion_after_an_inline_commit_is_a_full_no_op() {
+        let mut e = open(config(10, 5));
+        e.append_no_sync(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"first",
+        })
+        .unwrap();
+        let (_file, stale) = e.begin_async_commit().unwrap().expect("one barrier owed");
+        // An INLINE barrier (a Run job's commit_batch, a quiesce) overtakes the flight and
+        // covers everything, including a record appended after the stage.
+        e.append_no_sync(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"second",
+        })
+        .unwrap();
+        e.commit_batch().unwrap();
+        assert_eq!(e.durable_offset(), Offset::new(2));
+        // The late completion must not rewind the durable head or disturb the byte meter (the
+        // log-level all-or-nothing guard, INV-6, observed through the engine seam).
+        e.complete_async_commit(&stale, 42);
+        assert_eq!(e.durable_offset(), Offset::new(2), "no rewind");
+        assert_eq!(e.flushed_offset(), Offset::new(2));
+        assert_eq!(e.unsynced_bytes(), 0);
+    }
+
+    #[test]
+    fn sync_max_dirty_bytes_is_plumbed_from_config_and_defaults_to_16_mib() {
+        // Config plumbing only (#1040): the value is carried to the spawn-time snapshot seam and
+        // nothing else — the enforcement lands with the pipelined actor loop.
+        assert_eq!(DEFAULT_SYNC_MAX_DIRTY_BYTES, 16 * 1024 * 1024);
+        let e = open(EngineConfig {
+            sync_max_dirty_bytes: 123,
+            ..config(10, 5)
+        });
+        assert_eq!(e.sync_max_dirty_bytes(), 123);
+        // The shared test config keeps it disabled (0), the inert value.
+        let off = open(config(10, 5));
+        assert_eq!(off.sync_max_dirty_bytes(), 0);
     }
 
     #[test]

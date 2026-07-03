@@ -9284,6 +9284,11 @@ fn open_engine_with<F: Filesystem + Clone>(
             // drain under `sync` / the interval window under a relaxed level), so a zero-config
             // broker is unchanged; a non-zero value is the opt-in tight RAM / loss-window bound.
             wal_fsync_headroom_bytes: config.wal_fsync_headroom_bytes,
+            // The pipelined sync tier's dirty-byte bound (#1040) at its shipped default (16 MiB).
+            // PLUMBING ONLY today — nothing enforces it until the pipelined actor loop lands, so
+            // a zero-config broker is byte-for-byte unchanged; the `--sync-max-dirty-bytes` flag
+            // arrives with that activation PR.
+            sync_max_dirty_bytes: ironbus_server::engine::DEFAULT_SYNC_MAX_DIRTY_BYTES,
             // The per-record write-path compression codec (#430, ADR-0003), wired from
             // `--compression` (default `lz4`). `none` stores every record raw, byte-for-byte the
             // historical layout; `zstd` was already rejected at parse on this build, so the two
@@ -14818,6 +14823,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
@@ -15765,6 +15771,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
@@ -15850,6 +15857,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
@@ -19556,6 +19564,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
@@ -19640,6 +19649,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,

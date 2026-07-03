@@ -4017,6 +4017,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 // The write-path codec under test (#430): `None` for every historical test
                 // (byte-identical broker), `Lz4` for the transparency end-to-end test.
                 compression,
@@ -4077,6 +4078,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 compression: ironbus_core::compress::Codec::None,
                 default_message_ttl_ms: 0,
                 dead_letter_exchange: None,
@@ -7663,6 +7665,7 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
                 compression: ironbus_core::compress::Codec::None,
                 default_message_ttl_ms: 0,
                 dead_letter_exchange: None,
@@ -7983,6 +7986,7 @@ mod tests {
             fire_and_forget_refill_ms: 0,
             egress_limit: 0,
             wal_fsync_headroom_bytes: 0,
+            sync_max_dirty_bytes: 0,
             compression: ironbus_core::compress::Codec::None,
             default_message_ttl_ms: 0,
             dead_letter_exchange: None,
