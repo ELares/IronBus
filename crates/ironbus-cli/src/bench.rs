@@ -293,6 +293,17 @@ pub struct BenchConfig {
     /// mode only, and mutually exclusive with `--stream` and `--fire-and-forget` (each is its own
     /// distinct publish path).
     pub auto_pipeline: bool,
+    /// MULTI-PRODUCER publish (#1040): how many INDEPENDENT client CONNECTIONS `--mode publish`
+    /// drives concurrently (`--producers`, default 1). Each producer is its own TCP connection
+    /// running its own produce loop with the configured `--pubwindow`/`--stream` shape — the
+    /// multi-connection load the pipelined sync tier needs to fill its overlap window, which the
+    /// #1040 design spec proved a SINGLE connection cannot (the session drains its parked window
+    /// at pass end). A `--count` bound splits evenly across producers (remainder to the first);
+    /// the aggregate throughput is total messages over the WHOLE-PHASE wall time (start-of-first
+    /// leg to end-of-last leg). 1 is the historical single-connection path with its measurement
+    /// window unchanged. Publish-only: a value above 1 is refused in subscribe/round-trip mode
+    /// (each has its own fixed connection shape the flag says nothing about).
+    pub producers: usize,
     /// The storage BACKEND of bench's own ISOLATED synthetic broker (#445, refs #443): `disk` (the
     /// default, the historical bench broker over an auto-deleted synthetic data dir) or `memory`
     /// (the same engine over the in-memory filesystem, for honest RAM-path numbers next to the
@@ -425,6 +436,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut fire_and_forget = false;
     let mut auto_pipeline = false;
     let mut pub_window: usize = 1;
+    let mut producers: usize = 1;
     let mut storage: Option<StorageArg> = None;
     let mut per_message_ack = false;
     let mut consume_tier = ConsumeTier::Work;
@@ -542,6 +554,24 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
                     ));
                 }
                 pub_window = parsed;
+            }
+            // MULTI-PRODUCER publish (#1040): N independent client connections. 0 is meaningless
+            // (nobody would ever publish), so it is a usage error naming the bound, exactly like
+            // `--pubwindow 0`.
+            "--producers" => {
+                let raw = take(args, &mut i, "--producers")?;
+                let parsed: usize = raw.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "`--producers` must be a positive integer, got `{raw}`"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(CliError::Usage(
+                        "`--producers` must be at least 1 (1 = the single-connection default)"
+                            .into(),
+                    ));
+                }
+                producers = parsed;
             }
             // The isolated broker's storage backend (#445): `disk` (default) or `memory`. Reuses
             // the serve-side parser so bench and serve can never drift on the accepted names.
@@ -762,6 +792,22 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         ));
     }
 
+    // MULTI-PRODUCER guard (#1040). N producer CONNECTIONS shape only the publish load: subscribe
+    // drives a consumer drain (no bench producer runs during the measured phase) and round-trip is
+    // the fixed one-producer/one-consumer pair, so `--producers > 1` there would silently mean
+    // nothing — refuse it (a no-op flag is a footgun), exactly as `--per-message-ack` is refused
+    // outside subscribe. The explicit single-connection default (`--producers 1`) is accepted in
+    // any mode, the `--consume-tier work` precedent.
+    if producers > 1 && mode != Mode::Publish {
+        return Err(CliError::Usage(
+            "`--producers` runs N concurrent publisher connections and requires `--mode publish`: \
+             subscribe drives a consumer drain and round-trip is the fixed one-producer/\
+             one-consumer pair, so the flag would mean nothing there. Pass `--mode publish`, or \
+             drop `--producers`."
+                .into(),
+        ));
+    }
+
     Ok(BenchConfig {
         mode,
         bound,
@@ -776,6 +822,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         fire_and_forget,
         auto_pipeline,
         pub_window,
+        producers,
         storage,
         consume_ack,
         consume_tier,
@@ -868,6 +915,16 @@ pub fn write_human<W: Write + ?Sized>(
         }
     )?;
     writeln!(out, "group:          {}", cfg.group)?;
+    // The multi-producer fleet (#1040): named only above the single-connection default, so the
+    // historical `--producers 1` view is byte-identical.
+    if cfg.mode == Mode::Publish && cfg.producers > 1 {
+        writeln!(
+            out,
+            "producers:      {} concurrent connections (a count bound splits evenly, remainder \
+             to the first)",
+            cfg.producers
+        )?;
+    }
     if cfg.mode == Mode::Subscribe {
         writeln!(
             out,
@@ -966,6 +1023,19 @@ fn write_fsync_cost_line<W: Write + ?Sized>(
             "fsync cost:     not measured (--no-fsync dry run; the honest fsync number needs the \
              per-ack durable path)"
         )?;
+    } else if cfg.producers > 1 {
+        // MULTI-PRODUCER (#1040): the broker's group commit gathers windows from MANY concurrent
+        // connections under one covering fdatasync, so a per-op durable share would double-count
+        // the shared fsync — dishonest for the same reason the overlapped single-connection paths
+        // withhold it. The merged ack RTT percentiles above stay honest (each sample is one
+        // self-contained awaited produce call).
+        writeln!(
+            out,
+            "fsync cost:     not attributed (--producers {}: concurrent connections share \
+             covering group-commit fsyncs; use --producers 1 --pubwindow 1 for the honest \
+             per-ack cost)",
+            cfg.producers
+        )?;
     } else {
         // Overlapped disk paths without --no-fsync (windowed/stream/autopipe/faf): the durable
         // cost EXISTS but no single produce owns a covering fsync, so per-op attribution would be
@@ -999,7 +1069,10 @@ fn write_latency_line<W: Write + ?Sized>(
 /// a recorded run self-describes which backend it measured and a RAM-path number is never
 /// mistaken for a disk number. The produce-to-ack RTT percentile fields (#1024,
 /// `ack_p50_us`/`ack_p99_us`/`ack_p999_us`/`ack_max_us`) are likewise ADDITIVE, null unless every
-/// produce was individually awaited. Written to `out`.
+/// produce was individually awaited. The `producers` field (#1040) is ADDITIVE too (always
+/// present, `1` for the historical single-connection run), so a multi-connection row
+/// self-describes its concurrency; its ack percentiles are the honest MERGE of every producer's
+/// individually-awaited RTT samples. Written to `out`.
 ///
 /// # Errors
 /// Returns [`CliError`] if writing to `out` fails.
@@ -1023,7 +1096,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"consume_tier\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"producers\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"consume_tier\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -1040,6 +1113,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.fetch_batch,
         cfg.no_fsync,
         cfg.pub_window,
+        cfg.producers,
         cfg.stream,
         cfg.fire_and_forget,
         cfg.auto_pipeline,
@@ -1935,6 +2009,135 @@ mod tests {
             json.contains("\"schema_version\":1"),
             "additive, version unchanged: {json}"
         );
+    }
+
+    #[test]
+    fn producers_default_to_one_are_publish_only_above_one_and_land_in_the_json() {
+        // The #1040 multi-producer flag: default 1 (the historical single connection); `--producers
+        // N` parses in publish mode, composes with every publish shape and backend, is refused
+        // above 1 outside publish (a no-op flag is a footgun, the `--per-message-ack` precedent),
+        // and lands ADDITIVELY in the JSON (schema version unchanged, the #19/#114 precedent).
+        let cfg = parse(&["--count", "5", "--mode", "publish"]).unwrap();
+        assert_eq!(cfg.producers, 1, "the single-connection default");
+        let four = parse(&[
+            "--count",
+            "2000",
+            "--mode",
+            "publish",
+            "--producers",
+            "4",
+            "--no-fsync",
+        ])
+        .unwrap();
+        assert_eq!(four.producers, 4);
+        assert!(
+            four.no_fsync,
+            "the flag after --producers must still parse (no double-advance)"
+        );
+        // 0 and garbage are usage errors naming the bound.
+        match parse(&["--count", "5", "--mode", "publish", "--producers", "0"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("at least 1"), "{m}"),
+            other => panic!("--producers 0 must be a usage error, got {other:?}"),
+        }
+        assert!(parse(&["--count", "5", "--mode", "publish", "--producers", "many"]).is_err());
+        // Publish-only above 1: round-trip (the default mode) and subscribe are refused.
+        match parse(&["--count", "5", "--producers", "4"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("--mode publish"), "{m}"),
+            other => panic!("--producers > 1 + round-trip must be a usage error, got {other:?}"),
+        }
+        match parse(&["--count", "5", "--mode", "subscribe", "--producers", "2"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("publish"), "{m}"),
+            other => panic!("--producers > 1 + subscribe must be a usage error, got {other:?}"),
+        }
+        // The explicit single-connection default is accepted in any mode (the `--consume-tier
+        // work` precedent: naming the default is never an error).
+        let rt = parse(&["--count", "5", "--producers", "1"]).unwrap();
+        assert_eq!(rt.producers, 1);
+        // Composes with the publish shapes and backends the fleet runs per-connection.
+        let shaped = parse(&[
+            "--count",
+            "2000",
+            "--mode",
+            "publish",
+            "--producers",
+            "8",
+            "--stream",
+            "--pubwindow",
+            "64",
+            "--storage",
+            "memory",
+        ])
+        .unwrap();
+        assert_eq!(shaped.producers, 8);
+        assert!(shaped.stream && shaped.pub_window == 64);
+        let faf = parse(&[
+            "--count",
+            "100",
+            "--mode",
+            "publish",
+            "--producers",
+            "2",
+            "--faf",
+        ])
+        .unwrap();
+        assert_eq!(faf.producers, 2);
+        let autopipe = parse(&[
+            "--count",
+            "100",
+            "--mode",
+            "publish",
+            "--producers",
+            "2",
+            "--autopipe",
+        ])
+        .unwrap();
+        assert_eq!(autopipe.producers, 2);
+        // ADDITIVE JSON: the field is ALWAYS present (1 on the historical run), schema version
+        // unchanged, so a `--producers 1` object is the old object plus one additive field.
+        let json = bench_json(&four, &BenchReport::default());
+        assert!(json.contains("\"producers\":4"), "{json}");
+        assert!(
+            json.contains("\"schema_version\":1"),
+            "additive, version unchanged: {json}"
+        );
+        let json = bench_json(&cfg, &BenchReport::default());
+        assert!(json.contains("\"producers\":1"), "{json}");
+    }
+
+    #[test]
+    fn multi_producer_human_view_names_the_fleet_and_the_unattributed_fsync_cost() {
+        // #1040: the human view names the fleet size and states WHY the per-op fsync cost is not
+        // attributed above one producer (concurrent connections share covering group-commit
+        // fsyncs); the `--producers 1` view stays byte-identical (no fleet line at the default).
+        let cfg = parse(&["--count", "2000", "--mode", "publish", "--producers", "4"]).unwrap();
+        let report = BenchReport {
+            produced: 2000,
+            elapsed_secs: 1.0,
+            msgs_per_sec: 2000.0,
+            bytes_per_op: 256.0,
+            fsync_measured: false,
+            ..BenchReport::default()
+        };
+        let mut human = Vec::new();
+        write_human(&cfg, &report, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains("producers:      4"), "human: {human}");
+        assert!(
+            human.contains("share covering group-commit fsyncs"),
+            "the fsync line states the multi-connection reason: {human}"
+        );
+        // The single-producer default prints NO fleet line and keeps the historical fsync wording.
+        let one = parse(&["--count", "2000", "--mode", "publish"]).unwrap();
+        let report = BenchReport {
+            fsync_measured: true,
+            fsync_cost_us: Some(900.0),
+            ..BenchReport::default()
+        };
+        let mut human = Vec::new();
+        write_human(&one, &report, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(!human.contains("producers:"), "human: {human}");
+        assert!(human.contains("fsync cost:     900.0 us"), "human: {human}");
     }
 
     #[test]

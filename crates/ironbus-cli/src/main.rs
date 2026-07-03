@@ -916,7 +916,7 @@ USAGE:
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
                   [--fetch-batch <n>] [--group <name>] [--no-fsync] [--pubwindow <n>] [--stream] [--json]
-                  [--storage <disk|memory>] [--per-message-ack]
+                  [--producers <n>] [--storage <disk|memory>] [--per-message-ack]
                   [--addr <host:port> --i-understand-this-is-live]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
     ironbus rollback --dest <path>
@@ -1174,6 +1174,14 @@ Notes:
     flight per produce call, so the broker's group commit covers the window with ONE fdatasync
     instead of n (#450). Every ack keeps its fsynced-durable meaning; only WHEN the publisher
     awaits changes. 1 is the historical one-awaited-ack-per-publish path.
+    --producers <n> (default 1, publish mode only) runs n INDEPENDENT publisher connections
+    concurrently against the one spawned (or live) broker, each its own produce loop with the
+    configured --pubwindow/--stream shape (#1040). A --count splits evenly across them
+    (remainder to the first) and the reported rate is total messages over the whole-phase wall
+    time (start-of-first to end-of-last). Ack percentiles are MERGED across producers (each
+    sample is one self-contained awaited produce RTT); the per-op fsync cost is not attributed
+    above 1 (concurrent connections share covering group-commit fsyncs). The JSON gains an
+    additive producers field.
     <secs> or --count <n> is REQUIRED (no unbounded default), and --no-fsync is a dry run that
     runs the spawned isolated broker at INTERVAL durability (bounded-loss page-cache acks, the
     honest relaxed tier a real serve --durability-level interval runs, #1027) and batches its
