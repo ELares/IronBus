@@ -25,6 +25,7 @@ use ironbus_core::format::{
 };
 use ironbus_core::segment::SegmentHeader;
 use ironbus_core::types::{Offset, RecordFlags, Seq};
+use std::sync::Arc;
 
 /// The id of the first segment in a fresh log.
 const FIRST_SEGMENT_ID: u64 = 0;
@@ -870,6 +871,40 @@ struct PendingRoll {
     /// Its base offset (continues the sealed predecessor's run).
     base_offset: Offset,
 }
+
+/// A STAGED, not-yet-covered durability barrier for the pipelined sync tier (#1040): the snapshot
+/// [`Log::prepare_async_sync`] takes at the dirty-at-sync-start boundary, applied by
+/// [`Log::complete_async_sync`] once the EXTERNAL `fdatasync` on the shared file handle has
+/// RETURNED successfully. Everything appended AFTER the stage is deliberately outside this
+/// ticket: it stays in the unsynced window and is covered by the NEXT barrier, which is what lets
+/// the caller overlap one in-flight fdatasync with further appends on the same fd without ever
+/// advertising an uncovered byte as durable. Opaque outside this module: the engine and the
+/// append actor carry it between `prepare` and `complete` without reading it.
+#[derive(Clone, Copy, Debug)]
+pub struct SyncTicket {
+    /// The offset the durable head advances TO when this barrier completes: `next_offset` at
+    /// stage time. Bytes appended during the flight are never credited to this ticket.
+    target: Offset,
+    /// The active segment id at stage time: guards the resident seek-index raise across a roll
+    /// (a completion must never touch a DIFFERENT segment's index; after a roll the seal already
+    /// raised the sealed index to its full prefix).
+    segment_id: u64,
+    /// The resident active index `valid_end` at stage time, AFTER the stage's flush put every
+    /// staged byte in the file (#537): the exact in-file prefix this barrier covers, so the
+    /// completion raises the index's `flushed_end` to THIS snapshot — never the then-current
+    /// `valid_end`, whose tail may still sit in the writer's pending buffer.
+    staged_valid_end: u64,
+    /// The unsynced record-byte exposure at stage time: exactly the bytes this barrier covers,
+    /// subtracted (saturating) from the live meter on completion so records appended during the
+    /// flight keep their at-risk accounting until their own barrier returns.
+    covered_bytes: u64,
+}
+
+/// What [`Log::prepare_async_sync`] stages for a DIRTIED log (#1040): the SHARED active-segment
+/// fd the external `fdatasync` runs on, paired with the [`SyncTicket`] to apply on completion.
+/// `None` = the log is CLEAN (no barrier owed) — distinct by construction from a FROZEN writer,
+/// which is an `Err`, never a clean `None`.
+pub type StagedSync<F> = Option<(Arc<F>, SyncTicket)>;
 
 /// The bounds of a single [`Log::read_range`] pass, threaded to the per-segment read helpers so
 /// they share one definition of the start, the durable end, and the record/byte caps (#538).
@@ -3062,6 +3097,149 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.publish_flushed_frontier();
     }
 
+    /// STAGES the covering durability barrier for the PIPELINED sync tier (#1040) without issuing
+    /// it: the third sibling of the #564 split-barrier family. It drains the writer's pending
+    /// buffer to the file (page cache) so the appended bytes are all IN the file, then returns a
+    /// SHARED handle to the active segment's fd plus a [`SyncTicket`] snapshotting the
+    /// dirty-at-sync-start boundary. The caller issues `sync_data` on the handle OFF this thread
+    /// (the flusher) and, once that external fdatasync has RETURNED successfully, applies the
+    /// ticket with [`Log::complete_async_sync`] — never before, preserving I2 exactly as
+    /// [`Log::advance_synced_offset_after_external_sync`]'s contract demands.
+    ///
+    /// Deliberately touches NEITHER head: contrast [`Log::flush_no_sync`], which raises the
+    /// VISIBLE head — reusing it here would leak not-yet-durable records to readers (and to the
+    /// cluster leader frontier) before the covering barrier returned, breaking
+    /// visible-equals-durable on this tier. Bytes appended AFTER this call are NOT covered by the
+    /// returned ticket (they stay in the unsynced window for the NEXT barrier), which is what
+    /// makes an in-flight barrier safe to overlap with further appends on the same fd.
+    ///
+    /// The three outcomes are DISTINCT by design (the false-ack conflation this API kills):
+    /// - **frozen** writer => `Err(WriterFrozen)`, NEVER a clean `None` — a frozen writer also
+    ///   reports `has_unsynced_records() == false`, so the frozen check precedes the clean check;
+    /// - **clean** log (nothing unsynced) => `Ok(None)`, no barrier owed;
+    /// - **dirtied** log => `Ok(Some((file, ticket)))`, one barrier owed.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::WriterFrozen`] if the writer is frozen (or if staging the pending
+    /// bytes fails, which freezes it — the same fatal class as in [`Log::flush_no_sync`]), or the
+    /// raw transient error from a deferred-roll retry (#867), exactly as [`Log::sync`] surfaces it.
+    pub fn prepare_async_sync(&mut self) -> Result<StagedSync<F::File>, StorageError> {
+        // Finish a transient-fault-deferred roll first (#867), exactly as `sync` does, so the
+        // barrier is staged against a fully installed active segment.
+        self.ensure_writable()?;
+        // FROZEN IS AN ERROR, NEVER A CLEAN None: `has_unsynced_records` reports `false` for a
+        // frozen writer, so this check MUST come first or a dead writer would be
+        // indistinguishable from a clean log and its parked producers would never be fataled.
+        if self.active.is_none() {
+            return Err(StorageError::WriterFrozen);
+        }
+        // CLEAN: nothing appended since the last covering barrier, no barrier owed. Distinct
+        // from frozen by construction (the writer is live here).
+        if !self.has_unsynced_records() {
+            return Ok(None);
+        }
+        // Stage the writer's pending bytes into the file so the external fdatasync covers every
+        // appended byte (the same flush-before-barrier ordering `sync` uses). A flush failure is
+        // the fatal frozen-writer class, exactly as in `flush_no_sync`; clear the pending roll
+        // too so `ensure_writable` can never resurrect a frozen writer.
+        let Some(w) = self.active.as_mut() else {
+            return Err(StorageError::WriterFrozen);
+        };
+        if w.flush_pending().is_err() {
+            self.active = None;
+            self.pending_roll = None;
+            return Err(StorageError::WriterFrozen);
+        }
+        let file = w.shared_file();
+        let write_pos = w.write_pos();
+        // The staged in-file prefix (#537): the resident active index's `valid_end`, which now —
+        // post-flush — equals the writer's write position. Snapshotted so the completion raises
+        // the index's flushed bound to exactly what THIS barrier covered, never to a later
+        // (possibly still-pending) prefix. Defensive fallback to the writer's position if the
+        // active index were ever absent (it never is on this path).
+        let staged_valid_end = self
+            .segment_indexes
+            .borrow()
+            .get(&self.active_id)
+            .map_or(write_pos, |idx| idx.valid_end);
+        Ok(Some((
+            file,
+            SyncTicket {
+                target: self.next_offset,
+                segment_id: self.active_id,
+                staged_valid_end,
+                covered_bytes: self.unsynced_record_bytes,
+            },
+        )))
+    }
+
+    /// Applies a RETURNED, SUCCESSFUL external barrier staged by [`Log::prepare_async_sync`]:
+    /// generalizes [`Log::advance_synced_offset_after_external_sync`] from "advance to
+    /// `next_offset`" to "advance to the SNAPSHOTTED ticket target", so bytes appended while the
+    /// barrier was in flight are never advertised durable by it (they belong to the next ticket).
+    ///
+    /// ALL-OR-NOTHING staleness guard: a completion that arrives after the writer FROZE, or after
+    /// an intervening covering barrier (a roll's seal, an inline [`Log::sync`]) already advanced
+    /// the durable head at or past this ticket's target, is a FULL no-op — heads, unsynced byte
+    /// meter, seek index, read-plane frontier, ALL untouched. Half-applying a stale ticket is
+    /// exactly the byte-meter-undercount / index-corruption class this guard exists to kill (a
+    /// roll's seal already advanced the heads and ZEROED the meter; subtracting the stale ticket's
+    /// covered bytes on top would undercount the new segment's live exposure).
+    ///
+    /// Staleness is BINARY under the caller's depth-1 dispatch discipline: any intervening barrier
+    /// advanced `synced_offset` to a then-current `next_offset >= ticket.target`, so a PARTIAL
+    /// overlap (guard passed but the ticket straddles a barrier) is unreachable; reaching the body
+    /// means no barrier ran since the stage.
+    pub fn complete_async_sync(&mut self, ticket: &SyncTicket) {
+        if !self.is_writable() || self.synced_offset >= ticket.target {
+            return;
+        }
+        // Monotone by construction (offsets are never rewound): a ticket's target can never
+        // exceed the appended head. An op that REWINDS offsets must quiesce the pipeline first.
+        debug_assert!(
+            ticket.target <= self.next_offset,
+            "a staged ticket's target must never exceed the appended head (#1040)"
+        );
+        // The external fdatasync covered exactly the staged prefix: advance BOTH heads to the
+        // ticket's target. Bytes appended during the flight stay unsynced and unadvertised
+        // (visible == durable on this tier). `max` keeps the visible head monotone even if a
+        // relaxed-level `flush_no_sync` ran it ahead (not a pipelined-tier flow; defensive).
+        self.flushed_offset = self.flushed_offset.max(ticket.target);
+        self.synced_offset = ticket.target;
+        // Retire the covered bytes from the at-risk meter — SUBTRACT the snapshot, never zero
+        // it: the meter kept accumulating for records appended during the flight, and those are
+        // still at risk until their own barrier returns. Saturating, like every meter update.
+        self.unsynced_record_bytes = self
+            .unsynced_record_bytes
+            .saturating_sub(ticket.covered_bytes);
+        // Raise the ACTIVE index's flushed read bound to the SNAPSHOTTED staged prefix (#537) —
+        // never the current `valid_end`, whose tail may still be in the writer's pending buffer
+        // (not yet in the file). Only if the staged segment is still the active one: after a
+        // roll the seal already raised the sealed index to its full prefix.
+        if ticket.segment_id == self.active_id {
+            if let Some(idx) = self.segment_indexes.borrow_mut().get_mut(&self.active_id) {
+                idx.flushed_end = idx.flushed_end.max(ticket.staged_valid_end);
+            }
+        }
+        // Publish the new flushed frontier to the off-actor read plane (#539): the LAST step, so
+        // a reader that observes the frontier also observes every prior store, and the caller
+        // releases producer acks only after readers can already serve the acked records.
+        self.publish_flushed_frontier();
+    }
+
+    /// FREEZES the writer after an EXTERNALLY-issued covering barrier (a flusher's `sync_data` on
+    /// the [`Log::prepare_async_sync`] handle) FAILED: the exact terminal state a failed
+    /// [`Log::sync`] leaves — `active` dropped so every later append/sync surfaces the fatal,
+    /// never-retried [`StorageError::WriterFrozen`], and `pending_roll` cleared so
+    /// [`ensure_writable`](Log::ensure_writable) can never resurrect the writer after the freeze
+    /// (matching the roll-boundary freeze discipline in `create_or_defer_segment`). Reads keep
+    /// serving the durable prefix, and a health check sees the degraded state, exactly as after
+    /// any other fatal barrier. Idempotent.
+    pub fn freeze_after_external_sync_failure(&mut self) {
+        self.active = None;
+        self.pending_roll = None;
+    }
+
     /// Whether this log has appended records not yet covered by a returned `fdatasync` — i.e. it is
     /// DIRTIED and owes the next commit tick a durability barrier (#564). The exact gate the
     /// cross-stream `CommitCoordinator` uses to pick which streams a tick must sync: a stream whose
@@ -3073,8 +3251,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// A frozen writer (`active` is `None`) reports `false`: it can no longer be made durable, so
     /// the coordinator must not pick it for a barrier (it would only re-surface `WriterFrozen`); its
     /// acked-but-now-lost tail is a recovery/loss concern, not a commit-tick concern.
+    ///
+    /// `pub` (widened from `pub(crate)`, #1040): the engine's pipelined-tier dispatch gate reads
+    /// the same predicate to decide whether a barrier is owed. NOTE the frozen-reports-`false`
+    /// caveat above — a dispatch seam must distinguish frozen from clean via
+    /// [`Log::prepare_async_sync`]'s `Err`, never via this predicate alone.
     #[must_use]
-    pub(crate) fn has_unsynced_records(&self) -> bool {
+    pub fn has_unsynced_records(&self) -> bool {
         self.is_writable() && self.synced_offset != self.next_offset
     }
 
@@ -7607,6 +7790,268 @@ mod tests {
         // The only fsync attempt was the roll's, and it faulted, so nothing became durable:
         // the flush mark is unchanged at the start.
         assert_eq!(log.flushed_offset(), Offset::ZERO);
+    }
+
+    // --- The pipelined-sync-tier staging API (#1040): prepare/complete/freeze ---
+
+    #[test]
+    fn prepare_async_sync_on_a_frozen_writer_is_an_error_never_a_clean_none() {
+        use crate::fault::FaultFs;
+        // Freeze the writer through a REAL failed barrier (the exact state a dead disk leaves).
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+        log.append(&rec(b"unsynced")).unwrap();
+        control.set_fail_sync(true);
+        assert!(matches!(log.sync(), Err(StorageError::WriterFrozen)));
+        assert!(!log.is_writable());
+        // The L1 conflation this API kills: a frozen writer also reports
+        // `has_unsynced_records() == false`, so a clean-check-first implementation would return
+        // `Ok(None)` here and the caller would treat a dead writer as a clean log — its parked
+        // producers would never be fataled. Frozen MUST be a DISTINCT error outcome.
+        assert!(!log.has_unsynced_records());
+        assert!(
+            matches!(log.prepare_async_sync(), Err(StorageError::WriterFrozen)),
+            "a frozen writer must be Err, never a clean Ok(None)"
+        );
+        // The external-failure freeze reaches the same terminal state and stays an error too.
+        log.freeze_after_external_sync_failure();
+        assert!(matches!(
+            log.prepare_async_sync(),
+            Err(StorageError::WriterFrozen)
+        ));
+    }
+
+    #[test]
+    fn prepare_async_sync_on_a_clean_log_is_none() {
+        let mut log = open_mem(LogConfig::default());
+        // A fresh, never-appended log owes no barrier.
+        assert!(log.prepare_async_sync().unwrap().is_none());
+        // A fully-synced log owes no barrier either (clean, NOT frozen: the writer is live).
+        log.append(&rec(b"payload")).unwrap();
+        log.sync().unwrap();
+        assert!(log.is_writable());
+        assert!(log.prepare_async_sync().unwrap().is_none());
+        // And a dirtied log owes exactly one: the three outcomes are distinct.
+        log.append(&rec(b"more")).unwrap();
+        assert!(log.prepare_async_sync().unwrap().is_some());
+    }
+
+    #[test]
+    fn stage_then_complete_advances_both_heads_to_the_target_and_publishes_the_frontier() {
+        let mut log = open_mem(LogConfig::default());
+        // Build the off-actor read plane FIRST so the completion's frontier publish is observable.
+        let plane = log.read_plane().unwrap();
+        log.append(&rec(b"aaaa")).unwrap();
+        log.append(&rec(b"bbbb")).unwrap();
+        let meter_before = log.unsynced_bytes();
+        assert_eq!(meter_before, 8, "two 4-byte payloads are at risk");
+
+        let (file, ticket) = log.prepare_async_sync().unwrap().unwrap();
+        // Staging touches NEITHER head (contrast `flush_no_sync`): nothing is visible or durable
+        // until the external barrier RETURNS, and the byte meter still carries the exposure.
+        assert_eq!(log.flushed_offset(), Offset::ZERO);
+        assert_eq!(log.synced_offset(), Offset::ZERO);
+        assert_eq!(log.unsynced_bytes(), meter_before);
+        assert!(log.has_unsynced_records());
+        assert_eq!(plane.flushed(), 0, "no frontier before the barrier returns");
+        assert!(log.read_from(Offset::ZERO, 10).unwrap().is_empty());
+
+        // The external covering barrier (what the flusher thread does), then the completion.
+        file.sync_data().unwrap();
+        log.complete_async_sync(&ticket);
+
+        // Both heads advance EXACTLY to the snapshotted target, the meter retires the covered
+        // bytes, the frontier is published, and the records are readable.
+        assert_eq!(log.flushed_offset(), Offset::new(2));
+        assert_eq!(log.synced_offset(), Offset::new(2));
+        assert_eq!(log.unsynced_bytes(), 0);
+        assert!(!log.has_unsynced_records());
+        assert_eq!(
+            plane.flushed(),
+            2,
+            "completion publishes the flushed frontier"
+        );
+        assert_eq!(log.read_from(Offset::ZERO, 10).unwrap().len(), 2);
+        // Nothing further owed: the next prepare is a clean None.
+        assert!(log.prepare_async_sync().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_byte_meter_stays_exact_across_overlapping_stage_complete_cycles() {
+        let mut log = open_mem(LogConfig::default());
+        // Cycle 1 stages record A (7 logical bytes)...
+        log.append(&rec(b"aaaaaaa")).unwrap();
+        assert_eq!(log.unsynced_bytes(), 7);
+        let (_file1, t1) = log.prepare_async_sync().unwrap().unwrap();
+        // ...record B (11 bytes) lands DURING the flight: the meter keeps accumulating and B is
+        // outside t1's snapshot (dirty-at-sync-start).
+        log.append(&rec(b"bbbbbbbbbbb")).unwrap();
+        assert_eq!(log.unsynced_bytes(), 18);
+        log.complete_async_sync(&t1);
+        // t1 retires EXACTLY its own 7 covered bytes: B's 11 stay at risk until ITS barrier.
+        assert_eq!(log.unsynced_bytes(), 11);
+        assert_eq!(log.synced_offset(), Offset::new(1));
+        assert_eq!(log.flushed_offset(), Offset::new(1));
+        assert!(log.has_unsynced_records(), "B is still unsynced");
+        // Cycle 2 covers B; after its completion the meter is exactly zero — no drift in either
+        // direction across the overlapped cycles.
+        let (_file2, t2) = log.prepare_async_sync().unwrap().unwrap();
+        log.complete_async_sync(&t2);
+        assert_eq!(log.unsynced_bytes(), 0);
+        assert_eq!(log.synced_offset(), Offset::new(2));
+        assert!(!log.has_unsynced_records());
+    }
+
+    #[test]
+    fn a_stale_completion_after_an_intervening_inline_sync_is_a_full_no_op() {
+        let mut log = open_mem(LogConfig::default());
+        log.append(&rec(b"aaaa")).unwrap();
+        let (_file, stale) = log.prepare_async_sync().unwrap().unwrap();
+        // An INLINE barrier (a Run job's `commit_batch`, a quiesce) overtakes the flight: it
+        // covers everything, including a record appended after the stage.
+        log.append(&rec(b"bbbb")).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.synced_offset(), Offset::new(2));
+        assert_eq!(log.unsynced_bytes(), 0);
+        // The late completion is a FULL no-op — applying it would REWIND the durable head to the
+        // stale target and rewind is exactly what the all-or-nothing guard forbids.
+        log.complete_async_sync(&stale);
+        assert_eq!(log.synced_offset(), Offset::new(2), "no rewind");
+        assert_eq!(log.flushed_offset(), Offset::new(2));
+        assert_eq!(log.unsynced_bytes(), 0);
+    }
+
+    #[test]
+    fn a_stale_completion_after_an_intervening_roll_is_a_full_no_op_including_the_byte_meter() {
+        // The L2 regression: a mid-flight roll's seal is itself a covering barrier that advances
+        // the heads and ZEROES the meter; the stale completion must then touch NOTHING — a
+        // half-applied ticket subtracting its covered bytes on top would UNDERCOUNT the new
+        // segment's live exposure forever.
+        let mut log = open_mem(small_config());
+        log.append(&rec(b"first")).unwrap();
+        let (file, stale) = log.prepare_async_sync().unwrap().unwrap();
+        // Force rolls while the barrier is "in flight": the 128-byte cap rolls within a few
+        // 20-byte records, and each roll's seal advances both heads past the stale target.
+        for i in 0..10u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        assert!(
+            log.synced_offset() > Offset::new(1),
+            "a roll's seal advanced the durable head past the stale target"
+        );
+        let synced_after_rolls = log.synced_offset();
+        let flushed_after_rolls = log.flushed_offset();
+        let meter_after_rolls = log.unsynced_bytes();
+        assert!(
+            meter_after_rolls > 0,
+            "the new active segment carries live unsynced exposure the stale ticket must not touch"
+        );
+        let index_flushed_end = log
+            .segment_indexes
+            .borrow()
+            .get(&log.active_id)
+            .unwrap()
+            .flushed_end;
+        // The stray fdatasync on the SEALED old fd is harmless (the Arc kept it alive)...
+        file.sync_data().unwrap();
+        // ...and its completion is a FULL no-op: heads, byte meter, and index all untouched.
+        log.complete_async_sync(&stale);
+        assert_eq!(log.synced_offset(), synced_after_rolls);
+        assert_eq!(log.flushed_offset(), flushed_after_rolls);
+        assert_eq!(
+            log.unsynced_bytes(),
+            meter_after_rolls,
+            "the meter must keep the NEW segment's exposure intact (no stale subtract)"
+        );
+        assert_eq!(
+            log.segment_indexes
+                .borrow()
+                .get(&log.active_id)
+                .unwrap()
+                .flushed_end,
+            index_flushed_end,
+            "the new active index's flushed bound is untouched by the stale completion"
+        );
+        // The log is fully live afterwards: appends and real barriers keep working.
+        log.append(&rec(b"after")).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.unsynced_bytes(), 0);
+    }
+
+    #[test]
+    fn a_completion_on_a_frozen_writer_is_a_full_no_op() {
+        let mut log = open_mem(LogConfig::default());
+        log.append(&rec(b"payload")).unwrap();
+        let (_file, ticket) = log.prepare_async_sync().unwrap().unwrap();
+        let meter_before = log.unsynced_bytes();
+        // The barrier FAILED on the flusher: the caller freezes the writer, then (in a race) the
+        // completion for an earlier Ok could still arrive — it must be a full no-op, because no
+        // ack may ever be released past a failed barrier and a frozen writer's heads are final.
+        log.freeze_after_external_sync_failure();
+        assert!(!log.is_writable());
+        log.complete_async_sync(&ticket);
+        assert_eq!(log.synced_offset(), Offset::ZERO);
+        assert_eq!(log.flushed_offset(), Offset::ZERO);
+        assert_eq!(log.unsynced_bytes(), meter_before);
+        // And the pipeline can never re-arm against the frozen writer.
+        assert!(matches!(
+            log.prepare_async_sync(),
+            Err(StorageError::WriterFrozen)
+        ));
+    }
+
+    #[test]
+    fn a_ticket_with_a_mismatched_segment_id_skips_the_index_raise() {
+        // The release-mode defensive arm of the completion's index raise: a ticket staged against
+        // a DIFFERENT segment id must never touch the current active segment's resident index
+        // (the heads/meter half still applies under the guard — this pins ONLY the index skip).
+        let mut log = open_mem(LogConfig::default());
+        log.append(&rec(b"aaaa")).unwrap();
+        log.append(&rec(b"bbbb")).unwrap();
+        let (_file, ticket) = log.prepare_async_sync().unwrap().unwrap();
+        let mut mismatched = ticket;
+        mismatched.segment_id = ticket.segment_id + 1;
+        let index_flushed_end_before = log
+            .segment_indexes
+            .borrow()
+            .get(&log.active_id)
+            .unwrap()
+            .flushed_end;
+        log.complete_async_sync(&mismatched);
+        // Heads and meter applied (the ticket is not stale)...
+        assert_eq!(log.synced_offset(), Offset::new(2));
+        assert_eq!(log.unsynced_bytes(), 0);
+        // ...but the active index's flushed bound was NOT raised by a foreign-segment ticket.
+        assert_eq!(
+            log.segment_indexes
+                .borrow()
+                .get(&log.active_id)
+                .unwrap()
+                .flushed_end,
+            index_flushed_end_before
+        );
+    }
+
+    #[test]
+    fn a_shared_file_handle_held_across_rolls_and_a_freeze_stays_harmless() {
+        // The Arc'd-writer property the flusher relies on (#1040): a staged handle that outlives
+        // the segment it was staged against (rolled away mid-flight) still accepts a barrier
+        // call, never resurrects the writer, and never disturbs the successor segment.
+        let mut log = open_mem(small_config());
+        log.append(&rec(b"first")).unwrap();
+        let (file, _ticket) = log.prepare_async_sync().unwrap().unwrap();
+        for i in 0..10u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        // The clone still points at the (long-sealed) old fd: a stray barrier is a no-op Ok.
+        file.sync_data().unwrap();
+        // The log keeps operating normally on the successor segments.
+        log.append(&rec(b"tail")).unwrap();
+        log.sync().unwrap();
+        assert!(log.is_writable());
+        assert_eq!(log.unsynced_bytes(), 0);
+        let total = log.read_from(Offset::ZERO, 100).unwrap().len();
+        assert_eq!(total, 12);
     }
 
     #[test]

@@ -679,6 +679,7 @@ fn build_config(setup: &Setup) -> EngineConfig {
         fire_and_forget_refill_ms: 0,
         egress_limit: 0,
         wal_fsync_headroom_bytes: 0,
+        sync_max_dirty_bytes: 0,
         // Compression OFF (#430): the frozen conformance vectors pin the uncompressed layout.
         compression: ironbus_core::compress::Codec::None,
         // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no

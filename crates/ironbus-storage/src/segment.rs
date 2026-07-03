@@ -18,6 +18,7 @@ use ironbus_core::format::{
 use ironbus_core::segment::{CompactionMeta, SegmentError, SegmentFooter, SegmentHeader};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
 use std::io;
+use std::sync::Arc;
 
 /// An error from the segment storage layer.
 #[derive(Debug)]
@@ -432,7 +433,17 @@ impl OwnedRecord {
 /// and rolls to a new segment by size or age.
 #[derive(Debug)]
 pub struct SegmentWriter<F: RandomAccessFile> {
-    file: F,
+    /// The segment's backing file, behind an `Arc` so an EXTERNAL durability barrier can hold a
+    /// shared handle to the SAME kernel fd (#1040: the pipelined sync tier's flusher thread issues
+    /// the covering `fdatasync` off the single-writer thread via [`SegmentWriter::shared_file`]).
+    /// Every writer-side use is a `&self` call on the file (`write_all_at` / `sync_data` /
+    /// `sync_all`), so the wrapper is transparent to the write paths and the on-disk bytes are
+    /// identical. A clone held across a [`SegmentWriter::seal`] (or a retention reap) merely delays
+    /// the fd close by the holder's lifetime — a stray fdatasync on a sealed or unlinked file is a
+    /// harmless no-op barrier. `Arc`, not `try_clone`: no new trait surface, no per-cycle
+    /// dup(2)/close, and a fault-injection backend that gates syncs gates the shared handle's syncs
+    /// identically (the shared object IS the gated object).
+    file: Arc<F>,
     header: SegmentHeader,
     write_pos: u64,
     record_count: u32,
@@ -478,7 +489,9 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     pub fn create(file: F, header: SegmentHeader) -> Result<SegmentWriter<F>, StorageError> {
         file.write_all_at(&header.encode(), 0)?;
         Ok(SegmentWriter {
-            file,
+            // Wrapped internally (#1040): callers keep passing a bare `F`; the `Arc` exists only
+            // so `shared_file` can hand the flusher a co-owned handle to the same fd.
+            file: Arc::new(file),
             header,
             write_pos: SEGMENT_HEADER_LEN as u64,
             record_count: 0,
@@ -509,7 +522,8 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         max_timestamp_ms: u64,
     ) -> SegmentWriter<F> {
         SegmentWriter {
-            file,
+            // Wrapped internally (#1040), exactly as in `create`.
+            file: Arc::new(file),
             header,
             write_pos,
             record_count,
@@ -540,7 +554,8 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         );
         file.write_all_at(&header.encode(), 0)?;
         Ok(SegmentWriter {
-            file,
+            // Wrapped internally (#1040), exactly as in `create`.
+            file: Arc::new(file),
             header,
             write_pos: SEGMENT_HEADER_LEN as u64,
             record_count: 0,
@@ -894,6 +909,19 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         self.pending_base = self.write_pos;
         self.pending.clear();
         Ok(())
+    }
+
+    /// A SHARED handle to the segment's backing file — the SAME kernel fd the writer stages into —
+    /// for an EXTERNAL durability barrier (#1040): the pipelined sync tier hands this to its
+    /// flusher thread, which calls `sync_data` (`&self`, the trait is `Send + Sync`) off the
+    /// single-writer thread while the writer keeps appending. The caller MUST have already drained
+    /// the pending buffer to the file ([`SegmentWriter::flush_pending`]) for the external barrier
+    /// to cover what it believes it covers, exactly the [`SegmentWriter::sync_data_only`] contract.
+    /// A handle that outlives a [`SegmentWriter::seal`] or a retention reap is harmless: a stray
+    /// fdatasync on a sealed or unlinked file is a no-op barrier, and the co-owned fd merely closes
+    /// a little later.
+    pub(crate) fn shared_file(&self) -> Arc<F> {
+        Arc::clone(&self.file)
     }
 
     /// Seals the segment by writing the footer and a full fsync, consuming the writer
@@ -2293,6 +2321,34 @@ mod tests {
         assert_eq!(footer.record_count, 2);
         assert_eq!(footer.last_seq, Seq::new(1));
 
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        assert!(scan.clean);
+        assert_eq!(scan.footer, Some(footer));
+        assert_eq!(scan.records.len(), 2);
+    }
+
+    #[test]
+    fn a_shared_file_clone_held_across_a_seal_stays_harmless() {
+        // The #1040 Arc'd-writer property: the flusher's shared handle points at the SAME kernel
+        // fd the writer stages into, and a clone that outlives the writer's `seal(mut self)` is
+        // harmless — a stray barrier on the sealed file is a no-op Ok, and the sealed bytes are
+        // byte-identical to a seal with no outstanding clone.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"a")).unwrap();
+        let shared = w.shared_file();
+        // The shared handle observes the writer's flushes: staging puts the frame in the file,
+        // and a barrier issued through the CLONE (the flusher's call shape) succeeds.
+        w.flush_pending().unwrap();
+        shared.sync_data().unwrap();
+        w.append(&rec(1, b"b")).unwrap();
+        let footer = w.seal().unwrap();
+        assert_eq!(footer.record_count, 2);
+        // The clone outlived the seal: a late (stale-flight) barrier is still a harmless no-op.
+        shared.sync_data().unwrap();
         let scan = SegmentReader::open(Arc::clone(&file))
             .unwrap()
             .scan()
