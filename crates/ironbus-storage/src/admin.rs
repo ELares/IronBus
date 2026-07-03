@@ -1256,6 +1256,14 @@ where
 
     // Enumerate every file in the source tree (root + subdirs), reading its bytes. Excludes the LOCK
     // file at the root. This is the faithful copy: every committed artifact, by enumeration.
+    //
+    // TODO(perf/r5 follow-up): the ACTIVE segment is captured at its full preallocated LOGICAL
+    // length (`docs/PREALLOCATION.md`): the broker extends it to the roll size at create, so this
+    // verbatim copy reads and stores up to `max_segment_bytes` (64 MiB default) of mostly
+    // never-written zeros in EVERY backup. Correctness is unaffected (a restore + open recovers
+    // and silently truncates the zero tail), but the backup is bloated; a sparse-aware capture
+    // (bound the active segment's read at its recovered `valid_end`, recorded in the manifest) is
+    // deliberately NOT implemented in the preallocation change and is filed as a follow-up.
     let mut captured: Vec<(String, Vec<u8>)> = Vec::new();
     collect_tree(src, "", &mut captured)?;
 

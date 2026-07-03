@@ -737,8 +737,10 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// scan. Exposed by [`Log::durable_record_count`].
     total_record_count: u64,
     /// Bytes dropped from a torn or unsynced active-segment tail at recovery: the silent
-    /// loss that recovery truncates to reach the last intact record. Zero for a fresh log
-    /// or a clean recovery.
+    /// loss that recovery truncates to reach the last intact record. Bounded at one past the
+    /// tail's last NON-ZERO byte (`crate::io::last_nonzero_end`): the never-written zeros of a
+    /// preallocated logical extension past that bound are truncated too but were never data, so
+    /// they are not counted. Zero for a fresh log, a clean recovery, or an all-zero tail.
     recovered_truncated_bytes: u64,
     /// The structured, versioned report of what recovery dropped (#120): the same loss as
     /// `recovered_truncated_bytes`, but as per-segment events carrying the byte span and the
@@ -1305,12 +1307,24 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if file_len <= header {
             return Ok(true);
         }
-        let mut pos = header;
+        Self::region_is_all_zero(file, header, file_len)
+    }
+
+    /// `true` if every byte of `file` in `[start, end)` is zero. Reads in bounded 4 KiB chunks so
+    /// a `max_segment_bytes`-long region costs no large allocation (and, on a filesystem with
+    /// unwritten-extent tracking, no device IO at all: a preallocated hole reads back as zeros
+    /// straight from the kernel). The #868 reap uses it via
+    /// [`segment_body_is_all_zero`](Log::segment_body_is_all_zero) to prove a bad-header trailing
+    /// segment is a genuinely-empty preallocated tail. (Recovery's zero-tail REPORTING rule uses
+    /// the sibling [`crate::io::last_nonzero_end`], which additionally bounds a non-zero tail at
+    /// one past its last written byte.)
+    fn region_is_all_zero(file: &F::File, start: u64, end: u64) -> Result<bool, StorageError> {
+        let mut pos = start;
         let mut buf = [0u8; 4096];
-        while pos < file_len {
+        while pos < end {
             let want = buf
                 .len()
-                .min(usize::try_from(file_len - pos).unwrap_or(usize::MAX));
+                .min(usize::try_from(end - pos).unwrap_or(usize::MAX));
             let chunk = &mut buf[..want];
             file.read_exact_at(chunk, pos)?;
             if chunk.iter().any(|&b| b != 0) {
@@ -1589,36 +1603,59 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             let file = log.fs.open(&name)?;
             let len = file.len()?;
             if scan.valid_end < len {
-                // Record the silent loss before dropping it, so an operator can see that a
-                // torn or unsynced tail was discarded at recovery, both as a raw byte count
-                // and as a structured loss event carrying the span and the reason (#120). The
-                // records-lost estimate is a lower bound: the torn or corrupt span is, by
-                // definition, not fully parseable, but at least the frame at `valid_end` is gone.
-                log.recovered_truncated_bytes = len - scan.valid_end;
-                let reason = scan.tail_reason.unwrap_or(ReasonCode::TornTail);
-                let event = LossEvent::span(last_id, scan.valid_end, len, 1, reason);
-                log.loss_report.push(event);
-                // Quarantine the corrupt bytes BEFORE truncating them away, while `file` still holds
-                // the full image (#134). This is a COPY: it only ever reads `file`, and the
-                // truncation below is unchanged. It is best-effort and forensic, so any quarantine
-                // failure is swallowed and never affects the truncation or the open; a clean torn
-                // tail is not quarantined (see `quarantine::is_corruption_skip`).
-                if crate::quarantine::is_corruption_skip(reason) {
-                    let captured = crate::quarantine::quarantine_corrupt_span(
-                        &log.fs,
-                        &file,
-                        &event,
-                        log.config.max_quarantine_bytes,
-                    );
-                    // Reflect the new blob in the PERSISTED total (#315). A capture under a cap can
-                    // evict older blobs to make room, so re-derive the gauge from the true on-disk
-                    // footprint (the seeded scan plus this capture, net of any eviction) rather than
-                    // a naive add. The re-scan is read-only and best-effort, so it never affects the
-                    // truncation below or the open. The cheap `captured > 0` guard skips the re-scan
-                    // when nothing was captured (a cap skip or a best-effort give-up).
-                    if captured > 0 {
-                        log.quarantined_bytes = crate::quarantine::persisted_bytes(&log.fs);
+                // Distinguish DISCARDED DATA from the unwritten remainder of a preallocated,
+                // logically-extended active segment: the production `StdFile::preallocate` advances
+                // the logical length to the roll size up front, so even a clean kill leaves the
+                // active segment with a (possibly roll-size) all-zero tail past the last record.
+                // Zeros are provably not acked data — a zero word is never a valid frame magic, so
+                // no frame was ever written there — so everything REPORTED (the loss event, the
+                // quarantine capture, `recovered_truncated_bytes`) is bounded at one past the
+                // tail's LAST NON-ZERO byte, the end of the bytes that were ever plausibly
+                // written. An ALL-ZERO tail is truncated silently (the same I3-tripping non-loss
+                // #868 declined to record); reporting to the FILE length instead would claim (and
+                // quarantine) up to a whole roll size of never-written zeros for ONE torn byte,
+                // and would fail the boot on the I3 per-event cap whenever `max_segment_bytes`
+                // exceeds it. The FILE truncation below still cuts at `valid_end` as before.
+                let reported_end = crate::io::last_nonzero_end(&file, scan.valid_end, len)?;
+                if reported_end > scan.valid_end {
+                    // Record the silent loss before dropping it, so an operator can see that a
+                    // torn or unsynced tail was discarded at recovery, both as a raw byte count
+                    // and as a structured loss event carrying the span and the reason (#120). The
+                    // records-lost estimate is a lower bound: the torn or corrupt span is, by
+                    // definition, not fully parseable, but at least the frame at `valid_end` is gone.
+                    log.recovered_truncated_bytes = reported_end - scan.valid_end;
+                    let reason = scan.tail_reason.unwrap_or(ReasonCode::TornTail);
+                    let event = LossEvent::span(last_id, scan.valid_end, reported_end, 1, reason);
+                    log.loss_report.push(event);
+                    // Quarantine the corrupt bytes BEFORE truncating them away, while `file` still holds
+                    // the full image (#134). This is a COPY: it only ever reads `file`, and the
+                    // truncation below is unchanged. It is best-effort and forensic, so any quarantine
+                    // failure is swallowed and never affects the truncation or the open; a clean torn
+                    // tail is not quarantined (see `quarantine::is_corruption_skip`).
+                    if crate::quarantine::is_corruption_skip(reason) {
+                        let captured = crate::quarantine::quarantine_corrupt_span(
+                            &log.fs,
+                            &file,
+                            &event,
+                            log.config.max_quarantine_bytes,
+                        );
+                        // Reflect the new blob in the PERSISTED total (#315). A capture under a cap can
+                        // evict older blobs to make room, so re-derive the gauge from the true on-disk
+                        // footprint (the seeded scan plus this capture, net of any eviction) rather than
+                        // a naive add. The re-scan is read-only and best-effort, so it never affects the
+                        // truncation below or the open. The cheap `captured > 0` guard skips the re-scan
+                        // when nothing was captured (a cap skip or a best-effort give-up).
+                        if captured > 0 {
+                            log.quarantined_bytes = crate::quarantine::persisted_bytes(&log.fs);
+                        }
                     }
+                    // I3, enforced BEFORE the destructive truncate below: a cap-exceeding loss must
+                    // fail closed with the evidence still ON DISK (plus the forensic quarantine copy
+                    // just taken). Truncating first would destroy the over-cap bytes, so the NEXT
+                    // boot would open clean with an empty loss report — a fail-closed refusal that
+                    // scrubbed the very state the operator is being told to inspect. The end-of-open
+                    // check below stays as the backstop for the paths that push no event here.
+                    log.enforce_loss_caps(durable_bytes)?;
                 }
                 file.set_len(scan.valid_end)?;
                 file.sync_all()?;
@@ -1639,21 +1676,33 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             ));
         }
 
-        // I3: fail closed if recovery would drop more than the bounded-loss caps allow (#120),
-        // rather than accept unbounded silent loss. The per-event cap is one segment or 64 MiB,
-        // whichever is smaller. The global cap is 1% of the durable bytes, FLOORED at the
-        // per-event cap so a single in-cap event (the normal torn tail, even on a tiny log whose
-        // 1% is under one byte) is always within bounds; without that floor the literal 1% would
-        // freeze a normal small-log recovery.
-        let per_event_cap = log
+        // I3 backstop: the torn-tail path above already enforced the caps BEFORE its truncate;
+        // this covers the no-event paths (a roll-forward pushes nothing) so every recovery exit
+        // is cap-checked exactly once against its final report.
+        log.enforce_loss_caps(durable_bytes)?;
+        Ok(log)
+    }
+
+    /// I3: fail closed if recovery would drop more than the bounded-loss caps allow (#120),
+    /// rather than accept unbounded silent loss. The per-event cap is one segment or 64 MiB,
+    /// whichever is smaller. The global cap is 1% of the durable bytes, FLOORED at the
+    /// per-event cap so a single in-cap event (the normal torn tail, even on a tiny log whose
+    /// 1% is under one byte) is always within bounds; without that floor the literal 1% would
+    /// freeze a normal small-log recovery.
+    ///
+    /// Both recovery paths call this at two points: right AFTER pushing the active-segment tail
+    /// loss event but BEFORE the truncate that would destroy the over-cap bytes (fail-closed must
+    /// leave the evidence on disk for the next boot and the offline inspector), and once more at
+    /// the end of the open as the backstop for the paths that push no tail event.
+    fn enforce_loss_caps(&self, durable_bytes: u64) -> Result<(), StorageError> {
+        let per_event_cap = self
             .config
             .max_segment_bytes
             .min(LossReport::PER_EVENT_BYTE_CAP);
         let global_cap = LossReport::global_loss_cap_bytes(durable_bytes).max(per_event_cap);
-        log.loss_report
+        self.loss_report
             .check_caps(per_event_cap, global_cap)
-            .map_err(StorageError::ExcessiveRecoveryLoss)?;
-        Ok(log)
+            .map_err(StorageError::ExcessiveRecoveryLoss)
     }
 
     /// Recovers a data directory that contains at least one COMPACTED (v2) segment (#337),
@@ -2085,20 +2134,34 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 let name = segment_file_name(a.id);
                 let file = log.fs.open(&name)?;
                 if a.valid_end < a.file_len {
-                    log.recovered_truncated_bytes = a.file_len - a.valid_end;
-                    let reason = a.tail_reason.unwrap_or(ReasonCode::TornTail);
-                    let event = LossEvent::span(a.id, a.valid_end, a.file_len, 1, reason);
-                    log.loss_report.push(event);
-                    if crate::quarantine::is_corruption_skip(reason) {
-                        let captured = crate::quarantine::quarantine_corrupt_span(
-                            &log.fs,
-                            &file,
-                            &event,
-                            log.config.max_quarantine_bytes,
-                        );
-                        if captured > 0 {
-                            log.quarantined_bytes = crate::quarantine::persisted_bytes(&log.fs);
+                    // As in the v1 recovery: the REPORTED span (loss event, quarantine capture,
+                    // `recovered_truncated_bytes`) is bounded at one past the tail's LAST NON-ZERO
+                    // byte — an all-zero tail is the unwritten remainder of the preallocated
+                    // logical extension (never acked data), truncated silently; a non-zero tail is
+                    // reported and quarantined over only the bytes that were ever plausibly
+                    // written, never the roll-size extension. The FILE truncation stays at
+                    // `valid_end`.
+                    let reported_end = crate::io::last_nonzero_end(&file, a.valid_end, a.file_len)?;
+                    if reported_end > a.valid_end {
+                        log.recovered_truncated_bytes = reported_end - a.valid_end;
+                        let reason = a.tail_reason.unwrap_or(ReasonCode::TornTail);
+                        let event = LossEvent::span(a.id, a.valid_end, reported_end, 1, reason);
+                        log.loss_report.push(event);
+                        if crate::quarantine::is_corruption_skip(reason) {
+                            let captured = crate::quarantine::quarantine_corrupt_span(
+                                &log.fs,
+                                &file,
+                                &event,
+                                log.config.max_quarantine_bytes,
+                            );
+                            if captured > 0 {
+                                log.quarantined_bytes = crate::quarantine::persisted_bytes(&log.fs);
+                            }
                         }
+                        // I3 BEFORE the destructive truncate, as in the v1 path: a cap-exceeding
+                        // report (this tail event, or the #836 corrupt-compacted events already
+                        // pushed above) must fail closed with the tail evidence still on disk.
+                        log.enforce_loss_caps(durable_bytes)?;
                     }
                     file.set_len(a.valid_end)?;
                     file.sync_all()?;
@@ -2139,18 +2202,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
 
         // I3 bounded-loss caps, identical to the v1 path: fail closed rather than accept unbounded
         // silent loss. The orphan/superseded reconciliation unlinks lose nothing (their data is
-        // present elsewhere), so the only loss events here are an active-segment torn tail and any
-        // #836 committed-but-corrupt compacted segment the reconciliation quarantined — the latter
-        // is exactly why the cap matters, so a cascade of corrupt compacted segments fails closed
+        // present elsewhere), so the only loss events here are an active-segment torn tail (already
+        // cap-checked BEFORE its truncate above) and any #836 committed-but-corrupt compacted
+        // segment the reconciliation quarantined — the latter is exactly why this backstop matters
+        // on the no-tail-event paths, so a cascade of corrupt compacted segments fails closed
         // rather than silently dropping every survivor they covered.
-        let per_event_cap = log
-            .config
-            .max_segment_bytes
-            .min(LossReport::PER_EVENT_BYTE_CAP);
-        let global_cap = LossReport::global_loss_cap_bytes(durable_bytes).max(per_event_cap);
-        log.loss_report
-            .check_caps(per_event_cap, global_cap)
-            .map_err(StorageError::ExcessiveRecoveryLoss)?;
+        log.enforce_loss_caps(durable_bytes)?;
         Ok(log)
     }
 
@@ -2170,17 +2227,23 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             flags: 0,
         };
         let file = self.fs.create_new(&segment_file_name(id))?;
-        // Preallocate the new active segment to the full roll size BEFORE the first append, so the
-        // steady-state appends write into already-reserved space (`docs/PREALLOCATION.md`). This is
-        // a BEST-EFFORT optimization: a filesystem with no reservation primitive (or any preallocate
-        // error) degrades to today's grow-on-append, so the failure is SWALLOWED and never fails the
-        // create. The reserved tail is zeros that recovery's torn-tail scan truncates exactly as a
-        // torn tail (the frozen #45 zero-window fixture), so preallocation cannot break recovery: a
-        // freshly preallocated empty segment (header then zeros) recovers as no records, and a
-        // partially-written one recovers to its longest valid prefix. A genuine create-time
-        // out-of-space is therefore not surfaced here as a distinct fail-fast event; it falls back to
-        // grow-on-append and surfaces at the append/sync as it does today (the doc's ENOSPC-to-
-        // `AtCapacity` routing is a forward refinement, not required for correctness).
+        // Preallocate the new active segment to the full roll size BEFORE the first append: the
+        // production backend reserves the blocks AND advances the LOGICAL length to the roll size
+        // (`docs/PREALLOCATION.md`), so every steady-state append lands inside both the reserved
+        // space and the logical size and the per-commit fdatasync carries no i_size update (the
+        // one-time unwritten→written extent-state conversions are still journaled on first touch;
+        // `io.rs` has the honest accounting). This is a BEST-EFFORT optimization: a filesystem
+        // with no reservation primitive (or any preallocate error) degrades to today's
+        // grow-on-append, so the failure is SWALLOWED and never fails the create. The unwritten
+        // tail is zeros that recovery's torn-tail scan stops at (the frozen #45 zero-window
+        // fixture) and truncates SILENTLY (never-written space, not loss), and `seal` truncates
+        // the file down to the footer end, so preallocation cannot break recovery or footer
+        // discovery: a freshly preallocated empty segment (header then zeros) recovers as no
+        // records, and a partially-written one recovers to its longest valid prefix. A genuine
+        // create-time out-of-space is therefore not surfaced here as a distinct fail-fast event;
+        // it falls back to grow-on-append and surfaces at the append/sync as it does today (the
+        // doc's ENOSPC-to-`AtCapacity` routing is a forward refinement, not required for
+        // correctness).
         let _ = file.preallocate(self.config.max_segment_bytes);
         let mut writer = SegmentWriter::create(file, header)?;
         writer.sync()?; // the header is durable...
@@ -3555,10 +3618,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             self.seek_in_segment(slot, seg_start, remaining)?
         else {
             // The index does not cover `seg_start` (the as-yet-unflushed active tail): fall back to a
-            // full scan for this segment — correct, only (rarely) slower, the same records.
-            let records = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
-                .scan()?
-                .records;
+            // full scan for this segment — correct, only (rarely) slower, the same records. The
+            // ACTIVE segment's scan is bounded at the writer's `write_pos`: its preallocated logical
+            // extension makes the FILE roll-size long, and an unbounded fallback would eagerly
+            // allocate and read the whole zero tail (up to 64 MiB of zeros for the same records).
+            let mut reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+            if slot.id == self.active_id {
+                if let Some(writer) = self.active.as_ref() {
+                    reader = reader.with_data_end(writer.write_pos());
+                }
+            }
+            let records = reader.scan()?.records;
             for record in records {
                 if record.offset.get() < bounds.start_v {
                     continue;
@@ -4042,6 +4112,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             });
         }
 
+        // Capture the active writer's data end BEFORE dropping it: when the KEPT segment is the
+        // active one, its preallocated logical extension makes the file roll-size long, and the
+        // `record_byte_positions` walk below would otherwise eagerly allocate and read the whole
+        // zero tail. Bounding the reader at `write_pos` is byte-identical for the walk (zeros
+        // decode no frame) and leaves the truncate-down below untouched.
+        let keep_data_end = (keep_slot.id == self.active_id)
+            .then(|| self.active.as_ref().map(SegmentWriter::write_pos))
+            .flatten();
+
         // Drop the active writer before any file surgery: it is rebuilt from the recovered chain.
         self.active = None;
 
@@ -4076,7 +4155,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // offset (it held only surviving records), nothing inside it is cut beyond removing a sealed
         // footer — which unseals it into the active writer, matching a fresh log's shape.
         let keep_name = segment_file_name(keep_slot.id);
-        let reader = SegmentReader::open(self.fs.open(&keep_name)?)?;
+        let mut reader = SegmentReader::open(self.fs.open(&keep_name)?)?;
+        if let Some(end) = keep_data_end {
+            reader = reader.with_data_end(end);
+        }
         let (positions, body_end) = reader.record_byte_positions()?;
         let within = usize::try_from(target_v - keep_slot.base_offset)
             .map_err(|_| StorageError::SegmentFull)?;
@@ -5467,6 +5549,284 @@ mod tests {
         }
         // The recovered writer resumes cleanly at offset 5.
         assert_eq!(log.append(&rec(b"after")).unwrap(), Offset::new(5));
+    }
+
+    #[test]
+    fn a_preallocated_logical_extension_zero_tail_recovers_silently_with_no_loss_event() {
+        // The PRODUCTION preallocation (`StdFile`) advances the active segment's logical length to
+        // the roll size, so a crash — or even a clean kill — leaves header + records + a large
+        // all-zero tail (here a multi-MiB one, the hazard case: the scan must stop at the first
+        // zero word, never walk the span frame-by-frame, and never classify it as loss). Recovery
+        // must recover exactly the records and truncate the never-written zero tail SILENTLY: no
+        // loss event, no quarantine, no recovered_truncated_bytes — those zeros were never acked
+        // data, and reporting a roll-size span on every boot would trip the I3 caps for nothing.
+        // The in-memory backend models the reservation only, so the test writes the logical
+        // extension out for real with the same set_len-up the production preallocate performs.
+        let cfg = LogConfig {
+            max_segment_bytes: 8 * 1024 * 1024,
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(cfg);
+        for i in 0..3u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        let file = log.filesystem().open(&segment_file_name(0)).unwrap();
+        let valid_end = file.len().unwrap();
+        file.set_len(cfg.max_segment_bytes).unwrap();
+        file.sync_all().unwrap();
+        let fs = log.into_filesystem();
+
+        let mut log = Log::open(fs, ManualClock::new(), cfg).unwrap();
+        assert_eq!(log.next_offset(), Offset::new(3), "the records survive");
+        assert!(
+            log.loss_report().events.is_empty(),
+            "an all-zero preallocated tail is never-written space, not reported loss"
+        );
+        assert_eq!(
+            log.recovered_truncated_bytes(),
+            0,
+            "no data byte was discarded"
+        );
+        assert_eq!(
+            log.quarantined_bytes(),
+            0,
+            "never-written zeros are not forensic material"
+        );
+        assert_eq!(
+            log.filesystem()
+                .open(&segment_file_name(0))
+                .unwrap()
+                .len()
+                .unwrap(),
+            valid_end,
+            "recovery truncated the unwritten extension back to the durable prefix"
+        );
+        // The resumed writer appends cleanly at the next offset.
+        assert_eq!(log.append(&rec(b"after")).unwrap(), Offset::new(3));
+    }
+
+    #[test]
+    fn a_torn_tail_inside_a_preallocated_extension_is_reported_bounded_to_its_written_span() {
+        // Only a PROVABLY all-zero tail is silent. Any non-zero byte after the valid prefix means
+        // real written bytes are being discarded (a torn/corrupt frame that reached the disk), so
+        // the skip-and-report path runs — BOUNDED at one past the tail's last non-zero byte,
+        // never at the extended file length: the loss event, `recovered_truncated_bytes`, and the
+        // quarantined forensic blob all cover exactly the 3 written garbage bytes, not the
+        // ~64 KiB extension of never-written zeros behind them. (Unbounded, one torn byte would
+        // quarantine a near-all-zero roll-size blob — four such boots would evict every genuine
+        // forensic blob under the default 256 MiB store cap — and would fail the boot outright on
+        // the I3 per-event cap for any `max_segment_bytes` above 64 MiB.)
+        let cfg = LogConfig {
+            max_segment_bytes: 64 * 1024,
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(cfg);
+        log.append(&rec(b"durable")).unwrap();
+        log.sync().unwrap();
+        let file = log.filesystem().open(&segment_file_name(0)).unwrap();
+        let valid_end = file.len().unwrap();
+        // Garbage (not a valid frame magic) directly after the prefix, then the zero extension.
+        file.write_all_at(&[0xAB, 0xCD, 0xEF], valid_end).unwrap();
+        file.set_len(cfg.max_segment_bytes).unwrap();
+        file.sync_all().unwrap();
+        let fs = log.into_filesystem();
+
+        let log = Log::open(fs, ManualClock::new(), cfg).unwrap();
+        assert_eq!(
+            log.next_offset(),
+            Offset::new(1),
+            "the durable record survives"
+        );
+        let events = &log.loss_report().events;
+        assert_eq!(events.len(), 1, "the discarded non-zero tail is reported");
+        let e = events[0];
+        assert_eq!(e.reason_code, ReasonCode::CorruptRecordHeader);
+        assert_eq!(e.byte_offset_start, valid_end);
+        assert_eq!(
+            e.byte_offset_end,
+            valid_end + 3,
+            "the span is the 3 written bytes, not the extension"
+        );
+        assert_eq!(e.bytes_skipped, 3);
+        assert_eq!(log.recovered_truncated_bytes(), 3);
+        assert_eq!(
+            log.quarantined_bytes(),
+            3,
+            "the forensic blob is the real span: bytes, not the roll size"
+        );
+        assert_eq!(
+            log.filesystem()
+                .open(&segment_file_name(0))
+                .unwrap()
+                .len()
+                .unwrap(),
+            valid_end,
+            "truncated back to the valid prefix"
+        );
+    }
+
+    #[test]
+    fn one_torn_byte_under_a_roll_size_beyond_the_per_event_cap_still_boots() {
+        // THE AVAILABILITY REGRESSION (perf/r5 review): with `max_segment_bytes` ABOVE the I3
+        // per-event cap (64 MiB), an UNBOUNDED torn-tail span [valid_end, file_len) on an
+        // extended active segment would be ~the roll size, exceed the cap, and fail Log::open
+        // with ExcessiveRecoveryLoss after a routine crash — one torn byte would take the broker
+        // down unrecoverably. Bounded at the last non-zero byte, the same boot succeeds and
+        // reports a ONE-BYTE loss event; the next boot is clean and consistent with it.
+        let cfg = LogConfig {
+            max_segment_bytes: 128 * 1024 * 1024, // 2x the 64 MiB per-event cap
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(cfg);
+        log.append(&rec(b"durable")).unwrap();
+        log.sync().unwrap();
+        let file = log.filesystem().open(&segment_file_name(0)).unwrap();
+        let valid_end = file.len().unwrap();
+        // One non-zero torn byte at valid_end, then the roll-size logical extension (written out
+        // for real, as the production preallocate leaves it).
+        file.write_all_at(&[0xAB], valid_end).unwrap();
+        file.set_len(cfg.max_segment_bytes).unwrap();
+        file.sync_all().unwrap();
+        let fs = log.into_filesystem();
+
+        // Boot 1 SUCCEEDS: the reported span is one byte, far under the 64 MiB per-event cap.
+        let log = Log::open(fs, ManualClock::new(), cfg).unwrap();
+        let events = &log.loss_report().events;
+        assert_eq!(events.len(), 1);
+        let e = events[0];
+        assert_eq!(e.byte_offset_start, valid_end);
+        assert_eq!(e.byte_offset_end, valid_end + 1, "one byte, not ~128 MiB");
+        assert_eq!(e.bytes_skipped, 1);
+        assert_eq!(log.recovered_truncated_bytes(), 1);
+        assert_eq!(log.quarantined_bytes(), 1, "a one-byte forensic blob");
+        assert_eq!(log.next_offset(), Offset::new(1));
+
+        // Boot 2 is CLEAN and consistent with boot 1's report: the file was truncated to the
+        // valid prefix, so nothing is left to report (and the recovered records are unchanged).
+        let fs = log.into_filesystem();
+        let log = Log::open(fs, ManualClock::new(), cfg).unwrap();
+        assert!(
+            log.loss_report().events.is_empty(),
+            "boot 2 reports nothing new"
+        );
+        assert_eq!(log.recovered_truncated_bytes(), 0);
+        assert_eq!(log.next_offset(), Offset::new(1));
+        assert_eq!(read_back(log.filesystem(), 0).len(), 1);
+    }
+
+    #[test]
+    fn a_cap_exceeding_corrupt_tail_fails_closed_without_destroying_the_evidence() {
+        // THE EVIDENCE-DESTRUCTION REGRESSION (perf/r5 review; the ordering predates the branch):
+        // recovery used to run its set_len(valid_end) + sync_all BEFORE the I3 cap check, so a
+        // cap-failing boot TRUNCATED the over-cap corrupt bytes and the NEXT boot opened clean
+        // with an empty loss report — the fail-closed refusal scrubbed the very state the
+        // operator is told to inspect. The cap check now runs BEFORE the destructive truncate:
+        // every cap-failing boot leaves the file byte-identical, so boot 2 (and an offline
+        // inspector) still see the full evidence and fail the same way.
+        let config = LogConfig {
+            max_segment_bytes: 4096, // the per-event cap: min(4096, 64 MiB) = 4096
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(config);
+        for i in 0..3u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        let active = log.active_segment_id();
+        let fs = log.into_filesystem();
+
+        // 5000 bytes of 0xff garbage past the durable tail: GENUINE over-cap corruption (every
+        // byte non-zero, so the last-non-zero bound does not shrink it below the 4096 cap).
+        let file = fs.open(&segment_file_name(active)).unwrap();
+        let len_before = file.len().unwrap();
+        file.write_all_at(&[0xffu8; 5000], len_before).unwrap();
+        file.sync_data().unwrap();
+        let expected_len = len_before + 5000;
+
+        // Boot 1 fails closed...
+        let err = Log::open(fs.clone(), ManualClock::new(), config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::ExcessiveRecoveryLoss(crate::loss::CapViolation::PerEvent {
+                    cap: 4096,
+                    ..
+                })
+            ),
+            "expected a per-event cap violation, got {err:?}"
+        );
+        // ...WITHOUT truncating: the evidence is byte-for-byte on disk.
+        assert_eq!(
+            fs.open(&segment_file_name(active)).unwrap().len().unwrap(),
+            expected_len,
+            "a cap-failing boot must not destroy its own evidence"
+        );
+
+        // Boot 2 sees the SAME evidence and fails the SAME way (no silent clean open).
+        let err2 = Log::open(fs.clone(), ManualClock::new(), config).unwrap_err();
+        assert!(
+            matches!(
+                err2,
+                StorageError::ExcessiveRecoveryLoss(crate::loss::CapViolation::PerEvent { .. })
+            ),
+            "boot 2 must fail closed on the surviving evidence, got {err2:?}"
+        );
+        assert_eq!(
+            fs.open(&segment_file_name(active)).unwrap().len().unwrap(),
+            expected_len,
+            "the evidence survives every refused boot"
+        );
+    }
+
+    #[test]
+    fn a_roll_seals_an_extended_active_segment_down_to_its_footer_end() {
+        // Footer discovery reads the END of the file. If the active segment carries a preallocated
+        // logical extension when it rolls, `seal` must truncate the zero tail so the sealed image
+        // ends exactly at the footer — otherwise the seal would be invisible (zeros where the
+        // footer is expected) and a reopen would refuse the chain with UnsealedPredecessor.
+        let cfg = LogConfig {
+            max_segment_bytes: 256,
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(cfg);
+        log.append(&rec(b"first")).unwrap();
+        log.sync().unwrap();
+        // Extend segment 0 as the production preallocate would have at create time.
+        log.filesystem()
+            .open(&segment_file_name(0))
+            .unwrap()
+            .set_len(cfg.max_segment_bytes * 4)
+            .unwrap();
+        // Append past the cap so the extended segment 0 is sealed by a roll.
+        for _ in 0..16 {
+            log.append(&rec(b"payload-payload")).unwrap();
+            log.sync().unwrap();
+        }
+        assert!(log.active_segment_id() >= 1, "the workload rolled");
+        let total = log.durable_record_count();
+        let seg0 = log.filesystem().open(&segment_file_name(0)).unwrap();
+        let len = seg0.len().unwrap();
+        assert!(
+            len < cfg.max_segment_bytes * 4,
+            "the extension was truncated at seal"
+        );
+        let scan = SegmentReader::open(seg0).unwrap().scan().unwrap();
+        assert!(
+            scan.footer.is_some(),
+            "the footer is discoverable at the file end"
+        );
+        assert_eq!(
+            scan.valid_end + SEGMENT_FOOTER_LEN as u64,
+            len,
+            "the sealed image ends exactly at the footer"
+        );
+        // A reopen recovers the sealed predecessor + the rest of the chain with no loss.
+        let fs = log.into_filesystem();
+        let log = Log::open(fs, ManualClock::new(), cfg).unwrap();
+        assert_eq!(log.durable_record_count(), total);
+        assert!(log.loss_report().events.is_empty());
     }
 
     /// A file whose `preallocate` always errors (an unsupported FS or an out-of-space reservation),
@@ -8302,6 +8662,57 @@ mod tests {
         assert_eq!(total, 9);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stdfs_preallocation_extends_the_active_segment_and_recovery_is_silent() {
+        // The PRODUCTION path end to end: `StdFile::preallocate` reserves blocks and advances the
+        // active segment's LOGICAL length to the roll size (so the per-commit fdatasync is a pure
+        // data flush), a kill + reopen recovers the records and truncates the unwritten zero tail
+        // SILENTLY (no loss event, nothing quarantined), and the log keeps working.
+        use crate::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let cfg = LogConfig {
+            max_segment_bytes: 64 * 1024,
+            ..LogConfig::default()
+        };
+        let mut log = Log::open(StdFs::new(root.clone()), ManualClock::new(), cfg).unwrap();
+        log.append(&rec(b"one")).unwrap();
+        log.append(&rec(b"two")).unwrap();
+        log.sync().unwrap();
+        let seg0_len = StdFs::new(root.clone())
+            .open(&segment_file_name(0))
+            .unwrap()
+            .len()
+            .unwrap();
+        assert_eq!(
+            seg0_len, cfg.max_segment_bytes,
+            "the active segment is logically extended to the roll size"
+        );
+        // A kill + reopen: the crash shape every preallocated broker leaves behind.
+        drop(log);
+        let mut log = Log::open(StdFs::new(root.clone()), ManualClock::new(), cfg).unwrap();
+        assert_eq!(log.next_offset(), Offset::new(2), "both records recovered");
+        assert!(
+            log.loss_report().events.is_empty(),
+            "the unwritten zero tail is not loss"
+        );
+        assert_eq!(log.recovered_truncated_bytes(), 0);
+        assert!(
+            StdFs::new(root.clone())
+                .open(&segment_file_name(0))
+                .unwrap()
+                .len()
+                .unwrap()
+                < cfg.max_segment_bytes,
+            "the zero tail was truncated at recovery"
+        );
+        // The resumed writer appends and syncs cleanly.
+        assert_eq!(log.append(&rec(b"three")).unwrap(), Offset::new(2));
+        log.sync().unwrap();
+        assert_eq!(read_back(log.filesystem(), 0).len(), 3);
+    }
+
     // Fills a small-segment log with `n` single-byte records (each `payload` byte `i`), synced,
     // and returns it rolled across several segments so the reaper has sealed predecessors.
     fn rolled_log(n: u8) -> Log<InMemoryFs, ManualClock> {
@@ -9396,6 +9807,56 @@ mod tests {
         log.append(&rec(b"new13")).unwrap();
         log.sync().unwrap();
         assert_eq!(log.next_offset(), Offset::new(14));
+    }
+
+    #[test]
+    fn truncate_to_inside_a_preallocated_extension_cuts_at_the_frame_boundary() {
+        // The admin truncate on an EXTENDED active segment (the production preallocate shape):
+        // the record-position walk is bounded at the writer's data end (never reading the
+        // roll-size zero tail eagerly), and the surgery still cuts exactly at the target's frame
+        // boundary — dropping both the divergent records AND the logical extension, exactly as a
+        // reopen-recovery would leave the file.
+        let cfg = LogConfig {
+            max_segment_bytes: 512 * 1024,
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(cfg);
+        for i in 0..8u8 {
+            log.append(&rec(&[i; 16])).unwrap();
+        }
+        log.sync().unwrap();
+        // Write the logical extension out for real (the in-memory backend models the
+        // reservation only).
+        log.filesystem()
+            .open(&segment_file_name(0))
+            .unwrap()
+            .set_len(cfg.max_segment_bytes)
+            .unwrap();
+
+        let outcome = log.truncate_to(Offset::new(5)).unwrap();
+        assert_eq!(outcome.truncated_to, 5);
+        assert_eq!(outcome.records_dropped, 3);
+        assert_eq!(log.next_offset(), Offset::new(5));
+
+        // The surviving records are intact and the extension is gone (a truncate-down).
+        let recs = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(recs.len(), 5);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), &[u8::try_from(i).unwrap(); 16]);
+        }
+        assert!(
+            log.filesystem()
+                .open(&segment_file_name(0))
+                .unwrap()
+                .len()
+                .unwrap()
+                < cfg.max_segment_bytes,
+            "the truncate cut the extension off with the suffix"
+        );
+        // Appending resumes cleanly at the truncation point.
+        log.append(&rec(b"resumed")).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.next_offset(), Offset::new(6));
     }
 
     #[test]

@@ -112,28 +112,41 @@ pub trait RandomAccessFile: Send + Sync {
     ///
     /// This is the cross-platform preallocation primitive (the four-primitive shim in
     /// `docs/PREALLOCATION.md`). It is a BEST-EFFORT optimization, never a correctness
-    /// requirement: it does not change the bytes a reader sees, it does not advance the
-    /// append cursor (the write position stays the logical length), and a backend that
-    /// cannot reserve blocks is free to do less. Two payoffs on the slow flash an edge node
-    /// runs on: the segment is placed as one contiguous extent (less fragmentation, faster
-    /// sequential scan), and the steady-state append writes into already-allocated space so
-    /// the per-commit `fdatasync` need not also persist a length-grow (less flash wear, lower
-    /// commit latency).
+    /// requirement: it does not change any byte that was ever written, it never SHRINKS the
+    /// file, it does not advance the append cursor (the writer's position is tracked by the
+    /// layers above, not derived from the file length), and a backend that cannot reserve
+    /// blocks is free to do less. The production [`StdFile`] does two things:
+    ///
+    /// 1. Reserves backing blocks (Linux `fallocate` with `FALLOC_FL_KEEP_SIZE`, macOS
+    ///    `fcntl(F_PREALLOCATE)`), so the segment is placed as one contiguous extent (less
+    ///    fragmentation, faster sequential scan) and appends never grow the block map.
+    /// 2. ADVANCES the LOGICAL length up to `len` (`set_len` up, never down), so every
+    ///    subsequent append lands INSIDE the logical size: the per-commit `fdatasync` no longer
+    ///    journals an inode-size (`i_size`) update on every commit. (It is NOT metadata-free:
+    ///    on ext4 the first append into each reserved-but-unwritten extent still journals that
+    ///    extent's one-time unwritten→written state conversion — both probe arms paid those —
+    ///    so what the extension eliminates is precisely the EVERY-COMMIT `i_size` update.
+    ///    Measured on the ext4/virtio bench VM: ~13us / 7% p50 and ~26us / 10% p99 saved per
+    ///    fdatasync versus the keep-size form whose every append grew `i_size`.)
+    ///
+    /// The logical extension makes the unwritten remainder READ BACK AS ZEROS, and a zero word
+    /// is never a valid record-frame magic, so recovery's torn-tail scan stops at the first
+    /// unwritten byte and truncates the unwritten tail (the zero-window end-of-data rule, the
+    /// frozen #45 fixture); recovery treats a provably all-zero tail as never-written space
+    /// (truncated silently, not reported as loss), and the seal path truncates the file back
+    /// down to the footer end (with the documented `set_len`-shrink-needs-`sync_all` pairing)
+    /// so a SEALED segment's on-disk image is byte-identical to a never-preallocated one and
+    /// footer discovery at the file end still works. A freshly preallocated, empty segment
+    /// (header then zeros) recovers as no records.
     ///
     /// The reservation is NOT the durability barrier: the ack-implies-durable guarantee is
-    /// always the commit `sync_data` (I2), independent of preallocation. A preallocated tail
-    /// reads back as ZEROS, and a zero word is never a valid record-frame magic, so recovery's
-    /// torn-tail scan stops at the first unwritten byte and truncates the unwritten tail
-    /// exactly as it truncates a torn one (the zero-window end-of-data rule, the frozen #45
-    /// fixture). A freshly preallocated, empty segment (header then zeros) therefore recovers
-    /// as no records.
+    /// always the commit `sync_data` (I2), independent of preallocation, and losing the
+    /// logical extension in a crash merely shortens the file back toward its data.
     ///
     /// The DEFAULT body is a no-op: a backend with no preallocation primitive degrades to
     /// today's grow-on-append, which is correct, only without the wear/latency benefit. The
-    /// production [`StdFile`] overrides it with the per-OS KEEP-SIZE reservation (Linux
-    /// `fallocate` with `FALLOC_FL_KEEP_SIZE`, macOS `fcntl(F_PREALLOCATE)`), which reserves
-    /// blocks WITHOUT advancing the logical length, falling back to grow-on-append on a
-    /// filesystem that supports none of them.
+    /// deterministic-simulation [`InMemoryFile`] deliberately only TRACKS the request (see its
+    /// docs); the ephemeral in-RAM backend keeps the no-op (it has no fsync cost to save).
     ///
     /// # Errors
     /// Propagates an underlying IO error (for example `ENOSPC`, which an implementation may
@@ -143,6 +156,46 @@ pub trait RandomAccessFile: Send + Sync {
         let _ = len;
         Ok(())
     }
+}
+
+/// Returns one past the LAST non-zero byte of `file` in `[start, end)`, or `start` when the
+/// whole region is zero. Scans BACKWARD in bounded 4 KiB chunks, so a roll-size region costs no
+/// large allocation (and, on a filesystem with unwritten-extent tracking, the zero portion costs
+/// no device IO: a preallocated hole reads back as zeros straight from the kernel).
+///
+/// This is the shared ZERO-TAIL BOUNDING rule for a preallocated, logically-extended active
+/// segment (`docs/PREALLOCATION.md`): the tail past the durable valid prefix may be up to a roll
+/// size of never-written zeros, so both recovery ([`Log::recover`](crate::log::Log)) and the
+/// offline inspector ([`OfflineReader`](crate::offline::OfflineReader)) bound what they REPORT
+/// (loss events, quarantine capture) at one past the tail's last non-zero byte — the end of the
+/// bytes that were ever plausibly written. An all-zero tail (`start` returned) is unwritten
+/// space, not loss. The bound can exclude trailing zero bytes of a genuinely torn frame (a frame
+/// whose last written bytes happen to be zero); that under-report of informationless zeros is
+/// deliberate and bounded, whereas reporting up to the FILE length would claim a roll size of
+/// "loss" per event, flood quarantine with near-all-zero blobs, and trip the I3 per-event cap on
+/// any segment size above it.
+///
+/// # Errors
+/// Propagates the underlying IO error from the positioned reads.
+pub(crate) fn last_nonzero_end<F: RandomAccessFile>(
+    file: &F,
+    start: u64,
+    end: u64,
+) -> io::Result<u64> {
+    let mut hi = end;
+    let mut buf = [0u8; 4096];
+    while hi > start {
+        let lo = hi.saturating_sub(buf.len() as u64).max(start);
+        // `hi - lo` is at most the 4 KiB buffer, so the conversion never truncates.
+        let want = usize::try_from(hi - lo).unwrap_or(buf.len());
+        let chunk = &mut buf[..want];
+        file.read_exact_at(chunk, lo)?;
+        if let Some(i) = chunk.iter().rposition(|&b| b != 0) {
+            return Ok(lo + i as u64 + 1);
+        }
+        hi = lo;
+    }
+    Ok(start)
 }
 
 fn invalid_input(msg: &'static str) -> io::Error {
@@ -228,12 +281,15 @@ pub struct InMemoryFile {
     syncs: AtomicU64,
     /// The highest `len` ever passed to [`preallocate`](RandomAccessFile::preallocate), or `0` if
     /// it was never called. The in-memory backend models preallocation as a TRACKED RESERVATION,
-    /// not a length change: a real `fallocate` reserves backing blocks without advancing the file's
-    /// logical length or its bytes, and the deterministic simulation must mirror that so a
-    /// preallocated active segment is byte-identical to a grow-on-append one (the determinism and
-    /// crash-recovery sweeps stay green, and recovery's truncated-tail accounting is unchanged).
-    /// A test reads this back via [`InMemoryFile::preallocated_to`] to assert the roll-size
-    /// reservation was requested.
+    /// not a length change. The production [`StdFile`] now ALSO advances the logical length up to
+    /// the reservation (so its per-commit fdatasync carries no `i_size` update), but mirroring that here
+    /// would materialize `max_segment_bytes` of zeros in RAM for every active segment across every
+    /// simulation and server test (and double again in the durable image), so the simulation keeps
+    /// the compact reservation-only model: a preallocated active segment stays byte-identical to a
+    /// grow-on-append one, the determinism and crash-recovery sweeps stay green, and the
+    /// extended-zero-tail recovery behavior is pinned by explicit tests and the frozen #45
+    /// zero-window fixture, which write the zero tail out for real. A test reads this back via
+    /// [`InMemoryFile::preallocated_to`] to assert the roll-size reservation was requested.
     preallocated_to: AtomicU64,
 }
 
@@ -462,10 +518,13 @@ impl RandomAccessFile for InMemoryFile {
     }
 
     fn preallocate(&self, len: u64) -> io::Result<()> {
-        // Model `fallocate`: RESERVE backing space without changing the file's bytes or its
-        // logical length, so a preallocated active segment is byte-identical to a grow-on-append
-        // one and the determinism / crash-recovery sweeps stay green. Only the requested reservation
-        // is recorded (a high-water mark a test can read via `preallocated_to`).
+        // Model the RESERVATION half only: record the request without changing the file's bytes or
+        // its logical length, so a preallocated active segment is byte-identical to a grow-on-append
+        // one and the determinism / crash-recovery sweeps stay green. The production `StdFile` also
+        // extends the logical length; the simulation deliberately does not (see the field docs on
+        // `preallocated_to` for why), and the zero-tail recovery behavior that extension creates is
+        // pinned by tests that write the zero tail explicitly. Only the requested reservation is
+        // recorded (a high-water mark a test can read via `preallocated_to`).
         self.preallocated_to.fetch_max(len, Ordering::SeqCst);
         Ok(())
     }
@@ -521,6 +580,32 @@ mod tests {
         f.write_all_at(b"G", 0).unwrap();
         f.sync_data().unwrap();
         assert_eq!(f.durable_snapshot(), b"GDBA\x00\x00FF");
+    }
+
+    #[test]
+    fn last_nonzero_end_bounds_a_zero_tail_at_the_last_written_byte() {
+        // The zero-tail bounding rule recovery and the offline inspector share: the returned
+        // end is one past the LAST non-zero byte of the region, `start` for an all-zero region,
+        // exact across the backward 4 KiB chunk boundaries.
+        let f = InMemoryFile::new();
+        // An all-zero region (a pure preallocated extension) bounds to `start`.
+        f.set_len(3 * 4096 + 17).unwrap();
+        assert_eq!(last_nonzero_end(&f, 100, f.len().unwrap()).unwrap(), 100);
+        // A single non-zero byte in the FIRST chunk of the region: found across the backward
+        // chunk walk (two full zero chunks are scanned and skipped first).
+        f.write_all_at(&[0xAB], 334).unwrap();
+        assert_eq!(last_nonzero_end(&f, 100, f.len().unwrap()).unwrap(), 335);
+        // A later non-zero byte wins (the LAST one bounds), including exactly on a chunk edge.
+        f.write_all_at(&[0x01], 2 * 4096 - 1).unwrap();
+        assert_eq!(
+            last_nonzero_end(&f, 100, f.len().unwrap()).unwrap(),
+            2 * 4096
+        );
+        // A non-zero byte at `start` itself is inside the region; one just below is not.
+        assert_eq!(last_nonzero_end(&f, 334, 4096).unwrap(), 335);
+        assert_eq!(last_nonzero_end(&f, 335, 4096).unwrap(), 335);
+        // An empty region is `start`.
+        assert_eq!(last_nonzero_end(&f, 42, 42).unwrap(), 42);
     }
 
     #[test]
@@ -1092,66 +1177,79 @@ impl RandomAccessFile for StdFile {
     }
 
     // Preallocation (the `docs/PREALLOCATION.md` shim). Reserve `len` backing blocks for the
-    // segment up front so the steady-state appends write into already-allocated space. This is a
-    // BEST-EFFORT optimization: the fallback ladder bottoms out at today's grow-on-append, which is
-    // correct, only without the wear/latency win. It never advances the append cursor and never
-    // changes a byte a reader sees; the preallocated tail is zeros that recovery's torn-tail scan
-    // truncates exactly as it would a torn tail (the frozen #45 zero-window fixture).
+    // segment up front AND advance the logical length to the reservation boundary, so the
+    // steady-state appends land inside already-allocated space AND inside the logical size: the
+    // per-commit `fdatasync` then carries no `i_size` update (first-touch unwritten→written
+    // extent-state conversions are still journaled; see the trait doc for the honest
+    // accounting). This is a BEST-EFFORT optimization: the fallback ladder bottoms out at today's
+    // grow-on-append, which is correct, only without the wear/latency win. It never advances the
+    // append cursor and never changes a byte that was written; the unwritten tail is zeros that
+    // recovery's torn-tail scan truncates (the frozen #45 zero-window fixture), and the seal path
+    // truncates the file back down to the footer end.
     fn preallocate(&self, len: u64) -> io::Result<()> {
         preallocate_file(&self.file, len)
     }
 }
 
-/// Reserves `len` backing blocks for `file`, with the per-OS reservation recipe and a fallback
-/// ladder that bottoms out at grow-on-append (the `docs/PREALLOCATION.md` shim, primitive (a)).
+/// Reserves `len` backing blocks for `file` AND advances its LOGICAL length up to `len`, with the
+/// per-OS reservation recipe and a fallback ladder that bottoms out at grow-on-append (the
+/// `docs/PREALLOCATION.md` shim, primitive (a)).
 ///
-/// CRUCIAL invariant: the reservation reserves blocks WITHOUT advancing the file's LOGICAL length.
-/// The append cursor is the logical end of data, and recovery and the offline scan tools find the
-/// end of data from `file.len()`; if preallocation grew the logical length to `len`, every reader
-/// would see a 64 MiB zero tail and (correctly but needlessly) report it as a torn/zero window. So
-/// each OS uses the keep-size form: Linux `fallocate` with `FALLOC_FL_KEEP_SIZE`, macOS
-/// `F_PREALLOCATE` alone (which never advances the size). The appends then extend the logical
-/// length the normal way (a positioned write past the current end), landing in already-reserved
-/// blocks.
+/// Two halves, deliberately paired (the Redpanda `segment_appender` recipe: `fallocate` then
+/// truncate UP to the preallocation boundary):
 ///
-/// - **Linux**: `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` reserves real extents on ext4/f2fs/xfs
-///   (the edge targets) and keeps the apparent size. On `EOPNOTSUPP`/`ENOSYS` (a filesystem with no
-///   allocation support, e.g. some tmpfs) it falls back to grow-on-append.
-/// - **Apple**: `fcntl(fd, F_PREALLOCATE)` requesting contiguous blocks (`F_ALLOCATECONTIG`) then
-///   any blocks (`F_ALLOCATEALL`); it reserves blocks and never advances the logical size, so no
-///   `ftruncate` pairing is used. On `ENOTSUP` it falls back to grow-on-append.
-/// - **Any other Unix**: no portable keep-size reservation syscall, so it is grow-on-append (a
-///   no-op here).
+/// 1. **Block reservation** (keep-size form): Linux `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)`
+///    reserves real extents on ext4/f2fs/xfs (the edge targets); Apple
+///    `fcntl(fd, F_PREALLOCATE)` requests contiguous blocks (`F_ALLOCATECONTIG`) then any blocks
+///    (`F_ALLOCATEALL`). A filesystem with no allocation support
+///    (`EOPNOTSUPP`/`ENOSYS`/`ENOTSUP`) degrades to no reservation; any other Unix has no portable
+///    reservation syscall and skips this half.
+/// 2. **Logical extension**: `set_len` UP to `len` (never down — a file already longer is left
+///    alone). Every subsequent append then lands INSIDE the logical size, so the per-commit
+///    `fdatasync` no longer journals an `i_size` update per sync. It is NOT metadata-free: an
+///    append's first touch of a reserved-but-unwritten extent still journals that extent's
+///    one-time unwritten→written state conversion (both measurement arms paid those); the
+///    EVERY-COMMIT `i_size` update is what the extension eliminates. Measured on the
+///    ext4/virtio bench VM this saves ~13us (7%) p50 and ~26us (10%) p99 per fdatasync versus
+///    the keep-size-only form. The one-time size-grow metadata commit is paid by the first
+///    sync after this call.
 ///
-/// `len == 0` is a no-op (nothing to reserve). The reservation is never the durability barrier: the
-/// commit `sync_data` (I2) is, independent of this call. A genuine `ENOSPC` is surfaced so the
-/// caller can route a create-time out-of-space to the overflow path rather than discover it
+/// The extension is what the rest of the engine is built to absorb: the writer's append cursor is
+/// tracked by the layers above (never derived from `file.len()`), the unwritten tail reads back as
+/// zeros that recovery's zero-window rule truncates silently (never-written space, not loss), and
+/// the seal path truncates the file back down to the footer end so a sealed segment's image is
+/// byte-identical to a never-preallocated one.
+///
+/// `len == 0` is a no-op (nothing to reserve). The call is never the durability barrier: the
+/// commit `sync_data` (I2) is, independent of this call, and an extension lost to a crash merely
+/// leaves a shorter file that recovery handles like any other. A genuine `ENOSPC` is surfaced so
+/// the caller can route a create-time out-of-space to the overflow path rather than discover it
 /// mid-append.
 #[cfg(unix)]
 fn preallocate_file(file: &std::fs::File, len: u64) -> io::Result<()> {
     if len == 0 {
         return Ok(());
     }
+    // Half 1: reserve backing blocks (best-effort per OS; unsupported filesystems degrade inside).
     #[cfg(target_os = "linux")]
-    {
-        preallocate_linux(file, len)
-    }
+    preallocate_linux(file, len)?;
     #[cfg(target_vendor = "apple")]
-    {
-        preallocate_apple(file, len)
+    preallocate_apple(file, len)?;
+    // Half 2: advance the logical length up to the reservation boundary (never shrink). Done even
+    // when the reservation half degraded (or does not exist, on another Unix): a sparse extension
+    // still moves the size-grow metadata commit off the per-commit fdatasync path, which is the
+    // measured win; only the contiguity/wear benefit needs real reserved blocks.
+    if file.metadata()?.len() < len {
+        file.set_len(len)?;
     }
-    // Any other Unix (no portable keep-size reservation primitive): grow-on-append, the bottom rung.
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    {
-        let _ = (file, len);
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Linux: `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` reserves real extents while KEEPING the
-/// apparent file size (so the logical length still grows only with appends). A filesystem that
-/// cannot allocate (`EOPNOTSUPP`/`ENOSYS`) degrades to grow-on-append; any other error (e.g.
-/// `ENOSPC`) is surfaced so a create-time out-of-space is not masked.
+/// apparent file size; the caller ([`preallocate_file`]) then advances the logical length with a
+/// single `ftruncate`-up, which together are equivalent to a mode-0 `fallocate` (reserve + size).
+/// A filesystem that cannot allocate (`EOPNOTSUPP`/`ENOSYS`) degrades to the extension alone; any
+/// other error (e.g. `ENOSPC`) is surfaced so a create-time out-of-space is not masked.
 #[cfg(target_os = "linux")]
 fn preallocate_linux(file: &std::fs::File, len: u64) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -1180,9 +1278,9 @@ fn preallocate_linux(file: &std::fs::File, len: u64) -> io::Result<()> {
 }
 
 /// Apple: `fcntl(fd, F_PREALLOCATE)` reserves blocks (contiguous if possible) WITHOUT advancing the
-/// logical size, which is exactly the keep-size reservation we want (no `ftruncate` pairing, so the
-/// logical length still grows only with appends). If `F_PREALLOCATE` is unsupported (`ENOTSUP`),
-/// fall back to grow-on-append.
+/// logical size; the caller ([`preallocate_file`]) then advances the logical length with a single
+/// `set_len`-up (the `ftruncate` pairing Apple's own docs describe for a full preallocation). If
+/// `F_PREALLOCATE` is unsupported (`ENOTSUP`), fall back to the extension alone.
 #[cfg(target_vendor = "apple")]
 fn preallocate_apple(file: &std::fs::File, len: u64) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -1376,41 +1474,73 @@ mod std_file_tests {
     }
 
     #[test]
-    fn preallocate_keeps_the_logical_length_and_appends_round_trip() {
-        // The keep-size reservation reserves blocks WITHOUT advancing the logical length: the
-        // header written at 0 is intact, the logical length stays at the written length (no zero
-        // tail a reader or the offline scan tools would see), and an append into the reserved range
-        // round-trips. This is the load-bearing property: the logical length grows only with
-        // appends, so recovery and the offline `dump`/`scrub` tools find the end of data unchanged.
+    fn preallocate_extends_the_logical_length_and_appends_land_inside() {
+        // The production preallocation reserves blocks AND advances the LOGICAL length up to the
+        // reservation boundary, so subsequent appends land inside the logical size and the
+        // per-commit fdatasync carries no i_size update. The unwritten remainder
+        // reads back as ZEROS (the zero-window end-of-data rule recovery relies on), the written
+        // header is intact, and an append inside the extension round-trips.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg.log");
         let f = StdFile::create(&path).unwrap();
         f.write_all_at(b"HEADER", 0).unwrap();
-        f.preallocate(64 * 1024).unwrap();
+        let want: u64 = 64 * 1024;
+        f.preallocate(want).unwrap();
         f.sync_all().unwrap();
-        // The header is intact and the LOGICAL length is unchanged (the reservation grew no bytes).
+        // The header is intact and the LOGICAL length is the preallocation boundary.
         let mut hdr = [0u8; 6];
         f.read_exact_at(&mut hdr, 0).unwrap();
         assert_eq!(&hdr, b"HEADER");
         assert_eq!(
             f.len().unwrap(),
-            6,
-            "keep-size preallocation does not advance the logical length"
+            want,
+            "preallocation advances the logical length to the boundary"
         );
-        // A read past the logical end is a real EOF, exactly as before preallocation (no zero tail).
-        let mut buf = [0u8; 4];
-        assert_eq!(
-            f.read_at(&mut buf, 6).unwrap(),
-            0,
-            "no zero tail past the end"
+        // The unwritten tail reads back as zeros (never garbage): the zero-window rule's premise.
+        let mut tail = [0xFFu8; 32];
+        f.read_exact_at(&mut tail, 6).unwrap();
+        assert!(
+            tail.iter().all(|&b| b == 0),
+            "the unwritten extension reads back as zeros"
         );
-        // An append extends the logical length into the reserved range and round-trips.
+        // An append at the cursor (INSIDE the logical size) round-trips and does not grow the file.
         f.write_all_at(b"record", 6).unwrap();
         f.sync_data().unwrap();
-        assert_eq!(f.len().unwrap(), 12);
+        assert_eq!(
+            f.len().unwrap(),
+            want,
+            "an in-size append never grows i_size"
+        );
         let mut back = [0u8; 12];
         f.read_exact_at(&mut back, 0).unwrap();
         assert_eq!(&back, b"HEADERrecord");
+        // The seal-path shape: a shrink back to the true end (set_len + sync_all) works.
+        f.set_len(12).unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(
+            f.len().unwrap(),
+            12,
+            "the seal truncates the zero tail away"
+        );
+    }
+
+    #[test]
+    fn preallocate_never_shrinks_a_longer_file() {
+        // A reservation smaller than the current length must never truncate data: the extension
+        // half is set_len UP only.
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("long.log")).unwrap();
+        let data = vec![7u8; 8192];
+        f.write_all_at(&data, 0).unwrap();
+        f.preallocate(4096).unwrap();
+        assert_eq!(
+            f.len().unwrap(),
+            8192,
+            "a smaller preallocation never shrinks the file"
+        );
+        let mut back = vec![0u8; 8192];
+        f.read_exact_at(&mut back, 0).unwrap();
+        assert_eq!(back, data);
     }
 
     #[test]

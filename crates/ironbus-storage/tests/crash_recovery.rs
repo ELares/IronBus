@@ -151,34 +151,49 @@ fn assert_consistent_prefix<F: Filesystem>(log: &Log<F, ManualClock>) {
     }
 }
 
-/// The single-segment loss-bound assertion (#55 acceptance: `loss_bound` == actual discarded suffix).
+/// The single-segment loss-bound assertion (#55 acceptance: `loss_bound` == the discarded suffix,
+/// bounded at its last non-zero byte).
 ///
-/// `durable_active_len` is the active segment's DURABLE byte length captured just before recovery
-/// (the on-disk image a power cut would have left). After `Log::open` recovers and truncates any
-/// torn tail, the active segment file's length IS the kept `valid_end`, so the actual discarded
-/// suffix is `durable_active_len - kept_len`. This asserts the structured `LossReport`'s claimed
-/// byte loss (`total_bytes_skipped`) and the raw `recovered_truncated_bytes` both equal that actual
-/// discarded suffix, so a report that under- or over-claims its loss is mechanically falsified. It
-/// also asserts every claimed loss event names the active segment and the span matches.
+/// `durable_image` is the active segment's DURABLE on-disk image captured just before recovery
+/// (the bytes a power cut would have left). After `Log::open` recovers and truncates any torn
+/// tail, the active segment file's length IS the kept `valid_end`, so the actual discarded suffix
+/// is `durable_image.len() - kept_len`. What the report CLAIMS is that suffix bounded at one past
+/// its last NON-ZERO byte (the zero-tail rule, `docs/PREALLOCATION.md`): the suffix's trailing
+/// zeros were never plausibly-written data (on a preallocated, logically-extended segment they
+/// can be a whole roll size), so the claimed `total_bytes_skipped` and the raw
+/// `recovered_truncated_bytes` must equal EXACTLY the bounded suffix — computed here from the
+/// image itself, so a report that under- or over-claims its loss is still mechanically falsified.
+/// It also asserts every claimed loss event names the active segment and the spans sum to the
+/// same bound.
 fn assert_loss_bound_equals_discarded_suffix(
     fs: &InMemoryFs,
     active_id: u64,
-    durable_active_len: u64,
+    durable_image: &[u8],
     log: &Log<InMemoryFs, ManualClock>,
 ) {
+    let durable_active_len = durable_image.len() as u64;
     let active_name = segment_file_name(active_id);
     let kept_len = fs.open(&active_name).unwrap().len().unwrap();
     let actual_discarded = durable_active_len.saturating_sub(kept_len);
+    let reported_discarded = durable_image[usize::try_from(kept_len).unwrap()..]
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |i| i as u64 + 1);
+    assert!(
+        reported_discarded <= actual_discarded,
+        "the claim never exceeds the true discarded suffix"
+    );
     assert_eq!(
         log.loss_report().total_bytes_skipped(),
-        actual_discarded,
-        "the LossReport's claimed byte loss must equal the actual discarded suffix \
-         (durable {durable_active_len} - kept {kept_len})"
+        reported_discarded,
+        "the LossReport's claimed byte loss must equal the discarded suffix bounded at its last \
+         non-zero byte (durable {durable_active_len} - kept {kept_len}, of which \
+         {reported_discarded} plausibly written)"
     );
     assert_eq!(
         log.recovered_truncated_bytes(),
-        actual_discarded,
-        "the raw recovered_truncated_bytes must equal the actual discarded suffix"
+        reported_discarded,
+        "the raw recovered_truncated_bytes must equal the bounded discarded suffix"
     );
     // Every claimed loss event names the active segment and its span equals the discarded bytes.
     let claimed: u64 = log
@@ -195,8 +210,8 @@ fn assert_loss_bound_equals_discarded_suffix(
         })
         .sum();
     assert_eq!(
-        claimed, actual_discarded,
-        "the loss events sum to the discarded suffix"
+        claimed, reported_discarded,
+        "the loss events sum to the bounded discarded suffix"
     );
 }
 
@@ -1154,9 +1169,10 @@ fn loss_bound_equals_the_discarded_suffix_after_a_torn_tail() {
         let torn_len = full_len - chop;
         file.set_len(torn_len).unwrap();
         file.sync_all().unwrap();
-        let durable_active_len = fs.open(&segment_file_name(0)).unwrap().len().unwrap();
+        let durable_image = fs.open(&segment_file_name(0)).unwrap().snapshot();
         assert_eq!(
-            durable_active_len, torn_len,
+            durable_image.len() as u64,
+            torn_len,
             "the torn image is the durable image"
         );
 
@@ -1164,11 +1180,11 @@ fn loss_bound_equals_the_discarded_suffix_after_a_torn_tail() {
         // The whole last record is dropped (its frame is no longer parseable), so the prefix is n-1.
         assert_eq!(log.flushed_offset(), Offset::new(n - 1));
         assert_prefix(&log, n - 1);
-        // The claimed loss bound equals the actual discarded suffix.
-        assert_loss_bound_equals_discarded_suffix(&fs, 0, durable_active_len, &log);
+        // The claimed loss bound equals the discarded suffix (bounded at its last non-zero byte).
+        assert_loss_bound_equals_discarded_suffix(&fs, 0, &durable_image, &log);
         assert!(
-            log.loss_report().total_bytes_skipped() >= chop,
-            "the discarded suffix is at least the bytes we chopped"
+            log.loss_report().total_bytes_skipped() > 0,
+            "a discarded torn frame head reports a non-empty claim"
         );
     }
 }
@@ -1194,12 +1210,11 @@ fn loss_bound_equals_the_discarded_suffix_after_body_corruption() {
     file.set_len(0).unwrap();
     file.write_all_at(&bytes, 0).unwrap();
     file.sync_all().unwrap();
-    let durable_active_len = fs.open(&segment_file_name(0)).unwrap().len().unwrap();
 
     let log = Log::open(fs.clone(), ManualClock::new(), big_config()).unwrap();
     assert_eq!(log.flushed_offset(), Offset::new(n - 1));
     assert_prefix(&log, n - 1);
-    assert_loss_bound_equals_discarded_suffix(&fs, 0, durable_active_len, &log);
+    assert_loss_bound_equals_discarded_suffix(&fs, 0, &bytes, &log);
     // The corruption fell in the record body, so the body-CRC reason is reported (not torn-tail).
     assert!(
         log.loss_report()
@@ -1253,6 +1268,9 @@ fn power_cut_with_reordered_unsynced_tail_recovers_a_consistent_prefix() {
             after_len >= durable_active_len,
             "the durable (acked) bytes always survive the cut"
         );
+        // The post-cut durable image, for the loss-bound gate below (recovery truncates the file,
+        // so the discarded suffix's bytes must be captured before the open).
+        let after_image = fs.open(&segment_file_name(0)).unwrap().snapshot();
 
         // Recovery: the acked prefix survives, the reordered/dropped tail truncates at the first
         // incomplete record, and no acked record is lost.
@@ -1268,8 +1286,9 @@ fn power_cut_with_reordered_unsynced_tail_recovers_a_consistent_prefix() {
         let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
         let acked: Vec<u64> = (0..durable).collect();
         check_no_acked_loss(&records, &acked).unwrap();
-        // The loss bound equals the actual discarded suffix of the active segment after the cut.
-        assert_loss_bound_equals_discarded_suffix(&fs, 0, after_len, &log);
+        // The loss bound equals the discarded suffix of the active segment after the cut
+        // (bounded at the suffix's last non-zero byte).
+        assert_loss_bound_equals_discarded_suffix(&fs, 0, &after_image, &log);
     }
 }
 

@@ -6,9 +6,23 @@ segments are recycled. The preallocation primitive is now IMPLEMENTED (#330): th
 carries a `RandomAccessFile::preallocate(len)` method, `start_segment` preallocates each
 new active segment to the roll size best-effort, and the production `StdFile` reserves
 real blocks per OS (Linux `fallocate` with `FALLOC_FL_KEEP_SIZE`, macOS
-`fcntl(F_PREALLOCATE)`), falling back to today's grow-on-append on a filesystem that
-supports neither. The recycling question is RESOLVED, not deferred: in v1 a segment is
-never recycled, for the at-rest-encryption nonce reason recorded in
+`fcntl(F_PREALLOCATE)`) AND advances the file's LOGICAL length up to the roll size
+(a `set_len`-up pairing), falling back gracefully on a filesystem that supports less.
+The logical extension is a measured refinement over the original keep-size-only form:
+with every append landing INSIDE the logical size, the per-commit `fdatasync` no longer
+journals an inode-size (`i_size`) update. It is NOT metadata-free — on ext4 an append's
+first touch of a reserved-but-unwritten extent still journals that extent's one-time
+unwritten→written state conversion (both measurement arms paid those) — the EVERY-COMMIT
+`i_size` update is what the extension eliminates (measured on the ext4/virtio bench VM:
+~13us / 7% p50 and ~26us / 10% p99 saved per fdatasync). Two compensating rules keep the
+rest of the engine unchanged: the seal truncates the file back down to the footer end (a
+sealed segment's image stays byte-identical to a never-preallocated one, so footer
+discovery at the file end still works), and recovery and the offline tools apply the
+ZERO-TAIL rule — a provably ALL-ZERO tail is truncated (or, offline, passed over)
+silently as never-written space, and a non-zero tail's REPORTED span (loss event,
+quarantine capture) is bounded at one past its last non-zero byte, never at the extended
+file length. The recycling question is RESOLVED, not deferred: in v1 a segment is never
+recycled, for the at-rest-encryption nonce reason recorded in
 [ADR 0002](adr/0002-segments-never-recycled-in-v1.md).
 
 It complements [WAL.md](WAL.md) (the file lifecycle and the fsync model) and
@@ -64,10 +78,13 @@ engine knowing. v1 satisfies it with `pread`/`ReadFile`-positioned IO on every t
 Preallocation is **default ON**. When a new active segment is created (`Log::open` for the
 first segment, `Log::start_segment` on every roll), the file is preallocated to the
 configured roll size (`LogConfig::max_segment_bytes`, default 64 MiB; 8 MiB at the edge
-size) BEFORE the first record is appended. The file's *logical length* still grows with
-appends as today (the write position is the append cursor, not the preallocated end); what
-preallocation changes is that the *physical blocks* backing those bytes are reserved up
-front, in one call, rather than block by block as each append extends the file.
+size) BEFORE the first record is appended. The production preallocation does two things in
+one call: the *physical blocks* backing the roll size are reserved up front (one call, not
+block by block as appends arrive), and the file's *logical length* is advanced to the roll
+size, so appends land inside the logical size. The write position remains the append
+cursor tracked by the writer — it is never derived from `file.len()` — and the unwritten
+remainder past the cursor reads back as zeros until it is either overwritten by appends,
+truncated down at seal, or truncated silently at recovery.
 
 A knob to disable it for filesystems or operators that prefer not to (`preallocate`,
 default `true`) is a forward config key (there is no TOML config in code yet; see
@@ -131,12 +148,24 @@ calls for, and it reuses the shipped overflow path rather than inventing one.
 Preallocation interacts with the recovery end-of-data rule, tracked as R13 in the design
 risk hunt (RISK_REGISTER.md, RR-06 residual risk). The shipped torn-tail recovery finds
 the active segment's end of data by scanning records forward and stopping at the first
-non-record bytes; preallocated tail blocks read back as zeros. A future implementation
-MUST ensure the recovery scan distinguishes "preallocated-but-unwritten zero tail" from
-"a real record," which the existing framing already does (a zero region is not a valid
-record header: the magic and `header_crc` fail), so recovery truncates the unwritten tail
-exactly as it truncates a torn one. This spec records the requirement; the
-implementing PR carries the recovery-scan test that pins it on a preallocated file.
+non-record bytes; the preallocated (and now logically extended) tail reads back as zeros.
+The recovery scan distinguishes "preallocated-but-unwritten zero tail" from "a real
+record" structurally (a zero region is not a valid record header: the magic and
+`header_crc` fail), so the scan stops at the first unwritten byte, and the streaming scan
+does this with ONE bounded window read, never walking the zero span frame by frame. With
+the logical extension the tail can be a whole roll size, so recovery additionally BOUNDS
+what it REPORTS at one past the tail's LAST NON-ZERO byte (a bounded backward chunk
+scan): a provably all-zero tail is truncated silently (no loss event, no quarantine, no
+`recovered_truncated_bytes` — the bytes were never written, and a roll-size loss event
+on every boot would trip the I3 caps), and a tail with any non-zero byte gets the
+skip-and-report + quarantine treatment over ONLY the span up to that bound (one torn
+byte is a one-byte event and a one-byte forensic blob, never a roll-size one — an
+unbounded span would fail the boot on the I3 per-event 64 MiB cap whenever
+`max_segment_bytes` exceeds it, and would flood the quarantine store with near-all-zero
+blobs). The I3 cap check runs BEFORE recovery's truncate, so a cap-exceeding boot fails
+closed with the evidence still on disk. The file truncation itself still cuts at
+`valid_end`. The recovery-scan tests pin all of this on an extended file (log-level and
+`StdFs` end-to-end).
 
 ---
 
@@ -147,33 +176,59 @@ rather than a raw `fallocate`. Each maps to the same logical contract: reserve `
 backing blocks for the file without changing the bytes a reader sees, then make that
 reservation effective for the steady-state appends that follow.
 
-The implemented form uses the KEEP-SIZE variant on every OS: it reserves blocks WITHOUT
-advancing the file's logical length. This is load-bearing, and is a refinement of the
-earlier draft (which paired the reservation with an `ftruncate`/`posix_fallocate`
-size-grow): the append cursor is the logical end of data, and both recovery's torn-tail
-scan and the offline `dump`/`scrub` tools find the end of data from `file.len()`. If
-preallocation grew the logical length to the full roll size, every reader would see a
-multi-MiB zero tail and (correctly, but needlessly, and breaking the offline-tool output)
-report it as a zero window. Keeping the size means the logical length still grows only
-with appends, which land in the already-reserved blocks. So the macOS `ftruncate` pairing
-is dropped, and Linux uses `FALLOC_FL_KEEP_SIZE`.
+The implemented form pairs a KEEP-SIZE block reservation with an explicit logical
+extension (`set_len` up to the roll size, never down) — together equivalent to Linux's
+mode-0 `fallocate` and to Apple's documented `F_PREALLOCATE` + `ftruncate` recipe. This
+REVERSES the earlier keep-size-only refinement, on measurement: with the keep-size form
+every append advanced `i_size`, so every commit `fdatasync` also journaled an inode-size
+update; extending the logical length up front removes that per-commit `i_size` journal
+entry, worth ~13us (7%) p50 and ~26us (10%) p99 per fdatasync on the ext4/virtio bench
+VM. (Appends into the reserved-but-unwritten extents still journal their one-time
+unwritten→written extent-state conversions — both probe arms paid those — so the
+eliminated cost is precisely the every-commit `i_size` update, not all metadata.) The
+costs the keep-size form was avoiding are handled head-on instead:
+
+- **The append cursor** was never derived from `file.len()`: the writer tracks its own
+  `write_pos` (create starts it at the header end; recovery resumes it at the scanned
+  `valid_end`), so appends land inside the extension by construction.
+- **Footer discovery reads the file END**, so `seal` (and `seal_compacted`) truncates the
+  file down to the exact trailer end before its existing `sync_all` (the documented
+  `set_len`-shrink-needs-`sync_all` pairing). A SEALED segment's on-disk image is therefore
+  byte-identical to a never-preallocated one.
+- **Recovery** stops its torn-tail scan at the first zero word as always (a zero word is
+  never a valid frame magic), then BOUNDS its report at one past the tail's last non-zero
+  byte: a provably ALL-ZERO tail is the unwritten remainder of the extension —
+  never-written, never-acked space — and is truncated SILENTLY (no loss event, no
+  quarantine; reporting up to a roll size of zeros would trip the I3 bounded-loss caps on
+  every boot). Any non-zero byte in the tail means real written bytes are being
+  discarded, and the skip-and-report + quarantine path runs over the span up to that
+  bound only — one torn byte reports (and quarantines) one byte, never the roll-size
+  extension, so a routine crash can never trip the I3 per-event cap or flood the
+  quarantine store with near-all-zero blobs. The I3 check runs BEFORE the truncate, so a
+  genuinely cap-exceeding boot fails closed with the evidence intact.
+- **The offline tools (`verify`/`info`/`dump`/`scrub`)** apply the SAME zero-tail rule
+  through `OfflineReader`: a healthy stopped broker's extended active segment (the
+  normal, every-directory shape) reports ZERO loss, and a torn tail inside the extension
+  is reported bounded at its last non-zero byte — without this, `verify` would claim ~a
+  roll size of data loss (exit 3) for every healthy directory. Sealed segments (the
+  overwhelming majority) are truncated exact at seal and carry no tail at all.
 
 | OS | Primitive | Reserves real blocks? | Durability note |
 |---|---|---|---|
-| **Linux** (production, musl) | `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` | Yes | `fallocate` reserves real extents and `FALLOC_FL_KEEP_SIZE` leaves the logical size unchanged; the steady-state append then writes into allocated blocks, so the commit `fdatasync` need not also persist a length-grow. On a filesystem that does not support allocation (`EOPNOTSUPP`/`ENOSYS`, rare on ext4/f2fs/xfs, the edge targets) it falls back to no-prealloc (grow-on-append). A genuine `ENOSPC` is surfaced (not swallowed) at the seam. The block reservation itself is not the durability barrier: the I2 commit `fdatasync` still is. |
-| **macOS** (developer, CI) | `fcntl(fd, F_PREALLOCATE)` with `F_ALLOCATECONTIG` then `F_ALLOCATEALL` (NO `ftruncate`) | Yes (contiguous if possible) | `F_PREALLOCATE` reserves blocks and does NOT advance the file's logical size, which is exactly the keep-size reservation wanted, so no `ftruncate` pairing is used. On macOS the durability barrier is `F_FULLFSYNC`, which `std` already issues for both `sync_data` and `sync_all` (see `io.rs`); preallocation does not change that, it only removes the per-commit length-grow. If `F_PREALLOCATE` returns `ENOTSUP`, it falls back to no-prealloc (grow-on-append); any other error is surfaced. |
+| **Linux** (production, musl) | `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` then `ftruncate` up to `len` | Yes | `fallocate` reserves real extents; the `ftruncate`-up then advances the logical size once, so the steady-state append writes into reserved blocks INSIDE the logical size and the commit `fdatasync` persists no length-grow and allocates no new blocks (each reserved extent's one-time unwritten→written state conversion is still journaled on first touch; the one-time size-grow metadata commit is paid by the first sync after the preallocate). On a filesystem that does not support allocation (`EOPNOTSUPP`/`ENOSYS`, rare on ext4/f2fs/xfs, the edge targets) the reservation half degrades and the logical extension still applies (a sparse extension still removes the per-commit `i_size` update; block allocation then happens — and journals — as appends land). A genuine `ENOSPC` is surfaced (not swallowed) at the seam. Neither half is the durability barrier: the I2 commit `fdatasync` still is. |
+| **macOS** (developer, CI) | `fcntl(fd, F_PREALLOCATE)` with `F_ALLOCATECONTIG` then `F_ALLOCATEALL`, then `ftruncate` up to `len` | Yes (contiguous if possible) | `F_PREALLOCATE` reserves blocks without advancing the size; the `ftruncate`-up pairing (Apple's own documented recipe for a full preallocation) then advances the logical size once. On macOS the durability barrier is `F_FULLFSYNC`, which `std` already issues for both `sync_data` and `sync_all` (see `io.rs`); preallocation does not change that. If `F_PREALLOCATE` returns `ENOTSUP`, the reservation half degrades and the extension still applies; any other error is surfaced. |
 | **Windows** (v1 non-goal; flagged for #17) | `SetFilePointerEx(fd, len)` then `SetEndOfFile(fd)` to set the size; optionally `SetFileValidData` to mark the range valid without zeroing | Size set; blocks valid only with `SetFileValidData` | `SetFilePointerEx` + `SetEndOfFile` set the file size but leave the range as a zeroing-on-first-write valid-data region, so the wear/latency benefit is partial unless `SetFileValidData` is used. **`SetFileValidData` requires the `SE_MANAGE_VOLUME_NAME` privilege** and exposes previously-deleted disk contents in the unwritten range, so it is a deliberate, privileged opt-in, never the default. Without it, Windows preallocation sets the size (avoiding repeated grows) but the OS still zeroes-on-write; the durability barrier on Windows is `FlushFileBuffers`. Windows is a v1 NON-GOAL (the production targets are Linux musl and macOS; `io.rs` ships only the trait and `InMemoryFile` off Unix), so this row is the SPECIFIED Windows mapping for when the build matrix (#17) adds it, not shipped code. |
 
-The common fallback ladder on every OS is: **keep-size block reservation, then no-prealloc
-(grow-on-append)** when the filesystem reports it cannot allocate. The implementation drops
-the intermediate set-size / zero-fill rungs the draft listed precisely because they would
-advance the logical length (the very thing the keep-size form avoids), so they are not
-correct keep-size rungs. Both surviving rungs are correct for durability; the lower rung
-only gives up the wear/latency benefit, never the ack-implies-durable guarantee (which is
-always the commit `fdatasync`, independent of preallocation). Falling back to
-grow-on-append is exactly the shipped v1 behavior, so a platform that supports no
-keep-size reservation primitive (any non-Linux, non-Apple Unix, or an unsupported
-filesystem) degrades to today's code, not to an unsafe one.
+The common fallback ladder on every OS is: **block reservation + logical extension, then
+logical extension alone (a sparse extension, when the filesystem cannot reserve), then
+no-prealloc (grow-on-append, when the whole preallocate call errors and `start_segment`
+swallows it)**. Every rung is correct for durability; a lower rung only gives up part of
+the wear/latency benefit (the sparse rung still removes the per-commit `i_size` update
+but loses the contiguity and journals block allocations as appends land; the bottom rung
+keeps neither), never the ack-implies-durable guarantee (which is always the commit
+`fdatasync`, independent of preallocation). The bottom rung is exactly the pre-#330
+behavior, so a platform or filesystem that supports nothing degrades to the old code, not
+to an unsafe one.
 
 ---
 
@@ -188,12 +243,15 @@ plumbing:
   is a literal no-op (`Ok(())`): a backend with no reservation primitive degrades to
   grow-on-append, which is correct. The in-memory `InMemoryFile` overrides it to TRACK the
   requested reservation (a high-water `preallocated_to`) WITHOUT changing its bytes or its
-  logical length, mirroring the real keep-size reservation. This is deliberate over a
-  `set_len`-extend: a set-len would zero-fill the in-memory image to `len` and diverge the
-  deterministic disk image (the determinism and crash-recovery sweeps assert byte-identical
-  images and exact truncated-tail counts), whereas a tracked reservation keeps a
-  preallocated active segment byte-identical to a grow-on-append one while still letting a
-  test assert the roll-size reservation was requested.
+  logical length. This is deliberate even though the production `StdFile` now ALSO extends
+  the logical length: mirroring the extension in the simulation would materialize (and
+  durably double) `max_segment_bytes` of zeros in RAM for every active segment across every
+  simulation and server test, and would diverge the deterministic disk image the
+  determinism and crash-recovery sweeps assert. The extension-specific recovery and seal
+  behavior is pinned instead by tests that write the zero tail out for real (the log-level
+  extended-tail recovery tests, the seal-truncation tests, the `StdFs` end-to-end test, and
+  the frozen #45 zero-window fixture), while the tracked reservation still lets a test
+  assert the roll-size request was made.
 - The production `StdFile` (Unix) overrides it with the per-OS syscall above. `StdFile`
   already exposes `from_file` for "a preallocated or handed-off descriptor" (`io.rs`), so
   the preallocation can also be done at create time and handed in; the trait method is the
@@ -345,8 +403,9 @@ matrix (#17), which must be flagged so the portability promise is tested, not as
 |---|---|
 | The four-primitive shim (preallocate, file-datasync, directory-sync, sealed-read-map) | (a)(b)(c)(d) all IMPLEMENTED in the seam (a = `RandomAccessFile::preallocate`, #330) |
 | Preallocation always-on best-effort, active segment, full roll size, wear/latency rationale | IMPLEMENTED (`start_segment`, #330); an explicit disable knob is deferred to #14 config |
-| ENOSPC at roll | A keep-size `ENOSPC` is surfaced at the seam; v1 wiring SWALLOWS it in `start_segment` and falls back to grow-on-append (the doc's route-to-`AtCapacity` refinement is a forward improvement, not required for correctness) |
-| Per-OS preallocate (Linux `fallocate` + `FALLOC_FL_KEEP_SIZE`, macOS `fcntl(F_PREALLOCATE)`; Windows `SetEndOfFile`/`SetFileValidData` still SPECIFIED for #17) | IMPLEMENTED for Linux + macOS; other Unix and Windows degrade to the no-op default |
+| Logical extension to the roll size (no per-commit `i_size` journal; seal truncates down; recovery + offline tools silent on all-zero tails, reports bounded at the last non-zero byte) | IMPLEMENTED (perf/r5): `StdFile::preallocate` = reservation + `set_len`-up; `seal`/`seal_compacted` truncate to the trailer end; recovery and `OfflineReader` report loss only for non-zero tails, bounded to the written span |
+| ENOSPC at roll | A reservation `ENOSPC` is surfaced at the seam; v1 wiring SWALLOWS it in `start_segment` and falls back to grow-on-append (the doc's route-to-`AtCapacity` refinement is a forward improvement, not required for correctness) |
+| Per-OS preallocate (Linux `fallocate` + `FALLOC_FL_KEEP_SIZE` + `ftruncate`-up, macOS `fcntl(F_PREALLOCATE)` + `ftruncate`-up; Windows `SetEndOfFile`/`SetFileValidData` still SPECIFIED for #17) | IMPLEMENTED for Linux + macOS; any other Unix gets the sparse extension; Windows degrades to the no-op default |
 | Segment recycling | RESOLVED: v1 NEVER recycles (ADR 0002); no generation stamp; recycling is a v2 nonce-safety decision |
 | Build-matrix implications | FLAGGED to #17 |
 
