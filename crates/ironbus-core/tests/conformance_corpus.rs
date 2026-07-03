@@ -227,6 +227,7 @@ fn assert_fixture_verdict(f: &Fixture) {
         } => assert_intact_segment(f, records, *has_footer),
         Verdict::TornTruncate(loss) => assert_torn_truncate(f, loss),
         Verdict::SkipAndReport(loss) => assert_skip_and_report(f, loss),
+        Verdict::UnwrittenZeroTailTruncate { start } => assert_unwritten_zero_tail(f, *start),
         Verdict::FailClosedReject(expected_err) => {
             assert_eq!(
                 decode(&f.bytes),
@@ -353,6 +354,41 @@ fn assert_skip_and_report(f: &Fixture, loss: &conformance::LossTuple) {
     assert_eq!(
         stop as u64, loss.start,
         "{}: prefix ends at the corrupt head",
+        f.name
+    );
+}
+
+/// Asserts an unwritten-zero-tail fixture: every byte from `start` to EOF is zero (the tail is
+/// PROVABLY never-written space — the premise recovery's silent truncation stands on), decoding at
+/// `start` fails with a header-class error (a zero word is never a valid frame magic, so the scan
+/// stops there), and the valid prefix ends exactly at `start`. The recovery-level half of the
+/// contract — the span is truncated with NO loss report and nothing quarantined — is asserted by
+/// the storage-side gate (`ironbus-storage/tests/conformance_recovery.rs`), which drives these
+/// same bytes through `Log::open`.
+fn assert_unwritten_zero_tail(f: &Fixture, start: u64) {
+    let at = usize::try_from(start).expect("offset fits usize");
+    assert!(
+        f.bytes[at..].iter().all(|&b| b == 0),
+        "{}: the span is all zeros (provably unwritten)",
+        f.name
+    );
+    let err = decode(&f.bytes[at..]).expect_err("a zero word must not decode as a frame");
+    assert!(
+        matches!(
+            err,
+            DecodeError::BadMagic
+                | DecodeError::UnsupportedVersion(_)
+                | DecodeError::BadHeaderCrc
+                | DecodeError::Truncated
+        ),
+        "{}: header-class error at the zero window, got {err:?}",
+        f.name
+    );
+    // The valid prefix before the zero window decodes; its length is exactly `start`.
+    let (_, stop) = decode_segment_records(&f.bytes);
+    assert_eq!(
+        stop as u64, start,
+        "{}: prefix ends at the zero-window start",
         f.name
     );
 }

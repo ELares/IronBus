@@ -216,7 +216,21 @@ fn assert_valid_prefix(rec: &Recovered, expected_len: u64) {
 /// Asserts the loss report holds exactly one event, with the given reason, span, and that
 /// recovery never read past the torn / corrupt boundary (the event's start equals the recovered
 /// segment length, so every byte after the durable head was dropped, never replayed).
-fn assert_single_loss(rec: &Recovered, reason: ReasonCode, start: u64, end: u64) {
+/// `start..end` is the crafted DISCARDED tail inside `bytes` (the segment image recovery ran
+/// over). The reported span is pinned under the zero-tail BOUNDING rule (`docs/PREALLOCATION.md`):
+/// it ends at one past the LAST NON-ZERO byte within `[start, end)` — trailing zero bytes of a
+/// discarded tail are informationless and never claimed (on a preallocated, logically-extended
+/// active segment the unbounded end would be a whole roll size) — so the expected end is computed
+/// from the crafted image itself, keeping every fixture's assertion exact.
+fn assert_single_loss(rec: &Recovered, reason: ReasonCode, start: u64, end: u64, bytes: &[u8]) {
+    let expected_end = bytes[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()]
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(start, |i| start + i as u64 + 1);
+    assert!(
+        expected_end > start,
+        "a crafted discarded tail must contain a non-zero byte (an all-zero tail is not loss)"
+    );
     assert_eq!(rec.loss.events.len(), 1, "exactly one loss event");
     let e = rec.loss.events[0];
     assert_eq!(e.segment_id, 0);
@@ -225,8 +239,11 @@ fn assert_single_loss(rec: &Recovered, reason: ReasonCode, start: u64, end: u64)
         e.byte_offset_start, start,
         "loss span start (the torn head)"
     );
-    assert_eq!(e.byte_offset_end, end, "loss span end (the file length)");
-    assert_eq!(e.bytes_skipped, end - start, "bytes skipped");
+    assert_eq!(
+        e.byte_offset_end, expected_end,
+        "loss span end (one past the last non-zero discarded byte)"
+    );
+    assert_eq!(e.bytes_skipped, expected_end - start, "bytes skipped");
     // The recovered segment is truncated exactly at the torn head, so recovery never reads past
     // the torn tail: the live length is the loss-span start, not the original (longer) length.
     assert_eq!(
@@ -255,6 +272,7 @@ fn torn_tail_partial_record_header() {
         ReasonCode::TornTail,
         head_start as u64,
         (head_start + 4) as u64,
+        &bytes,
     );
 }
 
@@ -275,6 +293,7 @@ fn torn_tail_partial_record_body() {
         ReasonCode::TornTail,
         last_start as u64,
         (last_start + RECORD_HEADER_LEN + 2) as u64,
+        &bytes,
     );
 }
 
@@ -295,6 +314,7 @@ fn torn_tail_partial_record_trailer() {
         ReasonCode::TornTail,
         last_start as u64,
         (good.len() - 3) as u64,
+        &bytes,
     );
 }
 
@@ -317,6 +337,7 @@ fn flipped_record_header_crc() {
         ReasonCode::CorruptRecordHeader,
         last_start as u64,
         good.len() as u64,
+        &bytes,
     );
 }
 
@@ -336,6 +357,7 @@ fn flipped_record_body_crc() {
         ReasonCode::CorruptRecordBody,
         last_start as u64,
         good.len() as u64,
+        &bytes,
     );
 }
 
@@ -396,6 +418,7 @@ fn flipped_xxh3_field_on_over_threshold_record() {
         ReasonCode::CorruptRecordBody,
         big_frame_start,
         good.len() as u64,
+        &bytes,
     );
 }
 
@@ -417,6 +440,7 @@ fn bad_record_magic() {
         ReasonCode::CorruptRecordHeader,
         last_start as u64,
         good.len() as u64,
+        &bytes,
     );
 }
 
@@ -436,6 +460,7 @@ fn unsupported_record_version() {
         ReasonCode::CorruptRecordHeader,
         last_start as u64,
         good.len() as u64,
+        &bytes,
     );
 }
 
@@ -471,6 +496,7 @@ fn planted_false_magic_mid_log_is_rejected_at_the_checksum() {
         ReasonCode::CorruptRecordBody,
         mid_start as u64,
         good.len() as u64,
+        &bytes,
     );
 }
 
@@ -496,6 +522,7 @@ fn planted_false_magic_in_a_header_is_rejected_at_the_header_crc() {
         ReasonCode::CorruptRecordHeader,
         mid_start as u64,
         good.len() as u64,
+        &bytes,
     );
 }
 
@@ -604,6 +631,7 @@ fn truncated_footer_recovers_records_unsealed() {
         ReasonCode::TornTail,
         (good.len() - SEGMENT_FOOTER_LEN) as u64,
         (good.len() - 4) as u64,
+        &bytes,
     );
 }
 
@@ -792,10 +820,14 @@ fn unsealed_non_final_predecessor() {
 
 #[test]
 fn all_zeros_record_region() {
-    // The whole record region (everything after the 64-byte header) is zeroed, modelling a
-    // freshly preallocated or wiped segment whose records never landed. A zero word is not a valid
-    // record magic, so recovery decodes zero records and reports the zeroed bytes as a torn tail.
-    // No acked record existed there, so this is the empty-active-segment recovery, never a panic.
+    // The whole record region (everything after the 64-byte header) is zeroed: exactly the shape
+    // a preallocated, logically-extended active segment leaves when its records never landed. A
+    // zero word is not a valid record magic, so recovery decodes zero records — and, because the
+    // tail is PROVABLY all zeros (never-written space, never acked data), it truncates the span
+    // SILENTLY: no loss event and nothing quarantined. Production preallocates every active
+    // segment to the roll size with an advanced logical length, so an all-zero tail is the
+    // NORMAL every-boot shape, not a corruption; reporting it would claim a roll size of "loss"
+    // on each boot and trip the I3 caps for bytes that never held data.
     let n = 4u64;
     let good = good_unsealed_segment(n);
     let mut bytes = good.clone();
@@ -804,11 +836,14 @@ fn all_zeros_record_region() {
     }
     let rec = recover_ok(disk_with_segment0(&bytes));
     assert_valid_prefix(&rec, 0);
-    assert_single_loss(
-        &rec,
-        ReasonCode::CorruptRecordHeader,
-        SEGMENT_HEADER_LEN as u64,
-        good.len() as u64,
+    assert!(
+        rec.loss.events.is_empty(),
+        "an all-zero (unwritten) region is not reported as loss"
+    );
+    // The zero span is still truncated: the live segment ends at the durable head (the header).
+    assert_eq!(
+        rec.seg0_len, SEGMENT_HEADER_LEN as u64,
+        "recovery truncated the unwritten zero region"
     );
 }
 

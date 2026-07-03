@@ -658,6 +658,17 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         trailer[..SEGMENT_FOOTER_LEN].copy_from_slice(&footer.encode_v2());
         trailer[SEGMENT_FOOTER_LEN..].copy_from_slice(&meta.encode());
         self.file.write_all_at(&trailer, self.write_pos)?;
+        // As in `seal`: the v2 trailer is discovered by reading the END of the file, so a
+        // logically-extended (preallocated) file must be truncated down to the true trailer end
+        // before the same `sync_all` that commits the trailer. Compaction writers are not
+        // preallocated today, so this is normally a no-op guard kept local to the seal invariant.
+        let end = self
+            .write_pos
+            .checked_add((SEGMENT_FOOTER_LEN + COMPACTION_META_LEN) as u64)
+            .ok_or(StorageError::SegmentFull)?;
+        if self.file.len()? > end {
+            self.file.set_len(end)?;
+        }
         self.file.sync_all()?;
         Ok(())
     }
@@ -924,8 +935,17 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         Arc::clone(&self.file)
     }
 
-    /// Seals the segment by writing the footer and a full fsync, consuming the writer
-    /// and returning the footer.
+    /// Seals the segment by writing the footer, truncating any preallocated zero tail down to the
+    /// footer end, and issuing a full fsync, consuming the writer and returning the footer.
+    ///
+    /// The truncation is load-bearing with preallocation's LOGICAL extension (`StdFile::
+    /// preallocate` advances the file length to the roll size up front): footer discovery reads
+    /// the trailing 32 bytes of the FILE (`SegmentReader::scan` and every sibling), so a sealed
+    /// image must end exactly at the footer or the zero tail would hide the seal. The shrink is
+    /// metadata, made durable by the very `sync_all` the seal already issues (the documented
+    /// `set_len`-shrink-needs-`sync_all` pairing in `io.rs`), so a sealed segment's on-disk image
+    /// is byte-identical to a never-preallocated one. A never-extended file skips the `set_len`
+    /// (its length already equals the footer end).
     ///
     /// # Errors
     /// Propagates the underlying IO error.
@@ -938,6 +958,13 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             record_count: self.record_count,
         };
         self.file.write_all_at(&footer.encode(), self.write_pos)?;
+        let end = self
+            .write_pos
+            .checked_add(SEGMENT_FOOTER_LEN as u64)
+            .ok_or(StorageError::SegmentFull)?;
+        if self.file.len()? > end {
+            self.file.set_len(end)?;
+        }
         self.file.sync_all()?;
         Ok(footer)
     }
@@ -1122,6 +1149,26 @@ impl<F: RandomAccessFile> SegmentReader<F> {
     #[must_use]
     pub fn header(&self) -> &SegmentHeader {
         &self.header
+    }
+
+    /// Clamps this reader's view of the file to end at `end` (never grown past the real length,
+    /// never cut into the 64-byte header `open` validated).
+    ///
+    /// For the ACTIVE segment, whose preallocated LOGICAL EXTENSION (`docs/PREALLOCATION.md`)
+    /// makes `file.len()` the roll size rather than the data end, the caller (the log) knows the
+    /// true data end (the writer's `write_pos`); bounding the reader there keeps the eager
+    /// whole-region reads ([`scan`](SegmentReader::scan)'s body read,
+    /// [`record_byte_positions`](SegmentReader::record_byte_positions)'s walk) at O(data) instead
+    /// of O(roll size) — unbounded, a fallback scan of a nearly-empty extended segment would
+    /// allocate and read up to a whole roll size (64 MiB default) of zeros. Behavior is
+    /// byte-identical to scanning a file physically truncated at `end`: everything past the
+    /// writer's position is unwritten zeros, which no scan decodes a record or a footer from, so
+    /// the records, positions, and `valid_end` are unchanged. SEALED segments are truncated
+    /// exactly at their footer by `seal`, so they never need (and never get) this clamp.
+    #[must_use]
+    pub fn with_data_end(mut self, end: u64) -> SegmentReader<F> {
+        self.file_len = self.file_len.min(end.max(SEGMENT_HEADER_LEN as u64));
+        self
     }
 
     /// Reads `len` bytes starting at file byte position `start` into a FRESH shared [`Bytes`]
@@ -2359,6 +2406,40 @@ mod tests {
     }
 
     #[test]
+    fn seal_truncates_a_preallocated_logical_extension_down_to_the_footer_end() {
+        // The production preallocation logically EXTENDS the active file to the roll size, so at
+        // seal time the file may be much longer than the data. Footer discovery reads the trailing
+        // 32 bytes of the FILE, so `seal` must truncate the unwritten zero tail away: the sealed
+        // image ends exactly at the footer (byte-identical to a never-preallocated seal) and the
+        // footer is discoverable again.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"a")).unwrap();
+        w.append(&rec(1, b"b")).unwrap();
+        w.sync().unwrap();
+        // Apply the logical extension the production preallocate performs (the in-memory backend
+        // models the reservation only, so write the zero tail out for real).
+        file.set_len(64 * 1024).unwrap();
+        let expected_end = w.write_pos() + SEGMENT_FOOTER_LEN as u64;
+        let footer = w.seal().unwrap();
+        assert_eq!(
+            file.len().unwrap(),
+            expected_end,
+            "the sealed image ends exactly at the footer, zero tail gone"
+        );
+        // The truncation is fsynced by the seal's sync_all: it survives a power loss.
+        file.simulate_power_loss();
+        assert_eq!(file.len().unwrap(), expected_end);
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        assert!(scan.clean);
+        assert_eq!(scan.footer, Some(footer), "the seal is discoverable at EOF");
+        assert_eq!(scan.records.len(), 2);
+    }
+
+    #[test]
     fn empty_sealed_segment() {
         let file = Arc::new(InMemoryFile::new());
         let w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
@@ -2998,6 +3079,74 @@ mod tests {
         assert_eq!(scan.records.len(), 2);
         assert_eq!(scan.records[0].payload.as_ref(), b"keep1");
         assert_eq!(scan.records[1].payload.as_ref(), b"keep2");
+    }
+
+    #[test]
+    fn with_data_end_scans_an_extended_active_segment_byte_identically_and_bounded() {
+        // The active segment's preallocated LOGICAL EXTENSION makes file.len() the roll size, so
+        // an unbounded eager scan/walk reads the whole zero tail. `with_data_end(write_pos)`
+        // must be byte-identical to scanning the file as if it were physically truncated at the
+        // data end: same records, same valid_end, same positions — while the whole-file scan of
+        // the SAME extended image also agrees (zeros decode nothing), proving the clamp changes
+        // only the bytes read, never the result.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"alpha")).unwrap();
+        w.append(&rec(1, b"beta")).unwrap();
+        w.append(&rec(2, b"gamma")).unwrap();
+        w.sync().unwrap();
+        let data_end = w.write_pos();
+        // The production preallocate shape: the logical length is far past the data end.
+        file.set_len(64 * 1024).unwrap();
+
+        let bounded = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .with_data_end(data_end);
+        assert_eq!(
+            bounded.file_len, data_end,
+            "the clamp bounds the reader's view at the data end"
+        );
+        let bounded_scan = bounded.scan().unwrap();
+        let full_scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        assert_eq!(bounded_scan.valid_end, data_end);
+        assert_eq!(bounded_scan.valid_end, full_scan.valid_end);
+        assert_eq!(bounded_scan.records, full_scan.records);
+        assert_eq!(bounded_scan.records.len(), 3);
+        assert!(bounded_scan.footer.is_none() && full_scan.footer.is_none());
+        // The bounded view decoded the WHOLE region it saw (no zero tail inside it), while the
+        // full view necessarily stopped early at the zero tail.
+        assert!(bounded_scan.clean);
+        assert!(!full_scan.clean);
+
+        // The position walk agrees the same way (the truncate_to path).
+        let (bounded_pos, bounded_end) = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .with_data_end(data_end)
+            .record_byte_positions()
+            .unwrap();
+        let (full_pos, full_end) = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .record_byte_positions()
+            .unwrap();
+        assert_eq!(bounded_pos, full_pos);
+        assert_eq!(bounded_end, full_end);
+        assert_eq!(bounded_pos.len(), 3);
+
+        // The clamp never grows past the real length and never cuts into the header.
+        let short = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .with_data_end(u64::MAX);
+        assert_eq!(short.file_len, 64 * 1024, "never grown past the file");
+        let floor = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .with_data_end(0);
+        assert_eq!(
+            floor.file_len, SEGMENT_HEADER_LEN as u64,
+            "never cut into the validated header"
+        );
     }
 
     #[test]

@@ -175,8 +175,11 @@ fn torn_tail_mid_trailer_matches_the_corpus_loss_tuple() {
 #[test]
 fn mid_log_bit_flip_skips_and_reports_corrupt_body() {
     // A body byte of the SECOND record is flipped: the first survives, recovery stops at the
-    // second frame and reports CorruptRecordBody from there to the file end (the corpus
-    // SkipAndReport verdict).
+    // second frame and reports CorruptRecordBody from there (the corpus SkipAndReport verdict).
+    // The reported end is BOUNDED at one past the tail's last NON-ZERO byte (the zero-tail rule
+    // a preallocated logical extension requires): this frozen fixture's discarded tail happens
+    // to end in zero bytes, so the span excludes exactly those informationless zeros — it may
+    // never extend to a (possibly roll-size) file end.
     let bytes = corpus_bytes("segment_mid_log_bit_flip");
     let rec = recover(&bytes);
     assert_eq!(
@@ -189,11 +192,15 @@ fn mid_log_bit_flip_skips_and_reports_corrupt_body() {
         ReasonCode::CorruptRecordBody,
         "corrupt-body reason"
     );
+    let last_nonzero_end = bytes
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |i| i as u64 + 1);
     assert_eq!(
-        loss.byte_offset_end,
-        bytes.len() as u64,
-        "loss ends at the file end"
+        loss.byte_offset_end, last_nonzero_end,
+        "loss ends at one past the tail's last non-zero byte"
     );
+    assert!(loss.byte_offset_end <= bytes.len() as u64);
     assert_eq!(
         rec.seg_len, loss.byte_offset_start,
         "truncated to the corrupt head"
@@ -201,27 +208,26 @@ fn mid_log_bit_flip_skips_and_reports_corrupt_body() {
 }
 
 #[test]
-fn zero_window_tail_recovers_no_records_and_reports_a_corrupt_header() {
-    // A valid header then a zero-filled record region: no record decodes (a zero word is not a
-    // valid magic), recovery reports the zeroed span as a corrupt-header skip (the corpus
-    // SkipAndReport verdict), and recovers zero records.
+fn zero_window_tail_recovers_no_records_and_truncates_silently() {
+    // A valid header then an ALL-ZERO record region: exactly the shape a preallocated,
+    // logically-extended active segment leaves when its records never landed (the corpus
+    // UnwrittenZeroTailTruncate verdict). No record decodes (a zero word is never a valid
+    // magic), and recovery truncates the unwritten span SILENTLY: it is provably never-written
+    // space — no frame was ever written there, nothing was acked — so it is NOT a loss event
+    // and nothing is quarantined. (Production preallocates every active segment to the roll
+    // size, so reporting this span would claim up to a whole roll size of "loss" on every
+    // boot and trip the I3 caps for bytes that never held data.)
     let bytes = corpus_bytes("segment_zero_window_tail");
     let rec = recover(&bytes);
     assert_eq!(rec.record_count, 0, "no record decodes from a zero window");
-    let loss = rec.loss.expect("a zero window reports one loss event");
-    assert_eq!(
-        loss.reason_code,
-        ReasonCode::CorruptRecordHeader,
-        "corrupt-header reason"
-    );
-    assert_eq!(
-        loss.byte_offset_end,
-        bytes.len() as u64,
-        "loss ends at the file end"
+    assert!(
+        rec.loss.is_none(),
+        "an all-zero (unwritten) tail is not reported as loss"
     );
     // The live segment is truncated to the header end (no records landed past it).
     assert_eq!(
-        rec.seg_len, loss.byte_offset_start,
+        rec.seg_len,
+        ironbus_core::format::SEGMENT_HEADER_LEN as u64,
         "truncated to the record-region start"
     );
 }

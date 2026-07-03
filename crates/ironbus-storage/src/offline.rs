@@ -7,10 +7,14 @@
 //! it does not truncate a torn tail, roll a sealed segment forward, or create a new segment. It
 //! bounds every read to the durable high-water mark (the longest valid record prefix), so a
 //! torn or unsynced tail past that mark is reported as loss but never read as a record, even
-//! when the file is physically longer. It also does NOT fail closed on excessive loss (the I3
-//! cap that [`crate::log::Log`] recovery enforces): an inspector must be able to show a badly
-//! corrupted directory, not refuse to open it. This backs the offline `peek` / `dump` / `info`
-//! verbs (#92).
+//! when the file is physically longer. The report applies recovery's zero-tail rule
+//! (`docs/PREALLOCATION.md`): the active segment of every cleanly-stopped preallocating broker
+//! ends in a large all-zero logical extension, which is unwritten space (silent, not loss), and
+//! a non-zero tail's reported span is bounded at one past its last non-zero byte — so `verify`
+//! on a healthy stopped directory reports ZERO loss. It also does NOT fail closed on excessive
+//! loss (the I3 cap that [`crate::log::Log`] recovery enforces): an inspector must be able to
+//! show a badly corrupted directory, not refuse to open it. This backs the offline `peek` /
+//! `dump` / `info` verbs (#92).
 
 use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
@@ -103,11 +107,20 @@ impl<F: Filesystem> OfflineReader<F> {
                 .ok_or(StorageError::SegmentFull)?;
             // Only the active (final, unsealed) segment can carry a torn or corrupt tail past
             // its valid prefix; a sealed segment's `valid_end` is its footer start, with no
-            // loss. Record the dropped span exactly as recovery would, but without truncating
-            // it: the bytes stay on disk for an operator to inspect.
+            // loss. Record the dropped span exactly as recovery would — the same zero-tail rule
+            // ([`crate::io::last_nonzero_end`], `docs/PREALLOCATION.md`): an ALL-ZERO tail is the
+            // unwritten remainder of the preallocated logical extension (the NORMAL shape of
+            // EVERY cleanly-stopped broker's active segment, up to a roll size of never-written
+            // zeros), not loss, so it is not reported at all; a non-zero tail's span is bounded
+            // at one past its last non-zero byte. Unlike recovery, nothing is truncated: the
+            // bytes stay on disk for an operator to inspect.
             if is_last && scan.footer.is_none() && scan.valid_end < physical_len {
-                let reason = scan.tail_reason.unwrap_or(ReasonCode::TornTail);
-                loss_report.push(LossEvent::span(id, scan.valid_end, physical_len, 1, reason));
+                let reported_end =
+                    crate::io::last_nonzero_end(&fs.open(&name)?, scan.valid_end, physical_len)?;
+                if reported_end > scan.valid_end {
+                    let reason = scan.tail_reason.unwrap_or(ReasonCode::TornTail);
+                    loss_report.push(LossEvent::span(id, scan.valid_end, reported_end, 1, reason));
+                }
             }
         }
         // With no segments the range is empty; pin earliest to the head so `[earliest, head)` is
@@ -330,14 +343,16 @@ mod tests {
         assert_eq!(records[2].offset, Offset::new(2));
 
         // The dropped span is reported, exactly as recovery would: one torn-tail event in
-        // segment 0 ending at the physical (torn) length.
+        // segment 0. Its end is bounded at one past the tail's last NON-ZERO byte (the shared
+        // zero-tail rule), so it never claims past the physical (torn) length and may exclude
+        // trailing zero bytes of the torn frame.
         let report = reader.loss_report();
         assert_eq!(report.events.len(), 1);
         let e = report.events[0];
         assert_eq!(e.reason_code, ReasonCode::TornTail);
         assert_eq!(e.segment_id, 0);
-        assert_eq!(e.byte_offset_end, torn_len);
-        assert!(e.byte_offset_start < torn_len);
+        assert!(e.byte_offset_end <= torn_len);
+        assert!(e.byte_offset_start < e.byte_offset_end);
 
         // Read-only: the reader did NOT truncate the torn tail (online recovery would have).
         // The file is still its physically-torn length, proving the inspector never wrote.
@@ -351,5 +366,87 @@ mod tests {
             after_len, torn_len,
             "the offline reader must not mutate the file"
         );
+    }
+
+    #[test]
+    fn a_healthy_directory_with_a_preallocated_extension_reports_zero_loss() {
+        // THE `ironbus verify` REGRESSION (perf/r5 review): the production `StdFile::preallocate`
+        // extends the active segment's LOGICAL length to the roll size, so EVERY healthy,
+        // cleanly-stopped broker directory ends in a large all-zero tail. That tail is unwritten
+        // space, not loss: the offline reader (which backs `verify`/`info`/`scrub`) must report
+        // ZERO loss for it — an unbounded report would claim ~a roll size of "data loss" (a
+        // corrupt-header reason, exit 3) for every healthy directory. The in-memory backend
+        // models the reservation only, so the extension is written out for real here with the
+        // same set_len-up the production preallocate performs.
+        let cfg = LogConfig {
+            max_segment_bytes: 4 * 1024 * 1024,
+            ..LogConfig::default()
+        };
+        let mut log = Log::open(InMemoryFs::new(), ManualClock::new(), cfg).unwrap();
+        for i in 0..5u8 {
+            append(&mut log, &[i; 8]);
+        }
+        log.sync().unwrap(); // a clean shutdown: everything acked is synced
+        let head = log.flushed_offset();
+        let fs = log.into_filesystem();
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let valid_end = file.len().unwrap();
+        file.set_len(cfg.max_segment_bytes).unwrap();
+        file.sync_all().unwrap();
+
+        let reader = OfflineReader::open(fs).unwrap();
+        assert!(
+            reader.loss_report().is_empty(),
+            "a healthy stopped directory reports ZERO loss, got {:?}",
+            reader.loss_report().events
+        );
+        assert_eq!(reader.durable_head(), head);
+        assert_eq!(all_records(&reader).len(), 5);
+        // Read-only: the extension is still on disk, untouched.
+        assert_eq!(
+            reader
+                .into_filesystem()
+                .open(&segment_file_name(0))
+                .unwrap()
+                .len()
+                .unwrap(),
+            cfg.max_segment_bytes,
+            "the inspector never truncates"
+        );
+        assert!(valid_end < cfg.max_segment_bytes, "the tail existed");
+    }
+
+    #[test]
+    fn a_torn_byte_inside_a_preallocated_extension_is_reported_bounded_to_its_real_span() {
+        // A non-zero byte after the valid prefix of an EXTENDED active segment is real discarded
+        // data and must be reported — but bounded at one past the last non-zero byte, never to
+        // the roll-size file length (which would inflate one torn byte into megabytes of
+        // reported "loss").
+        let cfg = LogConfig {
+            max_segment_bytes: 4 * 1024 * 1024,
+            ..LogConfig::default()
+        };
+        let mut log = Log::open(InMemoryFs::new(), ManualClock::new(), cfg).unwrap();
+        append(&mut log, b"durable!");
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let valid_end = file.len().unwrap();
+        file.write_all_at(&[0xAB], valid_end).unwrap();
+        file.set_len(cfg.max_segment_bytes).unwrap();
+        file.sync_all().unwrap();
+
+        let reader = OfflineReader::open(fs).unwrap();
+        assert_eq!(reader.durable_head(), Offset::new(1));
+        let report = reader.loss_report();
+        assert_eq!(report.events.len(), 1, "the torn byte is reported");
+        let e = report.events[0];
+        assert_eq!(e.byte_offset_start, valid_end);
+        assert_eq!(
+            e.byte_offset_end,
+            valid_end + 1,
+            "the span is the ONE written byte, not the extension"
+        );
+        assert_eq!(e.bytes_skipped, 1);
     }
 }

@@ -74,14 +74,21 @@ fn disk_with_segment0(bytes: &[u8]) -> InMemoryFs {
 
 /// A segment-0 image whose LAST record's body CRC is flipped, so recovery recovers the first `n-1`
 /// records and reports a `CorruptRecordBody` over the last frame (the corpus `flipped_record_body_crc`
-/// case). Returns the bytes and the last frame's [start, end) span.
+/// case). Returns the bytes and the REPORTED [start, end) span of the discarded frame: the end is
+/// bounded at one past the frame's last NON-ZERO byte (the zero-tail rule, `docs/PREALLOCATION.md`)
+/// — recovery reports, and quarantine captures, exactly that span, never trailing zeros (which on a
+/// preallocated, logically-extended segment would be a whole roll size of never-written bytes).
 fn corrupt_body_segment(n: u64) -> (Vec<u8>, usize, usize) {
     let good = good_unsealed_segment(n);
     let last_start = frame_start(n - 1);
     let mut bytes = good.clone();
     // Flip a byte in the last record's payload: passes the header CRC, fails the body CRC.
     bytes[last_start + RECORD_HEADER_LEN] ^= 0x01;
-    let end = bytes.len();
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(last_start, |i| i + 1);
+    assert!(end > last_start, "the corrupt frame has a non-zero byte");
     (bytes, last_start, end)
 }
 

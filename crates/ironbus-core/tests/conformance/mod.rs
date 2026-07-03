@@ -95,8 +95,20 @@ pub enum Verdict {
     /// loss tuple is what recovery would emit when it truncates to the prior intact boundary.
     TornTruncate(LossTuple),
     /// `decode` returns a corruption error recovery turns into a skip-and-report with this
-    /// loss tuple (a mid-log single-bit flip, a zero-window tail, etc.).
+    /// loss tuple (a mid-log single-bit flip of real record bytes, etc.).
     SkipAndReport(LossTuple),
+    /// `decode` at `start` fails with a header-class error because every byte from `start` to
+    /// the file end is ZERO: the unwritten tail of a preallocated, logically-extended segment
+    /// (the shape every crashed preallocated active segment leaves). Recovery truncates the
+    /// all-zero span SILENTLY — a zero word is never a valid frame magic, so the span provably
+    /// never held a written frame, and reporting up to a roll size of never-written zeros as
+    /// loss (or quarantining them) on every boot would trip the bounded-loss caps for bytes
+    /// that were never acked data. Unlike [`Verdict::SkipAndReport`] there is NO loss tuple to
+    /// emit; the storage-side conformance gate asserts the silence.
+    UnwrittenZeroTailTruncate {
+        /// The byte offset within the fixture where the unwritten all-zero span begins.
+        start: u64,
+    },
     /// `decode` rejects the frame fail-closed (a newer-version record a v1 reader refuses).
     FailClosedReject(DecodeError),
 }
@@ -574,21 +586,23 @@ pub fn corpus() -> Vec<Fixture> {
     }
 
     // --- A zero-window (preallocated / zero-filled) tail. ---------------------------------
-    // The record region is entirely zero-filled, modelling a freshly preallocated segment whose
-    // records never landed. A zero word is not a valid record magic: decode at the region start
-    // -> BadMagic, recovery -> CorruptRecordHeader over the zeroed bytes (zero records recovered).
+    // The record region is entirely zero-filled: exactly the shape a preallocated, logically
+    // extended active segment leaves when its records never landed. A zero word is not a valid
+    // record magic, so decode at the region start -> BadMagic and the scan stops there (zero
+    // records recovered); recovery then truncates the provably-unwritten all-zero span SILENTLY
+    // (no loss report, nothing quarantined) — it never held a written frame, and production
+    // preallocates every active segment this way, so reporting it would claim a roll size of
+    // "loss" on every boot.
     {
         let mut bytes = corpus_segment_header().encode().to_vec();
         bytes.resize(SEGMENT_HEADER_LEN + 256, 0);
         out.push(Fixture {
             name: "segment_zero_window_tail",
             freeze: Freeze::RawBytes,
-            description: "Zero-window tail: a valid header then a zero-filled (preallocated) record region; no record decodes, recovery reports the zeroed span as a corrupt-header skip.",
-            verdict: Verdict::SkipAndReport(LossTuple {
-                reason: ReasonCode::CorruptRecordHeader,
+            description: "Zero-window tail: a valid header then an all-zero (preallocated, logically extended) record region; no record decodes, and recovery truncates the unwritten span silently (no loss report).",
+            verdict: Verdict::UnwrittenZeroTailTruncate {
                 start: SEGMENT_HEADER_LEN as u64,
-                end: bytes.len() as u64,
-            }),
+            },
             bytes,
         });
     }
