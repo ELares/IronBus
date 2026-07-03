@@ -413,7 +413,7 @@ fn pace(rate_hz: Option<f64>, seq: u64, started: Instant) {
     }
 }
 
-/// The AUTO-PIPELINING DURABLE publish leg (#508), split from [`run_publish`]: drive
+/// The AUTO-PIPELINING DURABLE publish loop (#508), one CONNECTION's leg of [`run_publish`]: drive
 /// [`Client::pipelined_producer_with_window`], the default single-producer durable-throughput lever.
 /// The handle buffers a window of at-least-once publishes and flushes them as ONE group-committed
 /// batch, so a SINGLE producer keeps the window in flight and the broker collapses it under one
@@ -424,9 +424,16 @@ fn pace(rate_hz: Option<f64>, seq: u64, started: Instant) {
 ///
 /// Per-op time is attributed across each flushed window evenly (one fdatasync covers the window), so
 /// the reported fsync cost honestly reflects the group-commit amortization, exactly as the
-/// half-duplex `--pubwindow` path does.
-fn run_publish_autopipe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
-    let mut pub_client = connect(addr)?;
+/// half-duplex `--pubwindow` path does. Returns this leg's `(produced, samples)` tallies.
+fn publish_autopipe_loop(
+    cfg: &BenchConfig,
+    client: &mut Client,
+    addr: &str,
+    bound: Bound,
+    rate_hz: Option<f64>,
+    seq_base: u64,
+    started: Instant,
+) -> Result<(u64, Vec<u64>), CliError> {
     // A bare `--autopipe` (pubwindow left at its unpipelined default of 1) still pipelines: use the
     // client's default window so the throughput lever actually engages.
     let window = if cfg.pub_window > 1 {
@@ -436,22 +443,17 @@ fn run_publish_autopipe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, Cl
     };
     let mut payload = vec![0u8; cfg.payload_bytes];
     let mut produced: u64 = 0;
-    let mut fsync_samples: Vec<u64> = Vec::new();
-    let started = Instant::now();
-    let mut pipe = pub_client.pipelined_producer_with_window(window);
+    let mut samples: Vec<u64> = Vec::new();
+    let mut pipe = client.pipelined_producer_with_window(window);
     // Time each flush across the publishes it made durable: a flush issues ONE write whose covering
     // group commit is one fdatasync, so dividing the flush's wall time across its publishes gives an
     // honest per-op durable cost (the same attribution the `--pubwindow` half-duplex path uses).
     let mut window_start = Instant::now();
     let mut window_count: u64 = 0;
-    while !should_stop(&cfg.bound, produced, started) {
-        fill_payload(
-            &mut payload,
-            cfg.payload_shape,
-            produced,
-            ROUND_TRIP_TOKEN_LEN,
-        );
-        stamp_seq(&mut payload, produced);
+    while !should_stop(&bound, produced, started) {
+        let seq = seq_base + produced;
+        fill_payload(&mut payload, cfg.payload_shape, seq, ROUND_TRIP_TOKEN_LEN);
+        stamp_seq(&mut payload, seq);
         let body = PubBody {
             flags: 0,
             timestamp_ms: 0,
@@ -466,39 +468,26 @@ fn run_publish_autopipe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, Cl
             // A non-empty summary means this publish filled the window and triggered a flush: the
             // window's publishes are now durable. Attribute the flush's elapsed time across them.
             Ok(summary) if summary.acked > 0 => {
-                attribute_window(&mut fsync_samples, &mut window_start, &mut window_count);
+                attribute_window(&mut samples, &mut window_start, &mut window_count);
             }
             Ok(_) => {} // buffered only; its flush is timed when the window fills (or at finish).
             Err(e) if is_shed(&e) => {
-                attribute_window(&mut fsync_samples, &mut window_start, &mut window_count);
+                attribute_window(&mut samples, &mut window_start, &mut window_count);
             }
             Err(e) => return Err(classify(addr, "auto-pipelining a produce to", &e)),
         }
         produced += 1;
-        pace(cfg.target_rate_hz, produced, started);
+        pace(rate_hz, produced, started);
     }
     // Drain the buffered tail: its flush makes the remaining publishes durable.
     match pipe.finish() {
-        Ok(_) => attribute_window(&mut fsync_samples, &mut window_start, &mut window_count),
+        Ok(_) => attribute_window(&mut samples, &mut window_start, &mut window_count),
         Err(e) if is_shed(&e) => {
-            attribute_window(&mut fsync_samples, &mut window_start, &mut window_count);
+            attribute_window(&mut samples, &mut window_start, &mut window_count);
         }
         Err(e) => return Err(classify(addr, "flushing the auto-pipelined tail to", &e)),
     }
-    let elapsed = started.elapsed();
-    // The flush attribution is amortized across the window, so no per-op ack RTT is claimed.
-    Ok(finish_report(
-        cfg,
-        produced,
-        produced,
-        &[],
-        &fsync_samples,
-        elapsed,
-        SampleAttribution {
-            fsync_measured: cfg.fsync_is_measured(),
-            acks_awaited: false,
-        },
-    ))
+    Ok((produced, samples))
 }
 
 /// Attributes one flushed window's elapsed wall time evenly across the publishes it covered, pushing
@@ -518,30 +507,40 @@ fn attribute_window(samples: &mut Vec<u64>, window_start: &mut Instant, window_c
     *window_start = Instant::now();
 }
 
-/// The FULL-DUPLEX publish leg (#458), split from [`run_publish`]: one `produce_stream` call
-/// pumps the whole run, writer and ack-reader overlapped, in-flight capped at the window.
-fn run_publish_stream(
+/// The FULL-DUPLEX publish loop (#458), one CONNECTION's leg of [`run_publish`]: one
+/// `produce_stream` call pumps the whole leg, writer and ack-reader overlapped, in-flight capped
+/// at the window. Returns this leg's `(produced, samples)` tallies; the sample set is EMPTY (no
+/// per-produce fsync attribution: the overlap makes a per-message share dishonest, and no per-op
+/// ack RTT is claimed either).
+fn publish_stream_loop(
     cfg: &BenchConfig,
-    pub_client: &mut Client,
+    client: &mut Client,
     addr: &str,
+    bound: Bound,
+    seq_base: u64,
     started: Instant,
-) -> Result<BenchReport, CliError> {
+) -> Result<(u64, Vec<u64>), CliError> {
     // The FULL-DUPLEX sliding window (#458): one produce_stream call pumps the whole run,
     // writer and ack-reader overlapped, in-flight capped at the window. Payloads come from a
     // pool of `window` DISTINCT pre-filled buffers cycled by sequence: the pool slots cannot
     // be re-stamped per message (they may still be borrowed by the in-flight encoder), and
     // publish mode never reads payloads back, so the seq/send-time stamps the half-duplex
     // path embeds would be dead bytes here anyway. Entropy honesty matches the windowed
-    // path's working set: `window` distinct realistic payloads in rotation.
+    // path's working set: `window` distinct realistic payloads in rotation, seeded from this
+    // leg's `seq_base` so concurrent legs never rotate identical pools (#1040).
     let mut pool: Vec<Vec<u8>> = vec![vec![0u8; cfg.payload_bytes]; cfg.pub_window];
     for (i, buf) in pool.iter_mut().enumerate() {
-        fill_payload(buf, cfg.payload_shape, i as u64, ROUND_TRIP_TOKEN_LEN);
+        fill_payload(
+            buf,
+            cfg.payload_shape,
+            seq_base + i as u64,
+            ROUND_TRIP_TOKEN_LEN,
+        );
     }
     let pool = &pool;
-    let bound = &cfg.bound;
     let mut seq: u64 = 0;
     let messages = std::iter::from_fn(move || {
-        if should_stop(bound, seq, started) {
+        if should_stop(&bound, seq, started) {
             return None;
         }
         let body = PubBody {
@@ -556,45 +555,44 @@ fn run_publish_stream(
         seq += 1;
         Some(body)
     });
-    let summary = pub_client
+    let summary = client
         .produce_stream(messages, cfg.pub_window)
         .map_err(|e| classify(addr, "streaming produces to", &e))?;
-    let produced = summary.acked;
-    let elapsed = started.elapsed();
-    // No per-produce fsync attribution: the overlap makes a per-message share dishonest, so
-    // the histogram stays empty, the report's fsync_measured flag is forced off, and no per-op
-    // ack RTT is claimed either.
-    Ok(finish_report(
-        cfg,
-        produced,
-        produced,
-        &[],
-        &[],
-        elapsed,
-        SampleAttribution {
-            fsync_measured: false,
-            acks_awaited: false,
-        },
-    ))
+    Ok((summary.acked, Vec::new()))
 }
 
-/// The AT-MOST-ONCE publish leg (QoS-0, the #11 fast path), split from [`run_publish`]: drive
-/// [`Client::produce_fire_and_forget`] as fast as the bound/rate allow. No `PubAck` is awaited (the
-/// broker may even drop a send under its fire-and-forget token bucket by contract), so there is no
-/// durable-write cost to attribute and no read-back latency: the report's fsync cost is forced
-/// not-measured and the latency fields stay `None`, exactly like the memory backend. This is the
-/// matched analog to a core fire-and-forget pub on a routing broker (e.g. NATS core `nats bench
-/// pub`), which likewise writes without awaiting an ack.
-fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
-    let mut pub_client = connect(addr)?;
+/// The AT-MOST-ONCE publish loop (QoS-0, the #11 fast path), one CONNECTION's leg of
+/// [`run_publish`]: drive [`Client::produce_fire_and_forget`] as fast as the bound/rate allow. No
+/// `PubAck` is awaited (the broker may even drop a send under its fire-and-forget token bucket by
+/// contract), so there is no durable-write cost to attribute and no read-back latency: the
+/// report's fsync cost is forced not-measured and the latency fields stay `None`, exactly like the
+/// memory backend. This is the matched analog to a core fire-and-forget pub on a routing broker
+/// (e.g. NATS core `nats bench pub`), which likewise writes without awaiting an ack. Returns this
+/// leg's `(produced, samples)` tallies (the sample set is always empty here).
+fn publish_faf_loop(
+    cfg: &BenchConfig,
+    client: &mut Client,
+    addr: &str,
+    bound: Bound,
+    rate_hz: Option<f64>,
+    seq_base: u64,
+    started: Instant,
+) -> Result<(u64, Vec<u64>), CliError> {
     // ONE realistic-shaped payload, filled once and reused for every send. The realistic fill is
     // independent of sequence (only the round-trip token region would vary by seq, and a
     // fire-and-forget send is never read back, so that region is dead bytes here), so a single
     // buffer is byte-equivalent to re-filling per message AND matches how a core-pub benchmark
     // drives its broker (a fixed payload). Filling once keeps the loop measuring the PURE
-    // at-most-once send rate, not a per-message refill the peer does not pay either.
+    // at-most-once send rate, not a per-message refill the peer does not pay either. The fill is
+    // seeded at this leg's `seq_base` so concurrent `--payload-shape random` legs do not all send
+    // the same bytes (#1040); at `--producers 1` the base is 0, the historical seed.
     let mut payload = vec![0u8; cfg.payload_bytes];
-    fill_payload(&mut payload, cfg.payload_shape, 0, ROUND_TRIP_TOKEN_LEN);
+    fill_payload(
+        &mut payload,
+        cfg.payload_shape,
+        seq_base,
+        ROUND_TRIP_TOKEN_LEN,
+    );
     let body = PubBody {
         flags: 0,
         timestamp_ms: 0,
@@ -607,144 +605,355 @@ fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliErro
         payload: &payload,
     };
     let mut produced: u64 = 0;
-    let started = Instant::now();
     // COALESCING at-most-once producer (#11 fast path): each publish is framed into the producer's wire
     // buffer and flushed to the socket with ONE `write_all` at 32 KiB boundaries, instead of one write
     // syscall per message — the same coalescing a core pub client (e.g. NATS `nats bench pub`) performs.
     // This is what makes the QoS-0 send rate a fair head-to-head with a coalescing core pub rather than
     // a self-handicapped syscall-per-message loop.
-    let mut faf_producer = pub_client.fire_and_forget_producer();
-    while !should_stop(&cfg.bound, produced, started) {
+    let mut faf_producer = client.fire_and_forget_producer();
+    while !should_stop(&bound, produced, started) {
         // No reply is read (the broker sends no PubAck for a fire-and-forget produce); TCP backpressure
         // is the only pacing when the broker falls behind. An IO/encode error is fatal (frozen codes).
         faf_producer
             .send(&body)
             .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
         produced += 1;
-        pace(cfg.target_rate_hz, produced, started);
+        pace(rate_hz, produced, started);
     }
-    // Push the final partial batch before stopping the clock so every counted message is on the wire.
+    // Push the final partial batch before the leg's clock stops so every counted message is on the
+    // wire.
     faf_producer
         .flush()
         .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
-    let elapsed = started.elapsed();
-    // At-most-once: no ack and no read-back, so no latency, no durable-write cost to attribute
-    // (the broker may even have shed sends under its token bucket), and certainly no ack RTT.
-    // fsync is forced not-measured.
-    Ok(finish_report(
-        cfg,
+    Ok((produced, Vec::new()))
+}
+
+/// The PIPELINED-WINDOW publish loop (#450), one CONNECTION's leg of [`run_publish`]: fill W
+/// distinct payload buffers, write all W PUB frames before awaiting any ack
+/// (`Client::produce_window`), and attribute the window's elapsed time evenly across its messages,
+/// so the per-op fsync-cost sample reflects the group-commit amortization honestly (one fdatasync
+/// covers the whole window). Returns this leg's `(produced, samples)` tallies.
+fn publish_window_loop(
+    cfg: &BenchConfig,
+    client: &mut Client,
+    addr: &str,
+    bound: Bound,
+    rate_hz: Option<f64>,
+    seq_base: u64,
+    started: Instant,
+) -> Result<(u64, Vec<u64>), CliError> {
+    let mut buffers: Vec<Vec<u8>> = vec![vec![0u8; cfg.payload_bytes]; cfg.pub_window];
+    let mut produced: u64 = 0;
+    let mut samples: Vec<u64> = Vec::new();
+    while !should_stop(&bound, produced, started) {
+        let want = match bound {
+            Bound::Count(n) => usize::try_from(n.saturating_sub(produced)).unwrap_or(usize::MAX),
+            Bound::Duration(_) => cfg.pub_window,
+        }
+        .min(cfg.pub_window);
+        if want == 0 {
+            break;
+        }
+        for (i, buf) in buffers.iter_mut().enumerate().take(want) {
+            let seq = seq_base + produced + i as u64;
+            fill_payload(buf, cfg.payload_shape, seq, ROUND_TRIP_TOKEN_LEN);
+            stamp_seq(buf, seq);
+            stamp_send_time(buf, started);
+        }
+        let window: Vec<PubBody<'_>> = buffers
+            .iter()
+            .take(want)
+            .map(|buf| PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: buf,
+            })
+            .collect();
+        let call_start = Instant::now();
+        match client.produce_window(&window) {
+            Ok(_) => {}
+            Err(e) if is_shed(&e) => {}
+            Err(e) => return Err(classify(addr, "producing a window to", &e)),
+        }
+        let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let per_msg = elapsed_ns / want as u64;
+        for _ in 0..want {
+            samples.push(per_msg);
+        }
+        produced += want as u64;
+        pace(rate_hz, produced, started);
+    }
+    Ok((produced, samples))
+}
+
+/// The plain AWAITED publish loop, one CONNECTION's leg of [`run_publish`]: one `produce` per
+/// message, each individually awaited, so every sample is an honest produce-to-ack RTT (#1024)
+/// and, through the per-ack durable disk path, an honest per-op fsync cost. Returns this leg's
+/// `(produced, samples)` tallies.
+fn publish_plain_loop(
+    cfg: &BenchConfig,
+    client: &mut Client,
+    addr: &str,
+    bound: Bound,
+    rate_hz: Option<f64>,
+    seq_base: u64,
+    started: Instant,
+) -> Result<(u64, Vec<u64>), CliError> {
+    let mut payload = vec![0u8; cfg.payload_bytes];
+    let mut produced: u64 = 0;
+    let mut samples: Vec<u64> = Vec::new();
+    while !should_stop(&bound, produced, started) {
+        let seq = seq_base + produced;
+        fill_payload(&mut payload, cfg.payload_shape, seq, ROUND_TRIP_TOKEN_LEN);
+        stamp_seq(&mut payload, seq);
+        samples.push(produce_one(client, addr, &mut payload, started)?);
+        produced += 1;
+        pace(rate_hz, produced, started);
+    }
+    Ok((produced, samples))
+}
+
+/// The raw tallies of ONE publish connection's produce loop (#1040): what the leg produced, its
+/// per-produce-call samples, and its own start/finish instants, so the multi-producer driver can
+/// compute the whole-phase wall time (start-of-first to end-of-last) and merge the sample sets.
+/// `--producers 1` runs exactly one leg and reports ITS window, so the historical single-connection
+/// measurement semantics (clock starts after the connect, stops after the last send/flush) are
+/// unchanged — pinned by `a_single_leg_aggregates_to_its_own_window_so_producers_1_is_unchanged`.
+struct PublishLeg {
+    /// Messages this connection successfully appended.
+    produced: u64,
+    /// Per-produce-call samples in nanoseconds: one awaited RTT per produce on the plain path,
+    /// window-amortized shares on the pipelined paths, empty on stream/fire-and-forget — exactly
+    /// what the matching single-connection path has always recorded.
+    samples: Vec<u64>,
+    /// When this leg's produce loop started (right after its own connect).
+    started: Instant,
+    /// When this leg finished (after its last send, final flush included).
+    finished: Instant,
+}
+
+/// Runs ONE publisher connection end to end (#1040): connect, then drive the configured publish
+/// shape (plain awaited / pipelined window / full-duplex stream / auto-pipelined /
+/// fire-and-forget) against `bound` at `rate_hz`, seeding payload entropy from `seq_base` so
+/// concurrent legs never emit identical byte streams. This is THE single-connection publish path:
+/// `--producers 1` runs exactly one leg inline and `--producers N` runs N of them on threads, so
+/// the two can never drift in shape.
+fn run_publish_leg(
+    cfg: &BenchConfig,
+    addr: &str,
+    bound: Bound,
+    rate_hz: Option<f64>,
+    seq_base: u64,
+) -> Result<PublishLeg, CliError> {
+    let mut client = connect(addr)?;
+    // The leg's measurement window: from here (connect excluded, exactly the historical clock
+    // start) to after the loop's last send/flush.
+    let started = Instant::now();
+    let (produced, samples) = if cfg.fire_and_forget {
+        publish_faf_loop(cfg, &mut client, addr, bound, rate_hz, seq_base, started)?
+    } else if cfg.auto_pipeline {
+        publish_autopipe_loop(cfg, &mut client, addr, bound, rate_hz, seq_base, started)?
+    } else if cfg.stream && cfg.pub_window > 1 {
+        publish_stream_loop(cfg, &mut client, addr, bound, seq_base, started)?
+    } else if cfg.pub_window > 1 {
+        publish_window_loop(cfg, &mut client, addr, bound, rate_hz, seq_base, started)?
+    } else {
+        publish_plain_loop(cfg, &mut client, addr, bound, rate_hz, seq_base, started)?
+    };
+    Ok(PublishLeg {
         produced,
-        produced,
-        &[],
-        &[],
-        elapsed,
+        samples,
+        started,
+        finished: Instant::now(),
+    })
+}
+
+/// The honest [`SampleAttribution`] for the configured SINGLE-CONNECTION publish shape — exactly
+/// the per-path flags the pre-#1040 split functions passed: stream and fire-and-forget attribute
+/// nothing (overlap / no ack at all), autopipe attributes the amortized fsync cost but no per-op
+/// ack RTT, and the plain/windowed paths follow [`BenchConfig::fsync_is_measured`] /
+/// [`BenchConfig::publish_acks_are_awaited`]. Pinned against those historical flags by
+/// `publish_attribution_matches_the_historical_per_path_flags`.
+fn publish_attribution(cfg: &BenchConfig) -> SampleAttribution {
+    if cfg.fire_and_forget || (cfg.stream && cfg.pub_window > 1) {
         SampleAttribution {
             fsync_measured: false,
             acks_awaited: false,
-        },
-    ))
+        }
+    } else if cfg.auto_pipeline {
+        SampleAttribution {
+            fsync_measured: cfg.fsync_is_measured(),
+            acks_awaited: false,
+        }
+    } else {
+        SampleAttribution {
+            fsync_measured: cfg.fsync_is_measured(),
+            acks_awaited: cfg.publish_acks_are_awaited(),
+        }
+    }
+}
+
+/// The [`SampleAttribution`] for a MULTI-PRODUCER publish (#1040): the per-shape flags, with the
+/// per-op fsync attribution FORCED OFF. Concurrent connections share covering group-commit fsyncs
+/// (the broker gathers windows from many connections under one fdatasync), so a per-op durable
+/// share would double-count the shared fsync — dishonest for the same reason the overlapped
+/// single-connection paths withhold it. `acks_awaited` is kept as-is: each plain-path sample is a
+/// self-contained produce-to-ack RTT of one individually-awaited produce on its own connection, so
+/// MERGING the legs' sample sets is honest (no sample divides a shared quantity; the union is the
+/// exact distribution of every awaited produce in the phase).
+fn multi_publish_attribution(cfg: &BenchConfig) -> SampleAttribution {
+    SampleAttribution {
+        fsync_measured: false,
+        ..publish_attribution(cfg)
+    }
 }
 
 /// PUBLISH mode: append at the bound/rate, measuring produce-side throughput and bytes/op. Latency
-/// is not measured (no read-back), so the latency fields stay `None`.
+/// is not measured (no read-back), so the latency fields stay `None`. `--producers 1` (the
+/// default) runs the historical single connection inline; `--producers N` (#1040) runs N
+/// independent connections concurrently — the multi-connection load the pipelined sync tier needs
+/// to fill its overlap window, which the design spec proved a single connection cannot.
 fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
-    if cfg.fire_and_forget {
-        return run_publish_faf(cfg, addr);
+    if cfg.producers > 1 {
+        return run_publish_multi(cfg, addr);
     }
-    if cfg.auto_pipeline {
-        return run_publish_autopipe(cfg, addr);
-    }
-    let mut pub_client = connect(addr)?;
-    let mut payload = vec![0u8; cfg.payload_bytes];
-    let mut produced: u64 = 0;
-    let mut fsync_samples: Vec<u64> = Vec::new();
-    let started = Instant::now();
-    if cfg.stream && cfg.pub_window > 1 {
-        return run_publish_stream(cfg, &mut pub_client, addr, started);
-    }
-    if cfg.pub_window > 1 {
-        // The PIPELINED window (#450): fill W distinct payload buffers, write all W PUB frames
-        // before awaiting any ack (Client::produce_window), and attribute the window's elapsed
-        // time evenly across its messages, so the per-op fsync-cost sample reflects the
-        // group-commit amortization honestly (one fdatasync covers the whole window).
-        let mut buffers: Vec<Vec<u8>> = vec![vec![0u8; cfg.payload_bytes]; cfg.pub_window];
-        while !should_stop(&cfg.bound, produced, started) {
-            let want = match &cfg.bound {
-                Bound::Count(n) => {
-                    usize::try_from(n.saturating_sub(produced)).unwrap_or(usize::MAX)
-                }
-                Bound::Duration(_) => cfg.pub_window,
-            }
-            .min(cfg.pub_window);
-            if want == 0 {
+    let leg = run_publish_leg(cfg, addr, cfg.bound, cfg.target_rate_hz, 0)?;
+    // Publish has no read-back, so no end-to-end latency; the per-produce samples carry the fsync
+    // cost and/or the #1024 ack RTTs exactly as the shape's attribution allows.
+    let elapsed = leg.finished.duration_since(leg.started);
+    Ok(finish_report(
+        cfg,
+        leg.produced,
+        leg.produced,
+        &[],
+        &leg.samples,
+        elapsed,
+        publish_attribution(cfg),
+    ))
+}
+
+/// The per-producer payload-entropy stride (#1040): leg `i` seeds its payload fills from sequence
+/// `i << 40`, so concurrent legs never share a fill sequence even under a duration bound whose
+/// per-leg count is unknown up front. 2^40 messages per leg is far beyond any bounded bench run,
+/// and leg 0's base is 0, the historical single-connection seed.
+const PRODUCER_SEQ_STRIDE_BITS: u32 = 40;
+
+/// The MULTI-PRODUCER publish driver (#1040): N INDEPENDENT client connections, each its own OS
+/// thread running the same single-connection [`run_publish_leg`] with the configured
+/// `--pubwindow`/`--stream` shape (threads, not async tasks: the bench client is the synchronous
+/// `ironbus-client`, exactly like the round-trip producer thread). One broker, N client
+/// connections; the spawned-broker lifecycle is untouched. A `--count` bound is split evenly
+/// across the legs (remainder to the first); a `--duration` bound runs every leg for the full
+/// window; the global `--rate` is split evenly so the configured AGGREGATE arrival rate is
+/// preserved. The aggregate throughput divides total messages by the WHOLE-PHASE wall time —
+/// start-of-first leg to end-of-last leg — so a straggler honestly stretches the denominator
+/// instead of being averaged away.
+///
+/// PERCENTILE MERGING: the #1024 ack-RTT sample sets are MERGED by concatenation before the
+/// percentile pass (see [`multi_publish_attribution`] for why that is honest, and why the per-op
+/// fsync attribution is NOT and is forced off instead).
+fn run_publish_multi(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
+    let producers = u64::try_from(cfg.producers).unwrap_or(u64::MAX);
+    let shares: Vec<Bound> = match cfg.bound {
+        Bound::Count(n) => split_count(n, producers)
+            .into_iter()
+            .map(Bound::Count)
+            .collect(),
+        Bound::Duration(d) => vec![Bound::Duration(d); cfg.producers],
+    };
+    // Split the GLOBAL --rate evenly: N legs each pacing at the full rate would multiply the
+    // offered load by N, silently changing what the flag means.
+    #[allow(clippy::cast_precision_loss)]
+    let rate_share = cfg.target_rate_hz.map(|hz| hz / cfg.producers as f64);
+    let mut handles = Vec::with_capacity(cfg.producers);
+    let mut spawn_failure: Option<CliError> = None;
+    for (i, share) in shares.into_iter().enumerate() {
+        let leg_cfg = cfg.clone();
+        let leg_addr = addr.to_string();
+        let seq_base = u64::try_from(i).unwrap_or(u64::MAX) << PRODUCER_SEQ_STRIDE_BITS;
+        match std::thread::Builder::new()
+            .name(format!("ironbus-bench-pub-{i}"))
+            .spawn(move || run_publish_leg(&leg_cfg, &leg_addr, share, rate_share, seq_base))
+        {
+            Ok(handle) => handles.push(handle),
+            Err(e) => {
+                // Stop spawning; the already-running legs are joined below (each is bounded, so
+                // the join is too) and the spawn failure is reported once they drain.
+                spawn_failure = Some(CliError::Internal(format!(
+                    "bench: cannot spawn producer thread {i}: {e}"
+                )));
                 break;
             }
-            for (i, buf) in buffers.iter_mut().enumerate().take(want) {
-                let seq = produced + i as u64;
-                fill_payload(buf, cfg.payload_shape, seq, ROUND_TRIP_TOKEN_LEN);
-                stamp_seq(buf, seq);
-                stamp_send_time(buf, started);
-            }
-            let window: Vec<PubBody<'_>> = buffers
-                .iter()
-                .take(want)
-                .map(|buf| PubBody {
-                    flags: 0,
-                    timestamp_ms: 0,
-                    key: b"",
-                    headers: b"",
-                    dedup: None,
-                    fire_and_forget: false,
-                    payload: buf,
-                })
-                .collect();
-            let call_start = Instant::now();
-            match pub_client.produce_window(&window) {
-                Ok(_) => {}
-                Err(e) if is_shed(&e) => {}
-                Err(e) => return Err(classify(addr, "producing a window to", &e)),
-            }
-            let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let per_msg = elapsed_ns / want as u64;
-            for _ in 0..want {
-                fsync_samples.push(per_msg);
-            }
-            produced += want as u64;
-            pace(cfg.target_rate_hz, produced, started);
-        }
-    } else {
-        while !should_stop(&cfg.bound, produced, started) {
-            fill_payload(
-                &mut payload,
-                cfg.payload_shape,
-                produced,
-                ROUND_TRIP_TOKEN_LEN,
-            );
-            stamp_seq(&mut payload, produced);
-            let produce_ns = produce_one(&mut pub_client, addr, &mut payload, started)?;
-            fsync_samples.push(produce_ns);
-            produced += 1;
-            pace(cfg.target_rate_hz, produced, started);
         }
     }
-    let elapsed = started.elapsed();
-    // Publish has no read-back, so no end-to-end latency; but the per-produce durable cost IS
-    // measured (the produce call returns after the fdatasync), so the fsync cost is honest unless
-    // --no-fsync batched the checkpoints. The ack RTT percentiles (#1024) are claimed only on the
-    // plain awaited-per-produce path (`--pubwindow 1`), never from the windowed loop's amortized
-    // per-op shares.
+    // Join EVERY spawned leg before reporting any failure, so no leg is left producing against a
+    // broker the caller is about to tear down.
+    let mut legs: Vec<PublishLeg> = Vec::with_capacity(handles.len());
+    let mut leg_failure: Option<CliError> = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(leg)) => legs.push(leg),
+            Ok(Err(e)) => leg_failure = leg_failure.or(Some(e)),
+            Err(_) => {
+                leg_failure = leg_failure.or_else(|| {
+                    Some(CliError::Internal(
+                        "bench: a producer thread panicked".to_string(),
+                    ))
+                });
+            }
+        }
+    }
+    if let Some(e) = spawn_failure.or(leg_failure) {
+        return Err(e);
+    }
+    let (produced, samples, wall) = aggregate_legs(&legs);
     Ok(finish_report(
         cfg,
         produced,
         produced,
         &[],
-        &fsync_samples,
-        elapsed,
-        SampleAttribution {
-            fsync_measured: cfg.fsync_is_measured(),
-            acks_awaited: cfg.publish_acks_are_awaited(),
-        },
+        &samples,
+        wall,
+        multi_publish_attribution(cfg),
     ))
+}
+
+/// Splits a `--count` bound evenly across `producers` legs, the REMAINDER ON THE FIRST (#1040), so
+/// the shares always sum to the exact requested count. Pure so the invariant is unit-tested
+/// directly (`count_split_is_even_with_the_remainder_on_the_first`).
+fn split_count(total: u64, producers: u64) -> Vec<u64> {
+    let producers = producers.max(1);
+    let per = total / producers;
+    let rem = total % producers;
+    (0..producers)
+        .map(|i| per + if i == 0 { rem } else { 0 })
+        .collect()
+}
+
+/// Aggregates the per-leg tallies into the whole-phase totals (#1040): total produced, the MERGED
+/// per-produce sample set (plain concatenation — each sample is a self-contained per-call
+/// measurement, see [`multi_publish_attribution`]), and the whole-phase wall time from the FIRST
+/// leg to start to the LAST leg to finish. For a single leg this is exactly that leg's own
+/// produced count, sample set, and started-to-finished window, so `--producers 1` keeps the
+/// historical single-connection measurement semantics. Pure so both properties are unit-tested.
+fn aggregate_legs(legs: &[PublishLeg]) -> (u64, Vec<u64>, Duration) {
+    let produced = legs.iter().map(|l| l.produced).sum();
+    let mut samples: Vec<u64> = Vec::with_capacity(legs.iter().map(|l| l.samples.len()).sum());
+    for leg in legs {
+        samples.extend_from_slice(&leg.samples);
+    }
+    let wall = match (
+        legs.iter().map(|l| l.started).min(),
+        legs.iter().map(|l| l.finished).max(),
+    ) {
+        (Some(first), Some(last)) => last.duration_since(first),
+        _ => Duration::ZERO,
+    };
+    (produced, samples, wall)
 }
 
 /// SUBSCRIBE mode: pre-populate the queue (count is known) then drain it via the synthetic group,
@@ -1486,6 +1695,176 @@ mod tests {
             line.contains("durability_level=sync") && line.contains("power_loss_safe=true"),
             "the default bench broker stays on the power-loss-safe sync tier: {line}"
         );
+    }
+
+    #[test]
+    fn a_single_leg_aggregates_to_its_own_window_so_producers_1_is_unchanged() {
+        // The #1040 determinism pin: aggregating ONE leg yields exactly that leg's own produced
+        // count, its own sample set, and its own started-to-finished window — the historical
+        // single-connection measurement semantics (clock after connect, stop after the last
+        // send/flush). This FAILS if the aggregation ever changes what a `--producers 1` run (or
+        // the single leg inside the multi driver) reports.
+        let started = Instant::now();
+        let finished = started + Duration::from_secs(2);
+        let leg = PublishLeg {
+            produced: 1000,
+            samples: vec![10, 20, 30],
+            started,
+            finished,
+        };
+        let (produced, samples, wall) = aggregate_legs(std::slice::from_ref(&leg));
+        assert_eq!(produced, 1000);
+        assert_eq!(samples, vec![10, 20, 30]);
+        assert_eq!(wall, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn multi_leg_wall_time_spans_first_start_to_last_finish_and_samples_merge() {
+        // The whole-phase wall time (#1040): start-of-FIRST leg to end-of-LAST leg, so a straggler
+        // stretches the denominator instead of being averaged away; the sample sets merge by
+        // concatenation (every leg's awaited RTTs all count, weighted by how many each sent).
+        let t0 = Instant::now();
+        let legs = vec![
+            PublishLeg {
+                produced: 504,
+                samples: vec![5, 7],
+                started: t0 + Duration::from_millis(10),
+                finished: t0 + Duration::from_millis(900),
+            },
+            PublishLeg {
+                produced: 496,
+                samples: vec![6],
+                started: t0,
+                finished: t0 + Duration::from_millis(800),
+            },
+        ];
+        let (produced, samples, wall) = aggregate_legs(&legs);
+        assert_eq!(produced, 1000, "total messages across the fleet");
+        assert_eq!(samples, vec![5, 7, 6], "merged by concatenation");
+        assert_eq!(
+            wall,
+            Duration::from_millis(900),
+            "start-of-first (t0) to end-of-last (t0 + 900ms)"
+        );
+    }
+
+    #[test]
+    fn count_split_is_even_with_the_remainder_on_the_first() {
+        // The #1040 count split: even shares, remainder to the first, ALWAYS summing to the exact
+        // requested count (the smoke gate: sum of per-producer sends == --count).
+        assert_eq!(split_count(2000, 4), vec![500, 500, 500, 500]);
+        assert_eq!(split_count(10, 4), vec![4, 2, 2, 2]);
+        assert_eq!(split_count(7, 1), vec![7]);
+        assert_eq!(
+            split_count(2, 4),
+            vec![2, 0, 0, 0],
+            "a count below the fleet size still sums exactly (idle legs produce nothing)"
+        );
+        for (total, producers) in [(2000u64, 4u64), (10, 3), (1, 8), (999, 7)] {
+            let shares = split_count(total, producers);
+            assert_eq!(
+                shares.iter().sum::<u64>(),
+                total,
+                "shares must sum to the exact count ({total} across {producers})"
+            );
+            assert_eq!(u64::try_from(shares.len()).unwrap(), producers);
+        }
+    }
+
+    #[test]
+    fn publish_attribution_matches_the_historical_per_path_flags() {
+        // The #1040 refactor pin: `publish_attribution` must reproduce EXACTLY the per-path
+        // SampleAttribution the pre-refactor split functions passed, so extracting the shared
+        // helper changed no report. This FAILS if any shape's honesty flags drift.
+        let plain = cfg_of(&["--count", "10", "--mode", "publish"]);
+        let a = publish_attribution(&plain);
+        assert!(
+            a.fsync_measured && a.acks_awaited,
+            "plain awaited disk path"
+        );
+        let windowed = cfg_of(&["--count", "10", "--mode", "publish", "--pubwindow", "8"]);
+        let a = publish_attribution(&windowed);
+        assert!(
+            a.fsync_measured && !a.acks_awaited,
+            "windowed: amortized fsync cost, no per-op ack RTT"
+        );
+        let stream = cfg_of(&[
+            "--count",
+            "10",
+            "--mode",
+            "publish",
+            "--stream",
+            "--pubwindow",
+            "8",
+        ]);
+        let a = publish_attribution(&stream);
+        assert!(
+            !a.fsync_measured && !a.acks_awaited,
+            "full-duplex overlap attributes nothing"
+        );
+        let faf = cfg_of(&["--count", "10", "--mode", "publish", "--faf"]);
+        let a = publish_attribution(&faf);
+        assert!(
+            !a.fsync_measured && !a.acks_awaited,
+            "fire-and-forget awaits nothing"
+        );
+        let autopipe = cfg_of(&["--count", "10", "--mode", "publish", "--autopipe"]);
+        let a = publish_attribution(&autopipe);
+        assert!(
+            a.fsync_measured && !a.acks_awaited,
+            "autopipe: amortized fsync cost, no per-op ack RTT"
+        );
+        let dry = cfg_of(&["--count", "10", "--mode", "publish", "--no-fsync"]);
+        let a = publish_attribution(&dry);
+        assert!(
+            !a.fsync_measured && a.acks_awaited,
+            "--no-fsync: the RTT is still awaited, the durable cost is not exercised"
+        );
+    }
+
+    #[test]
+    fn multi_producer_attribution_merges_ack_rtts_but_never_claims_a_per_op_fsync_cost() {
+        // The #1040 percentile decision, pinned: the merged ack-RTT percentiles ARE claimed (each
+        // sample is a self-contained awaited produce-call RTT on its own connection, so the
+        // concatenated union is the honest distribution of every awaited produce), while the
+        // per-op fsync cost is NOT (concurrent connections share covering group-commit fsyncs, so
+        // a per-op durable share would double-count the shared fsync).
+        let cfg = cfg_of(&["--count", "2000", "--mode", "publish", "--producers", "4"]);
+        let attribution = multi_publish_attribution(&cfg);
+        assert!(
+            attribution.acks_awaited,
+            "plain pubwindow-1 legs await every produce, so merged RTTs stay honest"
+        );
+        assert!(
+            !attribution.fsync_measured,
+            "shared covering fsyncs: no per-op durable cost may be claimed"
+        );
+        let report = finish_report(
+            &cfg,
+            2000,
+            2000,
+            &[],
+            &awaited_samples(),
+            Duration::from_secs(1),
+            attribution,
+        );
+        assert!(report.ack_p50_us.is_some(), "merged ack p50 is reported");
+        assert!(report.ack_max_us.is_some(), "merged ack max is reported");
+        assert!(!report.fsync_measured, "fsync flagged not measured");
+        assert!(report.fsync_cost_us.is_none(), "and no cost is claimed");
+        // The pipelined shapes stay amortized under a fleet too: no ack RTT there either.
+        let windowed = cfg_of(&[
+            "--count",
+            "2000",
+            "--mode",
+            "publish",
+            "--producers",
+            "4",
+            "--pubwindow",
+            "64",
+        ]);
+        let attribution = multi_publish_attribution(&windowed);
+        assert!(!attribution.acks_awaited && !attribution.fsync_measured);
     }
 
     #[test]

@@ -156,6 +156,7 @@ pub(crate) const COMMAND_TREE: &[Cmd] = &[
             "--group",
             "--no-fsync",
             "--pubwindow",
+            "--producers",
             "--stream",
             "--storage",
             "--per-message-ack",
