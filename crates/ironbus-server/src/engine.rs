@@ -6306,6 +6306,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.sync_max_dirty_bytes
     }
 
+    /// The measured duration of the LAST completed covering `fdatasync`, in nanoseconds (#1040):
+    /// the pipelined actor's first-dispatch linger reads this to self-tune its coalescing window
+    /// to the observed barrier cost (an fdatasync-cheap disk lingers ~nothing; an
+    /// `F_FULLFSYNC`-class disk recovers the retired gather's coalescing exactly where barriers
+    /// are wall-dominant). `0` until the first real barrier completes — the linger never engages
+    /// blind. Inline barriers measure through the deterministic clock seam
+    /// ([`Engine::commit_durability_barrier`]); flusher barriers report their wall-clock duration
+    /// through [`Engine::complete_async_commit`].
+    #[must_use]
+    pub fn last_fsync_nanos(&self) -> u64 {
+        self.last_fsync_nanos
+    }
+
+    /// Test seam: injects a fake last-barrier duration so the deterministic actor rigs can
+    /// engage the adaptive first-dispatch linger without a real (wall-clock-measured) fsync.
+    #[cfg(test)]
+    pub(crate) fn set_last_fsync_nanos_for_test(&mut self, nanos: u64) {
+        self.last_fsync_nanos = nanos;
+    }
+
     /// Whether the `interval` level's flush window is DUE this commit (#341): true when the time
     /// window has elapsed since the last completed `fdatasync` OR the accumulated unsynced record
     /// bytes have reached the byte budget. A trigger of `0` is DISABLED (that dimension never fires),

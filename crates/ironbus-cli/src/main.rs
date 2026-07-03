@@ -2295,9 +2295,13 @@ struct ServeFlags {
     compression: Option<String>,
     /// The `interval` level's TIME window in ms (#341); `None` falls back to the default.
     flush_interval_ms: Option<u64>,
-    /// The opt-in GROUP-COMMIT GATHER window in MICROSECONDS (#454); `None` resolves to 0 (off,
-    /// byte-identical actor behavior). See the `ServeConfig` field for the contract.
+    /// The DEPRECATED group-commit gather window in MICROSECONDS (#454, retired by #1040): still
+    /// parsed and validated for config compatibility, warned about at startup, and IGNORED. See
+    /// the `ServeConfig` field for the contract.
     commit_gather_us: Option<u64>,
+    /// The pipelined sync tier's dirty-byte admission bound (#1040); `None` falls back to the
+    /// shipped 16 MiB default, explicit `0` disables. See the `ServeConfig` field.
+    sync_max_dirty_bytes: Option<u64>,
     /// The `interval` level's unsynced-byte budget (#341); `None` falls back to the default.
     flush_max_bytes: Option<u64>,
     /// The explicit data-loss acknowledgement for `async`/`none` (#49, #379): the `--async-loss-ack`
@@ -2596,6 +2600,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--commit-gather-us" => {
                 f.commit_gather_us = Some(take_number("--commit-gather-us", args, &mut i)?);
+            }
+            "--sync-max-dirty-bytes" => {
+                f.sync_max_dirty_bytes = Some(take_number("--sync-max-dirty-bytes", args, &mut i)?);
             }
             "--flush-max-bytes" => {
                 f.flush_max_bytes = Some(take_number("--flush-max-bytes", args, &mut i)?);
@@ -3189,16 +3196,24 @@ fn parse_serve_flags_with_env_and_reader(
                 env,
                 DEFAULT_FLUSH_MAX_BYTES,
             )?,
-            // The group-commit gather (#454, #472): default [`DEFAULT_COMMIT_GATHER_US`] (a small,
-            // conservative window) so out-of-the-box durable produce batches fsyncs under a
-            // concurrent publisher. `0` restores the byte-identical historical actor; a single
-            // in-flight producer never engages the window (it only triggers on a pass holding >= 2
-            // produces), so the synchronous `produce` contract and I2 are unchanged.
+            // The DEPRECATED group-commit gather (#454, #472; retired by #1040): still resolved
+            // (flag > env > default) and validated for config compatibility, then IGNORED — the
+            // pipelined sync tier's self-clocking group commit replaced the wall-clock window. A
+            // non-default value draws a one-line startup deprecation warning.
             commit_gather_us: resolve_number(
                 "--commit-gather-us",
                 f.commit_gather_us,
                 env,
                 DEFAULT_COMMIT_GATHER_US,
+            )?,
+            // The pipelined sync tier's dirty-byte admission bound (#1040, INV-9): the most
+            // UNSYNCED record bytes the append actor admits before throttling a producer until
+            // the in-flight fdatasync completes. Default 16 MiB; explicit `0` disables the bound.
+            sync_max_dirty_bytes: resolve_number(
+                "--sync-max-dirty-bytes",
+                f.sync_max_dirty_bytes,
+                env,
+                ironbus_server::engine::DEFAULT_SYNC_MAX_DIRTY_BYTES,
             )?,
             async_loss_ack: resolve_bool("--async-loss-ack", f.async_loss_ack, env)?,
             // The storage backend (#443), resolved above (flag > env > default `disk`); the
@@ -4947,18 +4962,24 @@ struct ServeConfig {
     /// (`DEFAULT_FLUSH_MAX_BYTES`); `0` disables the byte trigger (the time window alone forces the
     /// sync). The EFFECTIVE worst-case loss bound is the smaller of the time and byte triggers.
     flush_max_bytes: u64,
-    /// The GROUP-COMMIT GATHER window in MICROSECONDS (#454, #472): when a drain pass already
-    /// holds at least TWO produces (evidence of a pipelining / concurrent publisher; a
-    /// single-produce pass never gathers, so an unpipelined producer pays no window), the append
-    /// actor keeps collecting commands for up to this long before committing, so the publisher's
-    /// whole in-flight window lands under ONE covering fsync instead of arrival-rate-sized slivers.
-    /// Defaults to [`DEFAULT_COMMIT_GATHER_US`] (a small, conservative window, #472) so out-of-the-
-    /// box durable produce batches fsyncs; `0` disables the gather and the actor is byte-identical
-    /// to the historical drain. Durability is UNTOUCHED: acks still mean fsynced-durable (I2); the
-    /// knob trades up to this much added commit latency under produce bursts for fewer, larger sync
-    /// barriers (the `MySQL` `binlog_group_commit_sync_delay` precedent). Bounded at 1 second by
-    /// validation so a typo cannot stall acks indefinitely.
+    /// DEPRECATED AND IGNORED (#1040): the retired #454/#472 group-commit gather window in
+    /// microseconds. The pipelined sync tier's SELF-CLOCKING group commit replaced it — the
+    /// in-flight `fdatasync` is the batching window now, with zero idle-start latency and
+    /// unbounded amortization, where this knob was both a latency floor and a coalescing ceiling.
+    /// Still parsed, resolved, and validated (config compatibility: an existing unit file keeps
+    /// booting), still printed in the materialized-config line, and passed inert to
+    /// `spawn_actor_with_gather`; a NON-DEFAULT value draws a one-line startup deprecation
+    /// warning. Bounded at 1 second by validation, exactly as before.
     commit_gather_us: u64,
+    /// The pipelined sync tier's DIRTY-BYTE admission bound (#1040, INV-9): the most unsynced
+    /// (appended-but-not-yet-fdatasync'd) record bytes the append actor admits before it
+    /// THROTTLES a producer (blocks admission until the in-flight barrier completes — never a
+    /// shed, the sync tier's semantics). Bounds the recovery/replay window and the page-cache
+    /// exposure under a slow disk with fast producers. Defaults to
+    /// [`ironbus_server::engine::DEFAULT_SYNC_MAX_DIRTY_BYTES`] (16 MiB); explicit `0` disables
+    /// the bound. Only the fsync-before-ack tier (durability `sync` on a real-barrier backend)
+    /// enforces it; every other tier ignores it.
+    sync_max_dirty_bytes: u64,
     /// The explicit DATA-LOSS ACKNOWLEDGEMENT for the unbounded-loss levels (#49, #379): the
     /// `--async-loss-ack` (a.k.a. `i-accept-acknowledged-data-loss`) bare flag. `async` and `none`
     /// WAIVE I2 with an unbounded loss window, so they REFUSE TO BOOT unless this is set (the
@@ -5092,9 +5113,13 @@ impl ServeConfig {
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
-            // The shipped default group-commit gather (#454, #472): the bench broker must match the
-            // `serve` default so its measured durable produce reflects what operators actually run.
+            // The retired gather knob at its (inert) default (#1040): kept so the materialized
+            // config and reload comparisons stay stable for existing deployments.
             commit_gather_us: DEFAULT_COMMIT_GATHER_US,
+            // The pipelined sync tier's dirty-byte bound at its shipped 16 MiB default (#1040):
+            // the bench broker must match the `serve` default so its measured durable produce
+            // reflects what operators actually run.
+            sync_max_dirty_bytes: ironbus_server::engine::DEFAULT_SYNC_MAX_DIRTY_BYTES,
             async_loss_ack: false,
             // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
             storage: StorageArg::Disk,
@@ -6349,7 +6374,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
          flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
-         commit_gather_us={}",
+         commit_gather_us={} sync_max_dirty_bytes={}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -6381,6 +6406,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.async_loss_ack,
         config.wal_fsync_headroom_bytes,
         config.commit_gather_us,
+        config.sync_max_dirty_bytes,
         data_dir = data_dir.map_or_else(|| "none".to_string(), |d| d.display().to_string()),
     )
 }
@@ -8028,6 +8054,22 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     for warning in config_warnings {
         let _ = writeln!(std::io::stderr(), "WARN: config: {warning}");
     }
+    // The one-line #1040 deprecation for the retired group-commit gather: an operator who
+    // EXPLICITLY tuned `--commit-gather-us` away from its default learns the knob is now inert
+    // (the pipelined sync tier's self-clocking group commit replaced the wall-clock window).
+    // Parsed and validated as ever, so an existing unit file keeps booting; only ignored.
+    if config.commit_gather_us != DEFAULT_COMMIT_GATHER_US {
+        let _ = writeln!(
+            std::io::stderr(),
+            "WARN: --commit-gather-us is DEPRECATED and ignored (#1040): the durable sync tier \
+             now pipelines its fdatasync with a self-clocking group commit (the in-flight barrier \
+             IS the batching window), which strictly dominates the retired wall-clock gather. The \
+             value {} was accepted for config compatibility and has no effect; remove the flag. \
+             The related admission bound is `--sync-max-dirty-bytes` (currently {}).",
+            config.commit_gather_us,
+            config.sync_max_dirty_bytes
+        );
+    }
     // The immutable effective-config + atomic reload handle (#380, #382): the resolved config is
     // installed into ONE immutable `Arc<EffectiveConfig>` behind a single safe swap point, read here
     // via one refcount bump (the single atomic pointer load on the path that needs it, never a
@@ -9292,11 +9334,11 @@ fn open_engine_with<F: Filesystem + Clone>(
             // drain under `sync` / the interval window under a relaxed level), so a zero-config
             // broker is unchanged; a non-zero value is the opt-in tight RAM / loss-window bound.
             wal_fsync_headroom_bytes: config.wal_fsync_headroom_bytes,
-            // The pipelined sync tier's dirty-byte bound (#1040) at its shipped default (16 MiB).
-            // PLUMBING ONLY today — nothing enforces it until the pipelined actor loop lands, so
-            // a zero-config broker is byte-for-byte unchanged; the `--sync-max-dirty-bytes` flag
-            // arrives with that activation PR.
-            sync_max_dirty_bytes: ironbus_server::engine::DEFAULT_SYNC_MAX_DIRTY_BYTES,
+            // The pipelined sync tier's dirty-byte admission bound (#1040, INV-9), wired from
+            // `--sync-max-dirty-bytes` (default 16 MiB; explicit `0` disables). Enforced by the
+            // append actor's pipelined branch as a THROTTLE (block for the in-flight barrier's
+            // completion), never a shed — the sync tier's semantics.
+            sync_max_dirty_bytes: config.sync_max_dirty_bytes,
             // The per-record write-path compression codec (#430, ADR-0003), wired from
             // `--compression` (default `lz4`). `none` stores every record raw, byte-for-byte the
             // historical layout; `zstd` was already rejected at parse on this build, so the two
@@ -12920,6 +12962,9 @@ mod tests {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             commit_gather_us: 0,
+            // The pipelined tier's dirty-byte bound (#1040) OFF in the test configs: the
+            // validation/serve tests pin behavior independent of the throttle.
+            sync_max_dirty_bytes: 0,
             async_loss_ack: false,
             // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
             storage: StorageArg::Disk,
@@ -16354,6 +16399,9 @@ mod tests {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             commit_gather_us: 0,
+            // The pipelined tier's dirty-byte bound (#1040) OFF in the test configs: the
+            // validation/serve tests pin behavior independent of the throttle.
+            sync_max_dirty_bytes: 0,
             async_loss_ack: false,
             // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
             storage: StorageArg::Disk,
@@ -16879,6 +16927,48 @@ mod tests {
             }
             other => panic!("an over-cap gather window must be a usage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_sync_max_dirty_bytes_flag_resolves_the_default_disables_on_zero_and_echoes() {
+        // The pipelined sync tier's dirty-byte admission bound (#1040, INV-9). DEFAULT: an
+        // untouched serve resolves to the shipped 16 MiB (`DEFAULT_SYNC_MAX_DIRTY_BYTES`), which
+        // ships IN THIS PR alongside the actor change (the L4/R4 in-PR discipline). An explicit
+        // `0` disables the bound. The flag parses without swallowing the next flag, and the
+        // materialized-config line echoes the resolved value.
+        let defaulted = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(
+            defaulted.sync_max_dirty_bytes,
+            ironbus_server::engine::DEFAULT_SYNC_MAX_DIRTY_BYTES,
+            "the bound resolves the shipped 16 MiB default when unset"
+        );
+        let disabled = parse_serve_flags(&serve_args(&["--sync-max-dirty-bytes", "0"]))
+            .unwrap()
+            .config;
+        assert_eq!(
+            disabled.sync_max_dirty_bytes, 0,
+            "an explicit 0 disables the bound"
+        );
+        let tuned = parse_serve_flags(&serve_args(&[
+            "--sync-max-dirty-bytes",
+            "1048576",
+            "--max-connections",
+            "9",
+        ]))
+        .unwrap()
+        .config;
+        assert_eq!(tuned.sync_max_dirty_bytes, 1_048_576);
+        assert_eq!(
+            tuned.max_connections, 9,
+            "the flag after --sync-max-dirty-bytes still parses (cursor not swallowed)"
+        );
+        assert!(validate_serve_config(&tuned).is_ok());
+        let line = materialized_config_line(
+            &tuned,
+            "127.0.0.1:7777",
+            Some(Path::new("/var/lib/ironbus")),
+        );
+        assert!(line.contains("sync_max_dirty_bytes=1048576"), "{line}");
     }
 
     #[test]
