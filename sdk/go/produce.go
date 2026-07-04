@@ -2,6 +2,8 @@ package ironbus
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/ELares/IronBus/sdk/go/internal/wire"
@@ -93,6 +95,85 @@ func (c *Client) ProduceWithAckLevel(ctx context.Context, m *Message, level uint
 // is never an error.
 func (c *Client) ProduceDedup(ctx context.Context, m *Message, d Dedup) (ProduceAck, error) {
 	return c.produceBody(ctx, wire.TagPub, nil, m, &d, AckLevelServer)
+}
+
+// ProduceWindow publishes a WINDOW of messages PIPELINED (#450): every Pub frame
+// is written before any ack is awaited, so the broker's group commit covers the
+// whole window with ONE fdatasync instead of one per message. It is the
+// single-connection durable-throughput lever the awaited Produce cannot reach
+// (Produce keeps one record in flight at a time). Size the window for your
+// workload: a larger window amortizes more, at the cost of more un-acked records
+// in flight (re-delivered, never lost, on a crash).
+//
+// Replies are FIFO in frame order — the Nth returned ack belongs to the Nth
+// message — and every ack keeps its at-least-once meaning: the record is
+// fsync-durable before the ack exists. Each message is produced at ack level 1
+// (durable); fire-and-forget and per-message dedup are not part of this path.
+//
+// On a per-slot server rejection (a typed *ServerError) or a cluster
+// *NotLeaderError, the REMAINING replies are still drained (one reply per
+// message, so the connection stays framed and usable) and the FIRST such error
+// is returned. An IO, unexpected-frame, or malformed-reply error is terminal: it
+// aborts immediately and the connection is broken (drop it). An empty window
+// returns nil without touching the wire.
+func (c *Client) ProduceWindow(ctx context.Context, messages []*Message) ([]ProduceAck, error) {
+	if c.broken != nil {
+		return nil, c.broken
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	// Phase 1: encode the WHOLE window into ONE buffer and write it with ONE
+	// syscall. This is what puts all N produces in front of the broker's
+	// group-commit drain as a single batch; a write() per frame would floor the
+	// window's throughput on small payloads.
+	c.wbuf = c.wbuf[:0]
+	for _, m := range messages {
+		body, err := c.encodePub(m, nil, AckLevelServer, false)
+		if err != nil {
+			return nil, err
+		}
+		c.wbuf, err = wire.AppendFrame(c.wbuf, wire.TagPub, body)
+		if err != nil {
+			return nil, err
+		}
+	}
+	restore, err := c.deadlineFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, werr := c.conn.Write(c.wbuf)
+	restore()
+	if werr != nil {
+		// A short or failed write leaves the peer mid-frame: terminal.
+		return nil, c.fail(fmt.Errorf("ironbus: write window: %w", werr))
+	}
+
+	// Phase 2: drain exactly one reply per message, FIFO. A per-slot server
+	// rejection / redirect is remembered (first wins) and the drain continues so
+	// the connection stays framed; any other error is terminal and aborts.
+	acks := make([]ProduceAck, len(messages))
+	var firstErr error
+	for i := range messages {
+		ack, err := c.readPubReply(ctx)
+		if err != nil {
+			var srv *ServerError
+			var nl *NotLeaderError
+			if errors.As(err, &srv) || errors.As(err, &nl) {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue // leave acks[i] the zero value; keep draining
+			}
+			return nil, err // terminal: readPubReply already marked the client broken
+		}
+		acks[i] = ack
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return acks, nil
 }
 
 // ProduceFireAndForget publishes at level 0 (QoS-0): the broker may shed the

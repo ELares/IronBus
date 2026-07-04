@@ -77,7 +77,7 @@ the broker's `--durability-level`). Pick the shape by your latency/throughput ne
 | Shape | Rust | Go | When |
 | --- | --- | --- | --- |
 | Awaited durable | `produce` | `Produce` | one record, simplest; ~one fsync per record |
-| **Pipelined durable** | `pipelined_producer[_with_window]`, `produce_window` | *(not yet)* | high single-producer throughput: a window shares one group-commit fsync |
+| **Pipelined durable** | `pipelined_producer[_with_window]`, `produce_window` | `ProduceWindow` | high single-producer throughput: a window shares one group-commit fsync |
 | Fire-and-forget (QoS 0) | `produce_fire_and_forget` | `ProduceFireAndForget` | max speed, loss acceptable |
 | Idempotent (dedup) | `produce_dedup` | `ProduceDedup` | safe retries: a repeated `MsgID` returns the original offset |
 
@@ -110,10 +110,12 @@ let summary = producer.finish()?; // every acked record is durable
 offset, err := client.Produce(ctx, &ironbus.Message{Key: []byte("sensor-12"), Payload: []byte(`{"temp":21.4}`)})
 ```
 
-> **Throughput note (Go):** the Go SDK currently produces one awaited record at a
-> time. Windowed/pipelined produce — the mechanism behind IronBus's durable
-> group-commit throughput numbers — is a tracked follow-up. Use multiple
-> connections to scale Go producers today.
+```go
+// Go: pipelined windowed produce — N frames in one write, one group-commit fsync,
+// N acks drained FIFO. The durable-throughput lever a single Go producer needs.
+batch := []*ironbus.Message{{Payload: []byte("a")}, {Payload: []byte("b")}, {Payload: []byte("c")}}
+acks, err := client.ProduceWindow(ctx, batch) // acks[i] is durable; acks[i].Offset is FIFO
+```
 
 ## Consume
 
@@ -278,7 +280,7 @@ superset; the async twin and the Go MVP are subsets with tracked follow-ups.
 | Awaited durable produce | ✅ | ✅ | ✅ |
 | Fire-and-forget (QoS 0) | ✅ | ✅ | ✅ |
 | Idempotent produce (dedup) | ✅ | ✅ | ✅ |
-| Pipelined / windowed produce | ✅ | `produce_window` | ⏳ |
+| Pipelined / windowed produce | ✅ | `produce_window` | ✅ (`ProduceWindow`) |
 | Work-group consume (ack/nack/term) | ✅ | ✅ | ✅ |
 | Cumulative ack (broadcast) | ✅ | ✅ | ✅ |
 | Batched ack (`ack_many`) | ✅ | ✅ | ⏳ |
@@ -299,7 +301,7 @@ Each runs against a live broker (`ironbus serve --data-dir /tmp/ironbus-demo`):
 
 | Topic | Rust (blocking) | Rust (async) | Go |
 | --- | --- | --- | --- |
-| Produce (awaited / QoS0 / dedup / pipelined) | `produce` | `produce_async` | `produce` |
+| Produce (awaited / QoS0 / dedup / pipelined) | `produce` | `produce_async` | `produce`, `produce_window` |
 | Work-group consume + ack | `consume_ack_group` | `consume_async` | `consume_ack_group` |
 | Streaming consume (Tier-S) | `streaming_consumer` | `streaming_consumer_async` | — |
 | Transactions (2PC) | `transactions` | — | — |
