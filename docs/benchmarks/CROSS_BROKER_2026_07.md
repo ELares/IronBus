@@ -162,10 +162,19 @@ throttled RTT). Redpanda's 2.5 k is a VM-virtualized fsync.
 
 | Broker | 128 B msg/s | 1 KiB msg/s |
 | --- | ---: | ---: |
-| ironbus | 88,348.4 | 15,261.9 |
+| ironbus | 64,209 § | 15,520 |
 | nats | — ‡ (no such mode) | — ‡ |
 | kafka † | 352,089.3 | 193,669.2 |
 | redpanda \* | *(1,085,633.7)* | *(196,834.4)* |
+
+> **§ IronBus P2/128 B restated for current `main`.** This study measured the pre-[#1040](https://github.com/ELares/IronBus/issues/1040)
+> engine (88,348 at 128 B, 15,262 at 1 KiB). The pipelined sync tier (#1040) then optimized
+> **multi-connection** group commit — a large win on every substrate, see
+> [REDPANDA_MATCHED_2026_07.md](REDPANDA_MATCHED_2026_07.md) — at a **single-connection** cost where
+> the `fdatasync` is wall-dominant. Re-measured A/B on the same host: single-connection P2/128 B
+> moved from ~88 k to ~64 k on macOS `F_FULLFSYNC`; P2/1 KiB is unchanged (~15.5 k), as are all
+> non-fsync-tier rows and, on Linux (cheap `fdatasync`), single-connection P2 itself. The
+> single-connection ceiling is the session per-connection drain ([#1045](https://github.com/ELares/IronBus/issues/1045)).
 
 IronBus latencies are not attributed on windowed produce (amortized per-op attribution would be
 dishonest — the #1024/#1025 gating); Kafka/Redpanda tool percentiles for this row (kafka 128 B
@@ -173,7 +182,9 @@ dishonest — the #1024/#1025 gating); Kafka/Redpanda tool percentiles for this 
 *156,000 / 178,000*) are producer-tool batch latencies, not single-record ack RTTs.
 **Read this row as a durability-label mismatch**: on macOS only the IronBus cell pays the
 drive-cache barrier before ack. On Linux, where `fdatasync` is the real barrier, this
-comparison must be re-run before quoting a ranking (see the follow-ups in §7).
+comparison was re-run — both brokers in one VM and on real Graviton/EBS — in
+[REDPANDA_MATCHED_2026_07.md](REDPANDA_MATCHED_2026_07.md), where IronBus's multi-connection
+durable produce beats Redpanda's peak.
 
 ### P3 — relaxed produce (page-cache ack; NOT power-loss-safe)
 
