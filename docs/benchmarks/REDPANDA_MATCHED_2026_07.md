@@ -95,10 +95,40 @@ The consensus finding of the source analysis is worth stating plainly: Redpanda'
 ## 6. Scope, and what this study is not
 
 - One VM, single-node brokers, guest loopback. No cluster claim.
-- Redpanda's numbers here are inside a VM — but so are IronBus's, on the identical substrate, which is the entire point. These rankings are valid **relative to each other in this environment**; they are not bare-metal absolute numbers for either broker. A real-hardware confirmation datapoint (single-node t4g, real EBS `fdatasync`) is the natural next step.
+- Redpanda's numbers here are inside a VM — but so are IronBus's, on the identical substrate, which is the entire point. These rankings are valid **relative to each other in this environment**; they are not bare-metal absolute numbers for either broker. A real-hardware confirmation on Graviton with real EBS `fdatasync` was run — see §7, which reproduces (and sharpens) the result.
 - P4 (in-memory) and L2 (in-memory RTT) are omitted: Redpanda has no true in-RAM ephemeral mode, and labeling its page cache as "memory" would be dishonest (those rows live in the macOS study, where IronBus's only honest in-memory peer was NATS).
 - Numbers are medians of 3; per-cell run-to-run spreads were ≤ ~8% except where noted. Never quote a single run.
 
-## 7. Artifacts and reproduction
+## 7. Real-hardware confirmation — AWS Graviton, real EBS `fdatasync`
 
-The guest-resident harness (`lib2.sh` / `cell2.sh` / `row2.sh` / `all2.sh` for the matrix, `p2multi.sh` and `rp_multi.sh` for the concurrency sweeps) and the raw `results.jsonl` / `p2multi.jsonl` / `rp_multi.jsonl` are archived with the study. The matrix mirrors the macOS study's protocol exactly (same tier labels, same pilot→freeze→median discipline, same fairness lint) so the two are directly comparable — the difference is only the substrate and the removal of the VM confound.
+The VM removes the *comparison* confound (both brokers on one substrate) but not the *virtualization* one (virtio `fdatasync` lands in the host page cache at ~200–300 µs — a real block-layer flush, but not a real durable-media one). To close that too, the same harness was run on a single **AWS t4g.large** (Graviton2, 2 vCPU, 8 GiB), Ubuntu 24.04 arm64, with both brokers writing the **EBS gp3** root — a genuine network-attached durable volume. Same protocol, same Redpanda build (v26.1.12, production mode), medians of 3.
+
+The substrate is materially harder: **EBS gp3 `fdatasync` measured ~2.8 ms p50 / ~3.1 ms p99** — roughly 10× the VM's virtio flush, near a macOS `F_FULLFSYNC`. A durable barrier this expensive is the toughest possible test of a group-commit engine: the only way to sustain throughput is to coalesce and overlap many records per sync.
+
+**Single connection** (msg/s; L1 is p50/p99 µs, lower better):
+
+| Row | Size | IronBus | Redpanda | Note |
+| --- | --- | ---: | ---: | :-- |
+| P1 sync-per-message | 128 B | 339 | 533 | Redpanda keeps a few requests in flight even at `batch.size=1`; IronBus `pubwindow=1` is strictly one-at-a-time (the same client-concurrency story as P2, #1045) |
+| P2 group-commit | 128 B | 62,329 | 137,605 | single-conn session-drain ceiling (#1045) |
+| | 1 KiB | 16,021 | 30,870 | |
+| P3 relaxed | 128 B | **385,447** | 219,852 | **IronBus 1.75×** |
+| | 1 KiB | **279,580** | 48,445 | **IronBus 5.8×** |
+| C1 consume | 128 B | 1,130,826 | 1,571,833 | Redpanda 1.39× |
+| | 1 KiB | **589,996** | 476,848 | **IronBus 1.24×** |
+| L1 durable-ack | 128 B | **2,956 / 3,381** | 2,000 / **137,000** | IronBus p99 3.4 ms vs Redpanda **137 ms** — a ~40× tighter tail (Redpanda's p50 is throttled-tool-quantized to whole ms) |
+
+**P2 under matched client concurrency** — and here the real durable substrate makes the divergence *starker* than the VM:
+
+| P2 durable produce | IronBus peak | Redpanda peak | IronBus advantage | at matched 8 clients |
+| --- | ---: | ---: | :-- | :-- |
+| 128 B | **256,016** (8 conns) | 211,022 (1 client) | **1.21×** | **2.25×** (256 k vs 114 k) |
+| 1 KiB | **62,338** (8 conns) | 37,386 (1 client) | **1.67×** | **2.46×** (62 k vs 25 k) |
+
+On the ~2.8 ms EBS sync, **Redpanda's throughput peaks at ONE client and falls monotonically** (128 B: 211 k → 161 k → 114 k at 1/4/8 clients; 1 KiB: 37 k → 33 k → 25 k) — its single raft group is contention-bound the instant each `fdatasync` is expensive. **IronBus scales the opposite way** (128 B: 62 k → 108 k → 167 k → 256 k), because the pipelined sync tier (#1040) turns concurrent durable producers into shared covering syncs. The VM result is not a virtualization artifact: it reproduces on real Graviton hardware over real EBS durability, and the pricier the sync, the wider IronBus's coalescing margin.
+
+*(Provenance: run on AWS, t4g.large, us-region, ephemeral instance — launched tagged, with an auto-terminate backstop, and torn down at completion. No account-specific identifiers are recorded here or in the raw data.)*
+
+## 8. Artifacts and reproduction
+
+The guest-resident harness (`lib2.sh` / `cell2.sh` / `row2.sh` / `all2.sh` for the matrix, `p2multi.sh` and `rp_multi.sh` for the concurrency sweeps) and the raw `results.jsonl` / `p2multi.jsonl` / `rp_multi.jsonl` are archived under [`matched-vm-harness/`](matched-vm-harness/); the t4g run's raw data is under [`matched-vm-harness/t4g/`](matched-vm-harness/t4g/). The matrix mirrors the macOS study's protocol exactly (same tier labels, same pilot→freeze→median discipline, same fairness lint) so all three studies are directly comparable — the difference is only the substrate.
