@@ -118,6 +118,47 @@ The substrate is materially harder: **EBS gp3 `fdatasync` measured ~2.8 ms p50 /
 | | 1 KiB | **589,996** | 476,848 | **IronBus 1.24×** |
 | L1 durable-ack | 128 B | **2,956 / 3,381** | 2,000 / **137,000** | IronBus p99 3.4 ms vs Redpanda **137 ms** — a ~40× tighter tail (Redpanda's p50 is throttled-tool-quantized to whole ms) |
 
+The two rows this table flags as trailing — **P1** and single-connection **P2** —
+predate a durable-write feature that has since shipped; see the update immediately
+below for the current single-connection result.
+
+### Update — the configurable io-mode (#1054), same substrate
+
+The table above is honest for the code at that time: `pubwindow=1`
+one-record-at-a-time produce over a ~2.8 ms **buffered** `fdatasync`. Two things
+have since landed. The **io-mode** (`--io-mode auto` auto-detects EBS as
+network-durable and engages an `O_DIRECT` write plus a *metadata-free* barrier —
+the data goes straight to EBS, so the covering `fdatasync` has nothing left to
+journal and costs ~1 µs instead of ~1.9 ms, **with the full fsync guarantee
+intact**), and a tuned pipeline window (Redpanda's fair equivalent,
+`batch.size=65536 × max.in.flight=5`, is ≈ 2,560 records in flight, so a
+`pubwindow` ≈ 4,096 is the matched single-producer window). Re-running the
+trailing single-connection rows with `--io-mode auto` (medians of 3, same box
+class, same Redpanda build, `write_caching=false`):
+
+| Row | Size | IronBus (auto) | Redpanda | Result |
+| --- | --- | ---: | ---: | :-- |
+| P1 sync-per-message | 128 B | **898** | 520 | **IronBus 1.7×** — was a loss; the metadata-free barrier flips it |
+| | 1 KiB | **897** | 364 | **IronBus 2.5×** |
+| P2 group-commit (`pubwindow=4096`) | 128 B | 130,035 | 140,805 | **at par** (0.92×, within this study's ~8 % cell spread) |
+| | 1 KiB | **125,163** | 33,763 | **IronBus 3.7×** |
+| L1 durable-ack (p50 / p99 µs) | 128 B | **1,039 / 3,155** | 2,000 / 317,000 | **IronBus 1.9× median, ~100× tail** |
+| | 1 KiB | **1,045 / 3,172** | 2,000 / 301,000 | **IronBus 1.9× median, ~95× tail** |
+
+The barrier is the whole story on P1/L1: the per-op ~2.8 ms buffered-`fdatasync`
+cost collapses to ~1 ms, so IronBus now leads L1 at the **median** too, not only
+the tail. The single remaining non-win is single-connection **P2/128**, which sits
+at par; the 1 KiB size — and every other row — is an outright win. `buffered`
+stays the default (safe on any substrate, unchanged); `direct`/`auto` are the
+network-durable opt-in (`ironbus serve --io-mode`, and `bench --io-mode`). This
+is a mode selection, not a durability weakening: the barrier is kept, and a
+pull-plug on EBS loses nothing the buffered path would not. (Harness:
+[`matched-vm-harness/t4g/bench_refresh_io_mode.sh`](matched-vm-harness/t4g/bench_refresh_io_mode.sh);
+its P2-multi and C1 blocks are unreliable on a 2-vCPU box — parallel-JVM
+starvation and a consumer-perf method mismatch — so only the P1 / P2-single / L1
+rows above are drawn from it; the multi-connection and consume stories stay with
+§7's careful measures.)
+
 **P2 under matched client concurrency** — and here the real durable substrate makes the divergence *starker* than the VM:
 
 | P2 durable produce | IronBus peak | Redpanda peak | IronBus advantage | at matched 8 clients |
