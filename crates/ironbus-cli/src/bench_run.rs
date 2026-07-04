@@ -323,6 +323,10 @@ const BENCH_MEMORY_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// owns the auto-delete of its synthetic disk dir) and the default in-RAM byte cap above.
 fn bench_serve_config(cfg: &BenchConfig) -> ServeConfig {
     let mut config = ServeConfig::bench_default();
+    // The durable-write io-mode (#1044) of the spawned broker: `direct` gets the O_DIRECT
+    // metadata-free barrier on network-durable storage. `open_disk_engine` resolves it (auto-detect
+    // + fail-closed) exactly like the real `serve` path; the memory backend ignores it.
+    config.io_mode = cfg.io_mode;
     config.checkpoint_interval = if cfg.no_fsync { 1_000_000 } else { 1 };
     if cfg.no_fsync {
         // The dry run's produce path must ALSO leave the per-ack fsync tier (#1027): `interval`
