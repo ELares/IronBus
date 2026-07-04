@@ -310,6 +310,15 @@ pub struct BenchConfig {
     /// disk numbers). The flag shapes ONLY the spawned broker, so it is refused alongside
     /// `--addr` (a live broker's backend is already decided by that broker).
     pub storage: StorageArg,
+    /// The durable-write IO-MODE of bench's own ISOLATED spawned broker (#1044): `buffered` (the
+    /// default, buffered write + fdatasync), `direct` (`O_DIRECT` + metadata-free barrier — the fast
+    /// path on network-durable storage like EBS), or `auto` (detect the substrate). Shapes ONLY the
+    /// spawned broker, so it is refused alongside `--addr`. Disk-only (memory has no fsync path).
+    /// Read only in `bench_run.rs` behind `cfg(unix)` (the bench broker is the Unix-only `serve`
+    /// path), so on a non-unix build this field is write-only and `-D warnings` would refuse it —
+    /// exactly the footgun the `#[cfg_attr(not(unix), allow(dead_code))]` on the methods above guards.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub io_mode: ironbus_storage::substrate::IoMode,
     /// How the SUBSCRIBE drain settles each fetched batch (#464): [`AckMode::Batched`] (the default,
     /// one pipelined `ack_many` per batch — the FAIR consume number) or [`AckMode::PerMessage`] (the
     /// legacy one synchronous `ack` per message — the ack-RPC-LATENCY ceiling, behind
@@ -438,6 +447,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut pub_window: usize = 1;
     let mut producers: usize = 1;
     let mut storage: Option<StorageArg> = None;
+    let mut io_mode = ironbus_storage::substrate::IoMode::Buffered;
     let mut per_message_ack = false;
     let mut consume_tier = ConsumeTier::Work;
     let mut json = false;
@@ -583,6 +593,14 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
                     ))
                 })?);
             }
+            "--io-mode" => {
+                let raw = take(args, &mut i, "--io-mode")?;
+                io_mode = ironbus_storage::substrate::IoMode::parse(&raw).ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "`--io-mode` must be `buffered`, `direct`, or `auto`, got `{raw}`"
+                    ))
+                })?;
+            }
             // FAIR-CONSUME opt-out (#464): drain the subscribe queue with one SYNCHRONOUS ack per
             // message (the legacy ack-RPC-bound path) instead of the default batched `ack_many` per
             // fetched batch. A legitimate ack-RPC-LATENCY measurement; NOT a fair throughput compare.
@@ -665,6 +683,20 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         ));
     }
     let storage = storage.unwrap_or(StorageArg::Disk);
+
+    // `--io-mode` shapes ONLY the durable-write path of bench's own ISOLATED synthetic broker
+    // (#1044), exactly like `--storage`. With `--addr` the target broker's io-mode was decided when
+    // THAT broker booted, so accepting the flag would silently mean nothing; refuse it (the same
+    // no-op-flag footgun the `--storage` guard above prevents).
+    if io_mode != ironbus_storage::substrate::IoMode::Buffered && live_addr.is_some() {
+        return Err(CliError::Usage(
+            "`--io-mode` selects the durable-write mode of bench's own ISOLATED synthetic broker; \
+             with `--addr` (a live run) the target broker's io-mode is already decided by that \
+             broker and this flag would silently mean nothing. Drop `--io-mode`, or drop `--addr` \
+             to bench an isolated broker."
+                .to_string(),
+        ));
+    }
 
     // PRODUCTION-SAFETY guard: a caller-named group that is not a bench namespace could be a real
     // consumer group; joining it would steal that group's messages, so it needs the ack too.
@@ -824,6 +856,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         pub_window,
         producers,
         storage,
+        io_mode,
         consume_ack,
         consume_tier,
         json,
