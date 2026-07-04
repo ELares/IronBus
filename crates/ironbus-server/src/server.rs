@@ -608,6 +608,20 @@ where
 /// frame (#176): after a pass leaves a partial trailing frame needing `needed` bytes, the loop does
 /// not re-run `process` until the buffer has reached that length, so each frame is decoded a constant
 /// number of times no matter how the client drips it.
+///
+/// # Single-connection produce pipelining (#1045)
+///
+/// A `process` pass no longer BLOCK-awaits its parked produce window at the pass boundary; it releases
+/// only the ready front prefix and PERSISTS the rest ([`Session::has_parked`]). That is what lets one
+/// connection overlap the NEXT batch with the CURRENT batch's fdatasync (closing the single-connection
+/// P2 ceiling) — but it makes the LOOP, not the pass, responsible for eventually delivering an
+/// un-fsync'd ack. So the loop reads NON-BLOCKING exactly while the window is non-empty: a would-block
+/// then means "no new bytes right now", and it BLOCK-drains the front parked ack
+/// ([`Session::drain_one_parked_blocking`]) so a bounded-window client that pipelined W produces and is
+/// waiting on their acks makes progress (no deadlock). A SATURATING producer keeps finding bytes on
+/// every read, so it stays in the read+submit+release cycle and its fsyncs overlap; the drain-one path
+/// is reached only when the socket momentarily empties. With an EMPTY window the loop reads BLOCKING
+/// (with the slowloris read timeout), so an idle connection sleeps on the socket instead of spinning.
 fn connection_loop<F, C>(
     stream: &mut TcpStream,
     engine: &EngineHandle<F, C>,
@@ -618,13 +632,15 @@ where
     C: Clock + Clone + 'static,
 {
     let mut inbuf: Vec<u8> = Vec::new();
-    // The read chunk BOUNDS the pipelined-window pass (#450, #454): a `process` pass sees at most
-    // one chunk of new frames, and every pass ends by awaiting its parked produce acks, so the
-    // effective publisher pipeline depth is (chunk bytes / wire frame bytes). The old 4 KiB stack
-    // chunk capped a 512-produce window at ~13 records per group commit on 256 B payloads (hive
-    // measured), paying ~40 fsyncs per window. 64 KiB lets a pass carry hundreds of small frames.
-    // Heap-allocated and zero-initialized: `alloc_zeroed` pages stay untouched (no RSS) until the
-    // kernel actually fills them, so an idle or ping-only connection still costs about a page.
+    // The read chunk sizes one pass's worth of new frames (#450, #454): a `process` pass sees at most
+    // one chunk of new frames. The old 4 KiB stack chunk capped a 512-produce window at ~13 records per
+    // group commit on 256 B payloads (hive measured), paying ~40 fsyncs per window. 64 KiB lets a pass
+    // carry hundreds of small frames. Since #1045 a pass no longer BLOCK-awaits its parked window at the
+    // pass boundary (it releases the ready prefix and persists the rest), so the publisher pipeline
+    // depth is no longer bounded to one chunk: batch N+1's read overlaps batch N's fsync, and the parked
+    // window spans passes up to `MAX_PARKED_PRODUCES`. Heap-allocated and zero-initialized:
+    // `alloc_zeroed` pages stay untouched (no RSS) until the kernel actually fills them, so an idle or
+    // ping-only connection still costs about a page.
     let mut chunk = vec![0u8; 64 * 1024];
     // The minimum buffer length before re-running `process` is worth it: `0` means run on any new
     // byte; a larger value is the trailing partial frame's `needed` hint, so a near-cap frame
@@ -639,41 +655,92 @@ where
     // idle/ping-only connection whose passes leave `out` empty never allocates.
     let mut out: Vec<u8> = Vec::new();
     loop {
-        let n = stream.read(&mut chunk[..])?;
-        if n == 0 {
-            return Ok(()); // the client closed the connection
+        // Read NON-BLOCKING exactly while the session has an un-acked pipelined window to overlap or
+        // drain (#1045); read BLOCKING (with the slowloris timeout) when the window is empty, so an
+        // idle connection sleeps on the socket. Confine the non-blocking flag to the READ syscall only
+        // and restore blocking immediately after: `set_nonblocking` is per-socket (it would make WRITES
+        // non-blocking too, and a `write_all` that hit `WouldBlock` mid-frame would truncate an ack on
+        // the wire), so every response is written back in blocking mode. The two `fcntl`s are amortized
+        // over a whole 64 KiB read's worth of frames.
+        let want_nonblocking = session.has_parked();
+        if want_nonblocking {
+            stream.set_nonblocking(true)?;
         }
-        inbuf.extend_from_slice(&chunk[..n]);
-        // Skip the dispatch until the buffer can make progress on the known-partial trailing frame.
-        if inbuf.len() < needed {
-            continue;
+        let read_result = stream.read(&mut chunk[..]);
+        if want_nonblocking {
+            stream.set_nonblocking(false)?;
         }
+        match read_result {
+            Ok(0) => {
+                // The client closed the connection. Any still-parked acks belong on the wire before
+                // the close (#1045): block-drain the whole remaining window and flush it, best-effort
+                // (a gone actor / fatal here just ends the connection). Then return so
+                // `handle_connection` runs its cleanup on this clean-EOF path.
+                if session.has_parked() {
+                    out.clear();
+                    let _ = session.flush_all_parked_blocking(engine, &mut out);
+                    let _ = stream.write_all(&out);
+                }
+                return Ok(());
+            }
+            Ok(n) => {
+                inbuf.extend_from_slice(&chunk[..n]);
+                // Skip the dispatch until the buffer can make progress on the known-partial trailing frame.
+                if inbuf.len() < needed {
+                    continue;
+                }
 
-        out.clear();
-        let Ok(progress) = session.process(engine, &inbuf, &mut out) else {
-            // A malformed frame, a fatal engine error, or a gone actor: flush any queued response
-            // and close (a length-prefixed stream cannot resync).
-            let _ = stream.write_all(&out);
-            return Ok(());
-        };
-        inbuf.drain(..progress.consumed);
-        // Persist the session's work-group cursor on the configured interval so a crash redelivers a
-        // bounded tail. ONLY when this pass actually advanced a committed cursor (an ack/flow/unsub):
-        // a ping- or connect-only pass skips the checkpoint entirely, so it never sends a command to
-        // the actor and therefore CANNOT be head-of-line-blocked by another connection's stalled
-        // produce fsync (#177 invariant 4). Best-effort: a checkpoint write failure only costs
-        // redelivery on restart, never correctness, so it must not fail the connection. Routed to the
-        // session's group (#60); a gone actor is a no-op, never a hang.
-        if progress.committed_progress {
-            let group = session.subscription().to_string();
-            let _ = engine.with(move |e| {
-                let _ = e.maybe_checkpoint_group(&group);
-            });
-        }
-        // Remember how many bytes the trailing partial frame needs before the next pass.
-        needed = progress.needed;
-        if !out.is_empty() {
-            stream.write_all(&out)?;
+                out.clear();
+                let Ok(progress) = session.process(engine, &inbuf, &mut out) else {
+                    // A malformed frame, a fatal engine error, or a gone actor: flush any queued response
+                    // (which, on the closing path, already carries the block-drained window) and close (a
+                    // length-prefixed stream cannot resync).
+                    let _ = stream.write_all(&out);
+                    return Ok(());
+                };
+                inbuf.drain(..progress.consumed);
+                // Persist the session's work-group cursor on the configured interval so a crash
+                // redelivers a bounded tail. ONLY when this pass actually advanced a committed cursor (an
+                // ack/flow/unsub): a ping- or connect-only pass skips the checkpoint entirely, so it
+                // never sends a command to the actor and therefore CANNOT be head-of-line-blocked by
+                // another connection's stalled produce fsync (#177 invariant 4). Best-effort: a
+                // checkpoint write failure only costs redelivery on restart, never correctness, so it
+                // must not fail the connection. Routed to the session's group (#60); a gone actor is a
+                // no-op, never a hang.
+                if progress.committed_progress {
+                    let group = session.subscription().to_string();
+                    let _ = engine.with(move |e| {
+                        let _ = e.maybe_checkpoint_group(&group);
+                    });
+                }
+                // Remember how many bytes the trailing partial frame needs before the next pass.
+                needed = progress.needed;
+                if !out.is_empty() {
+                    stream.write_all(&out)?;
+                }
+            }
+            // A NON-BLOCKING read found no new bytes while the window is non-empty (#1045): a
+            // bounded-window client pipelined W produces and is waiting on their acks, so there is no
+            // more input coming until it gets one. Block-await the FRONT parked ack (and any now-ready
+            // siblings) and write it, so the client can send its next batch — this is what stops a
+            // bounded-window producer from deadlocking under the non-blocking pass. A saturating
+            // producer almost never lands here (its next batch is already in the socket buffer, so the
+            // read takes the `Ok(n)` arm and its fsyncs overlap the reads). Gated on `want_nonblocking`
+            // so a BLOCKING-mode read timeout (the slowloris window, nothing parked) is NOT mistaken for
+            // this and instead closes the connection via the arm below.
+            Err(ref e) if want_nonblocking && e.kind() == std::io::ErrorKind::WouldBlock => {
+                out.clear();
+                if session.drain_one_parked_blocking(engine, &mut out).is_err() {
+                    let _ = stream.write_all(&out);
+                    return Ok(());
+                }
+                if !out.is_empty() {
+                    stream.write_all(&out)?;
+                }
+            }
+            // A real IO error, or a BLOCKING-mode read timeout (the slowloris defense with nothing
+            // parked): close the connection, exactly as the original blocking `read()?` did.
+            Err(e) => return Err(e),
         }
     }
 }
@@ -1591,6 +1658,100 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         server.join().unwrap();
         // Drain and stop the actor (it owns the fault-fs engine).
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join();
+    }
+
+    #[test]
+    fn a_bounded_window_client_is_unblocked_by_the_drain_one_path_1045() {
+        // #1045 NO-DEADLOCK TEETH, over a REAL socket + the real `connection_loop`: a bounded-window
+        // producer pipelines W produces in ONE write, then BLOCKS reading for their W acks before
+        // sending anything more. Since a pass no longer block-awaits its parked window, the connection
+        // loop must deliver those acks via its drain-one-when-would-block path — otherwise the client
+        // deadlocks (it waits for acks that are parked; the server waits for bytes that will not come
+        // until the client gets acks). We force exactly that shape with the fault-fs sync gate: the W
+        // produces park behind a gated group-commit fsync, the loop reads non-blocking, hits WouldBlock,
+        // and block-drains the front; once the gate opens all W acks arrive in FIFO order with NO
+        // further client bytes.
+        use ironbus_core::clock::ManualClock;
+        use ironbus_proto::message::{encode_pub, PubBody};
+        use ironbus_storage::fault::FaultFs;
+
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                let clock = ManualClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
+        });
+
+        // Close the gate FIRST so the client's whole window parks behind a gated covering fsync.
+        control.close_sync_gate();
+
+        // The bounded-window client, on its own thread (so the test can open the gate once the server is
+        // parked): connect, pipeline W PUBs in ONE write, then read W acks WITHOUT sending anything more.
+        let w: u64 = 5;
+        let client_thread = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = Vec::new();
+            c.write_all(&frame(FrameType::Connect, b"")).unwrap();
+            assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Info);
+            let mut batch = Vec::new();
+            for i in 0..w {
+                let payload = format!("m{i}");
+                let mut body = Vec::new();
+                encode_pub(
+                    &PubBody {
+                        flags: 0,
+                        timestamp_ms: 0,
+                        key: b"",
+                        headers: b"",
+                        dedup: None,
+                        fire_and_forget: false,
+                        payload: payload.as_bytes(),
+                    },
+                    &mut body,
+                )
+                .unwrap();
+                batch.extend_from_slice(&frame(FrameType::Pub, &body));
+            }
+            // One write of the whole window, then STOP sending and wait for the acks.
+            c.write_all(&batch).unwrap();
+            let mut offsets = Vec::new();
+            for _ in 0..w {
+                let (ty, body) = read_one_frame(&mut c, &mut buf);
+                assert_eq!(ty, FrameType::PubAck, "a bounded-window produce is acked");
+                offsets.push(u64::from_le_bytes(body[..8].try_into().unwrap()));
+            }
+            (c, offsets)
+        });
+
+        // Wait until the server is parked inside the window's covering fsync: it read the W pubs, parked
+        // them, hit WouldBlock on the empty socket, and called `drain_one_parked_blocking`, now blocked
+        // on the gate. Then open the gate: the window commits and the drain-one path releases every ack.
+        control.wait_for_sync_gate_entered(1);
+        control.open_sync_gate();
+
+        let (c, offsets) = client_thread.join().unwrap();
+        assert_eq!(
+            offsets,
+            (0..w).collect::<Vec<_>>(),
+            "all W acks delivered in FIFO order via the drain-one path — no deadlock"
+        );
+
+        drop(c);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
         let _ = handle.shutdown();
         drop(handle);
         let _ = actor.join();
