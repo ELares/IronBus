@@ -136,7 +136,9 @@ Given each broker the client concurrency that saturates it (IronBus `bench --pro
 | 128 B | **1.68 M** (8 conns) | 1.51 M (4 clients) | **1.11×** |
 | 1 KiB | **657 k** (8 conns) | 300 k (4 clients) | **2.19×** |
 
-**Redpanda does not scale with more clients** (its single raft group is saturated by one 5-in-flight client — throughput peaks at 4 and drops at 8); **IronBus scales up and passes Redpanda's peak on both sizes** (1.44×/2.46× at matched 8 clients). The single-connection row remains the honest exception, addressed by the session-side per-connection reorder ring ([#1045](https://github.com/ELares/IronBus/issues/1045)) — reported here unhidden. This study's rankings are valid **relative to each other in this VM**; a real-hardware (single-node t4g, real EBS `fdatasync`) confirmation is the natural next datapoint.
+**Redpanda does not scale with more clients** (its single raft group is saturated by one 5-in-flight client — throughput peaks at 4 and drops at 8); **IronBus scales up and passes Redpanda's peak on both sizes** (1.44×/2.46× at matched 8 clients). The single-connection row remains the honest exception, addressed by the session-side per-connection reorder ring ([#1045](https://github.com/ELares/IronBus/issues/1045)) — reported here unhidden.
+
+The same study was **re-run on real hardware** (a single AWS **t4g.large** Graviton node, both brokers writing an **EBS gp3** volume — a genuine network-attached durable disk whose `fdatasync` measured ~2.8 ms, ~10× the VM's virtio flush). The result **reproduces and sharpens**: on the expensive real sync, Redpanda peaks at *one* client and falls monotonically, while IronBus climbs to **256 k @128 B / 62 k @1 KiB** — beating Redpanda's peak **1.21× / 1.67×** (2.25× / 2.46× at matched 8 clients). The pricier the durability barrier, the wider IronBus's group-commit margin. See §7 of the study doc.
 
 ### Performance targets
 
