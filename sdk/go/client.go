@@ -85,6 +85,14 @@ type Client struct {
 // Connect dials the broker, completes the Connect/Info handshake, and adopts
 // the negotiated capabilities.
 func Connect(ctx context.Context, cfg Config) (*Client, error) {
+	// Symmetric client-side validation (#1039): the connection-wide default ack
+	// level must be one of the three frozen wire levels (0, 1, 2), exactly as
+	// ProduceWithAckLevel rejects an out-of-range per-publish level. Reject it here
+	// rather than dialing and sending an invalid byte the broker would refuse at the
+	// handshake — a config mistake surfaces as a clear typed error, not a wire error.
+	if cfg.DefaultAckLevel != nil && *cfg.DefaultAckLevel > AckLevelServerAndClient {
+		return nil, &InvalidAckLevelError{Level: *cfg.DefaultAckLevel}
+	}
 	addr := cfg.Addr
 	if addr == "" {
 		addr = DefaultAddr

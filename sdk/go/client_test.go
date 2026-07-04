@@ -97,3 +97,33 @@ func TestProduceWithAckLevelRejectsUnknownLevel(t *testing.T) {
 		t.Fatalf("level-3 produce = %v, want *InvalidAckLevelError with level 3", err)
 	}
 }
+
+// TestConnectRejectsInvalidDefaultAckLevel pins the symmetric client-side check
+// (#1039): a Config.DefaultAckLevel outside the frozen 0/1/2 spectrum is rejected
+// with the same typed *InvalidAckLevelError as the per-publish guard, BEFORE any
+// socket is dialed — so a config mistake never becomes a handshake-time wire error.
+func TestConnectRejectsInvalidDefaultAckLevel(t *testing.T) {
+	// Level 3 is rejected before any dial: the address is unroutable, so if the
+	// check regressed and Connect tried to reach it, the error would be a dial
+	// failure, not the typed *InvalidAckLevelError this asserts.
+	bad := uint8(3)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := Connect(ctx, Config{Addr: "203.0.113.1:1", DefaultAckLevel: &bad}); err != nil {
+		var want *InvalidAckLevelError
+		if !errors.As(err, &want) || want.Level != 3 {
+			t.Fatalf("connect with default ack level 3 = %v, want *InvalidAckLevelError with level 3", err)
+		}
+	} else {
+		t.Fatal("connect with default ack level 3 returned nil, want *InvalidAckLevelError")
+	}
+
+	// The boundary level 2 is VALID: validation lets it through and the handshake
+	// completes against a broker.
+	ok := AckLevelServerAndClient
+	c, err := Connect(context.Background(), Config{Addr: startStalledBroker(t), DefaultAckLevel: &ok})
+	if err != nil {
+		t.Fatalf("connect with default ack level 2 = %v, want success", err)
+	}
+	c.Close()
+}
