@@ -263,6 +263,13 @@ pub const KEY_TABLE: &[KeySpec] = &[
         key: "storage.max_total_bytes",
         kind: KeyKind::ByteSize,
     },
+    // The durable-write io-mode (perf/iomode-direct): `buffered` (default) | `direct` | `auto`. A
+    // COLD key (open fds carry the mode; a change needs a restart). Never weakens durability — the
+    // barrier is kept in every mode — only the sync MECHANISM differs.
+    KeySpec {
+        key: "storage.io_mode",
+        kind: KeyKind::Str,
+    },
     // [durability]
     KeySpec {
         key: "durability.level",
