@@ -307,6 +307,24 @@ pub enum ProduceSubmission {
     },
 }
 
+/// The result of a NON-BLOCKING poll of a submitted produce ([`ProduceSubmission::try_take`], #1045):
+/// either the covering commit has released the outcome (`Ready`), or it has not yet, in which case the
+/// UNCONSUMED submission is handed back (`NotReady`) so the caller can re-park it and poll again on a
+/// later pass. This is the primitive the session's persistent parked-window ring uses to release only
+/// the READY front prefix of its pipelined produces without ever block-awaiting an un-fsync'd one — so
+/// one connection keeps reading and submitting the NEXT batch while the actor fsyncs the current one
+/// (the single-connection group-commit overlap #1045 closes), instead of stalling the pass on the
+/// fdatasync of the batch it just parked.
+#[derive(Debug)]
+pub enum TryTake {
+    /// The outcome is available (the actor released it after its covering `commit_batch`, I2): the
+    /// caller writes its wire reply and drops the entry.
+    Ready(ProduceOutcome),
+    /// The outcome is not yet available: the submission is returned intact (its channel un-touched, so
+    /// a later `try_take` or a blocking `wait` still yields the one outcome) for the caller to re-park.
+    NotReady(ProduceSubmission),
+}
+
 /// The bounded busy-poll window for a spin-assisted produce-reply wait (#1032), in microseconds.
 /// Sized to cover the whole session->actor->session round trip on the no-pre-ack-fsync tiers — one
 /// cross-thread wake (measured ~10us hot, but with a scheduler-jitter tail well past 100us) plus the
@@ -375,6 +393,77 @@ impl ProduceSubmission {
                 Ok(outcome)
             }
         }
+    }
+
+    /// NON-BLOCKING poll of the produce outcome (#1045): the decoupled companion to [`wait`]. A
+    /// [`ProduceSubmission::Ready`] (a direct/same-thread engine, or a fast-reject) is ALWAYS ready. A
+    /// [`ProduceSubmission::Pending`] one is polled with a single `try_recv`: if the actor has already
+    /// released the outcome (after its covering `commit_batch`, I2) it is returned [`TryTake::Ready`]
+    /// and the recycled channel goes back to the pool (#475); otherwise the submission is handed back
+    /// intact as [`TryTake::NotReady`] for the caller to re-park (its channel is untouched, so the one
+    /// outcome is still there for a later `try_take` or a blocking `wait`).
+    ///
+    /// Semantically it can only ever observe what `wait` would: the channel carries exactly ONE
+    /// outcome, SENT by the actor strictly after the covering commit, so polling cannot reorder,
+    /// duplicate, or early-observe an ack ahead of its fsync — only the WAKE differs (a poll that comes
+    /// up empty parks nothing and returns immediately, where `wait` would block).
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] only if the actor dropped its cloned `tx` UN-sent (it exited before
+    /// replying), which disconnects the channel — exactly the condition `wait` maps to `ActorGone`. An
+    /// empty (not-yet-ready) channel is NOT an error; it is [`TryTake::NotReady`].
+    ///
+    /// [`wait`]: ProduceSubmission::wait
+    pub fn try_take(self) -> Result<TryTake, ActorGone> {
+        match self {
+            ProduceSubmission::Ready(outcome) => Ok(TryTake::Ready(outcome)),
+            ProduceSubmission::Pending {
+                channel,
+                pool,
+                spin,
+            } => match channel.rx.try_recv() {
+                // The outcome is here: recycle the drained channel (#475) and hand it back.
+                Ok(outcome) => {
+                    pool_return(&pool, channel);
+                    Ok(TryTake::Ready(outcome))
+                }
+                // Not yet released: return the submission INTACT (channel un-drained) to re-park. The
+                // co-located `tx` guarantees the channel cannot be disconnected here (the #802
+                // invariant), so `Empty` truly means "the actor has not committed this batch yet".
+                Err(TryRecvError::Empty) => Ok(TryTake::NotReady(ProduceSubmission::Pending {
+                    channel,
+                    pool,
+                    spin,
+                })),
+                // The actor exited before replying (it dropped its cloned `tx` un-sent): map it exactly
+                // like `wait`'s recv error so the session ends the connection cleanly.
+                Err(TryRecvError::Disconnected) => Err(ActorGone),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl ProduceSubmission {
+    /// Test-only constructor for a PENDING submission over a raw channel the test drives (#1045), so a
+    /// session test can control DETERMINISTICALLY when each parked produce's outcome becomes ready (the
+    /// ready-prefix release path) without a real actor thread or a real fsync. The returned
+    /// [`SyncSender`] is a SECOND handle on the reply channel: send a [`ProduceOutcome`] on it to make
+    /// this submission observe as [`TryTake::Ready`] (or unblock its `wait`); hold it un-sent to keep
+    /// the submission [`TryTake::NotReady`]. The submission retains its OWN co-located `tx`, so dropping
+    /// the returned sender never disconnects the channel (it stays `NotReady`, never `ActorGone`),
+    /// matching the production #802 invariant.
+    pub(crate) fn pending_for_test() -> (Self, SyncSender<ProduceOutcome>) {
+        let (tx, rx) = sync_channel(1);
+        let submission = ProduceSubmission::Pending {
+            channel: ReplyChannel { tx: tx.clone(), rx },
+            // A throwaway per-submission pool: the recycled channel returns here on release and is
+            // simply dropped with the test, never crossing to another connection.
+            pool: Arc::new(Mutex::new(Vec::new())),
+            // No spin: the test drives readiness explicitly, so the wait mechanics are irrelevant.
+            spin: false,
+        };
+        (submission, tx)
     }
 }
 

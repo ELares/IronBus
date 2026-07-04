@@ -17,7 +17,7 @@
 //! session.
 
 use crate::actor::{
-    ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission,
+    ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission, TryTake,
 };
 use crate::cluster::dataplane::FollowerReadOutcome;
 use crate::cluster::read_consistency::ReadTier;
@@ -53,7 +53,7 @@ use ironbus_proto::message::{
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 use ironbus_storage::streamset::StreamId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// A session error that ends the connection.
@@ -240,6 +240,19 @@ pub struct Session {
     /// every pass, so it never holds state across passes. Empty (the `Default`) for a connection that
     /// never publishes Level-0, so a non-publishing or at-least-once-only connection is unchanged.
     level0_pending: Vec<OwnedAppend>,
+    /// The PERSISTENT pipelined at-least-once produce window (#450, #1045): produces SUBMITTED to the
+    /// append actor whose acks have not yet been released, kept ACROSS passes (unlike the pass-scoped
+    /// `Vec` this used to be). Each pass parks new produces at the BACK and releases only the READY
+    /// FRONT PREFIX ([`ProduceSubmission::try_take`], non-blocking) — it never block-awaits an
+    /// un-fsync'd produce at the pass boundary anymore. That is what lets ONE connection keep reading
+    /// and submitting the NEXT batch while the actor group-commits the CURRENT one (closing the
+    /// single-connection ceiling #1045): the `Vec`-scoped drain used to stall the pass on batch N's
+    /// fdatasync, starving batch N+1. A [`VecDeque`] so front-prefix release (`pop_front`) and back
+    /// park (`push_back`) are both O(1). FIFO submission order is the wire ack order (#917): the front
+    /// prefix is released strictly in order and a not-ready front stops the release (the rest are also
+    /// not ready). Bounded at [`MAX_PARKED_PRODUCES`] (the connection block-drains the front when acks
+    /// lag arrivals). Empty (the `Default`) for a connection that never at-least-once-publishes.
+    parked: VecDeque<ParkedPub>,
     /// The work-group this connection is subscribed to, set by SUB and cleared by UNSUB.
     /// Empty selects the default group (#9), so an unsubscribed consumer behaves exactly as
     /// before. FLOW fetches and ACKs route to this group.
@@ -628,10 +641,14 @@ impl Session {
         // drain can register a Level-2 produce's confirm (#497) against this producer without
         // re-borrowing `self` while `handle_pub`/`dispatch` hold it.
         let member_id = self.member_id;
-        // The pass-scoped pipelined window (#450): produces submitted to the actor but not yet
-        // awaited. Scoped to ONE pass so the caller's flush boundary is unchanged: every parked ack
-        // is released into `out` before this method returns.
-        let mut parked: Vec<ParkedPub> = Vec::new();
+        // Resume the PERSISTENT pipelined window (#450, #1045): the produces submitted to the actor but
+        // not yet acked, carried over from prior passes. Taken into a LOCAL so `handle_pub`/`dispatch`
+        // can borrow `&mut self` without the borrow checker also seeing the field borrowed; it is stored
+        // back into `self.parked` before this method returns (both the normal-exit and error-exit
+        // paths), so a produce parked in one pass survives into the next. That persistence is the seam
+        // the connection loop overlaps the NEXT batch through — the pass no longer block-awaits the
+        // window at its end, so batch N's fdatasync no longer starves batch N+1 on one connection.
+        let mut parked = std::mem::take(&mut self.parked);
         let result = loop {
             match decode_frame(&input[consumed..]).map_err(SessionError::BadFrame) {
                 Err(e) => break Err(e),
@@ -671,12 +688,21 @@ impl Session {
                                 break Err(e);
                             }
                         }
-                        // The safety cap: a buffer packed with tiny PUB frames cannot park without
-                        // bound. At the cap the window is released (awaited FIFO) and a new window
-                        // starts; the cap matches the actor channel's default bound, so a capped
-                        // window still group-commits in at most a couple of batches.
+                        // Release any acks that are already ready (front prefix, NON-BLOCKING, #1045),
+                        // so a saturating producer's window stays small and its acks flow WITHIN the
+                        // pass instead of piling up. This does NOT block on an un-fsync'd produce — that
+                        // is the whole point: the pass keeps parsing/submitting the next frames while the
+                        // actor group-commits the batch already in flight.
+                        if let Err(e) = release_ready_prefix(engine, member_id, &mut parked, out) {
+                            break Err(e);
+                        }
+                        // The MAX_PARKED memory backstop (#450, #1045): if acks lag arrivals and the
+                        // window is STILL at the cap after releasing the ready prefix, block-drain the
+                        // front until it is bounded again (produce backpressure). The rare pathological
+                        // path — the actor is a full window of fsyncs behind — not the steady state.
                         if parked.len() >= MAX_PARKED_PRODUCES {
-                            if let Err(e) = drain_parked(engine, member_id, &mut parked, out) {
+                            if let Err(e) = enforce_parked_cap(engine, member_id, &mut parked, out)
+                            {
                                 break Err(e);
                             }
                         }
@@ -703,16 +729,24 @@ impl Session {
                 }
             }
         };
-        // End of the pass: release every still-parked ack (FIFO) before returning, so the caller's
-        // single `out` flush carries the whole window's replies. On an error exit the drain still
-        // runs (those produces already reached the actor and their acks belong on the wire before
-        // the close), but the FIRST error wins: a drain error after a loop error is the same fatal
-        // engine event and is subsumed by it.
-        // Flush any trailing Level-0 batch to the actor (#11 fast path) so the connection's last QoS-0
-        // produces are submitted before the pass returns; then release every still-parked ack. Both run
-        // even on an error exit (those produces/acks belong on the actor/wire before the close).
+        // End of the pass. Flush any trailing Level-0 batch to the actor (#11 fast path) so the
+        // connection's last QoS-0 produces are submitted before the pass returns.
+        //
+        // Then handle the still-parked at-least-once window (#1045). This is the crux of closing the
+        // single-connection ceiling: on a NORMAL exit the pass releases only the READY front prefix
+        // (non-blocking) and PERSISTS the rest in `self.parked` for the next pass / the connection
+        // loop's drain-one — it does NOT block-await the window, so one connection keeps reading and
+        // submitting the next batch while the actor group-commits the current one. On a CLOSING exit (a
+        // malformed frame / fatal engine error / auth violation broke the loop) the connection is going
+        // away, so block-drain the WHOLE remaining window FIFO — those produces already reached the
+        // actor and their acks belong on the wire before the close (the invariant), and the first error
+        // still wins (a drain error after a loop error is the same fatal engine event, subsumed).
         let level0_flushed = self.flush_level0(engine);
-        let drained = drain_parked(engine, member_id, &mut parked, out);
+        let drained = if result.is_err() {
+            drain_parked(engine, member_id, &mut parked, out)
+        } else {
+            release_ready_prefix(engine, member_id, &mut parked, out)
+        };
         // Drain any CLUSTER produce-acks the data plane RELEASED for this connection onto the wire
         // (#719): a clustered `C2-fsync` produce's wire `PubAck` was WITHHELD when it parked (in
         // `drain_parked` above), and the data plane flushes it onto this connection's outbox once the
@@ -756,10 +790,81 @@ impl Session {
         if self.registered_txn_listener() {
             drive_back_check(engine, member_id, out);
         }
+        // Persist the (possibly non-empty) pipelined window back onto the session (#1045), so produces
+        // parked but not yet acked survive into the next pass. Empty after a closing exit (the block
+        // drain above emptied it) or when every parked ack was already released; otherwise it carries
+        // the not-yet-committed tail the connection loop will drain-one or the next pass will release.
+        self.parked = parked;
         match result {
             Err(e) => Err(e),
             Ok(progress) => level0_flushed.and(drained).map(|()| progress),
         }
+    }
+
+    /// Whether this connection has at-least-once produces PARKED in its pipelined window (#1045) whose
+    /// acks have not yet been released. The connection loop consults it to choose its read mode: with a
+    /// non-empty window it reads NON-BLOCKING (so a would-block means "no new bytes right now", the cue
+    /// to release an ack a bounded-window client is waiting on) and, when empty, reads BLOCKING (an idle
+    /// connection sleeps on the socket rather than spinning).
+    #[must_use]
+    pub(crate) fn has_parked(&self) -> bool {
+        !self.parked.is_empty()
+    }
+
+    /// BLOCK-awaits the FRONT parked produce's ack (its covering group-commit fsync), writes its reply,
+    /// pops it (FIFO #917), then releases any further now-ready prefix (non-blocking) — so a whole
+    /// group-committed batch's acks flush in one call. The connection loop calls this when a
+    /// non-blocking read WOULD BLOCK while the window is non-empty: the socket has no new bytes, so a
+    /// client that pipelined W produces and is waiting on their acks is unblocked by releasing the front
+    /// ack (it can then send more). This is what keeps a bounded-window producer from deadlocking under
+    /// the non-blocking pass. Preserves #719/#497: the release goes through the SAME gated write +
+    /// confirm registration as every other drain path ([`release_parked_outcome`]).
+    ///
+    /// # Errors
+    /// [`SessionError::EngineFatal`]/[`SessionError::ActorGone`] if the front produce's outcome is fatal
+    /// or the actor exited — the connection then closes cleanly.
+    pub(crate) fn drain_one_parked_blocking<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let member_id = self.member_id;
+        drain_front_one_blocking(engine, member_id, &mut self.parked, out)?;
+        // The front's siblings in the same group-commit batch are almost certainly ready now (they
+        // share the fsync we just waited on): release them without blocking, so the whole batch's acks
+        // go out in one write.
+        release_ready_prefix(engine, member_id, &mut self.parked, out)
+    }
+
+    /// BLOCK-drains EVERY remaining parked ack onto `out` in FIFO order (#1045): the connection is
+    /// closing on a clean EOF, so the whole window's acks belong on the wire before the socket goes
+    /// away. A no-op on an empty window.
+    ///
+    /// # Errors
+    /// [`SessionError::EngineFatal`]/[`SessionError::ActorGone`] if a remaining produce's outcome is
+    /// fatal or the actor exited.
+    pub(crate) fn flush_all_parked_blocking<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let member_id = self.member_id;
+        drain_parked(engine, member_id, &mut self.parked, out)
+    }
+
+    /// The number of produces currently parked in the pipelined window (#1045). Test-only: the overlap
+    /// and cap tests assert the persistent window accumulates across passes and stays bounded.
+    #[cfg(test)]
+    pub(crate) fn parked_len(&self) -> usize {
+        self.parked.len()
     }
 
     /// Dispatches one decoded frame, returning whether it may have advanced a work-group's committed
@@ -802,7 +907,7 @@ impl Session {
             // one-entry window, submitted and immediately drained, byte-identical replies.
             Some(FrameType::Pub) => {
                 let member_id = self.member_id;
-                let mut parked = Vec::new();
+                let mut parked = VecDeque::new();
                 self.handle_pub(engine, body, &mut parked, out)?;
                 // This one-off Pub path submits and immediately drains, so flush any Level-0 it batched
                 // right away (no cross-frame accumulation here) — keeping the pass-scoped batch empty for
@@ -1245,7 +1350,7 @@ impl Session {
         &mut self,
         engine: &E,
         body: &[u8],
-        parked: &mut Vec<ParkedPub>,
+        parked: &mut VecDeque<ParkedPub>,
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
         // Captured up front (it is `Copy`) so the pre-submit error-path drains can register a parked
@@ -1474,7 +1579,7 @@ impl Session {
         // single total order holds (the L0s decoded earlier are appended before this L1): flush it now.
         self.flush_level0(engine)?;
         let submission = engine.produce_submit(append)?;
-        parked.push(ParkedPub {
+        parked.push_back(ParkedPub {
             submission,
             fire_and_forget,
             wants_confirm,
@@ -3078,7 +3183,7 @@ impl Session {
         // EXISTING default-stream produce path, byte-for-byte (#588 back-compat — a `PubTo("")` is
         // indistinguishable from a plain `Pub` downstream).
         if decoded.stream_id.is_empty() {
-            let mut parked = Vec::new();
+            let mut parked = VecDeque::new();
             self.handle_pub(engine, decoded.pub_body, &mut parked, out)?;
             // Flush any Level-0 this one-off subject-routed publish batched before draining (no
             // cross-frame accumulation here), keeping the single total order.
@@ -4298,7 +4403,9 @@ const MAX_PARKED_PRODUCES: usize = 1024;
 
 /// One produce PARKED in a session's pipelined window (#450): the un-awaited submission plus the
 /// QoS-0 marker the reply mapping needs (a fire-and-forget produce gets NO frame for any
-/// disposition, the #11 no-frame contract).
+/// disposition, the #11 no-frame contract). `Debug` because the window is now a persistent
+/// [`Session`] field (#1045), so it rides the struct's derived `Debug`.
+#[derive(Debug)]
 struct ParkedPub {
     /// The submitted-but-not-awaited produce; awaiting it yields the outcome only after the
     /// covering group-commit fsync (I2).
@@ -4312,44 +4419,196 @@ struct ParkedPub {
     wants_confirm: bool,
 }
 
-/// Releases a parked produce window (#450): awaits each submission IN SUBMISSION ORDER and appends
-/// its reply frame(s) to `out`, so the wire sees exactly the FIFO ack order the per-connection
-/// contract promises. On a fatal outcome the error propagates immediately; the remaining parked
-/// entries are dropped un-replied, which is safe because a batch-covering fsync failure marks EVERY
-/// member of the batch fatal (the actor's `flush_pending`) and the session is closing anyway (the
-/// actor tolerates a dropped reply receiver). After this returns, `parked` is empty.
+/// Writes ONE released produce's wire reply and, for a Level-2 publish (#497), registers its confirm —
+/// the SHARED release tail every drain path funnels through (the blocking full-window [`drain_parked`],
+/// the non-blocking ready-prefix [`release_ready_prefix`], and the blocking front-one
+/// [`drain_front_one_blocking`]), so the #719 cluster produce-ack gate and the #497 confirm
+/// registration are BYTE-IDENTICAL no matter which path releases the ack. `outcome` is the awaited or
+/// polled disposition; `fire_and_forget`/`wants_confirm` are the parked entry's markers.
 ///
-/// For a Level-2 publish (#497), AFTER its durability `PubAck` is written (the record is durable
-/// first, I2), the durable offset is REGISTERED in the engine's bounded confirm registry against this
-/// connection's `member_id`, so a later consumer ack in the designated group fires a `ProduceConfirm`
-/// back to this producer. The registration is layered ON TOP of the unchanged Level-1 reply; L0/L1
-/// (`wants_confirm == false`) skip it entirely.
+/// For a Level-2 publish, AFTER its durability `PubAck` is written (the record is durable first, I2),
+/// the durable offset is REGISTERED in the engine's bounded confirm registry against `member_id`, so a
+/// later consumer ack in the designated group fires a `ProduceConfirm` back to this producer. The
+/// registration is layered ON TOP of the unchanged Level-1 reply; L0/L1 (`wants_confirm == false`)
+/// skip it entirely.
+fn release_parked_outcome<
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+>(
+    engine: &E,
+    member_id: MemberId,
+    outcome: ProduceOutcome,
+    fire_and_forget: bool,
+    wants_confirm: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    // A Level-2 publish whose record became durable registers its offset for the consumer-ack
+    // confirmation, AFTER the durability ack is written below. Only a fresh `Appended` is a new durable
+    // offset to confirm; a dedup hit (`AppendedDuplicate`) returns an ALREADY-confirmed-or-pending
+    // earlier offset, a shed/fence/fatal never became durable, and a fire-and-forget L2 is not a thing
+    // (L2 is at-least-once). So capture the offset to register only on `Appended`.
+    let confirm_offset = match &outcome {
+        ProduceOutcome::Appended(offset) if wants_confirm => Some(*offset),
+        _ => None,
+    };
+    write_pub_reply_gated(engine, member_id, outcome, fire_and_forget, out)?;
+    if let Some(offset) = confirm_offset {
+        // Register AFTER the `PubAck` was written: the record is durable (the covering fsync ran before
+        // the actor reported `Appended`) and its durability ack is already on the wire, so the Level-2
+        // confirm wait is strictly layered on top of the Level-1 durability guarantee. A gone actor here
+        // is a no-op (the connection is ending anyway); the registry is bounded, so this can never grow
+        // without bound.
+        let _ = engine.with(move |e| e.register_l2_confirm(offset, member_id));
+    }
+    Ok(())
+}
+
+/// BLOCK-drains the ENTIRE parked produce window (#450): awaits each submission IN SUBMISSION ORDER
+/// and appends its reply frame(s) to `out`, so the wire sees exactly the FIFO ack order the
+/// per-connection contract promises (#917). On a fatal outcome the error propagates immediately; the
+/// remaining parked entries are dropped un-replied, which is safe because a batch-covering fsync
+/// failure marks EVERY member of the batch fatal (the actor's `flush_pending`) and the session is
+/// closing anyway (the actor tolerates a dropped reply receiver). After this returns, `parked` is
+/// empty.
+///
+/// Used on the CLOSING paths only (#1045): a non-produce frame's ordering barrier (an ack/flow/sub
+/// reply must come after every prior produce ack), a malformed/fatal pass exit, and the connection's
+/// clean-EOF final flush — the cases where the whole window's acks belong on the wire before the next
+/// (non-produce) reply or the close. The STEADY-STATE per-pass release does NOT block-await here; it
+/// uses [`release_ready_prefix`], which is what lets one connection overlap the next batch with the
+/// current batch's fsync.
 fn drain_parked<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
     engine: &E,
     member_id: MemberId,
-    parked: &mut Vec<ParkedPub>,
+    parked: &mut VecDeque<ParkedPub>,
     out: &mut Vec<u8>,
 ) -> Result<(), SessionError> {
-    for p in parked.drain(..) {
-        let outcome = p.submission.wait()?;
-        // A Level-2 publish whose record became durable registers its offset for the consumer-ack
-        // confirmation, AFTER the durability ack is written below. Only a fresh `Appended` is a new
-        // durable offset to confirm; a dedup hit (`AppendedDuplicate`) returns an ALREADY-confirmed-or-
-        // pending earlier offset, a shed/fence/fatal never became durable, and a fire-and-forget L2 is
-        // not a thing (L2 is at-least-once). So capture the offset to register only on `Appended`.
-        let confirm_offset = match &outcome {
-            ProduceOutcome::Appended(offset) if p.wants_confirm => Some(*offset),
-            _ => None,
-        };
-        write_pub_reply_gated(engine, member_id, outcome, p.fire_and_forget, out)?;
-        if let Some(offset) = confirm_offset {
-            // Register AFTER the `PubAck` was written: the record is durable (the covering fsync ran
-            // before the actor reported `Appended`) and its durability ack is already on the wire, so
-            // the Level-2 confirm wait is strictly layered on top of the Level-1 durability guarantee.
-            // A gone actor here is a no-op (the connection is ending anyway); the registry is bounded,
-            // so this can never grow without bound.
-            let _ = engine.with(move |e| e.register_l2_confirm(offset, member_id));
+    while let Some(p) = parked.pop_front() {
+        let ParkedPub {
+            submission,
+            fire_and_forget,
+            wants_confirm,
+        } = p;
+        let outcome = submission.wait()?;
+        release_parked_outcome(
+            engine,
+            member_id,
+            outcome,
+            fire_and_forget,
+            wants_confirm,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// Releases only the READY FRONT PREFIX of the parked window (#1045): NON-BLOCKING — while the FRONT
+/// parked produce's outcome is already available ([`ProduceSubmission::try_take`]), write its reply and
+/// pop it; STOP at the first not-ready front and leave it (and everything behind it) parked. By the
+/// per-connection FIFO submission order (#917) a not-ready front implies the rest are also not ready
+/// (a later batch cannot commit before an earlier one), so releasing the ready prefix preserves the
+/// exact wire ack order while NEVER block-awaiting an un-fsync'd produce. This is the seam that lets a
+/// saturating producer keep reading and submitting the next batch instead of stalling the pass on the
+/// fdatasync of the batch it just parked.
+fn release_ready_prefix<
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+>(
+    engine: &E,
+    member_id: MemberId,
+    parked: &mut VecDeque<ParkedPub>,
+    out: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    while let Some(p) = parked.pop_front() {
+        let ParkedPub {
+            submission,
+            fire_and_forget,
+            wants_confirm,
+        } = p;
+        match submission.try_take()? {
+            TryTake::Ready(outcome) => {
+                release_parked_outcome(
+                    engine,
+                    member_id,
+                    outcome,
+                    fire_and_forget,
+                    wants_confirm,
+                    out,
+                )?;
+            }
+            TryTake::NotReady(submission) => {
+                // The front's covering commit has not landed yet: re-park it at the FRONT and stop. By
+                // FIFO the rest of the window is also not ready, so we never reorder acks.
+                parked.push_front(ParkedPub {
+                    submission,
+                    fire_and_forget,
+                    wants_confirm,
+                });
+                break;
+            }
         }
+    }
+    Ok(())
+}
+
+/// BLOCK-awaits the single FRONT parked produce's ack (its covering group-commit fsync), writes its
+/// reply, and pops it (#1045, FIFO #917). The bounded-window primitive: when a non-blocking read would
+/// block AND the window is non-empty, the socket has no new bytes, so the ONLY way to make progress for
+/// a client waiting on acks it already sent is to release the FRONT ack — block on exactly that one
+/// fsync. A no-op on an empty window.
+fn drain_front_one_blocking<
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+>(
+    engine: &E,
+    member_id: MemberId,
+    parked: &mut VecDeque<ParkedPub>,
+    out: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    if let Some(p) = parked.pop_front() {
+        let ParkedPub {
+            submission,
+            fire_and_forget,
+            wants_confirm,
+        } = p;
+        let outcome = submission.wait()?;
+        release_parked_outcome(
+            engine,
+            member_id,
+            outcome,
+            fire_and_forget,
+            wants_confirm,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// Enforces the [`MAX_PARKED_PRODUCES`] memory backstop (#450, #1045): once the persistent window has
+/// grown to the cap (acks lagging arrivals), release the ready front prefix and, if that is not enough,
+/// BLOCK-drain the front one at a time until the window is back under the cap. Bounds the parked-window
+/// memory at exactly `MAX_PARKED_PRODUCES` entries regardless of how far the actor's fsyncs lag; the
+/// blocking drain is natural produce backpressure (a new produce waits for an old one to commit).
+fn enforce_parked_cap<
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+>(
+    engine: &E,
+    member_id: MemberId,
+    parked: &mut VecDeque<ParkedPub>,
+    out: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    // Cheap first: release anything already-ready (no block). Usually enough on its own.
+    release_ready_prefix(engine, member_id, parked, out)?;
+    // Still at the cap: the front is genuinely un-committed, so block on it (backpressure) until the
+    // window is bounded again.
+    while parked.len() >= MAX_PARKED_PRODUCES {
+        drain_front_one_blocking(engine, member_id, parked, out)?;
+        release_ready_prefix(engine, member_id, parked, out)?;
     }
     Ok(())
 }
@@ -10081,8 +10340,12 @@ mod tests {
             .unwrap();
         control.wait_for_sync_gate_entered(1);
 
-        // The pipelined window: N PUB frames in ONE input buffer, ONE process pass. The pass
-        // submits all N (opening the gate on the last submission), then awaits the parked acks.
+        // The pipelined window: N PUB frames in ONE input buffer, ONE process pass. The pass submits
+        // all N (opening the gate on the last submission) and PARKS them. Since #1045 the pass no longer
+        // block-awaits the window at its end — it releases only the ready front prefix and persists the
+        // rest — so the acks are collected with an explicit `flush_all_parked_blocking`, exactly what
+        // the connection loop does on a clean EOF or a would-block. The #450 teeth are unchanged: N
+        // pipelined produces are still covered by ONE group-commit fsync and acked as N FIFO PubAcks.
         let n: u64 = 8;
         let mut input = Vec::new();
         for i in 0..n {
@@ -10096,6 +10359,9 @@ mod tests {
         };
         let progress = s.process(&window_handle, &input, &mut out).unwrap();
         assert_eq!(progress.consumed, input.len(), "the whole window consumed");
+        // Drain the persistent window (the gate is already open, so the actor group-commits all N and
+        // the FIFO acks flush into `out` — combined with any the pass's ready-prefix already released).
+        s.flush_all_parked_blocking(&handle, &mut out).unwrap();
 
         // The primer (awaited only now) and the window are all durable.
         assert!(matches!(primer.wait().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
@@ -10133,6 +10399,308 @@ mod tests {
         let _ = handle.shutdown();
         drop(handle);
         let _ = actor.join().unwrap();
+    }
+
+    #[test]
+    fn overlap_a_second_pass_of_produces_is_in_flight_before_the_first_ack_1045() {
+        // #1045 OVERLAP TEETH: a `process` pass no longer block-awaits its parked window at the pass
+        // boundary, so ONE connection can submit batch N+1 while batch N's group-commit fdatasync is
+        // still in flight — the single-connection ceiling this closes. Proven deterministically with the
+        // fault-fs sync gate: park the actor inside a primer's fsync (gate closed), then run TWO
+        // SEPARATE process passes of PUBs. Under the OLD block-at-pass-end design the FIRST pass would
+        // hang inside its drain; under #1045 both passes RETURN with the actor still parked, so 2*BATCH
+        // produces are in flight and ZERO acks have been written. Opening the gate then drains them as
+        // 2*BATCH FIFO PubAcks under ONE covering fsync (group commit preserved).
+        use crate::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
+        use ironbus_storage::fault::FaultFs;
+
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), test_config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+
+        // Handshake before the gate closes (Connect never touches the fsync path).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&handle, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        // Park the actor inside a primer produce's covering fsync: a provable barrier. Until the gate
+        // opens the actor consumes NO further command, so every windowed produce stays queued/parked.
+        control.close_sync_gate();
+        let primer = handle
+            .produce_submit(crate::actor::OwnedAppend {
+                timestamp_ms: 0,
+                flags: 0,
+                key: Bytes::new(),
+                headers: Bytes::new(),
+                payload: Bytes::from_static(b"primer"),
+                body_checksums: None,
+                dedup: None,
+                enqueue_monotonic_nanos: 0,
+                fire_and_forget: false,
+                ack_level: ironbus_proto::message::AckLevel::ServerAck,
+            })
+            .unwrap();
+        control.wait_for_sync_gate_entered(1);
+        let before = control.sync_count();
+
+        // PASS 1: submit a batch of PUBs. The pass parks them and RETURNS without block-awaiting (the
+        // actor is still parked in the primer fsync, so nothing is ready to release).
+        let batch: u64 = 4;
+        let mut pass1 = Vec::new();
+        for i in 0..batch {
+            pass1.extend_from_slice(&pub_frame(format!("a{i}").as_bytes()));
+        }
+        s.process(&handle, &pass1, &mut out).unwrap();
+        assert!(
+            out.is_empty(),
+            "pass 1 wrote no ack — the batch's covering fsync is still gated"
+        );
+        assert_eq!(
+            s.parked_len(),
+            usize::try_from(batch).unwrap(),
+            "pass 1's batch is parked, not block-awaited"
+        );
+
+        // PASS 2: submit a SECOND batch. This pass is only reachable because pass 1 did NOT block on its
+        // window (the overlap). The window now spans BOTH passes with the actor still parked.
+        let mut pass2 = Vec::new();
+        for i in 0..batch {
+            pass2.extend_from_slice(&pub_frame(format!("b{i}").as_bytes()));
+        }
+        s.process(&handle, &pass2, &mut out).unwrap();
+        assert!(out.is_empty(), "pass 2 wrote no ack either — still gated");
+        assert_eq!(
+            s.parked_len(),
+            usize::try_from(2 * batch).unwrap(),
+            "MORE THAN ONE PASS's worth of produces are in flight before the first ack (the #1045 overlap)"
+        );
+
+        // Release the gate: the primer commits, then the actor drains the WHOLE 2*BATCH window and
+        // covers it with ONE group-commit fsync. Drain: 2*BATCH FIFO PubAcks, contiguous offsets after
+        // the primer.
+        control.open_sync_gate();
+        assert!(matches!(primer.wait().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
+        s.flush_all_parked_blocking(&handle, &mut out).unwrap();
+        assert_eq!(s.parked_len(), 0, "the whole window drained");
+        let offsets: Vec<u64> = decode_all(&out)
+            .iter()
+            .map(|(t, body)| {
+                assert_eq!(*t, FrameType::PubAck);
+                decode_pub_ack(body).unwrap().offset
+            })
+            .collect();
+        assert_eq!(
+            offsets,
+            (1..=2 * batch).collect::<Vec<_>>(),
+            "FIFO acks with contiguous offsets after the primer (order preserved across two passes)"
+        );
+        let window_syncs = control.sync_count() - before;
+        assert_eq!(
+            window_syncs,
+            1,
+            "both passes' produces group-committed under ONE fsync, not {}",
+            2 * batch
+        );
+
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join().unwrap();
+    }
+
+    #[test]
+    fn interleaved_produce_and_non_produce_frames_reply_in_frame_order_under_the_nonblocking_release_1045(
+    ) {
+        // #1045 + #917: with the non-blocking ready-prefix release, the wire reply order under
+        // INTERLEAVED produce and non-produce frames must STILL be exactly the frame order. A
+        // non-produce frame block-drains the full parked prefix before its own reply (a pong must come
+        // after every prior produce ack), and the ready-prefix releases produces FIFO — so the replies
+        // are frame-order no matter which path released each produce.
+        use crate::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
+
+        let engine = Engine::open(InMemoryFs::new(), ManualClock::new(), test_config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&handle, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        // Interleave PUB, PING, PUB, PING in ONE buffer / ONE pass. Ending on a non-produce frame keeps
+        // the pass deterministic: each PING's block-drain flushes the preceding PUB's ack before its
+        // Pong, so `out` carries the full sequence in exact frame order.
+        let mut input = Vec::new();
+        input.extend_from_slice(&pub_frame(b"x0"));
+        input.extend_from_slice(&frame(FrameType::Ping, b""));
+        input.extend_from_slice(&pub_frame(b"x1"));
+        input.extend_from_slice(&frame(FrameType::Ping, b""));
+        s.process(&handle, &input, &mut out).unwrap();
+        // Any produce still parked at the final pass boundary would be flushed by the connection loop;
+        // do it explicitly (a no-op here, since the trailing PING already block-drained the window).
+        s.flush_all_parked_blocking(&handle, &mut out).unwrap();
+
+        let frames = decode_all(&out);
+        let kinds: Vec<FrameType> = frames.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                FrameType::PubAck,
+                FrameType::Pong,
+                FrameType::PubAck,
+                FrameType::Pong
+            ],
+            "interleaved replies are in exact frame order (FIFO #917 across the non-blocking release)"
+        );
+        assert_eq!(decode_pub_ack(&frames[0].1).unwrap().offset, 0);
+        assert_eq!(
+            decode_pub_ack(&frames[2].1).unwrap().offset,
+            1,
+            "the second produce takes the next offset — FIFO, no reorder"
+        );
+
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join().unwrap();
+    }
+
+    /// A test [`EngineAccess`] that hands out PRE-BUILT pending produce submissions (#1045), so a test
+    /// can control DETERMINISTICALLY when each parked produce's outcome becomes ready — exercising the
+    /// persistent parked-window ring and its `MAX_PARKED_PRODUCES` cap without a real actor or fsync.
+    /// `produce_submit` pops the next queued submission; the test drives readiness by sending on the
+    /// matching [`std::sync::mpsc::SyncSender`] returned by [`ProduceSubmission::pending_for_test`].
+    struct ScriptedSubmitEngine {
+        submissions: std::cell::RefCell<VecDeque<ProduceSubmission>>,
+    }
+
+    impl ScriptedSubmitEngine {
+        /// Builds `n` pending submissions, returning the engine and the per-submission senders (index-
+        /// aligned): sending `ProduceOutcome::Appended(Offset::new(i))` on `senders[i]` makes the i-th
+        /// produce observe as ready with offset `i`, so the released acks are FIFO-checkable.
+        fn new(n: usize) -> (Self, Vec<std::sync::mpsc::SyncSender<ProduceOutcome>>) {
+            let mut submissions = VecDeque::with_capacity(n);
+            let mut senders = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (submission, tx) = ProduceSubmission::pending_for_test();
+                submissions.push_back(submission);
+                senders.push(tx);
+            }
+            (
+                Self {
+                    submissions: std::cell::RefCell::new(submissions),
+                },
+                senders,
+            )
+        }
+    }
+
+    impl EngineAccess<InMemoryFs, ManualClock> for ScriptedSubmitEngine {
+        fn produce(&self, _append: OwnedAppend) -> Result<ProduceOutcome, ActorGone> {
+            // Never reached: `handle_pub` routes an at-least-once produce through `produce_submit`.
+            Ok(ProduceOutcome::Appended(Offset::new(0)))
+        }
+        fn produce_submit(&self, _append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
+            Ok(self
+                .submissions
+                .borrow_mut()
+                .pop_front()
+                .expect("scripted submission underflow"))
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+    }
+
+    #[test]
+    fn the_persistent_parked_window_is_bounded_by_the_max_parked_cap_1045() {
+        // #1045: the pipelined window is PERSISTENT (survives across passes) and BOUNDED at
+        // `MAX_PARKED_PRODUCES` entries even when acks lag arrivals. First prove persistence + unbounded-
+        // free accumulation up to just under the cap with NO outcomes released (deterministic, no
+        // threads); then release every outcome from a background thread and drive the window PAST the
+        // cap, so `enforce_parked_cap` (release-ready-prefix, then block-drain the front until under the
+        // cap) keeps memory bounded while every ack is still delivered exactly once in FIFO order.
+        let n = MAX_PARKED_PRODUCES + 4;
+        let (engine, senders) = ScriptedSubmitEngine::new(n);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&engine, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        // PASS 1 then PASS 2, one PUB each, no outcomes released: the window PERSISTS across passes.
+        s.process(&engine, &pub_frame(b"p"), &mut out).unwrap();
+        assert_eq!(s.parked_len(), 1, "pass 1's produce persists");
+        s.process(&engine, &pub_frame(b"p"), &mut out).unwrap();
+        assert_eq!(
+            s.parked_len(),
+            2,
+            "pass 2's produce is ADDED to the persisted window (it survived the pass boundary)"
+        );
+
+        // PASS 3: fill to exactly MAX_PARKED_PRODUCES - 1, still no outcomes: accumulates the backlog up
+        // to just under the cap WITHOUT blocking (the pass never block-awaits an un-fsync'd produce).
+        let mut fill = Vec::new();
+        for _ in 0..(MAX_PARKED_PRODUCES - 1 - 2) {
+            fill.extend_from_slice(&pub_frame(b"p"));
+        }
+        s.process(&engine, &fill, &mut out).unwrap();
+        assert_eq!(
+            s.parked_len(),
+            MAX_PARKED_PRODUCES - 1,
+            "the persistent window holds the whole un-acked backlog, just under the cap"
+        );
+        assert!(
+            out.is_empty(),
+            "nothing acked yet — no outcome has been released"
+        );
+
+        // Release every outcome from a background thread (in submission order), so the cap's front
+        // block-drain never wedges. Then feed the remaining PUBs so the window CROSSES the cap: the pass
+        // hits `enforce_parked_cap`, which keeps `parked` bounded at MAX_PARKED_PRODUCES.
+        let sender_thread = std::thread::spawn(move || {
+            for (i, tx) in senders.into_iter().enumerate() {
+                let _ = tx.send(ProduceOutcome::Appended(Offset::new(i as u64)));
+            }
+        });
+        let mut rest = Vec::new();
+        for _ in 0..(n - (MAX_PARKED_PRODUCES - 1)) {
+            rest.extend_from_slice(&pub_frame(b"p"));
+        }
+        s.process(&engine, &rest, &mut out).unwrap();
+        // Flush any straggler the pass could not yet release (an outcome the background thread had not
+        // sent when the pass ended); block-awaits it, so the window ends empty.
+        s.flush_all_parked_blocking(&engine, &mut out).unwrap();
+        sender_thread.join().unwrap();
+        assert_eq!(
+            s.parked_len(),
+            0,
+            "the whole window drained after the cap crossing"
+        );
+
+        // Every one of the N produces acked EXACTLY ONCE, in FIFO offset order 0..N — no loss, no
+        // reorder, across the cap-enforcing block drains.
+        let offsets: Vec<u64> = decode_all(&out)
+            .iter()
+            .map(|(t, body)| {
+                assert_eq!(*t, FrameType::PubAck);
+                decode_pub_ack(body).unwrap().offset
+            })
+            .collect();
+        assert_eq!(
+            offsets,
+            (0..n as u64).collect::<Vec<_>>(),
+            "N FIFO PubAcks — the cap bounded the window without dropping or reordering an ack"
+        );
     }
 
     // --- Ack-level server accept-path (#495) ------------------------------------------------------
