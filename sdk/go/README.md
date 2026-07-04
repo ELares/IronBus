@@ -87,6 +87,9 @@ Each example runs against a live broker
 - `examples/cluster_notleader`: following the typed NotLeader redirect (a
   single-node broker never emits it; run against a cluster node to see the
   redirect).
+- `examples/auth`: connecting with a bearer or username+password credential
+  (secret redacted when logged; safe to run against a no-auth broker, which
+  ignores it).
 
 The only dependency is `github.com/pierrec/lz4/v4` (the broker compresses
 stored payloads transparently, so the SDK must decode lz4 blocks).
