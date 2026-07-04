@@ -508,6 +508,8 @@ ironbus bench --duration 30 --mode round-trip --payload-bytes 256 --pubwindow 64
 
 The wire protocol is a small, versioned, length-framed binary protocol ([docs/TRANSPORT.md](docs/TRANSPORT.md)); the official clients speak it natively — no HTTP, no protobuf.
 
+**New to the clients?** [docs/CLIENT_SDKS.md](docs/CLIENT_SDKS.md) is the full getting-started walkthrough for both languages — connect, every produce/consume shape, transactions, subjects, auth, cluster redirects, and a capability matrix across the Rust (sync/async) and Go clients.
+
 ### Rust
 
 Two first-party crates in this workspace, sharing every wire codec and type: [`ironbus-client`](crates/ironbus-client/) (blocking, minimal, edge-first) and [`ironbus-client-async`](crates/ironbus-client-async/) (its tokio twin — same API surface, `.await`ed). Broker-side lz4 compression is transparent in both; auth rides `ClientConfig::credential` (`AuthCredential` bearer/password). Runnable examples live in [`crates/ironbus-client/examples/`](https://github.com/ELares/IronBus/tree/main/crates/ironbus-client/examples).
