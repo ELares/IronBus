@@ -98,6 +98,15 @@ pub struct ActorWatchdog {
     /// The monotonic nanos the actor began the current batch, or `0` when idle (blocked awaiting a
     /// command). Stored as `max(1)` so a `now` of `0` (a fresh manual clock) is never mistaken for idle.
     processing_since: AtomicU64,
+    /// The monotonic nanos the append actor's pipelined branch DISPATCHED the covering barrier
+    /// currently in flight on the flusher thread (#1040, INV-8), or `0` when none is in flight.
+    /// Stored as `max(1)` like `processing_since`. This is the wedge visibility the busy stamp
+    /// cannot provide on the pipelined tier (#862): there the actor does NOT block inside the
+    /// fsync — it returns to idle (clearing `processing_since`) or keeps serving passes
+    /// (RE-stamping `processing_since` fresh every pass) while the flusher's `fdatasync` hangs —
+    /// so BOTH wedge variants, the idle actor and the busy broker, are visible only through this
+    /// stamp. Non-zero EXACTLY while the actor records an in-flight barrier.
+    sync_inflight_since_nanos: AtomicU64,
     /// The overrun bound in nanos: an in-flight batch older than this is WEDGED. `0` = the watchdog is
     /// DISABLED (it never trips), the default until a serve configures it via [`set_bound_nanos`].
     ///
@@ -116,6 +125,7 @@ impl ActorWatchdog {
     pub fn new(bound_nanos: u64) -> ActorWatchdog {
         ActorWatchdog {
             processing_since: AtomicU64::new(0),
+            sync_inflight_since_nanos: AtomicU64::new(0),
             bound_nanos: AtomicU64::new(bound_nanos),
             writer_healthy: AtomicBool::new(true),
         }
@@ -150,9 +160,36 @@ impl ActorWatchdog {
         self.processing_since.store(0, Ordering::Release);
     }
 
-    /// Whether the actor's current batch has been in flight longer than the configured bound — a hung
-    /// fsync. `false` when idle (`processing_since == 0`), when no bound is configured (`bound == 0`),
-    /// or within the bound. The comparison is strict `>` so the exact-bound boundary is still healthy.
+    /// Records that the append actor's pipelined branch DISPATCHED a covering barrier to the
+    /// flusher thread at `now_monotonic_nanos` (#1040, INV-8). One relaxed store per DISPATCH
+    /// (at most one barrier is ever in flight, so this is per-group-commit, never per message).
+    /// Cleared by [`clear_sync_inflight`] the moment the completion is taken off the channel, so
+    /// the stamp is non-zero exactly while a barrier is in flight.
+    ///
+    /// [`clear_sync_inflight`]: ActorWatchdog::clear_sync_inflight
+    pub fn mark_sync_inflight(&self, now_monotonic_nanos: u64) {
+        self.sync_inflight_since_nanos
+            .store(now_monotonic_nanos.max(1), Ordering::Relaxed);
+    }
+
+    /// Records that the in-flight covering barrier RETURNED (Ok or Err — either ends the flight;
+    /// an Err freezes the writer, which `/readyz` sees via the published frozen flag, not via a
+    /// perpetual wedge). Clears the stamp so the watchdog cannot trip between barriers.
+    pub fn clear_sync_inflight(&self) {
+        self.sync_inflight_since_nanos.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the actor's current batch OR the pipelined tier's in-flight covering barrier has
+    /// been in flight longer than the configured bound — a hung fsync (#862, #1040 INV-8).
+    /// `false` when there is neither (`processing_since == 0` and no barrier in flight), when no
+    /// bound is configured (`bound == 0`), or within the bound. The comparison is strict `>` so
+    /// the exact-bound boundary is still healthy.
+    ///
+    /// The overrun is the MAX of the two ages: the busy-batch stamp catches the legacy tiers'
+    /// inline-fsync wedge exactly as before, and the sync-inflight stamp catches the pipelined
+    /// tier's flusher wedge — which the busy stamp structurally CANNOT see, because there the
+    /// actor keeps re-stamping `busy` fresh every pass (a busy broker) or clears it entirely (an
+    /// idle actor) while the flusher hangs.
     ///
     /// The `processing_since` load is ACQUIRE so that reading the idle stamp (`0`) synchronizes-with the
     /// actor's [`mark_idle`] RELEASE store and transitively publishes the writer-frozen flag the actor set
@@ -166,7 +203,11 @@ impl ActorWatchdog {
             return false;
         }
         let since = self.processing_since.load(Ordering::Acquire);
-        since != 0 && now_monotonic_nanos.saturating_sub(since) > bound
+        let busy_overrun = since != 0 && now_monotonic_nanos.saturating_sub(since) > bound;
+        let sync_since = self.sync_inflight_since_nanos.load(Ordering::Relaxed);
+        let sync_overrun =
+            sync_since != 0 && now_monotonic_nanos.saturating_sub(sync_since) > bound;
+        busy_overrun || sync_overrun
     }
 
     /// Publishes the writer's live/frozen state (`engine.is_healthy()`), called by the actor after each
@@ -298,6 +339,30 @@ mod tests {
             w.overran(32),
             "a batch begun at t=0 still overruns the bound"
         );
+    }
+
+    #[test]
+    fn a_sync_inflight_overrun_trips_even_while_the_actor_stamps_busy_or_idle() {
+        // #1040 INV-8 (the #862 pipelined-tier wedge): the flusher's in-flight barrier trips the
+        // watchdog REGARDLESS of the busy stamp — an idle actor (stamp cleared) and a busy broker
+        // (stamp re-freshened every pass) are BOTH blind spots for the busy age alone.
+        let w = ActorWatchdog::new(30);
+        // Idle actor, barrier in flight: only the sync stamp can see the wedge.
+        w.mark_sync_inflight(100);
+        w.mark_idle();
+        assert!(!w.overran(100 + 30), "within the bound (strict >)");
+        assert!(w.overran(100 + 31), "idle actor + wedged barrier trips");
+        // Busy broker: passes keep re-stamping busy FRESH, so the busy age never overruns — the
+        // sync stamp still trips (the C1/D2 busy-broker blind spot).
+        w.mark_busy(130);
+        assert!(w.overran(131 + 1), "fresh busy stamp cannot mask the wedge");
+        // The completion clears the flight: no wedge from either stamp afterward.
+        w.clear_sync_inflight();
+        w.mark_idle();
+        assert!(!w.overran(u64::MAX), "no flight, no batch: never wedged");
+        // A stamp at logical time 0 is clamped to 1 (not mistaken for no-flight).
+        w.mark_sync_inflight(0);
+        assert!(w.overran(32), "a t=0 dispatch still overruns the bound");
     }
 
     #[test]

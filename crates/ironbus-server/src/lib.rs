@@ -9,6 +9,7 @@ pub mod cluster;
 pub mod codes;
 pub mod connz;
 pub mod engine;
+pub(crate) mod flusher;
 pub mod health;
 pub mod liveness;
 pub mod metrics;

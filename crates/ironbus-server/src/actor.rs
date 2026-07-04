@@ -20,8 +20,26 @@
 //! Pings (and anything that needs no engine state) are answered by the connection handler WITHOUT
 //! touching the actor, so a stalled produce `sync_data` on one producer's group never blocks another
 //! connection's ping. Acks/flow/sub run as a [`Command::Run`] job that the actor executes against the
-//! owned engine; the actor flushes any pending produce batch (one fsync) BEFORE a job runs, so a job
-//! observes a consistent durable head and the total durable order is unchanged.
+//! owned engine. On the non-fsync tiers the actor flushes any pending produce batch (one fsync)
+//! BEFORE a job runs, so a job observes a consistent durable head and the total durable order is
+//! unchanged. On the PIPELINED sync tier (#1040) a job does NOT quiesce the in-flight barrier: it
+//! observes a consistent, MONOTONE durable head that may trail the appended head by the in-flight
+//! window (reads are bounded by the flushed frontier, which only advances at durability), and an
+//! in-job inline barrier (a txn `commit_batch`, a `force_sync`, a named-stream `commit_tick`)
+//! composes safely — the overtaken flight's late completion is a FULL no-op and the in-job-covered
+//! waiters release at the post-job reconcile.
+//!
+//! ## The pipelined sync tier (#1040)
+//!
+//! Exactly where an ack waits on a REAL pre-ack fsync barrier ([`Engine::commit_syncs_before_ack`],
+//! #1026 — durability `sync` on a real-barrier backend), `run_actor` branches ONCE at entry into a
+//! pipelined loop: appends stay on the actor, but the covering `fdatasync` runs on a dedicated
+//! flusher thread ([`crate::flusher`]) with AT MOST ONE barrier in flight. Each parked reply is
+//! stamped with the appended head at park and released ONLY once the durable head reaches it
+//! (INV-1, I2). Everything appended while a barrier is in flight merges into the NEXT ticket,
+//! dispatched the instant the previous completes — the in-flight fsync IS the batching window
+//! (self-clocking group commit; the #454 wall-clock gather is retired). Every other tier runs the
+//! legacy loop byte-for-byte.
 //!
 //! ## Invariants
 //!
@@ -31,7 +49,8 @@
 //! - No lost replies / no deadlock: every command gets exactly one reply; a closed channel is a typed
 //!   [`ActorGone`], never a panic, so neither side hangs forever if the other dies.
 
-use crate::engine::{DiskFullPolicy, Engine, EngineError};
+use crate::engine::{AsyncCommit, DiskFullPolicy, Engine, EngineError};
+use crate::flusher::{spawn_flusher, FlushJob, SyncDone};
 use crate::liveness::ActorWatchdog;
 use crate::produce_gate::ProduceCapGate;
 use bytes::Bytes;
@@ -39,7 +58,8 @@ use ironbus_core::clock::Clock;
 use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::collections::VecDeque;
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cluster::client_ack::{ClientAckGate, ClusterProduceRouting};
@@ -1384,30 +1404,23 @@ pub fn spawn_actor<F, C>(
 ) -> (EngineHandle<F, C>, std::thread::JoinHandle<Engine<F, C>>)
 where
     F: Filesystem + 'static,
+    F::File: 'static,
     C: Clock + Clone + 'static,
 {
     spawn_actor_with_gather(engine, channel_bound, 0)
 }
 
-/// Like [`spawn_actor`] with a bounded GROUP-COMMIT GATHER (#454, #472). With `gather_micros`
-/// of 0 the actor is byte-identical to the historical drain (this is what [`spawn_actor`] passes,
-/// and what an operator gets from `--commit-gather-us 0`; the shipped CLI default is a small
-/// non-zero window so out-of-the-box durable produce batches fsyncs, #472). With a window set, a
-/// drain pass that already holds at
-/// least TWO produces (evidence of a pipelining publisher; a single-produce pass never gathers,
-/// so an unpipelined producer pays no window) keeps collecting commands for up to the window
-/// before committing, so a pipelined publisher's whole in-flight window lands under ONE covering
-/// fsync instead of self-sizing slivers (measured on the reference edge box: a 512-record client window committed as ~12
-/// records per fsync, because the drain only sees what arrived during the PREVIOUS batch's
-/// fsync). Acks keep their fsynced-durable meaning; the knob trades up to the window in added
-/// commit latency under produce bursts for fewer, larger barriers (the `MySQL`
-/// `binlog_group_commit_sync_delay` / `PostgreSQL` `commit_delay` precedent).
-///
-/// The window engages ONLY when the engine's commit path issues a real covering fsync before ack
-/// ([`crate::engine::Engine::commit_syncs_before_ack`], #1026): durability `sync` on a real-barrier
-/// backend. On the ephemeral memory backend, or under a relaxed durability level
-/// (`interval`/`async`/`none`), an ack waits on no barrier, so there is nothing to amortize and the
-/// actor runs as if the window were 0 (no produce is ever parked to fill a batch).
+/// Like [`spawn_actor`]; the historical GROUP-COMMIT GATHER window parameter (#454, #472) is now
+/// INERT (#1040). The gather only ever engaged on the fsync-before-ack tier
+/// ([`crate::engine::Engine::commit_syncs_before_ack`]; every other tier resolved the window to
+/// 0), and that tier now runs the PIPELINED sync branch of [`run_actor`], whose self-clocking
+/// group commit strictly dominates a wall-clock window: the in-flight `fdatasync` IS the batching
+/// window — everything appended while one barrier is in flight merges into the next ticket,
+/// dispatched the instant the previous completes — with zero idle-start latency and unbounded
+/// amortization (the 200 us window was both a latency floor and a coalescing ceiling, and it
+/// slept to its wall-clock deadline). `gather_micros` is therefore accepted for call-site
+/// compatibility (the CLI keeps `--commit-gather-us` parsed, validated, and warned-deprecated)
+/// and IGNORED here.
 ///
 /// # Panics
 /// Panics if the OS refuses to spawn the actor thread, exactly as [`spawn_actor`]: a STARTUP step,
@@ -1415,10 +1428,11 @@ where
 pub fn spawn_actor_with_gather<F, C>(
     engine: Engine<F, C>,
     channel_bound: usize,
-    gather_micros: u64,
+    _gather_micros: u64,
 ) -> (EngineHandle<F, C>, std::thread::JoinHandle<Engine<F, C>>)
 where
     F: Filesystem + 'static,
+    F::File: 'static,
     C: Clock + Clone + 'static,
 {
     let (tx, rx) = sync_channel::<Command<F, C>>(channel_bound.max(1));
@@ -1435,6 +1449,28 @@ where
     // for the engine's life (the level is not live-reloadable, the backend type is static), so the
     // snapshot is exact, mirroring the actor's own gather-window resolution.
     let reply_spin = !engine.commit_syncs_before_ack();
+    // The PIPELINED sync tier (#1040): exactly where an ack waits on a real pre-ack fsync barrier
+    // (#1026, the same fixed-for-life snapshot `reply_spin` negates), spawn the dedicated flusher
+    // thread and hand its rig to the actor — resolved ONCE here, before the engine moves, exactly
+    // like the `reply_spin` snapshot. `None` on every other tier: no flusher thread exists and the
+    // legacy loop runs byte-for-byte. The deterministic sim and `produce_once` drive the `Engine`
+    // directly and never reach this spawn, so they can never enter the pipelined branch.
+    let pipeline = engine.commit_syncs_before_ack().then(|| {
+        // Job channel bound 1: depth-1 dispatch by construction (INV-3) — the send can never
+        // block because a second barrier is never dispatched while one is outstanding. Completion
+        // channel UNBOUNDED: the flusher's send never blocks, so it can never wedge behind a slow
+        // actor and the actor can never miss a completion (the L8 topology). The flusher never
+        // holds a command-channel sender, so drop-driven shutdown (the last `EngineHandle` drop
+        // disconnecting `rx`) is preserved structurally.
+        let (req_tx, req_rx) = sync_channel::<FlushJob<F::File>>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<SyncDone>();
+        PipelineRig {
+            req_tx,
+            done_rx,
+            flusher: spawn_flusher(req_rx, done_tx),
+            max_dirty_bytes: engine.sync_max_dirty_bytes(),
+        }
+    });
     // Build the connection-thread byte-cap fast-reject gate (#476) BEFORE the engine moves into the
     // actor. The cap is fixed for the engine's life (not live-reloadable), so it is snapshotted once
     // here; the live byte total and the policy sentinel are published by the actor as it runs. The
@@ -1463,7 +1499,7 @@ where
             run_actor(
                 engine,
                 &rx,
-                gather_micros,
+                pipeline,
                 &actor_gate,
                 &actor_watchdog_thread,
                 &actor_clock,
@@ -1533,63 +1569,35 @@ where
     }
 }
 
-/// The bounded group-commit gather (#454): keeps collecting commands into `commands` for up to
-/// `gather_micros`, so the caller's batch covers a pipelined publisher's whole in-flight window
-/// under ONE fsync. Wall-clock (`std::time::Instant`) is correct here: the gather is a real-time
-/// IO batching decision on the actor thread, outside the engine's deterministic clock seam (the
-/// sim drives the `Engine` directly and never runs this loop). A `Shutdown` gathered mid-window is
-/// processed in order after the batch, exactly as if it had arrived in the same burst. A
-/// disconnect ends the gather early; the caller's batch then processes and the next outer `recv`
-/// observes the disconnect.
+/// The pipelined sync tier's spawn-time rig (#1040): the dedicated flusher thread plus its two
+/// channels, created in [`spawn_actor_with_gather`] BEFORE the engine moves (exactly like the
+/// `reply_spin` snapshot) and handed to [`run_actor`]'s pipelined branch. `None` on every other
+/// tier: no flusher thread exists and the legacy loop runs byte-for-byte.
 ///
-/// A pass holding FEWER THAN TWO produces never gathers: an unpipelined producer (one in-flight
-/// produce, awaiting each ack) would otherwise stall the full window on every send and gain
-/// nothing, since its next produce cannot arrive until this one is acked; and a produce-less
-/// control pass (acks, polls, subscribes) has no fsync to amortize.
-fn gather_commands<F, C>(
-    commands: &mut Vec<Command<F, C>>,
-    rx: &Receiver<Command<F, C>>,
-    gather_micros: u64,
-) where
-    F: Filesystem,
-    C: Clock + Clone,
-{
-    let produces = commands
-        .iter()
-        .map(|c| match c {
-            Command::Produce { .. } | Command::ProduceNoReply { .. } => 1,
-            // A batched Level-0 submit represents `appends.len()` pipelined produces, not one: count
-            // them so a coalesced batch trips the bounded-gather heuristic the same as that many
-            // per-message produces would. It group-commits as one batch regardless; counting the
-            // appends only restores the cross-socket-read fsync amortization the gather is meant to
-            // capture (otherwise a single 1000-append batch reads as "1 produce" and never gathers).
-            Command::ProduceNoReplyBatch { appends } => appends.len(),
-            _ => 0,
-        })
-        .sum::<usize>();
-    if produces < 2 {
-        return;
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(gather_micros);
-    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-        if left.is_zero() {
-            return;
-        }
-        let Ok(cmd) = rx.recv_timeout(left) else {
-            return;
-        };
-        commands.push(cmd);
-        while let Ok(c) = rx.try_recv() {
-            commands.push(c);
-        }
-    }
+/// This rig REPLACES the retired #454/#472 wall-clock gather window: the in-flight `fdatasync` is
+/// the batching window now (self-clocking, zero idle-start latency, unbounded amortization),
+/// where the gather was both a latency floor and a coalescing ceiling that slept to its deadline.
+struct PipelineRig<File> {
+    /// The depth-1 barrier-job channel's send half (INV-3): bound 1, provably empty at every
+    /// dispatch because at most one barrier is ever outstanding.
+    req_tx: SyncSender<FlushJob<File>>,
+    /// The DEDICATED completion channel (the L8 topology): a returned barrier never rides the
+    /// command queue, so it can never be starved behind a command backlog.
+    done_rx: Receiver<SyncDone>,
+    /// The flusher's join handle, reaped on every `run_actor` return path (after the quiesce, so
+    /// the join can never hang on an in-flight barrier).
+    flusher: std::thread::JoinHandle<()>,
+    /// The spawn-time snapshot of [`Engine::sync_max_dirty_bytes`] (INV-9); `0` disables the
+    /// dirty-byte admission throttle.
+    max_dirty_bytes: u64,
 }
 
 /// The actor's run loop. It blocks for one command, then DRAINS every command already queued
 /// (`try_recv`) into the same pass so a burst of produces group-commits together. Produces are
 /// appended (no sync) and their replies parked; a non-produce job or the end of the drain triggers
 /// the ONE `commit_batch` that covers the parked produces, after which their replies are released.
-/// Returns the engine on exit so a caller can recover it.
+/// Returns the engine on exit so a caller can recover it. Branches ONCE at entry on the spawn-time
+/// tier snapshot (#1040): with a [`PipelineRig`] it runs [`run_actor_pipelined`] instead.
 // The drain/group-commit loop is one cohesive unit (recv → drain → per-command append/run/shutdown →
 // one covering fsync → publish); splitting it would scatter the single-writer ordering it enforces. The
 // #862 watchdog stamps push it one line over the pedantic 100-line bound.
@@ -1597,7 +1605,7 @@ fn gather_commands<F, C>(
 fn run_actor<F, C>(
     mut engine: Engine<F, C>,
     rx: &Receiver<Command<F, C>>,
-    gather_micros: u64,
+    pipeline: Option<PipelineRig<F::File>>,
     cap_gate: &ProduceCapGate,
     watchdog: &ActorWatchdog,
     clock: &C,
@@ -1606,18 +1614,13 @@ where
     F: Filesystem,
     C: Clock + Clone,
 {
-    // The gather engages ONLY when the commit path issues a real covering fsync before ack (#1026):
-    // durability `sync` on a real-barrier backend. Everywhere else — the ephemeral memory backend
-    // (no-op syncs) or a relaxed level (`interval`/`async`/`none` ack on the page-cache write) — an
-    // ack waits on NO barrier, so parking produces to batch one amortizes nothing and only quantizes
-    // the ack pipeline to the window (measured 10x+ throughput loss at the 200us default). Both
-    // inputs are fixed for the engine's life (the level is not live-reloadable, the backend type is
-    // static), so the effective window is resolved ONCE here, exactly as `--commit-gather-us 0`.
-    let gather_micros = if engine.commit_syncs_before_ack() {
-        gather_micros
-    } else {
-        0
-    };
+    // The PIPELINED sync tier (#1040), resolved at spawn: decoupled fdatasync, self-clocking group
+    // commit, in-flight write merging. Exactly where an ack waits on a real pre-ack fsync barrier
+    // (#1026) the pipelined loop runs; every non-fsync tier falls through to the LEGACY loop below,
+    // byte-for-byte (an ack there waits on no barrier, so there is nothing to pipeline).
+    if let Some(rig) = pipeline {
+        return run_actor_pipelined(engine, rx, rig, cap_gate, watchdog, clock);
+    }
     // Produces appended this pass but not yet durable: each parked reply is released only after the
     // single covering `commit_batch`, so a `PubAck` never precedes its fsync (I2).
     let mut pending: Vec<PendingProduce> = Vec::new();
@@ -1649,11 +1652,6 @@ where
         // Drain everything immediately available so a concurrent burst of produces forms one group.
         while let Ok(cmd) = rx.try_recv() {
             commands.push(cmd);
-        }
-        // The opt-in bounded gather (#454); a no-op unless configured AND this pass already
-        // shows a pipelining publisher (two or more produces).
-        if gather_micros > 0 {
-            gather_commands(&mut commands, rx, gather_micros);
         }
         // An explicit `Drain` iterator (not a `for`) so the `Shutdown` arm can hand the STILL-UNPROCESSED
         // tail of this batch to the drain, replying a closing outcome to every produce queued after the
@@ -1757,6 +1755,643 @@ where
     }
 }
 
+/// The PIPELINED sync tier's run loop (#1040): the actor appends and parks replies exactly like the
+/// legacy loop, but the covering `fdatasync` runs on the dedicated flusher thread with AT MOST ONE
+/// barrier in flight (INV-3), so the actor keeps appending while the disk syncs and everything
+/// appended during a flight merges into the NEXT ticket (self-clocking group commit).
+///
+/// BLOCKING TOPOLOGY (the L8 fix): the actor blocks on the completion channel ONLY when a command
+/// `try_recv` came up empty AND a barrier is outstanding — i.e. when a completion is the sole event
+/// that can make progress the actor can deliver. Commands arriving during that wait queue in the
+/// bounded channel for at most one fsync — exactly the delay the legacy INLINE fdatasync imposes on
+/// them — and under load (channel non-empty) the actor never blocks there at all. The flusher never
+/// holds a command-channel sender, so `rx` disconnects exactly when the last [`EngineHandle`] drops
+/// (drop-driven shutdown preserved structurally); a disconnect mid-flight is observed right after
+/// the in-flight completion is processed, and the loss-free E7 drain runs.
+// One cohesive state machine (recv/try_recv → per-command poll+process → pass-end
+// stage/dispatch/release/reconcile); splitting it would scatter the single-writer ordering and the
+// reconcile points the no-wedge lemma is proved over.
+#[allow(clippy::too_many_lines)]
+fn run_actor_pipelined<F, C>(
+    mut engine: Engine<F, C>,
+    rx: &Receiver<Command<F, C>>,
+    rig: PipelineRig<F::File>,
+    cap_gate: &ProduceCapGate,
+    watchdog: &ActorWatchdog,
+    clock: &C,
+) -> Engine<F, C>
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    let mut pipeline = Pipeline {
+        parked: VecDeque::new(),
+        in_flight: None,
+        next_seq: 0,
+        req_tx: Some(rig.req_tx),
+        done_rx: rig.done_rx,
+        flusher: Some(rig.flusher),
+        max_dirty_bytes: rig.max_dirty_bytes,
+        watchdog,
+        clock,
+        cap_gate,
+    };
+    // The per-pass command batch, hoisted and reused across drains (#828), exactly as in the
+    // legacy loop.
+    let mut commands: Vec<Command<F, C>> = Vec::new();
+    // A command the PREVIOUS pass end pulled off the channel while deciding its dispatch shape
+    // (H1's channel-empty probe, or a non-produce arrival ending H2's linger): it becomes the
+    // next pass's first command, so channel order is preserved exactly.
+    let mut carryover: Option<Command<F, C>> = None;
+    loop {
+        // E10 (idle wait): while a barrier is IN FLIGHT never block on the command channel — a
+        // non-blocking `try_recv` keeps commands flowing, and an EMPTY channel means the one event
+        // that can advance the parked acks is the completion, so block on `done_rx` instead. With
+        // no flight outstanding this is the legacy `recv()`, verbatim. A pass-end carryover
+        // front-runs both: it was already received.
+        let first = if let Some(cmd) = carryover.take() {
+            cmd
+        } else if pipeline.in_flight.is_some() {
+            match rx.try_recv() {
+                Ok(cmd) => cmd,
+                Err(TryRecvError::Empty) => {
+                    pipeline.wait_one_completion(&mut engine);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // E7: the last handle dropped mid-flight. Mark BUSY across the final drain so
+                    // a wedged final barrier is still detectable, quiesce (drain the flight via
+                    // `done_rx`, inline-commit the tail), and exit loss-free.
+                    watchdog.mark_busy(clock.now_monotonic_nanos());
+                    pipeline.quiesce_to_durable(&mut engine);
+                    pipeline.join_flusher();
+                    return engine;
+                }
+            }
+        } else {
+            let Ok(cmd) = rx.recv() else {
+                // E7, no flight outstanding: the legacy shutdown drain with the inline barrier.
+                watchdog.mark_busy(clock.now_monotonic_nanos());
+                pipeline.quiesce_to_durable(&mut engine);
+                pipeline.join_flusher();
+                return engine;
+            };
+            cmd
+        };
+        // BUSY for this pass (#862): the busy stamp catches a wedged INLINE barrier (quiesce,
+        // in-job sync); the flusher's in-flight barrier is watched by the dedicated sync-inflight
+        // stamp (INV-8), because this busy stamp is re-freshened every pass and cleared at idle.
+        watchdog.mark_busy(clock.now_monotonic_nanos());
+        // Pass top: fold in any completion that landed while this pass was being assembled, so a
+        // returned barrier releases its acks and re-dispatches before any command work runs.
+        pipeline.poll_completions(&mut engine);
+        commands.clear();
+        commands.push(first);
+        // Drain everything immediately available so a burst forms one merged window.
+        while let Ok(cmd) = rx.try_recv() {
+            commands.push(cmd);
+        }
+        // The same explicit `Drain` as the legacy loop, for the #802 Shutdown-tail contract.
+        let mut command_iter = commands.drain(..);
+        while let Some(cmd) = command_iter.next() {
+            // Before EACH command: a `try_recv` on an empty channel is a few nanoseconds, and this
+            // is what bounds the disk's idle time to ~one command instead of one pass (L8) — the
+            // instant a barrier returns, the very next command boundary dispatches the successor.
+            pipeline.poll_completions(&mut engine);
+            match cmd {
+                // E1: the SAME admission + append as the legacy arm (`process_produce` is shared);
+                // only the park sink differs — the reply is stamped with its covering target and
+                // released by `release_ready` once the durable head reaches it (INV-1).
+                Command::Produce { append, reply } => {
+                    process_produce(&mut engine, &mut pipeline, &append, Some(reply));
+                }
+                Command::ProduceNoReply { append } => {
+                    process_produce(&mut engine, &mut pipeline, &append, None);
+                }
+                Command::ProduceNoReplyBatch { appends } => {
+                    for append in &appends {
+                        process_produce(&mut engine, &mut pipeline, append, None);
+                    }
+                }
+                // E5: a Run job does NOT quiesce the pipeline (L9). The job observes a consistent,
+                // MONOTONE durable head that may trail the appended head by the in-flight window;
+                // reads are bounded by the flushed frontier, which only advances at durability
+                // (INV-2), and an in-job INLINE barrier (txn `commit_batch`, `force_sync`,
+                // named-stream `commit_tick`) composes via the all-or-nothing staleness guard
+                // (INV-6). The shed reconcile → job → cap-gate refresh sequence is the legacy
+                // arm's, verbatim; the post-job poll/release/reconcile converts any in-job barrier
+                // advance into ack releases and keeps the no-wedge lemma at this reconcile point.
+                Command::Run(job) => {
+                    engine.record_fast_reject_sheds(cap_gate.take_unreconciled_fast_rejects());
+                    engine.record_fire_and_forget_sheds(cap_gate.take_unreconciled_l0_sheds());
+                    job(&mut engine);
+                    refresh_cap_gate(cap_gate, &mut engine);
+                    pipeline.poll_completions(&mut engine);
+                    pipeline.release_ready(&mut engine);
+                    pipeline.reconcile_writer_freeze(&mut engine, None);
+                }
+                // E6: graceful drain (#195). Quiesce to durable FIRST (drain the flight, then the
+                // legacy inline barrier for the tail — identical post-conditions to the legacy
+                // `flush_pending`), so a produce acked-by-being-parked is durable before the
+                // checkpoints and the exit. Completions never ride the command channel, so the
+                // #802 shutdown-tail drain is unchanged.
+                Command::Shutdown(reply) => {
+                    pipeline.quiesce_to_durable(&mut engine);
+                    let result = engine.checkpoint_all_groups();
+                    let _ = reply.send(result);
+                    drain_shutdown_replies(command_iter, rx);
+                    pipeline.join_flusher();
+                    return engine;
+                }
+            }
+        }
+        // E4 (pass end): fold completions, release anything a seal / in-job barrier made durable
+        // this pass, then finish the pass — the SOLO-INLINE / adaptive-linger dispatch decision
+        // plus the stage-and-dispatch of the covering barrier (or the merge into the in-flight
+        // window) — and reconcile a synchronous freeze so no parked reply can ever wedge (the
+        // no-wedge lemma's pass-end point). Then the legacy tail, verbatim.
+        pipeline.poll_completions(&mut engine);
+        pipeline.release_ready(&mut engine);
+        carryover = pipeline.finish_pass(&mut engine, rx);
+        pipeline.reconcile_writer_freeze(&mut engine, None);
+        refresh_cap_gate(cap_gate, &mut engine);
+        engine.codel_queue_empty();
+        // The same #862 publish → idle RELEASE-store pairing as the legacy loop (do not reorder);
+        // wedge visibility while idle-with-flight comes from the sync-inflight stamp (INV-8), not
+        // the busy stamp.
+        watchdog.publish_writer_healthy(engine.is_healthy());
+        watchdog.mark_idle();
+    }
+}
+
+/// One produce reply parked in the pipelined branch (#1040), stamped with the appended head at park
+/// so it can be released the moment the durable head covers it. The pipelined twin of
+/// [`PendingProduce`], plus the covering target.
+struct ParkedAck {
+    /// The pre-sync outcome, exactly [`PendingProduce::outcome`]'s taxonomy.
+    outcome: PendingOutcome,
+    /// The reply channel, or `None` for a Level-0 (no-ack) produce (#495): released or fataled
+    /// with no frame either way, exactly the legacy contract.
+    reply: Option<SyncSender<ProduceOutcome>>,
+    /// `log.next_offset()` AFTER this produce's append: the ack releases only once
+    /// `covering_target <= durable_offset()` (INV-1, I2). Non-decreasing along the deque (INV-4:
+    /// single writer, offsets monotone), so release is a FIFO prefix drain and per-connection ack
+    /// order equals submission order (#917) with zero session changes.
+    covering_target: Offset,
+}
+
+/// The one in-flight covering barrier (#1040): the dispatch sequence number echoed back by the
+/// flusher (INV-3's depth-1 debug check) and the engine's opaque staged commit.
+struct InFlight {
+    /// The dispatch sequence number, echoed in [`SyncDone::seq`].
+    seq: u64,
+    /// The staged commit ([`Engine::begin_async_commit`]) to hand back on completion.
+    commit: AsyncCommit,
+}
+
+/// The CAP on the adaptive first-dispatch linger (H2, #1040): at a pass end that is about to
+/// dispatch the FIRST barrier of a window (nothing in flight, >= 2 waiters parked), the actor
+/// lingers on the command channel for up to `min(this cap, last_fsync_nanos / 10)` before
+/// staging, folding late arrivals of the same burst into the one covering barrier. The cap
+/// bounds the tax at 200 us — the retired #454 gather's window, which field experience showed
+/// is invisible against a wall-dominant barrier (macOS `F_FULLFSYNC`, ~3.8 ms) and is exactly
+/// where the immediate first dispatch was measured splitting each session burst into ~2.6
+/// barriers where the gather paid ~1.8. The `last_fsync_nanos / 10` term self-tunes it away on
+/// fast-barrier disks (Linux fdatasync ~200-300 us => linger <= ~30 us, negligible) and to zero
+/// before the first barrier ever completes (never linger blind). Under sustained load a flight
+/// is outstanding at every pass end, so the linger NEVER engages there — deliberately a
+/// constant, not a knob: the tier self-tunes.
+const FIRST_DISPATCH_LINGER_CAP_NANOS: u64 = 200_000;
+
+/// The pipelined branch's actor-local state machine (#1040): the parked-ack deque, the depth-1
+/// in-flight record, the flusher channels, and the spawn-time snapshots. All mutation happens on
+/// the actor thread (single-writer preserved); the flusher only ever executes `sync_data` on the
+/// shared fd it is handed.
+///
+/// The NO-WEDGE LEMMA, proved over the helpers below: at every reconcile point (pass end, each
+/// completion, post-job, quiesce), for every entry `p` in `parked` exactly one holds — (1)
+/// `p.covering_target <= durable_offset()`, released by [`Pipeline::release_ready`]; (2) the
+/// writer is frozen, fataled by [`Pipeline::reconcile_writer_freeze`]; or (3) the writer is live
+/// with `p.covering_target > durable_offset()`, which implies `has_unsynced_records()`, so
+/// [`Pipeline::maybe_issue`] either already holds an in-flight barrier (whose completion re-runs
+/// this analysis) or dispatches one now. Progress is therefore guaranteed, a false ack is
+/// impossible by INV-1, and a permanent parked wedge is impossible by cases 2-3.
+struct Pipeline<'a, F: Filesystem, C: Clock + Clone> {
+    /// Parked produce replies, covering targets non-decreasing (INV-4).
+    parked: VecDeque<ParkedAck>,
+    /// The at-most-one outstanding barrier (INV-3).
+    in_flight: Option<InFlight>,
+    /// The dispatch sequence counter (monotone; echoed by the flusher).
+    next_seq: u64,
+    /// The barrier-job channel's send half; `None` only after [`Pipeline::join_flusher`] dropped
+    /// it to end the flusher (every `run_actor_pipelined` return path).
+    req_tx: Option<SyncSender<FlushJob<F::File>>>,
+    /// The dedicated completion channel (unbounded; the flusher's send never blocks).
+    done_rx: Receiver<SyncDone>,
+    /// The flusher's join handle, reaped by [`Pipeline::join_flusher`].
+    flusher: Option<std::thread::JoinHandle<()>>,
+    /// The INV-9 dirty-byte bound snapshot; `0` disables the throttle.
+    max_dirty_bytes: u64,
+    /// The shared actor watchdog (#862): this branch stamps the sync-inflight field (INV-8).
+    watchdog: &'a ActorWatchdog,
+    /// The engine's clock seam, for the sync-inflight stamp (the same clock `overran` reads).
+    clock: &'a C,
+    /// The connection-thread fast-reject gate (#476), refreshed after each completion's commit
+    /// tail (durable bytes moved).
+    cap_gate: &'a ProduceCapGate,
+}
+
+impl<F, C> Pipeline<'_, F, C>
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    /// Drains every already-delivered completion without blocking (a `try_recv` on an empty
+    /// channel is a few nanoseconds). Called at pass top, before EACH command in a drained pass,
+    /// at pass end, and post-job (L8). A disconnected channel with a flight outstanding is the
+    /// flusher's death: a dispatched barrier can never return, the failed-barrier class (E3).
+    fn poll_completions(&mut self, engine: &mut Engine<F, C>) {
+        loop {
+            match self.done_rx.try_recv() {
+                Ok(done) => self.on_completion(engine, done),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    if self.in_flight.is_some() {
+                        self.on_flusher_death(engine);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Blocks for exactly one completion (E10's idle wait, E8's throttle wait, quiesce's flight
+    /// drain). Only ever called with a flight outstanding, so the flusher owes exactly one
+    /// message; a disconnect instead is the flusher's death (E3).
+    fn wait_one_completion(&mut self, engine: &mut Engine<F, C>) {
+        debug_assert!(
+            self.in_flight.is_some(),
+            "wait_one_completion requires an outstanding flight (#1040)"
+        );
+        match self.done_rx.recv() {
+            Ok(done) => self.on_completion(engine, done),
+            Err(_) => self.on_flusher_death(engine),
+        }
+    }
+
+    /// Applies one RETURNED barrier — E2 (Ok) / E3 (Err), in the spec's exact order.
+    fn on_completion(&mut self, engine: &mut Engine<F, C>, done: SyncDone) {
+        let Some(flight) = self.in_flight.take() else {
+            // Unreachable by INV-3 (the flusher echoes exactly one completion per job); tolerate
+            // in release builds by ignoring the orphan rather than corrupting state.
+            debug_assert!(
+                false,
+                "a completion arrived with no in-flight barrier (INV-3)"
+            );
+            return;
+        };
+        debug_assert_eq!(
+            flight.seq, done.seq,
+            "the depth-1 seq echo mismatched (INV-3)"
+        );
+        // The flight is no longer outstanding, whatever its result: clear the wedge stamp (INV-8).
+        self.watchdog.clear_sync_inflight();
+        match done.result {
+            Ok(()) => {
+                // (2) Heads + read-plane frontier + histograms, all-or-nothing against a stale
+                // ticket (INV-6, enforced inside the log — never bypassed here). The frontier is
+                // published INSIDE this call, on this thread, strictly before the releases below
+                // (INV-10: read-your-acked-write for actor-routed reads AND the off-actor plane).
+                engine.complete_async_commit(&flight.commit, done.fsync_nanos);
+                // (3) Dispatch the NEXT barrier BEFORE any bookkeeping or ack fan-out (L11): the
+                // disk idles only for the length of this call, and the window appended during the
+                // completed flight is already staged behind its own ticket.
+                self.maybe_issue(engine);
+                // (4) Release the FIFO prefix the completed barrier covered (INV-1).
+                self.release_ready(engine);
+                // (5) The once-per-commit tail (retention reap + sweeps), AFTER dispatch and
+                // release so bookkeeping never idles the disk or the producers. An error freezes
+                // (the R2 disposition): the acks already released were covered by a RETURNED
+                // barrier, so I2 holds; everything still parked is fataled by the reconcile.
+                match engine.commit_tail_after_async_completion() {
+                    Ok(()) => {
+                        // (6) The no-wedge lemma's per-completion reconcile point.
+                        self.reconcile_writer_freeze(engine, None);
+                    }
+                    Err(e) => {
+                        let _ = engine.fail_async_commit();
+                        self.reconcile_writer_freeze(engine, Some(e));
+                    }
+                }
+                // (7) The durable byte total moved: refresh the fast-reject gate (#476).
+                refresh_cap_gate(self.cap_gate, engine);
+            }
+            Err(io_error) => {
+                // E3: the covering barrier FAILED. Freeze the writer forever (INV-7; the exact
+                // terminal state a failed inline `Log::sync` leaves), then fatal-fan EVERY parked
+                // reply: batch N's first at-least-once member carries the real error, everything
+                // else `WriterFrozen` — batch N+1 can never become durable behind a frozen writer.
+                // `maybe_issue` can never re-arm (`begin_async_commit` errors on frozen), so a
+                // failed barrier is never retried (fsyncgate).
+                let _ = engine.fail_async_commit();
+                self.reconcile_writer_freeze(
+                    engine,
+                    Some(EngineError::Storage(
+                        ironbus_storage::segment::StorageError::Io(io_error),
+                    )),
+                );
+            }
+        }
+    }
+
+    /// The flusher died with a barrier outstanding (`done_rx` disconnected): a dispatched barrier
+    /// can never return, which is the failed-barrier class — E3 with a synthesized error. Quiesce
+    /// can therefore never hang on a dead flusher.
+    fn on_flusher_death(&mut self, engine: &mut Engine<F, C>) {
+        self.in_flight = None;
+        self.watchdog.clear_sync_inflight();
+        let _ = engine.fail_async_commit();
+        self.reconcile_writer_freeze(
+            engine,
+            Some(EngineError::Storage(
+                ironbus_storage::segment::StorageError::Io(std::io::Error::other(
+                    "the fsync flusher thread died with a barrier in flight (#1040)",
+                )),
+            )),
+        );
+    }
+
+    /// Releases the FIFO prefix of parked replies whose covering target the durable head has
+    /// reached — the ONLY release path (INV-1): a non-Fatal reply is sent from here and nowhere
+    /// else, and `durable_offset` advances only after a RETURNED successful barrier (a completed
+    /// flusher fdatasync, an inline `Log::sync`, or a roll's seal). INV-4 makes the prefix drain
+    /// exact: targets are non-decreasing, so the first uncovered entry ends the sweep.
+    fn release_ready(&mut self, engine: &mut Engine<F, C>) {
+        let durable = engine.durable_offset();
+        while self
+            .parked
+            .front()
+            .is_some_and(|p| p.covering_target <= durable)
+        {
+            let Some(p) = self.parked.pop_front() else {
+                return;
+            };
+            // A Level-0 (no-ack) parked produce carries no reply channel (#495): durable now,
+            // but the producer fired and forgot, so send nothing.
+            let Some(reply) = p.reply else {
+                continue;
+            };
+            let _ = reply.send(released_outcome(p.outcome));
+        }
+    }
+
+    /// The L6 fix, a first-class transition: if the writer froze (a failed flusher barrier, a
+    /// failed seal/stage, a failed in-job inline sync), first release every waiter an EARLIER
+    /// returned barrier already covers (their acks are honest), then fatal-fan the remainder
+    /// exactly per the legacy `flush_pending` Err arm — `first` (the real error) to the first
+    /// at-least-once member, `WriterFrozen` to the rest, Level-0 `None` replies skipped WITHOUT
+    /// consuming the real error. Publishes the unhealthy flag at freeze time so `/readyz` flips
+    /// without waiting for the pass-end publish. Idempotent; a no-op on a live writer.
+    fn reconcile_writer_freeze(&mut self, engine: &mut Engine<F, C>, first: Option<EngineError>) {
+        if engine.log_is_writable() {
+            return;
+        }
+        self.release_ready(engine);
+        fatal_fan_replies(self.parked.drain(..).map(|p| p.reply), first);
+        self.watchdog.publish_writer_healthy(false);
+    }
+
+    /// Stages and dispatches the covering barrier for everything appended-but-unsynced — or does
+    /// nothing if a barrier is already in flight (this IS the in-flight write merge: the window
+    /// keeps accumulating and the completion dispatches its successor). `Ok(None)` is a CLEAN log
+    /// (no barrier owed — distinct from frozen by construction, the L1 fix: frozen is an `Err`).
+    /// The stage (`prepare_async_sync` inside `begin_async_commit`) flushes the writer's pending
+    /// bytes into the file BEFORE the job crosses the channel, so the ticket's dirty-at-sync-start
+    /// snapshot is exact (INV-5).
+    fn maybe_issue(&mut self, engine: &mut Engine<F, C>) {
+        if self.in_flight.is_some() {
+            return;
+        }
+        match engine.begin_async_commit() {
+            Ok(None) => {}
+            Ok(Some((file, commit))) => {
+                self.next_seq += 1;
+                let seq = self.next_seq;
+                // INV-8: non-zero exactly while a barrier is in flight, stamped BEFORE the send so
+                // the watchdog can never miss a wedged dispatch.
+                self.watchdog
+                    .mark_sync_inflight(self.clock.now_monotonic_nanos());
+                self.in_flight = Some(InFlight { seq, commit });
+                // The bound-1 job channel is provably empty here (depth-1): the send never blocks.
+                // A send failure means the flusher is gone — a dispatched barrier can never
+                // return, so treat it as the failed-barrier class immediately.
+                let sent = self
+                    .req_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(FlushJob { seq, file }).is_ok());
+                if !sent {
+                    self.on_flusher_death(engine);
+                }
+            }
+            Err(e) => self.reconcile_writer_freeze(engine, Some(e)),
+        }
+    }
+
+    /// Finishes a pass (E4's dispatch decision, #1040): stages the covering barrier for the
+    /// window just appended — inline, lingered, or dispatched — by the shape of the pass.
+    /// Returns a command to hand the NEXT pass when the decision pulled one off the channel.
+    ///
+    /// - **Flight outstanding:** nothing to decide — the window keeps merging and the completion
+    ///   dispatches its successor (this IS the in-flight write merge; the completion covers
+    ///   dispatch, so an inline barrier here would only serialize the actor behind the disk).
+    /// - **H1 SOLO-INLINE:** exactly ONE waiter parked (by the no-wedge lemma's case analysis,
+    ///   with no flight and the pass-top/pass-end releases done, everything parked was parked by
+    ///   THIS pass) and the command channel verifiably empty — there is provably nothing to
+    ///   overlap, so the two flusher hops (actor -> flusher -> actor) are pure added cost per
+    ///   barrier. Run the LEGACY inline barrier instead (the same `commit_batch` the legacy
+    ///   branch and `quiesce_to_durable` issue): identical latency to the pre-pipeline actor BY
+    ///   CONSTRUCTION, zero thread hops, and the inline barrier is an ordinary intervening sync
+    ///   the machinery already composes with (the durable head advances, `release_ready` covers
+    ///   the waiter, no ticket exists). The emptiness probe is an actual `try_recv`: a command
+    ///   already queued means more of the burst is coming, so dispatch async and carry the
+    ///   command into the next pass — never inline with work waiting (that is the legacy loop's
+    ///   pathology this branch exists to remove).
+    /// - **H2 ADAPTIVE FIRST-DISPATCH LINGER:** >= 2 waiters parked and no flight — the FIRST
+    ///   barrier of a burst window. Linger up to `min(200 us, last_fsync_nanos / 10)` draining
+    ///   late arrivals of the same burst into this window before staging
+    ///   ([`FIRST_DISPATCH_LINGER_CAP_NANOS`]): produces append and park; a non-produce command
+    ///   ends the linger and carries over; a disconnect ends it (the next loop iteration runs
+    ///   the E7 drain). Wall-clock deadline, same precedent as the flusher's measurement (the
+    ///   sim never constructs the pipeline).
+    fn finish_pass(
+        &mut self,
+        engine: &mut Engine<F, C>,
+        rx: &Receiver<Command<F, C>>,
+    ) -> Option<Command<F, C>> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        // H1: a solo waiter with a drained channel goes inline; a solo waiter with the burst's
+        // next command already queued dispatches async and hands the command to the next pass.
+        if self.parked.len() == 1 {
+            return match rx.try_recv() {
+                Ok(cmd) => {
+                    self.maybe_issue(engine);
+                    Some(cmd)
+                }
+                // Disconnected inlines too: no command can ever arrive to overlap with, and the
+                // next loop iteration observes the disconnect and runs the loss-free E7 drain.
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                    self.commit_inline(engine);
+                    None
+                }
+            };
+        }
+        // H2: linger before the burst window's FIRST dispatch, scaled to the observed barrier
+        // cost (zero before the first barrier ever completes — never linger blind).
+        if self.parked.len() >= 2 {
+            let linger_nanos = FIRST_DISPATCH_LINGER_CAP_NANOS.min(engine.last_fsync_nanos() / 10);
+            if linger_nanos > 0 {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_nanos(linger_nanos);
+                while let Some(remaining) =
+                    deadline.checked_duration_since(std::time::Instant::now())
+                {
+                    match rx.recv_timeout(remaining) {
+                        Ok(Command::Produce { append, reply }) => {
+                            process_produce(engine, self, &append, Some(reply));
+                        }
+                        Ok(Command::ProduceNoReply { append }) => {
+                            process_produce(engine, self, &append, None);
+                        }
+                        Ok(Command::ProduceNoReplyBatch { appends }) => {
+                            for append in &appends {
+                                process_produce(engine, self, append, None);
+                            }
+                        }
+                        // A non-produce command ends the linger: dispatch the window now and
+                        // handle the command in the normal loop (as the next pass's head).
+                        Ok(other) => {
+                            self.maybe_issue(engine);
+                            return Some(other);
+                        }
+                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                    }
+                    // A lingered produce's admission throttle (E8) may itself have dispatched
+                    // (dispatch-before-block): the window's barrier is already out, so the
+                    // linger's purpose is spent — later arrivals merge behind the flight.
+                    if self.in_flight.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        self.maybe_issue(engine);
+        None
+    }
+
+    /// H1's inline covering barrier (#1040): the LEGACY synchronous group commit
+    /// (`commit_batch`, byte-for-byte what the legacy branch's `flush_pending` and
+    /// `quiesce_to_durable` issue — barrier + histograms + retention/sweep tail), then the
+    /// release of everything it covered. Callable only with no flight outstanding (a stale prior
+    /// flight is impossible here, and any still-outstanding flight's completion would be a full
+    /// no-op by INV-6 anyway). On failure the writer froze: fatal-fan per the legacy Err arm.
+    fn commit_inline(&mut self, engine: &mut Engine<F, C>) {
+        debug_assert!(
+            self.in_flight.is_none(),
+            "the inline barrier requires no outstanding flight (#1040)"
+        );
+        if engine.has_unsynced_records() {
+            if let Err(e) = engine.commit_batch() {
+                // Two distinct failure classes hide behind one `Err`. A BARRIER failure froze the
+                // writer: `reconcile_writer_freeze` releases the durable prefix (none) and
+                // fatal-fans the rest. A commit-TAIL failure (retention reap / idle sweep) AFTER a
+                // durable barrier leaves the writer WRITABLE with the durable head already
+                // advanced — there `reconcile` is a no-op, so we MUST fall through to
+                // `release_ready` (below) or the covered waiter wedges on an idle broker with its
+                // record durable but its ack never sent (the reap retries next cycle; an
+                // already-durable ack must never block on it). This mirrors the async completion
+                // path, which releases on the advanced durable head BEFORE its commit-tail runs.
+                self.reconcile_writer_freeze(engine, Some(e));
+            }
+        }
+        // Runs after every barrier — Ok, frozen (parked already drained by the fatal-fan, so this
+        // is a no-op), or writable-tail-error (releases the durable-but-still-parked waiter).
+        self.release_ready(engine);
+    }
+
+    /// E6/E7/#378-drain: waits out the in-flight barrier (via `done_rx`, never the command
+    /// channel), then issues the LEGACY synchronous barrier for any remaining tail (safe: no
+    /// flight outstanding), releases everything covered, and fatal-fans the rest if the writer
+    /// froze. Post-conditions IDENTICAL to the legacy `flush_pending`: no flight outstanding,
+    /// nothing parked, durable head == appended head or writer frozen with all replies fataled —
+    /// so every barrier-site caller (shutdown checkpoint, disconnect drain, headroom re-admit)
+    /// runs unchanged after it.
+    fn quiesce_to_durable(&mut self, engine: &mut Engine<F, C>) {
+        while self.in_flight.is_some() {
+            self.wait_one_completion(engine);
+        }
+        if engine.has_unsynced_records() {
+            if let Err(e) = engine.commit_batch() {
+                self.reconcile_writer_freeze(engine, Some(e));
+            }
+        }
+        self.release_ready(engine);
+        self.reconcile_writer_freeze(engine, None);
+        debug_assert!(
+            self.parked.is_empty(),
+            "quiesce_to_durable leaves nothing parked (#1040)"
+        );
+    }
+
+    /// Drops the barrier-job sender (ending the flusher's `recv` loop) and joins the thread.
+    /// Called on every `run_actor_pipelined` return path, always AFTER a quiesce, so no barrier
+    /// is in flight and the join cannot hang. A flusher that already died (its panic was absorbed
+    /// as the failed-barrier class) is reaped here; its panic payload is deliberately discarded.
+    fn join_flusher(&mut self) {
+        self.req_tx = None;
+        if let Some(flusher) = self.flusher.take() {
+            let _ = flusher.join();
+        }
+    }
+}
+
+/// Maps a parked produce's pre-sync outcome to its reply once the covering barrier RETURNED Ok —
+/// the release half of the historical `flush_pending` mapping, extracted verbatim and shared by
+/// the legacy batch release and the pipelined `release_ready` (#1040).
+fn released_outcome(outcome: PendingOutcome) -> ProduceOutcome {
+    match outcome {
+        PendingOutcome::Appended(offset) => ProduceOutcome::Appended(offset),
+        // A dedup hit replies PubAckDuplicate now that the covering barrier is durable (#33).
+        PendingOutcome::Duplicate(offset) => ProduceOutcome::AppendedDuplicate(offset),
+        // A fire-and-forget produce is durable now, but the session sends NO PubAck (#11).
+        PendingOutcome::FireAndForgetAppended(offset) => {
+            ProduceOutcome::FireAndForgetAppended(offset)
+        }
+    }
+}
+
+/// Fatal-fans a failed covering barrier to every parked reply — the Err half of the historical
+/// `flush_pending` mapping, extracted verbatim and shared by the legacy batch and the pipelined
+/// reconcile (#1040): the FIRST at-least-once member carries the real error (when the caller has
+/// one), every later member an equivalent `WriterFrozen` (the freeze is the same event), and a
+/// Level-0 `None` reply is SKIPPED WITHOUT consuming the real error — the fired-and-forgotten
+/// producer is not listening, and the first at-least-once member must still receive the truth.
+fn fatal_fan_replies(
+    replies: impl Iterator<Item = Option<SyncSender<ProduceOutcome>>>,
+    mut first: Option<EngineError>,
+) {
+    for reply in replies {
+        let Some(reply) = reply else {
+            continue;
+        };
+        let err = first.take().unwrap_or(EngineError::Storage(
+            ironbus_storage::segment::StorageError::WriterFrozen,
+        ));
+        let _ = reply.send(ProduceOutcome::Fatal(err));
+    }
+}
+
 /// Replies a CLOSING outcome to every produce that was queued but not processed when the actor exits on
 /// a `Command::Shutdown` (#802): the still-unprocessed `tail` of the drained batch AND everything still
 /// buffered in the channel. Without this, a produce that landed AFTER the `Shutdown` (reachable under
@@ -1810,6 +2445,7 @@ struct PendingProduce {
 /// The pre-sync outcome of a parked produce. A fresh append OR a dedup hit reaches here (a shed,
 /// fence, or hard error replies immediately and never parks), so the post-sync mapping is a
 /// success-or-freeze decision for either.
+#[derive(Clone, Copy)]
 enum PendingOutcome {
     /// A fresh append at this offset, pending the covering fsync: replies `PubAck` once durable.
     Appended(Offset),
@@ -1824,6 +2460,136 @@ enum PendingOutcome {
     FireAndForgetAppended(Offset),
 }
 
+/// Where a produce's parkable disposition lands and how its tier drains a full admission window:
+/// the seam that lets ONE `process_produce` (the admission + append path, byte-for-byte the
+/// historical code) serve both actor loops (#1040).
+///
+/// - The LEGACY tiers implement it on the batch `Vec` itself: park is a plain push (released by
+///   `flush_pending`'s covering `commit_batch`), the headroom drain IS `flush_pending`, and the
+///   dirty-byte throttle is a no-op (the legacy loop drains every pass, so the covering barrier
+///   already bounds the window).
+/// - The PIPELINED branch implements it on [`Pipeline`]: park stamps the covering target
+///   (INV-1/INV-4), the headroom drain is `quiesce_to_durable` (identical post-conditions), and
+///   the throttle enforces INV-9 dispatch-before-block.
+trait ProduceBatch<F: Filesystem, C: Clock + Clone> {
+    /// E8 (#1040, INV-9): block (dispatch-before-block, never shed) until admitting a record of
+    /// `record_bytes` LOGICAL bytes keeps the unsynced window within the configured bound. A
+    /// legacy-tier no-op.
+    fn throttle_admit(&mut self, engine: &mut Engine<F, C>, record_bytes: u64);
+    /// The #378 fsync-headroom drain: issue the ONE covering barrier for everything parked so the
+    /// un-fsynced frontier can reset before the admission re-check.
+    fn drain_for_headroom(&mut self, engine: &mut Engine<F, C>);
+    /// Park a parkable disposition (a fresh append, a dedup hit, a fire-and-forget append) behind
+    /// its covering barrier.
+    fn park(
+        &mut self,
+        engine: &mut Engine<F, C>,
+        outcome: PendingOutcome,
+        reply: Option<SyncSender<ProduceOutcome>>,
+    );
+}
+
+/// The legacy tiers' batch sink: the parked `Vec` drained by `flush_pending`, byte-for-byte the
+/// historical behavior (see [`ProduceBatch`]).
+impl<F, C> ProduceBatch<F, C> for Vec<PendingProduce>
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    fn throttle_admit(&mut self, _engine: &mut Engine<F, C>, _record_bytes: u64) {
+        // The legacy loop commits (and on the sync tier fsyncs) every pass, so the unsynced
+        // window is already bounded by the pass; the INV-9 throttle is a pipelined-tier concern.
+    }
+
+    fn drain_for_headroom(&mut self, engine: &mut Engine<F, C>) {
+        flush_pending(engine, self);
+    }
+
+    fn park(
+        &mut self,
+        _engine: &mut Engine<F, C>,
+        outcome: PendingOutcome,
+        reply: Option<SyncSender<ProduceOutcome>>,
+    ) {
+        self.push(PendingProduce { outcome, reply });
+    }
+}
+
+/// The pipelined branch's batch sink (#1040): covering-target stamping, dup-of-durable fast path,
+/// quiesce-backed headroom drain, and the INV-9 throttle (see [`ProduceBatch`]).
+impl<F, C> ProduceBatch<F, C> for Pipeline<'_, F, C>
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    fn throttle_admit(&mut self, engine: &mut Engine<F, C>, record_bytes: u64) {
+        if self.max_dirty_bytes == 0 {
+            return;
+        }
+        loop {
+            let unsynced = engine.unsynced_bytes();
+            // The one-record floor: an EMPTY window always admits (a record larger than the bound
+            // must throttle its successors, never wedge itself), and admission keeps
+            // `unsynced + record <= bound` otherwise (INV-9).
+            if unsynced == 0 || unsynced.saturating_add(record_bytes) <= self.max_dirty_bytes {
+                return;
+            }
+            // DISPATCH-BEFORE-BLOCK (L3): never wait with nothing in flight. `maybe_issue` on a
+            // dirtied log either dispatches (something to wait for) or hit a frozen writer (the
+            // reconcile inside fataled the parked window; break and let the append surface the
+            // fatal to THIS produce — throttle never sheds).
+            if self.in_flight.is_none() {
+                self.maybe_issue(engine);
+                if self.in_flight.is_none() {
+                    return;
+                }
+            }
+            self.wait_one_completion(engine);
+        }
+    }
+
+    fn drain_for_headroom(&mut self, engine: &mut Engine<F, C>) {
+        // The sync tier's drain-then-admit semantics (#378), now through the pipeline-safe
+        // quiesce: identical post-conditions to the legacy `flush_pending` (durable == appended
+        // or frozen-with-fatals), so the caller's re-check behaves exactly as before.
+        self.quiesce_to_durable(engine);
+    }
+
+    fn park(
+        &mut self,
+        engine: &mut Engine<F, C>,
+        outcome: PendingOutcome,
+        reply: Option<SyncSender<ProduceOutcome>>,
+    ) {
+        // E1: stamp the covering target — the appended head AFTER this produce's append.
+        let covering_target = engine.append_head();
+        if covering_target <= engine.durable_offset() {
+            // The dup-of-durable fast path: everything at/below the target is ALREADY covered by
+            // a returned barrier, which is only reachable for a disposition that appended nothing
+            // on a fully-durable log (a duplicate of a long-durable id) — so reply now, with zero
+            // additional fsyncs (I2 holds: the original record's covering barrier returned long
+            // ago). A fresh append always has `covering_target > durable_offset` and parks.
+            if let Some(reply) = reply {
+                let _ = reply.send(released_outcome(outcome));
+            }
+            return;
+        }
+        // INV-4: the single writer appends with monotone offsets, so targets are non-decreasing
+        // along the deque and release is a FIFO prefix drain (#917).
+        debug_assert!(
+            self.parked
+                .back()
+                .map_or(true, |b| b.covering_target <= covering_target),
+            "parked covering targets must be non-decreasing (INV-4, #1040)"
+        );
+        self.parked.push_back(ParkedAck {
+            outcome,
+            reply,
+            covering_target,
+        });
+    }
+}
+
 /// Runs one produce's admission + append on the actor, parking its reply behind the covering fsync or
 /// replying/dropping it immediately on a non-appended disposition.
 ///
@@ -1832,14 +2598,17 @@ enum PendingOutcome {
 /// the historical produce path: every disposition sends exactly the frame it always did. When `None`,
 /// every disposition is a SILENT drop with no frame (the L0 producer fired and forgot), but the
 /// admission and append are IDENTICAL — an appended L0 still joins the batch and is covered by the one
-/// `commit_batch` (single-writer storage / single total order), it just parks `None`.
+/// covering barrier (single-writer storage / single total order), it just parks `None`.
 ///
 /// A `None` (Level-0) produce always has `append.fire_and_forget == true` (the session sets it for the
 /// canonical fire-and-forget bit AND the level-bit Level-0 encoding), so the fire-and-forget token
 /// bucket governs it exactly as it governed the historical faf path — this is that path generalized.
+///
+/// `batch` is the tier's park/drain/throttle seam ([`ProduceBatch`], #1040): the legacy `Vec` batch
+/// or the pipelined [`Pipeline`]. The admission + append below is shared verbatim between them.
 fn process_produce<F, C>(
     engine: &mut Engine<F, C>,
-    pending: &mut Vec<PendingProduce>,
+    batch: &mut impl ProduceBatch<F, C>,
     append: &OwnedAppend,
     reply: Option<SyncSender<ProduceOutcome>>,
 ) where
@@ -1854,6 +2623,14 @@ fn process_produce<F, C>(
             let _ = tx.send(outcome);
         }
     };
+    // E8 (#1040, INV-9): the pipelined tier's dirty-byte admission throttle, FIRST — block
+    // (dispatch-before-block, drain one completion at a time) until the unsynced window can take
+    // this record's LOGICAL bytes. THROTTLES, never sheds (the sync tier's semantics); a no-op on
+    // the legacy tiers and when the bound is disabled.
+    let throttle_record_bytes =
+        u64::try_from(append.key.len() + append.headers.len() + append.payload.len())
+            .unwrap_or(u64::MAX);
+    batch.throttle_admit(engine, throttle_record_bytes);
     // FIRE-AND-FORGET (QoS-0, #11, #402) admission, decided FIRST and only for a produce the client
     // marked fire-and-forget (every Level-0 produce, #495). The per-connection token bucket (#336)
     // caps this un-credited tier: an exhausted bucket DROPS the produce (without acking and without
@@ -1895,16 +2672,17 @@ fn process_produce<F, C>(
             u64::try_from(append.key.len() + append.headers.len() + append.payload.len())
                 .unwrap_or(u64::MAX);
         if !engine.wal_headroom_admit(record_bytes) {
-            // The headroom is exhausted: DRAIN first. `flush_pending` issues the ONE group-commit
-            // barrier for the parked batch. Under the default `sync` level (and a DUE `interval`
-            // window) that is a real `fdatasync`, so it resets the un-fsynced frontier to `0` and the
-            // record is then admitted by the no-wedge floor: the headroom THROTTLES (drain-then-admit),
-            // never sheds, never loses. Under a relaxed `async`/`none` level a commit DEFERS the fsync,
-            // so the frontier does NOT drain; the re-check still fails and the new produce is SHED to
-            // keep the loss window within the headroom. The already-buffered records are untouched (they
-            // stay durable-pending and are made durable by their level's barrier), so only this NEW
-            // produce is rejected.
-            flush_pending(engine, pending);
+            // The headroom is exhausted: DRAIN first — the ONE covering barrier for the parked
+            // batch (`flush_pending` on the legacy tiers; `quiesce_to_durable` on the pipelined
+            // tier, identical post-conditions, #1040). Under the default `sync` level (and a DUE
+            // `interval` window) that is a real `fdatasync`, so it resets the un-fsynced frontier
+            // to `0` and the record is then admitted by the no-wedge floor: the headroom THROTTLES
+            // (drain-then-admit), never sheds, never loses. Under a relaxed `async`/`none` level a
+            // commit DEFERS the fsync, so the frontier does NOT drain; the re-check still fails and
+            // the new produce is SHED to keep the loss window within the headroom. The
+            // already-buffered records are untouched (they stay durable-pending and are made
+            // durable by their level's barrier), so only this NEW produce is rejected.
+            batch.drain_for_headroom(engine);
             if !engine.wal_headroom_admit(record_bytes) {
                 // The drain could not free the headroom (a relaxed level deferring the fsync): shed
                 // this NEW produce with the typed, self-announcing signal, count it (a shed is never
@@ -1946,17 +2724,16 @@ fn process_produce<F, C>(
             } else {
                 PendingOutcome::Appended(offset)
             };
-            pending.push(PendingProduce { outcome, reply });
+            batch.park(engine, outcome, reply);
         }
         // A BENIGN dedup hit (#33): nothing was appended, but its original offset may be an id recorded
         // earlier in THIS uncommitted batch, so PARK the reply behind the covering fsync too (I2). On a
         // sync failure the batch is non-durable and every parked reply, hit or fresh, becomes Fatal,
-        // exactly as for a fresh append.
+        // exactly as for a fresh append. (On the pipelined tier a duplicate of a LONG-DURABLE id on a
+        // fully-durable log releases immediately with zero fsyncs — the park's dup-of-durable fast
+        // path, #1040; a hit on an id recorded in the current unsynced window still parks, I2 uniform.)
         Ok(crate::engine::AppendOutcome::Duplicate(offset)) => {
-            pending.push(PendingProduce {
-                outcome: PendingOutcome::Duplicate(offset),
-                reply,
-            });
+            batch.park(engine, PendingOutcome::Duplicate(offset), reply);
         }
         // A stale-epoch fence (#33): nothing was written, so reply immediately; it does not join the
         // durable batch.
@@ -2009,36 +2786,16 @@ where
                 let Some(reply) = p.reply else {
                     continue;
                 };
-                let outcome = match p.outcome {
-                    PendingOutcome::Appended(offset) => ProduceOutcome::Appended(offset),
-                    // A dedup hit replies PubAckDuplicate now that the covering batch is durable (#33).
-                    PendingOutcome::Duplicate(offset) => ProduceOutcome::AppendedDuplicate(offset),
-                    // A fire-and-forget produce is durable now, but the session sends NO PubAck (#11).
-                    PendingOutcome::FireAndForgetAppended(offset) => {
-                        ProduceOutcome::FireAndForgetAppended(offset)
-                    }
-                };
-                let _ = reply.send(outcome);
+                let _ = reply.send(released_outcome(p.outcome));
             }
         }
         Err(e) => {
             // The fsync froze the writer: NONE of the batch is durable. Tell every producer it was a
             // fatal storage error so each ends its session, exactly as the pre-actor per-produce path
-            // did when its `log.sync()?` surfaced `WriterFrozen`. The first member carries the real
-            // error; the rest carry an equivalent frozen-writer error (the freeze is the same event).
-            // A LEVEL-0 (no-ack) parked produce has no reply channel (#495), so it is SKIPPED WITHOUT
-            // consuming the real error — the fired-and-forgotten producer is not listening, and the
-            // first at-least-once member must still receive the true error.
-            let mut first = Some(e);
-            for p in pending.drain(..) {
-                let Some(reply) = p.reply else {
-                    continue;
-                };
-                let err = first.take().unwrap_or(EngineError::Storage(
-                    ironbus_storage::segment::StorageError::WriterFrozen,
-                ));
-                let _ = reply.send(ProduceOutcome::Fatal(err));
-            }
+            // did when its `log.sync()?` surfaced `WriterFrozen` — the shared fan-out mapping
+            // (first member the real error, the rest `WriterFrozen`, Level-0 skipped without
+            // consuming the real error).
+            fatal_fan_replies(pending.drain(..).map(|p| p.reply), Some(e));
         }
     }
 }
@@ -2993,49 +3750,76 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_gather_window_collects_a_spaced_produce_into_the_pipelined_batch() {
-        // The opt-in group-commit gather (#454): a drain pass holding TWO OR MORE produces (a
-        // pipelining publisher) keeps gathering, so a produce that arrives WHILE the actor is
-        // gathering joins the in-progress batch instead of paying its own fsync. The sync gate
-        // gives a deterministic setup: a primer produce parks the actor on its covering fsync,
-        // TWO produces queue behind it (so the next drain pass proves pipelining), the gate
-        // opens, and a fourth produce sent mid-gather must land in the SAME batch: exactly TWO
-        // syncs total (the primer's, then ONE covering the gathered three).
+    fn the_in_flight_fdatasync_is_the_batching_window_and_merges_the_queued_burst() {
+        // T2 (#1040), the self-clocking rewrite of the retired #454 gather test: the previous
+        // fsync IS the batching window. A BURST primer pass ([p1, p2] — two parked waiters, so
+        // pass end declines H1 and dispatches async) puts its covering barrier into the closed
+        // gate; 32 produces queued as SEPARATE channel sends (defeating single-pass batching at
+        // the submission side) are then appended by the FREE actor WHILE the barrier is in
+        // flight and MERGE into the in-flight window. When the gate opens, the merged window is
+        // covered by exactly ONE additional fdatasync — no wall-clock window, no latency floor,
+        // unbounded amortization — and all 32 acks arrive in submission order (INV-4/#917).
+        // Under sustained staged load the barrier count is exactly two: the primer window's and
+        // the merged window's (the H2 linger never engages behind an outstanding flight).
         let (fs, control) = FaultFs::new(InMemoryFs::new());
         let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        // The inert historical window parameter (#1040): passed non-zero to pin that it is IGNORED.
         let (handle, actor) = spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, 800_000);
         control.close_sync_gate();
-        let primer = handle.produce_async(append(b"primer")).unwrap();
+        // Stage pass 1 = [p1, p2, hold]: while the hold keeps the pass open, the 32 sends land in
+        // the channel, so the flight dispatches at pass end with the burst already queued behind
+        // it — the actor then appends all 32 mid-flight (never parked on the gate itself).
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let p1 = handle.produce_async(append(b"primer-1")).unwrap();
+        let p2 = handle.produce_async(append(b"primer-2")).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        // 32 separate sends, all queued while the burst pass is held open: they are drained and
+        // appended WHILE barrier #1 is provably in flight, merging into ONE window. A third hold
+        // rides BEHIND them in the same pass: once it reports in, all 32 are appended-and-parked
+        // (FIFO within the drained pass) with the gate still closed — so the one merged window
+        // is pinned BEFORE the gate opens, and the per-command completion polling can never
+        // split the burst across chunked windows.
+        let replies: Vec<_> = (0..32u64)
+            .map(|i| {
+                handle
+                    .produce_async(append(format!("merged-{i}").as_bytes()))
+                    .unwrap()
+            })
+            .collect();
+        let (entered3, release3) = send_blocking_job(&handle);
+        release2.send(()).unwrap();
         control.wait_for_sync_gate_entered(1);
-        let queued_a = handle.produce_async(append(b"queued-a")).unwrap();
-        let queued_b = handle.produce_async(append(b"queued-b")).unwrap();
+        entered3.recv().unwrap();
+        // Sampled while the primer window's barrier is still parked inside the gate and all 32
+        // merged produces are provably appended behind it.
         let before = control.sync_count();
+        release3.send(()).unwrap();
         control.open_sync_gate();
-        match primer.recv().unwrap() {
-            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 0),
-            other => panic!("expected Appended primer, got {other:?}"),
+        for (name, rx, expected) in [("p1", p1, 0), ("p2", p2, 1)] {
+            match rx.recv().unwrap() {
+                ProduceOutcome::Appended(o) => assert_eq!(o.get(), expected, "{name}"),
+                other => panic!("expected Appended {name}, got {other:?}"),
+            }
         }
-        // The primer is acked, so the actor is in its next pass: it drained the two queued
-        // produces (>= 2, the gather engages) and is now collecting. Real-time spacing is the
-        // point under test (the gather is a wall-clock IO batching decision, outside the
-        // ManualClock seam), with a 16x margin between the spacing and the window so a slow CI
-        // runner cannot expire the gather before the late produce lands.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let late = handle.produce_async(append(b"gathered-late")).unwrap();
         let mut offsets = Vec::new();
-        for reply in [queued_a, queued_b, late] {
+        for reply in replies {
             match reply.recv().unwrap() {
                 ProduceOutcome::Appended(o) => offsets.push(o.get()),
                 other => panic!("expected Appended, got {other:?}"),
             }
         }
-        assert_eq!(offsets, vec![1, 2, 3], "all three appended in send order");
-        // `sync_count` ticks when a sync ENTERS the gate, so the primer's (parked) sync is
-        // already inside `before`; the gathered batch of three adds exactly ONE more.
+        assert_eq!(
+            offsets,
+            (2..=33).collect::<Vec<_>>(),
+            "all 32 merged produces ack in submission order with contiguous offsets"
+        );
         assert_eq!(
             control.sync_count() - before,
             1,
-            "ONE covering fsync for the gathered batch of three, none for the late produce"
+            "the whole merged window of 32 is covered by exactly ONE additional fdatasync"
         );
         drop(handle);
         actor.join().unwrap();
@@ -3043,10 +3827,11 @@ mod tests {
 
     #[test]
     fn a_single_inflight_produce_never_pays_the_gather_window() {
-        // The no-tax rule (#454): a drain pass holding ONE produce never gathers, so an
-        // unpipelined producer (send, await ack, send) on a gather-enabled broker keeps the
-        // historical ack latency. With an 800 ms window, a gathered single produce could not ack
-        // in under 800 ms; the bound asserts the ack came back far sooner.
+        // The no-tax rule, now BY CONSTRUCTION (#1040): the retired #454 gather window parameter
+        // is inert, and the self-clocking pipeline adds zero idle-start latency — a lone produce
+        // dispatches its covering barrier immediately at pass end. With an 800 ms window value, a
+        // gathered single produce could not ack in under 800 ms; the bound asserts the ack came
+        // back far sooner (the deprecated knob is accepted and IGNORED).
         let (fs, control) = FaultFs::new(InMemoryFs::new());
         let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
         let (handle, actor) = spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, 800_000);
@@ -3588,5 +4373,2016 @@ mod tests {
             other => panic!("expected Appended for s_b, got {other:?}"),
         }
         let _ = recover(handle, actor);
+    }
+
+    // ---- The pipelined sync tier (#1040): T1-T14 + the prep-review mutation gaps ----
+    //
+    // Per the #823 lesson, every concurrency claim below is OVERLAP-OBSERVING: interleavings are
+    // asserted via the fault-fs gates (`close_sync_gate` holds a barrier provably in flight;
+    // `arm_sync_rendezvous` proves two barriers were simultaneously inside their fsync) and via
+    // LIVE-image probes of the shared `InMemoryFs`, never via sleeps or outcome-only checks.
+
+    /// Like [`rig`] over `cfg`, but also returns a PROBE alias of the underlying [`InMemoryFs`]
+    /// (the clones share one backing store), so a test can inspect the LIVE file image while the
+    /// actor still owns the engine, or simulate a power cut mid-flight.
+    #[allow(clippy::type_complexity)]
+    fn rig_probed_with(
+        cfg: EngineConfig,
+    ) -> (
+        EngineHandle<FaultFs<InMemoryFs>, ManualClock>,
+        std::thread::JoinHandle<Engine<FaultFs<InMemoryFs>, ManualClock>>,
+        FaultControl,
+        InMemoryFs,
+    ) {
+        let mem = InMemoryFs::new();
+        let probe = mem.clone();
+        let (fs, control) = FaultFs::new(mem);
+        let engine = Engine::open(fs, ManualClock::new(), cfg).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        (handle, actor, control, probe)
+    }
+
+    /// The LIVE (unsynced-included) images of every segment file, concatenated in name order —
+    /// what a reader of the page cache would see right now, via the probe alias.
+    fn live_segment_bytes(probe: &InMemoryFs) -> Vec<u8> {
+        use ironbus_storage::io::RandomAccessFile;
+        let mut names: Vec<String> = probe
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|n| is_segment_file(n))
+            .collect();
+        names.sort();
+        let mut all = Vec::new();
+        for name in &names {
+            let Ok(file) = probe.open(name) else { continue };
+            let len = usize::try_from(file.len().unwrap()).unwrap();
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, 0).unwrap();
+            all.extend_from_slice(&buf);
+        }
+        all
+    }
+
+    /// Whether `haystack` contains `needle` as a byte substring.
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Whether `name` is a segment file (`seg-<16 hex>.log`). Exact-case by design: the writer
+    /// emits exactly this lowercase form (`naming::segment_file_name`), so a case-insensitive
+    /// match would be wrong (a foreign `SEG-...LOG` file is NOT a segment).
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    fn is_segment_file(name: &str) -> bool {
+        name.starts_with("seg-") && name.ends_with(".log")
+    }
+
+    /// Bounded-polls the probe's live segment image for `needle` (a progress wait on the actor
+    /// thread, NOT an interleaving assumption — the interleaving is pinned by a held gate).
+    fn wait_for_live_bytes(probe: &InMemoryFs, needle: &[u8]) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if contains_bytes(&live_segment_bytes(probe), needle) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        false
+    }
+
+    /// Sends a raw `Command::Run` job that signals `entered` and then BLOCKS until `release` —
+    /// the deterministic pass-stager: while the job blocks, everything the test queues lands in
+    /// the channel and is drained TOGETHER in a later pass (or, queued during the SAME pass's
+    /// drain, in the very next one), with no sleeps and no races.
+    fn send_blocking_job(
+        handle: &EngineHandle<FaultFs<InMemoryFs>, ManualClock>,
+    ) -> (Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered_rx) = sync_channel::<()>(1);
+        let (release_tx, release_rx) = sync_channel::<()>(1);
+        handle
+            .tx
+            .send(Command::Run(Box::new(move |_e| {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            })))
+            .unwrap();
+        (entered_rx, release_tx)
+    }
+
+    /// Stages ONE pass holding exactly the two produces (a BURST pass, two parked waiters), so
+    /// pass end DECLINES the H1 solo-inline heuristic and DISPATCHES the covering barrier to the
+    /// flusher — the deterministic way to put a real async flight into a (typically closed) sync
+    /// gate while the ACTOR stays free. A SOLO staged produce would instead run the legacy
+    /// inline barrier on the actor itself (H1) and wedge the actor, not the flusher, in the gate.
+    fn stage_burst_pass(
+        handle: &EngineHandle<FaultFs<InMemoryFs>, ManualClock>,
+        a: OwnedAppend,
+        b: OwnedAppend,
+    ) -> (Receiver<ProduceOutcome>, Receiver<ProduceOutcome>) {
+        let (entered, release) = send_blocking_job(handle);
+        entered.recv().unwrap();
+        let ra = handle.produce_async(a).unwrap();
+        let rb = handle.produce_async(b).unwrap();
+        release.send(()).unwrap();
+        (ra, rb)
+    }
+
+    #[test]
+    fn t1_a_produce_appends_into_the_live_segment_while_the_first_barrier_is_in_flight() {
+        // T1, the HEADLINE overlap observation (#1040): while produce A's covering fdatasync is
+        // provably INSIDE the held sync gate, produce B must APPEND — its frame bytes appear in
+        // the active segment's LIVE image (B is larger than the writer's 256 KiB spill bound, so
+        // its append flushes to the file immediately) while NEITHER reply has been released
+        // (INV-1). A serialized implementation (the legacy loop) is parked inside the fsync and
+        // cannot pass the mid-gate byte observation. Opening the gate releases A then B, and B's
+        // merged window costs exactly ONE additional fdatasync.
+        let (handle, actor, control, probe) = rig_probed_with(config());
+        control.close_sync_gate();
+        // Stage deterministically: while a blocking job holds a pass open, queue [A, hold2]; then,
+        // while hold2 blocks (in the SAME pass that appended A), queue B in the channel. Releasing
+        // hold2 ends A's pass — its covering barrier dispatches into the closed gate — and the
+        // actor's next `try_recv` finds B ALREADY queued, so B is appended WHILE the barrier is in
+        // flight (deterministic: never a race against the actor's idle wait, which only blocks on
+        // the completion channel when the command channel is empty).
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let a = handle.produce_async(append(b"t1-first-flight")).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        // B: bigger than PENDING_SPILL_BYTES (256 KiB) so the append itself spills the frame into
+        // the file — the append-during-flight observation. A distinctive marker rides at the end.
+        let mut big = vec![0x42_u8; 300 * 1024];
+        big.extend_from_slice(b"T1-LIVE-DURING-FLIGHT");
+        let b = handle.produce_async(append(&big)).unwrap();
+        release2.send(()).unwrap();
+        // The flusher is now provably INSIDE fdatasync #1 (entered the closed gate).
+        control.wait_for_sync_gate_entered(1);
+        assert!(
+            wait_for_live_bytes(&probe, b"T1-LIVE-DURING-FLIGHT"),
+            "B's frame bytes must appear in the LIVE segment image WHILE barrier #1 holds the \
+             gate — the append-during-flight overlap a serialized actor cannot produce"
+        );
+        // INV-1: no reply precedes its covering barrier — both still parked while the gate holds.
+        assert!(
+            a.try_recv().is_err(),
+            "A must not ack before its fdatasync returned (I2)"
+        );
+        assert!(
+            b.try_recv().is_err(),
+            "B must not ack before ITS covering fdatasync (it merged into the NEXT window)"
+        );
+        let before = control.sync_count();
+        control.open_sync_gate();
+        // Acks arrive in order: A (covered by barrier #1), then B (covered by barrier #2).
+        assert!(
+            matches!(a.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0),
+            "A acks first, at offset 0"
+        );
+        assert!(
+            matches!(b.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 1),
+            "B acks second, at offset 1"
+        );
+        assert_eq!(
+            control.sync_count() - before,
+            1,
+            "B's window is exactly ONE more fdatasync (two total for two overlapped produces)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t3a_a_power_cut_with_nothing_acked_recovers_with_any_loss_legal() {
+        // T3(a)+(c) (#1040): gate held, A's barrier in flight, B appended-during-flight, NOTHING
+        // acked — a power cut may lose any subset (no ack was released, so I2 is vacuous). The
+        // assertion is the recovery invariant only: the reverted image opens cleanly and the
+        // recovered heads are consistent. The wedged actor/flusher are leaked deliberately (the
+        // cut happened; they no longer own the disk).
+        let (handle, actor, control, probe) = rig_probed_with(config());
+        control.close_sync_gate();
+        // The T1 stager: A's pass is held open while B is queued, so B is appended (and, being
+        // over the spill bound, lands in the live image) WHILE A's barrier is parked in the gate.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let a = handle.produce_async(append(b"t3a-inflight")).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        let mut big = vec![0x51_u8; 300 * 1024];
+        big.extend_from_slice(b"T3A-DIRTY-DURING-FLIGHT");
+        let b = handle.produce_async(append(&big)).unwrap();
+        release2.send(()).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        // B provably appended (in the live image) while A's barrier is still parked: the cut
+        // below lands with one staged-and-syncing record and one dirty record, nothing acked.
+        assert!(wait_for_live_bytes(&probe, b"T3A-DIRTY-DURING-FLIGHT"));
+        assert!(
+            a.try_recv().is_err() && b.try_recv().is_err(),
+            "nothing acked"
+        );
+        probe.simulate_power_loss();
+        // Recover from the reverted image: any loss is legal; the open itself and head coherence
+        // are the invariants.
+        let reopened = Engine::open(probe.clone(), ManualClock::new(), config()).unwrap();
+        assert_eq!(
+            reopened.flushed_offset(),
+            reopened.durable_offset(),
+            "recovery leaves visible == durable"
+        );
+        assert!(
+            reopened.flushed_offset().get() <= 2,
+            "at most the two written records survive"
+        );
+        // Leak the wedged rig: the gate is never opened (the modelled machine lost power).
+        std::mem::forget((handle, actor, control, a, b));
+    }
+
+    #[test]
+    fn t3b_an_acked_produce_survives_a_power_cut_taken_mid_next_flight() {
+        // T3(b) (#1040): A was ACKED (its covering fdatasync returned), then a cut lands while a
+        // LATER window's barrier is in flight (a BURST window, so the barrier really is a
+        // flusher flight, not H1's inline barrier). Acked-implies-durable must hold across the
+        // cut: A's record survives recovery.
+        let (handle, actor, control, probe) = rig_probed_with(config());
+        assert!(
+            matches!(handle.produce(append(b"t3b-acked")).unwrap(), ProduceOutcome::Appended(o) if o.get() == 0)
+        );
+        control.close_sync_gate();
+        let (c1, c2) = stage_burst_pass(
+            &handle,
+            append(b"t3b-unacked-inflight-1"),
+            append(b"t3b-unacked-inflight-2"),
+        );
+        control.wait_for_sync_gate_entered(1);
+        assert!(
+            c1.try_recv().is_err() && c2.try_recv().is_err(),
+            "the later window is mid-flight, unacked"
+        );
+        probe.simulate_power_loss();
+        let reopened = Engine::open(probe.clone(), ManualClock::new(), config()).unwrap();
+        assert!(
+            reopened.flushed_offset().get() >= 1,
+            "the ACKED record must survive the cut (acked implies durable, I2)"
+        );
+        std::mem::forget((handle, actor, control, c1, c2));
+    }
+
+    #[test]
+    fn t3d_a_roll_spanning_power_cut_with_reordered_tail_recovers_for_every_seed() {
+        // T3(d) (#1040): tiny segments force rolls, the cut REORDERS/DROPS the active segment's
+        // unsynced tail (the page-cache model, #164), swept across seeds. Nothing acked after the
+        // gate closes, so any tail loss is legal; recovery must open cleanly at every seed.
+        for seed in 0..8u64 {
+            let cfg = EngineConfig {
+                log: LogConfig {
+                    max_segment_bytes: 192,
+                    ..LogConfig::default()
+                },
+                ..config()
+            };
+            let (handle, actor, control, probe) = rig_probed_with(cfg.clone());
+            // A few acked records first (rolling across segments).
+            for i in 0..4u64 {
+                assert!(matches!(
+                    handle
+                        .produce(append(&[0x60 + u8::try_from(i).unwrap(); 40]))
+                        .unwrap(),
+                    ProduceOutcome::Appended(_)
+                ));
+            }
+            // Now a gated flight plus dirty appends behind it.
+            control.close_sync_gate();
+            let r1 = handle.produce_async(append(&[0xa1; 40])).unwrap();
+            control.wait_for_sync_gate_entered(1);
+            let r2 = handle.produce_async(append(&[0xa2; 40])).unwrap();
+            // The ACTIVE segment is the highest-id one; reorder ITS unsynced tail.
+            let active = probe
+                .list()
+                .unwrap()
+                .into_iter()
+                .filter(|n| is_segment_file(n))
+                .max()
+                .unwrap();
+            let _kept = probe.simulate_power_loss_reorder(&active, seed);
+            let reopened = Engine::open(probe.clone(), ManualClock::new(), cfg).unwrap();
+            assert!(
+                reopened.flushed_offset().get() >= 4,
+                "seed {seed}: every ACKED record survives"
+            );
+            assert_eq!(
+                reopened.flushed_offset(),
+                reopened.durable_offset(),
+                "seed {seed}: visible == durable after recovery"
+            );
+            std::mem::forget((handle, actor, control, r1, r2));
+        }
+    }
+
+    #[test]
+    fn t4_a_failed_flusher_barrier_freezes_forever_and_fatal_fans_every_parked_batch() {
+        // T4, fail-closed fsyncgate (#1040, INV-7): batch N (a BURST window [a1, a2], so its
+        // covering barrier is a real flusher flight — a SOLO produce would run H1's inline
+        // barrier and surface the legacy `WriterFrozen` from `Log::sync` instead of the
+        // flusher's raw error) is parked in the gate, batch N+1 queues behind it, then the
+        // barrier FAILS. Batch N's first at-least-once waiter gets the REAL injected error, its
+        // second member `WriterFrozen` in the SAME fan-out sweep; batch N+1 surfaces
+        // `WriterFrozen` too (it can never become durable behind a frozen writer); zero acks
+        // ever; `sync_count` freezes (no re-arm, a failed barrier is never retried); health
+        // flips; clearing the fault does not resurrect.
+        let (handle, actor, control) = rig();
+        control.close_sync_gate();
+        let (a1, a2) = stage_burst_pass(
+            &handle,
+            append(b"t4-batch-n-first"),
+            append(b"t4-batch-n-second"),
+        );
+        control.wait_for_sync_gate_entered(1);
+        let b = handle.produce_async(append(b"t4-batch-n1-first")).unwrap();
+        let c = handle.produce_async(append(b"t4-batch-n1-second")).unwrap();
+        // Arm the failure while the barrier is parked (the fail check runs after the gate), then
+        // release the gate: the in-flight fdatasync returns the injected error.
+        control.set_fail_sync(true);
+        control.open_sync_gate();
+        // A1 carries the REAL error (the first at-least-once member of the fan-out), A2 the
+        // equivalent `WriterFrozen` from the same sweep...
+        match a1.recv().unwrap() {
+            ProduceOutcome::Fatal(EngineError::Storage(
+                ironbus_storage::segment::StorageError::Io(_),
+            )) => {}
+            other => panic!("batch N must carry the real injected IO error, got {other:?}"),
+        }
+        // ...and batch N+1 is fataled as WriterFrozen behind the frozen writer.
+        for (name, rx) in [("a2", a2), ("b", b), ("c", c)] {
+            match rx.recv().unwrap() {
+                ProduceOutcome::Fatal(EngineError::Storage(
+                    ironbus_storage::segment::StorageError::WriterFrozen,
+                )) => {}
+                other => panic!("{name} must be fataled WriterFrozen, got {other:?}"),
+            }
+        }
+        let frozen_syncs = control.sync_count();
+        // A later produce surfaces the frozen writer; no barrier is ever dispatched again.
+        assert!(
+            matches!(
+                handle.produce(append(b"t4-after")).unwrap(),
+                ProduceOutcome::Fatal(_)
+            ),
+            "an append on the frozen writer is fatal"
+        );
+        let _ = handle.with(|_| ());
+        assert!(
+            !handle.writer_appears_healthy(),
+            "the freeze is published for /readyz"
+        );
+        // Clearing the injected fault must NOT resurrect the writer (INV-7: frozen forever).
+        control.set_fail_sync(false);
+        assert!(
+            matches!(
+                handle.produce(append(b"t4-still-frozen")).unwrap(),
+                ProduceOutcome::Fatal(_)
+            ),
+            "clearing the fault does not resurrect the frozen writer"
+        );
+        assert_eq!(
+            control.sync_count(),
+            frozen_syncs,
+            "sync_count froze: no barrier was ever re-armed after the failure"
+        );
+        drop(handle);
+        let _ = actor.join();
+    }
+
+    #[test]
+    fn t5a_a_synchronous_seal_freeze_with_no_flight_fatals_the_parked_waiter_promptly() {
+        // T5(a), the frozen-writer no-wedge regression (#1040, L6): a parked waiter exists, then a
+        // ROLL-SEAL failure freezes the writer SYNCHRONOUSLY (no barrier in flight yet — the
+        // freeze happens inside the same pass, before pass-end dispatch). The pass-end
+        // `reconcile_writer_freeze` must fatal the parked waiter promptly — the exact D3 wedge
+        // (a parked reply with no flight and a dead writer) this transition exists to kill.
+        let cfg = EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 192,
+                ..LogConfig::default()
+            },
+            ..config()
+        };
+        let (handle, actor, control, _probe) = rig_probed_with(cfg);
+        // Stage ONE pass containing [B (parks), C (forces a roll whose seal fails)]: hold the
+        // actor in a blocking job while both are queued, then release.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        // B fills segment 1 PAST the 192-byte cap (the roll triggers on the NEXT append), so C's
+        // append MUST roll — the seal (`sync_all`) is the first barrier of the pass and it fails
+        // BEFORE any flusher dispatch exists (the pure synchronous-freeze path; both produces are
+        // in ONE pass, so no pass-end dispatch has run yet either).
+        let b = handle.produce_async(append(&[0xb0; 200])).unwrap();
+        let c = handle.produce_async(append(&[0xc0; 24])).unwrap();
+        // Every sync now fails: the roll's seal (`sync_all`) freezes the writer mid-pass.
+        control.set_fail_sync(true);
+        let syncs_before = control.sync_count();
+        release.send(()).unwrap();
+        // C hit the failed seal inside its own append: fatal immediately.
+        match c.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ProduceOutcome::Fatal(_)) => {}
+            other => panic!("the roller must surface the seal failure as Fatal, got {other:?}"),
+        }
+        // THE NO-WEDGE ASSERTION: B was parked before the freeze with NO flight outstanding; the
+        // pass-end reconcile must fatal it promptly (a wedged implementation leaves it parked
+        // forever and this recv times out).
+        match b.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ProduceOutcome::Fatal(_)) => {}
+            other => panic!("the parked waiter must be fataled at pass end, got {other:?}"),
+        }
+        assert_eq!(
+            control.sync_count() - syncs_before,
+            1,
+            "exactly the failed SEAL ran — the pure synchronous-freeze path, no flusher barrier \
+             was ever dispatched (frozen at the pass-end stage)"
+        );
+        let _ = handle.with(|_| ());
+        assert!(!handle.writer_appears_healthy(), "freeze published");
+        control.set_fail_sync(false);
+        drop(handle);
+        let _ = actor.join();
+    }
+
+    #[test]
+    fn t5b_a_freeze_while_an_ok_completion_is_in_flight_full_no_ops_and_fatals_everything() {
+        // T5(b) (#1040): the writer freezes (an in-job engine-level freeze) WHILE an Ok barrier is
+        // still in flight. Every parked reply — the in-flight batch AND the merged one — is
+        // fataled promptly (while the flight is STILL parked in the gate: the no-wedge point),
+        // and when the flight later returns Ok its completion is a FULL no-op: the durable head
+        // never advances past the freeze and no ack is ever released (INV-1/INV-6/INV-7).
+        let (handle, actor, control) = rig();
+        // Stage: pass = [B, blocking job]; while held, queue [C, freeze-job]; the gate is closed
+        // BEFORE the pass ends so B's dispatched barrier parks deterministically.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let b = handle.produce_async(append(b"t5b-inflight-batch")).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        control.close_sync_gate();
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        // The actor is mid-pass (holding [B, job2]); queue the NEXT pass: C then the freeze.
+        let c = handle.produce_async(append(b"t5b-merged-batch")).unwrap();
+        handle
+            .tx
+            .send(Command::Run(Box::new(|e| {
+                // The engine-level freeze seam (what a failed in-job inline barrier leaves): the
+                // writer is dead from this instant, while B's barrier is still in the gate.
+                let _ = e.fail_async_commit();
+            })))
+            .unwrap();
+        release2.send(()).unwrap();
+        // B's barrier is now provably IN FLIGHT (parked in the closed gate)...
+        control.wait_for_sync_gate_entered(1);
+        // ...and the freeze pass runs behind it: BOTH batches are fataled while the gate still
+        // holds the flight (the mid-flight no-wedge proof — a quiesce-based design would hang).
+        for (name, rx) in [("b", b), ("c", c)] {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(ProduceOutcome::Fatal(_)) => {}
+                other => panic!("{name} must be fataled while the flight is parked, got {other:?}"),
+            }
+        }
+        // Release the flight: it returns Ok AFTER the freeze — the completion must be a FULL
+        // no-op (a half-applied ticket would advance the durable head past a frozen writer).
+        control.open_sync_gate();
+        let (flushed, durable, writable) = handle
+            .with(|e| {
+                (
+                    e.flushed_offset().get(),
+                    e.durable_offset().get(),
+                    e.log_is_writable(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            flushed, 0,
+            "the stale Ok completion advanced NOTHING (INV-6)"
+        );
+        assert_eq!(
+            durable, 0,
+            "the durable head never advances on a frozen writer"
+        );
+        assert!(!writable, "the writer stays frozen forever (INV-7)");
+        drop(handle);
+        let _ = actor.join();
+    }
+
+    #[test]
+    fn t5c_a_synchronous_roll_seal_freeze_under_an_ok_flight_fatal_fans_at_pass_end() {
+        // T5(c) (#1040, the PROMPTNESS half of L6): the writer freezes SYNCHRONOUSLY (a real
+        // roll-seal failure, T5(a)'s trigger class) while an Ok barrier is STILL IN FLIGHT. In
+        // this shape pass-end `maybe_issue` EARLY-RETURNS on the outstanding flight, so its
+        // frozen-writer Err arm — the reconcile that happens to cover T5(a)'s no-flight shape —
+        // never runs: ONLY the pass-end `reconcile_writer_freeze` can fatal the parked replies
+        // now. An implementation that leans on the completion's reconcile instead fans them one
+        // flight LATER. The promptness proof: every Fatal arrives while the flight is provably
+        // still parked inside the closed gate (no completion — and no completion-side reconcile —
+        // can have run). The stale Ok completion is then a FULL no-op, exactly as in T5(b).
+        let cfg = EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 192,
+                ..LogConfig::default()
+            },
+            ..config()
+        };
+        let (handle, actor, control, _probe) = rig_probed_with(cfg);
+        control.close_sync_gate();
+        // Stage pass 1 = [A, job2] with the blocking-job stager (commands land in the SAME pass,
+        // never a bare send racing the actor's idle wait): A parks small, and pass 1's END
+        // dispatches A's covering barrier into the closed gate.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let a = handle.produce_async(append(&[0xa5; 16])).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        // While job2 holds pass 1 open, queue ALL of pass 2 = [B, arm-job, C]: B (200 bytes,
+        // buffered — no fs write) fills segment 1 PAST the 192-byte cap (the roll triggers on the
+        // NEXT append); the arm-job arms `fail_write` FROM WITHIN the pass (arming any earlier
+        // would fail the dispatch's own stage flush at pass 1's end); C's append must then roll,
+        // and the seal's `flush_pending` of B's buffered frame is a WRITE — it fails BEFORE the
+        // seal's gated `sync_all`, so the writer freezes synchronously ON THE ACTOR THREAD (the
+        // actor never touches the closed gate) while the flight stays parked in it.
+        let b = handle.produce_async(append(&[0xb5; 200])).unwrap();
+        let arm = control.clone();
+        handle
+            .tx
+            .send(Command::Run(Box::new(move |_e| {
+                arm.set_fail_write(true);
+            })))
+            .unwrap();
+        let c = handle.produce_async(append(&[0xc5; 24])).unwrap();
+        let syncs_before = control.sync_count();
+        release2.send(()).unwrap();
+        // A's barrier is now provably IN FLIGHT (parked inside the closed gate)...
+        control.wait_for_sync_gate_entered(1);
+        // ...and pass 2 froze the writer BEHIND it. C hit the failed seal inside its own append:
+        // fatal immediately, from the append path itself.
+        match c.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ProduceOutcome::Fatal(_)) => {}
+            other => panic!("the roller must surface the seal failure as Fatal, got {other:?}"),
+        }
+        // THE PROMPTNESS ASSERTION: A and B are fataled by the PASS-END reconcile while the gate
+        // still holds the flight — the gate has not been opened, so no completion exists yet. A
+        // one-flight-late implementation leaves both parked until the gate opens, and these
+        // bounded recvs time out instead of hanging the suite.
+        for (name, rx) in [("a", a), ("b", b)] {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(ProduceOutcome::Fatal(_)) => {}
+                other => panic!(
+                    "{name} must be fataled at pass end, BEFORE the gate releases the flight, \
+                     got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(
+            control.sync_count() - syncs_before,
+            1,
+            "only the parked in-flight fdatasync ever reached a sync: the seal died at its WRITE \
+             (flush_pending), so the freeze was synchronous and no second barrier was dispatched"
+        );
+        // Release the flight: it returns Ok AFTER the freeze — the stale completion must be a
+        // FULL no-op (INV-6): heads pinned, writer still frozen, nothing resurrected (INV-7).
+        control.set_fail_write(false);
+        control.open_sync_gate();
+        let (flushed, durable, writable) = handle
+            .with(|e| {
+                (
+                    e.flushed_offset().get(),
+                    e.durable_offset().get(),
+                    e.log_is_writable(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            flushed, 0,
+            "the stale Ok completion advanced NOTHING (INV-6)"
+        );
+        assert_eq!(
+            durable, 0,
+            "the durable head never advances on a frozen writer"
+        );
+        assert!(!writable, "the writer stays frozen forever (INV-7)");
+        assert!(!handle.writer_appears_healthy(), "freeze published");
+        drop(handle);
+        let _ = actor.join();
+    }
+
+    #[test]
+    fn t6_an_acked_record_is_readable_on_actor_and_off_actor_planes_and_the_frontier_lags() {
+        // T6 + the T15 leader-frontier assertion (#1040, INV-2/INV-10): while a barrier is in
+        // flight the OFF-ACTOR read plane's flushed frontier must LAG (visible == durable — the
+        // ISR leader frontier seeds from this plane, so it may never exceed the fdatasync-completed
+        // offset); after the PubAck, both the actor-routed read and the off-actor plane serve the
+        // record immediately (read-your-acked-write).
+        let mem = InMemoryFs::new();
+        let (fs, control) = FaultFs::new(mem);
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let plane = engine.read_plane().unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        control.close_sync_gate();
+        // A BURST window ([a, a2]) so the covering barrier is a real flusher FLIGHT (H1 would
+        // inline a solo produce): the frontier-lag observation below is taken while the staged
+        // bytes are provably in the file but the barrier has not returned.
+        let (a, a2) = stage_burst_pass(
+            &handle,
+            append(b"t6-read-your-write"),
+            append(b"t6-second-in-window"),
+        );
+        control.wait_for_sync_gate_entered(1);
+        assert_eq!(
+            plane.flushed(),
+            0,
+            "the off-actor frontier NEVER runs ahead of the completed fdatasync (INV-2)"
+        );
+        control.open_sync_gate();
+        assert!(matches!(a.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
+        assert!(matches!(a2.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 1));
+        // The ack was observed: the frontier was published BEFORE the release (INV-10), so the
+        // off-actor plane already serves the record...
+        assert_eq!(
+            plane.flushed(),
+            2,
+            "the PubAck implies the published frontier covers the record (INV-10)"
+        );
+        // ...and so does an actor-routed poll.
+        let delivered = handle
+            .with(|e| match e.poll_now_in("") {
+                Ok(Poll::Message(d)) => Some(d.record.payload.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            delivered.as_deref(),
+            Some(b"t6-read-your-write".as_slice()),
+            "an immediate actor-routed poll serves the acked record"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t7_a_roll_under_an_in_flight_barrier_releases_pre_roll_waiters_at_the_seal() {
+        // T7 (#1040, E9): a segment roll happens while the old segment's covering barrier is in
+        // flight. The rendezvous PROVES the roll's seal (`sync_all`) and the flusher's `fdatasync`
+        // were simultaneously inside their barriers (two threads, one shared fd — the kernel-safe
+        // overlap); the seal itself is a covering barrier, so the pre-roll waiter releases off it
+        // with zero extra fsyncs; the old ticket's late completion is a full no-op (pinned at the
+        // log level; observed here as exact final heads/meter); and the pipeline keeps flowing
+        // afterward (the meter-drift livelock regression, T10b).
+        let cfg = EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 192,
+                ..LogConfig::default()
+            },
+            ..config()
+        };
+        let (handle, actor, control, _probe) = rig_probed_with(cfg);
+        // Stage: pass = [B (parks, small), blocking job]; while held, queue C (forces the roll).
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        // B fills segment 1 PAST the 192-byte cap: the NEXT append (C) must roll, so C's seal is
+        // issued while B's covering barrier is provably inside the rendezvous.
+        let b = handle.produce_async(append(&[0xb1; 200])).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        let c = handle.produce_async(append(&[0xc1; 24])).unwrap();
+        // Arm the width-2 rendezvous ONLY now (no unrelated sync can join), then release: the
+        // pass ends, B's barrier dispatches and parks INSIDE the rendezvous; the next pass
+        // appends C, whose roll-seal `sync_all` joins as the second participant — OVERLAP.
+        control.arm_sync_rendezvous(2);
+        release2.send(()).unwrap();
+        assert!(
+            control.wait_for_rendezvous_or_release(std::time::Duration::from_secs(10)),
+            "the roll's seal and the in-flight fdatasync must overlap (two barriers, one fd)"
+        );
+        // B releases off the SEAL (the covering barrier at the roll boundary); C releases off its
+        // own next barrier. Submission order is preserved.
+        assert!(
+            matches!(b.recv_timeout(std::time::Duration::from_secs(10)), Ok(ProduceOutcome::Appended(o)) if o.get() == 0),
+            "the pre-roll waiter releases at the seal"
+        );
+        assert!(
+            matches!(c.recv_timeout(std::time::Duration::from_secs(10)), Ok(ProduceOutcome::Appended(o)) if o.get() == 1),
+            "the post-roll waiter releases after the next covering barrier"
+        );
+        // The stale old-fd completion was a FULL no-op: the meter and heads are exact, and the
+        // pipeline still flows (no meter-drift livelock) — a follow-up produce acks cleanly.
+        let (unsynced, flushed, durable) = handle
+            .with(|e| {
+                (
+                    e.unsynced_bytes(),
+                    e.flushed_offset().get(),
+                    e.durable_offset().get(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            unsynced, 0,
+            "the byte meter reconciled exactly across the roll"
+        );
+        assert_eq!(flushed, durable, "visible == durable");
+        assert_eq!(flushed, 2, "both records durable");
+        assert!(
+            matches!(handle.produce(append(b"t7-after-roll")).unwrap(), ProduceOutcome::Appended(o) if o.get() == 2),
+            "the pipeline keeps flowing after the roll-under-flight"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t8_interleaved_connections_get_fifo_acks_across_merged_windows() {
+        // T8 (#917 x #1040): two logical connections interleave submissions across MERGED windows
+        // (a gated BURST primer guarantees a real flusher flight for them to merge behind).
+        // Structural FIFO (INV-4) must hold: each connection's acks arrive in ITS submission
+        // order with position-correlated offsets.
+        let (handle, actor, control) = rig();
+        control.close_sync_gate();
+        let (p1, p2) = stage_burst_pass(&handle, append(b"t8-primer-1"), append(b"t8-primer-2"));
+        control.wait_for_sync_gate_entered(1);
+        // Interleaved: a1, b1, a2, b2, a3, b3 — all merged behind the parked barrier.
+        let conn_a: Vec<_> = ["a1", "a2", "a3"].iter().map(|_| ()).collect();
+        let mut a_replies = Vec::new();
+        let mut b_replies = Vec::new();
+        for i in 0..conn_a.len() {
+            a_replies.push(
+                handle
+                    .produce_submit(append(format!("t8-a{i}").as_bytes()))
+                    .unwrap(),
+            );
+            b_replies.push(
+                handle
+                    .produce_submit(append(format!("t8-b{i}").as_bytes()))
+                    .unwrap(),
+            );
+        }
+        control.open_sync_gate();
+        assert!(matches!(p1.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
+        assert!(matches!(p2.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 1));
+        // Per-connection ack order == submission order; offsets correlate with position: the
+        // interleaving assigned a_i offset 2+2i and b_i offset 3+2i.
+        for (i, s) in a_replies.into_iter().enumerate() {
+            let expected = 2 + 2 * u64::try_from(i).unwrap();
+            assert!(
+                matches!(s.wait().unwrap(), ProduceOutcome::Appended(o) if o.get() == expected),
+                "conn A's ack {i} must be its own offset {expected}"
+            );
+        }
+        for (i, s) in b_replies.into_iter().enumerate() {
+            let expected = 3 + 2 * u64::try_from(i).unwrap();
+            assert!(
+                matches!(s.wait().unwrap(), ProduceOutcome::Appended(o) if o.get() == expected),
+                "conn B's ack {i} must be its own offset {expected}"
+            );
+        }
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t9_a_same_window_duplicate_waits_the_fsync_and_a_durable_duplicate_needs_none() {
+        // T9, dedup I2-uniformity (#33 x #1040): (a) a duplicate of an id recorded in the CURRENT
+        // unsynced window parks behind the covering fsync exactly like the fresh append (its
+        // original offset is not durable yet); (b) a duplicate of a LONG-DURABLE id on an idle
+        // log releases immediately with ZERO fsyncs (the dup-of-durable fast path).
+        let (handle, actor, control, probe) = rig_probed_with(config());
+        control.close_sync_gate();
+        // Stage pass 1 = [p1, p2, hold] (a burst window, so the flight is the flusher's), and
+        // queue the fresh+duplicate pair while the pass is held open: the FREE actor appends and
+        // PARKS both while the gate still holds the flight — the parked observations below are
+        // taken against records that were really processed mid-flight, not merely queued (the
+        // fresh append is over the 256 KiB spill bound, so its bytes appearing in the LIVE image
+        // prove the pass ran; the duplicate is drained in the SAME pass, right behind it).
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let p1 = handle.produce_async(append(b"t9-primer-1")).unwrap();
+        let p2 = handle.produce_async(append(b"t9-primer-2")).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        // (a) Fresh dedup'd X and its same-window duplicate, queued behind the held pass.
+        let mut fresh_payload = vec![0x9a_u8; 300 * 1024];
+        fresh_payload.extend_from_slice(b"T9-FRESH-MID-FLIGHT");
+        let fresh = handle
+            .produce_async(append_dedup(&fresh_payload, b"t9-prod", 1, b"t9-idem"))
+            .unwrap();
+        let dup = handle
+            .produce_async(append_dedup(b"x-again", b"t9-prod", 1, b"t9-idem"))
+            .unwrap();
+        release2.send(()).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        assert!(
+            wait_for_live_bytes(&probe, b"T9-FRESH-MID-FLIGHT"),
+            "the fresh append (and, same pass, its duplicate) was processed WHILE the primer \
+             window's barrier held the gate"
+        );
+        // I2-uniformity: the duplicate must NOT reply before the covering fsync — its original
+        // offset lives in the same unsynced window (fresh is appended but NOT durable).
+        assert!(fresh.try_recv().is_err(), "fresh parked behind the fsync");
+        assert!(
+            dup.try_recv().is_err(),
+            "the same-window duplicate must WAIT for the covering fsync (I2 uniformity)"
+        );
+        control.open_sync_gate();
+        for rx in [p1, p2] {
+            assert!(matches!(rx.recv().unwrap(), ProduceOutcome::Appended(_)));
+        }
+        assert!(
+            matches!(fresh.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 2),
+            "the fresh dedup'd produce appends at offset 2"
+        );
+        assert!(
+            matches!(dup.recv().unwrap(), ProduceOutcome::AppendedDuplicate(o) if o.get() == 2),
+            "the duplicate returns the ORIGINAL offset once durable"
+        );
+        // (b) The log is now idle and fully durable: a duplicate of the long-durable id releases
+        // with ZERO additional fsyncs.
+        let before = control.sync_count();
+        assert!(
+            matches!(
+                handle.produce(append_dedup(b"x-later", b"t9-prod", 1, b"t9-idem")).unwrap(),
+                ProduceOutcome::AppendedDuplicate(o) if o.get() == 2
+            ),
+            "a duplicate of a durable id releases immediately"
+        );
+        assert_eq!(
+            control.sync_count() - before,
+            0,
+            "the dup-of-durable fast path issues NO barrier"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t10_the_dirty_byte_bound_throttles_admission_and_never_sheds() {
+        // T10(a) (#1040, INV-9/E8): with a tiny `sync_max_dirty_bytes` and the covering barrier
+        // held in the gate, the NEXT produce is THROTTLED — blocked BEFORE its append (its bytes
+        // never reach the live image while the gate holds), never shed — and admitted the moment
+        // the completion drains the window. The bound forces the windows apart: each throttled
+        // record rides its OWN barrier (dispatch-before-block, so no deadlock either).
+        let cfg = EngineConfig {
+            sync_max_dirty_bytes: 64,
+            ..config()
+        };
+        let (handle, actor, control, probe) = rig_probed_with(cfg);
+        control.close_sync_gate();
+        // Stage pass 1 = [A1 (36 logical bytes), A2 (8), hold]: a burst window (44 <= 64 admits
+        // both; two parked waiters, so the pass end dispatches the flusher flight, never H1's
+        // inline barrier), with B queued while the pass is held open — B's pass then runs while
+        // the flight is provably in the gate, and B's throttle engages for real.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let mut a_payload = vec![0xa0_u8; 24];
+        a_payload.extend_from_slice(b"T10-A-STAGED");
+        let a = handle.produce_async(append(&a_payload)).unwrap();
+        let a2 = handle.produce_async(append(&[0xa1_u8; 8])).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        // B (39 logical bytes) would push the window over the 64-byte bound (44 + 39 > 64): the
+        // actor must throttle BEFORE B's append, so B's bytes must NOT appear while the gate
+        // holds the covering barrier.
+        let mut b_payload = vec![0xb0_u8; 24];
+        b_payload.extend_from_slice(b"T10-B-THROTTLED");
+        let b = handle.produce_async(append(&b_payload)).unwrap();
+        release2.send(()).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        // A's frame IS staged into the file (the dispatch's stage flushed it).
+        assert!(
+            wait_for_live_bytes(&probe, b"T10-A-STAGED"),
+            "A's staged frame is in the live image while its barrier is in flight"
+        );
+        let observe_until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < observe_until {
+            assert!(
+                !contains_bytes(&live_segment_bytes(&probe), b"T10-B-THROTTLED"),
+                "B must be throttled BEFORE its append while the window is over the bound"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(b.try_recv().is_err(), "B is not acked while throttled");
+        let entered_before_open = control.sync_count();
+        control.open_sync_gate();
+        // The completion drains the window: A1/A2 ack, then B admits, appends, and rides its own
+        // barrier. Zero sheds anywhere (the throttle blocks, never sheds).
+        assert!(matches!(a.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
+        assert!(matches!(a2.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 1));
+        assert!(matches!(b.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 2));
+        assert_eq!(
+            control.sync_count() - entered_before_open,
+            1,
+            "the bound split the windows: B rides exactly one barrier of its own"
+        );
+        let (rejected, headroom_sheds, unsynced) = handle
+            .with(|e| {
+                (
+                    e.counters().produce_rejected,
+                    e.backpressure_snapshot().wal_headroom_shed,
+                    e.unsynced_bytes(),
+                )
+            })
+            .unwrap();
+        assert_eq!(rejected, 0, "the throttle never sheds (INV-9)");
+        assert_eq!(headroom_sheds, 0, "no headroom shed either");
+        assert_eq!(unsynced, 0, "the window fully drained");
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t10b_a_same_pass_burst_over_the_bound_dispatches_before_blocking_never_deadlocks() {
+        // T10(b) (#1040, INV-9/L3, the dispatch-before-block proof): BOTH produces land in ONE
+        // actor pass (staged exactly like T1), so B's throttle check runs MID-PASS with the
+        // window over the bound and NO flight outstanding — pass-end `maybe_issue` has not run
+        // yet, so this is the one shape where the THROTTLE ITSELF must dispatch. It must
+        // `maybe_issue` A's covering barrier FIRST (so a completion can ever arrive) and only
+        // then block; an implementation that parks on the completion channel with nothing in
+        // flight deadlocks right here (or trips the depth-1 debug assert). The dispatch is
+        // observed BOUNDED: the flusher enters the closed gate (`sync_count` bumps at gate entry)
+        // while B is still throttled and unacked, and every later wait is a timed recv.
+        let cfg = EngineConfig {
+            sync_max_dirty_bytes: 64,
+            ..config()
+        };
+        let (handle, actor, control, probe) = rig_probed_with(cfg);
+        control.close_sync_gate();
+        // Stage pass = [A, B] with the blocking-job stager (the same technique T1 uses): while
+        // the job holds the actor, queue both produces; releasing the job makes the very next
+        // pass drain them TOGETHER — never a bare send racing the actor's idle wait.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        // A: 40 logical bytes — admitted on the empty-window floor, parked, unsynced = 40.
+        let mut a_payload = vec![0xa6_u8; 28];
+        a_payload.extend_from_slice(b"T10B-A-FIRST");
+        let a = handle.produce_async(append(&a_payload)).unwrap();
+        // B: 36 logical bytes — 40 + 36 > 64, so B must throttle mid-pass with NO flight yet.
+        let mut b_payload = vec![0xb6_u8; 24];
+        b_payload.extend_from_slice(b"T10B-B-GATED");
+        let b = handle.produce_async(append(&b_payload)).unwrap();
+        let syncs_before = control.sync_count();
+        release.send(()).unwrap();
+        // THE MUTANT-KILLING OBSERVATION: A's covering barrier is dispatched FROM INSIDE B's
+        // throttle — nothing else can dispatch it, because the pass never ends while B blocks
+        // mid-pass. A block-without-dispatch implementation never bumps `sync_count`, and this
+        // poll fails BOUNDED instead of hanging the suite on a barrier that can never arrive.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while control.sync_count() == syncs_before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        assert_eq!(
+            control.sync_count(),
+            syncs_before + 1,
+            "the throttle must dispatch A's covering barrier BEFORE blocking (INV-9, L3): no \
+             barrier entered the gate, so the throttle parked with nothing in flight"
+        );
+        control.wait_for_sync_gate_entered(1);
+        // While the gate holds the flight: A's staged frame is in the live image (the dispatch's
+        // stage flushed it), B is throttled BEFORE its append (its bytes never appear), and
+        // neither reply has been released (INV-1).
+        assert!(
+            wait_for_live_bytes(&probe, b"T10B-A-FIRST"),
+            "A's staged frame is in the live image while its barrier is in flight"
+        );
+        let observe_until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < observe_until {
+            assert!(
+                !contains_bytes(&live_segment_bytes(&probe), b"T10B-B-GATED"),
+                "B must be throttled BEFORE its append while the window is over the bound"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            a.try_recv().is_err(),
+            "A is not acked while its barrier is parked (INV-1)"
+        );
+        assert!(b.try_recv().is_err(), "B is not acked while throttled");
+        // Open the gate: the completion drains the window — A acks FIRST, B is admitted ONLY
+        // after that completion, appends, and rides its OWN barrier. Acks in submission order,
+        // bounded waits throughout, zero sheds anywhere (the throttle blocks, never sheds).
+        control.open_sync_gate();
+        match a.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ProduceOutcome::Appended(o)) => assert_eq!(o.get(), 0, "A acks first, at offset 0"),
+            other => panic!("A must ack Appended once its barrier returns, got {other:?}"),
+        }
+        match b.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ProduceOutcome::Appended(o)) => {
+                assert_eq!(
+                    o.get(),
+                    1,
+                    "B admits only after the completion, at offset 1"
+                );
+            }
+            other => panic!("B must ack Appended after ITS OWN barrier, got {other:?}"),
+        }
+        assert_eq!(
+            control.sync_count() - syncs_before,
+            2,
+            "the bound split the windows: exactly A's barrier plus B's own, no third"
+        );
+        let (rejected, headroom_sheds, unsynced) = handle
+            .with(|e| {
+                (
+                    e.counters().produce_rejected,
+                    e.backpressure_snapshot().wal_headroom_shed,
+                    e.unsynced_bytes(),
+                )
+            })
+            .unwrap();
+        assert_eq!(rejected, 0, "the throttle never sheds (INV-9)");
+        assert_eq!(headroom_sheds, 0, "no headroom shed either");
+        assert_eq!(unsynced, 0, "the window fully drained");
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t11_the_sync_inflight_stamp_sets_on_dispatch_and_clears_on_completion() {
+        // T11, the actor-level wiring of INV-8 (#862 x #1040): while the flusher's barrier is
+        // parked in the gate the actor itself is IDLE (its busy stamp was cleared at pass end and
+        // it is blocked on the completion channel), so a tripped watchdog PROVES the dedicated
+        // sync-inflight stamp is wired (the busy stamp cannot see this wedge). After the
+        // completion, the stamp clears and the watchdog un-trips. The busy-broker variant (fresh
+        // busy stamps masking nothing) is pinned in the liveness unit test.
+        const BOUND: u64 = 1_000;
+        let (handle, actor, control) = rig();
+        handle.set_actor_watchdog_bound(BOUND);
+        let t0 = handle.now_monotonic_nanos();
+        control.close_sync_gate();
+        // A BURST window so the wedged barrier is the FLUSHER's flight (a solo produce would
+        // wedge the actor in H1's inline barrier — visible to the BUSY stamp, which is exactly
+        // what this test must prove unnecessary for a flight).
+        let (a, a2) = stage_burst_pass(&handle, append(b"t11-wedge"), append(b"t11-wedge-2"));
+        control.wait_for_sync_gate_entered(1);
+        // The dispatch stamped sync-inflight strictly BEFORE the flusher could enter the gate, so
+        // the wedge is visible from this instant on — and it STAYS visible once the actor's pass
+        // ends and it parks idle on the completion channel with its busy stamp cleared (the state
+        // this scenario settles into), which only the dedicated sync-inflight stamp can see. The
+        // liveness unit test isolates the two stamps; this pins the actor-level wiring.
+        assert!(
+            handle.actor_watchdog_overran(t0 + BOUND + 2),
+            "the in-flight barrier trips the watchdog while the actor is not busy (INV-8)"
+        );
+        control.open_sync_gate();
+        assert!(matches!(a.recv().unwrap(), ProduceOutcome::Appended(_)));
+        assert!(matches!(a2.recv().unwrap(), ProduceOutcome::Appended(_)));
+        // Round-trip a job so the completion has provably been processed, then bounded-poll the
+        // watchdog UN-TRIPPING: the completion cleared the sync-inflight stamp, and once the
+        // actor's pass ends (`mark_idle` can lag this thread on a loaded test host) neither stamp
+        // can trip. With a flight still outstanding this would stay tripped FOREVER, so the flip
+        // to false pins the clear.
+        let _ = handle.with(|_| ());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut untripped = false;
+        while std::time::Instant::now() < deadline {
+            if !handle.actor_watchdog_overran(t0 + BOUND + 2) {
+                untripped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            untripped,
+            "the completion clears the sync-inflight stamp; no flight => no wedge"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t12a_a_run_job_does_not_quiesce_the_pipeline() {
+        // T12 (#1040, E5/L9): a Run job in the same pass as a produce runs with ZERO covering
+        // barriers issued beforehand (the legacy loop force-flushed exactly one) and observes a
+        // consistent durable head TRAILING the appended head. The in-pass appended produce still
+        // acks afterward (the pass end dispatches its barrier).
+        let (handle, actor, control) = rig();
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let b = handle.produce_async(append(b"t12-appended")).unwrap();
+        let (obs_tx, obs_rx) = sync_channel::<(u64, u64, u64)>(1);
+        let control_in_job = control.clone();
+        handle
+            .tx
+            .send(Command::Run(Box::new(move |e| {
+                let _ = obs_tx.send((
+                    e.durable_offset().get(),
+                    e.append_head().get(),
+                    control_in_job.sync_count(),
+                ));
+            })))
+            .unwrap();
+        let sync_baseline = control.sync_count();
+        release.send(()).unwrap();
+        let (durable, appended, syncs_at_job) = obs_rx.recv().unwrap();
+        assert_eq!(appended, 1, "the produce appended before the job");
+        assert_eq!(
+            durable, 0,
+            "the job observes the durable head TRAILING the appended head — no pre-job quiesce"
+        );
+        assert_eq!(
+            syncs_at_job, sync_baseline,
+            "ZERO covering barriers ran before the job (the legacy loop would have forced one)"
+        );
+        assert!(matches!(b.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t12b_an_in_job_inline_barrier_overlaps_the_flight_and_composes_exactly() {
+        // T12's inline-barrier composition (#1040, E5/INV-6): a Run job issues an INLINE
+        // `commit_batch` WHILE the flusher's barrier is in flight — the rendezvous proves the two
+        // barriers were simultaneously inside their fsyncs on the one shared fd. The inline
+        // barrier overtakes the flight (covering the in-job window); the in-job-covered waiter
+        // releases at the POST-JOB reconcile; the overtaken flight's late completion is a FULL
+        // no-op; the meter stays exact and the pipeline keeps flowing.
+        let (handle, actor, control) = rig();
+        // Stage: pass = [B (parks), blocking job]; while held, queue the inline-barrier job.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let b = handle
+            .produce_async(append(b"t12b-covered-in-job"))
+            .unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        let (job_tx, job_rx) = sync_channel::<(u64, u64)>(1);
+        handle
+            .tx
+            .send(Command::Run(Box::new(move |e| {
+                let before = (e.durable_offset().get(), e.append_head().get());
+                // The in-job INLINE covering barrier (a txn commit / force_sync stand-in),
+                // racing the in-flight fdatasync on the same fd.
+                let _ = e.commit_batch();
+                let _ = job_tx.send(before);
+            })))
+            .unwrap();
+        // Arm the width-2 rendezvous ONLY now, then let the pass end: B's barrier dispatches into
+        // the rendezvous (participant 1), the next pass runs the job whose inline barrier joins
+        // as participant 2 — both provably inside their fsyncs at once.
+        control.arm_sync_rendezvous(2);
+        release2.send(()).unwrap();
+        assert!(
+            control.wait_for_rendezvous_or_release(std::time::Duration::from_secs(10)),
+            "the inline in-job barrier and the in-flight fdatasync must OVERLAP"
+        );
+        let (durable_at_job, appended_at_job) = job_rx.recv().unwrap();
+        assert_eq!(appended_at_job, 1, "B was appended before the job");
+        assert_eq!(
+            durable_at_job, 0,
+            "the flight had not completed when the job began"
+        );
+        // The in-job-covered waiter releases at the post-job reconcile (or the stale completion's
+        // release — either way, promptly and exactly once).
+        assert!(
+            matches!(b.recv_timeout(std::time::Duration::from_secs(10)), Ok(ProduceOutcome::Appended(o)) if o.get() == 0),
+            "the in-job inline barrier's coverage releases the parked waiter"
+        );
+        // The late completion was a full no-op: meter exact, heads exact, pipeline alive.
+        let (unsynced, flushed) = handle
+            .with(|e| (e.unsynced_bytes(), e.flushed_offset().get()))
+            .unwrap();
+        assert_eq!(
+            unsynced, 0,
+            "the meter is exact after the overlapped barriers"
+        );
+        assert_eq!(flushed, 1, "exactly the one record is durable");
+        assert!(
+            matches!(handle.produce(append(b"t12b-after")).unwrap(), ProduceOutcome::Appended(o) if o.get() == 1),
+            "the pipeline keeps flowing after the overlap"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn t13a_dropping_the_last_handle_mid_flight_releases_the_ack_and_exits_cleanly() {
+        // T13(a), drop-driven shutdown (#1040): the last handle drops while a barrier is in
+        // flight (a BURST window, so it really is the flusher's flight). The actor processes the
+        // completion FIRST (releasing the covered acks to their still-live receivers), then
+        // observes the disconnect and runs the loss-free E7 drain — clean exit, engine
+        // recovered, flusher joined.
+        let (handle, actor, control) = rig();
+        control.close_sync_gate();
+        let (a, a2) = stage_burst_pass(
+            &handle,
+            append(b"t13a-mid-flight"),
+            append(b"t13a-mid-flight-2"),
+        );
+        control.wait_for_sync_gate_entered(1);
+        drop(handle);
+        control.open_sync_gate();
+        assert!(
+            matches!(a.recv_timeout(std::time::Duration::from_secs(10)), Ok(ProduceOutcome::Appended(o)) if o.get() == 0),
+            "the completion is processed and the covered ack released despite the dropped handle"
+        );
+        assert!(
+            matches!(a2.recv_timeout(std::time::Duration::from_secs(10)), Ok(ProduceOutcome::Appended(o)) if o.get() == 1),
+            "the whole covered window releases"
+        );
+        let engine = actor.join().unwrap();
+        assert_eq!(
+            engine.flushed_offset().get(),
+            2,
+            "the records are durable in the recovered engine"
+        );
+    }
+
+    #[test]
+    fn t13b_an_explicit_shutdown_mid_flight_quiesces_checkpoints_and_joins_the_flusher() {
+        // T13(b) (#1040): an explicit Shutdown lands while a barrier is in flight (a BURST
+        // window, so it really is the flusher's flight). The E6 path quiesces (drains the
+        // flight, inline-commits the tail), checkpoints, replies, and joins the flusher — the
+        // actor thread exits cleanly with the engine returned.
+        let (handle, actor, control) = rig();
+        control.close_sync_gate();
+        let (a, a2) = stage_burst_pass(
+            &handle,
+            append(b"t13b-mid-flight"),
+            append(b"t13b-mid-flight-2"),
+        );
+        control.wait_for_sync_gate_entered(1);
+        let (sd_tx, sd_rx) = sync_channel::<Result<(), EngineError>>(1);
+        handle.tx.send(Command::Shutdown(sd_tx)).unwrap();
+        // A second produce lands AFTER the Shutdown: the #802 closing-reply contract must hold
+        // on the pipelined tier too.
+        let late = handle
+            .produce_async(append(b"t13b-after-shutdown"))
+            .unwrap();
+        control.open_sync_gate();
+        assert!(matches!(a.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
+        assert!(matches!(a2.recv().unwrap(), ProduceOutcome::Appended(o) if o.get() == 1));
+        sd_rx.recv().unwrap().unwrap();
+        match late.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ProduceOutcome::AtCapacity) => {}
+            other => panic!("the shutdown-queued produce gets the closing reply, got {other:?}"),
+        }
+        let engine = actor.join().unwrap();
+        assert_eq!(engine.flushed_offset().get(), 2);
+    }
+
+    #[test]
+    fn t13c_a_dead_flusher_is_a_failed_barrier_never_a_hang() {
+        // T13(c) (#1040): the flusher thread is GONE (both its channel halves dropped — the
+        // harness variant of a crashed flusher). A dispatch cannot round-trip, so it is treated
+        // as the failed-barrier class: freeze + fatal-fan, and quiesce returns instead of
+        // hanging. Driven directly against the Pipeline state machine (the run loop's helpers).
+        let (fs, _control) = FaultFs::new(InMemoryFs::new());
+        let mut engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let watchdog = ActorWatchdog::new(0);
+        let clock = ManualClock::new();
+        let cap_gate = ProduceCapGate::new(0);
+        let (req_tx, req_rx) =
+            sync_channel::<FlushJob<<FaultFs<InMemoryFs> as Filesystem>::File>>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<SyncDone>();
+        // The dead flusher: nobody serves the job channel or holds the completion sender.
+        drop(req_rx);
+        drop(done_tx);
+        let mut pipeline = Pipeline {
+            parked: VecDeque::new(),
+            in_flight: None,
+            next_seq: 0,
+            req_tx: Some(req_tx),
+            done_rx,
+            flusher: None,
+            max_dirty_bytes: 0,
+            watchdog: &watchdog,
+            clock: &clock,
+            cap_gate: &cap_gate,
+        };
+        // Append one record and park its reply through the real park path.
+        let view = Append {
+            timestamp_ms: 0,
+            flags: ironbus_core::types::RecordFlags::from_bits(0),
+            key: b"",
+            headers: b"",
+            payload: b"t13c",
+        };
+        let offset = match engine
+            .append_no_sync_dedup_checked(&view, None, None)
+            .unwrap()
+        {
+            crate::engine::AppendOutcome::Appended(o) => o,
+            other => panic!("append failed: {other:?}"),
+        };
+        let (reply_tx, reply_rx) = sync_channel::<ProduceOutcome>(1);
+        pipeline.park(
+            &mut engine,
+            PendingOutcome::Appended(offset),
+            Some(reply_tx),
+        );
+        // The dispatch hits the dead flusher: failed-barrier class, immediately.
+        pipeline.maybe_issue(&mut engine);
+        match reply_rx.try_recv() {
+            Ok(ProduceOutcome::Fatal(EngineError::Storage(
+                ironbus_storage::segment::StorageError::Io(_),
+            ))) => {}
+            other => panic!("the parked waiter must get the synthesized fatal, got {other:?}"),
+        }
+        assert!(!engine.log_is_writable(), "the writer froze (INV-7)");
+        assert!(pipeline.in_flight.is_none(), "no phantom flight remains");
+        // And the quiesce path returns promptly on the frozen, flusher-less pipeline (no hang).
+        pipeline.quiesce_to_durable(&mut engine);
+        assert!(pipeline.parked.is_empty());
+    }
+
+    #[test]
+    fn t14_pipelined_actor_segments_are_byte_identical_to_produce_once_segments() {
+        // T14, the conformance gate (#1040): an identical produce sequence through (a) the
+        // synchronous `produce_once` path and (b) the pipelined actor (including merged windows
+        // and a segment roll) must leave BYTE-IDENTICAL segment files — the pipeline changes
+        // WHEN fsyncs happen, never what lands on disk.
+        let cfg = || EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 512,
+                ..LogConfig::default()
+            },
+            ..config()
+        };
+        let payloads: Vec<Vec<u8>> = (0..40u8)
+            .map(|i| vec![i; 3 + usize::from(i % 17)])
+            .collect();
+        // (a) The synchronous reference: produce_once, one barrier per record.
+        let mem_ref = InMemoryFs::new();
+        let probe_ref = mem_ref.clone();
+        let mut reference = Engine::open(mem_ref, ManualClock::new(), cfg()).unwrap();
+        for p in &payloads {
+            assert!(matches!(
+                produce_once(&mut reference, &append(p)),
+                ProduceOutcome::Appended(_)
+            ));
+        }
+        // (b) The pipelined actor: a gated BURST primer window ([0, 1]) holds a real flusher
+        // flight while [2..8) are appended mid-flight and merge into the next window; the rest
+        // run solo (H1's inline barrier path), so BOTH dispatch shapes contribute bytes.
+        let (handle, actor, control, probe_pipe) = rig_probed_with(cfg());
+        control.close_sync_gate();
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let first = handle.produce_async(append(&payloads[0])).unwrap();
+        let second = handle.produce_async(append(&payloads[1])).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        let merged: Vec<_> = payloads[2..8]
+            .iter()
+            .map(|p| handle.produce_async(append(p)).unwrap())
+            .collect();
+        release2.send(()).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        control.open_sync_gate();
+        assert!(matches!(first.recv().unwrap(), ProduceOutcome::Appended(_)));
+        assert!(matches!(
+            second.recv().unwrap(),
+            ProduceOutcome::Appended(_)
+        ));
+        for r in merged {
+            assert!(matches!(r.recv().unwrap(), ProduceOutcome::Appended(_)));
+        }
+        for p in &payloads[8..] {
+            assert!(matches!(
+                handle.produce(append(p)).unwrap(),
+                ProduceOutcome::Appended(_)
+            ));
+        }
+        // Quiesce the actor so the tails are flushed identically, then compare EVERY segment.
+        let _ = recover(handle, actor);
+        let seg_names = |probe: &InMemoryFs| -> Vec<String> {
+            let mut names: Vec<String> = probe
+                .list()
+                .unwrap()
+                .into_iter()
+                .filter(|n| is_segment_file(n))
+                .collect();
+            names.sort();
+            names
+        };
+        let ref_names = seg_names(&probe_ref);
+        let pipe_names = seg_names(&probe_pipe);
+        assert_eq!(
+            ref_names, pipe_names,
+            "same segment file set (rolls at the same points)"
+        );
+        assert!(ref_names.len() > 1, "the sequence spans a roll");
+        for name in &ref_names {
+            use ironbus_storage::io::RandomAccessFile;
+            let read_all = |probe: &InMemoryFs| -> Vec<u8> {
+                let f = probe.open(name).unwrap();
+                let len = usize::try_from(f.len().unwrap()).unwrap();
+                let mut buf = vec![0u8; len];
+                f.read_exact_at(&mut buf, 0).unwrap();
+                buf
+            };
+            assert_eq!(
+                read_all(&probe_ref),
+                read_all(&probe_pipe),
+                "segment {name} must be byte-identical between produce_once and the pipeline"
+            );
+        }
+    }
+
+    // ---- H1 solo-inline + H2 adaptive first-dispatch linger (#1040 dispatch heuristics) ----
+
+    /// The HELD flusher ends for a direct-[`Pipeline`] rig (the t13c construction): every
+    /// dispatched `FlushJob` is observable in `req_rx` (and none can complete until the test
+    /// plays flusher via `complete_one_flight`), which is what makes the H1/H2 dispatch-shape
+    /// assertions exact rather than timing-inferred.
+    struct HeldFlusher {
+        req_rx: Receiver<FlushJob<<FaultFs<InMemoryFs> as Filesystem>::File>>,
+        done_tx: std::sync::mpsc::Sender<SyncDone>,
+    }
+
+    impl HeldFlusher {
+        /// Plays one flusher round: takes the ONE dispatched job, issues its barrier, and
+        /// reports the completion.
+        fn complete_one_flight(&self) {
+            use ironbus_storage::io::RandomAccessFile;
+            let job = self
+                .req_rx
+                .try_recv()
+                .expect("a dispatched FlushJob must be on the bound-1 channel");
+            job.file.sync_data().unwrap();
+            self.done_tx
+                .send(SyncDone {
+                    seq: job.seq,
+                    result: Ok(()),
+                    fsync_nanos: 1_000,
+                })
+                .unwrap();
+        }
+    }
+
+    /// Builds the held flusher plus the pipeline-side channel halves to construct a direct
+    /// [`Pipeline`] over.
+    #[allow(clippy::type_complexity)]
+    fn held_flusher() -> (
+        HeldFlusher,
+        SyncSender<FlushJob<<FaultFs<InMemoryFs> as Filesystem>::File>>,
+        Receiver<SyncDone>,
+    ) {
+        let (req_tx, req_rx) =
+            sync_channel::<FlushJob<<FaultFs<InMemoryFs> as Filesystem>::File>>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<SyncDone>();
+        (HeldFlusher { req_rx, done_tx }, req_tx, done_rx)
+    }
+
+    /// A fresh engine over a fault fs for the direct-[`Pipeline`] rigs.
+    fn direct_engine() -> Engine<FaultFs<InMemoryFs>, ManualClock> {
+        let (fs, _control) = FaultFs::new(InMemoryFs::new());
+        Engine::open(fs, ManualClock::new(), config()).unwrap()
+    }
+
+    #[test]
+    fn h1_a_solo_produce_on_an_idle_pipelined_tier_inlines_with_zero_flusher_jobs() {
+        // H1 SOLO-INLINE (#1040 regression fix, the P1 shape): a pass that parked exactly ONE
+        // waiter, with no flight outstanding and the command channel verifiably empty, runs the
+        // LEGACY inline barrier on the actor — ZERO flusher jobs (no `FlushJob` ever crosses the
+        // job channel, held by this test), zero thread hops — and still acks DURABLY (the reply
+        // is released only after the inline barrier returned; durable == appended afterward).
+        // An always-dispatch mutant (H1 deleted) stages a FlushJob instead and leaves the
+        // waiter parked for a flusher round-trip: it fails every assertion below.
+        let mut engine = direct_engine();
+        let (flusher, req_tx, done_rx) = held_flusher();
+        let watchdog = ActorWatchdog::new(0);
+        let clock = ManualClock::new();
+        let cap_gate = ProduceCapGate::new(0);
+        let mut pipeline = Pipeline {
+            parked: VecDeque::new(),
+            in_flight: None,
+            next_seq: 0,
+            req_tx: Some(req_tx),
+            done_rx,
+            flusher: None,
+            max_dirty_bytes: 0,
+            watchdog: &watchdog,
+            clock: &clock,
+            cap_gate: &cap_gate,
+        };
+        let (reply_tx, reply_rx) = sync_channel::<ProduceOutcome>(1);
+        process_produce(
+            &mut engine,
+            &mut pipeline,
+            &append(b"h1-solo"),
+            Some(reply_tx),
+        );
+        assert_eq!(pipeline.parked.len(), 1, "the solo produce parked");
+        assert!(reply_rx.try_recv().is_err(), "not acked before the barrier");
+        // The pass ends with an EMPTY (still-connected) command channel.
+        let (_cmd_tx, cmd_rx) = sync_channel::<Command<FaultFs<InMemoryFs>, ManualClock>>(4);
+        let carry = pipeline.finish_pass(&mut engine, &cmd_rx);
+        assert!(carry.is_none(), "nothing was pulled off an empty channel");
+        // ZERO flusher jobs: no flight exists and nothing crossed the job channel...
+        assert!(
+            pipeline.in_flight.is_none(),
+            "H1 went inline: no flight was staged for a solo pass"
+        );
+        assert!(
+            matches!(flusher.req_rx.try_recv(), Err(TryRecvError::Empty)),
+            "H1 went inline: no FlushJob was dispatched"
+        );
+        // ...yet the waiter was released DURABLY by the inline barrier (I2).
+        match reply_rx.try_recv() {
+            Ok(ProduceOutcome::Appended(o)) => assert_eq!(o.get(), 0),
+            other => panic!("the solo produce must ack via the inline barrier, got {other:?}"),
+        }
+        assert!(
+            !engine.has_unsynced_records(),
+            "the inline barrier covered the window"
+        );
+        assert_eq!(
+            engine.durable_offset(),
+            engine.append_head(),
+            "durable == appended after the inline barrier"
+        );
+        assert!(pipeline.parked.is_empty(), "nothing left parked");
+    }
+
+    #[test]
+    fn h1_guard_a_solo_pass_with_a_flight_outstanding_parks_and_never_inlines() {
+        // The H1 GUARD (#1040): a solo produce whose pass ends WHILE a barrier is in flight must
+        // NOT inline (an inline barrier there would serialize the actor behind the disk — the
+        // exact coupling the pipeline removes): it parks, the pass end stages nothing (depth-1),
+        // the durable head does not move, and the waiter acks only after ITS covering
+        // completion — the flight's completion dispatches the successor that covers it.
+        let mut engine = direct_engine();
+        let (flusher, req_tx, done_rx) = held_flusher();
+        let watchdog = ActorWatchdog::new(0);
+        let clock = ManualClock::new();
+        let cap_gate = ProduceCapGate::new(0);
+        let mut pipeline = Pipeline {
+            parked: VecDeque::new(),
+            in_flight: None,
+            next_seq: 0,
+            req_tx: Some(req_tx),
+            done_rx,
+            flusher: None,
+            max_dirty_bytes: 0,
+            watchdog: &watchdog,
+            clock: &clock,
+            cap_gate: &cap_gate,
+        };
+        let (_cmd_tx, cmd_rx) = sync_channel::<Command<FaultFs<InMemoryFs>, ManualClock>>(4);
+        // A burst window [A, B] dispatches the ONE FlushJob (held, un-completed, by the test).
+        let (a_tx, a_rx) = sync_channel::<ProduceOutcome>(1);
+        let (b_tx, b_rx) = sync_channel::<ProduceOutcome>(1);
+        process_produce(&mut engine, &mut pipeline, &append(b"h1g-a"), Some(a_tx));
+        process_produce(&mut engine, &mut pipeline, &append(b"h1g-b"), Some(b_tx));
+        assert!(pipeline.finish_pass(&mut engine, &cmd_rx).is_none());
+        assert!(pipeline.in_flight.is_some(), "the burst window dispatched");
+        // A SOLO produce lands in a later pass while that flight is outstanding.
+        let (c_tx, c_rx) = sync_channel::<ProduceOutcome>(1);
+        process_produce(&mut engine, &mut pipeline, &append(b"h1g-c"), Some(c_tx));
+        assert!(pipeline.finish_pass(&mut engine, &cmd_rx).is_none());
+        // THE GUARD: no inline barrier ran (the durable head is pinned at zero — an inline
+        // `commit_batch` would have advanced it and released everything), and no second job was
+        // staged (depth-1: the job channel still holds exactly the FIRST window's job).
+        assert_eq!(
+            engine.durable_offset().get(),
+            0,
+            "no inline barrier may run behind an outstanding flight"
+        );
+        assert!(
+            c_rx.try_recv().is_err(),
+            "the solo produce parks behind the flight (never inline-acked)"
+        );
+        // Play the flusher for the FIRST window: its completion releases A and B, then
+        // dispatches the successor covering C (the merge), which releases C when IT completes.
+        flusher.complete_one_flight();
+        pipeline.poll_completions(&mut engine);
+        assert!(matches!(a_rx.try_recv(), Ok(ProduceOutcome::Appended(o)) if o.get() == 0));
+        assert!(matches!(b_rx.try_recv(), Ok(ProduceOutcome::Appended(o)) if o.get() == 1));
+        assert!(
+            c_rx.try_recv().is_err(),
+            "C acks only after ITS covering completion, not the first window's"
+        );
+        flusher.complete_one_flight();
+        pipeline.poll_completions(&mut engine);
+        assert!(matches!(c_rx.try_recv(), Ok(ProduceOutcome::Appended(o)) if o.get() == 2));
+        assert!(pipeline.parked.is_empty());
+        assert_eq!(engine.durable_offset(), engine.append_head());
+    }
+
+    #[test]
+    fn h2_the_adaptive_linger_folds_a_late_arrival_into_the_first_dispatch() {
+        // H2 ADAPTIVE FIRST-DISPATCH LINGER (#1040 regression fix, the wall-dominant-barrier
+        // shape): at a burst pass end about to dispatch the FIRST barrier of a window (>= 2
+        // waiters, nothing in flight), the actor lingers up to min(200 us, last_fsync_nanos/10)
+        // draining late arrivals into the same window. With a rig-injected 4 ms barrier cost
+        // (the F_FULLFSYNC class) and C already queued when the pass ends (deterministic: a
+        // queued command beats any timeout), C folds into the window: ONE covering barrier acks
+        // all three. An implementation without the linger dispatches [A, B] immediately and
+        // pays a SECOND barrier for C — the sync-count assertion fails.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        engine.set_last_fsync_nanos_for_test(4_000_000);
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let before = control.sync_count();
+        // Stage pass = [A, B, hold]; while held, queue C: at pass end the linger's first recv
+        // finds C already waiting and folds it in before staging the ticket.
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let a = handle.produce_async(append(b"h2-a")).unwrap();
+        let b = handle.produce_async(append(b"h2-b")).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        let c = handle.produce_async(append(b"h2-c-during-linger")).unwrap();
+        release2.send(()).unwrap();
+        for (name, rx, expected) in [("a", a, 0), ("b", b, 1), ("c", c, 2)] {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(ProduceOutcome::Appended(o)) => {
+                    assert_eq!(o.get(), expected, "{name} at its offset");
+                }
+                other => panic!("{name} must ack Appended, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            control.sync_count() - before,
+            1,
+            "ONE covering barrier for all three: the linger folded C into the first dispatch"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn h2_guard_the_linger_never_engages_behind_an_outstanding_flight() {
+        // The H2 GUARD (#1040): the linger exists ONLY for a window's FIRST dispatch. With a
+        // flight outstanding — the sustained-load steady state — a pass end must return
+        // immediately and must NOT touch the command channel (under load the in-flight barrier
+        // IS the batching window; a linger there would stall every pass by up to 200 us, the
+        // multi-connection regression this guard pins). The injected barrier cost is huge, so a
+        // mutant that lingers despite the flight would deterministically CONSUME the queued
+        // command; the guard leaves it in the channel.
+        let mut engine = direct_engine();
+        engine.set_last_fsync_nanos_for_test(400_000_000);
+        let (flusher, req_tx, done_rx) = held_flusher();
+        let watchdog = ActorWatchdog::new(0);
+        let clock = ManualClock::new();
+        let cap_gate = ProduceCapGate::new(0);
+        let mut pipeline = Pipeline {
+            parked: VecDeque::new(),
+            in_flight: None,
+            next_seq: 0,
+            req_tx: Some(req_tx),
+            done_rx,
+            flusher: None,
+            max_dirty_bytes: 0,
+            watchdog: &watchdog,
+            clock: &clock,
+            cap_gate: &cap_gate,
+        };
+        let (cmd_tx, cmd_rx) = sync_channel::<Command<FaultFs<InMemoryFs>, ManualClock>>(4);
+        // First window [A, B]: dispatches (the linger may run here — first dispatch, empty
+        // channel — costing at most its 200 us cap, then staging the job the test now holds).
+        let (a_tx, a_rx) = sync_channel::<ProduceOutcome>(1);
+        let (b_tx, b_rx) = sync_channel::<ProduceOutcome>(1);
+        process_produce(&mut engine, &mut pipeline, &append(b"h2g-a"), Some(a_tx));
+        process_produce(&mut engine, &mut pipeline, &append(b"h2g-b"), Some(b_tx));
+        assert!(pipeline.finish_pass(&mut engine, &cmd_rx).is_none());
+        assert!(pipeline.in_flight.is_some(), "the first window dispatched");
+        // Sustained staged load: a NEXT burst pass [D, E] ends while the flight is outstanding,
+        // with another command already queued behind it.
+        let (d_tx, d_rx) = sync_channel::<ProduceOutcome>(1);
+        let (e_tx, e_rx) = sync_channel::<ProduceOutcome>(1);
+        process_produce(&mut engine, &mut pipeline, &append(b"h2g-d"), Some(d_tx));
+        process_produce(&mut engine, &mut pipeline, &append(b"h2g-e"), Some(e_tx));
+        let (queued_tx, _queued_rx) = sync_channel::<ProduceOutcome>(1);
+        cmd_tx
+            .send(Command::Produce {
+                append: append(b"h2g-queued"),
+                reply: queued_tx,
+            })
+            .unwrap();
+        assert!(pipeline.finish_pass(&mut engine, &cmd_rx).is_none());
+        // THE GUARD: the queued command was NOT consumed (no linger engaged behind the flight),
+        // and no second barrier exists in any form (depth-1 job channel; durable head pinned).
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(Command::Produce { .. })),
+            "the linger must never drain the channel while a flight is outstanding"
+        );
+        assert_eq!(engine.durable_offset().get(), 0, "no barrier completed");
+        // Under sustained staged load the barrier COUNT is exactly one per window: the first
+        // window's completion covers [D, E] with the second job, and nothing else is ever
+        // dispatched for them.
+        flusher.complete_one_flight();
+        pipeline.poll_completions(&mut engine);
+        assert!(matches!(a_rx.try_recv(), Ok(ProduceOutcome::Appended(_))));
+        assert!(matches!(b_rx.try_recv(), Ok(ProduceOutcome::Appended(_))));
+        assert!(d_rx.try_recv().is_err(), "D rides the SECOND window");
+        flusher.complete_one_flight();
+        pipeline.poll_completions(&mut engine);
+        assert!(matches!(d_rx.try_recv(), Ok(ProduceOutcome::Appended(_))));
+        assert!(matches!(e_rx.try_recv(), Ok(ProduceOutcome::Appended(_))));
+        assert!(
+            matches!(flusher.req_rx.try_recv(), Err(TryRecvError::Empty)),
+            "exactly two jobs total: one per window, none from a linger"
+        );
+        assert!(pipeline.parked.is_empty());
+    }
+
+    #[test]
+    fn a_completed_barrier_records_fsync_append_and_produce_ack_histograms() {
+        // The prep-review mutation gaps (#1040): `complete_async_commit` must feed (1) the
+        // engine's fsync histogram, (2) the registry's fsync-duration and append-latency
+        // histograms, and (3) the #570 produce->ack histogram — one sample per completed barrier,
+        // exactly as the inline `commit_batch` records. Deleting any of those observes here. The
+        // window is a BURST (two produces, one covering barrier), so the sample really comes
+        // from the flusher completion — a solo produce would take H1's inline barrier, whose
+        // `commit_batch` records these histograms on its own.
+        let (handle, actor, _control) = rig();
+        let before = handle
+            .with(|e| {
+                (
+                    e.fsync_histogram().count(),
+                    e.registry().fsync_duration().count(),
+                    e.registry().append_latency().count(),
+                    e.registry().produce_ack_latency().count(),
+                )
+            })
+            .unwrap();
+        let (w1, w2) = stage_burst_pass(&handle, append(b"histograms-1"), append(b"histograms-2"));
+        for rx in [w1, w2] {
+            assert!(matches!(
+                rx.recv_timeout(std::time::Duration::from_secs(10)),
+                Ok(ProduceOutcome::Appended(_))
+            ));
+        }
+        let after = handle
+            .with(|e| {
+                (
+                    e.fsync_histogram().count(),
+                    e.registry().fsync_duration().count(),
+                    e.registry().append_latency().count(),
+                    e.registry().produce_ack_latency().count(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            after.0 - before.0,
+            1,
+            "engine fsync histogram: one sample per barrier"
+        );
+        assert_eq!(
+            after.1 - before.1,
+            1,
+            "registry fsync-duration histogram observed"
+        );
+        assert_eq!(
+            after.2 - before.2,
+            1,
+            "registry append-latency histogram observed"
+        );
+        assert_eq!(
+            after.3 - before.3,
+            1,
+            "registry produce->ack histogram observed (#570)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn the_commit_tail_reaps_retention_per_completion() {
+        // The retention-observable commit tail (#1040 mutation gap): the pipelined completion's
+        // `commit_tail_after_async_completion` must keep running the consumer-safe retention
+        // reap — with tiny segments, a byte cap, and every record acked, sealed segments are
+        // reclaimed as later produces complete. Deleting the tail call leaves the directory
+        // growing without bound and fails here. The post-ack produces ride BURST windows (real
+        // flusher completions), so the only reap path for them IS the completion tail — a solo
+        // produce would reap inside H1's inline `commit_batch` and mask the mutant.
+        let cfg = EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 256,
+                ..LogConfig::default()
+            },
+            max_retained_bytes: 512,
+            ..config()
+        };
+        let (handle, actor, _control, probe) = rig_probed_with(cfg);
+        // Fill several segments.
+        for i in 0..24u8 {
+            assert!(matches!(
+                handle.produce(append(&[i; 48])).unwrap(),
+                ProduceOutcome::Appended(_)
+            ));
+        }
+        // Ack everything so the consumer-safe floor allows reaping.
+        handle
+            .with(|e| {
+                while let Ok(Poll::Message(d)) = e.poll_now_in("") {
+                    let _ = e.ack_in("", &d.token);
+                }
+            })
+            .unwrap();
+        // More produces as burst windows: each COMPLETION's commit tail runs the reap.
+        for i in 0..4u8 {
+            let (w1, w2) = stage_burst_pass(
+                &handle,
+                append(&[0xf0 + 2 * i; 48]),
+                append(&[0xf1 + 2 * i; 48]),
+            );
+            for rx in [w1, w2] {
+                assert!(matches!(
+                    rx.recv_timeout(std::time::Duration::from_secs(10)),
+                    Ok(ProduceOutcome::Appended(_))
+                ));
+            }
+        }
+        let segments = probe
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|n| is_segment_file(n))
+            .count();
+        assert!(
+            segments <= 6,
+            "the per-completion commit tail reaps acked, over-retention segments \
+             (still {segments} segment files on disk)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn adv_review_h1_an_inline_tail_error_must_not_wedge_the_solo_waiter() {
+        // ADVERSARIAL REVIEW INTERLEAVING 1 (#1040 H1): a SOLO produce takes H1's inline
+        // `commit_batch`; the barrier (fdatasync) SUCCEEDS but the commit tail's retention reap
+        // fails (injected unlink error) with the writer still WRITABLE. The no-wedge lemma
+        // requires the covered waiter to be released (or fataled) at this pass-end reconcile
+        // point; it must never stay parked on an otherwise idle broker.
+        let cfg = EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 256,
+                ..LogConfig::default()
+            },
+            max_retained_bytes: 512,
+            ..config()
+        };
+        let (handle, actor, control, _probe) = rig_probed_with(cfg);
+        // Fill sealed segments; solo produces reap inline (floor = head: no touched groups).
+        for i in 0..24u8 {
+            assert!(matches!(
+                handle.produce(append(&[i; 48])).unwrap(),
+                ProduceOutcome::Appended(_)
+            ));
+        }
+        // Arm: the NEXT unlink fails. Then drive solo produces until one's inline commit tail
+        // attempts the failing remove.
+        control.fail_remove_on(1);
+        let base_removes = control.remove_count();
+        let mut wedged = None;
+        for i in 0..16u8 {
+            let rx = handle.produce_async(append(&[0xa0 + i; 48])).unwrap();
+            if rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err()
+            {
+                wedged = Some(rx);
+                break;
+            }
+        }
+        assert!(
+            control.remove_count() > base_removes,
+            "the armed remove was attempted (the tail error is real)"
+        );
+        if let Some(rx) = wedged {
+            // The waiter is parked with its record DURABLE (the sync preceded the reap) and the
+            // actor idle: no completion pending, no command queued. Prove the wedge is real and
+            // only a LATER unrelated command unwedges it.
+            let (_e, release) = send_blocking_job(&handle);
+            release.send(()).unwrap();
+            let late = rx.recv_timeout(std::time::Duration::from_secs(5));
+            let _ = recover(handle, actor);
+            panic!(
+                "no-wedge lemma violated: the solo waiter wedged across an idle actor after the \
+                 inline commit tail error, and was only released by a LATER unrelated command \
+                 ({late:?})"
+            );
+        }
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn adv_review_h1_unit_a_commit_batch_tail_error_leaves_the_solo_waiter_parked() {
+        // UNIT probe of the commit_inline Err arm: reap error (injected unlink failure) after a
+        // SUCCESSFUL sync, writer still writable. Inspect the Pipeline state directly.
+        let cfg = EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 256,
+                ..LogConfig::default()
+            },
+            max_retained_bytes: 512,
+            ..config()
+        };
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut engine = Engine::open(fs, ManualClock::new(), cfg).unwrap();
+        let (_flusher, req_tx, done_rx) = held_flusher();
+        let watchdog = ActorWatchdog::new(0);
+        let clock = ManualClock::new();
+        let cap_gate = ProduceCapGate::new(0);
+        let mut pipeline = Pipeline {
+            parked: VecDeque::new(),
+            in_flight: None,
+            next_seq: 0,
+            req_tx: Some(req_tx),
+            done_rx,
+            flusher: None,
+            max_dirty_bytes: 0,
+            watchdog: &watchdog,
+            clock: &clock,
+            cap_gate: &cap_gate,
+        };
+        let (_cmd_tx, cmd_rx) = sync_channel::<Command<FaultFs<InMemoryFs>, ManualClock>>(4);
+        // Fill sealed segments via solo inline passes.
+        for i in 0..24u8 {
+            let (tx, rx) = sync_channel::<ProduceOutcome>(1);
+            process_produce(&mut engine, &mut pipeline, &append(&[i; 48]), Some(tx));
+            assert!(pipeline.finish_pass(&mut engine, &cmd_rx).is_none());
+            assert!(
+                matches!(rx.try_recv(), Ok(ProduceOutcome::Appended(_))),
+                "fill {i}"
+            );
+        }
+        // Run solo passes; arm the unlink failure ONLY across the finish_pass window, so the
+        // failing remove is provably the COMMIT TAIL's reap unlink (never a roll-time unlink).
+        for i in 0..16u8 {
+            let (tx, rx) = sync_channel::<ProduceOutcome>(1);
+            process_produce(
+                &mut engine,
+                &mut pipeline,
+                &append(&[0xa0 + i; 48]),
+                Some(tx),
+            );
+            control.fail_remove_on(1);
+            let target = control.remove_count() + 1;
+            assert!(pipeline.finish_pass(&mut engine, &cmd_rx).is_none());
+            let fired = control.remove_count() >= target;
+            control.fail_remove_on(0);
+            let reply = rx.try_recv();
+            if fired {
+                assert!(
+                    reply.is_ok(),
+                    "no-wedge lemma violated: after the inline commit tail error the solo waiter \
+                     is still parked (parked={}) with the record durable (durable={} head={}) and \
+                     the writer writable={}",
+                    pipeline.parked.len(),
+                    engine.durable_offset().get(),
+                    engine.append_head().get(),
+                    engine.log_is_writable()
+                );
+                return;
+            }
+            assert!(reply.is_ok(), "pre-fire iterations release normally");
+        }
+        panic!("the armed remove never fired: rig assumption broken");
+    }
+
+    #[test]
+    fn adv_review_h2_a_shutdown_during_the_linger_is_exactly_once_after_dispatch() {
+        // ADVERSARIAL REVIEW INTERLEAVING 2 (#1040 H2 x E6): a Shutdown lands in the command
+        // channel while the pass end is inside the adaptive first-dispatch linger, and the
+        // window's covering barrier is HELD in the closed sync gate. The linger must end on the
+        // non-produce command, dispatch the window's barrier, carry the Shutdown into the next
+        // pass exactly once, quiesce (drain the gated flight), ack the parked window durably,
+        // reply Ok, and join the flusher: no lost command, no lost ack, no hang.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        // Engage the linger deterministically: a huge observed barrier cost caps it at 200us.
+        engine.set_last_fsync_nanos_for_test(4_000_000);
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        control.close_sync_gate();
+        // Stage pass = [A, B, hold]; while held, queue the Shutdown so the linger's FIRST recv
+        // finds it already waiting (a queued command beats any timeout: deterministic).
+        let (entered, release) = send_blocking_job(&handle);
+        entered.recv().unwrap();
+        let a = handle.produce_async(append(b"adv-h2-a")).unwrap();
+        let b = handle.produce_async(append(b"adv-h2-b")).unwrap();
+        let (entered2, release2) = send_blocking_job(&handle);
+        release.send(()).unwrap();
+        entered2.recv().unwrap();
+        let (sd_tx, sd_rx) = sync_channel::<Result<(), EngineError>>(1);
+        handle.tx.send(Command::Shutdown(sd_tx)).unwrap();
+        release2.send(()).unwrap();
+        // The linger ends on the Shutdown; the window's barrier dispatches INTO the closed gate.
+        control.wait_for_sync_gate_entered(1);
+        // While the flight is provably held: nothing acked (INV-1), no shutdown reply yet (the
+        // quiesce is draining the flight).
+        assert!(a.try_recv().is_err(), "A unacked while the barrier is held");
+        assert!(b.try_recv().is_err(), "B unacked while the barrier is held");
+        assert!(
+            sd_rx.try_recv().is_err(),
+            "the shutdown reply waits on the quiesce"
+        );
+        control.open_sync_gate();
+        // Exactly-once, in order, durable: A then B ack Appended; the shutdown replies Ok once.
+        assert!(matches!(
+            a.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(ProduceOutcome::Appended(o)) if o.get() == 0
+        ));
+        assert!(matches!(
+            b.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(ProduceOutcome::Appended(o)) if o.get() == 1
+        ));
+        assert!(matches!(
+            sd_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(Ok(()))
+        ));
+        let engine = actor.join().unwrap();
+        assert_eq!(engine.durable_offset(), engine.append_head());
+        assert!(!engine.has_unsynced_records());
+        drop(handle);
     }
 }

@@ -8339,6 +8339,73 @@ mod tests {
     }
 
     #[test]
+    fn a_spill_during_the_flight_never_raises_flushed_end_past_the_staged_snapshot() {
+        // The #1040 prep-review mutation gap: a record appended DURING a flight that crosses the
+        // writer's 256 KiB spill bound flushes its bytes into the FILE (raising the resident
+        // index's `valid_end`) while still un-fsynced. The late completion must raise the index's
+        // flushed read bound to the ticket's SNAPSHOTTED `staged_valid_end` — never the current
+        // `valid_end`, whose spilled tail the returned barrier did NOT cover. A mutant that reads
+        // the live `valid_end` at completion instead of the snapshot fails here.
+        let mut log = open_mem(LogConfig::default());
+        log.append(&rec(b"covered")).unwrap();
+        let (file, ticket) = log.prepare_async_sync().unwrap().unwrap();
+        let staged_end = log
+            .segment_indexes
+            .borrow()
+            .get(&log.active_id)
+            .unwrap()
+            .valid_end;
+        // The in-flight append: bigger than the spill bound, so its frame lands IN THE FILE now.
+        let spill_payload = vec![0x7a_u8; 300 * 1024];
+        log.append(&rec(&spill_payload)).unwrap();
+        let valid_end_after_spill = log
+            .segment_indexes
+            .borrow()
+            .get(&log.active_id)
+            .unwrap()
+            .valid_end;
+        assert!(
+            valid_end_after_spill > staged_end,
+            "the spilled frame extended the appended prefix during the flight"
+        );
+        // The external barrier returns; the completion applies the SNAPSHOT, not the live end.
+        file.sync_data().unwrap();
+        log.complete_async_sync(&ticket);
+        let idx_flushed_end = log
+            .segment_indexes
+            .borrow()
+            .get(&log.active_id)
+            .unwrap()
+            .flushed_end;
+        assert_eq!(
+            idx_flushed_end, staged_end,
+            "flushed_end raises to the ticket's dirty-at-sync-start snapshot ONLY (#537, INV-5)"
+        );
+        assert!(
+            idx_flushed_end < valid_end_after_spill,
+            "the spilled-but-unsynced tail stays outside the flushed read bound"
+        );
+        // Heads track the ticket target exactly: the spilled record is still unsynced.
+        assert_eq!(log.synced_offset(), Offset::new(1));
+        assert!(log.has_unsynced_records());
+        // Its own barrier then covers the spilled tail and raises the bound to the full prefix.
+        let (file2, t2) = log.prepare_async_sync().unwrap().unwrap();
+        file2.sync_data().unwrap();
+        log.complete_async_sync(&t2);
+        assert_eq!(log.synced_offset(), Offset::new(2));
+        assert_eq!(
+            log.segment_indexes
+                .borrow()
+                .get(&log.active_id)
+                .unwrap()
+                .flushed_end,
+            valid_end_after_spill,
+            "the second completion raises the bound to the spilled frame's end"
+        );
+        assert_eq!(log.unsynced_bytes(), 0);
+    }
+
+    #[test]
     fn a_completion_on_a_frozen_writer_is_a_full_no_op() {
         let mut log = open_mem(LogConfig::default());
         log.append(&rec(b"payload")).unwrap();
