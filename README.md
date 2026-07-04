@@ -123,6 +123,21 @@ What the table says, factually:
 > - C1 measures a drain of a pre-filled durable log (throughput only; per-fetch latencies are not comparable across tools and are omitted).
 > - These are single-node numbers. The **cluster** benchmarks are not yet CI-gated ([#636](https://github.com/ELares/IronBus/issues/636)) — no cluster performance claim is made here.
 
+### Matched-conditions: IronBus vs Redpanda, both inside one Linux VM
+
+The table above shows Redpanda *(in parentheses)* because it is Linux-only and ran in a VM while the other brokers ran natively — a guest `fsync` through a virtual disk is not comparable to a host `F_FULLFSYNC`. To make Redpanda rankable, a companion study puts **both brokers inside the same Linux VM** — same kernel, same ext4-on-virtio disk, same guest loopback, same real `fdatasync` (~200–300 µs) — so the VM is the identical substrate for both. Full methodology, every cell, and the harness: **[docs/benchmarks/REDPANDA_MATCHED_2026_07.md](docs/benchmarks/REDPANDA_MATCHED_2026_07.md)**.
+
+The single-connection matrix there has IronBus winning P3/1 KiB, both consume rows, and both durable-latency rows (L1 ~7×, real sub-millisecond fsync-ack vs Redpanda's tool-quantized 2 ms), tying P1, and trailing on **P2 group-commit produce** — the gap that motivated the **pipelined sync tier** ([#1040](https://github.com/ELares/IronBus/issues/1040): `fdatasync` decoupled from and overlapped with the append path, self-clocking group commit). That single-connection P2 gap is the IronBus **client**, not its broker: the session drains its parked-produce window each pass, so one connection cannot fill the pipeline — while Redpanda's Kafka client already pipelines 5-in-flight on one connection.
+
+Given each broker the client concurrency that saturates it (IronBus `bench --producers N`; Redpanda N parallel perf clients), the durable-produce result inverts:
+
+| P2 durable produce | IronBus peak | Redpanda peak | IronBus advantage |
+| --- | ---: | ---: | :-- |
+| 128 B | **1.68 M** (8 conns) | 1.51 M (4 clients) | **1.11×** |
+| 1 KiB | **657 k** (8 conns) | 300 k (4 clients) | **2.19×** |
+
+**Redpanda does not scale with more clients** (its single raft group is saturated by one 5-in-flight client — throughput peaks at 4 and drops at 8); **IronBus scales up and passes Redpanda's peak on both sizes** (1.44×/2.46× at matched 8 clients). The single-connection row remains the honest exception, addressed by the session-side per-connection reorder ring ([#1045](https://github.com/ELares/IronBus/issues/1045)) — reported here unhidden. This study's rankings are valid **relative to each other in this VM**; a real-hardware (single-node t4g, real EBS `fdatasync`) confirmation is the natural next datapoint.
+
 ### Performance targets
 
 The measured table above does not retire the SLO discipline: the provisional marquee **target** (a floor, not a measurement) remains 256-byte messages, a single consumer, durable group-commit `fdatasync`, sustaining at least 60,000 messages per second with p99 latency under 6 ms **on a Raspberry Pi 4**. Every published SLO is a measured floor (the on-device p99 minus a 20 percent margin), recorded with an HdrHistogram against a single monotonic clock, and gated against regression on a rolling baseline. See [docs/SLO.md](docs/SLO.md) and [docs/PERF_LEDGER.md](docs/PERF_LEDGER.md) for the on-device (t4g / edge) measured history, including the ~80x-NATS durable-produce and ~6–8x consume results that predate this cross-broker study.

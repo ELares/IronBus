@@ -1,0 +1,104 @@
+# Matched-conditions study, July 2026: IronBus vs Redpanda, both inside one Linux VM
+
+The July 2026 cross-broker study ([CROSS_BROKER_2026_07.md](CROSS_BROKER_2026_07.md), [#1023](https://github.com/ELares/IronBus/issues/1023)) ran on macOS and had to show **Redpanda in parentheses** — Redpanda is Linux-only, so it ran inside a VM while the other brokers ran natively, and a guest `fsync` through a virtual disk is not comparable to a host `F_FULLFSYNC`. That study said plainly: *its wins and losses prove nothing about bare-metal Redpanda.*
+
+This companion study removes that confound the only honest way: **both brokers run inside the same Linux VM**, on the same kernel, the same ext4-on-virtio disk, the same loopback, with the same real `fdatasync`. The VM is no longer a handicap on one side — it is the identical substrate for both, so the comparison is finally rankable.
+
+It also closes the loop on the optimization work this study motivated: the P2 durable-produce gap it measured drove the **pipelined sync tier** ([#1040](https://github.com/ELares/IronBus/issues/1040)), and the numbers below are IronBus **after** that landed.
+
+## 1. Environment
+
+- **Host:** Apple M4 Pro (14 cores, 48 GB), macOS 26.5.
+- **VM:** lima `vz` (virtio), Ubuntu, kernel 7.0, 8 vCPU, 8 GiB, a single ext4 filesystem on the `vda1` virtio block device. All brokers and all load clients run **inside** the VM on guest loopback — no host↔guest port-forward hop, unlike the macOS study.
+- **Durability substrate:** guest `fdatasync` through virtio, measured at ~200–300 µs (a real block-layer flush, ~15–20× cheaper than the host's ~4 ms `F_FULLFSYNC` — which is why several rows that were flat against the fsync wall on macOS become discriminating here).
+- **IronBus:** current `main` including the pipelined sync tier (#1040), built in-guest for `aarch64-unknown-linux-gnu`, release profile. Shipped defaults, lz4 compression on, realistic (compressible) payloads.
+- **Redpanda:** v26.1.12, **production mode** (`developer_mode: false` — no `--unsafe-bypass-fsync`), `--smp=6 --memory=6G` (its own ≥1 GiB/core production floor), `io_uring` reactor backend. Durable tiers set `write_caching=false` (genuinely fsync-before-ack; Redpanda's default). Every tier knob validated at each broker start.
+
+## 2. Fairness pins (the traps this study had to avoid)
+
+- **Guest `/tmp` is tmpfs (RAM).** IronBus's bench spawns its broker under `temp_dir()`, which would have silently put its "disk" log in RAM. `TMPDIR` is pinned to ext4 on the same `vda1` device Redpanda writes.
+- **Redpanda's default is fsync-before-ack.** `write_caching` is **off** by default, so Redpanda's durable rows are a genuine power-loss-safe peer — this study does not quietly compare IronBus's fsync against Redpanda's page cache.
+- **Both drivers are the systems' standard load tools.** IronBus: `ironbus bench` (its own client). Redpanda: `kafka-producer-perf-test` (the standard Kafka perf client, `acks=all`, `batch.size=65536 linger.ms=5`, up to 5 in-flight requests per connection). Both are each system's normal, saturating client shape.
+- **Serial, quiet, 3-run medians.** One broker at a time, ports asserted free between brokers, fresh data dirs per cell, pilot-run → frozen-count → 3-timed-runs → median. Redpanda gets an extra unrecorded JVM-client warm-up per cell.
+
+## 3. The matrix (single connection, medians of 3)
+
+Matched durability tiers, one client connection each. `msg/s`, higher is better; L1 is produce→ack RTT, lower is better.
+
+| Row (durability label) | Size | IronBus | Redpanda | Winner |
+| --- | --- | ---: | ---: | :-- |
+| **P1** sync-per-message produce (fsync before **every** ack) | 128 B | 3,569 | 4,207 | Redpanda 1.18× |
+| | 1 KiB | 3,580 | 3,513 | IronBus 1.02× |
+| **P2** group-commit produce (coalesced fsync-before-ack) | 128 B | 592,747 | 1,557,863 | Redpanda 2.63× |
+| | 1 KiB | 130,452 | 287,675 | Redpanda 2.21× |
+| **P3** relaxed produce (page-cache ack, NOT power-loss-safe) | 128 B | 1,709,873 | 1,872,973 | Redpanda 1.10× |
+| | 1 KiB | 843,143 | 464,588 | **IronBus 1.81×** |
+| **C1** consume / replay (single-consumer drain) | 128 B | 5,659,915 | 5,482,456 | **IronBus 1.03×** |
+| | 1 KiB | 2,164,179 | 1,183,940 | **IronBus 1.83×** |
+
+| Latency row | Size | IronBus p50 / p99 | Redpanda p50 / p99 | Winner |
+| --- | --- | --- | --- | :-- |
+| **L1** durable produce→ack RTT (single in-flight) | 128 B | **285 / 368 µs** | 2,000 / 9,000 µs | **IronBus ~7×** |
+| | 1 KiB | **282 / 342 µs** | 2,000 / 9,000 µs | **IronBus ~7×** |
+
+Single-connection reading: IronBus **wins P3/1 KiB, both C1 rows, and both L1 rows outright**, ties P1/1 KiB, and trails on P2 (both sizes) and P3/128 B. The P2 single-connection gap is not the engine — it is the client: IronBus's session drains its parked-produce window at each pass boundary, so one connection cannot keep the group-commit pipeline full. That ceiling is the subject of the P2 sweep below and its follow-up.
+
+> Redpanda's L1 reads *worse* than its own P1 (2 ms vs ~240 µs implied by 4,207 msg/s) because the L1 tool throttles to 100 msg/s and reports whole-millisecond-quantized latency; the P-rows are the fair throughput comparison, the L-rows the fair IronBus-internal latency. IronBus's L1 (real per-ack RTT via #1024 percentiles) is the honest sub-millisecond durable-ack number.
+
+## 4. P2 under client concurrency — the pipelined sync tier
+
+The single-connection P2 ceiling is the IronBus **client**, not its broker. The broker's group-commit pipeline (#1040: `fdatasync` decoupled from the append path, overlapped with the next append window, self-clocking drain) needs several in-flight connections to fill — exactly what Redpanda's Kafka client already does on one connection (5 in-flight). Giving each broker the client concurrency that saturates it:
+
+*(Redpanda run under N parallel `kafka-producer-perf-test` clients; IronBus under `bench --producers N`. Aggregate = total records ÷ full wall window. Medians of 3.)*
+
+**P2 @ 128 B (msg/s):**
+
+| Clients | IronBus | Redpanda | Ratio |
+| ---: | ---: | ---: | :-- |
+| 1 | 601,177 | 1,397,144 | Redpanda 2.32× |
+| 4 | 1,643,505 | 1,510,518 | **IronBus 1.09×** |
+| 8 | 1,683,450 | 1,170,813 | **IronBus 1.44×** |
+| **peak** | **1,683,450** (x8) | 1,510,518 (x4) | **IronBus 1.11×** |
+
+**P2 @ 1 KiB (msg/s):**
+
+| Clients | IronBus | Redpanda | Ratio |
+| ---: | ---: | ---: | :-- |
+| 1 | 132,784 | 233,558 | Redpanda 1.76× |
+| 4 | 406,501 | 299,681 | **IronBus 1.36×** |
+| 8 | 657,035 | 267,080 | **IronBus 2.46×** |
+| **peak** | **657,035** (x8) | 299,681 (x4) | **IronBus 2.19×** |
+
+Two facts, both measured at matched client concurrency (no x4-vs-x1 sleight of hand — Redpanda was run under the same 1/4/8 parallel clients):
+
+- **Redpanda does not scale with more clients.** Its single-partition raft group is already saturated by one 5-in-flight Kafka client; adding clients adds contention, so its throughput **peaks at 4 clients and drops at 8** (1.51 M → 1.17 M @128 B; 300 k → 267 k @1 KiB).
+- **IronBus scales up and passes Redpanda's peak.** The pipelined sync tier (#1040) turns concurrent durable producers into shared covering `fdatasync`s, so IronBus climbs to **1.68 M @128 B and 657 k @1 KiB** — above Redpanda's best on both sizes (1.11× and 2.19×), and 1.44×/2.46× at matched 8 clients.
+
+The single-connection row is the honest exception: there IronBus trails, because its session drains the parked-produce window at each pass boundary and one connection cannot fill the pipeline. That ceiling — not the broker engine — is the subject of the session-side per-connection reorder ring ([#1045](https://github.com/ELares/IronBus/issues/1045)). This study reports the single-connection loss and the multi-connection win side by side, unhidden.
+
+## 5. How the gaps were found and closed
+
+The single-connection matrix drove a mechanism-level source analysis of Redpanda (documented against its `dev` tree) and a ranked set of portable optimizations. What shipped this round:
+
+- **P2 (the headline gap): the pipelined sync tier** — [#1040](https://github.com/ELares/IronBus/issues/1040) (activation), building on the async-commit prep API [#1046](https://github.com/ELares/IronBus/issues/1046) and the `fdatasync`-carries-no-i_size-update preallocation change [#1047](https://github.com/ELares/IronBus/issues/1047). The multi-connection validation and the honest single-connection ceiling are on #1040.
+- **Bench tooling:** `bench --producers N` — [#1048](https://github.com/ELares/IronBus/issues/1048) — the multi-connection driver these rows required.
+
+Filed as design issues with measured evidence rather than rushed ports:
+
+- **C1 @128 B** small-record consume (a noise-band tie here — IronBus 5.66 M vs Redpanda 5.48 M, inside Redpanda's ~30 % run-to-run spread on that cell; Redpanda's zero-copy tail path can lead on other runs) — the tail-delivery / dirty-pinned-cache path, [#1041](https://github.com/ELares/IronBus/issues/1041). *Verified during analysis: the IronBus broker does not decompress on deliver — the cost is per-record tail materialization, not codec CPU.*
+- **P2 single-connection ceiling** — the session per-connection seq-reorder ring, [#1045](https://github.com/ELares/IronBus/issues/1045).
+- **SDK-side compression by default** (revisits ADR-0003 broker-side lz4) — [#1042](https://github.com/ELares/IronBus/issues/1042).
+- **Architecture-class, gated on a mixed-load bench row first:** thread-per-core scheduling isolation [#1043](https://github.com/ELares/IronBus/issues/1043); O_DIRECT + broker-owned cache [#1044](https://github.com/ELares/IronBus/issues/1044). Both were flagged by all five analysis lenses as *not* single-node row movers on a quiet box — filed for the record, not built.
+
+The consensus finding of the source analysis is worth stating plainly: Redpanda's single-node speed is **not** thread-per-core. It is (a) `fdatasync` decoupled from and overlapped with the append path, (b) zero per-record broker work (wire bytes are the stored bytes are the fetch bytes), and (c) a dirty-pinned in-memory tail cache. The first of these is what #1040 ported, and it is what moved P2.
+
+## 6. Scope, and what this study is not
+
+- One VM, single-node brokers, guest loopback. No cluster claim.
+- Redpanda's numbers here are inside a VM — but so are IronBus's, on the identical substrate, which is the entire point. These rankings are valid **relative to each other in this environment**; they are not bare-metal absolute numbers for either broker. A real-hardware confirmation datapoint (single-node t4g, real EBS `fdatasync`) is the natural next step.
+- P4 (in-memory) and L2 (in-memory RTT) are omitted: Redpanda has no true in-RAM ephemeral mode, and labeling its page cache as "memory" would be dishonest (those rows live in the macOS study, where IronBus's only honest in-memory peer was NATS).
+- Numbers are medians of 3; per-cell run-to-run spreads were ≤ ~8% except where noted. Never quote a single run.
+
+## 7. Artifacts and reproduction
+
+The guest-resident harness (`lib2.sh` / `cell2.sh` / `row2.sh` / `all2.sh` for the matrix, `p2multi.sh` and `rp_multi.sh` for the concurrency sweeps) and the raw `results.jsonl` / `p2multi.jsonl` / `rp_multi.jsonl` are archived with the study. The matrix mirrors the macOS study's protocol exactly (same tier labels, same pilot→freeze→median discipline, same fairness lint) so the two are directly comparable — the difference is only the substrate and the removal of the VM confound.
