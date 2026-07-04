@@ -20,6 +20,40 @@
 //! broker concern; the `lz4` path never references one) surfaces as the typed
 //! [`ClientError::Decompress`] with `PoisonUnresolvedDict`, never a panic, as does an unknown
 //! codec or a corrupt stream.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use ironbus_client::Client;
+//! use ironbus_client::proto::PubBody;
+//!
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut client = Client::connect("127.0.0.1:7000")?;
+//!
+//! // Produce a record (durable on the returned ack).
+//! let offset = client.produce(&PubBody {
+//!     flags: 0,
+//!     timestamp_ms: 0,
+//!     key: b"key",
+//!     headers: b"",
+//!     dedup: None,
+//!     fire_and_forget: false,
+//!     payload: b"hello",
+//! })?;
+//! assert_eq!(offset, 0);
+//!
+//! // Subscribe to a work-group, fetch the record back, and ack each delivery by its lease.
+//! client.subscribe("workers")?;
+//! let fetched = client.fetch(10)?;
+//! for message in &fetched.messages {
+//!     client.ack(message.offset, message.generation)?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! More runnable programs are in this crate's `examples/` directory (produce, consume, streaming
+//! consumer, transactions, subjects, cluster not-leader, auth).
 
 use ironbus_core::compress::{
     decompress_payload, DecompressError, NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES,
@@ -46,6 +80,16 @@ use ironbus_proto::message::{
 use ironbus_proto::message::append_connect_auth;
 #[doc(no_inline)]
 pub use ironbus_proto::message::{pack_password_material, AuthCredential, AuthMechanism};
+
+/// The wire body/enum types a caller constructs to drive the client (`PubBody` to produce, the
+/// `AckLevel` / `ConsumeTier` selectors, `PubDedup` for idempotent produce), re-exported so a caller
+/// need not depend on `ironbus-proto` directly. Mirrors the `ironbus-client-async` crate's `proto`
+/// module so the sync and async clients share one import surface. The RETURNED data types ([`Message`], [`Fetch`],
+/// [`ProduceAck`], …) are defined in this crate, not here.
+pub mod proto {
+    pub use ironbus_proto::message::{AckLevel, ConsumeTier, PubBody, PubDedup};
+}
+
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
