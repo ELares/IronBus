@@ -22,7 +22,10 @@ for _, m := range res.Messages {
   gap-marker / default ack level), Bearer + Password auth with redacting
   `String()`/`GoString()` on the credential.
 - Produce: awaited (level 1), fire-and-forget (level 0), level-2 wire bits,
-  opt-in dedup (duplicate returns the original offset).
+  opt-in dedup (duplicate returns the original offset), and pipelined
+  `ProduceWindow` (one coalesced write of N `Pub` frames + FIFO ack drain, so a
+  single connection shares one group-commit `fdatasync` across the window — the
+  durable-throughput lever the awaited path can't reach).
 - Tier-W consume: `Subscribe` + batch `Fetch` (tag 23) on the default stream,
   `Ack`/`Nack`/`Term`/`Progress` with offset+generation fencing,
   `CumulativeAck` for broadcast groups, DeadLetter / Truncated / GapMarker
@@ -81,6 +84,8 @@ Each example runs against a live broker
 (`ironbus serve --data-dir /tmp/ironbus-demo`):
 
 - `examples/produce`: awaited, fire-and-forget, and dedup produces.
+- `examples/produce_window`: pipelined windowed produce (one group-commit fsync
+  per window) with a measured throughput print.
 - `examples/consume_ack_group`: the work-group fetch/ack loop.
 - `examples/streams`: named-stream declare / query / produce / consume.
 - `examples/subjects_wildcard`: wildcard subject binding + subject pub/sub.

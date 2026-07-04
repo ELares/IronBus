@@ -105,6 +105,60 @@ func fetchAll(t *testing.T, ctx context.Context, c *Client, n int) []Delivery {
 
 // TestLiveProduceConsumeAckLevels exercises the produce/consume/ack loop
 // across ack levels 0/1/2 plus the dedup duplicate path.
+// TestLiveProduceWindow drives the pipelined windowed produce against a real
+// broker: a window of durable records returns FIFO acks with contiguous offsets,
+// and every acked record is readable back in order.
+func TestLiveProduceWindow(t *testing.T) {
+	addr := startBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	producer := liveConnect(t, ctx, addr)
+	const n = 16
+	msgs := make([]*Message, n)
+	for i := range msgs {
+		msgs[i] = &Message{Payload: []byte(fmt.Sprintf("win-%d", i))}
+	}
+	acks, err := producer.ProduceWindow(ctx, msgs)
+	if err != nil {
+		t.Fatalf("produce window: %v", err)
+	}
+	if len(acks) != n {
+		t.Fatalf("got %d acks, want %d", len(acks), n)
+	}
+	for i := 1; i < n; i++ {
+		if acks[i].Offset != acks[i-1].Offset+1 {
+			t.Fatalf("ack %d offset = %d, want %d (contiguous FIFO)", i, acks[i].Offset, acks[i-1].Offset+1)
+		}
+	}
+
+	// Read the window back and confirm each payload landed durably, in order.
+	consumer := liveConnect(t, ctx, addr)
+	if err := consumer.Subscribe(ctx, "win-verify"); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	got := 0
+	for got < n {
+		res, err := consumer.Fetch(ctx, FetchOptions{MaxRecords: n, Expires: 2 * time.Second})
+		if err != nil {
+			t.Fatalf("fetch: %v", err)
+		}
+		if len(res.Messages) == 0 {
+			t.Fatalf("drained early: got %d of %d", got, n)
+		}
+		for _, m := range res.Messages {
+			want := fmt.Sprintf("win-%d", got)
+			if string(m.Payload) != want {
+				t.Fatalf("record %d payload = %q, want %q", got, m.Payload, want)
+			}
+			if _, err := consumer.Ack(ctx, m.Offset, m.Generation); err != nil {
+				t.Fatalf("ack: %v", err)
+			}
+			got++
+		}
+	}
+}
+
 func TestLiveProduceConsumeAckLevels(t *testing.T) {
 	addr := startBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
