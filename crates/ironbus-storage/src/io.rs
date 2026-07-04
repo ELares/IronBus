@@ -1554,6 +1554,553 @@ mod std_file_tests {
     }
 }
 
+// ============================================================================
+// Direct-write (O_DIRECT) backend — the SAFE T1 durable io-mode (perf/iomode-direct).
+//
+// `DirectFile` is the `direct` io-mode's [`RandomAccessFile`]: it writes record bytes
+// straight to the device with `O_DIRECT` (no page cache) over segments whose extents are
+// pre-formatted `written` at create time, and KEEPS the durability barrier (`fdatasync` /
+// `fsync`) exactly as buffered mode does. The speed comes from making that barrier
+// metadata-free (written extents => no `unwritten->written` conversion, no `i_size` update)
+// and page-cache-free (O_DIRECT), NOT from dropping it, so ack-implies-durable (I2) holds
+// identically to buffered: an ack releases only after the covering write's `pwrite` returned
+// AND the barrier returned. See `docs`/the io-mode spec for the full durability argument.
+//
+// The whole O_DIRECT complexity lives HERE, behind the `RandomAccessFile` seam, so the
+// buffered [`StdFile`] path is byte-and-behavior identical to today. The on-disk byte IMAGE
+// a `DirectFile` produces is identical to [`StdFile`]'s (same header/frames, and the tail
+// past the write frontier is zeros in both — pre-format zeros here, preallocated-hole zeros
+// there), so recovery, the offline reader, and the conformance byte-identity gate are
+// mode-agnostic (the mode is an IO strategy, not a format).
+//
+// `DirectFile` is `#[cfg(unix)]` (not linux-only) SO ITS RMW/ALIGNMENT/PRE-FORMAT LOGIC IS
+// EXERCISED BY THE UNIX TEST SUITE (macOS CI included): those bytes are platform-independent.
+// The `O_DIRECT` OPEN FLAG — the only genuinely-linux-specific piece — is applied only on
+// Linux (`open_direct_write_fd`); on other unix the fds are ordinary (still block-aligned IO,
+// still a real barrier via `F_FULLFSYNC`), which is a faithful model of the byte path. In
+// PRODUCTION `direct` is selected only where the substrate probe confirms it (Linux); the
+// resolver fails closed to `buffered` on non-Linux (see `substrate.rs`), so a `DirectFile` is
+// constructed on macOS ONLY by a test that asks for one directly.
+// ============================================================================
+
+/// The `O_DIRECT` alignment IronBus uses for every direct-mode write: buffer address, file
+/// offset, and length are all multiples of this. 4096 is a superset of every common device's
+/// logical block size (512 and 4096 both divide it), so a single fixed alignment satisfies
+/// 512-sector and 4K-native devices alike without probing `BLKSSZGET`. A device with a larger
+/// logical block (rare) would reject the `O_DIRECT` write with `EINVAL`, which surfaces as a
+/// fatal writer error (fail-closed) rather than a silent downgrade.
+///
+/// `cfg(unix)`: only the `O_DIRECT` `DirectFile` path consumes it; on non-unix (buffered-only) it
+/// would be dead code.
+#[cfg(unix)]
+pub(crate) const DIO_ALIGN: usize = 4096;
+
+/// The pre-format zero-write chunk (a multiple of [`DIO_ALIGN`]): the whole segment is made
+/// `written` at create by streaming zeros through one reusable aligned buffer of this size, so
+/// pre-format costs O(1) heap regardless of the segment size (~213ms/64MiB at ~300MB/s).
+#[cfg(unix)]
+const PREFORMAT_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Rounds `x` down to the nearest multiple of `align` (a power of two).
+#[cfg(unix)]
+#[inline]
+fn align_down(x: u64, align: usize) -> u64 {
+    let mask = align as u64 - 1;
+    x & !mask
+}
+
+/// Rounds `x` up to the nearest multiple of `align` (a power of two), saturating at [`u64::MAX`]
+/// (an offset that near the top of the address space is never reached by a bounded segment).
+#[cfg(unix)]
+#[inline]
+fn align_up(x: u64, align: usize) -> u64 {
+    let mask = align as u64 - 1;
+    x.saturating_add(mask) & !mask
+}
+
+/// A heap buffer whose start address is [`DIO_ALIGN`]-aligned and whose length is a multiple of
+/// [`DIO_ALIGN`], the buffer `O_DIRECT` requires. Allocated zeroed (so the tail padding of a
+/// sub-block write, and the whole pre-format image, is zeros with no extra fill). It is only ever a
+/// method-local temporary (never stored in a shared struct, never moved across a thread), so it
+/// needs no `Send`/`Sync` impl.
+#[cfg(unix)]
+struct AlignedBuf {
+    ptr: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+#[cfg(unix)]
+impl AlignedBuf {
+    /// Allocates a zeroed, [`DIO_ALIGN`]-aligned buffer of exactly `len` bytes, where `len` must
+    /// be a nonzero multiple of [`DIO_ALIGN`].
+    fn zeroed(len: usize) -> io::Result<AlignedBuf> {
+        debug_assert!(
+            len > 0 && len % DIO_ALIGN == 0,
+            "aligned buffer length must be a nonzero multiple of the block size"
+        );
+        let layout = std::alloc::Layout::from_size_align(len, DIO_ALIGN)
+            .map_err(|_| invalid_input("aligned buffer layout out of range"))?;
+        // SAFETY: `layout` has a nonzero size (guaranteed by the debug assert / caller contract),
+        // which is the sole precondition of `alloc_zeroed`. The returned pointer is checked for
+        // null below and is deallocated with the identical `layout` in `Drop`.
+        #[allow(unsafe_code)]
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = std::ptr::NonNull::new(raw).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "aligned allocation failed")
+        })?;
+        Ok(AlignedBuf { ptr, layout })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` points to `layout.size()` initialized bytes owned by `self` (allocated
+        // zeroed, only ever written through `as_mut_slice`), and the returned slice borrows `self`,
+        // so no aliasing `&mut` can exist for its lifetime.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size())
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `self` is borrowed mutably, so this is the unique reference to the `layout.size()`
+        // owned, initialized bytes at `ptr` for the returned slice's lifetime.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size())
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from `alloc_zeroed` with exactly `self.layout` and has not been freed
+        // elsewhere (unique ownership), so freeing it with the same layout is sound.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::alloc::dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+/// The cached image of the current partial *frontier block* (the block that holds the last
+/// written byte), so a frontier append can preserve that block's committed prefix WITHOUT a
+/// device read. It is a strict cache: whenever it is present it equals what a device read of
+/// `[base, base+DIO_ALIGN)` would return, and `None` simply forces the read — so the cache can
+/// never cause an incorrect write, only save a read on the hot append path.
+#[cfg(unix)]
+struct FrontierBlock {
+    base: u64,
+    bytes: Box<[u8]>,
+}
+
+/// The mutable write-side state of a [`DirectFile`], guarded by a `Mutex` because
+/// [`RandomAccessFile`] writes take `&self`. There is a single logical writer (the append
+/// actor), so the lock is uncontended; the off-actor durability barrier (`sync_data`, #1040)
+/// touches NEITHER field, so it never contends here.
+#[cfg(unix)]
+struct DirectWriteState {
+    /// One past the highest byte the CALLER has written (the log's header/records/footer), i.e.
+    /// the RMW high-water. A block entirely at or above `data_end` is known-fresh (pre-format
+    /// zeros) and needs no read-back on a re-write; a block below it holds committed bytes and is
+    /// read (unless it is the cached frontier block). Pre-format zeros do NOT advance it — they
+    /// are the background, not caller data — which is what keeps a fresh segment's appends
+    /// read-free. Initialized to the file length on `open` (conservative: every existing byte is
+    /// treated as committed) and to 0 on `create_new`.
+    data_end: u64,
+    /// The cached frontier block (see [`FrontierBlock`]).
+    tail: Option<FrontierBlock>,
+}
+
+/// A production [`RandomAccessFile`] that writes with ``O_DIRECT`` (Linux) and keeps the durability
+/// barrier — the `direct` io-mode's file (the T1 tier). See the module section header above.
+#[cfg(unix)]
+pub struct DirectFile {
+    /// The write fd: opened ``O_DIRECT`` on Linux (all writes block-aligned, cache-bypassing), plain
+    /// on other unix. Every append and the pre-format go through it; it is also the fd the kept
+    /// barrier (`sync_data`/`sync_all`) flushes.
+    write: std::fs::File,
+    /// The read fd: always buffered, for arbitrary unaligned `pread`s (reads are not the
+    /// bottleneck, and an `O_DIRECT` read would force the caller's buffers to be aligned). On Linux
+    /// an `O_DIRECT` write invalidates the overlapping page-cache pages, so a subsequent buffered
+    /// read re-reads fresh from the device — coherent as long as readers use `pread` (never mmap),
+    /// which IronBus does.
+    read: std::fs::File,
+    state: Mutex<DirectWriteState>,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for DirectFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectFile").finish_non_exhaustive()
+    }
+}
+
+/// Opens the write fd for a [`DirectFile`], adding ``O_DIRECT`` on Linux (the only platform where it
+/// is a cache-bypass; on other unix the flag is omitted and the fds are ordinary, which the tests
+/// exercise). `create_new` selects `O_EXCL` create vs open-existing.
+#[cfg(unix)]
+fn open_direct_write_fd(path: &std::path::Path, create_new: bool) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true);
+    if create_new {
+        opts.create_new(true);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_DIRECT: bytes go straight to the device, bypassing the page cache. Its per-arch value
+        // is provided by `libc` (0o40000 on x86_64, 0o200000 on aarch64, ...).
+        opts.custom_flags(libc::O_DIRECT);
+    }
+    opts.open(path)
+}
+
+#[cfg(unix)]
+impl DirectFile {
+    /// Opens an existing file in direct mode (both the `O_DIRECT` write fd and the buffered read fd).
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error.
+    pub fn open(path: &std::path::Path) -> io::Result<DirectFile> {
+        let write = open_direct_write_fd(path, false)?;
+        let read = std::fs::OpenOptions::new().read(true).open(path)?;
+        let data_end = write.metadata()?.len();
+        Ok(DirectFile {
+            write,
+            read,
+            state: Mutex::new(DirectWriteState {
+                data_end,
+                tail: None,
+            }),
+        })
+    }
+
+    /// Creates a new file (`O_EXCL`) in direct mode, failing with
+    /// [`io::ErrorKind::AlreadyExists`] if it exists.
+    ///
+    /// # Errors
+    /// Returns `AlreadyExists` if the path exists, or propagates the underlying IO error.
+    pub fn create_new(path: &std::path::Path) -> io::Result<DirectFile> {
+        let write = open_direct_write_fd(path, true)?;
+        let read = std::fs::OpenOptions::new().read(true).open(path)?;
+        Ok(DirectFile {
+            write,
+            read,
+            state: Mutex::new(DirectWriteState {
+                data_end: 0,
+                tail: None,
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DirectWriteState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Writes `buf` to `file` at `offset` with positioned writes, looping until every byte lands.
+/// For an `O_DIRECT` fd the caller guarantees `buf`'s address, `offset`, and `buf.len()` are all
+/// block-aligned; a partial write returned by the kernel is itself block-aligned, so the
+/// continuation stays aligned.
+#[cfg(unix)]
+fn pwrite_all(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buf.is_empty() {
+        match file.write_at(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "direct write returned zero bytes",
+                ))
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Reads up to a full block of `file` into `block` at `offset` via the buffered read fd,
+/// zero-filling any bytes past the current end of file (a block that straddles EOF reads back
+/// as its bytes plus zeros, exactly the RMW background a partial trailing block needs).
+#[cfg(unix)]
+fn read_block_background(file: &std::fs::File, block: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0usize;
+    while filled < block.len() {
+        match file.read_at(&mut block[filled..], offset + filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    for b in &mut block[filled..] {
+        *b = 0;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+impl RandomAccessFile for DirectFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        // Always the BUFFERED read fd: reads may be unaligned, and O_DIRECT invalidates the
+        // overlapping page-cache pages on write, so this re-reads fresh from the device.
+        self.read.read_at(buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let bs = DIO_ALIGN;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| invalid_input("write extends past the addressable range"))?;
+        let blo = align_down(offset, bs);
+        let bhi = align_up(end, bs);
+        let span =
+            usize::try_from(bhi - blo).map_err(|_| invalid_input("aligned span out of range"))?;
+        let mut chunk = AlignedBuf::zeroed(span)?;
+        let cbuf = chunk.as_mut_slice();
+
+        let mut guard = self.lock();
+        let st = &mut *guard;
+
+        // Materialize the correct on-device background for every block that this write does not
+        // FULLY cover (a fully-covered block is overwritten wholesale, so its prior content is
+        // irrelevant). A partially-covered block gets its content from, in order: the cached
+        // frontier block (no read); known-fresh zeros if it sits at or above `data_end`; else a
+        // device read (a header re-write, a checkpoint's other slot, or a resumed segment's tail).
+        let bs_u64 = bs as u64;
+        let mut b = blo;
+        while b < bhi {
+            let bo = usize::try_from(b - blo).expect("block offset fits (span already fits usize)");
+            let covers_lo = offset <= b;
+            let covers_hi = end >= b + bs_u64;
+            if !(covers_lo && covers_hi) {
+                let block = &mut cbuf[bo..bo + bs];
+                let cache_hit = st.tail.as_ref().is_some_and(|t| t.base == b);
+                if cache_hit {
+                    block.copy_from_slice(&st.tail.as_ref().expect("cache_hit implies Some").bytes);
+                } else if b >= st.data_end {
+                    // Known-fresh (pre-format zeros): `AlignedBuf` already zeroed this block.
+                } else {
+                    read_block_background(&self.read, block, b)?;
+                }
+            }
+            b += bs_u64;
+        }
+
+        // Overlay the caller's bytes.
+        let ov = usize::try_from(offset - blo).expect("overlay offset fits");
+        cbuf[ov..ov + buf.len()].copy_from_slice(buf);
+
+        // One O_DIRECT write of the whole aligned span (so a group-commit batch is one write, and
+        // the barrier stays a real group commit).
+        debug_assert_eq!(blo % bs_u64, 0, "aligned write offset");
+        debug_assert_eq!(cbuf.len() % bs, 0, "aligned write length");
+        debug_assert_eq!(
+            cbuf.as_ptr() as usize % bs,
+            0,
+            "aligned write buffer address"
+        );
+        pwrite_all(&self.write, cbuf, blo)?;
+
+        // Advance the high-water and refresh the frontier-block cache. Capturing the frontier
+        // block from the just-written image keeps the cache device-consistent with no extra read.
+        st.data_end = st.data_end.max(end);
+        if st.data_end % bs_u64 == 0 {
+            // A block-aligned frontier: the next append starts a fresh block, nothing partial to
+            // cache.
+            st.tail = None;
+        } else {
+            let fbase = align_down(st.data_end, bs);
+            if fbase >= blo && fbase < bhi {
+                let fo = usize::try_from(fbase - blo).expect("frontier offset within span");
+                let mut bytes = vec![0u8; bs].into_boxed_slice();
+                bytes.copy_from_slice(&cbuf[fo..fo + bs]);
+                st.tail = Some(FrontierBlock { base: fbase, bytes });
+            }
+            // else: this write did not touch the frontier block (a pure back-patch below it), so
+            // the existing cache is still valid — leave it.
+        }
+        Ok(())
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        // The KEPT durability barrier (T1). On a pre-formatted written extent with O_DIRECT data
+        // already on the device this is metadata-free — its cost is exactly the substrate's true
+        // flush cost — but it is a real barrier and is what makes an ack durable (I2), identical to
+        // buffered mode. Off-actor via the #1040 flusher; touches no write-side state.
+        self.write.sync_data()
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.write.sync_all()
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.write.metadata()?.len())
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.write.set_len(len)?;
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        // A shrink (the seal's truncate-to-footer-end) drops any high-water and cached block past
+        // the new end; a grow zero-fills sparsely (never used on the segment path, which
+        // pre-formats instead) and leaves the caller high-water alone.
+        if len < st.data_end {
+            st.data_end = len;
+        }
+        if st
+            .tail
+            .as_ref()
+            .is_some_and(|t| t.base + DIO_ALIGN as u64 > len)
+        {
+            st.tail = None;
+        }
+        Ok(())
+    }
+
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        // The WRITTEN-EXTENT PRE-FORMAT (direct mode's replacement for the buffered keep-size
+        // fallocate, spec §4): make every extent of the segment `written` and journal-durable ONCE
+        // at create, so every steady-state append is an overwrite of a written extent — no
+        // `unwritten->written` conversion, no `i_size` update, no per-op metadata journaling. After
+        // this the kept barrier is metadata-free. `len == 0` is a no-op.
+        //
+        // PRECONDITION: this zero-writes `[0, len)`, so it MUST run on a freshly-created, still-empty
+        // segment — exactly where the log calls it (`create_new` then `preallocate`, before the
+        // header write). A resumed segment is `SegmentWriter::resume`d and NEVER re-preallocated, so
+        // this never zeroes committed data. The debug assert pins that invariant against future
+        // misuse (a release build still zeroes from 0, correct for the only real call path).
+        if len == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(
+            self.lock().data_end,
+            0,
+            "pre-format (preallocate) must run on a freshly-created empty segment, before any write"
+        );
+        let bs = DIO_ALIGN;
+        let hi = align_up(len, bs);
+        // 1) Reserve the blocks (Linux). Best-effort: an fs without allocation support degrades to
+        //    the zero-write below allocating on demand.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let off = libc::off_t::try_from(hi)
+                .map_err(|_| invalid_input("preallocate length out of range"))?;
+            // SAFETY: `fallocate` is a libc syscall wrapper; `self.write` owns a valid, open,
+            // writable fd that outlives the call; the mode flag and two `off_t` args are passed by
+            // value and it touches only the kernel block map for that fd.
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                libc::fallocate(self.write.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, off)
+            };
+            if rc != 0 {
+                let err = io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EOPNOTSUPP | libc::ENOSYS) => {}
+                    _ => return Err(err),
+                }
+            }
+        }
+        // 2) Sequentially O_DIRECT-write zeros over the whole logical length, one reusable aligned
+        //    chunk at a time, so every extent becomes `written`. `hi` and `PREFORMAT_CHUNK_BYTES`
+        //    are both block multiples, so their min is a block-aligned buffer length (>= one block).
+        let cap = (PREFORMAT_CHUNK_BYTES as u64).min(hi);
+        let chunk_len = usize::try_from(cap).unwrap_or(PREFORMAT_CHUNK_BYTES);
+        let zeros = AlignedBuf::zeroed(chunk_len)?;
+        let mut off = 0u64;
+        while off < hi {
+            let n =
+                usize::try_from((hi - off).min(chunk_len as u64)).expect("chunk length fits usize");
+            pwrite_all(&self.write, &zeros.as_slice()[..n], off)?;
+            off += n as u64;
+        }
+        // 3) Trim the block-rounded tail back to the exact logical length so the file length is
+        //    byte-identical to the buffered preallocation (`set_len` up to `len`); the trimmed tail
+        //    was zeros anyway.
+        if self.write.metadata()?.len() > len {
+            self.write.set_len(len)?;
+        }
+        // 4) One barrier makes the extent map + length durable (the metadata domain, closed once).
+        self.write.sync_all()?;
+        // The pre-format zeros are BACKGROUND, not caller data: the RMW high-water stays where it
+        // was (0 for a fresh create), which is what keeps the following appends read-free.
+        Ok(())
+    }
+}
+
+/// The [`Filesystem`](crate::fs::Filesystem)-selected production file: either the buffered
+/// [`StdFile`] (the default, byte-and-behavior identical to today) or the [`DirectFile`] `O_DIRECT`
+/// backend, chosen once by the resolved io-mode when the filesystem is built. Dispatch is a plain
+/// enum (no `Box<dyn>`) so the file stays `Clone`-free-`Send + Sync` and every method is a direct
+/// delegation — the buffered arm adds nothing but a match to today's path.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum MaybeDirectFile {
+    /// The default buffered file. Delegates VERBATIM to [`StdFile`], so buffered mode is unchanged.
+    Buffered(StdFile),
+    /// The `O_DIRECT` direct-write file (the T1 tier).
+    Direct(DirectFile),
+}
+
+#[cfg(unix)]
+impl RandomAccessFile for MaybeDirectFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.read_at(buf, offset),
+            MaybeDirectFile::Direct(f) => f.read_at(buf, offset),
+        }
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.write_all_at(buf, offset),
+            MaybeDirectFile::Direct(f) => f.write_all_at(buf, offset),
+        }
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.sync_data(),
+            MaybeDirectFile::Direct(f) => f.sync_data(),
+        }
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.sync_all(),
+            MaybeDirectFile::Direct(f) => f.sync_all(),
+        }
+    }
+    fn len(&self) -> io::Result<u64> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.len(),
+            MaybeDirectFile::Direct(f) => f.len(),
+        }
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.set_len(len),
+            MaybeDirectFile::Direct(f) => f.set_len(len),
+        }
+    }
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.preallocate(len),
+            MaybeDirectFile::Direct(f) => f.preallocate(len),
+        }
+    }
+}
+
 /// Sharing a file behind a reference forwards to the inner implementation, so the
 /// single writer and the lock-free readers can hold the same file.
 impl<F: RandomAccessFile + ?Sized> RandomAccessFile for &F {
@@ -1602,5 +2149,264 @@ impl<F: RandomAccessFile + ?Sized> RandomAccessFile for std::sync::Arc<F> {
     }
     fn preallocate(&self, len: u64) -> io::Result<()> {
         (**self).preallocate(len)
+    }
+}
+
+// The direct-write backend's byte-level correctness (alignment, the partial-tail read-modify-write,
+// pre-format, and byte-identity with the buffered `StdFile`) is platform-independent, so these run
+// on EVERY unix target (macOS CI included), not just Linux. On non-Linux the `DirectFile` fds are
+// ordinary (no O_DIRECT), which is a faithful model of the exact byte path; the Linux-only property
+// (O_DIRECT truly bypasses the page cache) plus the physical-device durability are validated by the
+// separate real-fs / t4g step.
+#[cfg(all(test, unix))]
+mod direct_file_tests {
+    use super::*;
+
+    const BS: usize = DIO_ALIGN;
+
+    fn dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    /// Reads the whole file (through the buffered read fd) into a `Vec` for oracle comparison.
+    fn read_all(f: &DirectFile, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        let mut filled = 0;
+        while filled < len {
+            match f.read_at(&mut v[filled..], filled as u64).unwrap() {
+                0 => break,
+                k => filled += k,
+            }
+        }
+        v.truncate(filled);
+        v
+    }
+
+    #[test]
+    fn direct_write_read_roundtrip_and_persists_across_reopen() {
+        let d = dir();
+        let path = d.path().join("seg");
+        {
+            let f = DirectFile::create_new(&path).unwrap();
+            f.write_all_at(b"hello world", 0).unwrap();
+            f.sync_all().unwrap();
+            let mut buf = [0u8; 11];
+            f.read_exact_at(&mut buf, 0).unwrap();
+            assert_eq!(&buf, b"hello world");
+        }
+        // Reopen (models a process restart): the synced bytes survive.
+        let g = DirectFile::open(&path).unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(g.read_at(&mut buf, 6).unwrap(), 5);
+        assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn direct_matches_a_byte_oracle_across_alignment_edge_cases() {
+        // The load-bearing RMW test: an arbitrary write sequence covering header@0, sub-block
+        // frontier appends, an append that SPANS a block boundary, a multi-block append with a
+        // sub-block tail, and a back-patch (rewriting offset 0 after records exist) must leave the
+        // file byte-identical to a plain in-memory oracle for EVERY case.
+        let d = dir();
+        let f = DirectFile::create_new(&d.path().join("seg")).unwrap();
+        let mut oracle: Vec<u8> = Vec::new();
+        let writes: Vec<(u64, Vec<u8>)> = vec![
+            (0, vec![0xA1; 64]),                               // header@0 (sub-block)
+            (64, vec![0xB2; 100]),                             // frontier append within block 0
+            (164, vec![0xC3; (BS - 164) + 10]),                // append SPANS the block boundary
+            (u64::try_from(BS + 10).unwrap(), vec![0xD4; BS]), // a full-block-sized append mid-block
+            (u64::try_from(2 * BS + 10).unwrap(), vec![0xE5; 3 * BS + 7]), // multi-block, sub-block tail
+            (0, vec![0xFF; 64]), // back-patch: rewrite the header
+        ];
+        for (off, bytes) in &writes {
+            let start = usize::try_from(*off).unwrap();
+            let end = start + bytes.len();
+            if oracle.len() < end {
+                oracle.resize(end, 0);
+            }
+            oracle[start..end].copy_from_slice(bytes);
+            f.write_all_at(bytes, *off).unwrap();
+            f.sync_data().unwrap();
+            assert_eq!(
+                read_all(&f, oracle.len()),
+                oracle,
+                "mismatch after write at {off}"
+            );
+        }
+        f.sync_all().unwrap();
+        drop(f);
+        let g = DirectFile::open(&d.path().join("seg")).unwrap();
+        assert_eq!(read_all(&g, oracle.len()), oracle, "mismatch after reopen");
+    }
+
+    #[test]
+    fn direct_is_byte_identical_to_buffered_over_the_same_record_stream() {
+        // The byte-identity guarantee (spec §7): the SAME write sequence through the buffered
+        // `StdFile` and the `DirectFile` yields the same durable byte prefix. (The direct file may be
+        // block-padded LONGER; the data prefix `[0, logical_end)` is identical.)
+        let d = dir();
+        let sf = StdFile::create(&d.path().join("buffered")).unwrap();
+        let df = DirectFile::create_new(&d.path().join("direct")).unwrap();
+        let header = vec![0x5A; 64];
+        sf.write_all_at(&header, 0).unwrap();
+        df.write_all_at(&header, 0).unwrap();
+        let mut off = 64u64;
+        for i in 0..200u32 {
+            let len = 1 + (i as usize * 37) % 900; // spans sub-block, block, multi-block writes
+            let rec = vec![u8::try_from(i % 251).unwrap(); len];
+            sf.write_all_at(&rec, off).unwrap();
+            df.write_all_at(&rec, off).unwrap();
+            off += len as u64;
+        }
+        sf.sync_all().unwrap();
+        df.sync_all().unwrap();
+        let end = usize::try_from(off).unwrap();
+        let mut a = vec![0u8; end];
+        let mut b = vec![0u8; end];
+        sf.read_exact_at(&mut a, 0).unwrap();
+        df.read_exact_at(&mut b, 0).unwrap();
+        assert_eq!(
+            a, b,
+            "direct-mode durable image differs from buffered over [0, {end})"
+        );
+    }
+
+    #[test]
+    fn direct_partial_tail_rmw_preserves_the_committed_prefix_byte_for_byte() {
+        // The crux of the §3 crash-consistency proof: re-writing a partial frontier block to append
+        // more re-writes the already-committed prefix bytes BYTE-IDENTICALLY (and the padding stays
+        // zero), so a torn re-write can only ever damage the newly-appended, not-yet-acked bytes —
+        // never a committed byte. Assert the re-write leaves the committed prefix untouched.
+        let d = dir();
+        let f = DirectFile::create_new(&d.path().join("seg")).unwrap();
+        f.write_all_at(b"HDR", 0).unwrap();
+        f.write_all_at(b"AAAAAAAA", 3).unwrap();
+        f.sync_data().unwrap();
+        let committed_end = 11usize;
+        let mut before = vec![0u8; committed_end];
+        f.read_exact_at(&mut before, 0).unwrap();
+        f.write_all_at(b"BBBB", committed_end as u64).unwrap(); // a tail-block RMW
+        let mut after = vec![0u8; committed_end];
+        f.read_exact_at(&mut after, 0).unwrap();
+        assert_eq!(
+            before, after,
+            "the tail-block RMW must not disturb the committed prefix"
+        );
+        let mut all = vec![0u8; 15];
+        f.read_exact_at(&mut all, 0).unwrap();
+        assert_eq!(&all, b"HDRAAAAAAAABBBB");
+    }
+
+    #[test]
+    fn direct_preformat_makes_written_zeros_and_composes_with_the_zero_tail_rule() {
+        // Pre-format (`preallocate`) writes zeros over the whole segment (making the extents
+        // `written`) and trims the length back to exactly the requested size — byte-identical to the
+        // buffered preallocation's zero tail. After a header + records, the tail past the frontier is
+        // all zeros and `last_nonzero_end` bounds recovery exactly at the last written byte.
+        let d = dir();
+        let f = DirectFile::create_new(&d.path().join("seg")).unwrap();
+        let seg_bytes = 64 * 1024u64; // block-aligned
+        f.preallocate(seg_bytes).unwrap();
+        assert_eq!(
+            f.len().unwrap(),
+            seg_bytes,
+            "pre-format trims to the exact logical length"
+        );
+        assert_eq!(
+            last_nonzero_end(&f, 0, seg_bytes).unwrap(),
+            0,
+            "a pre-formatted segment is all zeros"
+        );
+        f.write_all_at(b"HEADERHEADER", 0).unwrap();
+        f.write_all_at(&[0x11; 300], 12).unwrap();
+        f.sync_data().unwrap();
+        let frontier = 12 + 300u64;
+        assert_eq!(
+            last_nonzero_end(&f, 0, seg_bytes).unwrap(),
+            frontier,
+            "the zero tail past the frontier bounds recovery at the last written byte"
+        );
+        assert_eq!(
+            f.len().unwrap(),
+            seg_bytes,
+            "appends land inside the pre-format, no i_size churn"
+        );
+    }
+
+    #[test]
+    fn direct_seal_shape_truncates_to_the_exact_footer_end() {
+        // The seal path (footer `write_all_at` at the frontier, then `set_len` down + `sync_all`)
+        // must leave the file at EXACTLY the footer end — byte-identical to a buffered seal, so
+        // footer-at-file-end discovery still works — even though the O_DIRECT footer write padded to
+        // a block first.
+        let d = dir();
+        let f = DirectFile::create_new(&d.path().join("seg")).unwrap();
+        f.preallocate(64 * 1024).unwrap();
+        f.write_all_at(b"HEADER", 0).unwrap();
+        f.write_all_at(&[0x22; 500], 6).unwrap();
+        let write_pos = 506u64;
+        f.write_all_at(&[0x33; 32], write_pos).unwrap(); // the footer at the frontier
+        let end = write_pos + 32;
+        if f.len().unwrap() > end {
+            f.set_len(end).unwrap();
+        }
+        f.sync_all().unwrap();
+        assert_eq!(
+            f.len().unwrap(),
+            end,
+            "sealed length is the exact footer end"
+        );
+        let mut footer = [0u8; 32];
+        f.read_exact_at(&mut footer, write_pos).unwrap();
+        assert_eq!(footer, [0x33; 32]);
+    }
+
+    #[test]
+    fn direct_resumed_segment_appends_correctly_after_reopen() {
+        // A resumed (reopened) segment sets its RMW high-water to the file length (conservative), so
+        // the first append after reopen preserves the boundary block via a device read; the bytes
+        // must still be correct.
+        let d = dir();
+        let path = d.path().join("seg");
+        {
+            let f = DirectFile::create_new(&path).unwrap();
+            f.preallocate(64 * 1024).unwrap();
+            f.write_all_at(b"HEADER", 0).unwrap();
+            f.write_all_at(b"first", 6).unwrap();
+            f.sync_all().unwrap();
+        }
+        let g = DirectFile::open(&path).unwrap();
+        g.write_all_at(b"second", 11).unwrap(); // append at the recovered frontier
+        g.sync_data().unwrap();
+        let mut all = vec![0u8; 17];
+        g.read_exact_at(&mut all, 0).unwrap();
+        assert_eq!(&all, b"HEADERfirstsecond");
+    }
+
+    #[test]
+    fn direct_empty_write_is_a_noop() {
+        let d = dir();
+        let f = DirectFile::create_new(&d.path().join("seg")).unwrap();
+        f.write_all_at(b"", 0).unwrap();
+        assert_eq!(f.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn aligned_buf_address_and_length_are_block_aligned() {
+        // O_DIRECT's precondition: the buffer ADDRESS and length must both be block multiples.
+        let b = AlignedBuf::zeroed(BS).unwrap();
+        assert_eq!(
+            b.as_slice().as_ptr() as usize % BS,
+            0,
+            "buffer address is block-aligned"
+        );
+        assert_eq!(
+            b.as_slice().len() % BS,
+            0,
+            "buffer length is a block multiple"
+        );
+        assert!(b.as_slice().iter().all(|&x| x == 0), "allocated zeroed");
+        let big = AlignedBuf::zeroed(4 * BS).unwrap();
+        assert_eq!(big.as_slice().as_ptr() as usize % BS, 0);
     }
 }

@@ -45,9 +45,12 @@ pub enum ReloadClass {
 /// against the candidate; classifying them here, with their [`ReloadClass`], keeps the cold/hot
 /// distinction the design names in one auditable place. `storage.segment_size` and
 /// `storage.data_dir` are COLD because changing them live could strand segments or move the store.
+/// `storage.io_mode` is COLD because the open segment fds carry the io strategy (buffered vs the
+/// `O_DIRECT` direct-write file); switching it live cannot re-open them, so a change requires a restart.
 pub const COLD_KEYS: &[(&str, ReloadClass)] = &[
     ("storage.segment_size", ReloadClass::Cold),
     ("storage.data_dir", ReloadClass::Cold),
+    ("storage.io_mode", ReloadClass::Cold),
 ];
 
 /// The reload class of `key`: [`ReloadClass::Cold`] if it is in the classified [`COLD_KEYS`] set,

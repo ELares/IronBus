@@ -48,6 +48,10 @@ pub mod sim;
 /// recovers to its own valid prefix + loss report without touching a sibling — and per-record cost
 /// stays flat as streams grow (no per-record structure is added).
 pub mod streamset;
+/// Durable-write io-mode selection and storage-substrate detection (`buffered` | `direct` | `auto`):
+/// the SAFE T1 O_DIRECT tier's config surface + the network-durable-storage probe. See the module
+/// docs; the io-strategy itself lives in [`io::DirectFile`] behind [`io::MaybeDirectFile`].
+pub mod substrate;
 /// The durable transactional half-message store (`txn/` sub-log, V2-M8, #640 part 1/2): a second
 /// segmented [`log::Log`] (modeled on the `dlq/` sink) holding the durable, consumer-INVISIBLE half
 /// (prepared) messages and their resolution (commit/rollback) op-markers, plus the in-memory

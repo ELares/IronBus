@@ -547,4 +547,37 @@ mod tests {
             Some(vec![1u8; 64])
         );
     }
+
+    // The C1 offset-commit path over the direct-write backend: the checkpoint's per-write
+    // `write_all_at` + `sync_all` land on a `DirectFile` in direct mode. The dual-slot design is a
+    // BACK-PATCH pattern (alternating slot writes RMW a shared block), the exact O_DIRECT read-
+    // modify-write hazard — so this runs the checkpoint end to end on a real `DirectFile` (unix, so
+    // macOS CI too) and asserts the dual-slot crash-safety still recovers the latest durable value.
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_over_directfile_round_trips_and_stays_torn_safe() {
+        use crate::io::DirectFile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.ckpt");
+        {
+            let f = DirectFile::create_new(&path).unwrap();
+            let (mut cp, recovered) = Checkpoint::open(f).unwrap();
+            assert_eq!(
+                recovered, None,
+                "a fresh direct-mode checkpoint recovers nothing"
+            );
+            // Several alternating-slot writes: each slot write RMWs the shared boundary block.
+            for v in [&b"one"[..], b"two", b"three", b"four", b"five"] {
+                cp.write(v).unwrap();
+            }
+        }
+        // Reopen (a real fd close + reopen): the LATEST durable value survives, both slots intact.
+        let g = DirectFile::open(&path).unwrap();
+        let (_cp, recovered) = Checkpoint::open(g).unwrap();
+        assert_eq!(
+            recovered,
+            Some(b"five".to_vec()),
+            "direct-mode checkpoint recovers the latest value"
+        );
+    }
 }

@@ -14,6 +14,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 #[cfg(unix)]
 use crate::io::{sync_dir, StdFile};
+// The O_DIRECT direct-write backend is unix-only (`DirectFile` uses `RawFd`/`O_DIRECT`). On
+// non-unix (Windows is a v1 non-goal for `StdFs`) the filesystem hands out the buffered `StdFile`
+// directly — exactly today's path — so the whole io-mode surface is a no-op there.
+#[cfg(unix)]
+use crate::io::{DirectFile, MaybeDirectFile};
+#[cfg(unix)]
+use crate::substrate::ResolvedIoMode;
 
 /// A flat directory of named files: the seam through which the storage engine
 /// creates, opens, lists, and removes the segment files of one data directory.
@@ -499,14 +506,39 @@ impl Filesystem for EphemeralFs {
 #[derive(Clone, Debug)]
 pub struct StdFs {
     root: std::path::PathBuf,
+    /// The durable-write io-mode every file this fs hands out uses (COLD: fixed for the fs's life,
+    /// and inherited by [`StdFs::subdir`] so a DLQ / stream subtree writes the same way). Defaults
+    /// to [`ResolvedIoMode::Buffered`] via [`StdFs::new`], so every existing caller is unchanged.
+    io_mode: ResolvedIoMode,
 }
 
 #[cfg(unix)]
 impl StdFs {
-    /// Roots a filesystem at `root`. The directory itself must already exist.
+    /// Roots a BUFFERED filesystem at `root` (the default io-mode). The directory itself must
+    /// already exist. Byte-and-behavior identical to today — every file it hands out is a plain
+    /// buffered [`StdFile`].
     #[must_use]
     pub fn new(root: std::path::PathBuf) -> StdFs {
-        StdFs { root }
+        StdFs {
+            root,
+            io_mode: ResolvedIoMode::Buffered,
+        }
+    }
+
+    /// Roots a filesystem at `root` with an explicit resolved durable-write io-mode. In
+    /// [`ResolvedIoMode::Direct`] every file it hands out is a [`DirectFile`] (`O_DIRECT` writes over
+    /// pre-formatted written extents, barrier KEPT); in [`ResolvedIoMode::Buffered`] it is exactly
+    /// [`StdFs::new`]. The mode is COLD (open fds carry it; a change needs a restart). Production
+    /// only reaches `Direct` where `substrate::resolve_for_dir` confirmed it is supported.
+    #[must_use]
+    pub fn with_io_mode(root: std::path::PathBuf, io_mode: ResolvedIoMode) -> StdFs {
+        StdFs { root, io_mode }
+    }
+
+    /// The io-mode this filesystem writes with.
+    #[must_use]
+    pub fn io_mode(&self) -> ResolvedIoMode {
+        self.io_mode
     }
 
     /// Resolves `name` to a path inside the data directory, rejecting anything that is
@@ -528,12 +560,34 @@ impl StdFs {
 
 #[cfg(unix)]
 impl Filesystem for StdFs {
+    #[cfg(unix)]
+    type File = MaybeDirectFile;
+    // Non-unix: the buffered `StdFile` IS the file — no io-mode dispatch (direct mode is unix-only).
+    #[cfg(not(unix))]
     type File = StdFile;
 
+    #[cfg(unix)]
+    fn open(&self, name: &str) -> io::Result<MaybeDirectFile> {
+        let path = self.resolve(name)?;
+        match self.io_mode {
+            ResolvedIoMode::Buffered => Ok(MaybeDirectFile::Buffered(StdFile::open(&path)?)),
+            ResolvedIoMode::Direct => Ok(MaybeDirectFile::Direct(DirectFile::open(&path)?)),
+        }
+    }
+    #[cfg(not(unix))]
     fn open(&self, name: &str) -> io::Result<StdFile> {
         StdFile::open(&self.resolve(name)?)
     }
 
+    #[cfg(unix)]
+    fn create_new(&self, name: &str) -> io::Result<MaybeDirectFile> {
+        let path = self.resolve(name)?;
+        match self.io_mode {
+            ResolvedIoMode::Buffered => Ok(MaybeDirectFile::Buffered(StdFile::create_new(&path)?)),
+            ResolvedIoMode::Direct => Ok(MaybeDirectFile::Direct(DirectFile::create_new(&path)?)),
+        }
+    }
+    #[cfg(not(unix))]
     fn create_new(&self, name: &str) -> io::Result<StdFile> {
         StdFile::create_new(&self.resolve(name)?)
     }
@@ -586,7 +640,12 @@ impl Filesystem for StdFs {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
-        Ok(StdFs { root: path })
+        // The subtree inherits the parent's io-mode, so a DLQ / stream subdir writes durably the
+        // same way the root does.
+        Ok(StdFs {
+            root: path,
+            io_mode: self.io_mode,
+        })
     }
 
     fn subdir_exists(&self, name: &str) -> io::Result<bool> {

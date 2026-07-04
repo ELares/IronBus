@@ -8780,6 +8780,186 @@ mod tests {
         assert_eq!(read_back(log.filesystem(), 0).len(), 3);
     }
 
+    // ---- direct io-mode (the SAFE T1 O_DIRECT tier), end to end over a real StdFs ----
+    // These run on every unix target (macOS included): `DirectFile`'s bytes are platform-independent
+    // (only the O_DIRECT cache-bypass is Linux-specific, and it does not change the recovered image),
+    // so the whole segment/roll/seal/recovery machinery is exercised over the direct backend here;
+    // the physical-device durability + the actual O_DIRECT flag are validated by the t4g step.
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_io_mode_recovers_every_acked_record_across_rolls() {
+        // The crash-consistency tooth: append+sync a record stream that ROLLS across several
+        // segments in direct mode (so the written pre-format + O_DIRECT appends + seal all run), then
+        // kill + reopen (still direct) and assert every acked record recovered, in order, with NO
+        // loss event and no torn block.
+        use crate::fs::StdFs;
+        use crate::substrate::ResolvedIoMode;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let open = |root: std::path::PathBuf| {
+            Log::open(
+                StdFs::with_io_mode(root, ResolvedIoMode::Direct),
+                ManualClock::new(),
+                small_config(),
+            )
+            .unwrap()
+        };
+        let mut log = open(root.clone());
+        let n = 24u8;
+        for i in 0..n {
+            log.append(&rec(&[i; 20])).unwrap();
+            log.sync().unwrap();
+        }
+        assert!(
+            log.active_segment_id() >= 2,
+            "the stream rolled across several segments"
+        );
+        drop(log); // an unclean kill (the segment files stay as the O_DIRECT writes left them)
+
+        let log = open(root.clone());
+        assert_eq!(
+            log.next_offset(),
+            Offset::new(u64::from(n)),
+            "every acked record recovered"
+        );
+        assert!(
+            log.loss_report().events.is_empty(),
+            "no loss on a clean direct-mode restart"
+        );
+        assert_eq!(log.recovered_truncated_bytes(), 0);
+        let records = log.read_from(Offset::ZERO, 1000).unwrap();
+        assert_eq!(records.len(), usize::from(n));
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.offset, Offset::new(i as u64));
+            assert_eq!(&r.payload[..], &[u8::try_from(i).unwrap(); 20][..]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_and_buffered_produce_identical_sealed_bytes_and_recovered_state() {
+        // The metamorphic byte-identity proof (spec §7): the SAME record stream through a BUFFERED
+        // log and a DIRECT log yields byte-identical SEALED segment images and identical recovered
+        // records. If the bytes are identical, recovery (and the conformance gate) are mode-agnostic
+        // by construction.
+        use crate::fs::StdFs;
+        use crate::substrate::ResolvedIoMode;
+        let base = tempfile::tempdir().unwrap();
+        let buf_root = base.path().join("buffered");
+        let dir_root = base.path().join("direct");
+        std::fs::create_dir(&buf_root).unwrap();
+        std::fs::create_dir(&dir_root).unwrap();
+
+        let run = |fs: StdFs| {
+            let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+            for i in 0..24u8 {
+                log.append(&rec(&[i; 20])).unwrap();
+                log.sync().unwrap();
+            }
+            log.active_segment_id()
+        };
+        let buf_active = run(StdFs::new(buf_root.clone()));
+        let dir_active = run(StdFs::with_io_mode(
+            dir_root.clone(),
+            ResolvedIoMode::Direct,
+        ));
+        assert_eq!(buf_active, dir_active, "both modes roll at the same points");
+
+        // Every SEALED segment (all but the active one) is byte-identical between the two modes.
+        let buf_fs = StdFs::new(buf_root.clone());
+        let dir_fs = StdFs::new(dir_root.clone()); // read back in BUFFERED mode: a sealed segment is exact
+        for id in 0..buf_active {
+            let name = segment_file_name(id);
+            let bf = buf_fs.open(&name).unwrap();
+            let df = dir_fs.open(&name).unwrap();
+            let bl = bf.len().unwrap();
+            let dl = df.len().unwrap();
+            assert_eq!(
+                bl, dl,
+                "sealed segment {id} lengths differ (buffered {bl}, direct {dl})"
+            );
+            let mut b = vec![0u8; usize::try_from(bl).unwrap()];
+            let mut d = vec![0u8; usize::try_from(dl).unwrap()];
+            bf.read_exact_at(&mut b, 0).unwrap();
+            df.read_exact_at(&mut d, 0).unwrap();
+            assert_eq!(
+                b, d,
+                "sealed segment {id} bytes differ between buffered and direct"
+            );
+        }
+
+        // And the recovered record streams are identical.
+        let recovered = |root: std::path::PathBuf| {
+            let log = Log::open(StdFs::new(root), ManualClock::new(), small_config()).unwrap();
+            log.read_from(Offset::ZERO, 1000)
+                .unwrap()
+                .iter()
+                .map(|r| (r.offset, r.payload.to_vec()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            recovered(buf_root),
+            recovered(dir_root),
+            "recovered state differs across modes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_io_mode_torn_tail_is_dropped_and_acked_records_survive() {
+        // A torn/garbage tail block past the acked frontier (a crash mid-append that left partial,
+        // non-frame bytes) must be caught by the frame CRC on recovery and dropped — never accepted
+        // as data — while every acked record survives. We simulate the torn write by stamping
+        // non-frame garbage just past the durable frontier of the active segment.
+        use crate::fs::StdFs;
+        use crate::io::StdFile;
+        use crate::substrate::ResolvedIoMode;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut log = Log::open(
+            StdFs::with_io_mode(root.clone(), ResolvedIoMode::Direct),
+            ManualClock::new(),
+            small_config(),
+        )
+        .unwrap();
+        for i in 0..3u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+            log.sync().unwrap(); // acked
+        }
+        let acked = log.next_offset();
+        let active = log.active_segment_id();
+        drop(log);
+
+        // Stamp garbage at the TRUE frame boundary (the scan's `valid_end`, one past record 2's
+        // complete frame — NOT `last_nonzero_end`, which can point INSIDE a frame that ends in zero
+        // bytes), exactly as a crash mid-4th-append would leave a torn, non-frame tail.
+        let name = segment_file_name(active);
+        let frontier = SegmentReader::open(StdFile::open(&root.join(&name)).unwrap())
+            .unwrap()
+            .scan()
+            .unwrap()
+            .valid_end;
+        let raw = StdFile::open(&root.join(&name)).unwrap();
+        raw.write_all_at(&[0xAB; 48], frontier).unwrap();
+        raw.sync_all().unwrap();
+        drop(raw);
+
+        // Recover: the acked records survive, the torn tail is dropped (not accepted as a record).
+        let log = Log::open(
+            StdFs::with_io_mode(root.clone(), ResolvedIoMode::Direct),
+            ManualClock::new(),
+            small_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            log.next_offset(),
+            acked,
+            "no acked record lost, no torn block accepted"
+        );
+        assert_eq!(log.read_from(Offset::ZERO, 100).unwrap().len(), 3);
+    }
+
     // Fills a small-segment log with `n` single-byte records (each `payload` byte `i`), synced,
     // and returns it rolled across several segments so the reaper has sealed predecessors.
     fn rolled_log(n: u8) -> Log<InMemoryFs, ManualClock> {

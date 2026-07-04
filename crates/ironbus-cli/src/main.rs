@@ -269,6 +269,15 @@ const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 /// levels (`interval`/`async`/`none`) are strictly opt-in and weaken I2 by a documented loss window.
 const DEFAULT_DURABILITY_LEVEL: &str = "sync";
 
+/// The default durable-write IO-MODE for `serve` (perf/iomode-direct): `buffered` — today's
+/// `StdFile` (buffered `pwrite` + `fdatasync`), so a zero-config broker is byte-and-behavior
+/// identical to the historical broker. `direct` is the SAFE T1 `O_DIRECT` tier (data straight to the
+/// device over pre-formatted written extents, durability barrier KEPT — ack-implies-durable holds);
+/// `auto` enables it only where the substrate probe confirms network-durable block storage. The
+/// resolved mode is threaded into `StdFs::with_io_mode` at `open_disk_engine`; it never weakens
+/// durability (the barrier is kept in every mode), only the sync MECHANISM differs.
+const DEFAULT_IO_MODE: &str = "buffered";
+
 /// The default storage BACKEND for `serve` (#443): `disk`, the durable on-disk store, so a
 /// zero-config broker is byte-for-byte the historical durable broker. The `memory` backend runs the
 /// SAME engine over the in-memory filesystem (NO files, NO fsync, explicitly NO power-loss or
@@ -870,7 +879,7 @@ ironbus: a durable edge message queue.
 USAGE:
     ironbus serve (--data-dir <dir> | --storage memory) [--config <path>] [--allow-unknown-config]
                   [--profile <edge-tiny|balanced|throughput>]
-                  [--storage <disk|memory>] [--ephemeral-loss-ack]
+                  [--storage <disk|memory>] [--ephemeral-loss-ack] [--io-mode <buffered|direct|auto>]
                   [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--allow-unlimited-deliver]
                   [--backoff-ms <ms,ms,...>] [--max-in-flight <n>]
@@ -977,6 +986,16 @@ Notes:
     post-compression bytes, and 0 = unlimited would OOM the device). With --storage memory,
     --data-dir must be ABSENT (the broker keeps no on-disk state). The startup banner states the
     ephemeral contract and the materialized-config line says storage=memory.
+    --io-mode <buffered|direct|auto> (default buffered) selects the durable-write strategy. buffered
+    is today's path (buffered pwrite + fdatasync), byte-and-behavior identical. direct is the SAFE
+    O_DIRECT tier: record bytes go straight to the device over segments whose extents are
+    pre-formatted written at create, and the durability barrier is KEPT (ack still implies durable,
+    same I2 as buffered) — it targets the durable-single-op latency on network-durable block storage
+    (EBS-class) by making the barrier metadata-free and page-cache-free, never by dropping it. auto
+    enables direct only where a substrate probe confirms network-durable storage, and fails closed to
+    buffered otherwise. direct is Linux-only (no O_DIRECT elsewhere -> buffered). It is a COLD knob
+    (a change needs a restart) and never weakens durability in any mode; the resolved strategy is
+    logged at startup and echoed as io_mode= in the materialized-config line.
     --max-in-flight bounds the per-GROUP in-flight (max-ack-pending) window; --consumer-credit
     (default 2048) is the per-CONNECTION un-acked CEILING the auto-tuning credit window grows
     toward (#552): the window starts at a 64-message floor and grows toward this ceiling as the
@@ -2289,6 +2308,11 @@ struct ServeFlags {
     /// `None` resolves to the default `sync` (ack-implies-durable, I2, zero acked loss). An unknown
     /// name is a usage error.
     durability_level: Option<String>,
+    /// The durable-write IO-MODE (perf/iomode-direct) selected by `--io-mode` / `IRONBUS_IO_MODE`.
+    /// `None` resolves to the default `buffered` (today's `StdFile`; byte-and-behavior unchanged).
+    /// `direct` forces the SAFE T1 `O_DIRECT`+kept-barrier file, `auto` enables it only on confirmed
+    /// network-durable storage. An unknown name is a usage error.
+    io_mode: Option<String>,
     /// The compression CODEC (#12, #387) selected by `--compression` / `IRONBUS_COMPRESSION`. `None`
     /// resolves to the default `lz4` (the ADR-0003 pure-Rust default codec). `none` stores every
     /// record raw; `zstd` is rejected on the default build. An unknown name is a usage error.
@@ -2591,6 +2615,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--durability-level" => {
                 f.durability_level = Some(take_value("--durability-level", args, &mut i)?);
+            }
+            "--io-mode" => {
+                f.io_mode = Some(take_value("--io-mode", args, &mut i)?);
             }
             "--compression" => {
                 f.compression = Some(take_value("--compression", args, &mut i)?);
@@ -2989,6 +3016,23 @@ fn parse_serve_flags_with_env_and_reader(
             "`{source}` must be `sync`, `interval`, `async`, or `none`, got `{durability_level_arg}`"
         ))
     })?;
+    // The durable-write IO-MODE (perf/iomode-direct) resolves the same way: flag > env > default
+    // (`buffered`), parsed after resolution so a bad value names its source. The default keeps the
+    // buffered `StdFile`; `direct`/`auto` request the SAFE T1 O_DIRECT tier (barrier kept). The
+    // requested mode is resolved to a concrete strategy at boot, once the data dir exists
+    // (`open_disk_engine`), where the substrate probe runs.
+    let io_mode_from_flag = f.io_mode.is_some();
+    let io_mode_arg = resolve_string("--io-mode", f.io_mode, env, DEFAULT_IO_MODE);
+    let io_mode = ironbus_storage::substrate::IoMode::parse(&io_mode_arg).ok_or_else(|| {
+        let source = if io_mode_from_flag {
+            "--io-mode".to_string()
+        } else {
+            env_var_name("--io-mode")
+        };
+        CliError::Usage(format!(
+            "`{source}` must be `buffered`, `direct`, or `auto`, got `{io_mode_arg}`"
+        ))
+    })?;
     // The compression CODEC (#12, #387) resolves like the disk-full policy: an enum string with
     // flag > env > default (`lz4`) precedence, parsed after resolution so a bad value names its
     // source (the flag if explicit, else the env var). `zstd` is rejected here on the default build
@@ -3182,6 +3226,10 @@ fn parse_serve_flags_with_env_and_reader(
             // set, overridable by env/flag. `async`/`none` are gated behind `--async-loss-ack` in
             // `validate_serve_config`, never reachable by accident.
             durability_level,
+            // The durable-write io-mode (perf/iomode-direct); default `buffered`. Resolved to a
+            // concrete strategy at boot (`open_disk_engine`) once the data dir exists and the
+            // substrate probe can run. Never weakens durability — the barrier is kept in every mode.
+            io_mode,
             // The compression codec (#12, #387); default `lz4` per ADR-0003, `none` stores raw.
             compression,
             flush_interval_ms: resolve_number(
@@ -3491,7 +3539,11 @@ fn build_effective_config(
             let value = match *key {
                 "storage.segment_size" => config.max_segment_bytes.to_string(),
                 "storage.data_dir" => data_dir_cold_value(data_dir),
-                // Unreachable: COLD_KEYS lists only the two above; a new cold key must add its arm.
+                // The io-mode is COLD (open fds carry it): a live reload that changed it is rejected,
+                // the operator must restart. Echo the REQUESTED knob (what the file sets), matching
+                // how the other cold keys carry their configured value.
+                "storage.io_mode" => config.io_mode.as_str().to_string(),
+                // Unreachable: a new cold key must add its arm.
                 other => {
                     debug_assert!(false, "unhandled cold key `{other}`");
                     String::new()
@@ -4941,6 +4993,16 @@ struct ServeConfig {
     /// to boot without `async_loss_ack` (the none/async safety gate). Platform-neutral so it is
     /// validated on every platform; the Unix on-disk path maps it to the engine enum.
     durability_level: DurabilityLevelArg,
+    /// The durable-write IO-MODE knob (perf/iomode-direct). Default
+    /// [`ironbus_storage::substrate::IoMode::Buffered`] — today's buffered `StdFile`, so a
+    /// zero-config broker is byte-and-behavior identical. `Direct` requests the SAFE T1 `O_DIRECT` tier
+    /// (data straight to the device over pre-formatted written extents, durability barrier KEPT —
+    /// ack-implies-durable holds, same I2 as buffered); `Auto` enables it only where the substrate
+    /// probe confirms network-durable storage. Resolved to a concrete `StdFs` strategy at boot in
+    /// `open_disk_engine` (where the data dir exists and the probe can run); never weakens durability
+    /// in any mode (only the sync MECHANISM differs). Platform-neutral so it is parsed on every
+    /// platform; the non-Linux on-disk path degrades `direct`/`auto` to buffered.
+    io_mode: ironbus_storage::substrate::IoMode,
     /// The COMPRESSION CODEC knob (#12, #387, wired by #430). Default [`CompressionArg::Lz4`]
     /// (the ADR-0003 pure-Rust default codec). The resolved knob is threaded into
     /// `EngineConfig::compression` by `open_disk_engine`, so the write path stores each
@@ -5110,6 +5172,7 @@ impl ServeConfig {
             // power-loss-safe guarantee the shipped `serve` default carries.
             durability_level: DurabilityLevelArg::Sync,
             // The bench broker runs the default compression codec (#387): lz4 per ADR-0003.
+            io_mode: ironbus_storage::substrate::IoMode::Buffered,
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
@@ -6357,6 +6420,12 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
     // compressible payload at or over the 64-byte threshold is stored compressed behind the
     // `COMPRESSED` record flag (sub-threshold and incompressible payloads store raw by design).
     let compression = config.compression.as_str();
+    // The durable-write io-mode echo (perf/iomode-direct): the REQUESTED knob (`buffered`/`direct`/
+    // `auto`), mirroring how `durability_level` echoes the requested level. The concrete strategy it
+    // resolved to (and why) is logged separately by `open_disk_engine` at boot. Never a durability
+    // signal — every mode keeps the barrier — so it sits next to the mechanism knobs, not the safety
+    // ones.
+    let io_mode = config.io_mode.as_str();
     // The storage backend echo (#443). Memory mode has no data dir, so the `data_dir=` field (kept
     // in place for field-order stability) carries the `none` sentinel there.
     let storage = config.storage.as_str();
@@ -6372,7 +6441,8 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          enable_admin={} ram_ceiling_bytes={} dedup_max_ids={} dedup_max_producers={} \
          max_prepared={} max_prepared_bytes={} \
          durability_level={durability_level} \
-         power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
+         power_loss_safe={power_loss_safe} compression={compression} io_mode={io_mode} \
+         flush_interval_ms={} \
          flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
          commit_gather_us={} sync_max_dirty_bytes={}",
         config.profile.name(),
@@ -9159,7 +9229,23 @@ fn open_disk_engine(
 ) -> Result<Engine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
-    let fs = StdFs::new(data_dir.to_path_buf());
+    // Resolve the requested io-mode NOW that the data dir exists (the substrate probe needs it), ONCE
+    // — the mode is COLD (open fds carry it; a change needs a restart). The resolver fails closed:
+    // `direct`/`auto` degrade to buffered on any non-Linux / uncertain / local-volatile substrate,
+    // and even a forced `direct` KEEPS the durability barrier, so this can never weaken durability.
+    let resolution = ironbus_storage::substrate::resolve_for_dir(config.io_mode, data_dir);
+    // Log the decision on stderr (the log stream, where the materialized-config line goes). Buffered
+    // (the default) resolves with NO notes, so a zero-config broker and every test stay silent; only
+    // an explicit `direct`/`auto` prints its INFO/WARN. `let _`: a broken stderr never kills serve.
+    for note in &resolution.notes {
+        let prefix = if note.warn {
+            "WARN: io-mode: "
+        } else {
+            "io-mode: "
+        };
+        let _ = writeln!(std::io::stderr(), "{prefix}{}", note.message);
+    }
+    let fs = StdFs::with_io_mode(data_dir.to_path_buf(), resolution.mode);
     open_engine_with(
         fs,
         config,
@@ -12958,6 +13044,7 @@ mod tests {
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,
             // The default compression codec (#387): lz4 per ADR-0003.
+            io_mode: ironbus_storage::substrate::IoMode::Buffered,
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
@@ -16395,6 +16482,7 @@ mod tests {
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,
             // The default compression codec (#387): lz4 per ADR-0003.
+            io_mode: ironbus_storage::substrate::IoMode::Buffered,
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
@@ -16744,6 +16832,89 @@ mod tests {
             }
             other => panic!("a bad durability level must be a usage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_io_mode_default_is_buffered_and_parses_each_value_with_env_precedence() {
+        use ironbus_storage::substrate::IoMode;
+        // The default is buffered (byte-and-behavior identical to today).
+        let cfg = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(cfg.io_mode, IoMode::Buffered, "default io-mode is buffered");
+        // Every accepted spelling round-trips through the flag.
+        for (flag, mode) in [
+            ("buffered", IoMode::Buffered),
+            ("direct", IoMode::Direct),
+            ("auto", IoMode::Auto),
+        ] {
+            let cfg = parse_serve_flags(&serve_args(&["--io-mode", flag]))
+                .unwrap()
+                .config;
+            assert_eq!(cfg.io_mode, mode, "{flag} parses to {mode:?}");
+        }
+        // An unknown value is a usage error naming the accepted values and echoing the bad one.
+        match parse_serve_flags(&serve_args(&["--io-mode", "bogus"])) {
+            Err(CliError::Usage(m)) => {
+                assert!(
+                    m.contains("buffered") && m.contains("direct") && m.contains("auto"),
+                    "names values: {m}"
+                );
+                assert!(m.contains("`bogus`"), "echoes the bad value: {m}");
+            }
+            other => panic!("a bad io-mode must be a usage error, got {other:?}"),
+        }
+        // The env layer resolves it (IRONBUS_IO_MODE), and an explicit flag WINS over the env
+        // (flag > env > default precedence, exactly like every other resolved knob).
+        let env = |name: &str| (name == "IRONBUS_IO_MODE").then(|| "direct".to_string());
+        let cfg = parse_serve_flags_with_env(&serve_args(&[]), &env)
+            .unwrap()
+            .config;
+        assert_eq!(cfg.io_mode, IoMode::Direct, "env IRONBUS_IO_MODE resolves");
+        let cfg = parse_serve_flags_with_env(&serve_args(&["--io-mode", "buffered"]), &env)
+            .unwrap()
+            .config;
+        assert_eq!(cfg.io_mode, IoMode::Buffered, "the flag beats the env");
+        // The materialized-config line echoes the requested io-mode.
+        let line = materialized_config_line(
+            &parse_serve_flags(&serve_args(&["--io-mode", "direct"]))
+                .unwrap()
+                .config,
+            "127.0.0.1:7700",
+            Some(Path::new("/tmp/d")),
+        );
+        assert!(
+            line.contains("io_mode=direct"),
+            "config line carries the io-mode: {line}"
+        );
+    }
+
+    #[test]
+    fn serve_io_mode_reads_from_the_config_file_under_env_precedence() {
+        use ironbus_storage::substrate::IoMode;
+        use std::collections::HashMap;
+        // `[storage] io_mode = "direct"` in the config file flows through the FILE layer (mapped to
+        // IRONBUS_IO_MODE, the new `storage.io_mode` known key) and resolves when no flag/env is set.
+        let doc = "[storage]\nio_mode = \"direct\"\n";
+        let cfg =
+            parse_with_env_and_file(&serve_args(&["--config", "cfg.toml"]), &HashMap::new(), doc)
+                .unwrap()
+                .config;
+        assert_eq!(cfg.io_mode, IoMode::Direct, "the config file sets io-mode");
+        // A flag overrides the file (flag > env > file > default).
+        let cfg = parse_with_env_and_file(
+            &serve_args(&["--config", "cfg.toml", "--io-mode", "buffered"]),
+            &HashMap::new(),
+            doc,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(cfg.io_mode, IoMode::Buffered, "the flag beats the file");
+        // And the env beats the file.
+        let mut env = HashMap::new();
+        env.insert("IRONBUS_IO_MODE".to_string(), "auto".to_string());
+        let cfg = parse_with_env_and_file(&serve_args(&["--config", "cfg.toml"]), &env, doc)
+            .unwrap()
+            .config;
+        assert_eq!(cfg.io_mode, IoMode::Auto, "the env beats the file");
     }
 
     #[test]
