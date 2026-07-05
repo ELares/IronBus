@@ -36,7 +36,7 @@ We rank the tenets, and when two conflict we resolve in this order: **Resilient 
 | --- | --- |
 | **Simple** | One logical queue, one binary, one config file with safe defaults, a tiny length-framed binary wire protocol whose stored records you can decode with the built-in `ironbus peek` and `ironbus dump` commands. Install to first message in under a minute (see the [Quick start](#quick-start-from-install-to-many-producers-and-consumers)). No ZooKeeper, no JVM, no external dependencies. |
 | **Resilient** | Every acknowledged durable write survives power loss. Startup always recovers a consistent prefix. A torn tail or a poison record or segment is skipped, never fatal, with loss bounded and reported as a number. |
-| **HyperScale** | High per-core throughput on edge hardware (not horizontal scale-out): a bounded ring-buffer core with structural backpressure, group-commit `fdatasync`, and zero-copy fan-out. Measured head-to-head against NATS, Kafka, and Redpanda in the [Benchmarks](#benchmarks) section — not asserted. |
+| **HyperScale** | High per-core throughput on edge hardware (not horizontal scale-out): a bounded ring-buffer core with structural backpressure, group-commit `fdatasync`, and zero-copy fan-out. Measured head-to-head against Redpanda on real durable hardware in the [Benchmarks](#benchmarks) section — not asserted. |
 | **Edge First** | RAM ceilings, flash-wear budgets, and brownout behavior are first-class configuration, not afterthoughts. The queue spills to disk and sheds load rather than blocking producers or running out of memory. |
 | **Cross Platform** | One static musl binary per architecture (aarch64, armv7, x86_64), kernel-only dependency, reproducible builds, embedded SBOM. |
 
@@ -80,58 +80,11 @@ zero-config default the cluster degrades to, not the ceiling:
 
 ## Benchmarks
 
-Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted, on two axes: a **head-to-head against Redpanda** on real durable hardware (AWS t4g / EBS) plus a same-VM cross-check — the comparison that actually decides a durable broker — and a **broad single-host survey** against Kafka and NATS on macOS. Everything below is **3-run medians** with each broker pinned to a matched, labeled durability tier; full methodology, per-broker configs, and harnesses live under **[docs/benchmarks/](docs/benchmarks/)**.
-
-> **Where is Redpanda in the macOS tables? Deliberately absent.** Redpanda is Linux-only, so on macOS it can only run inside a VM against native peers — a guest `fsync` through a virtual disk is *not* power-loss-comparable to a host `F_FULLFSYNC`, and it inflates Redpanda's apparent numbers by ~10× (page-cache "durability" + no real barrier). Publishing that next to native brokers would be apples-to-oranges in both directions. The honest IronBus-vs-Redpanda comparison is on **matched substrates** — see *Real hardware: AWS t4g / EBS* and the *matched Linux-VM* study below, where IronBus wins or ties every durable row on real EBS hardware and scales past Redpanda's peak under matched client concurrency (the one row Redpanda leads — single-connection group-commit on the VM's cheap fsync — narrows to par-or-a-win on real durable media with the io-mode).
-
-### The broad field on one host (macOS): IronBus vs Kafka & NATS
-
-A single-host survey against the two brokers that run **natively** on macOS — **Kafka 4.3.1** (KRaft, Temurin 21) and **NATS 2.14.3** (JetStream + Core) — on one quiet Apple M4 Pro (14 cores, 48 GB, macOS 26.5). Full methodology, pinned configs, and harness: **[docs/benchmarks/CROSS_BROKER_2026_07.md](docs/benchmarks/CROSS_BROKER_2026_07.md)**. One caveat dominates the durable produce rows: macOS `F_FULLFSYNC` (~4 ms) walls **every** power-loss-safe broker to ~250 msg/s, so those rows measure the OS barrier, not the broker (the real durable comparison is the AWS t4g / EBS table below).
-
-#### Throughput (msg/s, single node, medians of 3)
-
-| Row (durability label) | Size | IronBus | NATS JetStream | Kafka |
-| --- | --- | ---: | ---: | ---: |
-| **P1** sync-per-message produce (fsync before **every** ack) | 128 B | 250 | 253 | 242 † |
-| | 1 KiB | 250 | 250 | 221 † |
-| **P2** group-commit produce (fsync-before-ack, coalesced) | 128 B | 64,209 § | — ‡ | 352,089 † |
-| | 1 KiB | 15,262 | — ‡ | 193,669 † |
-| **P3** relaxed produce (page-cache ack, NOT power-loss-safe) | 128 B | 1.60 M | 285 k | 2.34 M |
-| | 1 KiB | **1.04 M** | 229 k | 582 k |
-| **P4** in-memory produce (ephemeral) | 128 B | **1.89 M** | 409 k | n/a |
-| | 1 KiB | **1.20 M** | 372 k | n/a |
-| **C1** consume / replay (single-consumer drain, durable log) | 128 B | 1.65 M | 394 k | 6.24 M |
-| | 1 KiB | 1.17 M | 371 k | 2.02 M |
-
-#### Produce→ack latency (µs, single in-flight, medians of 3)
-
-| Row (durability label) | Size | IronBus p50 / p99 | NATS JetStream p50 / p99 | Kafka p50 / p99 † |
-| --- | --- | --- | --- | --- |
-| **L1** durable ack (fsync before ack) | 128 B | 4,002 / 4,994 | 3,996 / 5,045 | 5,000 / 13,000 |
-| | 1 KiB | 3,998 / 4,185 | 4,001 / 4,987 | 5,000 / 13,000 |
-| **L2** in-memory ack (no fsync) | 128 B | **20.6 / 28.1** | 32.8 / 69.1 | n/a |
-| | 1 KiB | **22.4 / 28.9** | 33.3 / 69.8 | n/a |
-
-What these tables say, factually:
-
-- **IronBus beats or ties NATS on every row.** The P1/L1 durable rows are a tie inside noise — IronBus and NATS `sync_interval=always` are the only native entrants whose ack means the bytes survived power loss on this host, and both sit at the ~4 ms macOS `F_FULLFSYNC` wall (~250 msg/s), with IronBus carrying the tighter p99 (4,994 µs vs 5,045 µs). Every other row is an outright win: relaxed produce 5.6x / 4.6x, in-memory produce 4.6x / 3.2x, consume 4.2x / 3.1x.
-- **The L2 latency row flipped.** Before [#1032](https://github.com/ELares/IronBus/issues/1032) IronBus lost this row ~5x (163 µs vs 33 µs p50 — a double cross-thread wake-up chain). The spin-assisted produce-reply handoff turned it into a win: **21 µs p50 / 28 µs p99** vs NATS JetStream memory 33 / 69 — and it also beats NATS Core request-reply on its home turf (61 / 106 µs, an extra non-durable datapoint; see the methodology doc).
-- **P3 at 1 KiB and P4 at both sizes are the fastest here outright** (P4's only in-memory entrants are IronBus and NATS — Kafka has no true in-memory mode).
-- **P2 is a durability-label mismatch, not a like-for-like loss.** Kafka's `flush.messages` issues `fsync(2)`, which macOS does **not** translate into a drive-cache flush (`F_FULLFSYNC` is a separate, ~4 ms-per-call fcntl that IronBus and NATS-sync pay). IronBus's 64 k/15 k is the only native P2 number whose ack means bytes-on-durable-media on this host. NATS JetStream has no ack-after-fsync group-commit mode at all (its honest durable peer number is the P1 row).
-- **§ This macOS single-connection P2/128 B number (64 k) is an `F_FULLFSYNC`-specific artifact, not a real regression.** The pipelined sync tier ([#1040](https://github.com/ELares/IronBus/issues/1040)) optimizes **multi-connection** group commit — a large win on every substrate — at a **single-connection** cost only where the `fdatasync` is wall-dominant. On macOS `F_FULLFSYNC` (~4 ms), the self-clocking drain coalesces fewer records per barrier when one connection feeds it, so single-connection P2/128 B moved from ~88 k to ~64 k (A/B on the same host; P2/1 KiB and every non-fsync-tier row unchanged, and on Linux — cheap `fdatasync` — it is unchanged). On **real durable hardware** the configurable io-mode brings this row to **par** and turns the other single-connection durable rows (P1 and P2/1 KiB) into wins (see the *AWS t4g / EBS* table below); the residual client-side ceiling is tracked as [#1045](https://github.com/ELares/IronBus/issues/1045).
-- **Two acknowledged architecture-class gaps vs Kafka**, each with a filed design issue: the consumer drain (C1: 1.65 M vs 6.24 M @128 B — Kafka's consumer rides `sendfile(2)` zero-copy; [#1034](https://github.com/ELares/IronBus/issues/1034)) and small-record page-cache produce (P3 @128 B: 1.60 M vs 2.34 M — Kafka pipelines 5 in-flight 128 KiB batch requests; [#1035](https://github.com/ELares/IronBus/issues/1035)).
-
-> **Disclosures — read before quoting any number.**
-> - One machine, single-node brokers, loopback TCP, serial execution (one broker at a time), fresh data dirs per cell, pilot-run→frozen-count→3-timed-runs→median protocol, Kafka given an extra unrecorded JVM warm-up run per cell.
-> - † **Kafka's "fsync" rows are not power-loss-comparable on macOS**: `log.flush.interval.messages` calls `fsync(2)`, which macOS satisfies from the drive cache; it does not issue the `F_FULLFSYNC` barrier IronBus and NATS-sync pay. Kafka's L1 latencies are additionally quantized by its tool's whole-millisecond resolution.
-> - ‡ NATS JetStream has no group-commit (ack-after-coalesced-fsync) mode — a structural gap, marked rather than faked.
-> - IronBus ran its **shipped defaults, including lz4 compression on by default** (`--compression lz4`) with realistic (compressible) payloads; the peers ran their own defaults with `compression.type=none` producer configs. IronBus's codec is part of its shipped configuration and is disclosed rather than disabled.
-> - C1 measures a drain of a pre-filled durable log (throughput only; per-fetch latencies are not comparable across tools and are omitted).
-> - These are single-node numbers. The **cluster** benchmarks are not yet CI-gated ([#636](https://github.com/ELares/IronBus/issues/636)) — no cluster performance claim is made here.
+Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted, on the substrate that actually decides a durable broker: **real network-attached durable storage**, where a `fdatasync` ack means the bytes survived power loss. IronBus is benchmarked head-to-head against **Redpanda v26.1.12** on real AWS **t4g / EBS** hardware, cross-checked in a matched Linux VM. Everything below is **3-run medians** with each broker pinned to a matched, labeled durability tier; full methodology, per-broker configs, and harnesses live under **[docs/benchmarks/](docs/benchmarks/)**.
 
 ### Matched-conditions: IronBus vs Redpanda, both inside one Linux VM
 
-Redpanda is Linux-only, so to rank it fairly against IronBus a companion study puts **both brokers inside the same Linux VM** — same kernel, same ext4-on-virtio disk, same guest loopback, same real `fdatasync` (~200–300 µs) — the identical substrate for both. Full methodology, every cell, and the harness: **[docs/benchmarks/REDPANDA_MATCHED_2026_07.md](docs/benchmarks/REDPANDA_MATCHED_2026_07.md)**.
+Redpanda is Linux-only, so to rank it fairly against IronBus this study puts **both brokers inside the same Linux VM** — same kernel, same ext4-on-virtio disk, same guest loopback, same real `fdatasync` (~200–300 µs) — the identical substrate for both. Full methodology, every cell, and the harness: **[docs/benchmarks/REDPANDA_MATCHED_2026_07.md](docs/benchmarks/REDPANDA_MATCHED_2026_07.md)**.
 
 The single-connection matrix there has IronBus winning P3/1 KiB, both consume rows, and both durable-latency rows (L1 ~7×, real sub-millisecond fsync-ack vs Redpanda's tool-quantized 2 ms), tying P1, and trailing on **P2 group-commit produce** — the gap that motivated the **pipelined sync tier** ([#1040](https://github.com/ELares/IronBus/issues/1040): `fdatasync` decoupled from and overlapped with the append path, self-clocking group commit). That single-connection P2 gap is the IronBus **client**, not its broker: the session drains its parked-produce window each pass, so one connection cannot fill the pipeline — while Redpanda's Kafka client already pipelines 5-in-flight on one connection.
 
@@ -146,7 +99,7 @@ Given each broker the client concurrency that saturates it (IronBus `bench --pro
 
 ### Real hardware: AWS t4g / EBS — the authoritative durable numbers
 
-The macOS tables above hit the `F_FULLFSYNC` wall (~4 ms per barrier) that pins **every** power-loss-safe broker to ~250 msg/s, so they under-represent the durable rows; the definitive durable comparison is on **real network-attached durable hardware**. The matched study was **re-run on a single AWS t4g.large** Graviton node with both brokers writing an **EBS gp3** volume (real `fdatasync` ~2.8 ms, ~10× the VM's virtio flush). The result **reproduces and sharpens**: on the expensive real sync, Redpanda peaks at *one* client and falls monotonically, while IronBus climbs to **256 k @128 B / 62 k @1 KiB** — beating Redpanda's peak **1.21× / 1.67×** (2.25× / 2.46× at matched 8 clients). The pricier the durability barrier, the wider IronBus's group-commit margin. See §7 of the study doc.
+The VM's virtio `fdatasync` is real but cheap (~200–300 µs); the toughest test of a group-commit engine is a barrier expensive enough that the only way to sustain throughput is to coalesce and overlap many records per sync. So the matched study was **re-run on a single AWS t4g.large** Graviton node with both brokers writing an **EBS gp3** volume (real `fdatasync` ~2.8 ms, ~10× the VM's virtio flush). The result **reproduces and sharpens** the VM verdict: on the expensive real sync, Redpanda peaks at *one* client and falls monotonically, while IronBus climbs to **256 k @128 B / 62 k @1 KiB** — beating Redpanda's peak **1.21× / 1.67×** (2.25× / 2.46× at matched 8 clients). The pricier the durability barrier, the wider IronBus's group-commit margin. See §7 of the study doc.
 
 A subsequent configurable **io-mode** ([#1054](https://github.com/ELares/IronBus/issues/1054); `serve --io-mode auto`, which auto-detects EBS as network-durable) closes the *single-connection* rows too. On EBS the residual `fdatasync` cost is pure extent-metadata journaling, so an `O_DIRECT` write plus a now-free barrier (~1 µs, the full fsync guarantee kept) turns single-connection sync-per-message from a loss into a **1.7–2.5× win**, single-connection group-commit at 1 KiB into a **3.7× win** (128 B lands at par), and drops durable-ack **median** latency to ~1 ms so IronBus now leads L1 at the median as well as the ~100× tail. `buffered` stays the default; `auto`/`direct` are the network-durable opt-in.
 
@@ -165,7 +118,7 @@ On this real durable substrate IronBus **wins or ties every row**; the single no
 
 ### Performance targets
 
-The measured table above does not retire the SLO discipline: the provisional marquee **target** (a floor, not a measurement) remains 256-byte messages, a single consumer, durable group-commit `fdatasync`, sustaining at least 60,000 messages per second with p99 latency under 6 ms **on a Raspberry Pi 4**. Every published SLO is a measured floor (the on-device p99 minus a 20 percent margin), recorded with an HdrHistogram against a single monotonic clock, and gated against regression on a rolling baseline. See [docs/SLO.md](docs/SLO.md) and [docs/PERF_LEDGER.md](docs/PERF_LEDGER.md) for the on-device (t4g / edge) measured history, including the ~80x-NATS durable-produce and ~6–8x consume results that predate this cross-broker study.
+The measured table above does not retire the SLO discipline: the provisional marquee **target** (a floor, not a measurement) remains 256-byte messages, a single consumer, durable group-commit `fdatasync`, sustaining at least 60,000 messages per second with p99 latency under 6 ms **on a Raspberry Pi 4**. Every published SLO is a measured floor (the on-device p99 minus a 20 percent margin), recorded with an HdrHistogram against a single monotonic clock, and gated against regression on a rolling baseline. See [docs/SLO.md](docs/SLO.md) and [docs/PERF_LEDGER.md](docs/PERF_LEDGER.md) for the on-device (t4g / edge) measured history, including the ~80x-NATS durable-produce and ~6–8x consume results from the on-device history.
 
 ---
 
@@ -518,7 +471,7 @@ ironbus migrate --data-dir /var/lib/ironbus
 
 ### Load generator: bench
 
-A production-safe benchmark: by default it spawns its own **isolated** broker over a fresh throwaway data dir (it refuses to target a live broker without an explicit consent flag) and reports throughput, p50/p99/p999 latency, produce-ack RTT percentiles, and fsync cost. This is the driver the [cross-broker study](docs/benchmarks/CROSS_BROKER_2026_07.md) used.
+A production-safe benchmark: by default it spawns its own **isolated** broker over a fresh throwaway data dir (it refuses to target a live broker without an explicit consent flag) and reports throughput, p50/p99/p999 latency, produce-ack RTT percentiles, and fsync cost. This is the driver the [benchmark studies](docs/benchmarks/) used.
 
 ```sh
 ironbus bench --duration 30 --mode round-trip --payload-bytes 256 --pubwindow 64 --json
