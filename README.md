@@ -80,7 +80,7 @@ zero-config default the cluster degrades to, not the ceiling:
 
 ## Benchmarks
 
-Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted. The numbers below are the **measured 3-run medians** from the July 2026 cross-broker study ([#1023](https://github.com/ELares/IronBus/issues/1023)): IronBus (current main) vs **Kafka 4.3.1** (KRaft, Temurin 21) vs **Redpanda v26.1.12** vs **NATS 2.14.3** (JetStream and Core), single node each, on one quiet Apple M4 Pro (14 cores, 48 GB, macOS 26.5). Every row pins each broker to a **matched durability tier** and labels it; the full methodology, the pinned per-broker configs, every cell, and the reproducible harness live in **[docs/benchmarks/CROSS_BROKER_2026_07.md](docs/benchmarks/CROSS_BROKER_2026_07.md)**.
+Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted. The numbers below are the **measured 3-run medians** from the July 2026 cross-broker study ([#1023](https://github.com/ELares/IronBus/issues/1023)): IronBus (current main) vs **Kafka 4.3.1** (KRaft, Temurin 21) vs **Redpanda v26.1.12** vs **NATS 2.14.3** (JetStream and Core), single node each, on one quiet Apple M4 Pro (14 cores, 48 GB, macOS 26.5). Every row pins each broker to a **matched durability tier** and labels it; the full methodology, the pinned per-broker configs, every cell, and the reproducible harness live in **[docs/benchmarks/CROSS_BROKER_2026_07.md](docs/benchmarks/CROSS_BROKER_2026_07.md)**. This host has one caveat: macOS `F_FULLFSYNC` (~4 ms) walls **every** power-loss-safe broker to ~250 msg/s on the durable produce rows, so the definitive durable comparison — on real network-attached durable hardware — is the *Real hardware: AWS t4g / EBS* table further down.
 
 ### Throughput (msg/s, single node, medians of 3)
 
@@ -139,9 +139,24 @@ Given each broker the client concurrency that saturates it (IronBus `bench --pro
 
 **Redpanda does not scale with more clients** (its single raft group is saturated by one 5-in-flight client — throughput peaks at 4 and drops at 8); **IronBus scales up and passes Redpanda's peak on both sizes** (1.44×/2.46× at matched 8 clients). The single-connection row remains the honest exception, addressed by the session-side per-connection reorder ring ([#1045](https://github.com/ELares/IronBus/issues/1045)) — reported here unhidden.
 
-The same study was **re-run on real hardware** (a single AWS **t4g.large** Graviton node, both brokers writing an **EBS gp3** volume — a genuine network-attached durable disk whose `fdatasync` measured ~2.8 ms, ~10× the VM's virtio flush). The result **reproduces and sharpens**: on the expensive real sync, Redpanda peaks at *one* client and falls monotonically, while IronBus climbs to **256 k @128 B / 62 k @1 KiB** — beating Redpanda's peak **1.21× / 1.67×** (2.25× / 2.46× at matched 8 clients). The pricier the durability barrier, the wider IronBus's group-commit margin. See §7 of the study doc.
+### Real hardware: AWS t4g / EBS — the authoritative durable numbers
 
-A subsequent configurable **io-mode** ([#1054](https://github.com/ELares/IronBus/issues/1054); `serve --io-mode auto`, which auto-detects EBS as network-durable) closes the *single-connection* rows too. On EBS the residual `fdatasync` cost is pure extent-metadata journaling, so an `O_DIRECT` write plus a now-free barrier (~1 µs, the full fsync guarantee kept) turns single-connection sync-per-message from a loss into a **1.7–2.5× win**, single-connection group-commit at 1 KiB into a **3.7× win** (128 B lands at par), and drops durable-ack **median** latency to ~1 ms so IronBus now leads L1 at the median as well as the ~100× tail. `buffered` stays the default; `auto`/`direct` are the network-durable opt-in. With it, IronBus **wins or ties every measured row** against Redpanda on real Graviton/EBS — the medians are in §7.
+The macOS tables above hit the `F_FULLFSYNC` wall (~4 ms per barrier) that pins **every** power-loss-safe broker to ~250 msg/s, so they under-represent the durable rows; the definitive durable comparison is on **real network-attached durable hardware**. The matched study was **re-run on a single AWS t4g.large** Graviton node with both brokers writing an **EBS gp3** volume (real `fdatasync` ~2.8 ms, ~10× the VM's virtio flush). The result **reproduces and sharpens**: on the expensive real sync, Redpanda peaks at *one* client and falls monotonically, while IronBus climbs to **256 k @128 B / 62 k @1 KiB** — beating Redpanda's peak **1.21× / 1.67×** (2.25× / 2.46× at matched 8 clients). The pricier the durability barrier, the wider IronBus's group-commit margin. See §7 of the study doc.
+
+A subsequent configurable **io-mode** ([#1054](https://github.com/ELares/IronBus/issues/1054); `serve --io-mode auto`, which auto-detects EBS as network-durable) closes the *single-connection* rows too. On EBS the residual `fdatasync` cost is pure extent-metadata journaling, so an `O_DIRECT` write plus a now-free barrier (~1 µs, the full fsync guarantee kept) turns single-connection sync-per-message from a loss into a **1.7–2.5× win**, single-connection group-commit at 1 KiB into a **3.7× win** (128 B lands at par), and drops durable-ack **median** latency to ~1 ms so IronBus now leads L1 at the median as well as the ~100× tail. `buffered` stays the default; `auto`/`direct` are the network-durable opt-in.
+
+The single-connection medians on that substrate, with `--io-mode auto` (3-run medians, same box class and Redpanda build, `write_caching=false`):
+
+| Row (durability label) | Size | IronBus (`--io-mode auto`) | Redpanda | Result |
+| --- | --- | ---: | ---: | :-- |
+| **P1** sync-per-message (fsync before **every** ack) | 128 B | **898** | 520 | IronBus **1.7×** |
+| | 1 KiB | **897** | 364 | IronBus **2.5×** |
+| **P2** single-conn group-commit (`pubwindow=4096`) | 128 B | 130,035 | 140,805 | par (0.92×) |
+| | 1 KiB | **125,163** | 33,763 | IronBus **3.7×** |
+| **L1** durable ack, p50 / p99 µs (lower is better) | 128 B | **1,039 / 3,155** | 2,000 / 317,000 | IronBus **1.9× / ~100×** |
+| | 1 KiB | **1,045 / 3,172** | 2,000 / 301,000 | IronBus **1.9× / ~95×** |
+
+On this real durable substrate IronBus **wins or ties every row**; the single non-win is P2/128 B single-connection, at par (within the study's ~8 % cell spread). Redpanda's L1 p50 is throttled-tool-quantized to whole milliseconds, but its ~300 ms p99 tail is real. Full medians and the harness are in **[§7 of the study doc](docs/benchmarks/REDPANDA_MATCHED_2026_07.md)**.
 
 ### Performance targets
 
