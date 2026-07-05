@@ -359,8 +359,8 @@ impl BenchConfig {
 
     /// Whether PUBLISH mode awaits EVERY produce individually (#1024): the plain half-duplex path,
     /// `--pubwindow 1` without `--stream`, `--autopipe`, or `--faf`. Only then is each per-produce
-    /// sample an honest produce-to-ack RTT, the number the cross-broker study compares against a
-    /// Kafka/NATS synchronous publish. The pipelined paths (window > 1, stream, autopipe) amortize
+    /// sample an honest produce-to-ack RTT, the apples-to-apples number against a Kafka or NATS
+    /// synchronous publish. The pipelined paths (window > 1, stream, autopipe) amortize
     /// a flush across many messages, so a per-op share would be dishonest, and fire-and-forget
     /// awaits nothing at all. INDEPENDENT of the storage backend: an ack RTT is honest on the
     /// memory engine too (it is just not a durable-write cost), unlike [`Self::fsync_is_measured`].
