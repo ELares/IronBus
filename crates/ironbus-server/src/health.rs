@@ -438,6 +438,13 @@ where
                     "Service Unavailable",
                     "no event-loop progress",
                 )
+            } else if !engine.actor_alive() && !draining.load(Ordering::Acquire) {
+                // #922: an UNEXPECTED append-actor death (return or panic with `draining` unset) is
+                // liveness-fatal — the broker can never serve another produce, strictly worse than the
+                // wedge below, so an orchestrator should restart it. The `!draining` guard keeps a
+                // GRACEFUL shutdown's terminal window (the actor exits by design before the process
+                // does) reading 200 here: "told to die" is not "dead, restart me".
+                respond(&mut stream, 503, "Service Unavailable", "append actor gone")
             } else if engine.actor_watchdog_overran(now) {
                 respond(
                     &mut stream,
@@ -455,17 +462,23 @@ where
             // an orchestrator stops routing new work to it BEFORE the drain begins — the "stop
             // accepting before stop serving" ordering. The engine is still healthy at this instant
             // (the drain has not started), so the 503 must come from the gate, not the engine check.
-            // FULLY NON-BLOCKING readiness (#862): three atomic reads, NO actor round-trip, so a HUNG
+            // FULLY NON-BLOCKING readiness (#862): four atomic reads, NO actor round-trip, so a HUNG
             // fsync can never block this handler and — on the single-threaded health server — wedge the
             // whole health surface (the bug the old `engine.with(|e| e.is_healthy())` had: it queued a
             // job behind the wedged fsync and hung FOREVER, so even the watchdog's own 503 was never
             // served). Checked in priority order: a SIGTERM drain (#637, stop routing before stop
-            // serving), then a WEDGED actor (a hung fsync past the watchdog bound, #862), then a FROZEN
-            // writer (a fsync that RETURNED an error, read from the actor's published flag). Otherwise
-            // ready. The writer-frozen flag reflects the state as of the last completed batch — exactly
-            // when the old blocking read would have observed it.
+            // serving), then a GONE actor (#922: the shared alive flag, flipped by the actor's drop
+            // guard on return OR unwind — the case the watchdog misses when the actor died IDLE or the
+            // bound is disabled, and the frozen-writer flag misses too because a dead actor publishes
+            // nothing; this restores the old blocking read's `Err(_)` => 503 arm without the blocking),
+            // then a WEDGED actor (a hung fsync past the watchdog bound, #862), then a FROZEN writer (a
+            // fsync that RETURNED an error, read from the actor's published flag). Otherwise ready. The
+            // writer-frozen flag reflects the state as of the last completed batch — exactly when the
+            // old blocking read would have observed it.
             if draining.load(Ordering::Acquire) {
                 respond(&mut stream, 503, "Service Unavailable", "draining")
+            } else if !engine.actor_alive() {
+                respond(&mut stream, 503, "Service Unavailable", "append actor gone")
             } else if engine.actor_watchdog_overran(clock.now_monotonic_nanos()) {
                 respond(
                     &mut stream,
@@ -2938,6 +2951,9 @@ mod tests {
         wedged: Arc<AtomicBool>,
         /// The published writer live/frozen flag /readyz reads non-blockingly (#862); `true` = live.
         writer_healthy: Arc<AtomicBool>,
+        /// The shared actor-liveness flag (#949/#922); `true` = the append actor is running. A test
+        /// flips it `false` to model an UNEXPECTED actor death (return or panic) with the watchdog idle.
+        alive: Arc<AtomicBool>,
     }
 
     impl EngineAccess<InMemoryFs, Arc<ironbus_core::clock::ManualClock>> for WedgeableEngine {
@@ -2968,6 +2984,9 @@ mod tests {
         fn writer_appears_healthy(&self) -> bool {
             self.writer_healthy.load(Ordering::Relaxed)
         }
+        fn actor_alive(&self) -> bool {
+            self.alive.load(Ordering::Relaxed)
+        }
     }
 
     /// Runs `serve_health` over a `ManualClock` with the given liveness `window_nanos` and a beacon
@@ -2984,6 +3003,7 @@ mod tests {
         std::thread::JoinHandle<()>,
         Arc<ironbus_core::clock::ManualClock>,
         Arc<LivenessBeacon>,
+        Arc<AtomicBool>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
     ) {
@@ -3041,10 +3061,14 @@ mod tests {
         // The published writer live/frozen flag (#862), default true (a fresh broker's writer is live);
         // the frozen-writer test flips it to drive /readyz to 503 via the non-blocking path.
         let writer_healthy = Arc::new(AtomicBool::new(true));
+        // The shared actor-liveness flag (#949/#922), default true (the actor is running); the
+        // actor-gone test flips it to model an unexpected death the watchdog cannot see.
+        let alive = Arc::new(AtomicBool::new(true));
         let engine_access = WedgeableEngine {
             inner,
             wedged: Arc::clone(&wedged),
             writer_healthy: Arc::clone(&writer_healthy),
+            alive: Arc::clone(&alive),
         };
         // The beacon starts at the clock's origin (0), exactly as the broker seeds it from its start
         // instant, so it is fresh at t=0 and only goes stale once the clock advances past the window
@@ -3078,6 +3102,7 @@ mod tests {
             beacon,
             wedged,
             writer_healthy,
+            alive,
         )
     }
 
@@ -3086,7 +3111,7 @@ mod tests {
         // With a 30 ms window: a beacon tick at the current instant keeps /healthz 200 even after the
         // clock advances a little (under the window), so a slow-but-progressing loop never sheds.
         let window = 30_000_000; // 30 ms in nanos
-        let (addr, shutdown, handle, clock, beacon, _wedged, _writer_healthy) =
+        let (addr, shutdown, handle, clock, beacon, _wedged, _writer_healthy, _alive) =
             start_watchdog(window);
 
         // Fresh at t=0.
@@ -3109,7 +3134,7 @@ mod tests {
         // clock has advanced past the window /healthz sheds 503. This is the only thing that makes
         // the guard real: remove the watchdog (revert to a static 200) and this fails.
         let window = 30_000_000; // 30 ms
-        let (addr, shutdown, handle, clock, beacon, _wedged, _writer_healthy) =
+        let (addr, shutdown, handle, clock, beacon, _wedged, _writer_healthy, _alive) =
             start_watchdog(window);
 
         // Tick once at t=0, then let the loop wedge: no more ticks.
@@ -3146,7 +3171,7 @@ mod tests {
         // with no client work, so even across MANY window-lengths of pure idle /healthz never sheds.
         // This pins "idle is progress" so the watchdog cannot crash-loop an idle edge node.
         let window = 30_000_000; // 30 ms
-        let (addr, shutdown, handle, clock, beacon, _wedged, _writer_healthy) =
+        let (addr, shutdown, handle, clock, beacon, _wedged, _writer_healthy, _alive) =
             start_watchdog(window);
 
         // Model a long idle run: a 5 ms idle poll tick repeated past several windows.
@@ -3174,7 +3199,7 @@ mod tests {
         // purely the wedge watchdog, never the frozen-writer branch — a wedge is a HANG, not a
         // returned-error freeze.
         let window = 30_000_000; // 30 ms
-        let (addr, shutdown, handle, clock, beacon, wedged, _writer_healthy) =
+        let (addr, shutdown, handle, clock, beacon, wedged, _writer_healthy, _alive) =
             start_watchdog(window);
         beacon.mark_progress(clock.now_monotonic_nanos());
 
@@ -3221,13 +3246,127 @@ mod tests {
     }
 
     #[test]
+    fn healthz_and_readyz_flip_to_503_when_the_append_actor_died_unexpectedly() {
+        // #922: an UNEXPECTED append-actor death (return or panic) while the watchdog reads IDLE and
+        // `draining` is unset. The wedge watchdog never trips (`processing_since == 0` on an idle
+        // death — modeled here by leaving `wedged` false) and the frozen-writer flag is stuck at its
+        // last-published `true` (a dead actor publishes nothing), so ONLY the #949 alive flag can
+        // catch it. Both routes must answer 503 "append actor gone": /readyz so the orchestrator stops
+        // routing, /healthz so it restarts the node (a broker that can never serve another produce is
+        // dead, not merely unready). The window is 30 ms with a fresh beacon, so liveness is NOT the
+        // reason for any 503 — and the actor-gone branch works even with the watchdog disabled.
+        let window = 30_000_000; // 30 ms
+        let (addr, shutdown, handle, clock, beacon, _wedged, _writer_healthy, alive) =
+            start_watchdog(window);
+        beacon.mark_progress(clock.now_monotonic_nanos());
+
+        // Alive: both routes healthy (the happy path is unchanged).
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "live before death: {h}");
+        let r = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "ready before death: {r}");
+
+        // The actor dies unexpectedly (the drop guard flipped the shared flag; `draining` unset,
+        // `wedged` untripped, writer flag frozen at `true`).
+        alive.store(false, Ordering::Release);
+        beacon.mark_progress(clock.now_monotonic_nanos());
+        let r2 = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(
+            r2.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "readyz flips to 503 on an unexpected actor death: {r2}"
+        );
+        assert!(r2.ends_with("append actor gone"), "{r2}");
+        let h2 = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            h2.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "healthz flips to 503 too (dead-restart-me, strictly worse than a wedge): {h2}"
+        );
+        assert!(h2.ends_with("append actor gone"), "{h2}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn draining_wins_over_actor_gone_on_readyz_and_healthz_stays_200_through_the_drain() {
+        // #922 composition with the #637 drain gate: during a GRACEFUL shutdown the actor exits BY
+        // DESIGN before the process does, flipping the alive flag in the terminal window while the
+        // health server keeps serving. `/readyz` must still answer "draining" (the gate is checked
+        // FIRST — the operator asked for this state), and `/healthz` must stay 200 ("told to die" is
+        // not "dead, restart me" — the `!draining` guard), so an orchestrator never counts a graceful
+        // drain as a crash. Watchdog window 0 (disabled) — the #922 hard case.
+        use ironbus_core::clock::ManualClock;
+        let clock = Arc::new(ManualClock::new());
+        let engine = Engine::open(InMemoryFs::new(), Arc::clone(&clock), test_eng_cfg()).unwrap();
+        let inner: SharedEngine<InMemoryFs, Arc<ManualClock>> = Arc::new(Mutex::new(engine));
+        let alive = Arc::new(AtomicBool::new(true));
+        let engine_access = WedgeableEngine {
+            inner,
+            wedged: Arc::new(AtomicBool::new(false)),
+            writer_healthy: Arc::new(AtomicBool::new(true)),
+            alive: Arc::clone(&alive),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let draining = Arc::clone(&draining);
+            let clock = Arc::clone(&clock);
+            move || {
+                serve_health_connz_draining(
+                    &listener,
+                    &engine_access,
+                    &shutdown,
+                    &draining,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &clock,
+                    &Arc::new(ConnectionMetrics::new()),
+                    None,
+                )
+                .unwrap();
+            }
+        });
+
+        // The SIGTERM path: flip `draining` FIRST, then (later) the actor drain exits and flips the
+        // alive flag — model both, in order.
+        draining.store(true, Ordering::Release);
+        alive.store(false, Ordering::Release);
+
+        // /readyz: the drain gate wins the priority chain — the operator-initiated state, not the
+        // alarming "append actor gone".
+        let r = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "still 503 while draining: {r}"
+        );
+        assert!(
+            r.ends_with("draining"),
+            "the drain reason wins over actor-gone: {r}"
+        );
+
+        // /healthz: 200 through the drain's terminal window — a graceful exit is never a crash.
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            h.starts_with("HTTP/1.1 200 OK"),
+            "live through the graceful drain even after the actor exited: {h}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn readyz_flips_to_503_on_a_frozen_writer_without_blocking_on_the_actor() {
         // #862: /readyz reads the writer-frozen state from a PUBLISHED atomic, NOT through the actor
         // (engine.with), so a frozen writer sheds 503 promptly AND — crucially — the read can never block
         // behind a hung writer and wedge the single-threaded health server. /healthz is UNAFFECTED by a
         // frozen writer (a frozen-but-running process is still alive — that is liveness, not readiness).
         let window = 30_000_000; // 30 ms
-        let (addr, shutdown, handle, clock, beacon, _wedged, writer_healthy) =
+        let (addr, shutdown, handle, clock, beacon, _wedged, writer_healthy, _alive) =
             start_watchdog(window);
         beacon.mark_progress(clock.now_monotonic_nanos());
 
@@ -3261,7 +3400,8 @@ mod tests {
     fn a_zero_window_disables_the_healthz_watchdog() {
         // window 0 = the watchdog is off: /healthz is the legacy static 200 no matter how stale the
         // beacon, the opt-out path (and the contract the existing metrics/admin helpers rely on).
-        let (addr, shutdown, handle, clock, _beacon, _wedged, _writer_healthy) = start_watchdog(0);
+        let (addr, shutdown, handle, clock, _beacon, _wedged, _writer_healthy, _alive) =
+            start_watchdog(0);
         // Advance far past any window with NO beacon tick: still 200, because the watchdog is off.
         clock.advance_monotonic_nanos(10_000_000_000);
         let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
