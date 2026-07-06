@@ -40,6 +40,9 @@ jobs:
     # input is uploaded so it can be minimized into a permanent regression seed.
     name: fuzz soak (parsers)
     runs-on: ubuntu-latest
+    # ~63 min of fuzzing (21 targets x 180 s) + the ASan build; 120 bounds a wedged target to a
+    # loud failure instead of the runner's 6-hour default.
+    timeout-minutes: 120
     env:
       # cargo-fuzz computes its own sanitizer RUSTFLAGS; clear the inherited "-D warnings" so it
       # builds from a clean slate rather than risking a clobber or append ambiguity across versions.
@@ -57,16 +60,24 @@ jobs:
           tool: cargo-fuzz@0.13.1
       - name: soak each parser fuzz target
         env:
-          # Per-target wall-clock budget; 13 targets => ~39 min of fuzzing per nightly run. The #385
+          # Per-target wall-clock budget; 21 targets => ~63 min of fuzzing per nightly run. The #385
           # plan is to raise this toward 30 min/target; it is a single knob so deepening the soak is
           # a one-line change once the nightly runner-time budget allows.
           MAX_TOTAL_TIME: "180"
         run: |
+          set -euo pipefail
           # Select nightly explicitly via the rustup proxy: cargo-fuzz needs the nightly
           # sanitizer (-Zsanitizer=address). dtolnay/rust-toolchain does run `rustup default
           # nightly`, but that step is continue-on-error, so the `+nightly` makes the
           # toolchain unambiguous and matches the documented local command in fuzz/README.md.
-          for target in record_codec frame_decode cursor_snapshot seq_snapshot segment_scan segment_scan_compacted pub_body ack_body deliver_body dead_letter_body connect_body info_body gap_marker_body; do
+          #
+          # The target list is DERIVED from fuzz_targets/ (never hardcoded): a hardcoded list
+          # silently orphaned 8 of 21 targets from every CI lane while the docs claimed "every
+          # target" was soaked. Deriving from the filesystem makes orphaning impossible by
+          # construction — a new fuzz target is picked up the night it lands, and a target file
+          # missing its fuzz/Cargo.toml [[bin]] entry fails the run loudly.
+          for target_file in fuzz_targets/*.rs; do
+            target="$(basename "${target_file}" .rs)"
             echo "::group::fuzz ${target}"
             # Pin the fuzz build to the rustc HOST target (gnu), not cargo-fuzz's self-detected
             # default. cargo-fuzz infers its default --target from its OWN binary triple, and
@@ -78,7 +89,10 @@ jobs:
             #
             # The committed regression corpus (fuzz/corpus-regression/<target>, #385) is passed as
             # the seed corpus, so the soak always REPLAYS every #45 vector and every promoted crasher
-            # first, then explores from them rather than from an empty corpus each night.
+            # first, then explores from them rather than from an empty corpus each night. A target
+            # with no committed corpus yet gets an (ephemeral) empty dir — libFuzzer requires the
+            # positional corpus dir to exist — and explores from scratch until seeds are promoted.
+            mkdir -p "corpus-regression/${target}"
             cargo +nightly fuzz run "${target}" --target x86_64-unknown-linux-gnu \
               "corpus-regression/${target}" -- -max_total_time="${MAX_TOTAL_TIME}"
             echo "::endgroup::"

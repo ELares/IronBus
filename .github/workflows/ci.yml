@@ -46,6 +46,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Bound the known LOAD-DEPENDENT hang (an intermittent raft_cluster deadlock that only
+    # reproduces under the full parallel workspace run; passes in isolation) to a 30-minute
+    # failure instead of the runner's 6-hour default. The job normally finishes in ~6 min
+    # (ubuntu) / ~4 min (windows), so 30 min is ~5x headroom: a timeout here is a REAL hang
+    # signal, never ordinary-slowness noise. Root-causing the deadlock is tracked separately;
+    # this line is the containment.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -610,8 +617,9 @@ jobs:
     # A bounded per-PR libFuzzer smoke: replay the committed regression corpus and fuzz each target
     # for a few seconds under ASan, so a crash-class regression is caught on the PR, not only in the
     # nightly soak. This is the LIGHT lane; the DEEP exploratory soak (180 s/target, raising toward
-    # 30 min) stays in nightly.yml and is NOT weakened. Kept short so it never dominates PR latency.
-    timeout-minutes: 20
+    # 30 min) stays in nightly.yml and is NOT weakened. Kept short so it never dominates PR latency
+    # (30 min bounds 21 targets: one shared ASan build + ~15 s exploration each).
+    timeout-minutes: 30
     env:
       # cargo-fuzz computes its own sanitizer RUSTFLAGS; clear the inherited "-D warnings" so it
       # builds from a clean slate rather than risking a clobber, exactly as the nightly fuzz job does.
@@ -631,13 +639,22 @@ jobs:
       - name: replay the regression corpus and short-fuzz each target
         env:
           # Per-target wall-clock budget for the short exploratory leg AFTER the corpus replay.
-          # Small on purpose (8 targets => ~2 min of fuzzing): the deep soak is nightly's job.
+          # Small on purpose (21 targets => ~5 min of fuzzing): the deep soak is nightly's job.
           MAX_TOTAL_TIME: "15"
         run: |
           set -euo pipefail
-          for target in record_codec frame_decode cursor_snapshot seq_snapshot segment_scan segment_scan_compacted pub_body ack_body deliver_body dead_letter_body; do
+          # The target list is DERIVED from fuzz_targets/ (never hardcoded), exactly like the
+          # nightly soak: a hardcoded list silently orphaned targets from every lane. A new fuzz
+          # target is smoke-tested on the very PR that adds it; one missing its fuzz/Cargo.toml
+          # [[bin]] entry fails the lane loudly.
+          for target_file in fuzz/fuzz_targets/*.rs; do
+            target="$(basename "${target_file}" .rs)"
             echo "::group::fuzz-smoke ${target}"
             corpus="corpus-regression/${target}"
+            # A target with no committed regression corpus yet gets an (ephemeral) empty dir —
+            # libFuzzer requires the positional corpus dir to exist; the replay leg is then a no-op
+            # and the exploratory leg starts from scratch until seeds are promoted (#385).
+            mkdir -p "fuzz/${corpus}"
             # FIRST replay the committed regression seeds deterministically (-runs=0: execute each
             # input once, mutate nothing), so a seed that now crashes fails fast and reproducibly.
             # `--target x86_64-unknown-linux-gnu` is REQUIRED: cargo-fuzz is binstalled as a
