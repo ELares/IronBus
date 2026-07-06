@@ -20,3 +20,7 @@ pub mod registry;
 pub mod rss;
 pub mod server;
 pub mod session;
+// TLS 1.3 transport config (ADR-0004, #766) — compiled only under `--features tls`; the default and
+// edge-min builds carry no TLS code and no new C (deny.toml's aws-lc-sys allowance is feature-scoped).
+#[cfg(feature = "tls")]
+pub mod tls;

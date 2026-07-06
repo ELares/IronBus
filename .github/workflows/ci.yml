@@ -44,7 +44,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          # Linux is the broker's platform: run the FULL feature matrix, INCLUDING `tls` (rustls +
+          # aws-lc-rs, ADR-0004). ubuntu-latest ships cmake, which aws-lc-sys's vendored-C build needs.
+          - os: ubuntu-latest
+            featureflags: "--all-features"
+          # Windows is a client/tooling platform. Run every feature EXCEPT `tls`: aws-lc-sys's
+          # vendored-C build is validated on the Linux leg (the broker target), and forcing it onto
+          # the Windows runner (NASM/MSVC) adds cross-platform C-build risk for no coverage gain — the
+          # TLS 1.3 config is fully exercised on ubuntu. This keeps the existing zstd (vendored-C via
+          # cc) + otlp coverage. UPDATE this list if a new NON-tls feature is added.
+          - os: windows-latest
+            featureflags: "--features zstd,otlp"
     runs-on: ${{ matrix.os }}
     # Bound the known LOAD-DEPENDENT hang (an intermittent raft_cluster deadlock that only
     # reproduces under the full parallel workspace run; passes in isolation) to a 30-minute
@@ -57,7 +68,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo test --workspace ${{ matrix.featureflags }} --locked
 
   acceptance:
     name: golden-path acceptance gate (#133)
