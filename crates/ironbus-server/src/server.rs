@@ -50,6 +50,123 @@ pub(crate) fn set_nodelay_best_effort(stream: &TcpStream) {
     }
 }
 
+/// The per-connection byte stream: plaintext TCP, or — behind `--features tls` (ADR-0004, #766) — a
+/// rustls-terminated TCP carrying a completed TLS 1.3 session. Read/Write flow through the (possibly
+/// TLS) layer; the socket-option methods reach the underlying [`TcpStream`] so the #1045 non-blocking
+/// read pipelining and the slowloris read/write timeouts apply exactly as on a plaintext connection.
+///
+/// The variant is chosen ONCE, in the handler thread, before [`connection_loop`] runs (see
+/// [`TlsTermination::wrap`]); the loop is stream-agnostic from then on.
+enum Wire {
+    /// A plaintext TCP connection (the default, and every connection on a non-tls build).
+    Plain(TcpStream),
+    /// A TLS-terminated connection whose 1.3 handshake already completed. Boxed because
+    /// `StreamOwned` is large (it embeds the whole `ServerConnection`), so the common `Plain` variant
+    /// stays a bare fd-sized value.
+    #[cfg(feature = "tls")]
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+
+impl Wire {
+    /// The underlying accepted TCP socket, for the socket-level options [`connection_loop`] manages
+    /// directly (the #1045 per-read blocking toggle and the slowloris timeouts).
+    fn socket(&self) -> &TcpStream {
+        match self {
+            Wire::Plain(s) => s,
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.get_ref(),
+        }
+    }
+
+    /// Toggle blocking mode on the underlying socket (the #1045 pipelining trick). On a TLS wire this
+    /// composes cleanly: a non-blocking read that finds no COMPLETE TLS record yet returns
+    /// `WouldBlock` with any partial record retained inside rustls, so the next read resumes it — the
+    /// loop's `WouldBlock` handling (drain a parked ack, retry) stays correct. The slowloris read/write
+    /// timeouts are set on the raw socket in `handle_connection` before wrapping (they persist on the
+    /// same fd inside the `Wire`), so they are not re-exposed here.
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.socket().set_nonblocking(nonblocking)
+    }
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.read(buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.write(buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Wire::Plain(s) => s.flush(),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// The server-side TLS terminator threaded through the serve loop (ADR-0004, #766). The DEFAULT (and
+/// every value on a non-tls build) serves plaintext — the type merely keeps the serve signatures
+/// identical across builds. Behind `--features tls`, [`TlsTermination::with_config`] carries a rustls
+/// [`ServerConfig`](rustls::ServerConfig) and every accepted connection completes a TLS 1.3 handshake
+/// (in the HANDLER thread, so a slow handshake never stalls the accept loop) before its session runs.
+#[derive(Clone, Default)]
+pub struct TlsTermination {
+    #[cfg(feature = "tls")]
+    config: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl TlsTermination {
+    /// A terminator that wraps every accepted connection in TLS using `config` (ADR-0004).
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn with_config(config: Arc<rustls::ServerConfig>) -> Self {
+        Self {
+            config: Some(config),
+        }
+    }
+
+    /// Wrap a freshly-accepted socket into a [`Wire`], completing the TLS 1.3 handshake first when a
+    /// config is present. Runs in the HANDLER thread (never the accept loop), so a slow or hostile
+    /// handshake bounds only its own connection (under the already-set slowloris read timeout).
+    #[cfg(feature = "tls")]
+    fn wrap(&self, mut socket: TcpStream) -> std::io::Result<Wire> {
+        match &self.config {
+            Some(config) => {
+                let mut conn = rustls::ServerConnection::new(Arc::clone(config))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                // Drive the handshake to completion on the BLOCKING socket, before any application
+                // bytes and before the loop's non-blocking read trick — so `connection_loop` only ever
+                // sees a completed TLS session. A handshake failure (a plaintext probe, an unverified
+                // client cert once mTLS lands, an unsupported version) returns `Err` here and closes
+                // the connection, exactly as a malformed first frame would on the plaintext path.
+                conn.complete_io(&mut socket)?;
+                Ok(Wire::Tls(Box::new(rustls::StreamOwned::new(conn, socket))))
+            }
+            None => Ok(Wire::Plain(socket)),
+        }
+    }
+
+    /// On a non-tls build there is no crypto stack, so every connection is plaintext.
+    #[cfg(not(feature = "tls"))]
+    #[allow(clippy::unused_self)]
+    fn wrap(&self, socket: TcpStream) -> std::io::Result<Wire> {
+        Ok(Wire::Plain(socket))
+    }
+}
+
 /// Decrements the active-connection count on drop, so the count is released on both a
 /// normal handler return and a panic unwind. Also records the connection CLOSE on the shared connz
 /// metric (#572), so the close is accounted on every exit path (normal return AND panic unwind),
@@ -187,6 +304,7 @@ where
         connz,
         None,
         None,
+        TlsTermination::default(),
     )
 }
 
@@ -228,6 +346,7 @@ where
         connz,
         preauth,
         None,
+        TlsTermination::default(),
     )
 }
 
@@ -253,6 +372,7 @@ pub fn serve_with_auth_connz_preauth_audit<F, C>(
     connz: &Arc<ConnectionMetrics>,
     preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
     audit: Option<crate::audit::AuditEmitter>,
+    tls: TlsTermination,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -269,6 +389,7 @@ where
         connz,
         preauth,
         audit,
+        tls,
     )
 }
 
@@ -313,6 +434,7 @@ where
         &Arc::new(ConnectionMetrics::new()),
         None,
         None,
+        TlsTermination::default(),
     )
 }
 
@@ -333,6 +455,7 @@ fn serve_inner<F, C>(
     connz: &Arc<ConnectionMetrics>,
     preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
     audit: Option<crate::audit::AuditEmitter>,
+    tls: TlsTermination,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -428,6 +551,10 @@ where
                 // OUTCOME and any scope DENIAL through it (carrying the identity NAME, never a
                 // credential). `None` is the no-audit serve path (byte-for-byte historical).
                 let audit_for_conn = audit.clone();
+                // A cheap `Clone` of the TLS terminator (ADR-0004, #766): a shared `Arc<ServerConfig>`
+                // behind the `tls` feature, or a zero-sized plaintext marker otherwise. Each handler
+                // completes its own TLS handshake off the accept loop.
+                let tls_for_conn = tls.clone();
                 // FALLIBLE spawn (#866): `std::thread::spawn` PANICS on a thread-creation refusal
                 // (EAGAIN), which `panic = "abort"` turns into a whole-broker abort. `Builder::spawn`
                 // surfaces it as an `Err` the loop sheds. The connz ACCEPT is recorded INSIDE the handler
@@ -454,6 +581,7 @@ where
                     // `None` when the half-open cap is disabled (no slot to hand over).
                     let _ = handle_connection(
                         stream,
+                        &tls_for_conn,
                         &engine,
                         member_id,
                         auth,
@@ -495,7 +623,8 @@ where
 /// closes or the session ends.
 #[allow(clippy::too_many_arguments)]
 fn handle_connection<F, C>(
-    mut stream: TcpStream,
+    stream: TcpStream,
+    tls: &TlsTermination,
     engine: &EngineHandle<F, C>,
     member_id: MemberId,
     auth: Option<Arc<AuthConfig>>,
@@ -509,19 +638,26 @@ where
     F: Filesystem + Clone + 'static,
     C: Clock + Clone + 'static,
 {
-    stream.set_nonblocking(false)?; // the handler reads blocking
+    stream.set_nonblocking(false)?; // the handler reads blocking (and the TLS handshake needs it)
                                     // Bound how long a stalled client can hold this slot (slowloris defense): a read or
                                     // write that makes no progress within the window errors out and closes the connection.
+                                    // Set on the raw socket BEFORE the TLS handshake so a slow handshake is bounded too.
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
     // Disable Nagle on the accepted data-plane connection (#1028): small-frame request-response
     // traffic (acks, single-in-flight produces) must not wait out delayed-ACK. Best-effort — a
     // failed setsockopt costs latency, never correctness, so it does not close the connection.
     set_nodelay_best_effort(&stream);
+    // Terminate TLS if configured (ADR-0004, #766): completes the TLS 1.3 handshake on the blocking
+    // socket HERE, in the handler thread, so a slow/hostile handshake bounds only this connection
+    // (under the read timeout just set) and never stalls the accept loop. A handshake failure closes
+    // the connection. On the default (plaintext) path `wrap` is a zero-cost `Wire::Plain`. From here
+    // the loop is stream-agnostic.
+    let mut wire = tls.wrap(stream)?;
     // Pin the auth requirement onto the session: with a configured table the `Connect` handshake must
-    // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev). No TLS
-    // peer certificate is available in this PR (the TLS handshake is the flagged follow-up), so the
-    // mTLS SAN identity is `None` for now — an mTLS-mechanism connect fails closed until TLS lands.
+    // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev). The
+    // mTLS SAN identity is `None` for now — the verified client-certificate mapping is the next
+    // increment (#766), so an mTLS-mechanism connect fails closed until then.
     // The connz handle (#572) is attached so a successful `Connect` records the authed-flip.
     let mut session = match auth {
         Some(cfg) => Session::with_member_id_and_auth(member_id, cfg, None),
@@ -550,7 +686,7 @@ where
     // The read/dispatch loop, run to completion so the cleanup below ALWAYS executes on exit:
     // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
     // session, this connection must leave any key_shared group it joined (#64) and flush its cursor.
-    let outcome = connection_loop(&mut stream, engine, &mut session);
+    let outcome = connection_loop(&mut wire, engine, &mut session);
     // Leave any key_shared group (#64) so this member's keys re-route to their new owners (its
     // in-flight records drain or expire, the drain-or-expire guard), then flush its work-group's
     // committed cursor so a clean reconnect resumes past acked messages. Both go through the actor
@@ -623,7 +759,7 @@ where
 /// is reached only when the socket momentarily empties. With an EMPTY window the loop reads BLOCKING
 /// (with the slowloris read timeout), so an idle connection sleeps on the socket instead of spinning.
 fn connection_loop<F, C>(
-    stream: &mut TcpStream,
+    stream: &mut Wire,
     engine: &EngineHandle<F, C>,
     session: &mut Session,
 ) -> std::io::Result<()>
@@ -824,7 +960,7 @@ mod tests {
     /// Reads from `stream` until one complete frame is available, returning its type and
     /// body. `buf` carries leftover bytes between calls so a read that delivers several
     /// frames at once is not lost.
-    fn read_one_frame(stream: &mut TcpStream, buf: &mut Vec<u8>) -> (FrameType, Vec<u8>) {
+    fn read_one_frame(stream: &mut impl Read, buf: &mut Vec<u8>) -> (FrameType, Vec<u8>) {
         let mut chunk = [0u8; 256];
         loop {
             if let Ok(FrameDecode::Frame {
@@ -841,6 +977,131 @@ mod tests {
             assert!(n > 0, "connection closed before a full frame");
             buf.extend_from_slice(&chunk[..n]);
         }
+    }
+
+    // A long-lived (valid 2020..2100) self-signed P-256 server cert for "localhost" + its PKCS#8 key,
+    // the same fixtures `tls::tests` use. Embedded (not rcgen-generated) because rcgen pulls the
+    // deny.toml-banned `ring`; these drive the end-to-end TLS termination test below.
+    #[cfg(feature = "tls")]
+    const TLS_SERVER_CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBVzCB/aADAgECAhMjGIxpQAwb+081fMl2nX2WEMQ8MAoGCCqGSM49BAMCMB4x
+HDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIwIBcNMjAwMTAxMDAwMDAwWhgP
+MjEwMDAxMDEwMDAwMDBaMB4xHDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+AoxgwFjAU
+BgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwIDSQAwRgIhAJ+smDY9Jybx
+FoJDOjOor9Cb56IyQQ64ts0roLO5NVx9AiEAnB1pAliacK3UDfG6xKEig12h4tzf
+UrjVOalNQ4uwFJg=
+-----END CERTIFICATE-----
+";
+    #[cfg(feature = "tls")]
+    const TLS_SERVER_KEY: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWd4kisc5NnK6Nv0I
+RL0rrbnn9ozoIOti7I4eisF3CHWhRANCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
+-----END PRIVATE KEY-----
+";
+
+    /// End-to-end TLS 1.3 TERMINATION (ADR-0004, #766): a rustls client completes a real handshake
+    /// against a broker whose accept loop wraps every connection via [`TlsTermination::with_config`],
+    /// then CONNECTs and PRODUCEs over the ENCRYPTED connection and gets its ack back. This exercises
+    /// the whole accept → handshake → [`connection_loop`] → session → response path over TLS, and
+    /// proves the #1045 non-blocking-read pipelining composes with the rustls record layer.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn a_rustls_client_produces_over_a_tls_terminated_connection() {
+        let (handle, _actor) = spawn_inmem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connz = Arc::new(ConnectionMetrics::new());
+
+        let server_config =
+            crate::tls::server_config_from_pem(TLS_SERVER_CERT, TLS_SERVER_KEY).unwrap();
+        let tls = TlsTermination::with_config(Arc::new(server_config));
+
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let connz = Arc::clone(&connz);
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve_with_auth_connz_preauth_audit(
+                    &listener, &engine, &shutdown, 16, &clock, &beacon, None, &connz, None, None,
+                    tls,
+                )
+                .unwrap();
+            }
+        });
+
+        // The client verifies the broker against the embedded cert (mandatory server verification),
+        // completes a TLS 1.3 handshake, and exchanges framed requests over the encrypted stream.
+        let client_config = crate::tls::client_config_from_pem(TLS_SERVER_CERT).unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut conn = rustls::ClientConnection::new(Arc::new(client_config), name).unwrap();
+        let mut sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut tls_stream = rustls::Stream::new(&mut conn, &mut sock);
+
+        let mut buf = Vec::new();
+        tls_stream
+            .write_all(&frame(FrameType::Connect, b""))
+            .unwrap();
+        assert_eq!(read_one_frame(&mut tls_stream, &mut buf).0, FrameType::Info);
+        // The negotiated transport is exactly TLS 1.3 (docs/TRANSPORT.md §1.1).
+        assert_eq!(
+            tls_stream.conn.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3),
+            "the terminated connection must be TLS 1.3"
+        );
+
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"produced-over-tls",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        tls_stream
+            .write_all(&frame(FrameType::Pub, &pub_body))
+            .unwrap();
+        assert_eq!(
+            read_one_frame(&mut tls_stream, &mut buf).0,
+            FrameType::PubAck,
+            "a produce over the TLS-terminated connection must be acked"
+        );
+
+        // Consume the produced message BACK over the same TLS connection: a Flow grant yields a
+        // multi-frame Deliver + FlowEnd response, proving the response-write path (larger, multi-frame
+        // payloads) flows correctly through the rustls record layer, not just a single small ack.
+        tls_stream
+            .write_all(&frame(FrameType::Flow, &1u32.to_le_bytes()))
+            .unwrap();
+        let (ty, body) = read_one_frame(&mut tls_stream, &mut buf);
+        assert_eq!(ty, FrameType::Deliver, "a Flow grant must deliver over TLS");
+        let delivered = decode_deliver(&body).unwrap();
+        assert_eq!(
+            delivered.payload, b"produced-over-tls",
+            "the payload must round-trip byte-for-byte through TLS"
+        );
+        assert_eq!(
+            read_one_frame(&mut tls_stream, &mut buf).0,
+            FrameType::FlowEnd
+        );
+
+        // Stop the accept loop and join it; the detached handler drains when the client drops at scope end.
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
     }
 
     #[test]
@@ -1082,6 +1343,7 @@ mod tests {
                     &connz,
                     None,
                     None,
+                    TlsTermination::default(),
                 )
                 .unwrap();
             }
@@ -1313,6 +1575,7 @@ mod tests {
                     &connz,
                     Some(guard),
                     Some(audit),
+                    TlsTermination::default(),
                 )
                 .unwrap();
             }
@@ -1459,6 +1722,7 @@ mod tests {
                 let connz = Arc::new(ConnectionMetrics::new());
                 handle_connection(
                     stream,
+                    &TlsTermination::default(),
                     &engine,
                     MemberId::new(0),
                     None,
