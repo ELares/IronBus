@@ -87,6 +87,13 @@ Each row answers one operator question:
 | `IronbusConsumerTruncation` | `truncations_total` rises | a live consumer lost a span of records |
 | `IronbusRecoveryDataLoss` | `recovery_data_loss_bytes > 0` | the last restart lost previously-durable data |
 
+Each **act-now** alert has a response runbook. `IronbusWriterFrozen` → the frozen-writer
+runbook, [RECOVERY.md section 8.6](RECOVERY.md#86-the-runbook-the-writer-froze) (a fatal fsync
+fail-stopped the writer to hold "acked ⇒ durable"; recovery is fix-storage-then-restart, since
+a freeze is terminal and cannot self-thaw). `IronbusForceReapDataLoss` /
+`IronbusConsumerTruncation` / `IronbusRecoveryDataLoss` → the data-loss and segment runbooks,
+[RECOVERY.md sections 8.1 and 8.4](RECOVERY.md).
+
 Warnings cover degrading-but-not-down posture: `IronbusPowerLossUnsafe` (relaxed
 durability is active), `IronbusFsyncP99High` (> 6 ms SLO), `IronbusConsumerLagHigh`,
 `IronbusRedeliveryStorm`, `IronbusDeadLettering`, `IronbusBackpressureShedding`,
