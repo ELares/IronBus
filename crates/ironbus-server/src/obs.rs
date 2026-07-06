@@ -3,8 +3,11 @@
 //!
 //! IronBus instruments with the `tracing` crate. A JSON log layer is compiled in BY DEFAULT
 //! (`init_tracing`), so an operator gets structured, machine-parseable logs with no extra build
-//! flags. ERROR and WARN events (the corruption-skip, freeze, and drop signals #16 forbids being
-//! silent) are ALWAYS recorded regardless of the sampling rate, so a brownout is never sampled out.
+//! flags. The layer records any ERROR/WARN event regardless of the sampling rate, so an emitted
+//! error is never sampled out. HONESTY NOTE: the corruption-skip, writer-freeze, and drop signals
+//! #16 forbids being silent are surfaced today as METRICS + the loss report — dedicated log EVENTS
+//! for them are not emitted yet (tracked #1074); a broker PANIC does emit a structured JSON line
+//! (`install_panic_hook`, #1080).
 //!
 //! OTLP span export is FEATURE-GATED behind the non-default `otlp` Cargo feature and OFF at runtime
 //! by default: the default-shipped binary and the size-optimized `edge-min` build carry ZERO

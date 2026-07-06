@@ -2,8 +2,22 @@
 
 IronBus is maintainer-led. A small group of maintainers stewards the project,
 reviews and merges pull requests, and is responsible for keeping the design
-coherent. Every change still follows the contribution process: green CI plus an
-independent review before merge.
+coherent.
+
+**Honesty note on review, today.** The project currently has ONE maintainer, so
+"an independent human review before merge" is not yet possible for the
+maintainer's own changes and is therefore not claimed. The practiced bar for
+every merge is: green CI across the full gate battery (fmt, clippy `-D
+warnings`, multi-OS tests, fuzz smoke, acceptance, supply-chain, format-registry,
+and the rest), plus a written adversarial review on the PR (independent review
+lenses run against the diff before merge — findings addressed, not waved off).
+EXTERNAL contributions do receive an independent review by definition (the
+maintainer is not the author). Standing up a second maintainer — at which point
+maintainer PRs also require an approving review from someone other than the
+author, enforced by branch protection including administrators — is tracked as
+[#1077](https://github.com/ELares/IronBus/issues/1077). This section states
+practice as it is; the stricter rule becomes the documented bar the day it is
+enforceable.
 
 ## Independence (org-agnostic)
 

@@ -27,8 +27,12 @@ group plus pull-replication whose background cost tracks **nodes and traffic, ne
 inverse of the design that limits NATS today.
 
 We have no installed customer base, so we are free to rearchitect. Every feature is justified by Big-O
-and first principles; every milestone ships under PR + fresh-eyes review + CI-green + an on-device
-benchmark versus NATS JetStream **and** Core (and a multi-node rig for the cluster work).
+and first principles; every milestone ships under PR + adversarial review + the full CI gate battery +
+an on-device benchmark versus NATS JetStream **and** Core (and a multi-node rig for the cluster work).
+("Adversarial review" stated precisely, per GOVERNANCE.md's honesty note: with a single maintainer
+today this means independent review lenses run against the diff on the PR, findings addressed before
+merge — not yet an independent human approver; that stricter bar arrives with a second maintainer,
+#1077.)
 
 The single-node tenets are unchanged and remain the tie-breaker order:
 **Resilient > Simple > Edge First > HyperScale > Cross Platform** (see [the tenets in the README](../README.md#the-five-tenets)).

@@ -50,9 +50,15 @@ Every pull request needs two things before it can merge:
    - `DCO sign-off`: every commit on the PR carries a `Signed-off-by:` trailer
      (see the Developer Certificate of Origin section below).
    - `actionlint`: every workflow passes schema, expression, and shell linting.
-2. **An independent review.** Green CI is necessary but not sufficient. A
-   maintainer other than the author must review and approve before merge. CI
-   being green is never on its own a reason to merge.
+2. **A review beyond green CI.** Green CI is necessary but not sufficient; CI
+   being green is never on its own a reason to merge. For an EXTERNAL
+   contribution, a maintainer (who is not the author) reviews and approves
+   before merge. For the sole maintainer's own changes there is currently no
+   second maintainer to review them (see GOVERNANCE.md's honesty note): the
+   practiced bar is a written adversarial review on the PR — independent review
+   lenses run against the diff, findings addressed before merge. Author-blind
+   review for ALL changes becomes the enforced rule when a second maintainer
+   exists (#1077).
 
    A weekly scheduled scan (`.github/workflows/advisory-scan.yml`) additionally
    re-runs `cargo deny check advisories` against the committed `Cargo.lock` and
