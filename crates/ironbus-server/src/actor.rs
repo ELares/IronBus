@@ -1159,6 +1159,18 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         true
     }
 
+    /// Whether the append actor is still RUNNING (#922): a cheap LOCAL, non-blocking atomic read of the
+    /// shared `actor_alive` flag (#949) — `true` while [`run_actor`] runs, flipped `false` by its drop
+    /// guard on return OR unwind (a PANIC also clears it). The DEFAULT impl returns `true` (no actor /
+    /// an in-process test fixture is assumed live), mirroring [`EngineAccess::writer_appears_healthy`];
+    /// [`EngineHandle`] overrides it to read the shared flag. The health server uses this to flip
+    /// `/readyz` (and, outside a drain, `/healthz`) to 503 on an UNEXPECTED actor death — the case the
+    /// watchdog cannot see when the actor died IDLE (`processing_since == 0`) or the watchdog is
+    /// disabled, and the frozen-writer flag cannot see either (a dead actor publishes nothing).
+    fn actor_alive(&self) -> bool {
+        true
+    }
+
     /// The CLUSTER produce-ack decision (#719) for one durable produce on connection `member`: called
     /// AFTER the local group-commit fsync returned `Appended(offset)`, with the `offset`, and the EXACT
     /// wire-`PubAck` frame bytes the session would otherwise write now.
@@ -1302,6 +1314,14 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         // (#862): `/readyz` reads this instead of `engine.with(|e| e.is_healthy())`, so a hung writer
         // can never block the health server. `true` for a fresh broker that has run no batch yet.
         self.actor_watchdog.writer_healthy()
+    }
+
+    fn actor_alive(&self) -> bool {
+        // A non-blocking atomic read of the shared liveness flag (#949): `true` while `run_actor`
+        // runs, flipped `false` by its drop guard on return OR unwind. `/readyz` (and `/healthz`
+        // outside a drain) read this to catch an UNEXPECTED actor death the watchdog misses when the
+        // actor died idle or the bound is disabled (#922). Never goes through the actor.
+        self.actor_alive.load(Ordering::Acquire)
     }
 
     fn client_ack_disposition(
@@ -3857,6 +3877,46 @@ mod tests {
         assert!(
             handle.with(|e| e.flushed_offset()).is_err(),
             "with on a gone actor errors"
+        );
+    }
+
+    #[test]
+    fn actor_alive_reads_true_while_running_and_false_after_a_graceful_exit() {
+        // #922: the shared liveness flag is the health server's ONLY non-blocking way to see a gone
+        // actor (the watchdog misses an idle death; the frozen-writer flag freezes at its last value).
+        // Happy path: a running actor reads alive; the normal shutdown drop-guard flips it.
+        let (handle, actor, _control) = rig();
+        assert!(
+            EngineAccess::actor_alive(&handle),
+            "a running actor reads alive"
+        );
+        handle.shutdown().unwrap().unwrap();
+        actor.join().unwrap();
+        assert!(
+            !EngineAccess::actor_alive(&handle),
+            "the drop guard flips the flag on a graceful exit"
+        );
+    }
+
+    #[test]
+    fn actor_alive_flips_false_when_the_actor_panics() {
+        // #922's hard case: an UNEXPECTED actor death (a panic mid-job) with the watchdog idle. The
+        // ActorAliveGuard flips the flag on UNWIND (Drop runs during a panic), so the health server
+        // sees the death without any actor round-trip. The `with` reply channel is a fresh (unpooled)
+        // pair, so the caller observes a typed ActorGone from the disconnect — never a hang.
+        let (handle, actor, _control) = rig();
+        let result: Result<(), ActorGone> = handle.with(|_| panic!("injected actor death (#922)"));
+        assert!(
+            matches!(result, Err(ActorGone)),
+            "the with() whose job panicked surfaces ActorGone"
+        );
+        assert!(
+            actor.join().is_err(),
+            "the actor thread really panicked (join reports the unwind)"
+        );
+        assert!(
+            !EngineAccess::actor_alive(&handle),
+            "the drop guard flips the flag on a PANIC exit too"
         );
     }
 
