@@ -59,8 +59,10 @@ use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::cluster::client_ack::{ClientAckGate, ClusterProduceRouting};
 use crate::cluster::dataplane::{AckDisposition, FollowerReadOutcome};
@@ -73,6 +75,17 @@ use ironbus_core::keyshared::MemberId;
 /// the queued work rather than buffering without limit. It does not cap the GROUP size (the actor
 /// drains everything available each pass); it caps the un-drained backlog.
 pub const DEFAULT_CHANNEL_BOUND: usize = 1024;
+
+/// How long [`ProduceSubmission::wait`] parks per `recv_timeout` slice before it re-checks the shared
+/// `actor_alive` flag (#949). It bounds ONLY the latency to detect a departed actor on the residual
+/// shutdown race (a produce whose reply the exiting actor never sent, whose co-located `channel.tx`
+/// keeps the reply channel open so a plain `recv` would block FOREVER); it does NOT add latency to a
+/// normal produce, because `recv_timeout` returns the instant the actor sends the outcome (the fast
+/// path is unchanged — a value always wakes the wait immediately). A produce that legitimately blocks
+/// longer than this (a slow covering fsync) simply re-loops after a cheap flag load; the interval is
+/// long enough that such spurious wakeups are negligible on the hot path, short enough that a wedged
+/// producer learns [`ActorGone`] promptly at shutdown.
+const WAIT_ACTOR_ALIVE_POLL: Duration = Duration::from_millis(250);
 
 /// One recycled produce reply channel: a paired bounded `sync_channel(1)` (#475). The pool keeps the
 /// pair together so the SAME channel can carry one publish's outcome after another WITHOUT a fresh
@@ -304,6 +317,14 @@ pub enum ProduceSubmission {
         /// strictly after the covering commit), and each recycled channel carries exactly one outcome,
         /// so FIFO ack order (#917) and ack-implies-durable (I2) are unaffected by construction.
         spin: bool,
+        /// The shared actor-liveness flag (#949): `true` while the append actor runs, flipped to
+        /// `false` by the actor thread's drop guard when [`run_actor`] returns (or unwinds). This is
+        /// the ONLY way `wait` can detect actor departure on the produce path — the recycled channel's
+        /// co-located `tx` (still held right here in `channel`) keeps the reply channel OPEN, so a
+        /// plain `recv` never observes a disconnect and would wedge forever on a produce the exiting
+        /// actor abandoned reply-less (the residual shutdown race #802's review surfaced). The `Arc` is
+        /// SHARED across every connection's [`EngineHandle`] clone (one flag per actor).
+        actor_alive: Arc<AtomicBool>,
     },
 }
 
@@ -341,7 +362,10 @@ const REPLY_SPIN_MICROS: u64 = 100;
 /// plain `recv` — the channel carries exactly ONE outcome, sent by the actor only after the covering
 /// commit (I2), so polling cannot reorder, duplicate, or early-observe anything; only the WAKE
 /// mechanics differ (a poll hit skips the scheduler wake a park would need).
-fn recv_spin_then_park(rx: &Receiver<ProduceOutcome>) -> Result<ProduceOutcome, ActorGone> {
+fn recv_spin_then_park(
+    rx: &Receiver<ProduceOutcome>,
+    actor_alive: &AtomicBool,
+) -> Result<ProduceOutcome, ActorGone> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_micros(REPLY_SPIN_MICROS);
     loop {
         match rx.try_recv() {
@@ -353,10 +377,46 @@ fn recv_spin_then_park(rx: &Receiver<ProduceOutcome>) -> Result<ProduceOutcome, 
         }
         if std::time::Instant::now() >= deadline {
             // Window exhausted (the reply is slower than a wake is worth spinning for): park in the
-            // blocking recv, byte-for-byte the historical wait.
-            return rx.recv().map_err(|_| ActorGone);
+            // SLICED recv (#949) — the same wait as the non-spin tier, so a departed actor is
+            // detected here too instead of wedging forever on the open co-located channel.
+            return recv_sliced(rx, actor_alive);
         }
         std::hint::spin_loop();
+    }
+}
+
+/// Parks on the produce reply channel in bounded [`WAIT_ACTOR_ALIVE_POLL`] slices, consulting the
+/// shared `actor_alive` flag between slices (#949). A delivered outcome ALWAYS wins (the recv is
+/// checked first, and re-checked once after a dead-flag observation), so a real ack released just
+/// before the actor exited is never lost to a spurious [`ActorGone`] (I2). Detecting departure needs
+/// this flag, not a channel disconnect: the recycled channel's co-located `tx` (#475) keeps the
+/// channel open even when the exiting actor drops its cloned `tx` un-sent.
+fn recv_sliced(
+    rx: &Receiver<ProduceOutcome>,
+    actor_alive: &AtomicBool,
+) -> Result<ProduceOutcome, ActorGone> {
+    loop {
+        match rx.recv_timeout(WAIT_ACTOR_ALIVE_POLL) {
+            Ok(outcome) => return Ok(outcome),
+            // A real disconnect (a non-recycled reply channel, e.g. the direct/test path) is still
+            // `ActorGone`, exactly as before.
+            Err(RecvTimeoutError::Disconnected) => return Err(ActorGone),
+            Err(RecvTimeoutError::Timeout) => {
+                // The actor is still running: the outcome is merely not ready yet (a slow covering
+                // fsync). Re-loop and keep waiting — no latency is added to a normal produce, only a
+                // cheap flag load per slice on a genuinely slow one.
+                if actor_alive.load(Ordering::Acquire) {
+                    continue;
+                }
+                // The actor has exited. Re-check the channel ONCE: it may have released the outcome
+                // and THEN flipped the flag between our timeout and this load, so a real ack still
+                // wins over `ActorGone` (I2 — never lose a durable ack).
+                match rx.try_recv() {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(_) => return Err(ActorGone),
+                }
+            }
+        }
     }
 }
 
@@ -366,8 +426,14 @@ impl ProduceSubmission {
     /// [`ProduceSubmission::Ready`] one it returns immediately.
     ///
     /// # Errors
-    /// Returns [`ActorGone`] if the actor exited before replying, so the session ends the
-    /// connection cleanly rather than hanging on a dead actor.
+    /// Returns [`ActorGone`] if the actor exited before replying. Detecting that on the produce path
+    /// needs the shared `actor_alive` flag, NOT a channel disconnect: the recycled reply channel's
+    /// co-located `tx` (#475) still lives in this submission's `channel`, so the `rx` never observes a
+    /// disconnect even when the actor drops its cloned `tx` un-sent. So this recv's in bounded slices
+    /// and, on a slice that times out with no outcome, consults `actor_alive` — flipped `false` by the
+    /// actor's drop guard on exit — to return [`ActorGone`] instead of wedging forever (#949, closing
+    /// the residual #802 race). A delivered outcome ALWAYS wins the flag (recv is checked first), so a
+    /// real ack released just before the actor exited is never lost to a spurious `ActorGone` (I2).
     pub fn wait(self) -> Result<ProduceOutcome, ActorGone> {
         match self {
             ProduceSubmission::Ready(outcome) => Ok(outcome),
@@ -375,17 +441,19 @@ impl ProduceSubmission {
                 channel,
                 pool,
                 spin,
+                actor_alive,
             } => {
-                // Recv the ONE outcome the actor sent after the covering fsync (I2); the original `tx`
-                // half still lives in `channel`, so a clean recv yields the value rather than seeing a
-                // spurious disconnect. ActorGone only if the actor dropped its cloned `tx` un-sent
-                // (it exited before replying), which closes the channel. On the no-pre-ack-fsync tiers
-                // (`spin`, #1032) the recv is spin-assisted: a bounded busy-poll observes the reply
-                // without the second scheduler wake, then falls back to the identical blocking recv.
+                // Recv the ONE outcome the actor sends after the covering fsync (I2). A plain `recv`
+                // cannot detect actor departure here — the co-located `tx` in `channel` keeps the
+                // channel OPEN, so it would block forever on a produce the exiting actor abandoned
+                // reply-less. BOTH tiers therefore park in bounded slices with an actor-liveness
+                // check ([`recv_sliced`], #949): the no-pre-ack-fsync tiers (`spin`, #1032) first
+                // busy-poll the reply for the bounded spin window — the same hot fast path as before
+                // — and fall back to the identical sliced park when the window expires.
                 let outcome = if spin {
-                    recv_spin_then_park(&channel.rx)?
+                    recv_spin_then_park(&channel.rx, &actor_alive)?
                 } else {
-                    channel.rx.recv().map_err(|_| ActorGone)?
+                    recv_sliced(&channel.rx, &actor_alive)?
                 };
                 // The channel is now drained and ready: return the intact pair to the pool so the next
                 // publish reuses it instead of allocating a fresh one (#475).
@@ -421,6 +489,7 @@ impl ProduceSubmission {
                 channel,
                 pool,
                 spin,
+                actor_alive,
             } => match channel.rx.try_recv() {
                 // The outcome is here: recycle the drained channel (#475) and hand it back.
                 Ok(outcome) => {
@@ -434,6 +503,7 @@ impl ProduceSubmission {
                     channel,
                     pool,
                     spin,
+                    actor_alive,
                 })),
                 // The actor exited before replying (it dropped its cloned `tx` un-sent): map it exactly
                 // like `wait`'s recv error so the session ends the connection cleanly.
@@ -462,6 +532,9 @@ impl ProduceSubmission {
             pool: Arc::new(Mutex::new(Vec::new())),
             // No spin: the test drives readiness explicitly, so the wait mechanics are irrelevant.
             spin: false,
+            // A standing-alive flag: these deterministic tests have no real actor whose departure
+            // the sliced wait (#949) would need to detect.
+            actor_alive: Arc::new(AtomicBool::new(true)),
         };
         (submission, tx)
     }
@@ -602,6 +675,13 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// Shared on clone (like `cap_gate`): one watchdog per actor. Disabled (`bound == 0`) until the
     /// serve path sets the bound via [`set_actor_watchdog_bound`](Self::set_actor_watchdog_bound).
     actor_watchdog: Arc<ActorWatchdog>,
+    /// The shared actor-liveness flag (#949): `true` while the append actor runs, flipped `false` by
+    /// the actor thread's drop guard when [`run_actor`] returns or unwinds. A [`ProduceSubmission::Pending`]
+    /// captures a clone so [`ProduceSubmission::wait`] can detect actor departure DESPITE the recycled
+    /// reply channel's co-located `tx` keeping the channel open — the fix for the residual shutdown race
+    /// where a produce whose reply the exiting actor never sent would otherwise wedge forever. Shared on
+    /// clone (like `cap_gate`): one flag per actor.
+    actor_alive: Arc<AtomicBool>,
 }
 
 /// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
@@ -631,6 +711,8 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             client_ack: self.client_ack.clone(),
             // The SAME shared actor-progress watchdog (#862): one per actor, read by the health server.
             actor_watchdog: Arc::clone(&self.actor_watchdog),
+            // The SAME shared actor-liveness flag (#949): one per actor, observed by a pending wait.
+            actor_alive: Arc::clone(&self.actor_alive),
         }
     }
 }
@@ -751,6 +833,9 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
             // The no-pre-ack-fsync tiers get the spin-assisted wait (#1032); the sync tier parks
             // exactly as before (fixed at spawn time, see the field's doc).
             spin: self.reply_spin,
+            // Capture the shared liveness flag so `wait` can detect actor departure despite the
+            // recycled channel's co-located `tx` keeping the reply channel open (#949).
+            actor_alive: Arc::clone(&self.actor_alive),
         })
     }
 
@@ -1582,9 +1667,20 @@ where
     let actor_watchdog = Arc::new(ActorWatchdog::new(0));
     let actor_watchdog_thread = Arc::clone(&actor_watchdog);
     let actor_clock = clock.clone();
+    // The shared actor-liveness flag (#949): `true` now, flipped `false` by the drop guard below when
+    // the actor thread's closure returns OR unwinds, so a `ProduceSubmission::wait` parked on a produce
+    // the exiting actor abandoned reply-less (the residual #802 shutdown race) observes the departure and
+    // returns `ActorGone` instead of blocking forever behind the recycled channel's co-located `tx`.
+    let actor_alive = Arc::new(AtomicBool::new(true));
+    let actor_alive_thread = Arc::clone(&actor_alive);
     let join = std::thread::Builder::new()
         .name("ironbus-append-actor".to_string())
         .spawn(move || {
+            // Flip the liveness flag `false` when this closure ends by ANY path — a normal `run_actor`
+            // return (drop/Shutdown drain) or a panic unwind — so a waiting producer is never wedged by
+            // a departed actor (#949). Bound to a local so it outlives the `run_actor` call and drops at
+            // scope end, AFTER the returned engine is computed.
+            let _actor_alive_guard = ActorAliveGuard(actor_alive_thread);
             run_actor(
                 engine,
                 &rx,
@@ -1617,9 +1713,25 @@ where
             client_ack: None,
             // The shared actor-progress watchdog (#862), disabled until the serve path arms its bound.
             actor_watchdog,
+            // The shared actor-liveness flag (#949), observed by a pending produce's `wait`.
+            actor_alive,
         },
         join,
     )
+}
+
+/// Flips the shared actor-liveness flag `false` when the append actor thread's closure ends by ANY
+/// path — a clean [`run_actor`] return (a `Shutdown`/drop drain) or a panic unwind (#949). Held as a
+/// local in the actor closure, so its `Drop` is the single point that publishes "the actor is gone" to
+/// every [`ProduceSubmission::wait`] parked on a reply the exiting actor never sent. A `Release` store
+/// pairs with the `Acquire` load in `wait`, so a producer that sees the flag cleared also sees any
+/// outcome the actor released before it exited (that outcome still wins — `wait` recv's first).
+struct ActorAliveGuard(Arc<AtomicBool>);
+
+impl Drop for ActorAliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Refreshes the connection-thread fast-reject gate (#476) AND reconciles its fast-reject count into
@@ -3745,6 +3857,89 @@ mod tests {
         assert!(
             handle.with(|e| e.flushed_offset()).is_err(),
             "with on a gone actor errors"
+        );
+    }
+
+    #[test]
+    fn a_pending_wait_returns_actorgone_when_the_actor_exited_un_replied() {
+        // #949 (the residual #802 shutdown race): a `Command::Produce` whose reply the exiting actor
+        // never sent leaves a `Pending` submission whose recycled reply channel STILL holds its
+        // co-located `tx` (#475), so a plain `rx.recv()` would block FOREVER (the channel never
+        // disconnects). The shared `actor_alive` flag — `false` once the actor's drop guard ran — is
+        // what lets `wait` return the typed `ActorGone` instead of wedging. Build that exact state
+        // directly: a pooled channel with NO outcome ever sent, and a flag already flipped `false`.
+        //
+        // MUTATION CHECK: revert `wait` to the pre-fix `channel.rx.recv()` and this test HANGS forever
+        // (the co-located `tx` keeps the channel open), so it strictly discriminates the fix.
+        let pool: ReplyPool = Arc::new(Mutex::new(Vec::new()));
+        let channel = pool_take(&pool);
+        let actor_alive = Arc::new(AtomicBool::new(false));
+        let submission = ProduceSubmission::Pending {
+            channel,
+            pool: Arc::clone(&pool),
+            spin: false,
+            actor_alive,
+        };
+        assert!(
+            matches!(submission.wait(), Err(ActorGone)),
+            "a pending produce whose actor exited un-replied must return ActorGone, not wedge"
+        );
+    }
+
+    #[test]
+    fn a_pending_wait_delivers_a_sent_outcome_even_after_the_actor_marks_itself_gone() {
+        // I2 GUARD for the #949 fix: a delivered outcome ALWAYS wins the liveness flag. The actor
+        // released the ack (the produce IS durable) and only THEN flipped `actor_alive` false as it
+        // exited; `wait` recv's the outcome FIRST, so it must return that ack — never a spurious
+        // `ActorGone` that would tell a producer its durable record was lost.
+        //
+        // MUTATION CHECK: make `wait` consult the flag BEFORE recv'ing (return `ActorGone` on a false
+        // flag without draining the channel) and this test fails — the buffered ack is dropped.
+        let pool: ReplyPool = Arc::new(Mutex::new(Vec::new()));
+        let channel = pool_take(&pool);
+        channel
+            .tx
+            .send(ProduceOutcome::Appended(Offset::new(7)))
+            .unwrap();
+        let actor_alive = Arc::new(AtomicBool::new(false));
+        let submission = ProduceSubmission::Pending {
+            channel,
+            pool: Arc::clone(&pool),
+            spin: false,
+            actor_alive,
+        };
+        assert!(
+            matches!(submission.wait(), Ok(ProduceOutcome::Appended(o)) if o == Offset::new(7)),
+            "a released ack must win the liveness flag (never lose a durable ack to ActorGone)"
+        );
+        // The channel recycled back to the pool after the successful wait (#475).
+        assert_eq!(
+            pool.lock().unwrap().len(),
+            1,
+            "the drained channel recycles"
+        );
+    }
+
+    #[test]
+    fn a_spinning_pending_wait_also_returns_actorgone_when_the_actor_exited() {
+        // The SPIN tier (#1032) composes with the #949 liveness fix: its bounded busy-poll falls
+        // back to the SAME sliced park, so a no-pre-ack-fsync connection whose actor died un-replied
+        // gets the typed `ActorGone` too instead of wedging in the historical bare `recv` fallback
+        // (the co-located `tx` keeps the channel open there exactly as on the sync tier).
+        //
+        // MUTATION CHECK: revert `recv_spin_then_park`'s fallback to `rx.recv()` and this test HANGS.
+        let pool: ReplyPool = Arc::new(Mutex::new(Vec::new()));
+        let channel = pool_take(&pool);
+        let actor_alive = Arc::new(AtomicBool::new(false));
+        let submission = ProduceSubmission::Pending {
+            channel,
+            pool: Arc::clone(&pool),
+            spin: true,
+            actor_alive,
+        };
+        assert!(
+            matches!(submission.wait(), Err(ActorGone)),
+            "a spin-tier pending produce whose actor exited must return ActorGone, not wedge"
         );
     }
 
