@@ -19,6 +19,12 @@ of bounds.
 | `frame_decode` | `ironbus_proto::frame::decode_frame` | The length-framed wire decoder reads bytes straight off a client socket. |
 | `cursor_snapshot` | `ironbus_core::cursor::AckCursor::decode_snapshot` | A torn or hostile durable checkpoint payload must not crash recovery. |
 | `segment_scan` | `ironbus_storage::segment::SegmentReader` scan and recovery | The most security-critical parser: it runs on every startup over on-disk bytes a power cut may have corrupted. |
+| `connect_auth_section` | `ironbus_proto::message::parse_connect_auth` | The auth section of the `Connect` body, parsed on a NOT-YET-AUTHENTICATED connection — the most hostile input position (a panic here under `panic = "abort"` is an unauthenticated remote kill). |
+| `password_material` | `ironbus_proto::message::unpack_password_material` | Splits attacker-supplied credential bytes before the Argon2id verify, on the same pre-auth path. |
+
+The table above is representative, not exhaustive — CI derives the full target set from
+`fuzz_targets/*.rs` at run time (see [CI](#ci)), so adding a target here never requires
+touching a hardcoded list and can never silently orphan a parser.
 
 ## Running locally
 

@@ -163,6 +163,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "connect_auth_section"
+path = "fuzz_targets/connect_auth_section.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "password_material"
+path = "fuzz_targets/password_material.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace (which is `crates/*`): a cargo-fuzz crate must build with the
 # nightly sanitizer toolchain, separately from the merge-blocking stable workspace.
 [workspace]
