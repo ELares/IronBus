@@ -63,6 +63,22 @@ wildcards = "deny"
 # `scripts/ci/cffi-ban.sh` STRUCTURAL guard still bans zstd-sys/zstd on the DEFAULT graph it scopes
 # to, so the default build can never acquire the C-FFI silently; the allowance is feature-only.
 #
+# THE OPT-IN TLS C-FFI ALLOWANCE (ADR-0004, #766/#107). The owner ratified TLS 1.3 behind the
+# NON-DEFAULT `tls` Cargo feature of ironbus-server, whose crypto provider is `aws-lc-rs` (rustls's
+# default, best-audited, FIPS-capable). `aws-lc-sys` (the vendored AWS-LC C binding, `links` + a
+# `cc`/`cmake` build) is therefore the SECOND explicitly-allowed C-FFI under a feature, applying the
+# zstd precedent above: it is DELIBERATELY NOT name-banned (the ban entry was removed) because
+# cargo-deny resolves `all-features` and would otherwise reject the tls tree. It is licensed
+# `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND ...` — every component is
+# on the allow-list above, so NO license exception is needed. It builds VENDORED + STATIC (aws-lc-sys
+# compiles its bundled AWS-LC C with cc/cmake, no system libcrypto), matching the zstd-sys static
+# posture. `rustls` is built `default-features = false` with only `aws_lc_rs` + `std`, so `ring` is
+# NOT compiled (verified: `ring` is unreachable in the all-features `cargo tree`) and stays banned.
+# The DEFAULT and `edge-min` builds pull NEITHER rustls NOR aws-lc-sys (verified: `cargo tree -i
+# rustls` on the default ironbus-cli graph is empty), so they remain byte-for-byte pure-Rust; the
+# cffi-ban.sh structural guard proves the default graph carries no TLS C-FFI, so the allowance is
+# feature-only exactly like zstd.
+#
 # C-FFI BAN (#102). The best-known vendored-C / native crates are name-banned below as a
 # belt-and-suspenders layer; the STRUCTURAL forward guard is `scripts/ci/cffi-ban.sh` (run by the
 # CI `sbom` job over the shipped musl graph), which also catches an UNKNOWN `links` / C-builder
@@ -90,9 +106,16 @@ name = "lz4-sys" # the C lz4 binding; the default codec is lz4_flex (pure Rust) 
 [[bans.deny]]
 name = "bzip2-sys" # vendored bzip2 C.
 [[bans.deny]]
-name = "ring" # vendored C / assembly crypto; use a pure-Rust / *-rs primitive instead.
-[[bans.deny]]
-name = "aws-lc-sys" # vendored AWS-LC C.
+# vendored C/asm crypto. IronBus's `tls` feature uses aws-lc-rs, NOT ring (ADR-0004). ring stays
+# BANNED and is verified NOT reachable in the all-features graph (it is only an UNBUILT optional of
+# rustls-webpki, whose aws-lc-rs backend is the one compiled), so this ban is a safe belt-and-
+# suspenders guard that also records the deliberate rejection of ring as the provider.
+name = "ring"
+# NOTE: `aws-lc-sys` is DELIBERATELY NOT banned (see THE OPT-IN TLS C-FFI ALLOWANCE comment above): it
+# is the owner-ratified opt-in vendored-C crypto provider behind the NON-DEFAULT `tls` feature
+# (ADR-0004, #766), feature-gated and absent from the DEFAULT `ironbus-cli` graph the cffi-ban.sh +
+# SBOM gates scope to. Exactly the `zstd-sys` pattern: feature-only C-FFI, the default build stays
+# byte-for-byte pure-Rust.
 [[bans.deny]]
 name = "libsqlite3-sys" # vendored SQLite C.
 [[bans.deny]]

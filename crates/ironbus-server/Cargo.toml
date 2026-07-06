@@ -29,6 +29,16 @@ otlp = [
 # OTLP export out entirely and the binary shrinks measurably versus an `otlp` build. It is a marker
 # feature (no extra deps); the compile-out is enforced by it never pulling `otlp`.
 edge-min = []
+# TLS 1.3 transport (ADR-0004, #766/#107). The NON-DEFAULT feature that pulls the rustls TLS stack
+# with the aws-lc-rs crypto provider (the owner-ratified choice, 2026-07-06). Off by default and out
+# of `edge-min`, so the DEFAULT and edge-min builds link ZERO TLS code and ZERO new C — they stay
+# byte-for-byte pure-Rust. Building `--features tls` pulls `rustls` + `aws-lc-rs` (aws-lc-sys's
+# vendored AWS-LC C, cmake-built + static), which is why deny.toml carries a documented, feature-
+# scoped `aws-lc-sys` C-FFI allowance exactly like the approved `zstd-sys` one (ADR-0003), and
+# cffi-ban.sh proves the default graph still has no TLS C-FFI. `default-features = false` on rustls
+# drops its ring-backed webpki path and the tls12 code: IronBus is TLS 1.3-only (docs/TRANSPORT.md),
+# so the shipped tls graph is aws-lc-rs only, never ring.
+tls = ["dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
@@ -189,6 +199,21 @@ opentelemetry-otlp = { version = "0.27", optional = true, default-features = fal
 # build links no tokio. `rt` + `net` + `time` is the minimal surface (a current-thread runtime, the
 # TCP socket, and the batch timer); no `rt-multi-thread`, no `macros`.
 tokio = { version = "1", optional = true, default-features = false, features = ["rt", "net", "time"] }
+
+# TLS 1.3 stack (ADR-0004, the `tls` feature only; the DEFAULT build links none of this). `rustls`
+# 0.23 with the `aws_lc_rs` provider — the owner-ratified crypto backend. `default-features = false`
+# deliberately drops rustls's default `ring` provider AND its `tls12` code: IronBus is TLS 1.3-only
+# (docs/TRANSPORT.md §1.1), so the shipped tls graph carries aws-lc-rs (aws-lc-sys vendored C, the
+# deny.toml feature-scoped allowance) and NEVER ring. `std` for the std IO surface; `logging` off to
+# keep the surface minimal. rustls-webpki's ring dep stays an unbuilt optional in the lock (not in
+# the `cargo tree` build graph), so the compiled tls binary is aws-lc-rs only.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std"] }
+# PEM decoder for the cert chain + private key. This is `rustls-pki-types` (the SAME crate rustls
+# already re-exports as `rustls::pki_types`); its `pem` module (the `PemObject` slice decoders) is
+# gated on `alloc`, enabled here via `std`. This REPLACES the now-unmaintained `rustls-pemfile`
+# (RUSTSEC-2025-0134), whose functionality moved here. Pure Rust, no ring; `tls`-only, off the
+# default graph.
+rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
