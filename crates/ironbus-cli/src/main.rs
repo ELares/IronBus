@@ -8316,6 +8316,10 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         // byte-for-byte the historical accept path. This is the LAST use of `audit`, so move it in
         // (the signal thread already took its own clone).
         Some(audit),
+        // TLS termination (ADR-0004, #766): DEFAULT = plaintext for now. Loading `--tls-cert`/`--tls-key`
+        // into a `TlsTermination::with_config` and stopping the `--tls-*` refusal is the CLI-wiring
+        // follow-up; this PR lands server-side TLS termination in the library (tested via `serve`).
+        ironbus_server::server::TlsTermination::default(),
     )
     .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
     // The wire serve returned: either a stop signal flipped `shutdown` (the signal thread already
