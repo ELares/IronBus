@@ -406,8 +406,49 @@ test in `frame.rs`. They start at 1 and are contiguous.
 | 20  | `PubAckDuplicate` | server to client | the ORIGINAL durable `offset` as an 8-byte LE u64 (a benign dedup hit, #33): same body shape as `PubAck`, `duplicate = true` by the frame type alone, `rc = 0` |
 | 21  | `GapMarker` | server to client | `GapMarkerBody` (25 bytes, below): a permanently-absent offset span `[from, to)` + `bytes_skipped` + reason (#346). The consumer-visible, per-consumer OPT-IN twin of `Truncated` (tag 18); sent only to a consumer that advertised the capability, in place of `Truncated`, so an old consumer never receives it |
 
-`from_u8` returns `None` for tag 0 and for tags 22 and above (unknown, still framed by the
-envelope).
+Tags **22 through 49** were appended after the v1 core set above, under the same append-only
+rule (no existing tag's meaning ever changed). Their authoritative byte-level body layouts
+live in the `ironbus-proto` rustdoc on each variant (the normative encoder/decoder — restating
+all 28 body specs here is the duplication that lets tables rot); this table freezes the tag
+numbers, planes, and purposes:
+
+| tag | FrameType | plane / direction | purpose |
+|-----|-----------|-------------------|---------|
+| 22  | `ProduceConfirm` | server to client | Level-2 consumed-confirmation for an opted-in produce: `offset` (8B LE) + one-byte status (0 consumed, 1 timed-out, 2 dead-lettered) (#494, #497) |
+| 23  | `Fetch` | client to server | batched work-group pull; answered with the existing `Deliver`/advisory frames terminated by one `FlowEnd` (#464) |
+| 24  | `StreamFetch` | client to server | Tier-S offset-addressed window fetch (`start_offset` + caps) (#543) |
+| 25  | `StreamCommit` | client to server | Tier-S cumulative cursor commit for a streaming group (#550) |
+| 26  | `DeliverBatch` | server to client | one contiguous Tier-S run as raw on-disk frame bytes; capability-gated (an old client always gets per-record `Deliver`s) (#541) |
+| 27  | `Raft` | peer only | embedded metadata-Raft message envelope; a client never sends or receives it (#578) |
+| 28  | `StreamDeclare` | client to server | declare/ensure a named stream (#588) |
+| 29  | `StreamInfo` | client to server | named-stream existence + durable head query (#588) |
+| 30  | `PubTo` | client to server | stream-addressed publish (stream id + embedded `PubBody`) (#588) |
+| 31  | `SubTo` | client to server | stream-addressed subscribe (stream id + group) (#588) |
+| 32  | `FetchRecords` | peer only | ISR follower fetch request (`from_offset` + caps); encoder/decoder in `ironbus-server` `cluster::replication` |
+| 33  | `FetchResponse` | peer only | the leader's records + high-watermark reply to `FetchRecords` |
+| 34  | `BindSubject` | client to server | bind a `*`/`>` subject pattern to a named stream; `admin`-scoped under auth (#585) |
+| 35  | `PubSubject` | client to server | publish by literal subject; fail-closed single-home resolution (#585) |
+| 36  | `SubSubject` | client to server | subscribe by literal subject (#585) |
+| 37  | `AckReplicated` | peer only | quorum-`fdatasync` replication ack (releases the withheld cluster `PubAck`) (#719) |
+| 38  | `OffsetForLeaderEpoch` | peer only | KIP-101-style epoch/offset divergence query on the fetch path (#873) |
+| 39  | `SegmentFingerprints` | peer only | sealed-segment footer/CRC fingerprints for divergence self-heal (#612, #613) |
+| 40  | `MirrorPull` | peer only (cross-cluster) | async geo mirror pull request/response (verbatim CRC-framed records) |
+| 41  | `LeafPush` | peer only (leaf to hub) | leaf push replication; the hub re-validates every frame before appending |
+| 42  | `NotLeader` | server to client | typed cluster produce redirect with the leader's client-address hint (#735) |
+| 43  | `CommittedHwQuery` | peer only | committed high-watermark query/response |
+| 44  | `TxnPrepare` | client to server | durably buffer an invisible transactional half message (#640) |
+| 45  | `TxnCommit` | client to server | make a prepared half message visible, exactly once (#640) |
+| 46  | `TxnRollback` | client to server | discard a prepared half message (#640) |
+| 47  | `TxnCheck` | server to client | broker back-check of an in-doubt half message (pass-driven push, like tag 22) (#640) |
+| 48  | `TxnCheckResult` | client to server | the producer's commit/rollback resolution answer (#640) |
+| 49  | `TxnListen` | client to server | bind a transaction-state listener group to this connection (#640) |
+
+`from_u8` returns `None` for tag 0 and for tags 50 and above (unknown, still framed by the
+envelope). The tag map is HASH-PINNED by the registry gate (the `frame-tags-sha256` sentinel
+in [compat/versions.md](compat/versions.md)): a tag addition cannot land without re-pinning
+the registry and updating this table in the same commit. (This paragraph previously froze the
+vocabulary at "22 and above" while the code shipped through 49 — the pin exists so this file
+can never silently contradict `frame.rs` again.)
 
 The dedup-hit response (#33) deliberately uses the NEW append-only tag 20 rather than mutating the
 frozen `PubAck` (tag 14) body: a fresh produce answers `PubAck` (tag 14) and a dedup hit answers

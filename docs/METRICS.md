@@ -750,10 +750,15 @@ so the diagnostics survive a metric rename and a dashboard break.
 ## Tracing and the OTLP export feature gate (#99, #352)
 
 The broker instruments with the `tracing` crate and installs a JSON log layer by
-default at `serve` startup. ERROR and WARN events (the corruption-skip, freeze,
-and drop signals this contract forbids being silent) are always recorded
-regardless of the head-based sampling ratio, which defaults to `0.0` so the
-leanest edge build exports no sampled spans.
+default at `serve` startup. The layer records any ERROR/WARN event regardless of
+the head-based sampling ratio (which defaults to `0.0`, so the leanest edge build
+exports no sampled spans) — sampling can never drop an error that was emitted.
+HONESTY NOTE: the corruption-skip, writer-freeze, and drop signals this contract
+forbids being silent are surfaced today as METRICS (the recovery/loss counters
+above) and the machine-readable loss report — dedicated LOG EVENTS for them do
+not exist yet (`reconcile_writer_freeze` currently logs nothing); emitting them
+is tracked as #1074. A broker panic does emit a structured JSON line (the #1080
+panic hook).
 
 OTLP span export is behind the **non-default** `otlp` Cargo feature on
 `ironbus-server` and is off at runtime by default; the default-shipped binary and

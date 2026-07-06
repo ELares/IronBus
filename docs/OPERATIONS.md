@@ -187,8 +187,17 @@ promote bytes recorded as known-bad (#104, #348):
      --health-addr 127.0.0.1:9090
    wait_ready 127.0.0.1:9090 60
    ```
-   The old binary reads the same on-disk format it always did, so recovery and readiness
-   come up exactly as before. Then clear the counter:
+   The old binary reads the v1 on-disk format it always did — **with one documented
+   exception: COMPACTION**. A compacted segment is stamped `version = 2`
+   (`FORMAT_VERSION_COMPACTED`), which a strictly-older binary REFUSES fail-closed at
+   recovery — so a rollback across a data dir that compaction has touched since the upgrade
+   will refuse to start rather than come up (correct for durability, but it means the
+   rollback is NOT unconditional). There is no v2-segment preflight tool yet — that gap is
+   exactly #1071. Until it lands: compaction is OPT-IN (`--compact`, off by default), so if
+   this broker has ever run with `--compact` on this data dir, do NOT roll the binary back
+   in place — restore from the pre-upgrade backup instead. A dir that has never been
+   compacted is byte-for-byte v1, and recovery and readiness come up exactly as before.
+   Then clear the counter:
    ```sh
    ironbus record-start --dest /usr/bin/ironbus --ok
    ```
