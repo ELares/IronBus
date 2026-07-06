@@ -1,6 +1,6 @@
 # 0004. The TLS 1.3 crypto provider — a scoped, feature-gated aws-lc-rs allowance
 
-- **Status**: Proposed (owner decision required — this ADR exists to make that decision, not to pre-empt it)
+- **Status**: **Accepted** (2026-07-06). The owner ratified Option A — TLS behind a non-default `tls` feature with the `aws-lc-rs` crypto provider, added to `deny.toml` as a documented feature-scoped C-FFI exception exactly like the already-approved `zstd-sys` allowance (ADR-0003). Implementation is sequenced on [#766](https://github.com/ELares/IronBus/issues/766); `deny.toml` acquires the `aws-lc-sys` allowance in the same change that adds the dependency (never before), so the default build can never pick up the C-FFI early.
 - **Owning issue**: [#766](https://github.com/ELares/IronBus/issues/766) (crypto-provider decision + TLS 1.3/mTLS), [#957](https://github.com/ELares/IronBus/issues/957) (client TLS), [#107](https://github.com/ELares/IronBus/issues/107) (transport spec)
 
 ## Context
@@ -53,10 +53,10 @@ best-supported, least-surprising path. The zstd precedent already establishes th
 dependency is compatible with the project's supply-chain posture, so this is an *application* of an
 approved policy, not a new one.
 
-> **This ADR is Proposed, not Accepted.** Adding `aws-lc-sys` reverses a `deny.toml` ban and softens
-> the "pure Rust in every build" reading of the static-binary posture for the TLS-enabled build. That
-> is a values decision reserved to the owner. The three options and their consequences are laid out
-> so the decision can be made deliberately; the recommendation is aws-lc-rs.
+> **Decision record.** Adding `aws-lc-sys` reverses a `deny.toml` ban and softens the "pure Rust in
+> every build" reading of the static-binary posture for the TLS-enabled build — a values decision
+> reserved to the owner. The three options and their consequences were laid out so the decision could
+> be made deliberately; the owner ratified **Option A (aws-lc-rs, feature-scoped)** on 2026-07-06.
 
 ## Consequences
 
