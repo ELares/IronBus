@@ -87,6 +87,12 @@ Commit the new seed. From then on the per-PR replay (below) guards it on every P
 - **Nightly (deep):** the `fuzz` job soaks every target under ASan (180 s/target today,
   rising toward 30 min/target), seeded by the regression corpus. A crash fails the job and
   uploads the input (90-day retention) for triage and promotion.
+- **"Every target" is structural, not aspirational:** both the nightly soak and the per-PR
+  `fuzz-smoke` DERIVE their target list from `fuzz_targets/*.rs` at run time — there is no
+  hardcoded list to forget to update (a hardcoded list once silently orphaned 8 of 21 targets
+  from every lane). A new target is smoke-tested on the PR that adds it and soaked the same
+  night; a target file missing its `Cargo.toml` `[[bin]]` entry fails both lanes loudly. A
+  target with no committed regression corpus yet fuzzes from scratch until seeds are promoted.
 - **Coverage regression:** the nightly `coverage` job emits the workspace line-coverage
   percentage and retains `lcov.info`. The intended "coverage-below-last-release" gate
   (compare to the last released tag's archived coverage, fail on an un-ratified drop) is
