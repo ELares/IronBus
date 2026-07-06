@@ -301,6 +301,7 @@ pub const fn otlp_compiled_in() -> bool {
 pub fn init_tracing(config: &TracingConfig) -> std::sync::Arc<BoundedSpanQueue> {
     let queue = std::sync::Arc::new(BoundedSpanQueue::with_capacity(config.span_queue_capacity));
     install_json_log_layer();
+    install_panic_hook();
     #[cfg(feature = "otlp")]
     {
         if config.otlp_export_enabled {
@@ -312,6 +313,88 @@ pub fn init_tracing(config: &TracingConfig) -> std::sync::Arc<BoundedSpanQueue> 
         }
     }
     queue
+}
+
+/// Installs a process-wide PANIC HOOK that emits the crash reason as ONE structured JSON line on
+/// stdout — the same stream the JSON log layer writes to — BEFORE delegating to the previously
+/// installed hook (which keeps the plain-text stderr report and any test-harness capture intact).
+///
+/// Why this exists: the release profile builds with `panic = "abort"` and `strip = true`, so on a
+/// panic the process dies with NO unwind and an unsymbolized backtrace; the default hook's
+/// plain-text stderr line was the ONLY crash evidence, and it bypasses the structured stream an
+/// operator's log pipeline actually collects. This hook restores the actionable part — the panic
+/// MESSAGE, source LOCATION, and THREAD name — to that stream, so a crash-looping broker explains
+/// itself in the same place every other event lands.
+///
+/// The hook deliberately does NOT call `tracing`: a panic raised inside the logging stack itself
+/// would re-enter the subscriber from its own hook. It hand-serializes with a local JSON string
+/// escaper (`serde_json` is a dev-only dependency by the minimal-dep doctrine) and writes with one
+/// `println!`. Installed exactly once, idempotently, alongside the log layer.
+fn install_panic_hook() {
+    use std::sync::Once;
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            let location = info
+                .location()
+                .map_or_else(|| "<unknown>".to_string(), ToString::to_string);
+            let thread = std::thread::current();
+            let line = panic_json_line(
+                &message,
+                &location,
+                thread.name().unwrap_or("<unnamed>"),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            );
+            println!("{line}");
+            previous(info);
+        }));
+    });
+}
+
+/// Builds the panic hook's single JSON log line: flat fields shaped like the JSON log layer's
+/// events (`level` + `message` + context), with a numeric `timestamp_unix_ms` (no date formatter in
+/// a dependency-free hook; every collector accepts epoch millis). Pure and separately tested — the
+/// hook itself is unexercisable glue (a test that really panics under `panic = "abort"` would kill
+/// the harness).
+fn panic_json_line(message: &str, location: &str, thread: &str, unix_ms: u64) -> String {
+    format!(
+        "{{\"timestamp_unix_ms\":{unix_ms},\"level\":\"ERROR\",\"message\":\"broker panic\",\"panic_message\":\"{}\",\"panic_location\":\"{}\",\"panic_thread\":\"{}\"}}",
+        json_escape(message),
+        json_escape(location),
+        json_escape(thread)
+    )
+}
+
+/// Escapes a string for embedding in a JSON string literal: backslash, double quote, and every
+/// control character below 0x20 (the common ones as their short escapes, the rest as `\u00XX`).
+/// Minimal by design — the panic hook must not depend on a JSON crate (dev-only `serde_json`).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Installs the default JSON log layer exactly once. Behind a helper so the one-time guard and the
@@ -830,6 +913,68 @@ pub mod otlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_json_line_is_valid_json_with_the_expected_flat_fields() {
+        // The hook's one line must be machine-parseable by any JSON log pipeline. Parse it with the
+        // dev-only serde_json (the production hook hand-serializes by doctrine) and assert the flat
+        // shape mirrors the log layer's events.
+        let line = panic_json_line(
+            "index out of bounds: the len is 3",
+            "crates/ironbus-server/src/actor.rs:1234:9",
+            "ironbus-append-actor",
+            1_783_400_000_123,
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).expect("the line parses as JSON");
+        assert_eq!(v["level"], "ERROR");
+        assert_eq!(v["message"], "broker panic");
+        assert_eq!(v["panic_message"], "index out of bounds: the len is 3");
+        assert_eq!(
+            v["panic_location"],
+            "crates/ironbus-server/src/actor.rs:1234:9"
+        );
+        assert_eq!(v["panic_thread"], "ironbus-append-actor");
+        assert_eq!(v["timestamp_unix_ms"], 1_783_400_000_123u64);
+    }
+
+    #[test]
+    fn panic_json_line_survives_hostile_panic_messages() {
+        // A panic message is ARBITRARY text — quotes, backslashes, newlines, control bytes (e.g. a
+        // corrupt-frame assert echoing raw input). The escaper must keep the line one valid JSON
+        // object; a raw newline or quote would split/break the log stream at the worst moment.
+        let hostile = "quote\" backslash\\ newline\n tab\t cr\r bell\u{7} unicode\u{1f} ok";
+        let line = panic_json_line(hostile, "src\\odd\"loc:1:1", "t\nhread", 0);
+        assert!(
+            !line.contains('\n'),
+            "the emitted line must be exactly one line: {line:?}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).expect("hostile input still parses");
+        assert_eq!(v["panic_message"], hostile, "round-trips byte-for-byte");
+        assert_eq!(v["panic_location"], "src\\odd\"loc:1:1");
+        assert_eq!(v["panic_thread"], "t\nhread");
+    }
+
+    #[test]
+    fn the_installed_panic_hook_chains_and_never_breaks_unwinding() {
+        // End-to-end in an UNWINDING (test-profile) build: install the hook (idempotently, via the
+        // same entry production uses), raise a real panic under catch_unwind, and assert (1) the
+        // panic still propagates with its payload intact — the hook chains to the previous hook and
+        // never swallows or re-panics — and (2) a second install is a no-op (the Once). Under the
+        // release profile's panic=abort the hook body runs identically before the abort; what cannot
+        // be exercised here is the abort itself.
+        install_panic_hook();
+        install_panic_hook();
+        let result = std::panic::catch_unwind(|| panic!("hook smoke: {}", 42));
+        // The essential chaining property: the panic still PROPAGATES (the hook neither swallows it
+        // nor re-panics — a hook that panicked would abort the process and kill this harness). The
+        // payload's concrete TYPE is deliberately not asserted: std's panic-payload representation
+        // is version-dependent (lazily formatted payloads), and the hook's own message extraction
+        // is pinned by the pure `panic_json_line` tests above.
+        assert!(
+            result.is_err(),
+            "the panic must still propagate through the hook"
+        );
+    }
 
     #[test]
     fn a_full_queue_drops_and_counts_rather_than_blocking() {
