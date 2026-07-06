@@ -679,6 +679,60 @@ a NATS snapshot has no offline whole-store consistency proof of cursors-vs-log-v
 the manifest self-check plus the `verify` oracle make "this backup restores to a consistent
 dir" a checkable property, not a hope.
 
+### 8.6 The runbook: the writer froze
+
+A **frozen writer** is a deliberate fail-stop, not a crash. When a covering `fsync` (or the
+append behind it) returns a **fatal** storage error — EIO from a failing device, a read-only
+remount, a filesystem fault, or the volume filling at the OS layer — the append actor stops
+writing rather than keep acknowledging produces it can no longer make durable. That preserves
+**I2 (an ack implies the record is durable)**: IronBus would rather refuse than lie. The freeze
+is **terminal for the process** — `begin_async_commit` errors on a frozen writer, so batch N+1
+can never become durable behind it, and the writer **cannot self-thaw**. Recovery is a
+**restart onto healthy storage**, not a wait.
+
+**How you learn about it (there is no freeze log line — detection is a metric + `/readyz`):**
+
+- The `IronbusWriterFrozen` alert fires: `ironbus_writer_healthy == 0` (the **act-now** alert
+  table under [MONITORING.md](MONITORING.md) → Alerts).
+- `/readyz` returns **503 `writer frozen`**, so a load balancer pulls the broker out of
+  rotation (`/healthz` may still be 200 if the event loop is otherwise ticking — readyz is the
+  authoritative freeze signal, see [health.rs](../crates/ironbus-server/src/health.rs)).
+- In-flight and subsequent produces are **fataled/refused** with a `WriterFrozen` error; a
+  Level-1+ producer sees the failed ack rather than a false success.
+
+**The runbook:**
+
+1. **Confirm it is a freeze, then find the storage fault.** `ironbus_writer_healthy == 0` +
+   `/readyz` 503 `writer frozen` is the freeze. The freeze is the SYMPTOM; the cause is under
+   the mount. Check the kernel log (`dmesg` / journal) for `EIO` / device errors, the mount
+   state (a read-only remount after an fs error is common), device health (SMART), and free
+   space at the fs layer (`df` — a fatal ENOSPC differs from IronBus's own bounded disk-cap
+   shedding, which does NOT freeze the writer).
+2. **Fix the underlying storage.** Remount read-write after clearing the fs error, free or
+   extend the volume, or replace/repair the failing device — or move the data-dir onto a
+   healthy volume (a restore, step 4b).
+3. **Restart the broker.** The writer state is process-local, so a restart is what thaws it.
+   `Engine::open` runs its normal recovery over the data-dir on start; if the fatal write left
+   a torn tail, that recovery truncates it to the longest valid prefix (committed data
+   preserved) — a clean restart. `ironbus_writer_healthy` returns to `1`, `/readyz` to `200`,
+   and produces are accepted again.
+4. **If the restart's recovery reports corruption or the volume is gone:**
+   - a. Corruption beyond a torn tail → follow the **segment runbook (section 8.4)**
+     (`verify` → `repair --apply --force` → `verify`) before restarting.
+   - b. The volume is lost → **restore from backup (section 8.5)** onto a healthy volume, then
+     start; the restored dir passes `verify` by construction.
+5. **Verify recovery.** `ironbus_writer_healthy == 1`, `/readyz` 200, a test produce is acked.
+   The freeze left no silent loss: nothing was acked that is not durable (that is the whole
+   point of the fail-stop), so there is no data-loss ledger to reconcile — unlike a crash,
+   where you would check `ironbus_recovery_data_loss_bytes` (section 8.1).
+
+The **NATS contrast**: a JetStream write that cannot fsync has no equivalent terminal
+fail-stop with a dedicated liveness gauge and a readyz gate — the failure surfaces as errors
+without a single "the writer is frozen, stop trusting acks" signal to alert and page on. Here
+the freeze is one gauge (`ironbus_writer_healthy`), one readyz state (`writer frozen`), and one
+bounded recovery (fix storage → restart), so "acked ⇒ durable" holds across the fault instead
+of degrading silently.
+
 ---
 
 ## 9. Transactional messages (2PC): the half-message commit point and its durability scope (#640)
