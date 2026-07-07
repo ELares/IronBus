@@ -29,8 +29,12 @@ FAILS the whole release if `## [Unreleased]` in `CHANGELOG.md` has no content, s
 never ship without an audit-trail entry. Tag a release only after the entries are present.
 
 1. Land all changes for the release via the normal PR flow (CI green, self-reviewed, merged).
-2. Move the `## [Unreleased]` section of `CHANGELOG.md` under a new `## [vX.Y.Z]` heading and
-   bump the workspace `version` in the top-level `Cargo.toml`, in a final PR.
+2. In a final PR: move the `## [Unreleased]` section of `CHANGELOG.md` under a new `## [vX.Y.Z]`
+   heading (the changelog gate matches that heading EXACTLY, so keep it `## [vX.Y.Z]` with no
+   trailing date — put the release date on a line under the heading), bump the workspace `version`
+   in the top-level `Cargo.toml` (`cargo build` reconciles `Cargo.lock`), and archive the release's
+   perf + coverage baselines under `docs/benchmarks/baselines/vX.Y.Z/` (see
+   [Regression-gate baselines](#regression-gate-baselines-perf--coverage) below).
 3. After it merges, tag the merge commit and push the tag:
 
    ```sh
@@ -44,6 +48,30 @@ never ship without an audit-trail entry. Tag a release only after the entries ar
    Re-running the workflow for a tag that already has a published release fails at the
    `gh release create` step (it does not clobber); delete the existing release first
    (`gh release delete vX.Y.Z`) to rebuild it.
+
+## Regression-gate baselines (perf + coverage)
+
+Two CI regression gates compare each build against the LAST RELEASED TAG's archived baseline, so a
+release must archive its baselines for the gates to enforce. They were dormant (no-op) until the
+first tag because there was nothing to compare against; `v0.1.0` armed them (#1068). Each release
+archives its own `docs/benchmarks/baselines/vX.Y.Z/` directory and the gates point at the newest.
+
+- **Perf regression gate** (`regression-gate` job in `.github/workflows/ci.yml`, #114). Archive
+  `docs/benchmarks/baselines/vX.Y.Z/perf-baseline.json` in the
+  `ironbus_bench::regression::Baseline` schema (`{ "tag", "runs": [RunPoint...] }`) — the per-device
+  reference macro-bench medians (#111). The job passes it via `--baseline`; the gate then FAILS on an
+  un-ratified rolling-median regression (throughput -10%, p99 +15%, p99.9 +25%). The live per-device
+  numbers are a documented device residual (see [BASELINE_RIG.md](docs/BASELINE_RIG.md)); the checked-in
+  history fixture stands in for the current run so the job validates the GATE wiring, not live runs.
+  Update `--baseline` in `ci.yml` to point at the newest tag's file each release.
+- **Coverage regression gate** (`coverage` job in `.github/workflows/nightly.yml`, #385). Archive
+  `docs/benchmarks/baselines/vX.Y.Z/coverage-baseline.json`
+  (`{ "tag", "line_coverage_pct", "tolerance_pct" }`). The nightly `coverage-regression-gate` step
+  reads it and FAILS on `current < line_coverage_pct - tolerance_pct`. **Record the number** from the
+  first post-tag nightly run: the `coverage` lane prints the workspace line-coverage percentage
+  (`cargo llvm-cov --workspace --all-features`) to the job log + step summary and retains `lcov.info`
+  for 90 days — copy that percentage into `line_coverage_pct` (it is `null` until you do, which the
+  step reports as a documented PENDING no-op rather than a failure).
 
 ## What the release produces
 

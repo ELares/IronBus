@@ -25,9 +25,9 @@ tls = ["dep:tokio-rustls", "ironbus-client/tls", "ironbus-server/tls"]
 # ProduceAck, DeadLetter, Truncation, Gap, TxnId, ...) verbatim — this crate is the async
 # TWIN of `ironbus-client`, not a redefinition of its surface. The proto codecs and the
 # IO-free core (transparent deliver-path decompression) are shared identically.
-ironbus-client = { path = "../ironbus-client", version = "0.0.0" }
-ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
-ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
+ironbus-client = { path = "../ironbus-client", version = "0.1.0" }
+ironbus-proto = { path = "../ironbus-proto", version = "0.1.0" }
+ironbus-core = { path = "../ironbus-core", version = "0.1.0" }
 # tokio is already vetted in this workspace (ironbus-server's OTLP exporter depends on it),
 # so it passes cargo-deny + the MSRV floor. Use the SAME no-default-features form and add
 # only the features the async client needs: a runtime, the TCP socket, the async read/write
@@ -51,8 +51,8 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 
 [dev-dependencies]
 # The real broker, spawned in-process for the wire-compatibility round-trip test.
-ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
-ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
+ironbus-server = { path = "../ironbus-server", version = "0.1.0" }
+ironbus-storage = { path = "../ironbus-storage", version = "0.1.0" }
 # A multi-thread runtime + macros + timers for `#[tokio::test]`: the broker's accept loop runs
 # on a blocking std thread (it is sync/thread-per-connection), so the test's runtime must be
 # able to make progress on the async client while that thread blocks.

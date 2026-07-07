@@ -24,8 +24,8 @@ tls = ["dep:rustls", "dep:rustls-pki-types", "ironbus-server/tls"]
 [dependencies]
 # The IO-free core: the client's transparent deliver-path decompression (#430) uses the codec
 # runtime (`compress`) and the record-flag bits (`types`). Pure Rust on the default build.
-ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
-ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
+ironbus-core = { path = "../ironbus-core", version = "0.1.0" }
+ironbus-proto = { path = "../ironbus-proto", version = "0.1.0" }
 # TLS 1.3 client stack (the `tls` feature only; the default build links none of this). `default-features
 # = false` drops rustls's ring-backed webpki path and its tls12 code — the client is TLS 1.3-only with
 # the aws-lc-rs provider, never ring. `rustls-pki-types` decodes the PEM trust anchors / client cert+key.
@@ -33,8 +33,8 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 
 [dev-dependencies]
-ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
-ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
+ironbus-server = { path = "../ironbus-server", version = "0.1.0" }
+ironbus-storage = { path = "../ironbus-storage", version = "0.1.0" }
 
 [lints]
 workspace = true

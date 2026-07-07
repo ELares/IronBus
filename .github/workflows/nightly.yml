@@ -198,17 +198,18 @@ jobs:
     # gate and adds no external coverage service or token. It succeeds as long as coverage is
     # collected, so a drop in coverage is visible in the artifact without ever blocking a merge.
     #
-    # COVERAGE-REGRESSION GATE (#385, intended mechanism, documented here, NOT yet enforcing):
-    # the planned "coverage-below-last-release" gate compares this run's line coverage against the
-    # coverage archived for the last released tag and fails on an un-ratified drop. It is NOT wired
-    # as a hard gate yet for the SAME reason the #114 perf regression gate no-ops today: there is no
-    # released tag / baseline yet (v0.1.0 is the maintainer's action), so there is nothing to compare
-    # against. What IS wired cheaply now: this job emits the summary percentage to the job log and
-    # the step summary every night, and retains the lcov.info artifact for 90 days, so a release can
-    # archive a baseline lcov.info and a future revision of this job can flip the comparison on
-    # (read the baseline percentage, FAIL if `current < baseline - tolerance`), mirroring the perf
-    # gate's baseline/no-op/ratify shape. Documented in fuzz/README.md and CHANGELOG.
-    name: coverage (informational)
+    # COVERAGE-REGRESSION GATE (#385, WIRED at v0.1.0 per #1068): the "coverage-below-last-release"
+    # gate compares this run's line coverage against the coverage baseline archived for the last
+    # released tag (docs/benchmarks/baselines/v0.1.0/coverage-baseline.json) and FAILS on an
+    # un-tolerated drop (`current < line_coverage_pct - tolerance_pct`), mirroring the #114 perf
+    # gate's baseline/enforce shape. The comparison step below is now wired. ONE value remains for
+    # the maintainer to arm the block: the baseline's `line_coverage_pct` is null at cut time because
+    # the authoritative number is what THIS lane computes with `cargo llvm-cov --workspace
+    # --all-features` on the CI runner (the runner with the cmake/cc toolchain the all-features
+    # instrumented build needs), which is not faithfully reproducible off it. While null, the step
+    # logs a documented PENDING no-op; recording the first post-tag nightly percentage in that file
+    # flips it to blocking. This job also still emits the percentage and retains lcov.info for 90 days.
+    name: coverage (informational + regression gate #385)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -244,6 +245,43 @@ jobs:
           fi
           echo "line coverage: ${pct}% (${total_lh}/${total_lf} lines)"
           echo "line coverage: ${pct}% (${total_lh}/${total_lf} lines)" >> "$GITHUB_STEP_SUMMARY"
+      - name: coverage-regression gate against the archived v0.1.0 baseline (#385, #1068)
+        # ARMED at v0.1.0 (#1068): compare this run's line coverage against the coverage baseline
+        # archived at the release and FAIL on an un-tolerated drop, mirroring the perf gate's
+        # baseline/enforce shape. The baseline's `line_coverage_pct` is null until the maintainer
+        # records the first post-tag nightly's number (see the baseline README + the file's note);
+        # while null this step logs a documented PENDING no-op rather than failing, so the mechanism
+        # is fully wired and one recorded value away from blocking. Dependency-free: reads the flat,
+        # machine-written baseline JSON with grep and does the compare in awk.
+        run: |
+          set -euo pipefail
+          baseline_file="docs/benchmarks/baselines/v0.1.0/coverage-baseline.json"
+          total_lf=$(awk -F: '/^LF:/ {s+=$2} END {print s+0}' lcov.info)
+          total_lh=$(awk -F: '/^LH:/ {s+=$2} END {print s+0}' lcov.info)
+          if [ "$total_lf" -eq 0 ]; then
+            echo "::error::no instrumented lines found in lcov.info; cannot evaluate the coverage gate"
+            exit 1
+          fi
+          current=$(awk -v lh="$total_lh" -v lf="$total_lf" 'BEGIN { printf "%.2f", (lh*100.0)/lf }')
+          if [ ! -f "$baseline_file" ]; then
+            echo "::error::coverage baseline ${baseline_file} not found"
+            exit 1
+          fi
+          baseline=$(grep -oE '"line_coverage_pct"[[:space:]]*:[[:space:]]*[0-9]+(\.[0-9]+)?' "$baseline_file" | grep -oE '[0-9]+(\.[0-9]+)?$' || true)
+          tolerance=$(grep -oE '"tolerance_pct"[[:space:]]*:[[:space:]]*[0-9]+(\.[0-9]+)?' "$baseline_file" | grep -oE '[0-9]+(\.[0-9]+)?$' || true)
+          tolerance="${tolerance:-0}"
+          if [ -z "$baseline" ]; then
+            echo "coverage gate: PENDING (no baseline line_coverage_pct recorded yet; current ${current}%). Record the first post-v0.1.0 nightly percentage in ${baseline_file} to arm the block." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          floor=$(awk -v b="$baseline" -v t="$tolerance" 'BEGIN { printf "%.2f", b - t }')
+          echo "coverage gate: current ${current}% vs baseline ${baseline}% (tolerance ${tolerance}%, floor ${floor}%)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if awk -v c="$current" -v f="$floor" 'BEGIN { exit (c + 0 >= f + 0) ? 0 : 1 }'; then
+            echo "ok: line coverage ${current}% >= floor ${floor}%"
+          else
+            echo "::error::line coverage ${current}% dropped below the v0.1.0 floor ${floor}% (baseline ${baseline}% - tolerance ${tolerance}%)"
+            exit 1
+          fi
       - name: upload the coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

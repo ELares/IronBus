@@ -33,7 +33,7 @@ crc32c = "0.6"
 # the consume hot path. `bytes` is pure Rust (no `links`, no C build script), already in the workspace
 # tree (a direct dependency of `ironbus-server`), and is on the pure-Rust data-path allow-list.
 bytes = { version = "1", default-features = false }
-ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
+ironbus-core = { path = "../ironbus-core", version = "0.1.0" }
 # `serde` (derive only) makes the structured loss report (`loss::LossReport`) a versioned,
 # stable, fixture-assertable artifact (#120). Kept derive-only so the static edge binary stays
 # small: the JSON format crate (`serde_json`) is a dev-dependency, not shipped in the binary.

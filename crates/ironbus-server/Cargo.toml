@@ -41,9 +41,9 @@ edge-min = []
 tls = ["dep:rustls", "dep:rustls-pki-types", "dep:x509-cert", "dep:const-oid"]
 
 [dependencies]
-ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
-ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
-ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
+ironbus-core = { path = "../ironbus-core", version = "0.1.0" }
+ironbus-proto = { path = "../ironbus-proto", version = "0.1.0" }
+ironbus-storage = { path = "../ironbus-storage", version = "0.1.0" }
 
 # Embedded metadata Raft group (V2-C1, #578). `raft` is tikv/raft-rs, the production TiKV
 # Raft CORE (Apache-2.0): storage- and transport-agnostic, SYNCHRONOUS and caller-driven
