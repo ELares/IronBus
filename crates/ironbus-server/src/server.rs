@@ -87,6 +87,31 @@ impl Wire {
     fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
         self.socket().set_nonblocking(nonblocking)
     }
+
+    /// The mTLS identity (ADR-0004 increment 3, #766) derived from the VERIFIED peer certificate's SAN,
+    /// or `None` on a plaintext wire, a server-auth-only TLS wire (the server did not request a client
+    /// cert), or a non-tls build. When the server config required a client cert (mTLS), rustls has
+    /// already verified the chain against the client-CA during the handshake, so the leaf here is
+    /// trusted; its URI/DNS SAN maps to an auth identity via [`crate::auth::mtls_san_identity`]
+    /// (URI-then-DNS). Threaded into the session as `peer_san`, so an `Mtls`-mechanism `Connect`
+    /// authenticates on the certificate alone, with no bearer credential.
+    #[cfg(feature = "tls")]
+    fn peer_san(&self) -> Option<String> {
+        let Wire::Tls(s) = self else {
+            return None;
+        };
+        let leaf = s.conn.peer_certificates()?.first()?;
+        let (uris, dns) = crate::tls::peer_cert_sans(leaf.as_ref());
+        crate::auth::mtls_san_identity(&uris, &dns)
+    }
+
+    /// On a non-tls build there is no TLS layer to supply a verified peer certificate, so there is
+    /// never an mTLS identity.
+    #[cfg(not(feature = "tls"))]
+    #[allow(clippy::unused_self)]
+    fn peer_san(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Read for Wire {
@@ -654,13 +679,17 @@ where
     // the connection. On the default (plaintext) path `wrap` is a zero-cost `Wire::Plain`. From here
     // the loop is stream-agnostic.
     let mut wire = tls.wrap(stream)?;
+    // The mTLS identity (ADR-0004 increment 3, #766): on an mTLS connection rustls has already verified
+    // the client certificate against the client-CA during the handshake above, so this is the SAN of a
+    // TRUSTED cert (or `None` on plaintext / server-auth-only TLS / a non-tls build). It is threaded
+    // into the session as `peer_san` so an `Mtls`-mechanism `Connect` authenticates on the certificate
+    // alone; a non-mTLS connection carries `None` and an mTLS-mechanism connect fails closed.
+    let peer_san = wire.peer_san();
     // Pin the auth requirement onto the session: with a configured table the `Connect` handshake must
-    // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev). The
-    // mTLS SAN identity is `None` for now — the verified client-certificate mapping is the next
-    // increment (#766), so an mTLS-mechanism connect fails closed until then.
+    // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev).
     // The connz handle (#572) is attached so a successful `Connect` records the authed-flip.
     let mut session = match auth {
-        Some(cfg) => Session::with_member_id_and_auth(member_id, cfg, None),
+        Some(cfg) => Session::with_member_id_and_auth(member_id, cfg, peer_san),
         None => Session::with_member_id(member_id),
     }
     .with_connz(Arc::clone(connz));
@@ -1100,6 +1129,148 @@ yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
         );
 
         // Stop the accept loop and join it; the detached handler drains when the client drops at scope end.
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    // The mTLS fixtures (ADR-0004 increment 3): a test client-CA, a client cert it signed carrying the
+    // URI SAN `spiffe://ironbus/client-a`, and that client cert's key. Embedded (rcgen pulls banned ring).
+    #[cfg(feature = "tls")]
+    const MTLS_CLIENT_CA: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBeDCCAR6gAwIBAgIUD1qVcCqTnuzk5f2PPxzBVwN3GOYwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWaXJvbmJ1cy10ZXN0LWNsaWVudC1jYTAgFw03NTAxMDEwMDAw
+MDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWaXJvbmJ1cy10ZXN0LWNs
+aWVudC1jYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABDDYgFVNE0pzmAR9jf/e
+HWGvwuFfXdWUQa9n2nxTYcncGE47i3G4Er2RKnsh6hEfzqliAnoG/DWQxUIJl4C2
+euujMjAwMB0GA1UdDgQWBBQkZqZUZaw1BiRdd6FJjsPbMJq4lTAPBgNVHRMBAf8E
+BTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCjFMv+V2ep2/pvafj0nCL+OOH1glKT
+eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
+-----END CERTIFICATE-----
+";
+    #[cfg(feature = "tls")]
+    const MTLS_CLIENT_CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBazCCARGgAwIBAgIUT0zI7FaMJw1UP1RjaEl5HqkYI38wCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWaXJvbmJ1cy10ZXN0LWNsaWVudC1jYTAgFw03NTAxMDEwMDAw
+MDBaGA80MDk2MDEwMTAwMDAwMFowHjEcMBoGA1UEAwwTaXJvbmJ1cy10ZXN0LWNs
+aWVudDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABLupvaJvcE6GZOK5O+tFZmO8
+LjzvaLvPFMqSRGQbfiRb4Cfgl8zS/dHoenJQoUU0k/ftbV/UCuLsBuPqkjcN/jSj
+KDAmMCQGA1UdEQQdMBuGGXNwaWZmZTovL2lyb25idXMvY2xpZW50LWEwCgYIKoZI
+zj0EAwIDSAAwRQIhANh/YTa9XguQ8VPV3AQijNNqVY4wDvkGWBu5kMsrGvU0AiB1
+kQXnPnAxy3Jc6Zs9blJsL8IrT0lre7UCig1h/UYE0g==
+-----END CERTIFICATE-----
+";
+    #[cfg(feature = "tls")]
+    const MTLS_CLIENT_KEY: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgip1PQegOaJTyITUh
+WpS5ThUAVX2c3/+TzWk7kIP1nkyhRANCAAS7qb2ib3BOhmTiuTvrRWZjvC4872i7
+zxTKkkRkG34kW+An4JfM0v3R6HpyUKFFNJP37W1f1Ari7Abj6pI3Df40
+-----END PRIVATE KEY-----
+";
+
+    /// End-to-end mTLS (ADR-0004 increment 3, #766): the broker requires a client certificate chained
+    /// to the client-CA. A client presenting a VERIFIED cert completes the handshake and connects; a
+    /// client presenting NO cert is rejected at the TLS layer (before any `Connect`). This exercises the
+    /// `WebPkiClientVerifier` server config + the mTLS handshake through the real serve/accept path.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn an_mtls_client_with_a_verified_cert_connects_and_one_without_a_cert_is_rejected() {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
+
+        let (handle, _actor) = spawn_inmem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connz = Arc::new(ConnectionMetrics::new());
+
+        // The server REQUIRES a client cert chained to MTLS_CLIENT_CA.
+        let server_config = crate::tls::server_config_mtls_from_pem(
+            TLS_SERVER_CERT,
+            TLS_SERVER_KEY,
+            MTLS_CLIENT_CA,
+        )
+        .unwrap();
+        let tls = TlsTermination::with_config(Arc::new(server_config));
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let connz = Arc::clone(&connz);
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve_with_auth_connz_preauth_audit(
+                    &listener, &engine, &shutdown, 16, &clock, &beacon, None, &connz, None, None,
+                    tls,
+                )
+                .unwrap();
+            }
+        });
+
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut server_roots = rustls::RootCertStore::empty();
+        server_roots
+            .add(
+                CertificateDer::pem_slice_iter(TLS_SERVER_CERT)
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // POSITIVE: a client presenting the verified client cert completes the handshake and connects.
+        {
+            let client_cert = CertificateDer::pem_slice_iter(MTLS_CLIENT_CERT)
+                .next()
+                .unwrap()
+                .unwrap();
+            let client_key =
+                rustls::pki_types::PrivateKeyDer::from_pem_slice(MTLS_CLIENT_KEY).unwrap();
+            let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(server_roots.clone())
+                .with_client_auth_cert(vec![client_cert], client_key)
+                .unwrap();
+            let mut conn =
+                rustls::ClientConnection::new(Arc::new(client_config), name.clone()).unwrap();
+            let mut sock = TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut s = rustls::Stream::new(&mut conn, &mut sock);
+            let mut buf = Vec::new();
+            s.write_all(&frame(FrameType::Connect, b"")).unwrap();
+            assert_eq!(
+                read_one_frame(&mut s, &mut buf).0,
+                FrameType::Info,
+                "an mTLS client with a verified cert connects"
+            );
+        }
+
+        // NEGATIVE: a client presenting NO client cert is rejected at the mTLS layer (the server
+        // demands one), so the handshake fails — no `Connect` is ever processed.
+        {
+            let client_config = crate::tls::client_config_from_pem(TLS_SERVER_CERT).unwrap();
+            let mut conn =
+                rustls::ClientConnection::new(Arc::new(client_config), name.clone()).unwrap();
+            let mut sock = TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut s = rustls::Stream::new(&mut conn, &mut sock);
+            let rejected = s
+                .write_all(&frame(FrameType::Connect, b""))
+                .and_then(|()| {
+                    let mut chunk = [0u8; 64];
+                    s.read(&mut chunk).map(|_| ())
+                })
+                .is_err();
+            assert!(
+                rejected,
+                "a client presenting no cert must be rejected at the mTLS layer"
+            );
+        }
+
         shutdown.store(true, Ordering::Release);
         server.join().unwrap();
     }
