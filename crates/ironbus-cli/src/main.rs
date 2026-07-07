@@ -9565,6 +9565,11 @@ fn cmd_serve(
         config.fire_and_forget_byte_rate,
         config.fire_and_forget_refill_ms,
         config.egress_limit,
+        // The push-delivery consume long-poll budget is read only on the Unix serve path (it wires the
+        // engine's `consume_longpoll_ms`), so the non-Unix stub must consume it too or the Windows
+        // `-D warnings` build trips field-never-read, invisible to a macOS reviewer (the recurring
+        // #288/#99 footgun).
+        config.consume_longpoll_ms,
         // The #378 fsync-headroom knob is read only on the Unix serve path (it wires the engine's
         // wal_fsync_headroom_bytes), so the non-Unix stub must consume it too or the Windows
         // `-D warnings` build trips field-never-read, invisible to a macOS reviewer (the recurring

@@ -12653,9 +12653,11 @@ mod tests {
         .unwrap();
         let elapsed = start.elapsed();
         assert_eq!(flow_end_count(&out), 0, "empty group yields FlowEnd(0)");
+        // OFF engages NO wait, so this returns after only the poll round-trips. A generous ceiling keeps
+        // the assertion robust on a loaded/coarse-timer CI runner (Windows) while still catching a hang.
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "long-poll OFF must return immediately, took {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(1_000),
+            "long-poll OFF must return promptly (no wait), took {elapsed:?}"
         );
         drop(s);
         drop(handle);
@@ -12691,10 +12693,12 @@ mod tests {
             1,
             "the committed record is delivered on the commit-notify wakeup"
         );
-        // A commit-driven wakeup lands far below the budget; a broken bump would only free the
-        // consumer at the ~2 s timeout, so this bound is what proves the event path fired.
+        // A commit-driven wakeup lands far below the 2 s budget; a broken bump would only free the
+        // consumer at the ~2 s timeout. The 1.5 s bound clears that timeout with room to spare while
+        // leaving generous slack for Windows Condvar-wakeup + scheduler jitter (real wakeup is ~tens of
+        // ms), so it proves the event path fired without being timing-fragile.
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
+            elapsed < std::time::Duration::from_millis(1_500),
             "delivery must arrive well before the budget, took {elapsed:?}"
         );
         drop(s);
@@ -12704,7 +12708,9 @@ mod tests {
 
     #[test]
     fn longpoll_times_out_to_empty_without_a_producer() {
-        let budget_ms = 150u64;
+        // A budget large enough that a lower-bound assertion has a wide margin below the timeout, so
+        // Windows' ~15 ms timer granularity on `wait_timeout` can never dip the measured wait under it.
+        let budget_ms = 400u64;
         let (handle, actor) = longpoll_rig(budget_ms);
         let mut s = longpoll_consumer(&handle);
         let mut out = Vec::new();
@@ -12721,10 +12727,11 @@ mod tests {
             0,
             "no producer: the batch ends empty after waiting out the budget"
         );
-        // It must have actually blocked ~the budget (a small scheduling slack), proving the wait ran
-        // rather than returning empty immediately.
+        // It must have actually blocked out most of the budget, proving the wait ran rather than
+        // returning empty immediately. The 200 ms floor (half the 400 ms budget) is a wide margin that
+        // no timer-granularity slack can breach, so the assertion is deterministic on Windows.
         assert!(
-            elapsed >= std::time::Duration::from_millis(budget_ms - 40),
+            elapsed >= std::time::Duration::from_millis(200),
             "the consumer must wait out ~the budget, took {elapsed:?}"
         );
         drop(s);

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The commit-notify wakeup seam for event-driven consume long-poll (push delivery).
 //!
 //! An idle consumer that polls an empty group today returns an empty batch and is re-polled by the
@@ -15,6 +16,11 @@
 //! monotonically-increasing generation, so a bump that lands BETWEEN a waiter's snapshot and its wait
 //! can never be lost (the predicate `*seq == snapshot` is already false, so `wait_timeout_while`
 //! returns without parking) — the standard lost-wakeup-safe condvar protocol.
+//!
+//! NAMED-STREAM SCOPE (v1): the actor bumps only on the DEFAULT/root log's `flushed_offset` advancing,
+//! so a consumer long-polling a NAMED stream (#588 — its own per-stream log) gets NO early wakeup and
+//! falls back to its budget timeout. That is correct (it re-polls and delivers on timeout, exactly the
+//! pre-push-delivery behavior) and is the same per-stream-granularity refinement noted above.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;

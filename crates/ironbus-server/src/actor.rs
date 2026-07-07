@@ -1769,6 +1769,7 @@ where
                 &actor_watchdog_thread,
                 &actor_clock,
                 &actor_commit_notify,
+                consume_longpoll_ms,
             )
         })
         // A thread-spawn failure at startup is unrecoverable for the server, but the no-panic bar is
@@ -1886,6 +1887,13 @@ struct PipelineRig<File> {
 /// woken waiter that still finds nothing re-waits or times out); UNDER-bumping only costs a consumer a
 /// little latency (it falls back to its long-poll timeout). Cheap on the steady-state path: one offset
 /// read + compare, and the `bump` (a short lock + `notify_all`) runs only on a real advance.
+///
+/// SCOPE (v1): this observes ONLY the DEFAULT/root log's `flushed_offset`. A commit to a NAMED stream
+/// (#588 — its OWN per-stream log, served by `poll_in_stream`) does NOT advance this frontier, so a
+/// consumer long-polling a named stream gets NO early wakeup; it is TIMEOUT-BACKSTOPPED (still correct —
+/// it re-polls and delivers when its budget elapses, exactly the pre-push-delivery behavior for that
+/// consumer). Observing per-stream frontiers (a bump keyed by the stream that committed) is the
+/// documented per-stream-granularity refinement, deferred with the global-granularity note.
 fn notify_frontier_advance<F, C>(
     engine: &Engine<F, C>,
     commit_notify: &CommitNotify,
@@ -1910,7 +1918,11 @@ fn notify_frontier_advance<F, C>(
 // The drain/group-commit loop is one cohesive unit (recv → drain → per-command append/run/shutdown →
 // one covering fsync → publish); splitting it would scatter the single-writer ordering it enforces. The
 // #862 watchdog stamps push it one line over the pedantic 100-line bound.
-#[allow(clippy::too_many_lines)]
+// One added arg over the pedantic 7-arg bound: the append actor's single-writer loop legitimately
+// threads the engine, command channel, pipeline rig, cap gate, watchdog, clock, and (push delivery)
+// commit-notify seam — bundling any subset into a struct would only obscure the ownership the loop
+// relies on. Same rationale as `handle_connection`'s allow.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn run_actor<F, C>(
     mut engine: Engine<F, C>,
     rx: &Receiver<Command<F, C>>,
@@ -1919,6 +1931,7 @@ fn run_actor<F, C>(
     watchdog: &ActorWatchdog,
     clock: &C,
     commit_notify: &CommitNotify,
+    consume_longpoll_ms: u64,
 ) -> Engine<F, C>
 where
     F: Filesystem,
@@ -1929,14 +1942,32 @@ where
     // (#1026) the pipelined loop runs; every non-fsync tier falls through to the LEGACY loop below,
     // byte-for-byte (an ack there waits on no barrier, so there is nothing to pipeline).
     if let Some(rig) = pipeline {
-        return run_actor_pipelined(engine, rx, rig, cap_gate, watchdog, clock, commit_notify);
+        return run_actor_pipelined(
+            engine,
+            rx,
+            rig,
+            cap_gate,
+            watchdog,
+            clock,
+            commit_notify,
+            consume_longpoll_ms,
+        );
     }
     // Produces appended this pass but not yet durable: each parked reply is released only after the
     // single covering `commit_batch`, so a `PubAck` never precedes its fsync (I2).
     let mut pending: Vec<PendingProduce> = Vec::new();
-    // The last durable poll frontier this actor has already signalled to long-polling consumers (push
-    // delivery): seeded to the recovered head so only real ADVANCES bump the commit-notify seam.
-    let mut last_notified = engine.flushed_offset().get();
+    // Push delivery is OPT-IN and default-OFF (`consume_longpoll_ms == 0`): when off, the actor NEVER
+    // touches the commit-notify seam, so the group-commit hot path is byte-for-byte the historical one
+    // (no `flushed_offset` read, no lock, no `notify_all` per commit). Only a long-poll-enabled broker
+    // seeds the last-signalled frontier and bumps on advance.
+    let longpoll_enabled = consume_longpoll_ms != 0;
+    // The last durable poll frontier this actor has already signalled to long-polling consumers: seeded
+    // to the recovered head so only real ADVANCES bump the seam. Unused (and unread) when off.
+    let mut last_notified = if longpoll_enabled {
+        engine.flushed_offset().get()
+    } else {
+        0
+    };
     // The per-pass command batch, hoisted and reused across drains exactly like `pending` above (#828):
     // each pass `clear()`s it and `drain(..)`s it empty, so its backing capacity is retained instead of
     // freed and regrown-from-zero every batch. This actor is the single serialization point for all
@@ -2041,10 +2072,13 @@ where
         // The drain is exhausted: commit the parked produces with the ONE covering fsync, then release
         // their replies. This is the steady-state group commit boundary.
         flush_pending(&mut engine, &mut pending);
-        // Push delivery: the covering commit just advanced the durable poll frontier, so wake any idle
-        // long-polling consumer to re-poll. STRICTLY AFTER the flush (pure observation; a bump reads the
-        // now-current `flushed_offset`), never reordered with the durability work above.
-        notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+        // Push delivery (OPT-IN): only when long-poll is enabled does the covering commit's frontier
+        // advance wake an idle long-polling consumer. When off this branch is skipped entirely, so the
+        // group-commit boundary stays byte-for-byte the historical path. STRICTLY AFTER the flush (pure
+        // observation; a bump reads the now-current `flushed_offset`), never reordered with it.
+        if longpoll_enabled {
+            notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+        }
         // The batch just changed the durable byte total (an append grows it; a post-commit retention
         // reap can shrink it), so refresh the connection-thread fast-reject gate with the now-current
         // reading (#476). This is the ONE refresh that matters for steady-state load: a produce that
@@ -2088,7 +2122,11 @@ where
 // One cohesive state machine (recv/try_recv → per-command poll+process → pass-end
 // stage/dispatch/release/reconcile); splitting it would scatter the single-writer ordering and the
 // reconcile points the no-wedge lemma is proved over.
-#[allow(clippy::too_many_lines)]
+// One added arg over the pedantic 7-arg bound: the append actor's single-writer loop legitimately
+// threads the engine, command channel, pipeline rig, cap gate, watchdog, clock, and (push delivery)
+// commit-notify seam — bundling any subset into a struct would only obscure the ownership the loop
+// relies on. Same rationale as `handle_connection`'s allow.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn run_actor_pipelined<F, C>(
     mut engine: Engine<F, C>,
     rx: &Receiver<Command<F, C>>,
@@ -2097,15 +2135,24 @@ fn run_actor_pipelined<F, C>(
     watchdog: &ActorWatchdog,
     clock: &C,
     commit_notify: &CommitNotify,
+    consume_longpoll_ms: u64,
 ) -> Engine<F, C>
 where
     F: Filesystem,
     C: Clock + Clone,
 {
-    // The last durable poll frontier already signalled to long-polling consumers (push delivery): in
-    // this (sync) tier `flushed_offset` advances only at barrier completion, so a bump here means a
-    // record just became poll-visible. Seeded to the recovered head so only real advances signal.
-    let mut last_notified = engine.flushed_offset().get();
+    // Push delivery is OPT-IN and default-OFF: when off, this loop NEVER touches the commit-notify seam,
+    // so the pipelined group-commit path is byte-for-byte the historical one (no `flushed_offset` probe,
+    // no lock, no `notify_all`). Only a long-poll-enabled broker seeds the frontier and bumps on advance.
+    let longpoll_enabled = consume_longpoll_ms != 0;
+    // The last durable poll frontier already signalled to long-polling consumers: in this (sync) tier
+    // `flushed_offset` advances only at barrier completion, so a bump means a record just became
+    // poll-visible. Seeded to the recovered head so only real advances signal; unused when off.
+    let mut last_notified = if longpoll_enabled {
+        engine.flushed_offset().get()
+    } else {
+        0
+    };
     let mut pipeline = Pipeline {
         parked: VecDeque::new(),
         in_flight: None,
@@ -2138,11 +2185,14 @@ where
                 Ok(cmd) => cmd,
                 Err(TryRecvError::Empty) => {
                     pipeline.wait_one_completion(&mut engine);
-                    // Push delivery: waiting out the in-flight barrier is exactly where the durable
+                    // Push delivery (OPT-IN): waiting out the in-flight barrier is where the durable
                     // frontier advances while the command channel is idle, so wake any long-polling
-                    // consumer to re-poll the moment the barrier completes. STRICTLY AFTER the
-                    // completion is folded in — pure observation of the now-current `flushed_offset`.
-                    notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+                    // consumer to re-poll the moment the barrier completes. Skipped entirely when off, so
+                    // the idle-wait path is unchanged. STRICTLY AFTER the completion is folded in — pure
+                    // observation of the now-current `flushed_offset`.
+                    if longpoll_enabled {
+                        notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+                    }
                     continue;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -2241,15 +2291,17 @@ where
         pipeline.release_ready(&mut engine);
         carryover = pipeline.finish_pass(&mut engine, rx);
         pipeline.reconcile_writer_freeze(&mut engine, None);
-        // Push delivery: wake any idle long-polling consumer if the durable poll frontier advanced this
-        // pass. Placed AFTER `finish_pass` on purpose: the pass-end dispatch may take the SOLO-INLINE
-        // barrier (a single waiter's covering `fdatasync` run inline), which advances `flushed_offset`
-        // right here with NO in-flight barrier to observe later — a bump before `finish_pass` would miss
-        // it and strand the consumer until its timeout. An ASYNC barrier instead leaves the frontier
-        // unchanged now (this is a no-op) and is caught by the `wait_one_completion` bump when it
-        // completes. Pure observation of the now-current `flushed_offset`; never reorders the durability
-        // work above.
-        notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+        // Push delivery (OPT-IN): wake any idle long-polling consumer if the durable poll frontier
+        // advanced this pass. Placed AFTER `finish_pass` on purpose: the pass-end dispatch may take the
+        // SOLO-INLINE barrier (a single waiter's covering `fdatasync` run inline), which advances
+        // `flushed_offset` right here with NO in-flight barrier to observe later — a bump before
+        // `finish_pass` would miss it and strand the consumer until its timeout. An ASYNC barrier instead
+        // leaves the frontier unchanged now (this is a no-op) and is caught by the `wait_one_completion`
+        // bump when it completes. Skipped entirely when off, so the pass-end path is unchanged. Pure
+        // observation of the now-current `flushed_offset`; never reorders the durability work above.
+        if longpoll_enabled {
+            notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+        }
         refresh_cap_gate(cap_gate, &mut engine);
         engine.codel_queue_empty();
         // The same #862 publish → idle RELEASE-store pairing as the legacy loop (do not reorder);
