@@ -90,6 +90,13 @@ pub mod proto {
     pub use ironbus_proto::message::{AckLevel, ConsumeTier, PubBody, PubDedup};
 }
 
+// Client-side TLS 1.3 (ADR-0004 / #766, client side #957) — compiled only under `--features tls`. The
+// default client links no TLS code and stays byte-for-byte plain-TCP.
+#[cfg(feature = "tls")]
+pub mod tls;
+#[cfg(feature = "tls")]
+pub use tls::{TlsClientConfig, TlsClientError};
+
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -144,6 +151,11 @@ pub enum ClientError {
     LocalTransaction(String),
     /// The connection closed before a complete response arrived.
     Closed,
+    /// A client-side TLS configuration or handshake failure (#957, `--features tls`): a bad trust
+    /// anchor / client certificate, an invalid server name, or the broker's certificate failing
+    /// verification. (A verification failure at the handshake itself surfaces as [`ClientError::Io`].)
+    #[cfg(feature = "tls")]
+    Tls(String),
     /// The server REDIRECTED a produce: the node this client is connected to holds a clustered replica
     /// role for the target partition but is NOT its current leader (#735), so the produce was NOT
     /// appended/acked here — it must go to the leader. `leader_hint` is the current leader's CLIENT
@@ -208,6 +220,8 @@ impl core::fmt::Display for ClientError {
                 )
             }
             ClientError::Closed => write!(f, "connection closed mid-response"),
+            #[cfg(feature = "tls")]
+            ClientError::Tls(why) => write!(f, "client TLS error: {why}"),
             ClientError::Decompress { source, offset, .. } => {
                 write!(
                     f,
@@ -436,6 +450,15 @@ pub struct ClientConfig {
     /// still plain TCP, so a bearer/password credential is safe to use over loopback or an already-
     /// secured transport, and a TLS-wrapped stream (and the `Mtls` mechanism) is deferred.
     pub credential: Option<AuthCredential>,
+
+    /// The client TLS configuration (ADR-0004 / #957), or `None` for a plaintext connection. When
+    /// `Some`, [`Client::connect_with`] VERIFIES the broker's certificate and connects INSIDE a TLS 1.3
+    /// session, so the `credential` above travels ENCRYPTED (and a configured client certificate
+    /// authenticates the connection as mTLS). Mandatory server verification — a broker whose
+    /// certificate does not verify fails the connect, never a silent fallback to plaintext. Present
+    /// only behind `--features tls`; the default (plain-TCP) build has no TLS and this field is absent.
+    #[cfg(feature = "tls")]
+    pub tls: Option<TlsClientConfig>,
 }
 
 impl Default for ClientConfig {
@@ -478,6 +501,10 @@ impl Default for ClientConfig {
             // unauthenticated connect to a no-auth broker is unchanged (#884). A caller opts into auth
             // by setting this to the credential the broker verifies.
             credential: None,
+            // None by default: an unconfigured client is plain TCP (byte-for-byte the pre-#957 path). A
+            // caller opts into TLS by setting this to a `TlsClientConfig` (#957, `--features tls`).
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 }
@@ -705,7 +732,7 @@ struct StreamFlow {
 /// (notifying `room` as slots free) until the terminal `Pong` or a fatal error. Runs on the
 /// scoped reader thread over the cloned read half.
 fn drain_stream_replies(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     buf: &mut Vec<u8>,
     flow: &std::sync::Mutex<StreamFlow>,
     room: &std::sync::Condvar,
@@ -938,7 +965,7 @@ fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientErro
 /// form of [`Client::read_frame`] so [`Client::produce_stream`]'s reader thread can drain a
 /// cloned read half with its own buffer (#458).
 fn read_frame_from(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     buf: &mut Vec<u8>,
 ) -> Result<(FrameType, Vec<u8>), ClientError> {
     // Reused scratch for each socket read. `buf` is mutated ONLY by `extend_from_slice` AFTER a read
@@ -1055,10 +1082,123 @@ impl TxnDecision {
 // Each bool records a DISTINCT server-CONFIRMED wire capability for this connection (gap-marker /
 // streaming / deliver-batch / streams), each set from its `Info` echo bit — protocol negotiation
 // state, not internal flags a bitfield could replace.
+/// The client's per-connection byte stream: plaintext TCP, or — behind `--features tls` (#957) — a
+/// rustls-terminated TCP carrying a completed TLS 1.3 session. `Read`/`Write` flow through the
+/// (possibly TLS) layer; the lifecycle shims (`try_clone`, `shutdown`) reach the underlying socket.
+enum Wire {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl std::fmt::Debug for Wire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Wire::Plain(_) => f.write_str("Wire::Plain"),
+            #[cfg(feature = "tls")]
+            Wire::Tls(_) => f.write_str("Wire::Tls"),
+        }
+    }
+}
+
+impl Wire {
+    /// The underlying accepted TCP socket, for the socket-level lifecycle operations.
+    fn socket(&self) -> &TcpStream {
+        match self {
+            Wire::Plain(s) => s,
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.get_ref(),
+        }
+    }
+
+    /// Clone the stream so a reader thread can drain replies while the main thread writes (the
+    /// pipelined `produce_stream`/`produce_window` fan-out). A plaintext socket clones fine; a TLS
+    /// session is single-owner and CANNOT be split across threads, so this returns `Unsupported` for a
+    /// TLS wire — pipelined produce over TLS is a documented follow-up (use `produce()` over TLS, or a
+    /// plaintext connection for pipelined produce).
+    fn try_clone(&self) -> io::Result<Wire> {
+        match self {
+            Wire::Plain(s) => Ok(Wire::Plain(s.try_clone()?)),
+            #[cfg(feature = "tls")]
+            Wire::Tls(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pipelined produce (produce_stream / produce_window) is not supported over TLS: a TLS \
+                 session cannot be split across threads. Use produce() over TLS, or a plaintext \
+                 connection for pipelined produce.",
+            )),
+        }
+    }
+
+    /// Shut down the connection in `how` direction(s) on the underlying socket.
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.socket().shutdown(how)
+    }
+
+    /// The local socket address (a stable per-connection seed for transaction ids).
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.socket().local_addr()
+    }
+
+    /// Read back the `TCP_NODELAY` state of the underlying socket (used by a test).
+    #[cfg(test)]
+    fn nodelay(&self) -> io::Result<bool> {
+        self.socket().nodelay()
+    }
+
+    /// Establish a TLS 1.3 client session over an already-connected socket (#957): VERIFY the broker's
+    /// certificate against the configured trust anchor (mandatory — a verification failure returns an
+    /// error, never a silent fallback to plaintext), complete the handshake, and wrap.
+    #[cfg(feature = "tls")]
+    fn connect_tls(mut socket: TcpStream, config: &TlsClientConfig) -> Result<Wire, ClientError> {
+        let client_config = config
+            .build()
+            .map_err(|e| ClientError::Tls(e.to_string()))?;
+        let server_name = rustls::pki_types::ServerName::try_from(config.server_name().to_string())
+            .map_err(|_| {
+                ClientError::Tls(format!("invalid server name `{}`", config.server_name()))
+            })?;
+        let mut conn =
+            rustls::ClientConnection::new(std::sync::Arc::new(client_config), server_name)
+                .map_err(|e| ClientError::Tls(e.to_string()))?;
+        // Drive the TLS 1.3 handshake to completion (blocking). A certificate that does not verify, or a
+        // server name mismatch, fails HERE and returns the error — before any Connect frame is sent.
+        conn.complete_io(&mut socket).map_err(ClientError::Io)?;
+        Ok(Wire::Tls(Box::new(rustls::StreamOwned::new(conn, socket))))
+    }
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.read(buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.write(buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Wire::Plain(s) => s.flush(),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.flush(),
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct Client {
-    stream: TcpStream,
+    stream: Wire,
     buf: Vec<u8>,
     /// The per-consumer MESSAGE credit NEGOTIATED for this connection (#292), learned from the
     /// server's `Info` body at handshake: the server has already clamped this client's `Connect`
@@ -1132,8 +1272,20 @@ impl Client {
         config: &ClientConfig,
     ) -> Result<Client, ClientError> {
         let stream = Client::dial(addr, config.connect_timeout)?;
+        // Set the slowloris timeouts on the RAW socket before wrapping — they persist on the same fd
+        // inside the `Wire` (the handshake below also runs under the read timeout).
         stream.set_read_timeout(config.read_timeout)?;
         stream.set_write_timeout(config.write_timeout)?;
+        // Wrap the socket: TLS 1.3 when `config.tls` is set (verify the broker + complete the handshake
+        // HERE, so a bad certificate fails the connect, never a silent plaintext fallback), else a
+        // zero-cost plaintext `Wire`. On a non-tls build every connection is plaintext.
+        #[cfg(feature = "tls")]
+        let stream = match &config.tls {
+            Some(tls_config) => Wire::connect_tls(stream, tls_config)?,
+            None => Wire::Plain(stream),
+        };
+        #[cfg(not(feature = "tls"))]
+        let stream = Wire::Plain(stream);
         let mut client = Client {
             stream,
             buf: Vec::new(),
@@ -1185,6 +1337,23 @@ impl Client {
         // unauthenticated connect is unchanged. An oversized credential fails closed here (a typed
         // `ClientError::Body`) rather than sending a truncated auth section.
         if let Some(cred) = &config.credential {
+            // The `Mtls` mechanism authenticates on the client CERTIFICATE presented at the TLS
+            // handshake — its `Connect` body carries no credential bytes (#957). Guard it client-side:
+            // sending `Mtls` without a configured client certificate would be rejected by the server as
+            // an authorization violation, so fail fast here with an actionable error instead.
+            #[cfg(feature = "tls")]
+            if matches!(cred.mechanism, AuthMechanism::Mtls)
+                && !config
+                    .tls
+                    .as_ref()
+                    .is_some_and(TlsClientConfig::has_client_cert)
+            {
+                return Err(ClientError::Tls(
+                    "the Mtls credential authenticates on a client certificate, but none is \
+                     configured: set ClientConfig.tls to a TlsClientConfig::with_client_cert(...)"
+                        .to_string(),
+                ));
+            }
             append_connect_auth(&mut connect_body, cred).map_err(ClientError::Body)?;
         }
         client.send(FrameType::Connect, &connect_body)?;
@@ -4169,6 +4338,188 @@ mod tests {
             }
         });
         (addr, shutdown, handle)
+    }
+
+    /// Opens an in-memory test engine with the shared default config, extracted so the client-TLS
+    /// integration test can reuse it.
+    #[cfg(feature = "tls")]
+    fn open_test_engine(
+        consumer_credit: u32,
+        consumer_credit_bytes: u64,
+        compression: ironbus_core::compress::Codec,
+    ) -> Engine<InMemoryFs, SystemClock> {
+        Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit,
+                consumer_credit_bytes,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
+                max_streams: 0,
+                group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
+                sync_max_dirty_bytes: 0,
+                compression,
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
+            },
+        )
+        .unwrap()
+    }
+
+    // A long-lived self-signed server cert + key for "localhost", and a DIFFERENT (wrong) trust
+    // anchor, for the client-TLS integration test. Embedded (rcgen pulls banned ring).
+    #[cfg(feature = "tls")]
+    const TLS_SERVER_CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBVzCB/aADAgECAhMjGIxpQAwb+081fMl2nX2WEMQ8MAoGCCqGSM49BAMCMB4x
+HDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIwIBcNMjAwMTAxMDAwMDAwWhgP
+MjEwMDAxMDEwMDAwMDBaMB4xHDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+AoxgwFjAU
+BgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwIDSQAwRgIhAJ+smDY9Jybx
+FoJDOjOor9Cb56IyQQ64ts0roLO5NVx9AiEAnB1pAliacK3UDfG6xKEig12h4tzf
+UrjVOalNQ4uwFJg=
+-----END CERTIFICATE-----
+";
+    #[cfg(feature = "tls")]
+    const TLS_SERVER_KEY: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWd4kisc5NnK6Nv0I
+RL0rrbnn9ozoIOti7I4eisF3CHWhRANCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
+-----END PRIVATE KEY-----
+";
+    #[cfg(feature = "tls")]
+    const TLS_OTHER_CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBWjCCAQCgAwIBAgIUfIjY91xg+z0LSwh5bngCs73UQLswCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSaXJvbmJ1cy10ZXN0LW90aGVyMCAXDTIwMDEwMTAwMDAwMFoY
+DzIxMDAwMTAxMDAwMDAwWjAdMRswGQYDVQQDDBJpcm9uYnVzLXRlc3Qtb3RoZXIw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS/sQWpzoGIBq0tyDdZLN7918LWW/j0
++CsRiYQa+vfAdERrw1POkGOIed4wUocAT9+tMkOY/VB/OSbHJxeZwPSBoxwwGjAY
+BgNVHREEETAPgg1vdGhlci5pbnZhbGlkMAoGCCqGSM49BAMCA0gAMEUCIC4trwko
+Aq57VS5iw0sm+NFBdTHX5XSCUQvACWp0elXzAiEArjyI3F1SeVHMY/DKGtuy7J/3
+toYtkjmdU2eQ2pK/3gM=
+-----END CERTIFICATE-----
+";
+
+    /// Spins a TLS-terminating in-memory broker (ADR-0004 / #957): the same engine + serve loop as
+    /// [`spawn_serving`], but every accepted connection completes a TLS 1.3 handshake first.
+    #[cfg(feature = "tls")]
+    fn spawn_serving_tls(
+        engine: Engine<InMemoryFs, SystemClock>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (handle_engine, _actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_config =
+            ironbus_server::tls::server_config_from_pem(TLS_SERVER_CERT, TLS_SERVER_KEY).unwrap();
+        let tls =
+            ironbus_server::server::TlsTermination::with_config(std::sync::Arc::new(server_config));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                let clock = SystemClock::new();
+                let beacon =
+                    ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                let connz = Arc::new(ironbus_server::connz::ConnectionMetrics::new());
+                ironbus_server::server::serve_with_auth_connz_preauth_audit(
+                    &listener,
+                    &handle_engine,
+                    &shutdown,
+                    16,
+                    &clock,
+                    &beacon,
+                    None,
+                    &connz,
+                    None,
+                    None,
+                    tls,
+                )
+                .unwrap();
+            }
+        });
+        (addr, shutdown, handle)
+    }
+
+    /// End-to-end client TLS (ADR-0004 / #957): a `Client` VERIFIES the broker and connects over a real
+    /// TLS 1.3 session (so its `Connect`/credential travels encrypted), then produces over it. A client
+    /// pointed at the WRONG trust anchor fails the handshake — mandatory verification, no plaintext
+    /// fallback.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn a_client_produces_over_a_verified_tls_connection_and_a_wrong_anchor_is_rejected() {
+        let engine = open_test_engine(64, 0, ironbus_core::compress::Codec::None);
+        let (addr, shutdown, handle) = spawn_serving_tls(engine);
+
+        // Correct trust anchor: verify the broker, connect over TLS 1.3, and produce.
+        let config = ClientConfig {
+            tls: Some(crate::tls::TlsClientConfig::new(
+                TLS_SERVER_CERT.to_vec(),
+                "localhost",
+            )),
+            ..Default::default()
+        };
+        let mut client = Client::connect_with(addr, &config)
+            .expect("the client verifies the broker and connects");
+        let offset = client
+            .produce(&proto::PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"produced-over-client-tls",
+            })
+            .expect("a produce travels over the TLS connection");
+        assert_eq!(offset, 0, "the produce is durable at offset 0");
+
+        // Wrong trust anchor: the server certificate does not verify, so the handshake FAILS at connect.
+        let bad = ClientConfig {
+            tls: Some(crate::tls::TlsClientConfig::new(
+                TLS_OTHER_CERT.to_vec(),
+                "localhost",
+            )),
+            ..Default::default()
+        };
+        assert!(
+            Client::connect_with(addr, &bad).is_err(),
+            "a client with the wrong trust anchor must be rejected at the TLS handshake"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        drop(client);
+        let _ = handle.join();
     }
 
     /// Encodes one framed reply (length prefix, type, body).
