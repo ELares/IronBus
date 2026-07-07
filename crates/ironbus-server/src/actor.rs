@@ -49,6 +49,7 @@
 //! - No lost replies / no deadlock: every command gets exactly one reply; a closed channel is a typed
 //!   [`ActorGone`], never a panic, so neither side hangs forever if the other dies.
 
+use crate::commit_notify::CommitNotify;
 use crate::engine::{AsyncCommit, DiskFullPolicy, Engine, EngineError};
 use crate::flusher::{spawn_flusher, FlushJob, SyncDone};
 use crate::liveness::ActorWatchdog;
@@ -682,6 +683,18 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// where a produce whose reply the exiting actor never sent would otherwise wedge forever. Shared on
     /// clone (like `cap_gate`): one flag per actor.
     actor_alive: Arc<AtomicBool>,
+    /// The event-driven consume long-poll budget in MILLISECONDS (push delivery), snapshotted from
+    /// [`crate::engine::EngineConfig::consume_longpoll_ms`] at `spawn_actor` time exactly like
+    /// `consumer_credit_caps` — a fixed-for-life value the `Connect` path reads LOCALLY (no actor
+    /// round-trip) to set `Session::consume_longpoll_ms`. `0` (the default) is OFF: an idle Flow/Fetch
+    /// returns empty immediately, byte-for-byte today's behavior.
+    consume_longpoll_ms: u64,
+    /// The engine-wide commit-notify wakeup seam (push delivery): the SAME `Arc` the append actor
+    /// [`CommitNotify::bump`]s whenever the durable poll frontier advances, so an idle consumer that
+    /// long-polls can wake the instant a record commits instead of returning empty. SHARED across every
+    /// connection (one per actor), so a `clone` keeps the SAME `Arc` (like `cap_gate`). Consulted only
+    /// when `consume_longpoll_ms > 0`; the default-off path never touches it.
+    commit_notify: Arc<CommitNotify>,
 }
 
 /// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
@@ -713,6 +726,11 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             actor_watchdog: Arc::clone(&self.actor_watchdog),
             // The SAME shared actor-liveness flag (#949): one per actor, observed by a pending wait.
             actor_alive: Arc::clone(&self.actor_alive),
+            // The fixed-for-life long-poll budget (push delivery): a plain copy, like `reply_spin`.
+            consume_longpoll_ms: self.consume_longpoll_ms,
+            // The SAME shared commit-notify seam (push delivery): one per actor, bumped by the actor
+            // and waited on by every idle long-polling consumer, so the `Arc` is shared on clone.
+            commit_notify: Arc::clone(&self.commit_notify),
         }
     }
 }
@@ -765,6 +783,21 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     #[must_use]
     pub fn consumer_credit_caps(&self) -> (u32, u64) {
         self.consumer_credit_caps
+    }
+
+    /// The event-driven consume long-poll budget in MILLISECONDS (push delivery), snapshotted from the
+    /// engine config at `spawn_actor`. Read by the connection setup to seed `Session::consume_longpoll_ms`
+    /// WITHOUT an actor round-trip (like [`EngineHandle::consumer_credit_caps`]). `0` = OFF (the default).
+    #[must_use]
+    pub fn consume_longpoll_ms(&self) -> u64 {
+        self.consume_longpoll_ms
+    }
+
+    /// The engine-wide commit-notify wakeup seam (push delivery): the shared `Arc` an idle
+    /// long-polling consumer waits on and the append actor bumps on every durable-frontier advance.
+    #[must_use]
+    pub fn commit_notify(&self) -> &Arc<CommitNotify> {
+        &self.commit_notify
     }
 
     /// Submits a produce for the next group commit and AWAITS its outcome. The reply arrives only
@@ -1171,6 +1204,17 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         true
     }
 
+    /// The engine-wide commit-notify wakeup seam (push delivery), or `None` for an engine that has no
+    /// append actor to bump it. The DEFAULT impl returns `None` (every non-handle `EngineAccess` — the
+    /// in-process test fixtures — has no separate actor to signal a commit), so a session over such an
+    /// engine takes the byte-for-byte-unchanged empty-and-return consume path even when long-poll is
+    /// configured (there is nothing to wake it). [`EngineHandle`] overrides it to hand back its shared
+    /// [`CommitNotify`], which the actor bumps on every durable-frontier advance. Consulted ONLY when
+    /// `Session::consume_longpoll_ms > 0`; the default-off consume path never calls it.
+    fn commit_notify(&self) -> Option<&Arc<CommitNotify>> {
+        None
+    }
+
     /// The CLUSTER produce-ack decision (#719) for one durable produce on connection `member`: called
     /// AFTER the local group-commit fsync returned `Appended(offset)`, with the `offset`, and the EXACT
     /// wire-`PubAck` frame bytes the session would otherwise write now.
@@ -1322,6 +1366,12 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         // outside a drain) read this to catch an UNEXPECTED actor death the watchdog misses when the
         // actor died idle or the bound is disabled (#922). Never goes through the actor.
         self.actor_alive.load(Ordering::Acquire)
+    }
+
+    fn commit_notify(&self) -> Option<&Arc<CommitNotify>> {
+        // The shared seam the append actor bumps on every durable-frontier advance (push delivery): an
+        // idle long-polling consumer waits on this and wakes the instant a record commits.
+        Some(EngineHandle::commit_notify(self))
     }
 
     fn client_ack_disposition(
@@ -1637,6 +1687,16 @@ where
     // Snapshot the static per-consumer credit caps (#292) BEFORE the engine moves into the actor, so
     // the Connect handshake can negotiate them off the actor's hot path (no round-trip, #177).
     let consumer_credit_caps = (engine.consumer_credit(), engine.consumer_credit_bytes());
+    // Snapshot the consume long-poll budget (push delivery) BEFORE the engine moves, exactly like the
+    // credit caps above: it is fixed for the engine's life (a `serve` flag sets it once), so the
+    // `Connect` path reads it off the handle to seed `Session::consume_longpoll_ms` with no round-trip.
+    let consume_longpoll_ms = engine.consume_longpoll_ms();
+    // The engine-wide commit-notify wakeup seam (push delivery): ONE per actor, cloned into BOTH the
+    // handle template (so every connection shares it) AND the actor thread (which bumps it on every
+    // durable-frontier advance). Created unconditionally — it costs a `Mutex<u64>` + `Condvar` and is
+    // only ever bumped/waited when a consumer long-polls, so a default-off broker never touches it.
+    let commit_notify = CommitNotify::new();
+    let actor_commit_notify = Arc::clone(&commit_notify);
     // Snapshot the produce-reply spin discriminant (#1032) BEFORE the engine moves: a reply wait
     // spins only where the ack waits on NO pre-ack fsync barrier (#1026) — the memory backend or a
     // relaxed durability level — where the round trip is tens of microseconds. Both inputs are fixed
@@ -1708,6 +1768,7 @@ where
                 &actor_gate,
                 &actor_watchdog_thread,
                 &actor_clock,
+                &actor_commit_notify,
             )
         })
         // A thread-spawn failure at startup is unrecoverable for the server, but the no-panic bar is
@@ -1735,6 +1796,9 @@ where
             actor_watchdog,
             // The shared actor-liveness flag (#949), observed by a pending produce's `wait`.
             actor_alive,
+            // The consume long-poll budget snapshot + shared commit-notify seam (push delivery).
+            consume_longpoll_ms,
+            commit_notify,
         },
         join,
     )
@@ -1813,6 +1877,30 @@ struct PipelineRig<File> {
     max_dirty_bytes: u64,
 }
 
+/// Signals the commit-notify wakeup seam (push delivery) IFF the DURABLE poll frontier advanced since
+/// `last_notified`. Pure observation on the actor thread: it reads [`Engine::flushed_offset`] — the
+/// exact head [`Engine::poll_now_in_member`] serves up to, which under the sync tier advances only at
+/// barrier completion — and, only when it grew, records the new head and [`CommitNotify::bump`]s every
+/// idle long-polling consumer awake to re-poll. Called STRICTLY AFTER the durability work that may have
+/// advanced the frontier, so it never reorders any commit/append/release. OVER-bumping is harmless (a
+/// woken waiter that still finds nothing re-waits or times out); UNDER-bumping only costs a consumer a
+/// little latency (it falls back to its long-poll timeout). Cheap on the steady-state path: one offset
+/// read + compare, and the `bump` (a short lock + `notify_all`) runs only on a real advance.
+fn notify_frontier_advance<F, C>(
+    engine: &Engine<F, C>,
+    commit_notify: &CommitNotify,
+    last_notified: &mut u64,
+) where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    let head = engine.flushed_offset().get();
+    if head > *last_notified {
+        *last_notified = head;
+        commit_notify.bump();
+    }
+}
+
 /// The actor's run loop. It blocks for one command, then DRAINS every command already queued
 /// (`try_recv`) into the same pass so a burst of produces group-commits together. Produces are
 /// appended (no sync) and their replies parked; a non-produce job or the end of the drain triggers
@@ -1830,6 +1918,7 @@ fn run_actor<F, C>(
     cap_gate: &ProduceCapGate,
     watchdog: &ActorWatchdog,
     clock: &C,
+    commit_notify: &CommitNotify,
 ) -> Engine<F, C>
 where
     F: Filesystem,
@@ -1840,11 +1929,14 @@ where
     // (#1026) the pipelined loop runs; every non-fsync tier falls through to the LEGACY loop below,
     // byte-for-byte (an ack there waits on no barrier, so there is nothing to pipeline).
     if let Some(rig) = pipeline {
-        return run_actor_pipelined(engine, rx, rig, cap_gate, watchdog, clock);
+        return run_actor_pipelined(engine, rx, rig, cap_gate, watchdog, clock, commit_notify);
     }
     // Produces appended this pass but not yet durable: each parked reply is released only after the
     // single covering `commit_batch`, so a `PubAck` never precedes its fsync (I2).
     let mut pending: Vec<PendingProduce> = Vec::new();
+    // The last durable poll frontier this actor has already signalled to long-polling consumers (push
+    // delivery): seeded to the recovered head so only real ADVANCES bump the commit-notify seam.
+    let mut last_notified = engine.flushed_offset().get();
     // The per-pass command batch, hoisted and reused across drains exactly like `pending` above (#828):
     // each pass `clear()`s it and `drain(..)`s it empty, so its backing capacity is retained instead of
     // freed and regrown-from-zero every batch. This actor is the single serialization point for all
@@ -1949,6 +2041,10 @@ where
         // The drain is exhausted: commit the parked produces with the ONE covering fsync, then release
         // their replies. This is the steady-state group commit boundary.
         flush_pending(&mut engine, &mut pending);
+        // Push delivery: the covering commit just advanced the durable poll frontier, so wake any idle
+        // long-polling consumer to re-poll. STRICTLY AFTER the flush (pure observation; a bump reads the
+        // now-current `flushed_offset`), never reordered with the durability work above.
+        notify_frontier_advance(&engine, commit_notify, &mut last_notified);
         // The batch just changed the durable byte total (an append grows it; a post-commit retention
         // reap can shrink it), so refresh the connection-thread fast-reject gate with the now-current
         // reading (#476). This is the ONE refresh that matters for steady-state load: a produce that
@@ -2000,11 +2096,16 @@ fn run_actor_pipelined<F, C>(
     cap_gate: &ProduceCapGate,
     watchdog: &ActorWatchdog,
     clock: &C,
+    commit_notify: &CommitNotify,
 ) -> Engine<F, C>
 where
     F: Filesystem,
     C: Clock + Clone,
 {
+    // The last durable poll frontier already signalled to long-polling consumers (push delivery): in
+    // this (sync) tier `flushed_offset` advances only at barrier completion, so a bump here means a
+    // record just became poll-visible. Seeded to the recovered head so only real advances signal.
+    let mut last_notified = engine.flushed_offset().get();
     let mut pipeline = Pipeline {
         parked: VecDeque::new(),
         in_flight: None,
@@ -2037,6 +2138,11 @@ where
                 Ok(cmd) => cmd,
                 Err(TryRecvError::Empty) => {
                     pipeline.wait_one_completion(&mut engine);
+                    // Push delivery: waiting out the in-flight barrier is exactly where the durable
+                    // frontier advances while the command channel is idle, so wake any long-polling
+                    // consumer to re-poll the moment the barrier completes. STRICTLY AFTER the
+                    // completion is folded in — pure observation of the now-current `flushed_offset`.
+                    notify_frontier_advance(&engine, commit_notify, &mut last_notified);
                     continue;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -2135,6 +2241,15 @@ where
         pipeline.release_ready(&mut engine);
         carryover = pipeline.finish_pass(&mut engine, rx);
         pipeline.reconcile_writer_freeze(&mut engine, None);
+        // Push delivery: wake any idle long-polling consumer if the durable poll frontier advanced this
+        // pass. Placed AFTER `finish_pass` on purpose: the pass-end dispatch may take the SOLO-INLINE
+        // barrier (a single waiter's covering `fdatasync` run inline), which advances `flushed_offset`
+        // right here with NO in-flight barrier to observe later — a bump before `finish_pass` would miss
+        // it and strand the consumer until its timeout. An ASYNC barrier instead leaves the frontier
+        // unchanged now (this is a no-op) and is caught by the `wait_one_completion` bump when it
+        // completes. Pure observation of the now-current `flushed_offset`; never reorders the durability
+        // work above.
+        notify_frontier_advance(&engine, commit_notify, &mut last_notified);
         refresh_cap_gate(cap_gate, &mut engine);
         engine.codel_queue_empty();
         // The same #862 publish → idle RELEASE-store pairing as the legacy loop (do not reorder);
@@ -3074,6 +3189,7 @@ mod tests {
 
     fn config() -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -3201,6 +3317,7 @@ mod tests {
     /// under a chosen durability level.
     fn config_headroom(level: crate::engine::DurabilityLevel, headroom_bytes: u64) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             durability_level: level,
             wal_fsync_headroom_bytes: headroom_bytes,
             ..config()
@@ -3234,6 +3351,7 @@ mod tests {
     /// real append-actor byte-cap shed path under a chosen policy.
     fn config_capped(cap: u64, policy: DiskFullPolicy) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig::default().with_max_total_bytes(cap),
             disk_full_policy: policy,
             ..config()
@@ -4325,6 +4443,7 @@ mod tests {
         // page-cache acks. With an 800 ms window, a gathered pass could not ack in under 800 ms.
         let (fs, control) = FaultFs::new(InMemoryFs::new());
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             durability_level: crate::engine::DurabilityLevel::Interval,
             flush_max_bytes: 1,
             ..config()
@@ -4491,6 +4610,7 @@ mod tests {
     /// dropped. Byte dimension off (the message dimension binds, for a crisp count).
     fn config_faf() -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             fire_and_forget_msg_rate: 10,
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: 100,
@@ -4978,6 +5098,7 @@ mod tests {
         // gate closes, so any tail loss is legal; recovery must open cleanly at every seed.
         for seed in 0..8u64 {
             let cfg = EngineConfig {
+                consume_longpoll_ms: 0,
                 log: LogConfig {
                     max_segment_bytes: 192,
                     ..LogConfig::default()
@@ -5104,6 +5225,7 @@ mod tests {
         // `reconcile_writer_freeze` must fatal the parked waiter promptly — the exact D3 wedge
         // (a parked reply with no flight and a dead writer) this transition exists to kill.
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 192,
                 ..LogConfig::default()
@@ -5225,6 +5347,7 @@ mod tests {
         // still parked inside the closed gate (no completion — and no completion-side reconcile —
         // can have run). The stale Ok completion is then a FULL no-op, exactly as in T5(b).
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 192,
                 ..LogConfig::default()
@@ -5376,6 +5499,7 @@ mod tests {
         // log level; observed here as exact final heads/meter); and the pipeline keeps flowing
         // afterward (the meter-drift livelock regression, T10b).
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 192,
                 ..LogConfig::default()
@@ -5566,6 +5690,7 @@ mod tests {
         // the completion drains the window. The bound forces the windows apart: each throttled
         // record rides its OWN barrier (dispatch-before-block, so no deadlock either).
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             sync_max_dirty_bytes: 64,
             ..config()
         };
@@ -5645,6 +5770,7 @@ mod tests {
         // observed BOUNDED: the flusher enters the closed gate (`sync_count` bumps at gate entry)
         // while B is still throttled and unacked, and every later wait is a timed recv.
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             sync_max_dirty_bytes: 64,
             ..config()
         };
@@ -6032,6 +6158,7 @@ mod tests {
         // and a segment roll) must leave BYTE-IDENTICAL segment files — the pipeline changes
         // WHEN fsyncs happen, never what lands on disk.
         let cfg = || EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 512,
                 ..LogConfig::default()
@@ -6489,6 +6616,7 @@ mod tests {
         // flusher completions), so the only reap path for them IS the completion tail — a solo
         // produce would reap inside H1's inline `commit_batch` and mask the mutant.
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 256,
                 ..LogConfig::default()
@@ -6548,6 +6676,7 @@ mod tests {
         // requires the covered waiter to be released (or fataled) at this pass-end reconcile
         // point; it must never stay parked on an otherwise idle broker.
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 256,
                 ..LogConfig::default()
@@ -6604,6 +6733,7 @@ mod tests {
         // UNIT probe of the commit_inline Err arm: reap error (injected unlink failure) after a
         // SUCCESSFUL sync, writer still writable. Inspect the Pipeline state directly.
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 256,
                 ..LogConfig::default()

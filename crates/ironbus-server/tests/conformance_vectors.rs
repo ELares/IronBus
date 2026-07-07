@@ -634,6 +634,7 @@ fn build_config(setup: &Setup) -> EngineConfig {
         _ => DiskFullPolicy::DropNew,
     };
     EngineConfig {
+        consume_longpoll_ms: 0,
         log: LogConfig {
             max_segment_bytes: setup.max_segment_bytes,
             max_total_bytes: setup.max_total_bytes,

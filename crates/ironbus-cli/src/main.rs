@@ -378,6 +378,14 @@ const DEFAULT_EGRESS_LIMIT: u32 = 0;
 const DEFAULT_WAL_FSYNC_HEADROOM_BYTES: u64 =
     ironbus_core::backpressure::DEFAULT_WAL_FSYNC_HEADROOM_BYTES;
 
+/// The default `--consume-longpoll-ms` for `serve` (push delivery): `0` = OFF (the tunability-safe
+/// default), so an idle consumer that polls an empty group returns an empty batch immediately, exactly
+/// today's behavior. A NON-ZERO value opts in — an idle `Flow`/`Fetch` blocks up to this many
+/// milliseconds on the broker's commit-notify seam and re-polls the instant a record commits, turning
+/// the client's poll-interval latency floor into a commit-driven wakeup. Server-only: no wire, client,
+/// or format change.
+const DEFAULT_CONSUME_LONGPOLL_MS: u64 = 0;
+
 /// The default COUNT bound on each per-producer dedup window for `serve` (#3, #33), aliased to the
 /// engine's [`ironbus_core::dedup::DEFAULT_MAX_IDS`] so the CLI and engine default are one source of
 /// truth. Dedup is OFF by default and activates per-producer only when a publish carries a `msg_id`;
@@ -2407,6 +2415,9 @@ struct ServeFlags {
     fire_and_forget_refill_ms: Option<u64>,
     /// The starting / static-floor egress concurrency limit (#69); `None` -> default (16).
     egress_limit: Option<u32>,
+    /// The event-driven consume long-poll budget in MILLISECONDS (push delivery); `None` -> default
+    /// (`0` = off, the byte-identical empty-and-return consume path).
+    consume_longpoll_ms: Option<u64>,
     /// The fsync-headroom admission window in BYTES (#378); `None` -> default (`0` = off).
     wal_fsync_headroom_bytes: Option<u64>,
     /// The graceful-shutdown drain timeout in MILLISECONDS (#637); `None` -> default (30 s). `0` waits
@@ -2703,6 +2714,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--egress-limit" => {
                 f.egress_limit = Some(take_number("--egress-limit", args, &mut i)?);
+            }
+            "--consume-longpoll-ms" => {
+                f.consume_longpoll_ms = Some(take_number("--consume-longpoll-ms", args, &mut i)?);
             }
             "--wal-fsync-headroom-bytes" => {
                 f.wal_fsync_headroom_bytes =
@@ -3402,6 +3416,15 @@ fn parse_serve_flags_with_env_and_reader(
                 f.egress_limit,
                 env,
                 DEFAULT_EGRESS_LIMIT,
+            )?,
+            // The event-driven consume long-poll budget (push delivery), flag > env > default `0`
+            // (OFF), so a zero-config broker is byte-for-byte unchanged; a non-zero value opts an idle
+            // consumer into commit-driven wakeup instead of empty-and-return.
+            consume_longpoll_ms: resolve_number(
+                "--consume-longpoll-ms",
+                f.consume_longpoll_ms,
+                env,
+                DEFAULT_CONSUME_LONGPOLL_MS,
             )?,
             // The fsync-headroom admission window (#378), flag > env > default `0` (OFF), so a
             // zero-config broker is unchanged; a non-zero value bounds the un-fsynced write frontier.
@@ -5202,6 +5225,11 @@ struct ServeConfig {
     /// The starting / static-floor EGRESS concurrency limit for the AIMD downstream limiter (#69),
     /// adapted within `[4, 128]`. `0` is treated as the doc default floor (16) by the limiter.
     egress_limit: u32,
+    /// The event-driven consume long-poll budget in MILLISECONDS (push delivery): `0` = OFF (the
+    /// default), an idle consumer returns an empty batch immediately; a non-zero value lets an idle
+    /// `Flow`/`Fetch` block up to this budget on the broker's commit-notify seam and re-poll the
+    /// instant a record commits. Threaded into [`EngineConfig::consume_longpoll_ms`]. Server-only.
+    consume_longpoll_ms: u64,
     /// The fsync-HEADROOM admission window in BYTES (#378): the most un-fsynced (buffered-but-not-
     /// durable) record bytes the BUFFERED write frontier may run ahead of the DURABLE frontier before
     /// a new produce is throttled (a group-commit drain forced first) or shed. `0` = DISABLED (the
@@ -5238,6 +5266,7 @@ impl ServeConfig {
     /// here so it cannot drift from the per-flag default constants.
     fn bench_default() -> ServeConfig {
         ServeConfig {
+            consume_longpoll_ms: 0,
             // The bench broker is the shipped default set, i.e. the `balanced` profile.
             profile: Profile::Balanced,
             profile_schema_version: PROFILE_SCHEMA_VERSION,
@@ -9802,6 +9831,10 @@ fn open_engine_with<F: Filesystem + Clone>(
             fire_and_forget_byte_rate: config.fire_and_forget_byte_rate,
             fire_and_forget_refill_ms: config.fire_and_forget_refill_ms,
             egress_limit: config.egress_limit,
+            // The event-driven consume long-poll budget (push delivery), wired from
+            // `--consume-longpoll-ms` (default `0` = OFF). Server-only: an idle consumer wakes on a
+            // commit instead of returning empty; no wire/client/format change.
+            consume_longpoll_ms: config.consume_longpoll_ms,
             // The fsync-headroom admission window (#378), wired from `--wal-fsync-headroom-bytes`.
             // Default `0` = OFF (the un-fsynced frontier is bounded only by the group-commit
             // drain under `sync` / the interval window under a relaxed level), so a zero-config
@@ -13392,6 +13425,7 @@ mod tests {
     #[cfg(unix)]
     fn test_serve_config(max_in_flight: u32, checkpoint_interval: u64) -> ServeConfig {
         ServeConfig {
+            consume_longpoll_ms: 0,
             profile: Profile::Balanced,
             profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -15317,6 +15351,7 @@ mod tests {
             StdFs::new(dir.clone()),
             Arc::clone(&clock),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -16129,6 +16164,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let config = ServeConfig {
+            consume_longpoll_ms: 0,
             compression: codec,
             ..test_serve_config(64, 1)
         };
@@ -16268,6 +16304,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -16354,6 +16391,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -16830,6 +16868,7 @@ mod tests {
     // socket are never opened, so it needs no Unix gate). Defaults mirror the production defaults.
     fn validation_config() -> ServeConfig {
         ServeConfig {
+            consume_longpoll_ms: 0,
             profile: Profile::Balanced,
             profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -16904,6 +16943,7 @@ mod tests {
         // error, and the message points the operator at the opt-in flag (#63).
         for max in [0, u32::MAX] {
             let cfg = ServeConfig {
+                consume_longpoll_ms: 0,
                 max_deliver: max,
                 allow_unlimited_deliver: false,
                 ..validation_config()
@@ -16923,6 +16963,7 @@ mod tests {
         // startup WARN is emitted by cmd_serve; validation only stops rejecting.
         for max in [0, u32::MAX] {
             let cfg = ServeConfig {
+                consume_longpoll_ms: 0,
                 max_deliver: max,
                 allow_unlimited_deliver: true,
                 ..validation_config()
@@ -16950,6 +16991,7 @@ mod tests {
         // bounded-buffer footprint (~26 MiB, ~11 MiB of which is the dedup term) fits, so the broker
         // boots.
         let cfg = ServeConfig {
+            consume_longpoll_ms: 0,
             max_connections: 32,
             consumer_credit: 8,
             consumer_credit_bytes: 256 * 1024,
@@ -16982,6 +17024,7 @@ mod tests {
         // payloads, so an edge box booted under 64 MiB yet a `TxnPrepare` flood of distinct txn_ids could
         // pin the default 65_536 maximal records in RAM and OOM it.
         let cfg = ServeConfig {
+            consume_longpoll_ms: 0,
             max_connections: 32,
             consumer_credit: 8,
             consumer_credit_bytes: 256 * 1024,
@@ -17013,6 +17056,7 @@ mod tests {
         // in-flight bytes alone is 1 GiB, provably over 64 MiB, so the guard refuses to boot (exit 1)
         // and the usage message names the overage and the knob to lower.
         let cfg = ServeConfig {
+            consume_longpoll_ms: 0,
             max_connections: 4096,
             consumer_credit: 8,
             consumer_credit_bytes: 256 * 1024,
@@ -17044,6 +17088,7 @@ mod tests {
         // worst case is consumer_credit maximal frames per connection: under a 64 MiB ceiling this
         // cannot be PROVEN to fit and is refused (the honest, conservative reading).
         let cfg = ServeConfig {
+            consume_longpoll_ms: 0,
             max_connections: 32,
             consumer_credit: DEFAULT_CONSUMER_CREDIT,
             consumer_credit_bytes: 0,
@@ -17062,6 +17107,7 @@ mod tests {
     /// terms fit a 64 MiB ceiling with room to spare, so the verdict flips PURELY on the store.
     fn edge_tiny_caps() -> ServeConfig {
         ServeConfig {
+            consume_longpoll_ms: 0,
             max_connections: 32,
             consumer_credit: 8,
             consumer_credit_bytes: 256 * 1024,
@@ -17092,6 +17138,7 @@ mod tests {
         // small buffer caps are what make that kill possible: under the balanced defaults the
         // ceiling is exceeded by the connection terms alone and a fold-less mutant still refuses.
         let cfg = ServeConfig {
+            consume_longpoll_ms: 0,
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
             max_total_bytes: 1024 * 1024 * 1024,
@@ -17122,6 +17169,7 @@ mod tests {
         // The SAME knobs on the DISK backend still validate: the disk store is file-backed (~0
         // RSS), so it stays uncharged and the historical disk verdict is unchanged.
         let disk = ServeConfig {
+            consume_longpoll_ms: 0,
             max_total_bytes: 1024 * 1024 * 1024,
             ..edge_tiny_caps()
         };
@@ -17146,6 +17194,7 @@ mod tests {
         // refuse, so together they fix the multiplier at exactly 1.) The store cap is small because the
         // #909 prepared term now consumes most of the tiny ceiling's headroom.
         let cfg = ServeConfig {
+            consume_longpoll_ms: 0,
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
             max_total_bytes: 4 * 1024 * 1024,
@@ -17167,6 +17216,7 @@ mod tests {
         // ~11 MiB #878 dedup term plus the ~32 MiB #909 prepared term that sums to ~62 MiB, just
         // under the 64 MiB ceiling.
         let cfg = ServeConfig {
+            consume_longpoll_ms: 0,
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
             max_total_bytes: 4 * 1024 * 1024,
@@ -20453,6 +20503,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::from_millis(50, 300_000),
@@ -20538,6 +20589,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::from_millis(30_000, 300_000),

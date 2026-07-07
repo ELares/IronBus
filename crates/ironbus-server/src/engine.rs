@@ -567,6 +567,16 @@ pub struct EngineConfig {
     /// recorded event. Has effect only when a [`dead_letter_exchange`](Self::dead_letter_exchange)
     /// is configured; with no DLX an expired message is always reclaimed by retention.
     pub dead_letter_expired: bool,
+    /// The event-driven consume LONG-POLL budget in MILLISECONDS (push delivery). `0` (the default)
+    /// is OFF — an idle consumer that polls an empty group returns an empty batch immediately, exactly
+    /// today's behavior. A non-zero value lets an idle Flow/Fetch BLOCK up to this budget on the
+    /// broker's [`crate::commit_notify::CommitNotify`] and re-poll the instant a record commits (or the
+    /// budget elapses), turning the client's poll-interval latency floor into a commit-driven wakeup.
+    /// A purely OPT-IN tunable (the tunability principle): the safe default preserves the historical
+    /// empty-and-return path byte-for-byte, and no wire/client/format change is involved — a consumer
+    /// against a long-poll-enabled broker simply gets its empty batches later (once a commit or the
+    /// budget wakes it) instead of instantly.
+    pub consume_longpoll_ms: u64,
 }
 
 /// One PIPELINED async commit in flight (#1040): the engine-level pairing of the storage
@@ -2771,6 +2781,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// always reclaimed by the reap (still bounded, never delivered, counted in `expired`). See
     /// [`EngineConfig::dead_letter_expired`].
     dead_letter_expired: bool,
+    /// The event-driven consume long-poll budget in MILLISECONDS (push delivery), snapshotted from
+    /// [`EngineConfig::consume_longpoll_ms`] at open. `0` (the default) is OFF. Read once and handed to
+    /// each session (via the [`crate::actor::EngineHandle`] snapshot) so an idle Flow/Fetch can block up
+    /// to this budget on the commit-notify seam instead of returning empty immediately. Fixed for the
+    /// engine's life (a `serve` flag sets it once), like the per-consumer credit caps.
+    consume_longpoll_ms: u64,
     /// The set of group names CONFIGURED to use `key_shared` ordering (#64), declared server-side
     /// (NOT on the wire). Empty by default, so every group is plain competing
     /// ([`KeyOrdering::None`]) unless an operator opts it in. A session consults
@@ -3251,6 +3267,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // default (`None` keeps the fixed `dlq/` sink byte-identical).
             dead_letter_exchange: config.dead_letter_exchange,
             dead_letter_expired: config.dead_letter_expired,
+            consume_longpoll_ms: config.consume_longpoll_ms,
         };
         engine.seed_registry_from_recovered_state(flushed);
         // RESTORE the durable idempotent-producer SEQUENCE high-waters (V2-M8) into the registry, so a
@@ -8738,6 +8755,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.consumer_credit_bytes
     }
 
+    /// The event-driven consume long-poll budget in MILLISECONDS (push delivery), snapshotted from
+    /// [`EngineConfig::consume_longpoll_ms`] at open. `0` = OFF (the default). Read once at
+    /// [`crate::actor::spawn_actor`] time into the [`crate::actor::EngineHandle`] so an idle Flow/Fetch
+    /// can consult it WITHOUT an actor round-trip, exactly like [`Engine::consumer_credit`].
+    #[must_use]
+    pub fn consume_longpoll_ms(&self) -> u64 {
+        self.consume_longpoll_ms
+    }
+
     /// Whether `token` still names an ACTIVE (live and NOT yet expired) lease in `group` owned by
     /// exactly this `(offset, generation)` at the engine's current monotonic time (refs #65, #175):
     /// `true` only if the offset is currently leased, its generation matches the token, AND its
@@ -8871,6 +8897,7 @@ mod tests {
 
     fn config(max_in_flight: u32, max_deliver: u32) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig::default(),
             // 30 ns visibility, 100 ns cap, so tests advance time in small integers.
             lease: LeaseConfig {
@@ -9076,6 +9103,7 @@ mod tests {
         // nothing else — the enforcement lands with the pipelined actor loop.
         assert_eq!(DEFAULT_SYNC_MAX_DIRTY_BYTES, 16 * 1024 * 1024);
         let e = open(EngineConfig {
+            consume_longpoll_ms: 0,
             sync_max_dirty_bytes: 123,
             ..config(10, 5)
         });
@@ -9110,6 +9138,7 @@ mod tests {
     // sealed segments, giving the off-hot-path compactor adjacent dirty sources (#337).
     fn small_segment_config() -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig {
                 max_segment_bytes: 200,
                 ..LogConfig::default()
@@ -10371,6 +10400,7 @@ mod tests {
     // having to allocate `DEFAULT_MAX_GROUPS` groups.
     fn config_with_max_groups(max_groups: usize) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             max_groups,
             ..config(10, 5)
         }
@@ -12978,6 +13008,7 @@ mod tests {
     /// so every other field keeps its golden-path value.
     fn config_with_ttl(default_message_ttl_ms: u64) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             default_message_ttl_ms,
             ..config(64, 5)
         }
@@ -12988,6 +13019,7 @@ mod tests {
     /// reclaimed by retention. `max_deliver` is high so the only dead-letter trigger here is the TTL.
     fn config_with_dlx_for_expired(default_message_ttl_ms: u64, exchange: &str) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             default_message_ttl_ms,
             dead_letter_exchange: Some(exchange.to_string()),
             dead_letter_expired: true,
@@ -13195,6 +13227,7 @@ mod tests {
         let fs = InMemoryFs::new();
         let probe = fs.clone();
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             default_message_ttl_ms: 1_000,
             dead_letter_exchange: Some("dlx-unused".to_string()),
             dead_letter_expired: false, // routing OFF: reclaim, do not dead-letter
@@ -14190,6 +14223,7 @@ mod tests {
     // by the nanosecond equivalent.
     fn config_with_idle_evict_ms(group_idle_evict_ms: u64) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             group_idle_evict_ms,
             ..config(10, 5)
         }
@@ -14289,6 +14323,7 @@ mod tests {
         // caught-up named groups, a sweep evicts one and a NEW group can then be created where the
         // cap previously rejected it.
         let mut e = open(EngineConfig {
+            consume_longpoll_ms: 0,
             max_groups: 3, // default + 2 named groups fill the cap
             group_idle_evict_ms: 10,
             ..config(10, 5)
@@ -14714,6 +14749,7 @@ mod tests {
     /// small integers (4 ids OR 1000 ns), over a shared `ManualClock` the test advances.
     fn config_with_dedup(max_ids: usize, window_nanos: u64) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             dedup: ironbus_core::dedup::DedupConfig {
                 max_ids,
                 window_nanos,
@@ -15151,6 +15187,7 @@ mod tests {
         flush_max_bytes: u64,
     ) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             durability_level: level,
             flush_interval_ms,
             flush_max_bytes,
@@ -15436,6 +15473,7 @@ mod tests {
             ..LogConfig::default()
         };
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             log: small_segment,
             durability_level: DurabilityLevel::Async,
             flush_interval_ms: 0,
@@ -15473,6 +15511,7 @@ mod tests {
             probe,
             clock,
             EngineConfig {
+                consume_longpoll_ms: 0,
                 log: small_segment,
                 ..config(10, 5)
             },
@@ -15578,6 +15617,7 @@ mod tests {
         // fits and SHEDS once it would exceed the configured bound. This is the loss-window cap.
         let headroom = 64u64;
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             wal_fsync_headroom_bytes: headroom,
             ..config_durability(DurabilityLevel::Async, 0, 0)
         };
@@ -15632,6 +15672,7 @@ mod tests {
         // does, so the headroom THROTTLES (drain-then-admit) and never sheds.
         let headroom = 64u64;
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             wal_fsync_headroom_bytes: headroom,
             ..config_durability(DurabilityLevel::Async, 0, 0)
         };
@@ -15668,6 +15709,7 @@ mod tests {
         // commit. The headroom therefore never has a non-empty backlog to shed against: under `sync`
         // it can only ever THROTTLE (and with the actor's drain it admits), never lose, never shed.
         let cfg = EngineConfig {
+            consume_longpoll_ms: 0,
             wal_fsync_headroom_bytes: 8,
             ..config(10, 5)
         };
@@ -16236,6 +16278,7 @@ mod tests {
     /// to `config(10, 5)`, so any behavioral difference in these tests is the codec alone.
     fn lz4_config() -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             compression: Codec::Lz4,
             ..config(10, 5)
         }
@@ -16494,6 +16537,7 @@ mod tests {
         let payload = compressible(1024);
 
         let mut none = open(EngineConfig {
+            consume_longpoll_ms: 0,
             log: capped_log,
             ..config(10, 5)
         });
@@ -16522,6 +16566,7 @@ mod tests {
         );
 
         let mut lz4 = open(EngineConfig {
+            consume_longpoll_ms: 0,
             log: capped_log,
             compression: Codec::Lz4,
             ..config(10, 5)
@@ -16978,6 +17023,7 @@ mod tests {
     // having to allocate `DEFAULT_MAX_STREAMS` streams.
     fn config_with_max_streams(max_streams: usize) -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             max_streams,
             ..config(10, 5)
         }

@@ -18,6 +18,7 @@ use ironbus_storage::log::{Append, LogConfig};
 
 fn config() -> EngineConfig {
     EngineConfig {
+        consume_longpoll_ms: 0,
         log: LogConfig::default(),
         lease: LeaseConfig::from_millis(1000, 5000),
         delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -153,6 +154,7 @@ fn the_lz4_lifecycle_produces_a_byte_identical_disk_image() {
     // run-vs-run comparison deliberately avoids freezing the compressed bytes themselves, which
     // would couple the format gate to the `lz4_flex` version.
     let lz4_config = || EngineConfig {
+        consume_longpoll_ms: 0,
         compression: ironbus_core::compress::Codec::Lz4,
         ..config()
     };
