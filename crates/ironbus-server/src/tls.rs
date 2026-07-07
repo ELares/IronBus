@@ -46,6 +46,8 @@ pub enum TlsConfigError {
     KeyFileTooOpen { mode: u32 },
     /// rustls rejected the material (bad/mismatched key or cert, empty trust store, ...).
     Rustls(rustls::Error),
+    /// The mTLS client-certificate verifier could not be built from the client-CA (#766).
+    ClientVerifier(String),
 }
 
 impl std::fmt::Display for TlsConfigError {
@@ -61,6 +63,12 @@ impl std::fmt::Display for TlsConfigError {
                  refusing to start — restrict it to owner-only (chmod 600)"
             ),
             Self::Rustls(e) => write!(f, "rustls rejected the TLS material: {e}"),
+            Self::ClientVerifier(e) => {
+                write!(
+                    f,
+                    "could not build the mTLS client-certificate verifier: {e}"
+                )
+            }
         }
     }
 }
@@ -121,6 +129,79 @@ pub fn server_config_from_pem(
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     Ok(config)
+}
+
+/// Build the SERVER config for mTLS (ADR-0004 increment 3, #766): TLS 1.3-only, aws-lc-rs, and a
+/// REQUIRED, handshake-verified client certificate chained to `client_ca_pem`. A client that presents
+/// no certificate — or one that does not verify against the client-CA — terminates at the TLS layer
+/// (docs/TRANSPORT.md §1.4), BEFORE any application `Connect`. The verified certificate's SAN is then
+/// mapped to an identity by [`peer_cert_sans`] + [`crate::auth::mtls_san_identity`].
+///
+/// # Errors
+/// Returns [`TlsConfigError`] if any of the cert / key / client-CA PEMs is empty or malformed, if the
+/// client-CA yields no usable trust anchor, or if rustls rejects the material.
+///
+/// # Panics
+/// Panics only if the aws-lc-rs provider cannot offer TLS 1.3 — impossible for this build (see
+/// [`server_config_from_pem`]).
+pub fn server_config_mtls_from_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca_pem: &[u8],
+) -> Result<ServerConfig, TlsConfigError> {
+    let certs = parse_certs(cert_pem)?;
+    let key = parse_key(key_pem)?;
+    let client_anchors = parse_certs(client_ca_pem).map_err(|_| TlsConfigError::NoTrustAnchor)?;
+    let mut client_roots = RootCertStore::empty();
+    let (added, _ignored) = client_roots.add_parsable_certificates(client_anchors);
+    if added == 0 {
+        return Err(TlsConfigError::NoTrustAnchor);
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .map_err(|e| TlsConfigError::ClientVerifier(e.to_string()))?;
+    let config = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS13_ONLY)
+        .expect("TLS 1.3 is supported by the aws-lc-rs provider")
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?;
+    Ok(config)
+}
+
+/// Extract the URI and DNS Subject Alternative Names from a DER-encoded certificate — the VERIFIED
+/// peer certificate on an mTLS connection. Returns `(uri_sans, dns_sans)`; either may be empty. A
+/// malformed certificate yields two empty lists (fail-closed: no SAN → no identity → mTLS auth fails).
+/// The caller maps these to an identity via [`crate::auth::mtls_san_identity`] (URI-then-DNS precedence).
+#[must_use]
+pub fn peer_cert_sans(cert_der: &[u8]) -> (Vec<String>, Vec<String>) {
+    use x509_cert::der::Decode;
+    use x509_cert::ext::pkix::name::GeneralName;
+
+    let mut uris = Vec::new();
+    let mut dns = Vec::new();
+    let Ok(cert) = x509_cert::Certificate::from_der(cert_der) else {
+        return (uris, dns);
+    };
+    let Some(exts) = cert.tbs_certificate.extensions else {
+        return (uris, dns);
+    };
+    for ext in exts {
+        if ext.extn_id != const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME {
+            continue;
+        }
+        let Ok(san) = x509_cert::ext::pkix::SubjectAltName::from_der(ext.extn_value.as_bytes())
+        else {
+            continue;
+        };
+        for name in san.0 {
+            match name {
+                GeneralName::UniformResourceIdentifier(u) => uris.push(u.to_string()),
+                GeneralName::DnsName(d) => dns.push(d.to_string()),
+                _ => {}
+            }
+        }
+    }
+    (uris, dns)
 }
 
 /// Build the CLIENT config from a trust-anchor PEM bundle: TLS 1.3-only, aws-lc-rs, and MANDATORY
@@ -224,8 +305,55 @@ toYtkjmdU2eQ2pK/3gM=
 -----END CERTIFICATE-----
 ";
 
+    // A client certificate (signed by a test client-CA) carrying the URI SAN
+    // `spiffe://ironbus/client-a`, for the mTLS SAN-extraction test. Generated with rcgen out of tree.
+    const CLIENT_CERT_WITH_URI_SAN: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBazCCARGgAwIBAgIUT0zI7FaMJw1UP1RjaEl5HqkYI38wCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWaXJvbmJ1cy10ZXN0LWNsaWVudC1jYTAgFw03NTAxMDEwMDAw
+MDBaGA80MDk2MDEwMTAwMDAwMFowHjEcMBoGA1UEAwwTaXJvbmJ1cy10ZXN0LWNs
+aWVudDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABLupvaJvcE6GZOK5O+tFZmO8
+LjzvaLvPFMqSRGQbfiRb4Cfgl8zS/dHoenJQoUU0k/ftbV/UCuLsBuPqkjcN/jSj
+KDAmMCQGA1UdEQQdMBuGGXNwaWZmZTovL2lyb25idXMvY2xpZW50LWEwCgYIKoZI
+zj0EAwIDSAAwRQIhANh/YTa9XguQ8VPV3AQijNNqVY4wDvkGWBu5kMsrGvU0AiB1
+kQXnPnAxy3Jc6Zs9blJsL8IrT0lre7UCig1h/UYE0g==
+-----END CERTIFICATE-----
+";
+
     fn server_config() -> ServerConfig {
         server_config_from_pem(SERVER_CERT, SERVER_KEY).expect("server config from fixtures")
+    }
+
+    #[test]
+    fn peer_cert_sans_extracts_the_uri_san_and_mtls_san_identity_resolves_it() {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        let der = CertificateDer::pem_slice_iter(CLIENT_CERT_WITH_URI_SAN)
+            .next()
+            .unwrap()
+            .unwrap();
+        let (uris, dns) = peer_cert_sans(der.as_ref());
+        assert_eq!(uris, vec!["spiffe://ironbus/client-a".to_string()]);
+        assert!(dns.is_empty(), "the fixture has only a URI SAN");
+        // URI-then-DNS precedence: the resolved mTLS identity is the URI SAN.
+        assert_eq!(
+            crate::auth::mtls_san_identity(&uris, &dns).as_deref(),
+            Some("spiffe://ironbus/client-a"),
+        );
+    }
+
+    #[test]
+    fn peer_cert_sans_on_garbage_der_is_empty_fail_closed() {
+        let (uris, dns) = peer_cert_sans(b"not a certificate");
+        assert!(uris.is_empty() && dns.is_empty());
+        assert_eq!(crate::auth::mtls_san_identity(&uris, &dns), None);
+    }
+
+    #[test]
+    fn server_config_mtls_rejects_an_empty_client_ca() {
+        assert!(matches!(
+            server_config_mtls_from_pem(SERVER_CERT, SERVER_KEY, b"not a pem"),
+            Err(TlsConfigError::NoTrustAnchor)
+        ));
     }
 
     /// Drive a full in-memory handshake between a rustls server and client, returning the negotiated
