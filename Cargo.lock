@@ -978,6 +978,8 @@ dependencies = [
  "ironbus-proto",
  "ironbus-server",
  "ironbus-storage",
+ "rustls",
+ "rustls-pki-types",
 ]
 
 [[package]]

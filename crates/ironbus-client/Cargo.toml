@@ -8,11 +8,29 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# TLS 1.3 client transport (ADR-0004 / #766, client-side #957). The NON-DEFAULT feature that pulls the
+# rustls stack with the aws-lc-rs provider, so the client can VERIFY a broker's certificate and connect
+# INSIDE a TLS session (presenting the bearer credential encrypted), and optionally present a client
+# certificate for mTLS. Off by default: the default client links ZERO TLS code and stays byte-for-byte
+# plain-TCP, pure-Rust. Mirrors the server's `tls` feature (deny.toml carries the feature-scoped
+# aws-lc-sys allowance already). No X.509 SAN parsing is needed client-side, so this pulls no x509 crate.
+# `ironbus-server/tls` is forwarded ONLY to give the crate's own integration tests a real
+# TLS-terminating broker to connect to (ironbus-server is a dev-dependency); it is a no-op for the
+# shipped `cargo build` of this library (dev-deps are absent there), so a downstream `--features tls`
+# client still links only rustls + rustls-pki-types, never aws-lc-sys.
+tls = ["dep:rustls", "dep:rustls-pki-types", "ironbus-server/tls"]
+
 [dependencies]
 # The IO-free core: the client's transparent deliver-path decompression (#430) uses the codec
 # runtime (`compress`) and the record-flag bits (`types`). Pure Rust on the default build.
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
 ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
+# TLS 1.3 client stack (the `tls` feature only; the default build links none of this). `default-features
+# = false` drops rustls's ring-backed webpki path and its tls12 code — the client is TLS 1.3-only with
+# the aws-lc-rs provider, never ring. `rustls-pki-types` decodes the PEM trust anchors / client cert+key.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 
 [dev-dependencies]
 ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
