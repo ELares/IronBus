@@ -66,6 +66,7 @@ fn engine_config() -> EngineConfig {
 /// subject), not the per-group window, is the binding constraint the bench measures.
 fn engine_config_with_credit(consumer_credit: u32, max_in_flight: u32) -> EngineConfig {
     EngineConfig {
+        consume_longpoll_ms: 0,
         log: LogConfig::default(),
         lease: LeaseConfig::default(),
         // `unwrap` is fine in this bench/test-only path (not a lib hot path): the literal args are

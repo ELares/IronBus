@@ -692,7 +692,11 @@ where
         Some(cfg) => Session::with_member_id_and_auth(member_id, cfg, peer_san),
         None => Session::with_member_id(member_id),
     }
-    .with_connz(Arc::clone(connz));
+    .with_connz(Arc::clone(connz))
+    // Seed the event-driven consume long-poll budget (push delivery) from the engine config via a
+    // LOCAL handle read (no actor round-trip), exactly like the credit-cap negotiation. `0` (the
+    // default) keeps the byte-identical empty-and-return consume path.
+    .with_consume_longpoll_ms(engine.consume_longpoll_ms());
     // Attach the pre-auth `DoS` guard (#633) so the `Connect` handshake reports its auth outcome to the
     // per-IP failed-auth lockout (a failure feeds the lockout + bumps `rejected_total{auth_failed}`; a
     // success clears the IP's window). A no-op when no `DoS` defense is configured.
@@ -925,6 +929,7 @@ mod tests {
 
     fn config() -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),

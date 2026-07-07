@@ -476,6 +476,15 @@ pub struct Session {
     /// long-lived ones. `None` when no half-open cap is wired, or once the handshake has resolved. A
     /// slowloris that never sends a well-formed `Connect` keeps it until the connection times out.
     half_open_slot: Option<crate::preauth::HalfOpenSlot>,
+    /// The event-driven consume LONG-POLL budget in MILLISECONDS (push delivery), seeded once at
+    /// connection setup from [`crate::actor::EngineHandle::consume_longpoll_ms`] (a local read, no
+    /// round-trip). `0` (the default) is OFF: an idle `Flow`/`Fetch` on an empty group returns
+    /// `FlowEnd(0)` immediately, byte-for-byte today's behavior. When non-zero AND the engine exposes a
+    /// [`crate::commit_notify::CommitNotify`], a `Flow`/`Fetch` that drew NOTHING blocks up to this
+    /// budget on that seam and re-polls ONCE the instant a record commits (or the budget elapses),
+    /// turning the client's poll-interval latency floor into a commit-driven wakeup. Purely opt-in — the
+    /// wire, the client, and the response framing are unchanged.
+    consume_longpoll_ms: u64,
 }
 
 impl Session {
@@ -525,6 +534,17 @@ impl Session {
     #[must_use]
     pub fn with_connz(mut self, connz: std::sync::Arc<crate::connz::ConnectionMetrics>) -> Session {
         self.connz = Some(connz);
+        self
+    }
+
+    /// Seeds the event-driven consume LONG-POLL budget in MILLISECONDS (push delivery) from the engine
+    /// config (via [`crate::actor::EngineHandle::consume_longpoll_ms`]). A builder-style setter (like
+    /// [`with_connz`](Session::with_connz)) so every existing call site is unchanged and only the
+    /// server's live accept path opts in. `0` (the default when never called) keeps the byte-identical
+    /// empty-and-return consume path.
+    #[must_use]
+    pub fn with_consume_longpoll_ms(mut self, consume_longpoll_ms: u64) -> Session {
+        self.consume_longpoll_ms = consume_longpoll_ms;
         self
     }
 
@@ -2117,130 +2137,162 @@ impl Session {
         // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
         // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
         let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
-        for _ in 0..credits {
-            // The byte budget binds (#275): stop once in-flight bytes have reached the budget, unless
-            // this connection holds nothing in-flight (the floor-of-one). A budget of 0 is unlimited,
-            // so it never binds.
-            if ceiling_bytes != 0
-                && !self.leased.is_empty()
-                && self.in_flight_bytes() >= ceiling_bytes
-            {
-                break;
-            }
-            // Member-aware poll (#64): for a key_shared group this routes by the connection's
-            // member id; for a plain competing group it is identical to poll_now_in, so the
-            // KeyOrdering::None path is unchanged. One poll = one actor round-trip; the actor flushes
-            // any pending produce batch first, so each poll sees a consistent durable head.
-            //
-            // A NAMED-stream consumer (#588) routes to the engine's id-routed `poll_in_stream` instead
-            // (its OWN log + per-stream competing work-group, #676/#679), reading the engine's monotonic
-            // `now` inside the job. The named path is plain competing (no key_shared/Tier-S/compaction
-            // this phase, the #676 scope), so it returns only `Poll::Message`/`Poll::Idle`/an error; the
-            // advisory arms below are unreachable for it but cost nothing. The default stream
-            // (`self.stream` empty) is byte-for-byte the existing member-aware poll.
-            let group = self.subscription.clone();
-            let member = self.member_id;
-            let stream = self.stream.clone();
-            let poll = engine.with(move |e| {
-                if stream.is_empty() {
-                    e.poll_now_in_member(&group, member)
-                } else {
-                    let now = e.now_monotonic();
-                    e.poll_in_stream(&stream, &group, now)
+        // Event-driven long-poll (push delivery): snapshot the commit-notify generation BEFORE the poll
+        // batch (lost-wakeup safety — a commit racing the snapshot leaves the wait predicate already
+        // false), run the delivery drain, and if it drew NOTHING and long-poll is configured, block up
+        // to the budget on the seam and re-run the drain EXACTLY ONCE. The repoll is safe from
+        // `delivered == 0`: nothing was leased, no frame was emitted, and the credit/ceiling/AIMD bounds
+        // were computed above and stay unconsumed, so a second drain is byte-for-byte a fresh batch. A
+        // `None` seam or a zero budget skips straight to the unchanged tail. Granularity is GLOBAL: a
+        // spurious cross-stream wake just re-polls empty, exactly today's timer-driven re-poll.
+        let longpoll_notify = engine.commit_notify();
+        let longpoll_snapshot = longpoll_notify.map(|n| n.seq());
+        for longpoll_attempt in 0..2u8 {
+            for _ in 0..credits {
+                // The byte budget binds (#275): stop once in-flight bytes have reached the budget, unless
+                // this connection holds nothing in-flight (the floor-of-one). A budget of 0 is unlimited,
+                // so it never binds.
+                if ceiling_bytes != 0
+                    && !self.leased.is_empty()
+                    && self.in_flight_bytes() >= ceiling_bytes
+                {
+                    break;
                 }
-            })?;
-            match poll {
-                Ok(Poll::Message(d)) => {
-                    let msg = DeliverBody {
-                        offset: d.offset.get(),
-                        generation: d.token.generation,
-                        flags: d.record.flags.bits(),
-                        timestamp_ms: d.record.timestamp_ms,
-                        key: &d.record.key,
-                        headers: &d.record.headers,
-                        payload: &d.record.payload,
-                    };
-                    frame_body.clear();
-                    // The record's key/headers came through PUB (u16-bounded), so this cannot
-                    // exceed the field limit; on the impossible error, stop the batch.
-                    if encode_deliver(&msg, &mut frame_body).is_err() {
-                        break;
+                // Member-aware poll (#64): for a key_shared group this routes by the connection's
+                // member id; for a plain competing group it is identical to poll_now_in, so the
+                // KeyOrdering::None path is unchanged. One poll = one actor round-trip; the actor flushes
+                // any pending produce batch first, so each poll sees a consistent durable head.
+                //
+                // A NAMED-stream consumer (#588) routes to the engine's id-routed `poll_in_stream` instead
+                // (its OWN log + per-stream competing work-group, #676/#679), reading the engine's monotonic
+                // `now` inside the job. The named path is plain competing (no key_shared/Tier-S/compaction
+                // this phase, the #676 scope), so it returns only `Poll::Message`/`Poll::Idle`/an error; the
+                // advisory arms below are unreachable for it but cost nothing. The default stream
+                // (`self.stream` empty) is byte-for-byte the existing member-aware poll.
+                let group = self.subscription.clone();
+                let member = self.member_id;
+                let stream = self.stream.clone();
+                let poll = engine.with(move |e| {
+                    if stream.is_empty() {
+                        e.poll_now_in_member(&group, member)
+                    } else {
+                        let now = e.now_monotonic();
+                        e.poll_in_stream(&stream, &group, now)
                     }
-                    reply(out, FrameType::Deliver, &frame_body);
-                    // Record ownership so only this session can later act on this lease (#175), and
-                    // the message's byte size so the byte budget (#275) is derived from `leased`. The
-                    // size is key + headers + payload, matching the engine's produced-bytes accounting.
-                    let bytes = lease_bytes(&d.record);
-                    self.leased.insert(
-                        d.offset.get(),
-                        Lease {
+                })?;
+                match poll {
+                    Ok(Poll::Message(d)) => {
+                        let msg = DeliverBody {
+                            offset: d.offset.get(),
                             generation: d.token.generation,
-                            bytes,
-                        },
-                    );
-                    delivered += 1;
-                }
-                // A parked (poison, over max-deliver) message is committed past by the engine
-                // and skipped from delivery. Emit an in-band dead-letter advisory so the
-                // consumer learns the offset was dropped rather than silently never seeing it
-                // (#63); the durable DLQ topic write is still separate. The advisory does not
-                // count toward the delivered total. Keep draining the batch.
-                Ok(Poll::Parked { offset, .. }) => {
-                    frame_body.clear();
-                    encode_dead_letter(
-                        &DeadLetterBody {
-                            offset: offset.get(),
-                            reason: DEAD_LETTER_MAX_DELIVER,
-                        },
-                        &mut frame_body,
-                    );
-                    reply(out, FrameType::DeadLetter, &frame_body);
-                }
-                // The group's cursor fell below the oldest retained record because the disk-full
-                // drop-oldest policy force-reaped its old segments (#82, #84). The engine has just
-                // reset the cursor to `earliest_retained` and returned this ONCE. Emit the in-band
-                // truncation advisory so the consumer learns it lost a span and where delivery
-                // resumes, then keep draining: the next poll delivers normally from the reset
-                // cursor. This consumes one credit slot (like a delivery or a dead-letter), so the
-                // credit still bounds the total frames a batch streams. Any in-flight leases this
-                // session held below the reset are now meaningless; drop them so a later ack is a
-                // no-op fence rather than acting on a reaped offset.
-                Ok(Poll::Truncated {
-                    earliest_retained,
-                    skipped,
-                }) => {
-                    self.leased
-                        .retain(|&offset, _| offset >= earliest_retained.get());
-                    self.emit_truncation(out, &mut frame_body, earliest_retained.get(), skipped);
-                }
-                // The group's cursor advanced across a KEY-COMPACTION hole (#337, #411): the offsets
-                // in `[from, to)` were superseded by a later record for the same key, so they are
-                // permanently absent mid-stream (the engine already acked the cursor past them). A
-                // gap-marker-capable consumer (#292/#346) gets a `GapMarker` with reason COMPACTED so
-                // it can tell the offset jump is a bounded, reported gap rather than message loss; a
-                // non-capable consumer takes the unchanged SILENT advance (it has no gap-marker frame,
-                // and a compacted hole is not a loss, so emitting the legacy `Truncated` would
-                // mislabel it as a reap). The marker only consumes a credit slot when it is actually
-                // emitted, so a non-capable consumer's batch is byte-for-byte unchanged. Keep draining
-                // either way: the next poll resumes at `to`.
-                Ok(Poll::Compacted { from, to }) => {
-                    if self.gap_marker_enabled {
-                        Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
+                            flags: d.record.flags.bits(),
+                            timestamp_ms: d.record.timestamp_ms,
+                            key: &d.record.key,
+                            headers: &d.record.headers,
+                            payload: &d.record.payload,
+                        };
+                        frame_body.clear();
+                        // The record's key/headers came through PUB (u16-bounded), so this cannot
+                        // exceed the field limit; on the impossible error, stop the batch.
+                        if encode_deliver(&msg, &mut frame_body).is_err() {
+                            break;
+                        }
+                        reply(out, FrameType::Deliver, &frame_body);
+                        // Record ownership so only this session can later act on this lease (#175), and
+                        // the message's byte size so the byte budget (#275) is derived from `leased`. The
+                        // size is key + headers + payload, matching the engine's produced-bytes accounting.
+                        let bytes = lease_bytes(&d.record);
+                        self.leased.insert(
+                            d.offset.get(),
+                            Lease {
+                                generation: d.token.generation,
+                                bytes,
+                            },
+                        );
+                        delivered += 1;
+                    }
+                    // A parked (poison, over max-deliver) message is committed past by the engine
+                    // and skipped from delivery. Emit an in-band dead-letter advisory so the
+                    // consumer learns the offset was dropped rather than silently never seeing it
+                    // (#63); the durable DLQ topic write is still separate. The advisory does not
+                    // count toward the delivered total. Keep draining the batch.
+                    Ok(Poll::Parked { offset, .. }) => {
+                        frame_body.clear();
+                        encode_dead_letter(
+                            &DeadLetterBody {
+                                offset: offset.get(),
+                                reason: DEAD_LETTER_MAX_DELIVER,
+                            },
+                            &mut frame_body,
+                        );
+                        reply(out, FrameType::DeadLetter, &frame_body);
+                    }
+                    // The group's cursor fell below the oldest retained record because the disk-full
+                    // drop-oldest policy force-reaped its old segments (#82, #84). The engine has just
+                    // reset the cursor to `earliest_retained` and returned this ONCE. Emit the in-band
+                    // truncation advisory so the consumer learns it lost a span and where delivery
+                    // resumes, then keep draining: the next poll delivers normally from the reset
+                    // cursor. This consumes one credit slot (like a delivery or a dead-letter), so the
+                    // credit still bounds the total frames a batch streams. Any in-flight leases this
+                    // session held below the reset are now meaningless; drop them so a later ack is a
+                    // no-op fence rather than acting on a reaped offset.
+                    Ok(Poll::Truncated {
+                        earliest_retained,
+                        skipped,
+                    }) => {
+                        self.leased
+                            .retain(|&offset, _| offset >= earliest_retained.get());
+                        self.emit_truncation(
+                            out,
+                            &mut frame_body,
+                            earliest_retained.get(),
+                            skipped,
+                        );
+                    }
+                    // The group's cursor advanced across a KEY-COMPACTION hole (#337, #411): the offsets
+                    // in `[from, to)` were superseded by a later record for the same key, so they are
+                    // permanently absent mid-stream (the engine already acked the cursor past them). A
+                    // gap-marker-capable consumer (#292/#346) gets a `GapMarker` with reason COMPACTED so
+                    // it can tell the offset jump is a bounded, reported gap rather than message loss; a
+                    // non-capable consumer takes the unchanged SILENT advance (it has no gap-marker frame,
+                    // and a compacted hole is not a loss, so emitting the legacy `Truncated` would
+                    // mislabel it as a reap). The marker only consumes a credit slot when it is actually
+                    // emitted, so a non-capable consumer's batch is byte-for-byte unchanged. Keep draining
+                    // either way: the next poll resumes at `to`.
+                    Ok(Poll::Compacted { from, to }) => {
+                        if self.gap_marker_enabled {
+                            Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
+                        }
+                    }
+                    // Nothing more deliverable right now: end the batch early.
+                    Ok(Poll::Idle) => break,
+                    Err(e) if e.is_fatal() => {
+                        reply_err(out, "fatal storage error");
+                        return Err(SessionError::EngineFatal(e));
+                    }
+                    Err(_) => {
+                        // The Err is this batch's terminator; do NOT also send a FlowEnd (that
+                        // would desync the client, which expects exactly one terminator per Flow).
+                        reply_err(out, "fetch failed");
+                        return Ok(());
                     }
                 }
-                // Nothing more deliverable right now: end the batch early.
-                Ok(Poll::Idle) => break,
-                Err(e) if e.is_fatal() => {
-                    reply_err(out, "fatal storage error");
-                    return Err(SessionError::EngineFatal(e));
-                }
-                Err(_) => {
-                    // The Err is this batch's terminator; do NOT also send a FlowEnd (that
-                    // would desync the client, which expects exactly one terminator per Flow).
-                    reply_err(out, "fetch failed");
-                    return Ok(());
+            }
+            // Long-poll decision (push delivery): the drain drew NOTHING on the FIRST attempt and a budget
+            // + a commit-notify seam are both configured, so block until a commit advances the durable
+            // frontier (or the budget elapses) and repoll EXACTLY ONCE. Any other outcome — a non-empty
+            // drain, the second attempt, a zero budget, or no seam (a non-actor engine) — breaks to the
+            // unchanged tail below, which runs EXACTLY once regardless.
+            if longpoll_attempt == 0 && delivered == 0 && self.consume_longpoll_ms > 0 {
+                if let (Some(notify), Some(snapshot)) = (longpoll_notify, longpoll_snapshot) {
+                    notify.wait_for_change(
+                        snapshot,
+                        std::time::Duration::from_millis(self.consume_longpoll_ms),
+                    );
+                    continue;
                 }
             }
+            break;
         }
         // Drop ownership of any offset now committed (acked here, or committed past on a
         // dead-letter), keeping `leased` bounded to the in-flight window. A NAMED-stream consumer
@@ -2362,104 +2414,135 @@ impl Session {
         // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
         // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
         let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
-        for _ in 0..credits {
-            // The deadline binds (#489): once the monotonic clock has reached it, end the batch with
-            // whatever was gathered. Skipped for a no-wait / no-deadline fetch (`deadline` is `None`).
-            if let Some(deadline) = deadline {
-                if engine.with(|e| e.now_monotonic())? >= deadline {
-                    break;
-                }
-            }
-            // The byte cap binds (#275/#489): stop once delivering would exceed the cap, unless this
-            // connection holds nothing in-flight AND this batch has delivered nothing (the floor-of-one).
-            // A cap of 0 is unlimited, so it never binds. Mirrors the per-record byte-budget check, with
-            // the in-flight total taken as the connection's standing in-flight bytes (the budget is
-            // per-connection, so a fetch's own running total is already included once it leases).
-            if byte_cap != 0
-                && !(self.leased.is_empty() && delivered == 0)
-                && self.in_flight_bytes() >= byte_cap
-            {
-                break;
-            }
-            // Member-aware poll (#64): IDENTICAL to the per-record Flow path — one poll = one actor
-            // round-trip, routing by the connection's member for a key_shared group and behaving as a
-            // plain competing poll otherwise. This is THE shared primitive that makes a batch fetch
-            // deliver the same records, in the same order, leased the same way, as N per-record polls.
-            let group = self.subscription.clone();
-            let member = self.member_id;
-            match engine.with(move |e| e.poll_now_in_member(&group, member))? {
-                Ok(Poll::Message(d)) => {
-                    let msg = DeliverBody {
-                        offset: d.offset.get(),
-                        generation: d.token.generation,
-                        flags: d.record.flags.bits(),
-                        timestamp_ms: d.record.timestamp_ms,
-                        key: &d.record.key,
-                        headers: &d.record.headers,
-                        payload: &d.record.payload,
-                    };
-                    frame_body.clear();
-                    if encode_deliver(&msg, &mut frame_body).is_err() {
+        // Event-driven long-poll (push delivery): the batch twin of the `handle_flow` wrap — snapshot
+        // the commit-notify generation BEFORE the drain, and if the drain drew NOTHING re-run it EXACTLY
+        // ONCE after waking on a commit (or the budget elapsing). A `no_wait` fetch (#489) is EXEMPT: it
+        // is contractually a single immediate pass, so the wait is skipped and it returns as today.
+        let longpoll_notify = engine.commit_notify();
+        let longpoll_snapshot = longpoll_notify.map(|n| n.seq());
+        for longpoll_attempt in 0..2u8 {
+            for _ in 0..credits {
+                // The deadline binds (#489): once the monotonic clock has reached it, end the batch with
+                // whatever was gathered. Skipped for a no-wait / no-deadline fetch (`deadline` is `None`).
+                if let Some(deadline) = deadline {
+                    if engine.with(|e| e.now_monotonic())? >= deadline {
                         break;
                     }
-                    reply(out, FrameType::Deliver, &frame_body);
-                    // Lease ownership and byte accounting are IDENTICAL to `handle_flow`: only this
-                    // session can later act on the lease (#175), and the byte size feeds the byte budget
-                    // (#275). At-least-once holds because the record stays leased until acked.
-                    let bytes = lease_bytes(&d.record);
-                    self.leased.insert(
-                        d.offset.get(),
-                        Lease {
+                }
+                // The byte cap binds (#275/#489): stop once delivering would exceed the cap, unless this
+                // connection holds nothing in-flight AND this batch has delivered nothing (the floor-of-one).
+                // A cap of 0 is unlimited, so it never binds. Mirrors the per-record byte-budget check, with
+                // the in-flight total taken as the connection's standing in-flight bytes (the budget is
+                // per-connection, so a fetch's own running total is already included once it leases).
+                if byte_cap != 0
+                    && !(self.leased.is_empty() && delivered == 0)
+                    && self.in_flight_bytes() >= byte_cap
+                {
+                    break;
+                }
+                // Member-aware poll (#64): IDENTICAL to the per-record Flow path — one poll = one actor
+                // round-trip, routing by the connection's member for a key_shared group and behaving as a
+                // plain competing poll otherwise. This is THE shared primitive that makes a batch fetch
+                // deliver the same records, in the same order, leased the same way, as N per-record polls.
+                let group = self.subscription.clone();
+                let member = self.member_id;
+                match engine.with(move |e| e.poll_now_in_member(&group, member))? {
+                    Ok(Poll::Message(d)) => {
+                        let msg = DeliverBody {
+                            offset: d.offset.get(),
                             generation: d.token.generation,
-                            bytes,
-                        },
-                    );
-                    delivered += 1;
-                }
-                // A parked (poison) message: the same in-band dead-letter advisory as `handle_flow`. It
-                // consumes a credit slot (it ran a poll) but does not count toward `delivered`.
-                Ok(Poll::Parked { offset, .. }) => {
-                    frame_body.clear();
-                    encode_dead_letter(
-                        &DeadLetterBody {
-                            offset: offset.get(),
-                            reason: DEAD_LETTER_MAX_DELIVER,
-                        },
-                        &mut frame_body,
-                    );
-                    reply(out, FrameType::DeadLetter, &frame_body);
-                }
-                // A below-earliest truncation: identical handling to `handle_flow` — drop the now-meaningless
-                // leases below the reset and emit the in-band advisory (GapMarker or Truncated per the
-                // negotiated capability), then keep draining.
-                Ok(Poll::Truncated {
-                    earliest_retained,
-                    skipped,
-                }) => {
-                    self.leased
-                        .retain(|&offset, _| offset >= earliest_retained.get());
-                    self.emit_truncation(out, &mut frame_body, earliest_retained.get(), skipped);
-                }
-                // A key-compaction hole: identical to `handle_flow` — a gap-marker-capable consumer gets
-                // the COMPACTED marker, a non-capable one silently advances. Keep draining.
-                Ok(Poll::Compacted { from, to }) => {
-                    if self.gap_marker_enabled {
-                        Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
+                            flags: d.record.flags.bits(),
+                            timestamp_ms: d.record.timestamp_ms,
+                            key: &d.record.key,
+                            headers: &d.record.headers,
+                            payload: &d.record.payload,
+                        };
+                        frame_body.clear();
+                        if encode_deliver(&msg, &mut frame_body).is_err() {
+                            break;
+                        }
+                        reply(out, FrameType::Deliver, &frame_body);
+                        // Lease ownership and byte accounting are IDENTICAL to `handle_flow`: only this
+                        // session can later act on the lease (#175), and the byte size feeds the byte budget
+                        // (#275). At-least-once holds because the record stays leased until acked.
+                        let bytes = lease_bytes(&d.record);
+                        self.leased.insert(
+                            d.offset.get(),
+                            Lease {
+                                generation: d.token.generation,
+                                bytes,
+                            },
+                        );
+                        delivered += 1;
+                    }
+                    // A parked (poison) message: the same in-band dead-letter advisory as `handle_flow`. It
+                    // consumes a credit slot (it ran a poll) but does not count toward `delivered`.
+                    Ok(Poll::Parked { offset, .. }) => {
+                        frame_body.clear();
+                        encode_dead_letter(
+                            &DeadLetterBody {
+                                offset: offset.get(),
+                                reason: DEAD_LETTER_MAX_DELIVER,
+                            },
+                            &mut frame_body,
+                        );
+                        reply(out, FrameType::DeadLetter, &frame_body);
+                    }
+                    // A below-earliest truncation: identical handling to `handle_flow` — drop the now-meaningless
+                    // leases below the reset and emit the in-band advisory (GapMarker or Truncated per the
+                    // negotiated capability), then keep draining.
+                    Ok(Poll::Truncated {
+                        earliest_retained,
+                        skipped,
+                    }) => {
+                        self.leased
+                            .retain(|&offset, _| offset >= earliest_retained.get());
+                        self.emit_truncation(
+                            out,
+                            &mut frame_body,
+                            earliest_retained.get(),
+                            skipped,
+                        );
+                    }
+                    // A key-compaction hole: identical to `handle_flow` — a gap-marker-capable consumer gets
+                    // the COMPACTED marker, a non-capable one silently advances. Keep draining.
+                    Ok(Poll::Compacted { from, to }) => {
+                        if self.gap_marker_enabled {
+                            Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
+                        }
+                    }
+                    // Nothing more deliverable right now: end the batch early (the no_wait / ready-now case).
+                    Ok(Poll::Idle) => break,
+                    Err(e) if e.is_fatal() => {
+                        reply_err(out, "fatal storage error");
+                        return Err(SessionError::EngineFatal(e));
+                    }
+                    Err(_) => {
+                        // The Err is this batch's terminator; do NOT also send a FlowEnd (that would desync
+                        // the client, which expects exactly one terminator per fetch), matching `handle_flow`.
+                        reply_err(out, "fetch failed");
+                        return Ok(());
                     }
                 }
-                // Nothing more deliverable right now: end the batch early (the no_wait / ready-now case).
-                Ok(Poll::Idle) => break,
-                Err(e) if e.is_fatal() => {
-                    reply_err(out, "fatal storage error");
-                    return Err(SessionError::EngineFatal(e));
-                }
-                Err(_) => {
-                    // The Err is this batch's terminator; do NOT also send a FlowEnd (that would desync
-                    // the client, which expects exactly one terminator per fetch), matching `handle_flow`.
-                    reply_err(out, "fetch failed");
-                    return Ok(());
+            }
+            // Long-poll decision (push delivery), the `handle_flow` twin plus the `no_wait` exemption: an
+            // empty FIRST drain on a waiting fetch with a configured budget + seam blocks until a commit
+            // advances the frontier (or the budget elapses) and repolls ONCE; any other outcome (delivered,
+            // second attempt, zero budget, no seam, or `no_wait`) falls through to the unchanged tail.
+            if longpoll_attempt == 0
+                && delivered == 0
+                && self.consume_longpoll_ms > 0
+                && !req.no_wait
+            {
+                if let (Some(notify), Some(snapshot)) = (longpoll_notify, longpoll_snapshot) {
+                    notify.wait_for_change(
+                        snapshot,
+                        std::time::Duration::from_millis(self.consume_longpoll_ms),
+                    );
+                    continue;
                 }
             }
+            break;
         }
         // Drop ownership of any offset now committed, keeping `leased` bounded — identical to `handle_flow`.
         let group = self.subscription.clone();
@@ -4854,6 +4937,7 @@ mod tests {
     /// open the SAME config over a fault-injecting filesystem (to count fsyncs).
     fn test_config() -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             compression: ironbus_core::compress::Codec::None,
             log: LogConfig::default(),
             lease: LeaseConfig {
@@ -4958,6 +5042,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -5014,6 +5099,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
@@ -5332,6 +5418,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 200,
@@ -5853,6 +5940,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 max_in_flight: 100_000,
                 consumer_credit: 2048,
                 consumer_credit_bytes,
@@ -6843,6 +6931,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 log: LogConfig {
                     max_segment_bytes: 160,
                     ..LogConfig::default()
@@ -7272,6 +7361,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -8464,6 +8554,7 @@ mod tests {
                 InMemoryFs::new(),
                 ManualClock::new(),
                 EngineConfig {
+                    consume_longpoll_ms: 0,
                     compression: ironbus_core::compress::Codec::None,
                     log: LogConfig::default().with_max_total_bytes(one),
                     lease: LeaseConfig {
@@ -8867,6 +8958,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -8928,6 +9020,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -9140,6 +9233,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::Lz4,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -10035,6 +10129,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -12479,5 +12574,168 @@ mod tests {
         prod.process(&e, &txn_resolve_frame(FrameType::TxnCommit, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
+    }
+
+    // ---- Event-driven consume long-poll (push delivery) ---------------------------------------
+    // These drive a REAL spawned append actor (so `EngineHandle::commit_notify` is `Some` and the
+    // actor bumps the seam on every durable-frontier advance), the only `EngineAccess` that carries a
+    // commit-notify seam — the in-process `DirectEngine` returns `None`, so it always takes the
+    // byte-for-byte empty-and-return path even with a budget set.
+
+    /// A spawned-actor engine whose config carries `consume_longpoll_ms`, returning the handle + the
+    /// actor's join handle. Reuses `test_config()` via struct-update for the one new field.
+    fn longpoll_rig(
+        consume_longpoll_ms: u64,
+    ) -> (
+        crate::actor::EngineHandle<InMemoryFs, ManualClock>,
+        std::thread::JoinHandle<Engine<InMemoryFs, ManualClock>>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            ManualClock::new(),
+            EngineConfig {
+                consume_longpoll_ms,
+                ..test_config()
+            },
+        )
+        .unwrap();
+        crate::actor::spawn_actor(engine, crate::actor::DEFAULT_CHANNEL_BOUND)
+    }
+
+    /// A Level-1 owned produce for the long-poll tests (mirrors the actor harness `append`).
+    fn longpoll_append(payload: &[u8]) -> crate::actor::OwnedAppend {
+        crate::actor::OwnedAppend {
+            timestamp_ms: 0,
+            flags: 0,
+            key: bytes::Bytes::new(),
+            headers: bytes::Bytes::new(),
+            payload: bytes::Bytes::copy_from_slice(payload),
+            body_checksums: Some(ironbus_core::codec::BodyChecksums::compute(
+                b"", b"", payload,
+            )),
+            dedup: None,
+            enqueue_monotonic_nanos: 0,
+            fire_and_forget: false,
+            ack_level: ironbus_proto::message::AckLevel::ServerAck,
+        }
+    }
+
+    /// The `delivered` count carried by the terminating `FlowEnd` frame in `out`.
+    fn flow_end_count(out: &[u8]) -> u32 {
+        let frames = decode_all(out);
+        let (ty, body) = frames.last().expect("at least a FlowEnd frame");
+        assert_eq!(*ty, FrameType::FlowEnd, "the batch terminates with FlowEnd");
+        u32::from_le_bytes(body.as_slice().try_into().expect("FlowEnd body is a u32"))
+    }
+
+    /// Connects a fresh consumer session over the handle, its long-poll budget seeded from the
+    /// engine-config snapshot exactly as the live serve path does.
+    fn longpoll_consumer(handle: &crate::actor::EngineHandle<InMemoryFs, ManualClock>) -> Session {
+        let mut s = Session::new().with_consume_longpoll_ms(handle.consume_longpoll_ms());
+        let mut out = Vec::new();
+        s.process(handle, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        s
+    }
+
+    #[test]
+    fn longpoll_off_returns_empty_flow_immediately() {
+        // Budget 0 (the default): an empty group returns FlowEnd(0) at once, byte-for-byte today.
+        let (handle, actor) = longpoll_rig(0);
+        let mut s = longpoll_consumer(&handle);
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        s.process(
+            &handle,
+            &frame(FrameType::Flow, &10u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(flow_end_count(&out), 0, "empty group yields FlowEnd(0)");
+        // OFF engages NO wait, so this returns after only the poll round-trips. A generous ceiling keeps
+        // the assertion robust on a loaded/coarse-timer CI runner (Windows) while still catching a hang.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "long-poll OFF must return promptly (no wait), took {elapsed:?}"
+        );
+        drop(s);
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn longpoll_wakes_on_a_concurrent_produce() {
+        // A generous budget the wakeup should beat by an order of magnitude.
+        let budget_ms = 2_000u64;
+        let (handle, actor) = longpoll_rig(budget_ms);
+        let mut s = longpoll_consumer(&handle);
+        let mut out = Vec::new();
+        // A producer that publishes shortly AFTER the consumer begins long-polling the empty group.
+        let producer = handle.clone();
+        let jh = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            producer
+                .produce(longpoll_append(b"hello"))
+                .expect("a clean produce");
+        });
+        let start = std::time::Instant::now();
+        s.process(
+            &handle,
+            &frame(FrameType::Flow, &10u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        jh.join().unwrap();
+        assert_eq!(
+            flow_end_count(&out),
+            1,
+            "the committed record is delivered on the commit-notify wakeup"
+        );
+        // A commit-driven wakeup lands far below the 2 s budget; a broken bump would only free the
+        // consumer at the ~2 s timeout. The 1.5 s bound clears that timeout with room to spare while
+        // leaving generous slack for Windows Condvar-wakeup + scheduler jitter (real wakeup is ~tens of
+        // ms), so it proves the event path fired without being timing-fragile.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "delivery must arrive well before the budget, took {elapsed:?}"
+        );
+        drop(s);
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn longpoll_times_out_to_empty_without_a_producer() {
+        // A budget large enough that a lower-bound assertion has a wide margin below the timeout, so
+        // Windows' ~15 ms timer granularity on `wait_timeout` can never dip the measured wait under it.
+        let budget_ms = 400u64;
+        let (handle, actor) = longpoll_rig(budget_ms);
+        let mut s = longpoll_consumer(&handle);
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        s.process(
+            &handle,
+            &frame(FrameType::Flow, &10u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(
+            flow_end_count(&out),
+            0,
+            "no producer: the batch ends empty after waiting out the budget"
+        );
+        // It must have actually blocked out most of the budget, proving the wait ran rather than
+        // returning empty immediately. The 200 ms floor (half the 400 ms budget) is a wide margin that
+        // no timer-granularity slack can breach, so the assertion is deterministic on Windows.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "the consumer must wait out ~the budget, took {elapsed:?}"
+        );
+        drop(s);
+        drop(handle);
+        actor.join().unwrap();
     }
 }

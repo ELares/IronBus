@@ -7,6 +7,7 @@ pub mod auth;
 pub mod clock;
 pub mod cluster;
 pub mod codes;
+pub mod commit_notify;
 pub mod connz;
 pub mod engine;
 pub(crate) mod flusher;

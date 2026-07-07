@@ -671,6 +671,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),

@@ -2576,6 +2576,7 @@ mod tests {
     /// extracted so the connz/disk-free integration test reuses the SAME config as `start()`.
     fn test_eng_cfg() -> EngineConfig {
         EngineConfig {
+            consume_longpoll_ms: 0,
             compression: ironbus_core::compress::Codec::None,
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
@@ -3013,6 +3014,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -3787,6 +3789,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(max_total_bytes),
                 lease: LeaseConfig::default(),
@@ -3934,6 +3937,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -4014,6 +4018,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -4291,6 +4296,7 @@ mod tests {
                 InMemoryFs::new(),
                 SystemClock::new(),
                 EngineConfig {
+                    consume_longpoll_ms: 0,
                     compression: ironbus_core::compress::Codec::None,
                     log: LogConfig::default(),
                     lease: LeaseConfig::default(),
@@ -4349,6 +4355,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_daily_physical_write_budget_bytes(probe),
                 lease: LeaseConfig::default(),
@@ -4506,6 +4513,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 // Tiny visibility/cap so a redelivery is reclaimable a few ns later.
@@ -4647,6 +4655,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
@@ -4865,6 +4874,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
@@ -5911,6 +5921,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(1_000_000),
                 lease: LeaseConfig {
@@ -6124,6 +6135,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -6346,6 +6358,7 @@ mod tests {
             fs,
             ManualClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -6658,6 +6671,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(1_000_000),
                 lease: LeaseConfig {
