@@ -31,9 +31,11 @@ edge-min = ["ironbus-server/edge-min"]
 zstd = ["ironbus-storage/zstd", "ironbus-core/zstd"]
 # TLS 1.3 transport (ADR-0004, #766). NON-DEFAULT: forwards ironbus-server's `tls` feature so
 # `cargo build -p ironbus-cli --features tls` produces a broker that carries the rustls + aws-lc-rs
-# stack. The DEFAULT binary links no TLS code and no new C (the aws-lc-sys allowance is feature-scoped
-# in deny.toml, and cffi-ban.sh proves the default ironbus-cli graph stays pure-Rust).
-tls = ["ironbus-server/tls"]
+# stack, AND ironbus-client's `tls` feature (#957) so the CLIENT verbs (pub/sub/ack) can dial a
+# TLS broker configured on the active context. The DEFAULT binary links no TLS code and no new C (the
+# aws-lc-sys allowance is feature-scoped in deny.toml, and cffi-ban.sh proves the default ironbus-cli
+# graph stays pure-Rust).
+tls = ["ironbus-server/tls", "ironbus-client/tls"]
 
 [dependencies]
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }

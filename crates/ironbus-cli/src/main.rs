@@ -1480,7 +1480,11 @@ fn classify(addr: &str, doing: &str, e: &ClientError) -> CliError {
 }
 
 fn connect(addr: &str) -> Result<Client, CliError> {
-    Client::connect(addr).map_err(|e| classify(addr, "connecting to", &e))
+    // Resolve the active context's transport: TLS 1.3 when the context sets `tls_ca` (verify the broker
+    // and, with a client cert, present it for mTLS), else the plaintext default — byte-identical to the
+    // historical `Client::connect` when no context configures TLS.
+    let config = context::resolve_client_config(addr)?;
+    Client::connect_with(addr, &config).map_err(|e| classify(addr, "connecting to", &e))
 }
 
 fn run_pub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {

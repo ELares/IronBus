@@ -31,6 +31,7 @@
 //! The on-disk format is TOML, parsed with the `toml` crate already in the tree (no new dependency).
 
 use crate::CliError;
+use ironbus_client::ClientConfig;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,10 +44,18 @@ pub(crate) struct Context {
     pub addr: Option<String>,
     /// A bearer/auth token (a SECRET; never printed). `None` ⇒ unauthenticated, as today.
     pub token: Option<String>,
-    /// A TLS CA-bundle path to trust for the broker's certificate.
+    /// A TLS CA-bundle path to trust for the broker's certificate. Setting this makes the client verbs
+    /// dial the broker over TLS 1.3 (verifying its certificate); leaving it unset keeps the connection
+    /// plaintext, exactly as today.
     pub tls_ca: Option<String>,
     /// A TLS SNI / server-name override (when the dialed host differs from the cert's name).
     pub tls_server_name: Option<String>,
+    /// A client-certificate PEM path for mTLS — presented at the handshake so a broker configured with
+    /// `--tls-client-ca` can authenticate this client by certificate. Requires [`Context::tls_client_key`].
+    pub tls_client_cert: Option<String>,
+    /// The private-key PEM path paired with [`Context::tls_client_cert`] for mTLS (a SECRET; never
+    /// printed). Both cert and key must be set together, or neither.
+    pub tls_client_key: Option<String>,
     /// An offline data directory for the local-inspection verbs.
     pub data_dir: Option<String>,
 }
@@ -145,6 +154,8 @@ fn parse(text: &str, path: &Path) -> Result<Config, CliError> {
                     token: get("token"),
                     tls_ca: get("tls_ca"),
                     tls_server_name: get("tls_server_name"),
+                    tls_client_cert: get("tls_client_cert"),
+                    tls_client_key: get("tls_client_key"),
                     data_dir: get("data_dir"),
                 },
             );
@@ -180,6 +191,8 @@ pub(crate) fn serialize(cfg: &Config) -> String {
         put("token", &ctx.token);
         put("tls_ca", &ctx.tls_ca);
         put("tls_server_name", &ctx.tls_server_name);
+        put("tls_client_cert", &ctx.tls_client_cert);
+        put("tls_client_key", &ctx.tls_client_key);
         put("data_dir", &ctx.data_dir);
     }
     s
@@ -326,6 +339,12 @@ fn context_create(path: &Path, args: &[String], out: &mut impl Write) -> Result<
             "--tls-server-name" => {
                 ctx.tls_server_name = Some(crate::take_value("--tls-server-name", args, &mut i)?);
             }
+            "--tls-client-cert" => {
+                ctx.tls_client_cert = Some(crate::take_value("--tls-client-cert", args, &mut i)?);
+            }
+            "--tls-client-key" => {
+                ctx.tls_client_key = Some(crate::take_value("--tls-client-key", args, &mut i)?);
+            }
             "--data-dir" => ctx.data_dir = Some(crate::take_value("--data-dir", args, &mut i)?),
             "--use" => {
                 set_current = true;
@@ -462,6 +481,18 @@ fn context_show(path: &Path, args: &[String], out: &mut impl Write) -> Result<()
     )?;
     writeln!(
         out,
+        "tls_client_cert: {}",
+        ctx.tls_client_cert.as_deref().unwrap_or("<unset>")
+    )?;
+    // A PATH to the key, not the key itself — shown like the CA/cert paths. The secret is the file's
+    // contents, which `context show` never reads or prints.
+    writeln!(
+        out,
+        "tls_client_key: {}",
+        ctx.tls_client_key.as_deref().unwrap_or("<unset>")
+    )?;
+    writeln!(
+        out,
         "data_dir: {}",
         ctx.data_dir.as_deref().unwrap_or("<unset>")
     )?;
@@ -527,6 +558,112 @@ pub(crate) fn resolve_addr(flag: Option<&str>, default: &str) -> Result<String, 
         .unwrap_or_else(|| default.to_string()))
 }
 
+/// Builds the client [`ClientConfig`] a verb dials with, from the ACTIVE context's TLS settings (#957):
+/// when the context sets `tls_ca`, the client dials the broker over TLS 1.3 — verifying its certificate
+/// against that CA bundle and checking the server name — and optionally presents a client certificate for
+/// mTLS. With no TLS configured the config is the plaintext default, byte-identical to today. `addr` is
+/// the resolved broker address, used to derive the default TLS server name when the context sets none.
+///
+/// # Errors
+/// A usage error if the context configures TLS on a build without the `tls` feature, if only one of the
+/// mTLS cert/key is set (or a client cert is set with no `tls_ca`), or if a configured PEM cannot be read.
+pub(crate) fn resolve_client_config(addr: &str) -> Result<ClientConfig, CliError> {
+    // A config dir that cannot even be LOCATED (a bare environment with none of $IRONBUS_CONFIG /
+    // $XDG_CONFIG_HOME / $HOME — e.g. a Windows runner where only $USERPROFILE is set) means NO context
+    // is configured, so this resolves to the plaintext default, byte-identical to the historical
+    // `Client::connect`. Every client verb must keep working with no config present; only a config that
+    // is locatable AND present-but-malformed surfaces an error (via `load`). This mirrors the historical
+    // `connect` path, which never touched the config file at all.
+    let Ok(path) = config_path() else {
+        return client_config_for_context(None, addr);
+    };
+    let cfg = load(&path)?;
+    client_config_for_context(cfg.current_context(), addr)
+}
+
+/// The host portion of a `host:port` (or bare host) broker address, the default TLS server name when the
+/// context sets no `tls_server_name`. Handles a bracketed IPv6 literal (`[::1]:7000` → `::1`).
+#[cfg(feature = "tls")]
+fn host_of(addr: &str) -> &str {
+    if addr.starts_with('[') {
+        if let Some(end) = addr.find(']') {
+            return &addr[1..end];
+        }
+    }
+    addr.rsplit_once(':').map_or(addr, |(host, _port)| host)
+}
+
+/// The `--features tls` builder: reads the context's PEM paths and assembles a verifying (optionally
+/// mutual) TLS client config. See [`resolve_client_config`].
+#[cfg(feature = "tls")]
+fn client_config_for_context(ctx: Option<&Context>, addr: &str) -> Result<ClientConfig, CliError> {
+    let mut config = ClientConfig::default();
+    let Some(ctx) = ctx else {
+        return Ok(config);
+    };
+    // A client certificate with no CA to verify the SERVER against is a misconfiguration: mTLS is still
+    // TLS, and there is no accept-any path. Fail closed rather than silently dropping the client cert.
+    if ctx.tls_ca.is_none() && (ctx.tls_client_cert.is_some() || ctx.tls_client_key.is_some()) {
+        return Err(CliError::Usage(
+            "the context sets a TLS client certificate but no tls_ca: mTLS still requires tls_ca to \
+             verify the broker (set tls_ca, or clear the client cert/key)"
+                .to_string(),
+        ));
+    }
+    let Some(ca_path) = &ctx.tls_ca else {
+        return Ok(config);
+    };
+    let ca = std::fs::read(ca_path)
+        .map_err(|e| CliError::Usage(format!("cannot read TLS CA bundle `{ca_path}`: {e}")))?;
+    let server_name = ctx
+        .tls_server_name
+        .clone()
+        .unwrap_or_else(|| host_of(addr).to_string());
+    let mut tls = ironbus_client::TlsClientConfig::new(ca, server_name);
+    match (&ctx.tls_client_cert, &ctx.tls_client_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert = std::fs::read(cert_path).map_err(|e| {
+                CliError::Usage(format!("cannot read TLS client cert `{cert_path}`: {e}"))
+            })?;
+            let key = std::fs::read(key_path).map_err(|e| {
+                CliError::Usage(format!("cannot read TLS client key `{key_path}`: {e}"))
+            })?;
+            tls = tls.with_client_cert(cert, key);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(CliError::Usage(
+                "mTLS needs BOTH tls_client_cert and tls_client_key on the context (set both, or \
+                 neither)"
+                    .to_string(),
+            ));
+        }
+    }
+    config.tls = Some(tls);
+    Ok(config)
+}
+
+/// The no-`tls`-feature builder: TLS is not compiled in, so a context that configures ANY TLS setting is
+/// refused with an actionable error (mirroring the server side's refusal of `--tls-*` on a non-tls
+/// build), never silently ignored. With no TLS configured the plaintext default is returned unchanged.
+#[cfg(not(feature = "tls"))]
+fn client_config_for_context(ctx: Option<&Context>, _addr: &str) -> Result<ClientConfig, CliError> {
+    if let Some(ctx) = ctx {
+        if ctx.tls_ca.is_some()
+            || ctx.tls_server_name.is_some()
+            || ctx.tls_client_cert.is_some()
+            || ctx.tls_client_key.is_some()
+        {
+            return Err(CliError::Usage(
+                "the active context configures TLS, but this ironbus build has no TLS support: \
+                 rebuild with `--features tls` to dial a TLS broker"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(ClientConfig::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +709,8 @@ mod tests {
                 token: Some("s3cr3t".to_string()),
                 tls_ca: Some("/etc/ca.pem".to_string()),
                 tls_server_name: None,
+                tls_client_cert: Some("/etc/client.pem".to_string()),
+                tls_client_key: Some("/etc/client.key".to_string()),
                 data_dir: None,
             },
         );
@@ -740,5 +879,182 @@ mod tests {
         save(&path, &cfg).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config must be owner-only, got {mode:o}");
+    }
+
+    // Client-TLS config resolution (#957, increment 4c): the pure context->ClientConfig builder, tested
+    // WITHOUT a broker (the CLI test binary is where the known parallel raft deadlock lives, so we do not
+    // add a broker-spin here — 4a's library e2e already proves a TlsClientConfig connects+produces).
+    #[cfg(feature = "tls")]
+    mod tls_client {
+        use super::*;
+
+        // A self-signed "localhost" server cert + matching key (the client crate's fixture): usable both
+        // as a trust anchor (CA) and, for the mTLS build path, as a client cert+key pair.
+        const CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBVzCB/aADAgECAhMjGIxpQAwb+081fMl2nX2WEMQ8MAoGCCqGSM49BAMCMB4x
+HDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIwIBcNMjAwMTAxMDAwMDAwWhgP
+MjEwMDAxMDEwMDAwMDBaMB4xHDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+AoxgwFjAU
+BgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwIDSQAwRgIhAJ+smDY9Jybx
+FoJDOjOor9Cb56IyQQ64ts0roLO5NVx9AiEAnB1pAliacK3UDfG6xKEig12h4tzf
+UrjVOalNQ4uwFJg=
+-----END CERTIFICATE-----
+";
+        const KEY: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWd4kisc5NnK6Nv0I
+RL0rrbnn9ozoIOti7I4eisF3CHWhRANCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
+-----END PRIVATE KEY-----
+";
+
+        fn write_temp(dir: &Path, name: &str, bytes: &[u8]) -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p.to_str().unwrap().to_string()
+        }
+
+        #[test]
+        fn no_tls_ca_yields_the_plaintext_default() {
+            let ctx = Context {
+                addr: Some("localhost:7000".to_string()),
+                ..Context::default()
+            };
+            let cfg = client_config_for_context(Some(&ctx), "localhost:7000").unwrap();
+            assert!(
+                cfg.tls.is_none(),
+                "no tls_ca => plaintext, byte-identical to today"
+            );
+        }
+
+        #[test]
+        fn tls_ca_builds_a_verifying_config_with_server_name_from_the_addr() {
+            let dir = tempfile::tempdir().unwrap();
+            let ca = write_temp(dir.path(), "ca.pem", CERT);
+            let ctx = Context {
+                tls_ca: Some(ca),
+                ..Context::default()
+            };
+            let cfg = client_config_for_context(Some(&ctx), "localhost:7000").unwrap();
+            let tls = cfg.tls.expect("tls_ca => a TLS client config");
+            assert_eq!(
+                tls.server_name(),
+                "localhost",
+                "the server name derives from the addr host when the context sets none"
+            );
+            assert!(!tls.has_client_cert());
+            tls.build().expect("the CA parses as a valid trust anchor");
+        }
+
+        #[test]
+        fn tls_server_name_override_wins_over_the_addr_host() {
+            let dir = tempfile::tempdir().unwrap();
+            let ca = write_temp(dir.path(), "ca.pem", CERT);
+            let ctx = Context {
+                tls_ca: Some(ca),
+                tls_server_name: Some("broker.internal".to_string()),
+                ..Context::default()
+            };
+            let cfg = client_config_for_context(Some(&ctx), "10.0.0.1:7000").unwrap();
+            assert_eq!(cfg.tls.unwrap().server_name(), "broker.internal");
+        }
+
+        #[test]
+        fn a_client_cert_and_key_enable_mtls() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = Context {
+                tls_ca: Some(write_temp(dir.path(), "ca.pem", CERT)),
+                tls_client_cert: Some(write_temp(dir.path(), "client.pem", CERT)),
+                tls_client_key: Some(write_temp(dir.path(), "client.key", KEY)),
+                ..Context::default()
+            };
+            let cfg = client_config_for_context(Some(&ctx), "localhost:7000").unwrap();
+            let tls = cfg.tls.expect("tls configured");
+            assert!(tls.has_client_cert(), "both cert+key => mTLS");
+            tls.build().expect("cert+key build an mTLS client config");
+        }
+
+        #[test]
+        fn a_client_cert_without_a_key_is_rejected() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = Context {
+                tls_ca: Some(write_temp(dir.path(), "ca.pem", CERT)),
+                tls_client_cert: Some(write_temp(dir.path(), "client.pem", CERT)),
+                ..Context::default()
+            };
+            assert!(matches!(
+                client_config_for_context(Some(&ctx), "localhost:7000"),
+                Err(CliError::Usage(_))
+            ));
+        }
+
+        #[test]
+        fn a_client_cert_without_a_ca_is_rejected() {
+            let ctx = Context {
+                tls_client_cert: Some("/x.pem".to_string()),
+                tls_client_key: Some("/x.key".to_string()),
+                ..Context::default()
+            };
+            assert!(matches!(
+                client_config_for_context(Some(&ctx), "localhost:7000"),
+                Err(CliError::Usage(_))
+            ));
+        }
+
+        #[test]
+        fn a_missing_ca_file_is_a_usage_error() {
+            let ctx = Context {
+                tls_ca: Some("/does/not/exist.pem".to_string()),
+                ..Context::default()
+            };
+            assert!(matches!(
+                client_config_for_context(Some(&ctx), "localhost:7000"),
+                Err(CliError::Usage(_))
+            ));
+        }
+
+        #[test]
+        fn a_bracketed_ipv6_host_derives_the_inner_literal_as_the_server_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = Context {
+                tls_ca: Some(write_temp(dir.path(), "ca.pem", CERT)),
+                ..Context::default()
+            };
+            let cfg = client_config_for_context(Some(&ctx), "[::1]:7000").unwrap();
+            assert_eq!(cfg.tls.unwrap().server_name(), "::1");
+        }
+    }
+
+    // On a build WITHOUT the tls feature, any TLS setting on the active context is refused (never
+    // silently ignored), mirroring the server side's refusal of `--tls-*` on a non-tls build.
+    #[cfg(not(feature = "tls"))]
+    mod tls_client_no_feature {
+        use super::*;
+
+        #[test]
+        fn a_tls_context_on_a_non_tls_build_is_refused() {
+            let ctx = Context {
+                tls_ca: Some("/etc/ca.pem".to_string()),
+                ..Context::default()
+            };
+            assert!(matches!(
+                client_config_for_context(Some(&ctx), "localhost:7000"),
+                Err(CliError::Usage(_))
+            ));
+        }
+
+        #[test]
+        fn a_plaintext_context_still_yields_the_default() {
+            let ctx = Context {
+                addr: Some("localhost:7000".to_string()),
+                ..Context::default()
+            };
+            // No `tls` field exists on this build; a context with no TLS settings just builds the
+            // plaintext default without error.
+            client_config_for_context(Some(&ctx), "localhost:7000")
+                .expect("a plaintext context builds the default config");
+        }
     }
 }
