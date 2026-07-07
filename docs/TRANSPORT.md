@@ -8,25 +8,32 @@ checked. It is the network-boundary half of the security epic (#18); the
 credential model it leans on (auth identities, the three authorization scopes) is
 specified separately in #106.
 
-> **Status (updated #629/#631/#633, V2-M7): the FAIL-CLOSED BIND INVARIANT
-> (section 2) is now IMPLEMENTED and enforced with an HONEST posture — no config
-> may imply encryption that is not delivered; the TLS 1.3 handshake itself
-> (section 1) and the pre-auth DoS *enforcement* (section 3) are FLAGGED
-> follow-ups.** Because the native TLS 1.3 handshake is NOT yet wired (#107, no
-> allowed pure-Rust crypto provider), a `--tls-*` cert cannot encrypt the wire, so
-> the build must never accept one and imply encryption it cannot deliver. What
-> ships, therefore, is the honest non-loopback matrix:
+> **Status (updated ADR-0004 / #766, TLS increments 1–2b): SERVER-SIDE TLS 1.3
+> TERMINATION now SHIPS behind the non-default `tls` Cargo feature.** A broker
+> built `--features tls` and given `--tls-cert` + `--tls-key` terminates a real
+> TLS 1.3 handshake (rustls + the owner-ratified `aws-lc-rs` provider, ADR-0004),
+> so a non-loopback bind is genuinely encrypted — no `--insecure-plaintext-wire`
+> opt-in required. The FAIL-CLOSED BIND INVARIANT (section 2) stays enforced with
+> the same honest rule: no config may imply encryption it does not deliver. The
+> matrix is now feature-aware:
 >
 > - **The default loopback bind stays zero-config** (no TLS, no auth, no flag) —
 >   byte-for-byte the historical dev path.
-> - **Any `--tls-cert` / `--tls-key` / `--tls-client-ca` (flag OR `IRONBUS_TLS_*`
->   env) is REFUSED** at startup with a typed usage error naming the flag —
->   reserved/not-yet-honored until #107, so a cert can never falsely imply
->   encryption. (Refused on any bind, even loopback, so a stray cert never creates a
->   false impression of safety.)
-> - **A non-loopback `--addr` with no opt-in is REFUSED** (no silent plaintext):
->   bind a loopback address and terminate TLS upstream, pass
->   `--insecure-plaintext-wire`, or wait for native TLS.
+> - **`--features tls` build, `--tls-cert` + `--tls-key`: HONORED.** The wire is
+>   TLS 1.3-encrypted; a non-loopback bind is allowed with no plaintext opt-in.
+>   Exactly ONE of the pair is incomplete material and is REFUSED fail-closed; the
+>   private key is `StrictModes`-checked (owner-only) before it is read.
+> - **DEFAULT (non-`tls`) build, any `--tls-cert`/`--tls-key` (flag OR
+>   `IRONBUS_TLS_*` env): REFUSED** at startup with a typed usage error naming the
+>   flag — that build links no TLS stack, so a cert cannot encrypt and must never
+>   imply encryption. (Refused on any bind, even loopback.) Rebuild `--features
+>   tls`, terminate TLS upstream, or pass `--insecure-plaintext-wire`.
+> - **`--tls-client-ca` (mTLS) is REFUSED on EVERY build** until the mTLS increment
+>   (#766) verifies client certificates — honoring it now would imply mutual
+>   authentication IronBus does not yet perform.
+> - **A non-loopback `--addr` with no TLS and no opt-in is REFUSED** (no silent
+>   plaintext): use TLS, bind loopback + terminate TLS upstream, or pass
+>   `--insecure-plaintext-wire`.
 > - **`--insecure-plaintext-wire` WITH an auth identity ALLOWS a non-loopback
 >   plaintext bind** — the explicit, audited opt-in for the legitimate
 >   TLS-terminated-upstream pattern (a mesh / proxy / VPN encrypts the wire; the
@@ -39,14 +46,13 @@ specified separately in #106.
 > window where an unprotected non-loopback socket accepts a connection. The
 > connection-scoped auth model and the three-scope authorization (#631,
 > [AUTHENTICATION.md](AUTHENTICATION.md)) ship with it (bearer/password verify on
-> audited pure-Rust RustCrypto primitives; mTLS identity-mapping is wired but
-> needs the TLS layer to supply a verified peer certificate, so `--tls-client-ca`
-> is likewise reserved/refused until #107). What is FLAGGED: the actual rustls TLS
-> 1.3 handshake — its crypto provider is a deliberate supply-chain decision (the
-> only pure-Rust rustls provider available is an alpha crate that pulls a C builder;
-> `ring`/`aws-lc-sys` are on the `deny.toml` bans list), so the encryption layer is
-> the next PR rather than shipping a weak crypto path; when it lands, the `--tls-*`
-> flags are re-enabled to actually encrypt and rejoin the bind decision. The
+> audited pure-Rust RustCrypto primitives). What REMAINS flagged: **mTLS**
+> (`--tls-client-ca` client-certificate verification → identity mapping) and
+> **client-side TLS** (the IronBus CLI/SDK verifying and connecting to a TLS broker,
+> #957) are the next TLS increments; the crypto-provider supply-chain decision that
+> once blocked all of this is RESOLVED (aws-lc-rs behind the `tls` feature,
+> ADR-0004, a documented `deny.toml` C-FFI exception like `zstd-sys`; the default
+> and `edge-min` builds stay byte-for-byte pure-Rust). The
 > pre-auth DoS knobs (section 3) are parsed, validated, and surfaced with safe
 > defaults, but their accept-loop *enforcement* (the per-IP token bucket + half-open
 > cap + `connections_rejected_total{reason}`) is the next PR. The at-rest
@@ -61,15 +67,17 @@ away thinking IronBus can be put on a hostile network with a config that only
 *looks* secure:
 
 > **No config may imply encryption that is not delivered, and no non-loopback
-> wire is ever silently plaintext.** Until the native TLS 1.3 handshake lands
-> (#107) the build cannot encrypt the wire, so a `--tls-*` cert is REFUSED rather
-> than accepted as a false promise of encryption; a non-loopback bind is REFUSED
-> unless the operator EXPLICITLY passes `--insecure-plaintext-wire` together with
-> an auth identity, which is the honest, loudly-warned opt-in for a plaintext wire
-> with TLS terminated upstream. A plaintext wire is never anonymous off loopback,
-> and the broker refuses to start — before the listener opens, with an actionable
-> error — in every other case. Zero-config plaintext exists only on the loopback
-> interface, where the trust boundary is the host itself.
+> wire is ever silently plaintext.** A `--features tls` broker with `--tls-cert` +
+> `--tls-key` DELIVERS TLS 1.3 encryption, so its non-loopback bind is genuinely
+> secure. A build WITHOUT the `tls` feature cannot encrypt the wire, so a `--tls-*`
+> cert is REFUSED there rather than accepted as a false promise of encryption. In
+> either build a non-loopback plaintext bind is REFUSED unless the operator
+> EXPLICITLY passes `--insecure-plaintext-wire` together with an auth identity, the
+> honest, loudly-warned opt-in for a plaintext wire with TLS terminated upstream. A
+> plaintext wire is never anonymous off loopback, and the broker refuses to start —
+> before the listener opens, with an actionable error — in every other case.
+> Zero-config plaintext exists only on the loopback interface, where the trust
+> boundary is the host itself.
 
 ---
 

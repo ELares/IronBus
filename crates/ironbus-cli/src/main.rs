@@ -2055,15 +2055,24 @@ impl TransportSecurityFlags {
     // to match — otherwise it is dead_code on a Windows non-test binary build (-D warnings).
     #[cfg(any(unix, test))]
     fn reserved_tls_flag(&self) -> Option<&'static str> {
-        if self.tls_cert.is_some() {
-            Some("--tls-cert")
-        } else if self.tls_key.is_some() {
-            Some("--tls-key")
-        } else if self.tls_client_ca.is_some() {
-            Some("--tls-client-ca")
-        } else {
-            None
+        // On a NON-tls build a `--tls-cert`/`--tls-key` cannot encrypt, so it stays reserved (a
+        // fail-closed refusal). Behind `--features tls` those are HONORED (loaded at serve), so they
+        // are NOT reserved — only the resolved-value env path reaches here, and it too is honored.
+        #[cfg(not(feature = "tls"))]
+        {
+            if self.tls_cert.is_some() {
+                return Some("--tls-cert");
+            }
+            if self.tls_key.is_some() {
+                return Some("--tls-key");
+            }
         }
+        // `--tls-client-ca` (mTLS) is reserved on EVERY build until the mTLS increment (#766) verifies
+        // client certificates: honoring it now would imply mutual authentication this build does not do.
+        if self.tls_client_ca.is_some() {
+            return Some("--tls-client-ca");
+        }
+        None
     }
 
     /// Whether at least one auth identity is configured (#631): an identity-table file. (An mTLS
@@ -2823,13 +2832,34 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             // consumed so the message names the flag, not a stray positional). The same refusal is
             // enforced again on the RESOLVED value in `cmd_serve` to also catch the `IRONBUS_TLS_*` env
             // path, so no source — flag or env — can create a false impression of encryption.
+            // `--tls-cert` / `--tls-key`: HONORED behind `--features tls` (ADR-0004, #766) — the value
+            // is stored and loaded into a rustls `ServerConfig` at serve. On a NON-tls build they stay
+            // RESERVED (#107): a cert can never encrypt without the TLS stack, so accepting one would
+            // imply encryption this build cannot deliver — a fail-closed parse refusal. `--tls-client-ca`
+            // (mTLS) is reserved on EVERY build until the mTLS increment (#766) verifies client certs.
             "--tls-cert" => {
-                let _ = take_value("--tls-cert", args, &mut i)?;
-                return Err(reserved_tls_flag_refusal("--tls-cert"));
+                let value = take_value("--tls-cert", args, &mut i)?;
+                #[cfg(feature = "tls")]
+                {
+                    f.tls_cert = Some(value);
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = value;
+                    return Err(reserved_tls_flag_refusal("--tls-cert"));
+                }
             }
             "--tls-key" => {
-                let _ = take_value("--tls-key", args, &mut i)?;
-                return Err(reserved_tls_flag_refusal("--tls-key"));
+                let value = take_value("--tls-key", args, &mut i)?;
+                #[cfg(feature = "tls")]
+                {
+                    f.tls_key = Some(value);
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = value;
+                    return Err(reserved_tls_flag_refusal("--tls-key"));
+                }
             }
             "--tls-client-ca" => {
                 let _ = take_value("--tls-client-ca", args, &mut i)?;
@@ -4505,6 +4535,10 @@ fn validate_serve_invocation(
         // audited here, the validator stage), or `None` for `config validate` / `--check-only` (a
         // pure check, no emission).
         let _ = load_auth_config(transport, audit)?;
+        // Validate the TLS material the same way (ADR-0004, #766): StrictModes on the key + a real
+        // cert/key parse, so `--check-only` catches a bad-permission key or a malformed cert exactly
+        // as a live start would. A no-op (plaintext) when no --tls-cert/--tls-key is configured.
+        let _ = load_tls_termination(transport, audit)?;
     }
     #[cfg(not(unix))]
     {
@@ -5414,11 +5448,28 @@ fn wire_bind_decision(
     addr: &str,
     transport: &TransportSecurityFlags,
 ) -> Result<WireBindDecision, CliError> {
-    // FIRST and on ANY bind: a `--tls-*` value (flag or env) is refused as not-yet-honored, so a cert
-    // can NEVER imply encryption this build does not deliver. Loopback zero-config is unaffected (it
-    // passes no `--tls-*`); a loopback bind WITH a stray cert is also refused, by design.
+    // FIRST and on ANY bind: refuse any RESERVED `--tls-*` value (flag or env). What is reserved is
+    // build-dependent (see `reserved_tls_flag`): on a non-`tls` build, `--tls-cert`/`--tls-key` too
+    // (no TLS stack, so a cert cannot encrypt and must not imply it); on every build, `--tls-client-ca`
+    // (mTLS is a later increment). Loopback zero-config is unaffected (it passes no `--tls-*`).
     if let Some(flag) = transport.reserved_tls_flag() {
         return Err(reserved_tls_flag_refusal(flag));
+    }
+    // Native TLS (ADR-0004, #766): behind `--features tls`, a `--tls-cert` + `--tls-key` pair means
+    // the wire is ENCRYPTED (TLS 1.3), so a non-loopback bind is safe with NO `--insecure-plaintext-wire`
+    // opt-in — the transport itself provides confidentiality. Both halves are REQUIRED; one alone is
+    // incomplete TLS material and is refused fail-closed. The address is still resolved (the listener
+    // binds it later). On a non-tls build `tls_cert`/`tls_key` are always `None` (reserved above), so
+    // this branch is inert and the plaintext matrix below is byte-for-byte unchanged.
+    #[cfg(feature = "tls")]
+    if transport.tls_cert.is_some() || transport.tls_key.is_some() {
+        if transport.tls_cert.is_none() || transport.tls_key.is_none() {
+            return Err(tls_incomplete_material_refusal());
+        }
+        let _ = resolve_and_classify_wire_bind(addr)?;
+        return Ok(WireBindDecision {
+            transport_plaintext_optin: None,
+        });
     }
     let loopback = resolve_and_classify_wire_bind(addr)?;
     if loopback {
@@ -5428,8 +5479,9 @@ fn wire_bind_decision(
             transport_plaintext_optin: None,
         });
     }
-    // Non-loopback. Native TLS is not wired (#107), so the ONLY honest way to bind here is the explicit
-    // plaintext opt-in WITH auth; anything else is a fail-closed refusal (pre-listen).
+    // Non-loopback with NO TLS material configured (or a non-`tls` build): the ONLY honest way to bind
+    // here is the explicit plaintext opt-in WITH auth; anything else is a fail-closed refusal
+    // (pre-listen). A `--features tls` build with --tls-cert/--tls-key already returned above (encrypted).
     if !transport.insecure_plaintext_wire {
         return Err(wire_non_loopback_refusal(addr));
     }
@@ -5697,6 +5749,60 @@ fn build_audit_emitter(
 /// admin}`, and exactly one mechanism's additive credential list (`token_hashes`, or `username` +
 /// `password_hashes` PHC strings, or `mtls_san`). Secrets are the stored HASHES, never plaintext.
 ///
+/// Load the server-side TLS terminator (ADR-0004, #766) from the resolved `--tls-cert` / `--tls-key`
+/// paths, mirroring [`load_auth_config`]: it runs the fail-closed `StrictModes` owner-only permission
+/// check on the PRIVATE KEY (the cert chain is public; only the key is a secret), reads both PEM
+/// files, and builds a rustls `ServerConfig` (TLS 1.3-only, aws-lc-rs). Returns a plaintext
+/// [`TlsTermination`](ironbus_server::server::TlsTermination) when no TLS material is configured or on
+/// a non-`tls` build. Called by BOTH the config validator (so `--check-only` faithfully catches a bad
+/// key or malformed cert) and `cmd_serve` (for the live terminator) — exactly like `load_auth_config`.
+///
+/// # Errors
+/// [`CliError::Usage`] for a group/world-readable or wrong-owner key (`StrictModes`), an unreadable
+/// cert/key file, or TLS material rustls rejects (a mismatched or malformed cert/key).
+#[cfg(unix)]
+fn load_tls_termination(
+    transport: &TransportSecurityFlags,
+    audit: Option<&ironbus_server::audit::AuditEmitter>,
+) -> Result<ironbus_server::server::TlsTermination, CliError> {
+    #[cfg(feature = "tls")]
+    {
+        // wire_bind_decision already refused incomplete material (one of cert/key), so a lone flag
+        // never reaches here; treat anything but a complete pair as "no TLS" (plaintext).
+        let (Some(cert_path), Some(key_path)) = (&transport.tls_cert, &transport.tls_key) else {
+            return Ok(ironbus_server::server::TlsTermination::default());
+        };
+        // Fail-closed StrictModes owner-only check on the key (audited on the serve path, silent for
+        // the validator), before it is read — a group/world-readable key refuses startup.
+        strict_mode_check_secret_file_audited(key_path, audit)?;
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            CliError::Usage(format!(
+                "refusing to start: --tls-cert `{cert_path}` could not be read ({e})"
+            ))
+        })?;
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            CliError::Usage(format!(
+                "refusing to start: --tls-key `{key_path}` could not be read ({e})"
+            ))
+        })?;
+        let config =
+            ironbus_server::tls::server_config_from_pem(&cert_pem, &key_pem).map_err(|e| {
+                CliError::Usage(format!(
+                    "refusing to start: the TLS certificate/key are not usable: {e}"
+                ))
+            })?;
+        Ok(ironbus_server::server::TlsTermination::with_config(
+            std::sync::Arc::new(config),
+        ))
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        // No TLS stack in this build; --tls-* was already refused at parse/bind, so this is plaintext.
+        let _ = (transport, audit);
+        Ok(ironbus_server::server::TlsTermination::default())
+    }
+}
+
 /// # Errors
 /// [`CliError::Usage`] for a missing/unsafe secret file (`StrictModes`), a malformed table, an unknown
 /// scope, or a credential that does not parse (a fail-closed reject, never a silent skip).
@@ -6354,15 +6460,40 @@ fn toml_string(value: &str) -> String {
 /// binary with `cfg(test)=false`, so an `any(unix, test)` gate would vanish on a Windows non-test
 /// build while its ungated caller remained → E0425. It uses no unix API (pure error string).
 fn reserved_tls_flag_refusal(flag: &str) -> CliError {
+    if flag == "--tls-client-ca" {
+        // mTLS (client-certificate verification) is the next TLS increment (#766). Server TLS ships
+        // today behind `--features tls` via --tls-cert/--tls-key; honoring a client-CA now would imply
+        // mutual authentication this build does not yet verify, so it is refused fail-closed.
+        return CliError::Usage(format!(
+            "{flag} (mTLS client-certificate verification) is not yet honored: mutual-TLS identity \
+             verification is the flagged follow-up (#766). Server TLS IS available today with \
+             --tls-cert + --tls-key on a `--features tls` build; mTLS lands in a later increment. Do \
+             not pass {flag} expecting client-certificate authentication yet."
+        ));
+    }
+    // A --tls-cert/--tls-key on a build compiled WITHOUT the `tls` feature: there is no TLS stack, so a
+    // cert cannot encrypt the wire — accepting it would falsely imply encryption (#107, ADR-0004).
     CliError::Usage(format!(
-        "{flag} is not yet honored: the TLS 1.3 handshake is the flagged follow-up #107 (no allowed \
-         pure-Rust crypto provider is on the deny.toml allowlist yet), so a TLS cert CANNOT encrypt \
-         the wire in this build — accepting it would falsely imply encryption that is not delivered. \
-         Do not pass {flag} expecting encryption. To bind a non-loopback address today, terminate TLS \
-         upstream (mesh / proxy / VPN) and bind a loopback address, or pass --insecure-plaintext-wire \
-         to explicitly accept a plaintext wire WITH auth, or wait for native TLS (#107). When native \
-         TLS lands, {flag} is re-enabled to actually encrypt."
+        "{flag} is not honored in this build: it was compiled WITHOUT the `tls` feature, so it links \
+         no TLS stack and a cert CANNOT encrypt the wire — accepting it would falsely imply encryption \
+         that is not delivered. Rebuild with `--features tls` to terminate TLS 1.3 in the broker, or \
+         bind a loopback address and terminate TLS upstream (mesh / proxy / VPN), or pass \
+         --insecure-plaintext-wire to explicitly accept a plaintext wire WITH auth."
     ))
+}
+
+/// Refusal for incomplete server-TLS material (ADR-0004, #766): exactly one of `--tls-cert` /
+/// `--tls-key` was given. Terminating TLS needs both, so the broker refuses to start rather than fall
+/// back to a plaintext bind the operator's `--tls-*` flag implied would be encrypted.
+#[cfg(feature = "tls")]
+fn tls_incomplete_material_refusal() -> CliError {
+    CliError::Usage(
+        "incomplete TLS material: server TLS requires BOTH --tls-cert (the certificate chain) AND \
+         --tls-key (the private key); one without the other cannot terminate TLS. The broker refuses \
+         to start rather than silently bind plaintext where --tls-* implied encryption. Provide both, \
+         or neither (for a loopback / --insecure-plaintext-wire bind)."
+            .to_string(),
+    )
 }
 
 /// The fatal usage error for a NON-LOOPBACK `--addr` with no `--insecure-plaintext-wire` opt-in (#629).
@@ -6595,6 +6726,12 @@ fn cmd_serve(
     // secret file fails closed pre-listen. The audit emitter (built once in `finish_serve`) is threaded
     // in so a refusal here is audited too (a direct caller that skipped the validator still audits it).
     let auth = load_auth_config(transport, Some(&audit))?;
+    // Build the server-side TLS terminator (ADR-0004, #766) from --tls-cert/--tls-key: behind
+    // `--features tls` a complete pair loads a rustls TLS 1.3 ServerConfig (the private key
+    // StrictModes-checked first), else a zero-cost plaintext terminator. Built HERE (transport in
+    // scope) and threaded into `run_broker`'s accept loop alongside `auth`. Audited like the other
+    // secret loads. wire_bind_decision above already refused incomplete/reserved --tls-* material.
+    let tls_termination = load_tls_termination(transport, Some(&audit))?;
     // The pre-auth DoS defenses (#633) are ON for a NON-LOOPBACK bind, INERT on loopback (the trust
     // boundary is the host itself, so the zero-config loopback-dev path stays byte-for-byte unchanged —
     // no rate limit, no half-open cap, no lockout). `Some(_)` here means a non-loopback bind, exactly
@@ -6723,6 +6860,7 @@ fn cmd_serve(
                 auth,
                 preauth_cfg,
                 audit,
+                tls_termination,
                 reload,
                 out,
             );
@@ -6775,6 +6913,7 @@ fn cmd_serve(
                 auth,
                 preauth_cfg,
                 audit,
+                tls_termination,
                 reload,
                 out,
             )
@@ -8049,6 +8188,10 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // refusal is audited) and shared here for the startup config-change event and every connection's
     // auth-outcome / scope-denial. With no `--audit-log` it is the `Null` (zero-cost) emitter.
     audit: ironbus_server::audit::AuditEmitter,
+    // The server-side TLS terminator (ADR-0004, #766), built in `cmd_serve` from --tls-cert/--tls-key
+    // (where the resolved transport flags are in scope). A live rustls TLS 1.3 config behind
+    // `--features tls`, or a zero-cost plaintext terminator otherwise.
+    tls_termination: ironbus_server::server::TlsTermination,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -8316,10 +8459,9 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         // byte-for-byte the historical accept path. This is the LAST use of `audit`, so move it in
         // (the signal thread already took its own clone).
         Some(audit),
-        // TLS termination (ADR-0004, #766): DEFAULT = plaintext for now. Loading `--tls-cert`/`--tls-key`
-        // into a `TlsTermination::with_config` and stopping the `--tls-*` refusal is the CLI-wiring
-        // follow-up; this PR lands server-side TLS termination in the library (tested via `serve`).
-        ironbus_server::server::TlsTermination::default(),
+        // TLS termination (ADR-0004, #766): the terminator loaded above — a live TLS 1.3 ServerConfig
+        // when --tls-cert/--tls-key were given on a `--features tls` build, else plaintext.
+        tls_termination,
     )
     .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
     // The wire serve returned: either a stop signal flipped `shutdown` (the signal thread already
@@ -19055,10 +19197,11 @@ mod tests {
         assert!(wire_bind_decision("203.0.113.5:7777", &auth_only).is_err());
     }
 
+    #[cfg(not(feature = "tls"))]
     #[test]
-    fn a_non_loopback_bind_with_any_tls_material_is_refused_not_yet_honored() {
-        // #107/#629: a `--tls-*` value CANNOT encrypt this build's wire (no allowed crypto provider),
-        // so accepting it would falsely imply encryption. Every `--tls-*` shape is REFUSED with a typed
+    fn a_non_loopback_bind_with_any_tls_material_is_refused_on_a_non_tls_build() {
+        // On a build compiled WITHOUT the `tls` feature, a `--tls-*` value CANNOT encrypt the wire, so
+        // accepting it would falsely imply encryption. Every `--tls-*` shape is REFUSED with a typed
         // usage error that names the offending flag — a cert can NEVER imply undelivered encryption.
         for (transport, flag) in [
             (ts(Some("/c.pem"), None, None, None, false), "--tls-cert"),
@@ -19084,22 +19227,102 @@ mod tests {
             match e {
                 CliError::Usage(m) => {
                     assert!(m.contains(flag), "names the offending flag {flag}: {m}");
-                    assert!(
-                        m.contains("not yet honored"),
-                        "states the flag is reserved/not-yet-honored: {m}"
-                    );
-                    assert!(
-                        m.contains("CANNOT encrypt"),
-                        "states a cert cannot encrypt this build: {m}"
-                    );
                 }
                 other => panic!("expected Usage, got {other:?}"),
             }
         }
-        // A `--tls-*` value is refused even on a LOOPBACK bind, so a stray cert never creates a false
-        // impression of safety anywhere.
+        // Refused even on a LOOPBACK bind, so a stray cert never creates a false impression of safety.
         let loopback_cert = ts(Some("/c.pem"), None, None, None, false);
         assert!(wire_bind_decision("127.0.0.1:7777", &loopback_cert).is_err());
+    }
+
+    /// Behind `--features tls`, server TLS material is HONORED (ADR-0004, #766): a `--tls-cert` +
+    /// `--tls-key` pair encrypts the wire, so a non-loopback bind is allowed with NO
+    /// `--insecure-plaintext-wire` opt-in and no separate auth identity (the transport is confidential).
+    /// Incomplete material is refused fail-closed; `--tls-client-ca` (mTLS) stays reserved until the
+    /// mTLS increment.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_material_enables_a_non_loopback_bind_and_incomplete_or_mtls_is_refused() {
+        // A complete cert+key pair: a non-loopback bind is allowed WITHOUT the plaintext opt-in.
+        let full = ts(Some("/c.pem"), Some("/k.pem"), None, None, false);
+        let d = wire_bind_decision("0.0.0.0:7777", &full).expect("a TLS bind is allowed");
+        assert!(
+            d.transport_plaintext_optin.is_none(),
+            "a TLS bind is not a plaintext opt-in"
+        );
+        // Loopback TLS is fine too.
+        assert!(wire_bind_decision("127.0.0.1:7777", &full).is_ok());
+        // Incomplete material (exactly one of the pair) is refused fail-closed.
+        assert!(
+            wire_bind_decision("0.0.0.0:7777", &ts(Some("/c.pem"), None, None, None, false))
+                .is_err()
+        );
+        assert!(
+            wire_bind_decision("0.0.0.0:7777", &ts(None, Some("/k.pem"), None, None, false))
+                .is_err()
+        );
+        // `--tls-client-ca` (mTLS) is still reserved until the mTLS increment, checked before the pair.
+        let ca = ts(Some("/c.pem"), Some("/k.pem"), Some("/ca.pem"), None, false);
+        match wire_bind_decision("0.0.0.0:7777", &ca).unwrap_err() {
+            CliError::Usage(m) => assert!(m.contains("--tls-client-ca"), "names client-ca: {m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    // A long-lived self-signed server cert + key (the same fixtures the server/tls tests embed) for
+    // exercising the real cert/key load path. Embedded, not rcgen-generated (rcgen pulls banned ring).
+    #[cfg(all(feature = "tls", unix))]
+    const TLS_TEST_CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBVzCB/aADAgECAhMjGIxpQAwb+081fMl2nX2WEMQ8MAoGCCqGSM49BAMCMB4x
+HDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIwIBcNMjAwMTAxMDAwMDAwWhgP
+MjEwMDAxMDEwMDAwMDBaMB4xHDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+AoxgwFjAU
+BgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwIDSQAwRgIhAJ+smDY9Jybx
+FoJDOjOor9Cb56IyQQ64ts0roLO5NVx9AiEAnB1pAliacK3UDfG6xKEig12h4tzf
+UrjVOalNQ4uwFJg=
+-----END CERTIFICATE-----
+";
+    #[cfg(all(feature = "tls", unix))]
+    const TLS_TEST_KEY: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWd4kisc5NnK6Nv0I
+RL0rrbnn9ozoIOti7I4eisF3CHWhRANCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
+-----END PRIVATE KEY-----
+";
+
+    /// `load_tls_termination` (ADR-0004, #766): a good cert+key with an owner-only key builds a
+    /// terminator; a group/world-readable key is refused fail-closed by the `StrictModes` check.
+    #[cfg(all(feature = "tls", unix))]
+    #[test]
+    fn load_tls_termination_builds_from_good_material_and_refuses_a_group_readable_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        std::fs::write(&cert, TLS_TEST_CERT).unwrap();
+        std::fs::write(&key, TLS_TEST_KEY).unwrap();
+        let transport = ts(
+            Some(cert.to_str().unwrap()),
+            Some(key.to_str().unwrap()),
+            None,
+            None,
+            false,
+        );
+
+        // Owner-only key + valid material: loads a terminator.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        load_tls_termination(&transport, None).expect("good material loads a terminator");
+
+        // Group-readable key: StrictModes refuses startup fail-closed.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_tls_termination(&transport, None).is_err(),
+            "a group-readable TLS key must be refused"
+        );
     }
 
     #[test]
@@ -19209,23 +19432,55 @@ mod tests {
             "no --tls-* material reached the parsed flags"
         );
 
-        // Each `--tls-*` flag REFUSES at parse time with a typed usage error naming the flag, so a cert
-        // can never reach a bind decision and imply undelivered encryption (#107).
-        for flag in ["--tls-cert", "--tls-key", "--tls-client-ca"] {
+        // `--tls-client-ca` (mTLS) REFUSES at parse on EVERY build — mTLS client-certificate
+        // verification is a later increment (#766), so a client-CA can never imply mutual auth.
+        {
             let e = parse_serve_flags(&[
                 "--data-dir".to_string(),
                 "/tmp/x".to_string(),
-                flag.to_string(),
-                "/x.pem".to_string(),
+                "--tls-client-ca".to_string(),
+                "/ca.pem".to_string(),
             ])
             .unwrap_err();
             assert_eq!(e.exit_code(), EXIT_USAGE);
             match e {
-                CliError::Usage(m) => {
-                    assert!(m.contains(flag), "names the offending flag {flag}: {m}");
-                    assert!(m.contains("not yet honored"), "{m}");
+                CliError::Usage(m) => assert!(m.contains("--tls-client-ca"), "names the flag: {m}"),
+                other => panic!("expected Usage for --tls-client-ca, got {other:?}"),
+            }
+        }
+
+        // `--tls-cert` / `--tls-key`: REFUSED at parse on a NON-tls build (no TLS stack, so a cert
+        // cannot encrypt and must not imply it); HONORED (parsed + stored) behind `--features tls`
+        // (ADR-0004, #766).
+        for flag in ["--tls-cert", "--tls-key"] {
+            let parsed = parse_serve_flags(&[
+                "--data-dir".to_string(),
+                "/tmp/x".to_string(),
+                flag.to_string(),
+                "/x.pem".to_string(),
+            ]);
+            #[cfg(not(feature = "tls"))]
+            {
+                let e = parsed.unwrap_err();
+                assert_eq!(e.exit_code(), EXIT_USAGE);
+                match e {
+                    CliError::Usage(m) => assert!(m.contains(flag), "names the flag {flag}: {m}"),
+                    other => panic!("expected Usage for {flag}, got {other:?}"),
                 }
-                other => panic!("expected Usage for {flag}, got {other:?}"),
+            }
+            #[cfg(feature = "tls")]
+            {
+                let set = parsed.expect("a --features tls build honors --tls-cert/--tls-key");
+                let stored = if flag == "--tls-cert" {
+                    set.transport.tls_cert.as_deref()
+                } else {
+                    set.transport.tls_key.as_deref()
+                };
+                assert_eq!(
+                    stored,
+                    Some("/x.pem"),
+                    "{flag} value is stored under --features tls"
+                );
             }
         }
 
