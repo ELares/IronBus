@@ -442,9 +442,10 @@ numbers, planes, and purposes:
 | 47  | `TxnCheck` | server to client | broker back-check of an in-doubt half message (pass-driven push, like tag 22) (#640) |
 | 48  | `TxnCheckResult` | client to server | the producer's commit/rollback resolution answer (#640) |
 | 49  | `TxnListen` | client to server | bind a transaction-state listener group to this connection (#640) |
-| 50  | `RaftAuth` | peer only | HMAC-authenticated raft peer frame: the interim shared-secret integrity + origin-auth envelope `[ver:1][mac:32][raft_pb]` around a `Raft` (27) body; a client never sends or receives it (#1067) |
+| 50  | `RaftAuth` | peer only | HMAC-authenticated raft peer frame: the interim shared-secret integrity + origin-auth envelope `[ver:1][mac:32][raft_pb]` around a `Raft` (27) body; a client never sends or receives it (#1067 Inc 2) |
+| 51  | `DataPlaneAuth` | peer only | HMAC-authenticated cluster DATA-plane peer frame: the interim shared-secret integrity + origin-auth envelope `[ver:1][mac:32][verb-tag:1][partition:u64-le][layer body]` wrapping ANY data-plane verb (`FetchRecords` 32 / `FetchResponse` 33 / `AckReplicated` 37 / `OffsetForLeaderEpoch` 38 / `CommittedHwQuery` 43), over a domain label distinct from `RaftAuth`; the real verb tag is re-embedded inside the authenticated content, and the MAC is streamed over the (up to 8 MiB) zero-copy `FetchResponse` run without copying it. A client never sends or receives it (#1067 Inc 3) |
 
-`from_u8` returns `None` for tag 0 and for tags 51 and above (unknown, still framed by the
+`from_u8` returns `None` for tag 0 and for tags 52 and above (unknown, still framed by the
 envelope). The tag map is HASH-PINNED by the registry gate (the `frame-tags-sha256` sentinel
 in [compat/versions.md](compat/versions.md)): a tag addition cannot land without re-pinning
 the registry and updating this table in the same commit. (This paragraph previously froze the

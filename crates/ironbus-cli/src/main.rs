@@ -2041,10 +2041,11 @@ struct TransportSecurityFlags {
     insecure_plaintext_wire: bool,
     /// `--cluster-secret-file <path>` (#1067): the cluster-wide shared-secret file for interim HMAC peer
     /// authentication. HONORED — a set value is StrictModes-checked, read, and SHA-256-derived into the
-    /// peer-wire HMAC key at serve, which HMAC-authenticates the raft METADATA peer wire against outsider
-    /// forgery. It does NOT cover the co-located data-plane replication wire (a follow-up increment) and
-    /// therefore does NOT by itself satisfy a non-loopback bind — it COMPLEMENTS, not replaces,
-    /// `--insecure-plaintext-peers`. A PATH reference, never inline material. Inert on a single-node broker.
+    /// peer-wire HMAC key at serve, which HMAC-authenticates BOTH the raft METADATA peer wire (#1067 Inc 2)
+    /// and the co-located cluster DATA-PLANE replication wire (#1067 Inc 3) against outsider forgery. It is
+    /// ENFORCED only once `--cluster-peer-auth` reaches `required`, so at the default/off it does NOT by
+    /// itself satisfy a non-loopback bind — it COMPLEMENTS, not replaces, `--insecure-plaintext-peers`. A
+    /// PATH reference, never inline material. Inert on a single-node broker.
     cluster_secret_file: Option<String>,
     /// `--cluster-peer-auth <off|permissive|signed|required>` (#1067): the peer-auth ROLLOUT rung when a
     /// secret is configured — the ladder for migrating a live cluster (off → permissive → signed →
@@ -2055,8 +2056,9 @@ struct TransportSecurityFlags {
     /// cluster PEER-listener bind — the peer-wire twin of `--insecure-plaintext-wire`. A non-loopback
     /// peer bind is a fail-closed startup refusal unless the operator explicitly accepts the plaintext
     /// peer wire with this flag; a loud startup WARNING is always emitted. It COMPLEMENTS
-    /// `--cluster-secret-file` (which hardens only the metadata wire): the opt-in acknowledges the
-    /// still-plaintext data-plane wire. Inert for a single-node broker and for a loopback bind.
+    /// `--cluster-secret-file` (which HMAC-authenticates both peer wires only once `--cluster-peer-auth`
+    /// reaches `required`): the opt-in acknowledges a bind that may still be plaintext (pre-`required` or
+    /// off). Inert for a single-node broker and for a loopback bind.
     insecure_plaintext_peers: bool,
     /// `--max-preauth-connections`: the half-open (pre-auth) connection cap (default 128).
     max_preauth_connections: usize,
@@ -5630,13 +5632,14 @@ struct PeerPlaintextOptin {
 /// - **non-loopback, `--insecure-plaintext-peers`** -> ALLOWED as an explicit opt-in; a loud startup
 ///   WARNING is emitted by `cmd_serve`.
 ///
-/// IMPORTANT: `--cluster-secret-file` does NOT affect this bind decision and does NOT satisfy a
-/// non-loopback bind. It HMAC-authenticates only the raft METADATA peer wire (#1067 Increment 2); the
-/// co-located DATA-PLANE replication wire (ISR / fetch, on the same IP at `dataplane_addr`) is still
-/// plaintext, so the operator must still explicitly accept that plaintext wire with
-/// `--insecure-plaintext-peers`. The secret and the opt-in are COMPLEMENTARY: the secret hardens the
-/// consensus wire against outsider forgery, the opt-in acknowledges the still-plaintext data plane.
-/// Data-plane HMAC is the follow-up increment; per-node identity + confidentiality is mTLS #766.
+/// IMPORTANT: `--cluster-secret-file` does NOT affect this bind decision and does NOT by itself satisfy a
+/// non-loopback bind. It HMAC-authenticates BOTH the raft METADATA peer wire (#1067 Increment 2) and the
+/// co-located DATA-PLANE replication wire (ISR / fetch, on the same IP at `dataplane_addr`; #1067
+/// Increment 3), but only once `--cluster-peer-auth` reaches `required`; at the default/off the wires
+/// still accept plaintext, so the operator must still explicitly accept that with
+/// `--insecure-plaintext-peers`. The secret and the opt-in are COMPLEMENTARY: the secret hardens the peer
+/// wires against outsider forgery, the opt-in acknowledges a bind that may still be plaintext (pre-`required`
+/// or off). Per-node identity + confidentiality remain mTLS #766.
 ///
 /// The peer address is already a resolved `SocketAddr` (from `--cluster-peer` parsing), so no
 /// re-resolution is needed; `is_loopback()` is correctly `false` for the `0.0.0.0` / `::` wildcards. This
@@ -5673,11 +5676,12 @@ fn peer_bind_decision(
         });
     }
     // A non-loopback peer bind requires the explicit `--insecure-plaintext-peers` opt-in. NOTE: a
-    // `--cluster-secret-file` HMAC-authenticates only the raft METADATA peer wire (#1067 Increment 2);
-    // the co-located DATA-PLANE replication wire (ISR / fetch) is still plaintext, so a secret alone
-    // does NOT make a non-loopback bind safe and does NOT satisfy this guard — the operator must still
-    // explicitly accept the plaintext data-plane wire. (Data-plane HMAC is the follow-up increment.) The
-    // secret and the opt-in are therefore COMPLEMENTARY, not mutually exclusive.
+    // `--cluster-secret-file` HMAC-authenticates BOTH the raft METADATA peer wire (#1067 Increment 2) and
+    // the co-located DATA-PLANE replication wire (ISR / fetch; #1067 Increment 3), but only once
+    // `--cluster-peer-auth` reaches `required`; at the default/off a secret alone does NOT make a
+    // non-loopback bind safe and does NOT satisfy this guard — the operator must still explicitly accept a
+    // possibly-plaintext peer wire. The secret and the opt-in are therefore COMPLEMENTARY, not mutually
+    // exclusive.
     if !transport.insecure_plaintext_peers {
         return Err(peer_non_loopback_refusal(self_addr));
     }
@@ -6727,9 +6731,10 @@ fn peer_non_loopback_refusal(addr: std::net::SocketAddr) -> CliError {
          listener on loopback (a single-host deployment), OR — for a multi-host cluster whose peer wire \
          is carried over a mesh / private network / VPN — pass --insecure-plaintext-peers to EXPLICITLY \
          accept a plaintext peer wire (a loud startup warning is emitted). NOTE: --cluster-secret-file \
-         HMAC-hardens only the raft metadata wire against outsider forgery; the DATA-PLANE replication \
-         wire is still plaintext, so a secret does NOT by itself make a non-loopback bind safe and does \
-         NOT replace --insecure-plaintext-peers (data-plane authentication is a follow-up increment)."
+         HMAC-hardens BOTH the raft metadata wire (#1067 Inc 2) and the data-plane replication wire \
+         (#1067 Inc 3) against outsider forgery, but only once --cluster-peer-auth reaches `required`; a \
+         secret alone (default/off) does NOT yet make a non-loopback bind safe and does NOT replace \
+         --insecure-plaintext-peers."
     ))
 }
 
@@ -6993,18 +6998,19 @@ fn cmd_serve(
     // that the cluster peer wire is exposed and forgeable. Inert for single-node / loopback (no optin).
     if let Some(optin) = &peer_bind.plaintext_optin {
         let metadata_note = if transport.cluster_secret_file.is_some() {
-            "The raft METADATA wire IS HMAC-authenticated by --cluster-secret-file against outsider \
-             forgery; the DATA-PLANE wire is not."
+            "Both the raft METADATA wire (#1067 Inc 2) and the cluster DATA-PLANE wire (#1067 Inc 3) are \
+             HMAC-authenticated by --cluster-secret-file against outsider forgery when --cluster-peer-auth \
+             is `signed`/`required` (enforced only at `required`)."
         } else {
             "Both the raft metadata and data-plane wires are plaintext (configure --cluster-secret-file \
-             to HMAC-authenticate the metadata wire)."
+             plus --cluster-peer-auth required to HMAC-authenticate both wires)."
         };
         writeln!(
             out,
-            "WARNING: --insecure-plaintext-peers: the cluster DATA-PLANE peer wire on {} is PLAINTEXT and \
-             unauthenticated (#1067) — a forged replication / ISR frame could drive committed cluster \
-             state or false durability. Protect the peer wire out of band (a mesh / private network / \
-             VPN), or bind it on loopback. {} Data-plane authentication is the #1067 follow-up increment.",
+            "WARNING: --insecure-plaintext-peers: the cluster DATA-PLANE peer wire on {} is PLAINTEXT (#1067) \
+             — a forged replication / ISR frame could drive committed cluster state or false durability \
+             unless the wire is authenticated. Protect the peer wire out of band (a mesh / private network / \
+             VPN), or bind it on loopback. {}",
             optin.addr, metadata_note,
         )?;
     }
@@ -7109,6 +7115,7 @@ fn cmd_serve(
                     data_dir,
                     config,
                     cluster_peer_clients,
+                    &peer_security,
                 )?),
                 None => None,
             };
@@ -8164,6 +8171,7 @@ fn spawn_dataplane_serve(
     data_dir: &Path,
     config: &ServeConfig,
     cluster_peer_clients: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
+    peer_security: &ironbus_server::cluster::PeerSecurity,
 ) -> Result<DataPlaneServeHandle, CliError> {
     // Capture the engine's off-actor read plane NOW, while the engine is still owned here (before it
     // moves into the append actor). It is Arc-backed, so the leader role holds an Arc<ReadPlane> and
@@ -8228,6 +8236,12 @@ fn spawn_dataplane_serve(
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_t = std::sync::Arc::clone(&shutdown);
 
+    // The peer-wire authentication policy (#1067 Inc 3) for the WHOLE data-plane wire: cloned into the
+    // bootstrap thread (it is `'static` + `Send`) and threaded into the data-plane runtime, so the
+    // fetch/replication/ack peer links and the dirty-tier committed-HW confirm all sign/verify under the
+    // same cluster-secret ladder the raft metadata wire uses.
+    let peer_security_t = peer_security.clone();
+
     let bootstrap = std::thread::Builder::new()
         .name("ib-dataplane-bootstrap".to_string())
         .spawn(move || {
@@ -8246,6 +8260,7 @@ fn spawn_dataplane_serve(
                 leader_client_addrs,
                 &client_ack_slot_t,
                 &shutdown_t,
+                &peer_security_t,
             );
         })
         .map_err(|e| CliError::Internal(format!("cannot spawn data-plane bootstrap: {e}")))?;
@@ -8287,6 +8302,7 @@ fn run_dataplane_bootstrap(
     leader_client_addrs: std::collections::BTreeMap<u64, std::net::SocketAddr>,
     client_ack_slot: &ClientAckSlot,
     shutdown: &std::sync::atomic::AtomicBool,
+    peer_security: &ironbus_server::cluster::PeerSecurity,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -8403,6 +8419,8 @@ fn run_dataplane_bootstrap(
         // legitimate led-partition follower fanout, floored at the old constant — a high-fanout leader
         // admits every real follower link while an unauthenticated flood stays bounded.
         None,
+        // #1067 Inc 3: the peer-wire authentication policy for the whole data-plane wire.
+        peer_security,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -22412,6 +22430,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             &data_dir,
             &config,
             &std::collections::BTreeMap::new(),
+            &ironbus_server::cluster::PeerSecurity::disabled(),
         )
         .expect("data plane spawns");
 

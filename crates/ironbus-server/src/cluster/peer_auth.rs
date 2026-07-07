@@ -263,6 +263,93 @@ pub fn open<'a>(key: &PeerKey, body: &'a [u8]) -> Result<&'a [u8], PeerAuthError
     }
 }
 
+// --- #1067 Increment 3: the DATA-plane peer wire ------------------------------------------------
+//
+// The metadata (raft) peer wire is authenticated above; the co-located cluster DATA-plane wire (the
+// replication fetch / ISR-report / epoch / committed-HW verbs multiplexed on `DataPlaneLink`) is a
+// SEPARATE listener. It reuses the SAME [`PeerKey`] / [`PeerSecurity`] / [`PeerAuthMode`] ladder and the
+// SAME hand-rolled [`hmac_sha256`], differing only in (a) a DISTINCT domain label — so one shared cluster
+// secret can never cross-authenticate a raft frame as a data frame or vice-versa — and (b) a
+// STREAMING-MAC seam ([`data_seal_mac`]) that authenticates the up-to-~8 MiB zero-copy `FetchResponse`
+// payload WITHOUT copying it, preserving the leader's single-copy egress fast path (#810/#825).
+
+/// The fixed domain-separation label bound into every DATA-plane peer MAC (#1067 Increment 3),
+/// DISTINCT from [`DOMAIN_LABEL`] (the raft-metadata label) so a key can never be cross-used to
+/// authenticate a raft frame as a data-plane frame or vice-versa — the two co-located peer wires are
+/// cryptographically separated even under one shared cluster secret.
+const DATA_DOMAIN_LABEL: &[u8] = b"ironbus.cluster.peer.data.v1";
+
+/// The fixed byte length of a data-plane authentication HEADER — the `[ver: u8][mac: 32]` that
+/// [`data_seal`] prepends and [`data_open`] strips. The authenticated data-plane content follows it.
+pub const DATA_AUTH_HEADER_LEN: usize = 1 + 32;
+
+/// HMAC-SHA256 over the data-plane domain: `HMAC(key, DATA_DOMAIN_LABEL || [ver] || parts...)`. The
+/// `parts` are STREAMED through the HMAC in order and NEVER copied (`sha2::Sha256::update` reads each
+/// borrowed slice in place), so the up-to-~8 MiB zero-copy `FetchResponse` payload is authenticated by
+/// passing its borrowed slice as a part — no extra payload copy on either seal or open. Because the parts
+/// are streamed, a multi-part call is byte-identical to a single-part call over their concatenation (the
+/// [`tests::multipart_hmac_equals_the_concatenated_single_part`] invariant), so a frame sealed part-wise
+/// via [`data_seal_mac`] verifies against a single contiguous `content` in [`data_open`].
+fn data_hmac(key: &PeerKey, ver: u8, parts: &[&[u8]]) -> [u8; 32] {
+    let ver = [ver];
+    let mut all: Vec<&[u8]> = Vec::with_capacity(2 + parts.len());
+    all.push(DATA_DOMAIN_LABEL);
+    all.push(&ver);
+    all.extend_from_slice(parts);
+    hmac_sha256(&key.0, &all)
+}
+
+/// Compute JUST the data-plane MAC over the authenticated content `parts` (streamed, no copy) — the seam
+/// the zero-copy `FetchResponse` fast path uses. That path materializes the frame body itself (the ONE
+/// payload copy, into the outbound buffer) and then calls this over the BORROWED body slice to fill in the
+/// MAC in place, so the ~8 MiB run is copied exactly once (never for the MAC). The `content_parts` are the
+/// authenticated content `[inner_type][partition][layer_body]`, in order.
+#[must_use]
+pub fn data_seal_mac(key: &PeerKey, content_parts: &[&[u8]]) -> [u8; 32] {
+    data_hmac(key, MAC_VERSION, content_parts)
+}
+
+/// Produce a DATA-plane authentication BODY around already-materialized `content`:
+/// `[ver: u8][mac: 32][content: N]`, where `mac = HMAC-SHA256(key, DATA_DOMAIN_LABEL || ver || content)`.
+/// The generic (small-frame) data-plane encoder wraps its `[inner_type][partition][layer_body]` content
+/// with this; the big `FetchResponse` uses [`data_seal_mac`] instead to avoid materializing `content`
+/// twice. The caller frames this body with the [`DataPlaneAuth`](ironbus_proto::frame::FrameType::DataPlaneAuth)
+/// (tag 51) envelope.
+#[must_use]
+pub fn data_seal(key: &PeerKey, content: &[u8]) -> Vec<u8> {
+    let mac = data_hmac(key, MAC_VERSION, &[content]);
+    let mut out = Vec::with_capacity(DATA_AUTH_HEADER_LEN + content.len());
+    out.push(MAC_VERSION);
+    out.extend_from_slice(&mac);
+    out.extend_from_slice(content);
+    out
+}
+
+/// Verify a DATA-plane authentication BODY and, on success, return the inner authenticated `content`
+/// slice (`[inner_type][partition][layer_body]`) for the caller to parse + bounded-decode. The MAC is
+/// recomputed over the BORROWED content (no copy — the up-to-~8 MiB payload is read in place) and compared
+/// in constant time BEFORE any parse, so an unauthenticated peer never reaches the data-plane decoder.
+///
+/// # Errors
+/// [`PeerAuthError`] if the body is truncated, the MAC version is unsupported, or the MAC does not verify.
+pub fn data_open<'a>(key: &PeerKey, body: &'a [u8]) -> Result<&'a [u8], PeerAuthError> {
+    if body.len() < DATA_AUTH_HEADER_LEN {
+        return Err(PeerAuthError::Truncated);
+    }
+    let ver = body[0];
+    if ver != MAC_VERSION {
+        return Err(PeerAuthError::UnsupportedVersion(ver));
+    }
+    let mac = &body[1..DATA_AUTH_HEADER_LEN];
+    let content = &body[DATA_AUTH_HEADER_LEN..];
+    let expected = data_hmac(key, ver, &[content]);
+    if bool::from(mac.ct_eq(&expected)) {
+        Ok(content)
+    } else {
+        Err(PeerAuthError::MacMismatch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +468,103 @@ mod tests {
         let s = format!("{sec:?}");
         assert!(s.contains("Required") && s.contains("redacted"));
         assert!(!s.contains("top-secret"));
+    }
+
+    // --- #1067 Increment 3: the DATA-plane seal/open + streaming-MAC + domain separation. ---
+
+    #[test]
+    fn data_seal_then_open_round_trips_and_returns_the_exact_content() {
+        let key = PeerKey::from_secret_bytes(b"the-shared-cluster-secret-file-bytes");
+        // content = [inner_type][partition:8][layer body] — arbitrary bytes here.
+        let content = b"\x21\x00\x00\x00\x00\x00\x00\x00\x00some data-plane layer body";
+        let sealed = data_seal(&key, content);
+        assert_eq!(sealed.len(), DATA_AUTH_HEADER_LEN + content.len());
+        assert_eq!(sealed[0], MAC_VERSION);
+        let opened = data_open(&key, &sealed).expect("a freshly sealed data frame verifies");
+        assert_eq!(
+            opened, content,
+            "data_open returns the exact authenticated content"
+        );
+    }
+
+    #[test]
+    fn data_seal_mac_streamed_parts_equal_the_single_part_body_mac() {
+        // The zero-copy fast path streams the content as multiple borrowed parts; it MUST produce the
+        // exact MAC `data_seal`/`data_open` compute over the contiguous content, or a fast-path frame
+        // would fail verification. This is the property that lets the 8 MiB payload be authenticated by
+        // reference (no copy) while still verifying against the received contiguous body.
+        let key = PeerKey::from_secret_bytes(b"cluster-secret");
+        let inner_type = [33u8];
+        let partition = 7u64.to_le_bytes();
+        let header = b"\x10\x00header";
+        let payload = b"verbatim frame bytes (stand-in for the zero-copy run)";
+        let streamed = data_seal_mac(&key, &[&inner_type, &partition, header, payload]);
+        let mut contiguous = Vec::new();
+        contiguous.extend_from_slice(&inner_type);
+        contiguous.extend_from_slice(&partition);
+        contiguous.extend_from_slice(header);
+        contiguous.extend_from_slice(payload);
+        let via_seal = data_seal(&key, &contiguous);
+        assert_eq!(
+            &via_seal[1..DATA_AUTH_HEADER_LEN],
+            &streamed[..],
+            "the streamed multi-part MAC must equal the single-buffer body MAC"
+        );
+        // And a body assembled from the streamed MAC verifies through data_open.
+        let mut body = Vec::new();
+        body.push(MAC_VERSION);
+        body.extend_from_slice(&streamed);
+        body.extend_from_slice(&contiguous);
+        assert_eq!(data_open(&key, &body).expect("verifies"), &contiguous[..]);
+    }
+
+    #[test]
+    fn a_tampered_data_body_fails_verification() {
+        let key = PeerKey::from_secret_bytes(b"secret");
+        let mut sealed = data_seal(&key, b"payload-content");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        assert_eq!(data_open(&key, &sealed), Err(PeerAuthError::MacMismatch));
+    }
+
+    #[test]
+    fn a_data_frame_with_a_different_secret_is_rejected() {
+        let a = PeerKey::from_secret_bytes(b"secret-a");
+        let b = PeerKey::from_secret_bytes(b"secret-b");
+        let sealed = data_seal(&a, b"payload-content");
+        assert_eq!(data_open(&b, &sealed), Err(PeerAuthError::MacMismatch));
+    }
+
+    #[test]
+    fn a_truncated_or_wrong_version_data_body_is_rejected() {
+        let key = PeerKey::from_secret_bytes(b"secret");
+        assert_eq!(data_open(&key, &[]), Err(PeerAuthError::Truncated));
+        assert_eq!(data_open(&key, &[1u8; 10]), Err(PeerAuthError::Truncated));
+        let mut sealed = data_seal(&key, b"payload");
+        sealed[0] = 2;
+        assert_eq!(
+            data_open(&key, &sealed),
+            Err(PeerAuthError::UnsupportedVersion(2))
+        );
+    }
+
+    #[test]
+    fn the_raft_and_data_domains_do_not_cross_authenticate() {
+        // The SAME key seals a raft body and a data body over the SAME bytes; the two MACs differ (the
+        // domain label is bound in), so a raft-sealed frame can never be replayed as a data frame.
+        let key = PeerKey::from_secret_bytes(b"one-cluster-secret");
+        let bytes = b"identical inner bytes";
+        let raft = seal(&key, bytes); // [ver][mac][bytes] under DOMAIN_LABEL
+        let data = data_seal(&key, bytes); // [ver][mac][bytes] under DATA_DOMAIN_LABEL
+        assert_eq!(raft.len(), data.len());
+        assert_ne!(
+            &raft[1..33],
+            &data[1..33],
+            "the raft and data-plane MACs of the same bytes under the same key must differ"
+        );
+        // Cross-open fails: a data body does not verify with the raft `open`, and vice-versa.
+        assert_eq!(open(&key, &data), Err(PeerAuthError::MacMismatch));
+        assert_eq!(data_open(&key, &raft), Err(PeerAuthError::MacMismatch));
     }
 
     #[test]

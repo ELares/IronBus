@@ -359,9 +359,12 @@ the same fail-closed bind invariant applies, enforced pre-listen by
   opt-in; a loud startup WARNING is always emitted.
 
 `--cluster-secret-file` does **not** change this bind decision (see the scope note
-below): it hardens the metadata wire but does not cover the still-plaintext
-data-plane wire, so a non-loopback bind still needs `--insecure-plaintext-peers`.
-The two are **complementary**, not mutually exclusive.
+below): it HMAC-hardens **both** the metadata wire (#1067 Inc 2) and the data-plane
+wire (#1067 Inc 3), but enforcement is only downgrade-proof once
+`--cluster-peer-auth` reaches `required` — at the default/off (or the `permissive`/
+`signed` migration rungs) the wire still accepts plaintext, so a non-loopback bind
+still needs `--insecure-plaintext-peers`. The two are **complementary**, not mutually
+exclusive.
 
 **Interim HMAC peer authentication — the raft METADATA wire.** A cluster-wide
 `--cluster-secret-file` (a file of ≥ 32 random bytes, `head -c 32 /dev/urandom > f`,
@@ -377,13 +380,31 @@ identity is mTLS #766), NOT confidentiality (the raft protobuf is still cleartex
 and NOT anti-replay (raft's own term/index idempotence blunts replay). The HMAC uses
 the pure-Rust RustCrypto `sha2` already in the tree (no new dependency).
 
-**What is NOT authenticated (yet).** Only the raft *metadata* peer wire is signed.
-The co-located **data-plane replication wire** (per-partition ISR / fetch, on the
-same IP at `dataplane_addr`) is still plaintext — a forged `AckReplicated` could
-falsely raise a follower's durability frontier. That is why `--cluster-secret-file`
-does not satisfy a non-loopback bind on its own; the operator still accepts the
-plaintext data-plane wire with `--insecure-plaintext-peers`. Data-plane HMAC
-authentication is the follow-up increment.
+**Interim HMAC peer authentication — the DATA-plane wire (#1067 Inc 3).** The
+co-located **data-plane replication wire** (per-partition ISR / fetch, on the same IP
+at `dataplane_addr`) is now signed by the **same** `--cluster-secret-file` key under
+the **same** rollout ladder. Every data-plane peer verb (`FetchRecords`,
+`FetchResponse`, `AckReplicated`, `OffsetForLeaderEpoch`, `CommittedHwQuery`) rides a
+distinct `DataPlaneAuth` wire frame that HMAC-SHA256-signs the verb tag, partition,
+and layer body under a domain label **distinct** from `RaftAuth` (so one key can
+never cross-authenticate the two wires). Under `required` a forged or unsigned
+`AckReplicated` is rejected fail-closed, so an outsider can no longer falsely raise a
+follower's durability frontier. The MAC is streamed over the (up to ~8 MiB) zero-copy
+`FetchResponse` run without copying it, so authentication adds no bulk-payload copy.
+
+**What is still NOT covered.** Like the metadata wire, the data-plane HMAC is
+cluster-membership origin authentication + per-frame integrity ONLY: it is **not**
+per-node identity (one symmetric key — a compromised secret-holder can still forge
+`from`, granting an insider nothing new that raft's voter-trust does not already),
+**not** confidentiality (frames are still cleartext), and **not** anti-replay (a
+captured valid frame can be re-injected; raft term/index idempotence and the ISR's
+monotonic frontier blunt it, but there is no per-connection nonce yet — the `ver`
+byte leaves room for a future MAC version to add one). Per-node identity +
+confidentiality + anti-replay is native mTLS on the peer wire, #766. Enforcement is
+also only downgrade-proof at `--cluster-peer-auth required`; the pre-`required` rungs
+still accept plaintext, which is why `--cluster-secret-file` alone does not satisfy a
+non-loopback bind (the operator accepts a possibly-plaintext wire with
+`--insecure-plaintext-peers` until the fleet reaches `required`).
 
 **Rollout ladder (`--cluster-peer-auth off|permissive|signed|required`).** A
 frame-format change cannot be flipped on a live cluster at once — a node that both
@@ -406,8 +427,8 @@ to `required`. Skipping straight to `required` on a running cluster splits quoru
 
 **Key rotation** follows the same `permissive→signed→required` dance, which means an
 already-`required` (authenticated) cluster transits `permissive` — a transient window
-in which every node again *sends plaintext* and *accepts unsigned* frames, i.e. the
-metadata wire's origin authentication is OFF for the duration. Rotate over a trusted /
+in which every node again *sends plaintext* and *accepts unsigned* frames, i.e. both
+peer wires' origin authentication is OFF for the duration. Rotate over a trusted /
 private segment and keep the window short; the auth-preserving alternative is a full
 cluster stop-and-restart onto the new secret (a brief availability trade for no
 plaintext window). The `permissive`/`signed` rungs emit a startup WARNING so a
@@ -426,7 +447,7 @@ clusters and are not covered by `--insecure-plaintext-peers` — today they ride
 client-wire opt-in, so enabling `--insecure-plaintext-wire` also exposes that
 cross-cluster append endpoint, and hardening it is a follow-up alongside the
 leaf/federation auth work (#766); and (b) cryptographic **peer authenticity**
-itself (the interim HMAC, #1067 Increment 2, and ultimately mTLS #766). This
+itself (the interim HMAC, #1067 Increments 2–3, and ultimately mTLS #766). This
 increment closes the "silently plaintext, unguarded non-loopback peer bind" hole;
 it does not yet make a peer's claimed identity trustworthy.
 

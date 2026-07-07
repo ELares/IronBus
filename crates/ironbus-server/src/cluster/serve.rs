@@ -126,6 +126,7 @@ use super::divergence::{
     suspect_uncommitted_tail, ContentReconcile,
 };
 use super::isr::IsrConfig;
+use super::peer_auth::{self, PeerAuthError, PeerKey, PeerSecurity};
 use super::replication::{
     FetchRecordsBody, FetchResponseBody, OffsetForLeaderEpochBody, ReplicationError,
 };
@@ -150,6 +151,15 @@ pub const MAX_DATAPLANE_FRAME_BYTES: u32 = 12 * 1024 * 1024;
 /// on the wire, so one peer link can multiplex the data frames of every partition this node holds.
 const PARTITION_PREFIX_LEN: usize = 8;
 
+/// The fixed byte overhead a signed [`FrameType::DataPlaneAuth`] frame body adds over a plain data-plane
+/// frame body (#1067 Increment 3): the `[ver: 1][mac: 32]` auth header
+/// ([`peer_auth::DATA_AUTH_HEADER_LEN`]) plus the re-embedded `inner_type: 1` verb tag — the outer
+/// envelope tag is now `DataPlaneAuth`, so the real verb travels INSIDE the authenticated content. The
+/// inbound frame-size cap is RAISED by this so a signed frame carrying a max-size data body still fits.
+/// (Value: [`peer_auth::DATA_AUTH_HEADER_LEN`] (= 33) + 1; kept in lock-step by the `const` assertion.)
+const DATAPLANE_AUTH_OVERHEAD: u32 = 1 + 32 + 1;
+const _: () = assert!(DATAPLANE_AUTH_OVERHEAD as usize == peer_auth::DATA_AUTH_HEADER_LEN + 1);
+
 /// A typed error from the data-plane peer wire: every failure mode of framing / decoding an untrusted
 /// data-plane frame. Like [`PeerWireError`](super::transport::PeerWireError) the transport ALWAYS
 /// surfaces one of these rather than panicking or over-allocating, so a hostile peer is contained to a
@@ -171,6 +181,18 @@ pub enum DataPlaneWireError {
     Decode(DataPlaneError),
     /// An underlying IO error reading from / writing to the peer connection.
     Io(io::Error),
+    /// A plain (unsigned) data-plane frame arrived on a link whose peer-auth mode REQUIRES a signed
+    /// [`FrameType::DataPlaneAuth`] frame (#1067) — a downgrade, rejected fail-closed rather than
+    /// accepted unauthenticated. The DATA-plane twin of [`PeerWireError::MacMissing`](super::transport::PeerWireError::MacMissing).
+    MacMissing,
+    /// A signed [`FrameType::DataPlaneAuth`] frame arrived on a link with NO key configured or whose mode
+    /// does not verify authed frames (`Off`) — an unexpected type on this link (#1067). The DATA-plane
+    /// twin of the C1 transport's unexpected-`RaftAuth`-on-a-keyless-link rejection.
+    UnexpectedAuthFrame,
+    /// A signed [`FrameType::DataPlaneAuth`] frame failed peer authentication (bad/absent MAC, unsupported
+    /// MAC version, or a truncated auth header) — forged, tampered, or signed with a different cluster
+    /// secret (#1067).
+    Auth(PeerAuthError),
 }
 
 impl core::fmt::Display for DataPlaneWireError {
@@ -186,6 +208,15 @@ impl core::fmt::Display for DataPlaneWireError {
             }
             DataPlaneWireError::Decode(e) => write!(f, "data-plane frame decode error: {e}"),
             DataPlaneWireError::Io(e) => write!(f, "data-plane link IO error: {e}"),
+            DataPlaneWireError::MacMissing => write!(
+                f,
+                "peer sent an unsigned data-plane frame but this link requires signed (authenticated) frames; rejected as a downgrade"
+            ),
+            DataPlaneWireError::UnexpectedAuthFrame => write!(
+                f,
+                "peer sent a signed data-plane frame on a link with no peer-auth key configured; rejected as an unexpected type"
+            ),
+            DataPlaneWireError::Auth(e) => write!(f, "data-plane frame authentication failed: {e}"),
         }
     }
 }
@@ -196,6 +227,7 @@ impl std::error::Error for DataPlaneWireError {
             DataPlaneWireError::Frame(e) => Some(e),
             DataPlaneWireError::Decode(e) => Some(e),
             DataPlaneWireError::Io(e) => Some(e),
+            DataPlaneWireError::Auth(e) => Some(e),
             _ => None,
         }
     }
@@ -311,6 +343,110 @@ fn encode_fetch_response_peer_frame(
     Ok(out)
 }
 
+/// Encode one `(partition, frame)` under the peer-authentication policy `security` (#1067 Increment 3):
+/// SIGN it (emit a [`FrameType::DataPlaneAuth`] frame) when `security.mode` signs AND a key is present;
+/// otherwise fall back to the plaintext [`encode_dataplane_peer_frame`] (byte-for-byte today's wire).
+///
+/// # Errors
+/// As [`encode_dataplane_peer_frame`].
+pub fn encode_dataplane_peer_frame_secured(
+    partition: u64,
+    frame: &DataPlaneFrame,
+    security: &PeerSecurity,
+) -> Result<Vec<u8>, DataPlaneWireError> {
+    match (security.mode.sends_authed(), security.key.as_ref()) {
+        (true, Some(key)) => encode_dataplane_peer_frame_authed(partition, frame, key),
+        _ => encode_dataplane_peer_frame(partition, frame),
+    }
+}
+
+/// Encode one `(partition, frame)` as an HMAC-AUTHENTICATED [`FrameType::DataPlaneAuth`] frame (#1067):
+/// `[len][51][ver][mac:32][inner_type][partition-le][layer body]`, where the MAC covers
+/// `inner_type || partition || layer body` under the data-plane domain. The big `FetchResponse` takes the
+/// zero-copy path ([`encode_fetch_response_peer_frame_authed`]); every other (small) verb is sealed
+/// generically. The recovered `(inner_type, partition, layer body)` on the receiver is BYTE-IDENTICAL to a
+/// plaintext frame's, so it runs the identical bounded [`decode_dataplane_frame`].
+fn encode_dataplane_peer_frame_authed(
+    partition: u64,
+    frame: &DataPlaneFrame,
+    key: &PeerKey,
+) -> Result<Vec<u8>, DataPlaneWireError> {
+    // Zero-copy fast path for the big (up to 8 MiB) FETCH RESPONSE: authenticate the borrowed run without
+    // copying it (the MAC is streamed over the outbound buffer in place).
+    if let DataPlaneFrame::FetchResponse(resp) = frame {
+        return encode_fetch_response_peer_frame_authed(partition, resp, key);
+    }
+    // content = [inner_type: 1][partition: 8][layer body] — the authenticated bytes.
+    let layer_body = encode_dataplane_body(frame);
+    let mut content = Vec::with_capacity(1 + PARTITION_PREFIX_LEN + layer_body.len());
+    content.push(frame_type_for(frame).as_u8());
+    content.extend_from_slice(&partition.to_le_bytes());
+    content.extend_from_slice(&layer_body);
+    let body = peer_auth::data_seal(key, &content);
+    if body.len() as u64 > u64::from(MAX_DATAPLANE_FRAME_BYTES) {
+        return Err(DataPlaneWireError::Oversized {
+            len: body.len() as u64,
+        });
+    }
+    let mut out = Vec::with_capacity(body.len() + 5);
+    encode_frame(FrameType::DataPlaneAuth, &body, &mut out).map_err(|e| match e {
+        FrameError::FrameTooLarge { len } => DataPlaneWireError::Oversized { len },
+        e @ FrameError::EmptyFrame => DataPlaneWireError::Frame(e),
+    })?;
+    Ok(out)
+}
+
+/// Frame one FETCH RESPONSE directly into its final signed `[len][51][ver][mac:32][inner_type][partition-le]
+/// [layer body]` buffer, authenticating the (up to 8 MiB) zero-copy `frame_bytes` run WITHOUT copying it
+/// (#1067 Increment 3, preserving the #825 single-copy egress). The run is materialized into the outbound
+/// buffer EXACTLY ONCE (via [`FetchResponseBody::encode_into`]); the MAC is then computed by STREAMING the
+/// already-written content slice — no second copy of the payload — and written back into the reserved MAC
+/// slot. The resulting bytes verify against a receiver's [`peer_auth::data_open`] over the contiguous body.
+///
+/// # Errors
+/// [`DataPlaneWireError::Oversized`] if the signed body exceeds [`MAX_DATAPLANE_FRAME_BYTES`] or the framed
+/// length would exceed [`MAX_FRAME_LEN`].
+fn encode_fetch_response_peer_frame_authed(
+    partition: u64,
+    resp: &FetchResponseBody,
+    key: &PeerKey,
+) -> Result<Vec<u8>, DataPlaneWireError> {
+    // content = [inner_type: 1][partition: 8][fetch header + verbatim frame bytes].
+    let content_len = 1 + PARTITION_PREFIX_LEN + resp.encoded_len();
+    // body = [ver: 1][mac: 32] + content.
+    let body_len = peer_auth::DATA_AUTH_HEADER_LEN + content_len;
+    if body_len as u64 > u64::from(MAX_DATAPLANE_FRAME_BYTES) {
+        return Err(DataPlaneWireError::Oversized {
+            len: body_len as u64,
+        });
+    }
+    let frame_len = 1u64 + body_len as u64; // type byte + body
+    let Some(frame_len) = u32::try_from(frame_len)
+        .ok()
+        .filter(|&l| l <= MAX_FRAME_LEN)
+    else {
+        return Err(DataPlaneWireError::Oversized { len: frame_len });
+    };
+    let mut out = Vec::with_capacity(5 + body_len);
+    out.extend_from_slice(&frame_len.to_le_bytes());
+    out.push(FrameType::DataPlaneAuth.as_u8());
+    out.push(peer_auth::MAC_VERSION);
+    // Reserve the MAC slot; it is filled in AFTER the content is materialized (so the payload is copied
+    // exactly once — for the write, never for the MAC).
+    let mac_at = out.len();
+    out.extend_from_slice(&[0u8; 32]);
+    let content_at = out.len();
+    out.push(FrameType::FetchResponse.as_u8());
+    out.extend_from_slice(&partition.to_le_bytes());
+    // The SINGLE copy of the (up to 8 MiB) run into the outbound buffer.
+    resp.encode_into(&mut out);
+    // Compute the MAC over the content IN PLACE (a borrowed slice of the buffer — no extra copy) and write
+    // it into the reserved slot. The immutable borrow ends before the mutable write below.
+    let mac = peer_auth::data_seal_mac(key, &[&out[content_at..]]);
+    out[mac_at..mac_at + 32].copy_from_slice(&mac);
+    Ok(out)
+}
+
 /// Decode ONE untrusted data-plane peer FRAME (the full `[len][type][partition-le][body]` envelope for
 /// exactly one frame) into a `(partition, DataPlaneFrame)`, applying every bound: the size cap (the
 /// length prefix is checked against [`MAX_DATAPLANE_FRAME_BYTES`] before the body is taken), the
@@ -352,6 +488,89 @@ pub fn decode_dataplane_peer_frame(
     }
 }
 
+/// Decode one untrusted data-plane peer FRAME under the peer-authentication policy `security` (#1067
+/// Increment 3). Extends [`decode_dataplane_peer_frame`] with the [`FrameType::DataPlaneAuth`] path and the
+/// rollout ladder's accept rules (the DATA-plane twin of
+/// [`decode_peer_frame_secured`](super::transport::decode_peer_frame_secured)):
+///
+/// - a plain data verb frame is accepted only if `security.mode.accepts_plain()` (every mode but
+///   `Required`); under `Required` it is a [`DataPlaneWireError::MacMissing`] downgrade rejection;
+/// - a signed `DataPlaneAuth` (51) frame is verified — the MAC recomputed and compared in constant time,
+///   BEFORE any body parse, so an unauthenticated peer never reaches the layer decoder — only if a key is
+///   present and `security.mode.accepts_authed()`; otherwise it is [`DataPlaneWireError::UnexpectedAuthFrame`].
+///
+/// In both cases the recovered `(inner_type, partition, layer_body)` runs the identical bounded
+/// [`decode_dataplane_frame`].
+///
+/// # Errors
+/// See [`DataPlaneWireError`]: oversized/malformed frame, missing prefix, undecodable body, plus
+/// [`DataPlaneWireError::MacMissing`] (downgrade), [`DataPlaneWireError::UnexpectedAuthFrame`], and
+/// [`DataPlaneWireError::Auth`] (verification failure).
+pub fn decode_dataplane_peer_frame_secured(
+    input: &[u8],
+    security: &PeerSecurity,
+) -> Result<Option<(u64, DataPlaneFrame, usize)>, DataPlaneWireError> {
+    // The cap is the plain data cap RAISED by the auth envelope overhead (ver + mac + re-embedded verb
+    // tag), so a max-size data body inside a signed frame still fits; kept <= the absolute envelope cap.
+    let cap = MAX_DATAPLANE_FRAME_BYTES
+        .saturating_add(DATAPLANE_AUTH_OVERHEAD)
+        .min(MAX_FRAME_LEN);
+    match decode_frame_with_cap(input, cap) {
+        Ok(FrameDecode::Frame {
+            type_tag,
+            body,
+            consumed,
+        }) => {
+            // A signed `DataPlaneAuth` (51) frame verifies then re-embeds its verb tag; any other tag is a
+            // plain data verb frame (rejected as a downgrade under `Required`).
+            let (inner_type, partition, layer_body): (u8, u64, &[u8]) =
+                if let Some(FrameType::DataPlaneAuth) = FrameType::from_u8(type_tag) {
+                    // Accept a signed frame only when a key is configured AND the mode verifies authed
+                    // frames (any mode above `Off`); otherwise it is an unexpected type on this link.
+                    let (Some(key), true) = (security.key.as_ref(), security.mode.accepts_authed())
+                    else {
+                        return Err(DataPlaneWireError::UnexpectedAuthFrame);
+                    };
+                    // VERIFY before parse: strip+check ver/mac; `content` is [inner_type][partition][layer].
+                    let content =
+                        peer_auth::data_open(key, body).map_err(DataPlaneWireError::Auth)?;
+                    if content.len() < 1 + PARTITION_PREFIX_LEN {
+                        return Err(DataPlaneWireError::MissingPartitionPrefix);
+                    }
+                    let it = content[0];
+                    let mut p = [0u8; PARTITION_PREFIX_LEN];
+                    p.copy_from_slice(&content[1..=PARTITION_PREFIX_LEN]);
+                    (
+                        it,
+                        u64::from_le_bytes(p),
+                        &content[1 + PARTITION_PREFIX_LEN..],
+                    )
+                } else {
+                    // A plain data verb frame. Under `Required` an unsigned frame is a downgrade attempt.
+                    if !security.mode.accepts_plain() {
+                        return Err(DataPlaneWireError::MacMissing);
+                    }
+                    if body.len() < PARTITION_PREFIX_LEN {
+                        return Err(DataPlaneWireError::MissingPartitionPrefix);
+                    }
+                    let mut p = [0u8; PARTITION_PREFIX_LEN];
+                    p.copy_from_slice(&body[..PARTITION_PREFIX_LEN]);
+                    (
+                        type_tag,
+                        u64::from_le_bytes(p),
+                        &body[PARTITION_PREFIX_LEN..],
+                    )
+                };
+            let frame = decode_dataplane_frame(inner_type, layer_body)
+                .map_err(DataPlaneWireError::Decode)?;
+            Ok(Some((partition, frame, consumed)))
+        }
+        Ok(FrameDecode::Incomplete { .. }) => Ok(None),
+        Err(FrameError::FrameTooLarge { len }) => Err(DataPlaneWireError::Oversized { len }),
+        Err(other) => Err(DataPlaneWireError::Frame(other)),
+    }
+}
+
 /// A bidirectional DATA-plane peer link over any byte stream (`Read + Write`): a real `TcpStream` in
 /// production, an in-memory pipe in tests. Frames outbound `(partition, frame)` with [`send`] and
 /// reads bounded inbound ones with [`recv`], applying every bound in this module on the receive path.
@@ -365,18 +584,32 @@ pub struct DataPlaneLink<S> {
     stream: S,
     /// Accumulated, not-yet-consumed inbound bytes (a partial frame may straddle reads).
     inbuf: Vec<u8>,
+    /// The peer-authentication policy (#1067 Increment 3): governs whether `send` SIGNs (emits a
+    /// [`FrameType::DataPlaneAuth`] frame) and how `recv` verifies / enforces the rollout-ladder accept
+    /// rules (rejecting a downgrade under `Required`). [`PeerSecurity::disabled`] is today's plaintext wire.
+    security: PeerSecurity,
 }
 
 impl<S: Read + Write> DataPlaneLink<S> {
-    /// Wrap a byte stream as a data-plane peer link.
+    /// Wrap a byte stream as a PLAINTEXT data-plane peer link (no peer authentication) — today's behavior.
     pub fn new(stream: S) -> Self {
+        Self::with_security(stream, PeerSecurity::disabled())
+    }
+
+    /// Wrap a byte stream as a data-plane peer link with an explicit peer-authentication policy (#1067):
+    /// `send` SIGNs when `security.mode` signs and a key is configured, and `recv` verifies signed frames
+    /// and enforces the accept rules (rejecting a downgrade under `Required`).
+    pub fn with_security(stream: S, security: PeerSecurity) -> Self {
         Self {
             stream,
             inbuf: Vec::new(),
+            security,
         }
     }
 
-    /// Serialize and send one outbound `(partition, frame)` to the peer.
+    /// Serialize and send one outbound `(partition, frame)` to the peer, signing it (emitting a
+    /// [`FrameType::DataPlaneAuth`] frame) when the link's peer-auth mode signs and a key is configured;
+    /// otherwise sending a plain data-plane frame.
     ///
     /// # Errors
     /// Returns [`DataPlaneWireError::Oversized`] / [`DataPlaneWireError::Frame`] if the frame cannot be
@@ -386,7 +619,7 @@ impl<S: Read + Write> DataPlaneLink<S> {
         partition: u64,
         frame: &DataPlaneFrame,
     ) -> Result<(), DataPlaneWireError> {
-        let bytes = encode_dataplane_peer_frame(partition, frame)?;
+        let bytes = encode_dataplane_peer_frame_secured(partition, frame, &self.security)?;
         self.stream.write_all(&bytes)?;
         Ok(())
     }
@@ -402,7 +635,9 @@ impl<S: Read + Write> DataPlaneLink<S> {
     pub fn recv(&mut self) -> Result<Option<(u64, DataPlaneFrame)>, DataPlaneWireError> {
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
-            if let Some((partition, frame, consumed)) = decode_dataplane_peer_frame(&self.inbuf)? {
+            if let Some((partition, frame, consumed)) =
+                decode_dataplane_peer_frame_secured(&self.inbuf, &self.security)?
+            {
                 self.inbuf.drain(..consumed);
                 return Ok(Some((partition, frame)));
             }
@@ -457,6 +692,7 @@ pub fn query_leader_committed_hw(
     leader_data_addr: SocketAddr,
     partition: u64,
     timeout: Duration,
+    security: &PeerSecurity,
 ) -> Option<u64> {
     let stream = TcpStream::connect_timeout(&leader_data_addr, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
@@ -464,7 +700,9 @@ pub fn query_leader_committed_hw(
     // Disable Nagle (#1028): this is a single tiny query frame awaiting a tiny response — the exact
     // shape Nagle + delayed-ACK penalizes. Best-effort (latency-only), so it never fails the query.
     crate::server::set_nodelay_best_effort(&stream);
-    let mut link = DataPlaneLink::new(stream);
+    // #1067 Inc 3: sign the query / verify the response under the cluster peer-auth policy, so a
+    // `Required` leader accepts this confirm (a plain frame would be rejected as a downgrade).
+    let mut link = DataPlaneLink::with_security(stream, security.clone());
     link.send(
         partition,
         &DataPlaneFrame::CommittedHwQuery(super::dataplane::CommittedHwQueryBody),
@@ -995,8 +1233,16 @@ where
         peer_data_addrs: &BTreeMap<u64, SocketAddr>,
     ) -> io::Result<Self> {
         // No client gate and no configured reader cap: the inbound-reader cap defaults to the legitimate
-        // led-partition fanout, floored at the old constant (#915).
-        Self::start_inner(server, self_data_addr, peer_data_addrs, None, None)
+        // led-partition fanout, floored at the old constant (#915). No peer security (plaintext data wire —
+        // today's behavior); the CLI path threads a real policy via `start_with_client_gate_aware`.
+        Self::start_inner(
+            server,
+            self_data_addr,
+            peer_data_addrs,
+            None,
+            None,
+            &PeerSecurity::disabled(),
+        )
     }
 
     /// Like [`Self::start`], but BUILDS a shared CLIENT produce-ack
@@ -1035,8 +1281,9 @@ where
                 confirm_timeout: None,
             }),
             // No configured reader cap: default to the legitimate led-partition fanout, floored at the
-            // old constant (#915).
+            // old constant (#915). No peer security (plaintext data wire).
             None,
+            &PeerSecurity::disabled(),
         )
     }
 
@@ -1057,6 +1304,12 @@ where
     ///
     /// # Panics
     /// As [`Self::start`].
+    ///
+    /// `security` is the peer-wire [`PeerSecurity`] policy (#1067 Increment 3): it is threaded into the
+    /// leader-side inbound reader links, every follower fetch link, and the dirty-tier committed-HW confirm
+    /// link, so the WHOLE data-plane peer wire signs/verifies under the same cluster-secret ladder the raft
+    /// metadata wire uses. [`PeerSecurity::disabled`] is the plaintext default.
+    #[allow(clippy::too_many_arguments)] // the #735/#739/#1067 serve wiring genuinely needs each input
     pub fn start_with_client_gate_aware(
         server: DataPlaneServer<F, C>,
         self_data_addr: SocketAddr,
@@ -1065,6 +1318,7 @@ where
         leader_client_addrs: BTreeMap<u64, SocketAddr>,
         status: Arc<Mutex<super::runtime::ClusterStatus>>,
         dataplane_reader_cap: Option<usize>,
+        security: &PeerSecurity,
     ) -> io::Result<Self> {
         Self::start_inner(
             server,
@@ -1081,6 +1335,7 @@ where
                 confirm_timeout: None,
             }),
             dataplane_reader_cap,
+            security,
         )
     }
 
@@ -1096,6 +1351,7 @@ where
         peer_data_addrs: &BTreeMap<u64, SocketAddr>,
         client_cfg: Option<ClientGateConfig>,
         dataplane_reader_cap: Option<usize>,
+        security: &PeerSecurity,
     ) -> io::Result<Self> {
         // Bind the data-plane peer listener BEFORE spawning anything, so a bind failure is synchronous
         // (no half-started runtime). Non-blocking so the accept loop polls the shutdown flag.
@@ -1128,7 +1384,11 @@ where
             let mut gate =
                 super::client_ack::ClientAckGate::new(Arc::clone(&server), cfg.configured_level)
                     .with_leader_client_addrs(cfg.leader_client_addrs)
-                    .with_leader_data_addrs(cfg.leader_data_addrs);
+                    .with_leader_data_addrs(cfg.leader_data_addrs)
+                    // #1067 Inc 3: the dirty-tier committed-HW confirm dials a peer data-plane link, so it
+                    // must sign/verify under the same policy as the rest of the data wire (else a
+                    // `Required` leader would reject the plain confirm as a downgrade).
+                    .with_peer_security(security.clone());
             if let Some(status) = cfg.status {
                 gate = gate.with_status_handle(status);
             }
@@ -1152,6 +1412,10 @@ where
         // constant, operator-overridable) and refuses any link beyond it rather than spawning an
         // unbounded number of threads under a cluster-network flood.
         let active_readers = Arc::new(AtomicUsize::new(0));
+        // The peer-auth policy (#1067 Inc 3) for every inbound reader link this listener spawns: it VERIFIES
+        // inbound frames and SIGNs the responses it writes back. Cloned into the listener (the key is an
+        // `Arc`, so this is cheap).
+        let security_l = security.clone();
         let listener_handle = std::thread::Builder::new()
             .name("ib-dataplane-listen".to_string())
             .spawn(move || {
@@ -1162,6 +1426,7 @@ where
                     shutdown_l,
                     dataplane_reader_cap,
                     active_readers,
+                    security_l,
                 );
             })
             .expect("spawn data-plane listener thread");
@@ -1184,6 +1449,9 @@ where
             let server_f = Arc::clone(&server);
             let status_f = follower_status.clone();
             let divergence_f = Arc::clone(&follower_divergence);
+            // The peer-auth policy (#1067 Inc 3) for this follower's dial link: it SIGNs the fetch requests /
+            // reports it sends and VERIFIES the leader's responses. Cloned per follower thread.
+            let security_f = security.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("ib-dataplane-fetch-{partition}"))
                 .spawn(move || {
@@ -1194,6 +1462,7 @@ where
                         &shutdown_f,
                         status_f.as_ref(),
                         &divergence_f,
+                        security_f,
                     );
                 })
                 .expect("spawn data-plane follower fetch thread");
@@ -1272,6 +1541,7 @@ fn run_dataplane_listener<F, C>(
     shutdown: Arc<AtomicBool>,
     max_readers: usize,
     active_readers: Arc<AtomicUsize>,
+    security: PeerSecurity,
 ) where
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
@@ -1326,6 +1596,9 @@ fn run_dataplane_listener<F, C>(
                 let server = Arc::clone(&server);
                 let release = release.clone();
                 let sd = Arc::clone(&shutdown);
+                // The peer-auth policy (#1067 Inc 3) for this accepted inbound link: VERIFY inbound frames,
+                // SIGN the responses written back. Cloned per link (the key is an `Arc`).
+                let link_security = security.clone();
                 // Reserve the reader slot BEFORE spawning; the guard, moved into the reader, releases it
                 // on the reader's exit (return OR panic unwind), so the count can never leak. A spawn
                 // FAILURE drops the closure (and so the guard), releasing the slot automatically.
@@ -1337,7 +1610,12 @@ fn run_dataplane_listener<F, C>(
                     .name("ib-dataplane-read".to_string())
                     .spawn(move || {
                         let _slot = slot;
-                        run_dataplane_reader(DataPlaneLink::new(stream), &server, &release, &sd);
+                        run_dataplane_reader(
+                            DataPlaneLink::with_security(stream, link_security),
+                            &server,
+                            &release,
+                            &sd,
+                        );
                     });
                 // The OS may refuse thread creation (EAGAIN/ENOMEM): the failed closure is dropped,
                 // which releases the reserved reader slot (`slot`'s drop) and closes the stream.
@@ -1554,6 +1832,7 @@ fn run_follower_fetch<F, C>(
     shutdown: &AtomicBool,
     status: Option<&Arc<Mutex<ClusterStatus>>>,
     divergence: &FollowerDivergenceMetrics,
+    security: PeerSecurity,
 ) where
     F: Filesystem + Send + Sync + 'static,
     C: Clock + Send + 'static,
@@ -1574,7 +1853,9 @@ fn run_follower_fetch<F, C>(
                 // fetch request that must reach the leader before the (possibly large) response can
                 // start, so a Nagle-delayed request stalls the whole round. Best-effort (latency-only).
                 crate::server::set_nodelay_best_effort(&stream);
-                let mut link = DataPlaneLink::new(stream);
+                // #1067 Inc 3: SIGN the fetch/report frames this follower sends and VERIFY the leader's
+                // responses, under the cluster peer-auth policy (cheap `Arc` key clone per reconnect).
+                let mut link = DataPlaneLink::with_security(stream, security.clone());
                 follower_fetch_loop(
                     partition,
                     &mut link,
@@ -3483,6 +3764,231 @@ mod tests {
         }
     }
 
+    // --- #1067 Increment 3: the interim HMAC-authenticated DATA-plane peer wire (DataPlaneAuth / the
+    //     rollout ladder), the DATA-plane twin of the transport::PeerLink tests. ---
+
+    fn keyed(mode: peer_auth::PeerAuthMode, secret: &[u8]) -> PeerSecurity {
+        PeerSecurity {
+            key: Some(std::sync::Arc::new(PeerKey::from_secret_bytes(secret))),
+            mode,
+        }
+    }
+
+    fn sample_fetch_request() -> DataPlaneFrame {
+        DataPlaneFrame::FetchRequest(FetchRecordsBody {
+            from_offset: 7,
+            max_records: 8,
+            max_bytes: 4096,
+        })
+    }
+
+    fn sample_fetch_response(run_len: usize) -> FetchResponseBody {
+        let payload: Vec<u8> = (0..run_len)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        FetchResponseBody {
+            high_watermark: 987_654_321,
+            first_offset: 42,
+            record_count: 9,
+            frame_bytes: bytes::Bytes::from(payload),
+        }
+    }
+
+    #[test]
+    fn a_signed_dataplane_frame_verifies_and_round_trips() {
+        let frame = sample_fetch_request();
+        let secret = b"cluster-secret";
+        let wire = encode_dataplane_peer_frame_secured(
+            5,
+            &frame,
+            &keyed(peer_auth::PeerAuthMode::Required, secret),
+        )
+        .expect("sign");
+        // The frame carries the DataPlaneAuth type tag (51), not the plain verb tag.
+        assert_eq!(wire[4], FrameType::DataPlaneAuth.as_u8());
+        let (got_p, got_frame, consumed) = decode_dataplane_peer_frame_secured(
+            &wire,
+            &keyed(peer_auth::PeerAuthMode::Required, secret),
+        )
+        .expect("decode ok")
+        .expect("a complete frame");
+        assert_eq!(consumed, wire.len());
+        assert_eq!(got_p, 5, "partition round-trips through the signed frame");
+        assert_eq!(got_frame, frame, "the signed round-trip is byte-faithful");
+    }
+
+    #[test]
+    fn a_signed_fetch_response_zero_copy_path_round_trips_and_is_byte_identical_to_the_generic_seal(
+    ) {
+        // THE FORK PROOF (#1067 Inc 3): the up-to-8-MiB FetchResponse is authenticated by STREAMING the
+        // borrowed run (no extra payload copy). Prove for empty / tiny / multi-MiB runs that (a) the signed
+        // fast-path frame is byte-IDENTICAL to a naive materialize-then-`data_seal` reference, and (b) it
+        // verifies + round-trips back to the same frame.
+        let secret = b"cluster-secret";
+        let sec = keyed(peer_auth::PeerAuthMode::Required, secret);
+        let key = PeerKey::from_secret_bytes(secret);
+        for run_len in [0usize, 5, 1024, 3 * 1024 * 1024] {
+            let resp = sample_fetch_response(run_len);
+            let partition = 3u64;
+            let fast = encode_dataplane_peer_frame_secured(
+                partition,
+                &DataPlaneFrame::FetchResponse(resp.clone()),
+                &sec,
+            )
+            .expect("fast-path signs");
+
+            // Reference: content = [inner_type=33][partition-le][resp.encode()]; body = data_seal(content);
+            // frame = encode_frame(DataPlaneAuth, body). This materializes the run twice — the naive path.
+            let mut content = vec![FrameType::FetchResponse.as_u8()];
+            content.extend_from_slice(&partition.to_le_bytes());
+            content.extend_from_slice(&resp.encode());
+            let body = peer_auth::data_seal(&key, &content);
+            let mut reference = Vec::new();
+            proto_encode_frame(FrameType::DataPlaneAuth, &body, &mut reference).expect("frames");
+
+            assert_eq!(
+                fast, reference,
+                "the zero-copy signed FetchResponse must be byte-identical to the generic seal (run_len={run_len})"
+            );
+
+            let (got_p, got_frame, consumed) = decode_dataplane_peer_frame_secured(&fast, &sec)
+                .expect("decode ok")
+                .expect("a complete frame");
+            assert_eq!(consumed, fast.len());
+            assert_eq!(got_p, partition);
+            assert_eq!(
+                got_frame,
+                DataPlaneFrame::FetchResponse(resp),
+                "the signed FetchResponse round-trips byte-faithful (run_len={run_len})"
+            );
+        }
+    }
+
+    #[test]
+    fn data_plane_link_send_signs_when_the_mode_signs() {
+        let mut link = DataPlaneLink::with_security(
+            io::Cursor::new(Vec::new()),
+            keyed(peer_auth::PeerAuthMode::Signed, b"s"),
+        );
+        link.send(2, &sample_fetch_request()).expect("sign+send");
+        let wire = link.stream.into_inner();
+        assert_eq!(
+            wire[4],
+            FrameType::DataPlaneAuth.as_u8(),
+            "a signing mode emits a DataPlaneAuth frame"
+        );
+    }
+
+    #[test]
+    fn signed_round_trip_over_an_in_memory_data_plane_link() {
+        let frame = sample_fetch_request();
+        let wire = encode_dataplane_peer_frame_secured(
+            9,
+            &frame,
+            &keyed(peer_auth::PeerAuthMode::Required, b"cluster-secret"),
+        )
+        .expect("sign");
+        let mut link = DataPlaneLink::with_security(
+            io::Cursor::new(wire),
+            keyed(peer_auth::PeerAuthMode::Required, b"cluster-secret"),
+        );
+        let (got_p, got_frame) = link.recv().expect("recv ok").expect("a message");
+        assert_eq!(got_p, 9);
+        assert_eq!(got_frame, frame);
+    }
+
+    #[test]
+    fn required_mode_rejects_a_plain_dataplane_frame_as_a_downgrade() {
+        let plain = encode_dataplane_peer_frame(2, &sample_fetch_request()).expect("encode");
+        let sec = keyed(peer_auth::PeerAuthMode::Required, b"s");
+        let err = decode_dataplane_peer_frame_secured(&plain, &sec).unwrap_err();
+        assert!(
+            matches!(err, DataPlaneWireError::MacMissing),
+            "an unsigned data frame under Required is a downgrade rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn permissive_mode_accepts_both_plain_and_signed_dataplane_frames() {
+        let frame = sample_fetch_request();
+        let sec = keyed(peer_auth::PeerAuthMode::Permissive, b"s");
+        let plain = encode_dataplane_peer_frame(2, &frame).expect("encode");
+        assert!(
+            decode_dataplane_peer_frame_secured(&plain, &sec)
+                .unwrap()
+                .is_some(),
+            "permissive accepts a plain frame (a laggard peer)"
+        );
+        let signed = encode_dataplane_peer_frame_secured(
+            2,
+            &frame,
+            &keyed(peer_auth::PeerAuthMode::Signed, b"s"),
+        )
+        .expect("sign");
+        assert!(
+            decode_dataplane_peer_frame_secured(&signed, &sec)
+                .unwrap()
+                .is_some(),
+            "permissive also verifies a signed frame"
+        );
+    }
+
+    #[test]
+    fn a_dataplane_frame_signed_with_a_different_secret_is_rejected() {
+        let signed = encode_dataplane_peer_frame_secured(
+            2,
+            &sample_fetch_request(),
+            &keyed(peer_auth::PeerAuthMode::Required, b"secret-a"),
+        )
+        .expect("sign");
+        let sec = keyed(peer_auth::PeerAuthMode::Required, b"secret-b");
+        let err = decode_dataplane_peer_frame_secured(&signed, &sec).unwrap_err();
+        assert!(
+            matches!(err, DataPlaneWireError::Auth(_)),
+            "a mismatched-secret MAC fails authentication, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_off_keyless_link_rejects_a_dataplane_auth_frame_as_unexpected() {
+        let signed = encode_dataplane_peer_frame_secured(
+            2,
+            &sample_fetch_request(),
+            &keyed(peer_auth::PeerAuthMode::Required, b"s"),
+        )
+        .expect("sign");
+        // The Off default: no key, does not accept authed frames.
+        let err =
+            decode_dataplane_peer_frame_secured(&signed, &PeerSecurity::disabled()).unwrap_err();
+        assert!(
+            matches!(err, DataPlaneWireError::UnexpectedAuthFrame),
+            "an off/keyless link treats a DataPlaneAuth frame as an unexpected type, got {err:?}"
+        );
+        // The plaintext `decode_dataplane_peer_frame` likewise does not know tag 51 as a data verb.
+        assert!(decode_dataplane_peer_frame(&signed).is_err());
+    }
+
+    #[test]
+    fn a_tampered_signed_dataplane_frame_fails_verification() {
+        let sec = keyed(peer_auth::PeerAuthMode::Required, b"s");
+        // Tamper in the AUTHENTICATED payload of a signed FetchResponse (flip the last byte of the run).
+        let mut signed = encode_dataplane_peer_frame_secured(
+            1,
+            &DataPlaneFrame::FetchResponse(sample_fetch_response(64)),
+            &sec,
+        )
+        .expect("sign");
+        let last = signed.len() - 1;
+        signed[last] ^= 0x01;
+        assert!(
+            matches!(
+                decode_dataplane_peer_frame_secured(&signed, &sec),
+                Err(DataPlaneWireError::Auth(_))
+            ),
+            "a tampered signed frame must fail authentication"
+        );
+    }
+
     // ============================================================================================
     //  THE CAPSTONE: a 3-node SERVE cluster over REAL loopback sockets replicates produced data +
     //  quorum-gates a C2-fsync produce. The leader log is shared with the leader's DataPlaneServer;
@@ -4570,6 +5076,7 @@ mod tests {
                         shutdown,
                         cap,
                         active,
+                        PeerSecurity::disabled(),
                     );
                 }
             })
@@ -5730,6 +6237,7 @@ mod live_runtime_tests {
             advertise.clone(),
             Arc::clone(&leader_status),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("leader runtime with client gate");
         let leader_gate = leader_rt
@@ -5766,6 +6274,7 @@ mod live_runtime_tests {
             advertise.clone(),
             Arc::clone(&f_status),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("follower runtime with client gate");
         let follower_gate = f_rt
@@ -5808,6 +6317,7 @@ mod live_runtime_tests {
             BTreeMap::new(), // EMPTY advertise map (the hintless baseline)
             Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("follower runtime, empty advertise");
         let hintless_gate = f_rt2
@@ -5929,6 +6439,7 @@ mod live_runtime_tests {
             BTreeMap::new(),
             Arc::clone(&leader_status),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("leader runtime");
 
@@ -5962,6 +6473,7 @@ mod live_runtime_tests {
             BTreeMap::new(),
             Arc::clone(&f_status),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("follower runtime with client gate");
         let gate = f_rt
@@ -6095,6 +6607,7 @@ mod live_runtime_tests {
             BTreeMap::new(),
             Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("leader runtime");
 
@@ -6123,6 +6636,7 @@ mod live_runtime_tests {
             BTreeMap::new(),
             Arc::clone(&f_status),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("follower runtime");
         let gate = f_rt.client_gate().cloned().expect("client gate");
@@ -6213,6 +6727,7 @@ mod live_runtime_tests {
             BTreeMap::new(),
             Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("leader runtime");
 
@@ -6241,6 +6756,7 @@ mod live_runtime_tests {
             BTreeMap::new(),
             Arc::clone(&f_status),
             None,
+            &PeerSecurity::disabled(),
         )
         .expect("follower runtime");
         let gate = f_rt.client_gate().cloned().expect("client gate");
