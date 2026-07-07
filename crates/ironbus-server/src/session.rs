@@ -12656,7 +12656,7 @@ mod tests {
         // OFF engages NO wait, so this returns after only the poll round-trips. A generous ceiling keeps
         // the assertion robust on a loaded/coarse-timer CI runner (Windows) while still catching a hang.
         assert!(
-            elapsed < std::time::Duration::from_millis(1_000),
+            elapsed < std::time::Duration::from_secs(1),
             "long-poll OFF must return promptly (no wait), took {elapsed:?}"
         );
         drop(s);
