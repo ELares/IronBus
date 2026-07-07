@@ -339,6 +339,57 @@ already on the box, and local tooling and the same-host CLI (#15) must work with
 zero configuration. The moment the bind is non-loopback, the section 2.2 matrix
 applies with no further exception.
 
+### 2.5 The cluster peer wire: the same invariant, an interim opt-in (#1067)
+
+The client wire is not the only listener a broker opens. A clustered broker
+(`--cluster-id` + `--cluster-peer`) also binds a **peer wire** — the raft metadata
+and data-plane replication listeners that carry consensus frames between nodes.
+That wire is plaintext today, and until interim HMAC peer authentication lands it
+authenticates a peer only by its *claimed* node id (`PeerRegistry`), which is
+trivially spoofable: anyone who can reach a peer port could forge raft/ISR frames
+and drive committed cluster state. So the same fail-closed bind invariant applies,
+enforced pre-listen by `peer_bind_decision`, the twin of §2.2/§2.3:
+
+- **Single-node** (no cluster flags) → no peer listener is bound; the guard is
+  inert (byte-for-byte the standalone broker).
+- **Loopback peer bind** (`127.0.0.0/8` / `::1`) → ALLOWED silently: the trust
+  boundary is the host (dev, CI, a single-host or loopback-harness cluster).
+- **Non-loopback peer bind, no opt-in** → REFUSED before the listener opens. Bind
+  the peer wire on loopback (a single host, or a mesh / private network / VPN that
+  carries the peer traffic), or pass the explicit opt-in.
+- **Non-loopback peer bind, `--insecure-plaintext-peers`** → ALLOWED as an
+  explicit opt-in; a loud startup WARNING is always emitted.
+- **`--cluster-secret-file` set** → REFUSED (reserved): the shared-secret HMAC peer
+  authentication is a follow-up increment, so a configured secret cannot yet
+  authenticate the peer wire and must never imply that it does.
+
+One deliberate divergence from the client wire (§2.4): the client plaintext opt-in
+*also* requires an auth identity, but the peer wire has no per-peer auth table
+today, so `--insecure-plaintext-peers` grants a plaintext **and unauthenticated**
+peer wire. That residual is closed by the interim shared-secret HMAC increment
+(#1067) — which makes a peer's claimed id cryptographically trustworthy — and,
+ultimately, by mTLS on the peer wire (#766). The HMAC layer un-reserves
+`--cluster-secret-file`, at which point a configured secret becomes the secure
+satisfier of a non-loopback peer bind (as a `--tls-cert` pair is for the client
+wire), and `--insecure-plaintext-peers` is no longer required.
+
+**Scope of this guard.** "Peer wire" here means the **intra-cluster** listeners
+that carry raft consensus and per-partition ISR data-plane replication between the
+members of one cluster (`--cluster-id` / `--cluster-peer`, #717/#718). The guard is
+enforced at the **CLI boundary** (`ironbus serve`), pre-listen; the server crate's
+`ClusterRuntime::start` / `DataPlaneRuntime::start` do not themselves enforce it, so
+a library embedder that opens a peer listener without the CLI must apply its own
+bind policy. Two wires are explicitly **out of this increment's scope** and tracked
+separately: (a) the **cross-cluster serve** / leaf-hub / federation listeners
+(bound at `--addr` + 2, #738/#766), which carry `LeafPush` appends between distinct
+clusters and are not covered by `--insecure-plaintext-peers` — today they ride the
+client-wire opt-in, so enabling `--insecure-plaintext-wire` also exposes that
+cross-cluster append endpoint, and hardening it is a follow-up alongside the
+leaf/federation auth work (#766); and (b) cryptographic **peer authenticity**
+itself (the interim HMAC, #1067 Increment 2, and ultimately mTLS #766). This
+increment closes the "silently plaintext, unguarded non-loopback peer bind" hole;
+it does not yet make a peer's claimed identity trustworthy.
+
 ---
 
 ## 3. Pre-authentication DoS defenses
