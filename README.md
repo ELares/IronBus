@@ -585,12 +585,15 @@ for _, m := range res.Messages {
 A real multi-node cluster ships today, behind two flags — and it degrades to the zero-config single node at n=1:
 
 ```sh
+# Generate a cluster secret ONCE and copy it byte-identically to every node (chmod 0600):
+#   head -c 32 /dev/urandom > /etc/ironbus/cluster.secret
 # on each of three nodes (adjust --cluster-id and the addresses):
-# The peer wire is plaintext and not yet cryptographically peer-authenticated (#1067), so a
-# NON-loopback peer bind requires the explicit --insecure-plaintext-peers opt-in (carry the peer
-# traffic on a private network / VPN, or drop the flag once mTLS peer auth lands). A loopback
-# cluster needs no flag.
-ironbus serve --data-dir /var/lib/ironbus --cluster-id 1 --insecure-plaintext-peers \
+# --cluster-secret-file HMAC-authenticates the raft METADATA peer wire (#1067; mode defaults to
+# `required` — signs + rejects unsigned). The co-located data-plane replication wire is still
+# plaintext, so a NON-loopback cluster also passes --insecure-plaintext-peers to explicitly accept
+# that (a private network / VPN should carry the peer traffic). A loopback cluster needs neither flag.
+ironbus serve --data-dir /var/lib/ironbus --cluster-id 1 \
+  --cluster-secret-file /etc/ironbus/cluster.secret --insecure-plaintext-peers \
   --cluster-peer 1=10.0.0.1:7900 --cluster-peer 2=10.0.0.2:7900 --cluster-peer 3=10.0.0.3:7900
 ```
 

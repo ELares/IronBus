@@ -497,6 +497,16 @@ pub enum FrameType {
     /// byte-for-byte unchanged. Body: a [`crate::message::TxnListenBody`] (`body_version: u8`,
     /// `field_len: u16` over a `group` u16-length name).
     TxnListen,
+    /// **Interim HMAC peer authentication (#1067).** An HMAC-authenticated raft peer frame: the
+    /// shared-secret integrity + origin-auth envelope around a [`FrameType::Raft`] (27) body. Wire body:
+    /// `[ver: u8 = 1][mac: 32 bytes][raft_pb: N]`, where `mac = HMAC-SHA256(cluster-secret-derived key,
+    /// DOMAIN_LABEL || ver || raft_pb)` and `raft_pb` is BYTE-IDENTICAL to the tag-27 body (the `ver`+`mac`
+    /// are stripped by framing and never reach the protobuf decoder). Structurally DISTINCT from `Raft`,
+    /// so a downgrade (a plain 27 where a signed 50 is required) is a tag check, and an un-upgraded /
+    /// no-key receiver rejects tag 50 as an unexpected type rather than mis-feeding MAC bytes to the
+    /// decoder. A NEW append-only tag; tags 1-49 are byte-for-byte unchanged. Framing/verify live in
+    /// `ironbus_server::cluster::{transport, peer_auth}`.
+    RaftAuth,
 }
 
 impl FrameType {
@@ -553,6 +563,7 @@ impl FrameType {
             FrameType::TxnCheck => 47,
             FrameType::TxnCheckResult => 48,
             FrameType::TxnListen => 49,
+            FrameType::RaftAuth => 50,
         }
     }
 
@@ -611,6 +622,7 @@ impl FrameType {
             47 => FrameType::TxnCheck,
             48 => FrameType::TxnCheckResult,
             49 => FrameType::TxnListen,
+            50 => FrameType::RaftAuth,
             _ => return None,
         })
     }
@@ -743,7 +755,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 46] = [
+    const ALL_TYPES: [FrameType; 50] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -790,6 +802,10 @@ mod tests {
         FrameType::TxnPrepare,
         FrameType::TxnCommit,
         FrameType::TxnRollback,
+        FrameType::TxnCheck,
+        FrameType::TxnCheckResult,
+        FrameType::TxnListen,
+        FrameType::RaftAuth,
     ];
 
     #[test]
@@ -857,6 +873,7 @@ mod tests {
         assert_eq!(FrameType::TxnCheck.as_u8(), 47);
         assert_eq!(FrameType::TxnCheckResult.as_u8(), 48);
         assert_eq!(FrameType::TxnListen.as_u8(), 49);
+        assert_eq!(FrameType::RaftAuth.as_u8(), 50);
     }
 
     #[test]
@@ -877,8 +894,8 @@ mod tests {
         // (#625, V2-C7-I3); 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read
         // dirty-tier CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs
         // TxnPrepare/TxnCommit/TxnRollback (#640, V2-M8); 47-49 are the back-check verbs
-        // TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is now the next-free (still unknown) tag, so it
-        // frames but is not known.
+        // TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is the RaftAuth interim-peer-auth tag
+        // (#1067); 51 is now the next-free (still unknown) tag, so it frames but is not known.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -895,7 +912,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
         assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
-        assert_eq!(FrameType::from_u8(50), None);
+        assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
+        assert_eq!(FrameType::from_u8(51), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -940,8 +958,8 @@ mod tests {
         // (#611); 40 is the cross-cluster MirrorPull (#623); 41 is the edge leaf-spoke LeafPush (#625);
         // 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read dirty-tier
         // CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs (#640); 47-48
-        // are the back-check verbs TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is the
-        // next-free (still unknown) tag.
+        // are the back-check verbs TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is the RaftAuth
+        // interim-peer-auth tag (#1067); 51 is the next-free (still unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -958,7 +976,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
         assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
-        assert_eq!(FrameType::from_u8(50), None);
+        assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
+        assert_eq!(FrameType::from_u8(51), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -1005,7 +1024,7 @@ mod tests {
         // TxnRollback (46) take the next FREE tags after the follower-read CommittedHwQuery confirm
         // (43). Pinned here so a future reorder breaks a test, not a deployed protocol. They are
         // ADDITIVE: tags 1-43 are byte-for-byte unchanged, and a non-transactional client never sends
-        // them; 47-49 are the back-check verbs (#640 part 2), 50 is the next-free (still unknown) tag.
+        // them; 47-49 are the back-check verbs (#640 part 2), 50 is the RaftAuth peer-auth tag (#1067), 51 is the next-free (still unknown) tag.
         assert_eq!(FrameType::TxnPrepare.as_u8(), 44);
         assert_eq!(FrameType::TxnCommit.as_u8(), 45);
         assert_eq!(FrameType::TxnRollback.as_u8(), 46);
@@ -1037,7 +1056,7 @@ mod tests {
         // registration) take the next FREE tags after the part-1 transactional half-message verbs
         // (44-46). Pinned here so a future reorder breaks a test, not a deployed protocol. They are
         // ADDITIVE: tags 1-46 are byte-for-byte unchanged, and a client that never registers a
-        // transaction-state listener never sees or sends them; 50 is the next-free (still unknown) tag,
+        // transaction-state listener never sees or sends them; 50 is the RaftAuth peer-auth tag (#1067), 51 is the next-free (still unknown) tag,
         // so it frames but is not a known type.
         assert_eq!(FrameType::TxnCheck.as_u8(), 47);
         assert_eq!(FrameType::TxnCheckResult.as_u8(), 48);
@@ -1045,7 +1064,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
         assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
-        assert_eq!(FrameType::from_u8(50), None);
+        assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
+        assert_eq!(FrameType::from_u8(51), None);
         for ty in [
             FrameType::TxnCheck,
             FrameType::TxnCheckResult,
@@ -1121,7 +1141,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
         assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
-        assert_eq!(FrameType::from_u8(50), None);
+        assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
+        assert_eq!(FrameType::from_u8(51), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -1170,7 +1191,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(47), Some(FrameType::TxnCheck));
         assert_eq!(FrameType::from_u8(48), Some(FrameType::TxnCheckResult));
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
-        assert_eq!(FrameType::from_u8(50), None);
+        assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
+        assert_eq!(FrameType::from_u8(51), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -1365,7 +1387,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 50u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 51u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

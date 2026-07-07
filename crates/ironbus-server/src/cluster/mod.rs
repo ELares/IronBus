@@ -275,6 +275,7 @@ pub mod leaf;
 pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
+pub mod peer_auth;
 pub mod placement;
 pub mod read_consistency;
 pub mod replication;
@@ -322,6 +323,7 @@ pub use leaf::{
 pub use membership::{LearnerCatchup, MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
+pub use peer_auth::{PeerAuthError, PeerAuthMode, PeerKey, PeerSecurity};
 pub use placement::{
     decide_placement, placement_command, placement_node_from, reassign_leadership, FailoverOutcome,
     PlacementOutcome,
@@ -348,8 +350,9 @@ pub use serve::{
 pub use serve_accept::{CrossClusterServeConfig, CrossClusterServeRuntime};
 pub use state_machine::{DecodeError, MetadataCommand, MetadataStateMachine, NodeRole, Placement};
 pub use transport::{
-    decode_peer_frame, decode_raft_message, encode_raft_message, PeerLink, PeerRegistry,
-    PeerWireError, MAX_RAFT_MSG_BYTES, RAFT_DECODE_RECURSION_LIMIT,
+    decode_peer_frame, decode_peer_frame_secured, decode_raft_message, encode_raft_message,
+    encode_raft_message_authed, PeerLink, PeerRegistry, PeerWireError, MAX_RAFT_MSG_BYTES,
+    RAFT_DECODE_RECURSION_LIMIT,
 };
 
 /// A process-wide SERIAL guard shared by the HEAVY multi-node cluster tests across the `runtime` and

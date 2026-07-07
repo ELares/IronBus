@@ -83,6 +83,11 @@ toml = "0.5"
 # neither spawns the signal thread nor pulls the dependency.
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+# Zeroizing wrapper for the raw cluster-secret-file bytes read at serve (#1067), so the secret is wiped
+# on scope exit rather than lingering in a plain Vec. Unix-only (serve/`load_peer_security` is Unix-only).
+# `alloc` gives `Zeroize for Vec<u8>` (so `Zeroizing<Vec<u8>>` works); already in the lock via
+# ironbus-server, pinned to the same version (the added feature is additive, no lock churn).
+zeroize = { version = "=1.8.2", default-features = false, features = ["alloc"] }
 # The single-broker data-dir lock (#89) calls `flock(2)` directly for an exclusive advisory lock on
 # the data dir's `LOCK` file, so a second `serve` on one data dir fails fast instead of corrupting
 # the log with concurrent writers. `libc` is already in the tree (pulled by `signal-hook`) and on the
