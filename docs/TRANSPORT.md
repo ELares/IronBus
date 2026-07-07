@@ -28,9 +28,12 @@ specified separately in #106.
 >   flag — that build links no TLS stack, so a cert cannot encrypt and must never
 >   imply encryption. (Refused on any bind, even loopback.) Rebuild `--features
 >   tls`, terminate TLS upstream, or pass `--insecure-plaintext-wire`.
-> - **`--tls-client-ca` (mTLS) is REFUSED on EVERY build** until the mTLS increment
->   (#766) verifies client certificates — honoring it now would imply mutual
->   authentication IronBus does not yet perform.
+> - **`--features tls` build, `--tls-client-ca` (mTLS): HONORED** alongside
+>   `--tls-cert` + `--tls-key`. The broker then REQUIRES a client certificate,
+>   verifies it against the client-CA during the handshake (before any `Connect`),
+>   and maps its SAN to an auth identity (a verified client cert authenticates on
+>   its own). A client-CA WITHOUT the server cert+key is incomplete material and is
+>   REFUSED. On a non-`tls` build `--tls-client-ca` is REFUSED (no TLS stack).
 > - **A non-loopback `--addr` with no TLS and no opt-in is REFUSED** (no silent
 >   plaintext): use TLS, bind loopback + terminate TLS upstream, or pass
 >   `--insecure-plaintext-wire`.
@@ -46,10 +49,11 @@ specified separately in #106.
 > window where an unprotected non-loopback socket accepts a connection. The
 > connection-scoped auth model and the three-scope authorization (#631,
 > [AUTHENTICATION.md](AUTHENTICATION.md)) ship with it (bearer/password verify on
-> audited pure-Rust RustCrypto primitives). What REMAINS flagged: **mTLS**
-> (`--tls-client-ca` client-certificate verification → identity mapping) and
-> **client-side TLS** (the IronBus CLI/SDK verifying and connecting to a TLS broker,
-> #957) are the next TLS increments; the crypto-provider supply-chain decision that
+> audited pure-Rust RustCrypto primitives). Server TLS AND mTLS (client-certificate
+> verification → SAN identity mapping) now both ship behind `--features tls`. What
+> REMAINS flagged: **client-side TLS** (the IronBus CLI/SDK verifying and connecting
+> to a TLS broker, and presenting a client cert for mTLS, #957) is the next TLS
+> increment; the crypto-provider supply-chain decision that
 > once blocked all of this is RESOLVED (aws-lc-rs behind the `tls` feature,
 > ADR-0004, a documented `deny.toml` C-FFI exception like `zstd-sys`; the default
 > and `edge-min` builds stay byte-for-byte pure-Rust). The

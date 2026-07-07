@@ -2054,10 +2054,16 @@ impl TransportSecurityFlags {
     // `#[cfg(any(unix, test))]` / `#[cfg(unix)]` (serve is unix-only via StdFs), so gate the method
     // to match — otherwise it is dead_code on a Windows non-test binary build (-D warnings).
     #[cfg(any(unix, test))]
+    // Under `--features tls` every `--tls-*` is honored, so the body is just `None` and `self` is
+    // unused — that is correct, not a smell (the non-tls build DOES read `self`).
+    #[cfg_attr(feature = "tls", allow(clippy::unused_self))]
     fn reserved_tls_flag(&self) -> Option<&'static str> {
-        // On a NON-tls build a `--tls-cert`/`--tls-key` cannot encrypt, so it stays reserved (a
-        // fail-closed refusal). Behind `--features tls` those are HONORED (loaded at serve), so they
-        // are NOT reserved — only the resolved-value env path reaches here, and it too is honored.
+        // On a NON-tls build no `--tls-*` value can be honored (there is no TLS stack), so every one is
+        // RESERVED — a fail-closed refusal, since a cert/CA must never imply encryption or mutual auth
+        // this build cannot deliver. Behind `--features tls` ALL of `--tls-cert`/`--tls-key` (server
+        // TLS) and `--tls-client-ca` (mTLS) are HONORED (loaded at serve), so none is reserved;
+        // completeness — a client-CA, or a lone half, still requires the cert+key pair — is enforced by
+        // `wire_bind_decision`, not here.
         #[cfg(not(feature = "tls"))]
         {
             if self.tls_cert.is_some() {
@@ -2066,11 +2072,9 @@ impl TransportSecurityFlags {
             if self.tls_key.is_some() {
                 return Some("--tls-key");
             }
-        }
-        // `--tls-client-ca` (mTLS) is reserved on EVERY build until the mTLS increment (#766) verifies
-        // client certificates: honoring it now would imply mutual authentication this build does not do.
-        if self.tls_client_ca.is_some() {
-            return Some("--tls-client-ca");
+            if self.tls_client_ca.is_some() {
+                return Some("--tls-client-ca");
+            }
         }
         None
     }
@@ -2861,9 +2865,20 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                     return Err(reserved_tls_flag_refusal("--tls-key"));
                 }
             }
+            // `--tls-client-ca` (the mTLS client-CA trust anchor): HONORED behind `--features tls`
+            // (ADR-0004 increment 3) — stored and loaded into the mTLS server config at serve, requiring
+            // a verified client certificate. On a NON-tls build it stays RESERVED (no TLS stack).
             "--tls-client-ca" => {
-                let _ = take_value("--tls-client-ca", args, &mut i)?;
-                return Err(reserved_tls_flag_refusal("--tls-client-ca"));
+                let value = take_value("--tls-client-ca", args, &mut i)?;
+                #[cfg(feature = "tls")]
+                {
+                    f.tls_client_ca = Some(value);
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = value;
+                    return Err(reserved_tls_flag_refusal("--tls-client-ca"));
+                }
             }
             "--auth-config" => f.auth_config = Some(take_value("--auth-config", args, &mut i)?),
             // The EXPLICIT, loud plaintext-wire opt-in (#629). A bare boolean flag (no value): advance
@@ -5457,12 +5472,16 @@ fn wire_bind_decision(
     }
     // Native TLS (ADR-0004, #766): behind `--features tls`, a `--tls-cert` + `--tls-key` pair means
     // the wire is ENCRYPTED (TLS 1.3), so a non-loopback bind is safe with NO `--insecure-plaintext-wire`
-    // opt-in — the transport itself provides confidentiality. Both halves are REQUIRED; one alone is
-    // incomplete TLS material and is refused fail-closed. The address is still resolved (the listener
-    // binds it later). On a non-tls build `tls_cert`/`tls_key` are always `None` (reserved above), so
-    // this branch is inert and the plaintext matrix below is byte-for-byte unchanged.
+    // opt-in — the transport itself provides confidentiality. `--tls-client-ca` additionally requires a
+    // verified client cert (mTLS). The server cert+key pair is REQUIRED for any of the three; a lone
+    // half, or a client-CA without the pair, is incomplete TLS material and is refused fail-closed. The
+    // address is still resolved (the listener binds it later). On a non-tls build all three are always
+    // `None` (reserved above), so this branch is inert and the plaintext matrix below is unchanged.
     #[cfg(feature = "tls")]
-    if transport.tls_cert.is_some() || transport.tls_key.is_some() {
+    if transport.tls_cert.is_some()
+        || transport.tls_key.is_some()
+        || transport.tls_client_ca.is_some()
+    {
         if transport.tls_cert.is_none() || transport.tls_key.is_none() {
             return Err(tls_incomplete_material_refusal());
         }
@@ -5785,12 +5804,29 @@ fn load_tls_termination(
                 "refusing to start: --tls-key `{key_path}` could not be read ({e})"
             ))
         })?;
-        let config =
+        // mTLS (ADR-0004 increment 3, #766): with `--tls-client-ca` the server config additionally
+        // REQUIRES + verifies a client certificate chained to the client-CA (a verified cert's SAN then
+        // maps to an auth identity). Without it, server-authentication-only TLS. The client-CA is a
+        // public trust anchor (not a secret), so it is not StrictModes-checked.
+        let config = if let Some(client_ca_path) = &transport.tls_client_ca {
+            let client_ca_pem = std::fs::read(client_ca_path).map_err(|e| {
+                CliError::Usage(format!(
+                    "refusing to start: --tls-client-ca `{client_ca_path}` could not be read ({e})"
+                ))
+            })?;
+            ironbus_server::tls::server_config_mtls_from_pem(&cert_pem, &key_pem, &client_ca_pem)
+                .map_err(|e| {
+                    CliError::Usage(format!(
+                        "refusing to start: the TLS/mTLS material is not usable: {e}"
+                    ))
+                })?
+        } else {
             ironbus_server::tls::server_config_from_pem(&cert_pem, &key_pem).map_err(|e| {
                 CliError::Usage(format!(
                     "refusing to start: the TLS certificate/key are not usable: {e}"
                 ))
-            })?;
+            })?
+        };
         Ok(ironbus_server::server::TlsTermination::with_config(
             std::sync::Arc::new(config),
         ))
@@ -6460,38 +6496,33 @@ fn toml_string(value: &str) -> String {
 /// binary with `cfg(test)=false`, so an `any(unix, test)` gate would vanish on a Windows non-test
 /// build while its ungated caller remained → E0425. It uses no unix API (pure error string).
 fn reserved_tls_flag_refusal(flag: &str) -> CliError {
-    if flag == "--tls-client-ca" {
-        // mTLS (client-certificate verification) is the next TLS increment (#766). Server TLS ships
-        // today behind `--features tls` via --tls-cert/--tls-key; honoring a client-CA now would imply
-        // mutual authentication this build does not yet verify, so it is refused fail-closed.
-        return CliError::Usage(format!(
-            "{flag} (mTLS client-certificate verification) is not yet honored: mutual-TLS identity \
-             verification is the flagged follow-up (#766). Server TLS IS available today with \
-             --tls-cert + --tls-key on a `--features tls` build; mTLS lands in a later increment. Do \
-             not pass {flag} expecting client-certificate authentication yet."
-        ));
-    }
-    // A --tls-cert/--tls-key on a build compiled WITHOUT the `tls` feature: there is no TLS stack, so a
-    // cert cannot encrypt the wire — accepting it would falsely imply encryption (#107, ADR-0004).
+    // Reached only on a build compiled WITHOUT the `tls` feature (behind `--features tls` every
+    // `--tls-*` flag is honored, so `reserved_tls_flag` returns `None` and this is never called). Such
+    // a build links no TLS stack, so a cert/CA cannot encrypt the wire or verify a client — accepting
+    // one would falsely imply protection that is not delivered (#107, ADR-0004).
     CliError::Usage(format!(
         "{flag} is not honored in this build: it was compiled WITHOUT the `tls` feature, so it links \
-         no TLS stack and a cert CANNOT encrypt the wire — accepting it would falsely imply encryption \
-         that is not delivered. Rebuild with `--features tls` to terminate TLS 1.3 in the broker, or \
-         bind a loopback address and terminate TLS upstream (mesh / proxy / VPN), or pass \
-         --insecure-plaintext-wire to explicitly accept a plaintext wire WITH auth."
+         no TLS stack — a cert cannot encrypt the wire and a client-CA cannot verify a client. \
+         Accepting one would falsely imply protection that is not delivered. Rebuild with `--features \
+         tls` to terminate TLS 1.3 / mTLS in the broker, or bind a loopback address and terminate TLS \
+         upstream (mesh / proxy / VPN), or pass --insecure-plaintext-wire to explicitly accept a \
+         plaintext wire WITH auth."
     ))
 }
 
-/// Refusal for incomplete server-TLS material (ADR-0004, #766): exactly one of `--tls-cert` /
-/// `--tls-key` was given. Terminating TLS needs both, so the broker refuses to start rather than fall
-/// back to a plaintext bind the operator's `--tls-*` flag implied would be encrypted.
+/// Refusal for incomplete TLS material (ADR-0004, #766): `--tls-cert` and `--tls-key` are BOTH
+/// required to terminate TLS — a lone half, or a `--tls-client-ca` (mTLS) without the server cert+key,
+/// cannot serve TLS. The broker refuses to start rather than fall back to a plaintext bind the
+/// operator's `--tls-*` flag implied would be encrypted.
 #[cfg(feature = "tls")]
 fn tls_incomplete_material_refusal() -> CliError {
     CliError::Usage(
         "incomplete TLS material: server TLS requires BOTH --tls-cert (the certificate chain) AND \
-         --tls-key (the private key); one without the other cannot terminate TLS. The broker refuses \
-         to start rather than silently bind plaintext where --tls-* implied encryption. Provide both, \
-         or neither (for a loopback / --insecure-plaintext-wire bind)."
+         --tls-key (the private key); mTLS additionally takes --tls-client-ca, but a client-CA without \
+         the server cert+key (or a lone cert/key) cannot terminate TLS. The broker refuses to start \
+         rather than silently bind plaintext where --tls-* implied encryption. Provide --tls-cert + \
+         --tls-key (optionally with --tls-client-ca for mTLS), or none (for a loopback / \
+         --insecure-plaintext-wire bind)."
             .to_string(),
     )
 }
@@ -19236,14 +19267,14 @@ mod tests {
         assert!(wire_bind_decision("127.0.0.1:7777", &loopback_cert).is_err());
     }
 
-    /// Behind `--features tls`, server TLS material is HONORED (ADR-0004, #766): a `--tls-cert` +
-    /// `--tls-key` pair encrypts the wire, so a non-loopback bind is allowed with NO
-    /// `--insecure-plaintext-wire` opt-in and no separate auth identity (the transport is confidential).
-    /// Incomplete material is refused fail-closed; `--tls-client-ca` (mTLS) stays reserved until the
-    /// mTLS increment.
+    /// Behind `--features tls`, TLS material is HONORED (ADR-0004, #766): a `--tls-cert` + `--tls-key`
+    /// pair encrypts the wire, so a non-loopback bind is allowed with NO `--insecure-plaintext-wire`
+    /// opt-in and no separate auth identity (the transport is confidential). `--tls-client-ca` adds mTLS
+    /// on top and is likewise allowed WITH the pair. Any incomplete material — a lone half, or a
+    /// client-CA without the pair — is refused fail-closed.
     #[cfg(feature = "tls")]
     #[test]
-    fn tls_material_enables_a_non_loopback_bind_and_incomplete_or_mtls_is_refused() {
+    fn tls_material_enables_a_non_loopback_bind_and_incomplete_material_is_refused() {
         // A complete cert+key pair: a non-loopback bind is allowed WITHOUT the plaintext opt-in.
         let full = ts(Some("/c.pem"), Some("/k.pem"), None, None, false);
         let d = wire_bind_decision("0.0.0.0:7777", &full).expect("a TLS bind is allowed");
@@ -19253,20 +19284,21 @@ mod tests {
         );
         // Loopback TLS is fine too.
         assert!(wire_bind_decision("127.0.0.1:7777", &full).is_ok());
-        // Incomplete material (exactly one of the pair) is refused fail-closed.
-        assert!(
-            wire_bind_decision("0.0.0.0:7777", &ts(Some("/c.pem"), None, None, None, false))
-                .is_err()
-        );
-        assert!(
-            wire_bind_decision("0.0.0.0:7777", &ts(None, Some("/k.pem"), None, None, false))
-                .is_err()
-        );
-        // `--tls-client-ca` (mTLS) is still reserved until the mTLS increment, checked before the pair.
-        let ca = ts(Some("/c.pem"), Some("/k.pem"), Some("/ca.pem"), None, false);
-        match wire_bind_decision("0.0.0.0:7777", &ca).unwrap_err() {
-            CliError::Usage(m) => assert!(m.contains("--tls-client-ca"), "names client-ca: {m}"),
-            other => panic!("expected Usage, got {other:?}"),
+        // mTLS: cert + key + client-CA is a valid (encrypted, mutually-authenticated) non-loopback bind.
+        let mtls = ts(Some("/c.pem"), Some("/k.pem"), Some("/ca.pem"), None, false);
+        let d = wire_bind_decision("0.0.0.0:7777", &mtls).expect("an mTLS bind is allowed");
+        assert!(d.transport_plaintext_optin.is_none());
+        // Incomplete material is refused fail-closed: a lone cert, a lone key, or a client-CA with no
+        // server cert+key (mTLS still needs the server to present a cert).
+        for incomplete in [
+            ts(Some("/c.pem"), None, None, None, false),
+            ts(None, Some("/k.pem"), None, None, false),
+            ts(None, None, Some("/ca.pem"), None, false),
+        ] {
+            assert!(
+                wire_bind_decision("0.0.0.0:7777", &incomplete).is_err(),
+                "incomplete TLS material must be refused"
+            );
         }
     }
 
@@ -19322,6 +19354,52 @@ yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
         assert!(
             load_tls_termination(&transport, None).is_err(),
             "a group-readable TLS key must be refused"
+        );
+    }
+
+    // A test client-CA (self-signed, is_ca) for the mTLS load path. Embedded (rcgen pulls banned ring).
+    #[cfg(all(feature = "tls", unix))]
+    const TLS_TEST_CLIENT_CA: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBeDCCAR6gAwIBAgIUD1qVcCqTnuzk5f2PPxzBVwN3GOYwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWaXJvbmJ1cy10ZXN0LWNsaWVudC1jYTAgFw03NTAxMDEwMDAw
+MDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWaXJvbmJ1cy10ZXN0LWNs
+aWVudC1jYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABDDYgFVNE0pzmAR9jf/e
+HWGvwuFfXdWUQa9n2nxTYcncGE47i3G4Er2RKnsh6hEfzqliAnoG/DWQxUIJl4C2
+euujMjAwMB0GA1UdDgQWBBQkZqZUZaw1BiRdd6FJjsPbMJq4lTAPBgNVHRMBAf8E
+BTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCjFMv+V2ep2/pvafj0nCL+OOH1glKT
+eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
+-----END CERTIFICATE-----
+";
+
+    /// mTLS CLI load path (ADR-0004 increment 3b, #766): `--tls-cert` + `--tls-key` + `--tls-client-ca`
+    /// loads an mTLS terminator; a malformed client-CA is refused fail-closed.
+    #[cfg(all(feature = "tls", unix))]
+    #[test]
+    fn load_tls_termination_builds_an_mtls_config_from_a_client_ca() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, TLS_TEST_CERT).unwrap();
+        std::fs::write(&key, TLS_TEST_KEY).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&ca, TLS_TEST_CLIENT_CA).unwrap();
+        let good = ts(
+            Some(cert.to_str().unwrap()),
+            Some(key.to_str().unwrap()),
+            Some(ca.to_str().unwrap()),
+            None,
+            false,
+        );
+        load_tls_termination(&good, None).expect("cert + key + client-CA loads an mTLS terminator");
+
+        // A malformed client-CA is refused fail-closed.
+        std::fs::write(&ca, b"not a certificate").unwrap();
+        assert!(
+            load_tls_termination(&good, None).is_err(),
+            "a malformed --tls-client-ca must be refused"
         );
     }
 
@@ -19432,27 +19510,10 @@ yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
             "no --tls-* material reached the parsed flags"
         );
 
-        // `--tls-client-ca` (mTLS) REFUSES at parse on EVERY build — mTLS client-certificate
-        // verification is a later increment (#766), so a client-CA can never imply mutual auth.
-        {
-            let e = parse_serve_flags(&[
-                "--data-dir".to_string(),
-                "/tmp/x".to_string(),
-                "--tls-client-ca".to_string(),
-                "/ca.pem".to_string(),
-            ])
-            .unwrap_err();
-            assert_eq!(e.exit_code(), EXIT_USAGE);
-            match e {
-                CliError::Usage(m) => assert!(m.contains("--tls-client-ca"), "names the flag: {m}"),
-                other => panic!("expected Usage for --tls-client-ca, got {other:?}"),
-            }
-        }
-
-        // `--tls-cert` / `--tls-key`: REFUSED at parse on a NON-tls build (no TLS stack, so a cert
-        // cannot encrypt and must not imply it); HONORED (parsed + stored) behind `--features tls`
-        // (ADR-0004, #766).
-        for flag in ["--tls-cert", "--tls-key"] {
+        // `--tls-cert` / `--tls-key` / `--tls-client-ca`: REFUSED at parse on a NON-tls build (no TLS
+        // stack, so a cert/CA cannot protect the wire and must not imply it); HONORED (parsed + stored)
+        // behind `--features tls` (ADR-0004, #766 — server TLS and mTLS).
+        for flag in ["--tls-cert", "--tls-key", "--tls-client-ca"] {
             let parsed = parse_serve_flags(&[
                 "--data-dir".to_string(),
                 "/tmp/x".to_string(),
@@ -19470,11 +19531,12 @@ yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
             }
             #[cfg(feature = "tls")]
             {
-                let set = parsed.expect("a --features tls build honors --tls-cert/--tls-key");
-                let stored = if flag == "--tls-cert" {
-                    set.transport.tls_cert.as_deref()
-                } else {
-                    set.transport.tls_key.as_deref()
+                let set = parsed
+                    .expect("a --features tls build honors --tls-cert/--tls-key/--tls-client-ca");
+                let stored = match flag {
+                    "--tls-cert" => set.transport.tls_cert.as_deref(),
+                    "--tls-key" => set.transport.tls_key.as_deref(),
+                    _ => set.transport.tls_client_ca.as_deref(),
                 };
                 assert_eq!(
                     stored,
