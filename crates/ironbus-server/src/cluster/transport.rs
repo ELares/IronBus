@@ -93,6 +93,13 @@ use ironbus_proto::frame::{
 use protobuf::{CodedInputStream, Message as _};
 use raft::eraftpb::Message;
 
+use super::peer_auth::{self, PeerAuthError, PeerKey, PeerSecurity};
+
+/// The fixed byte overhead a [`FrameType::RaftAuth`] frame body adds over a plain `Raft` body: the
+/// `ver: u8` (1) plus the `mac: [u8; 32]` (32) that `peer_auth::seal` prepends (#1067). The peer-frame
+/// size cap is raised by this so an authenticated frame carrying a max-size raft body still fits.
+const RAFT_AUTH_OVERHEAD: u32 = 1 + 32;
+
 /// The hard maximum size, in bytes, of a single incoming peer Raft message body (the protobuf
 /// encoding of one `eraftpb::Message`). Checked against the frame's length prefix BEFORE the body
 /// is read or decoded, so an oversized frame is rejected without allocating or parsing.
@@ -152,6 +159,12 @@ pub enum PeerWireError {
     },
     /// An underlying IO error reading from / writing to the peer connection.
     Io(io::Error),
+    /// A plain (unsigned) `Raft` frame arrived on a link whose peer-auth mode REQUIRES a signed
+    /// `RaftAuth` frame (#1067) — a downgrade, rejected fail-closed rather than accepted unauthenticated.
+    MacMissing,
+    /// A signed `RaftAuth` frame failed peer authentication (bad/absent MAC, unsupported MAC version,
+    /// or a truncated auth header) — forged, tampered, or signed with a different cluster secret (#1067).
+    Auth(PeerAuthError),
 }
 
 impl core::fmt::Display for PeerWireError {
@@ -172,6 +185,11 @@ impl core::fmt::Display for PeerWireError {
                 write!(f, "peer raft message from unknown / invalid node id {from}; rejected")
             }
             PeerWireError::Io(e) => write!(f, "peer link IO error: {e}"),
+            PeerWireError::MacMissing => write!(
+                f,
+                "peer sent an unsigned Raft frame but this link requires signed (authenticated) frames; rejected as a downgrade"
+            ),
+            PeerWireError::Auth(e) => write!(f, "peer frame authentication failed: {e}"),
         }
     }
 }
@@ -182,6 +200,7 @@ impl std::error::Error for PeerWireError {
             PeerWireError::Frame(e) => Some(e),
             PeerWireError::Decode(e) => Some(e),
             PeerWireError::Io(e) => Some(e),
+            PeerWireError::Auth(e) => Some(e),
             _ => None,
         }
     }
@@ -214,6 +233,31 @@ pub fn encode_raft_message(msg: &Message) -> Result<Vec<u8>, PeerWireError> {
     }
     let mut out = Vec::with_capacity(body.len() + 5);
     encode_frame(FrameType::Raft, &body, &mut out).map_err(|e| match e {
+        FrameError::FrameTooLarge { len } => PeerWireError::Oversized { len },
+        e @ FrameError::EmptyFrame => PeerWireError::Frame(e),
+    })?;
+    Ok(out)
+}
+
+/// Encode an outbound Raft message as an HMAC-AUTHENTICATED [`FrameType::RaftAuth`] frame (#1067): the
+/// same protobuf `eraftpb::Message` body, wrapped by [`peer_auth::seal`] in `[ver][mac:32][raft_pb]`,
+/// then framed with tag 50. The `raft_pb` inside is BYTE-IDENTICAL to what [`encode_raft_message`]
+/// produces, so a verifying receiver strips `ver`+`mac` and runs the identical bounded decode. Used by
+/// [`PeerLink::send`] when the link's peer-auth mode signs.
+///
+/// # Errors
+/// [`PeerWireError::Decode`] if protobuf serialization fails, or [`PeerWireError::Oversized`] if the
+/// (sealed) body cannot be framed within the cap.
+pub fn encode_raft_message_authed(msg: &Message, key: &PeerKey) -> Result<Vec<u8>, PeerWireError> {
+    let body = msg.write_to_bytes().map_err(PeerWireError::Decode)?;
+    if body.len() as u64 > u64::from(MAX_RAFT_MSG_BYTES) {
+        return Err(PeerWireError::Oversized {
+            len: body.len() as u64,
+        });
+    }
+    let sealed = peer_auth::seal(key, &body);
+    let mut out = Vec::with_capacity(sealed.len() + 5);
+    encode_frame(FrameType::RaftAuth, &sealed, &mut out).map_err(|e| match e {
         FrameError::FrameTooLarge { len } => PeerWireError::Oversized { len },
         e @ FrameError::EmptyFrame => PeerWireError::Frame(e),
     })?;
@@ -336,19 +380,67 @@ pub fn decode_peer_frame(
     input: &[u8],
     registry: &PeerRegistry,
 ) -> Result<Option<(Message, usize)>, PeerWireError> {
-    // The SIZE bound is enforced HERE, by capping the frame length prefix at MAX_RAFT_MSG_BYTES
-    // (plus the one type byte) BEFORE the body is sliced out or the decoder is entered. An
-    // oversized frame is rejected without allocating its body.
-    match decode_frame_with_cap(input, MAX_RAFT_MSG_BYTES + 1) {
+    // With no peer security configured (the default), only plain `Raft` frames are accepted and a
+    // signed `RaftAuth` frame is an unexpected type. Behavior is unchanged from the pre-#1067 path with
+    // one benign exception: the frame-length cap is now uniformly the auth-raised cap (MAX + 1 +
+    // RAFT_AUTH_OVERHEAD) for all callers, so an oversized PLAIN body in the narrow `(MAX, MAX+33]` band
+    // is caught by the inner `decode_raft_message` (as `Decode`/`Oversized` with the body length) rather
+    // than by the frame layer — never accepted, only reported slightly differently.
+    decode_peer_frame_secured(input, registry, &PeerSecurity::disabled())
+}
+
+/// Decode an untrusted peer FRAME under the peer-authentication policy `security` (#1067). Extends
+/// [`decode_peer_frame`] with the [`FrameType::RaftAuth`] path and the rollout ladder's accept rules:
+///
+/// - a plain `Raft` (27) frame is accepted only if `security.mode.accepts_plain()` (every mode but
+///   `Required`); under `Required` it is a [`PeerWireError::MacMissing`] downgrade rejection;
+/// - a signed `RaftAuth` (50) frame is verified — HMAC recomputed and compared in constant time,
+///   BEFORE the protobuf decode, so an unauthenticated peer never reaches the bounded decoder — only if
+///   a key is present and `security.mode.accepts_authed()`; otherwise it is an unexpected type.
+///
+/// In both cases the recovered `raft_pb` runs the identical size + recursion-bounded [`decode_raft_message`]
+/// and [`PeerRegistry`] peer-id check.
+///
+/// # Errors
+/// See [`PeerWireError`]: oversized/malformed frame, unexpected type, undecodable body, unknown peer,
+/// plus [`PeerWireError::MacMissing`] (downgrade) and [`PeerWireError::Auth`] (verification failure).
+pub fn decode_peer_frame_secured(
+    input: &[u8],
+    registry: &PeerRegistry,
+    security: &PeerSecurity,
+) -> Result<Option<(Message, usize)>, PeerWireError> {
+    // The SIZE bound is enforced HERE, by capping the frame length prefix BEFORE the body is sliced out
+    // or the decoder is entered. The cap is the plain raft cap (MAX + the one type byte) RAISED by the
+    // auth envelope overhead (ver + mac), so a max-size raft body inside a signed frame still fits; the
+    // inner `decode_raft_message` re-checks the recovered `raft_pb` against MAX_RAFT_MSG_BYTES, so the
+    // looser frame cap never lets a plain body exceed the real bound.
+    match decode_frame_with_cap(input, MAX_RAFT_MSG_BYTES + 1 + RAFT_AUTH_OVERHEAD) {
         Ok(FrameDecode::Frame {
             type_tag,
             body,
             consumed,
         }) => {
-            let Some(FrameType::Raft) = FrameType::from_u8(type_tag) else {
-                return Err(PeerWireError::UnexpectedFrameType { tag: type_tag });
+            let raft_pb: &[u8] = match FrameType::from_u8(type_tag) {
+                Some(FrameType::Raft) => {
+                    if !security.mode.accepts_plain() {
+                        // `Required`: an unsigned frame is a downgrade attempt, rejected fail-closed.
+                        return Err(PeerWireError::MacMissing);
+                    }
+                    body
+                }
+                Some(FrameType::RaftAuth) => {
+                    // Accept a signed frame only when a key is configured AND the mode verifies authed
+                    // frames (any mode above `Off`); otherwise it is an unexpected type on this link.
+                    let (Some(key), true) = (security.key.as_ref(), security.mode.accepts_authed())
+                    else {
+                        return Err(PeerWireError::UnexpectedFrameType { tag: type_tag });
+                    };
+                    // VERIFY before decode: strip+check ver/mac; the returned slice is the raft body.
+                    peer_auth::open(key, body).map_err(PeerWireError::Auth)?
+                }
+                _ => return Err(PeerWireError::UnexpectedFrameType { tag: type_tag }),
             };
-            let msg = decode_raft_message(body)?;
+            let msg = decode_raft_message(raft_pb)?;
             registry.authenticate(&msg)?;
             Ok(Some((msg, consumed)))
         }
@@ -373,25 +465,44 @@ pub struct PeerLink<S> {
     stream: S,
     /// Accumulated, not-yet-consumed inbound bytes (a partial frame may straddle reads).
     inbuf: Vec<u8>,
+    /// The peer-authentication policy (#1067): governs whether `send` signs and how `recv` verifies /
+    /// enforces the rollout-ladder accept rules. `PeerSecurity::disabled()` is today's plaintext wire.
+    security: PeerSecurity,
 }
 
 impl<S: Read + Write> PeerLink<S> {
-    /// Wrap a byte stream as a peer link.
+    /// Wrap a byte stream as a plaintext peer link (no peer authentication) — today's behavior.
     pub fn new(stream: S) -> Self {
+        Self::with_security(stream, PeerSecurity::disabled())
+    }
+
+    /// Wrap a byte stream as a peer link with an explicit peer-authentication policy (#1067): `send`
+    /// signs when `security.mode` signs, and `recv` verifies signed frames and enforces the accept
+    /// rules (rejecting a downgrade under `Required`).
+    pub fn with_security(stream: S, security: PeerSecurity) -> Self {
         Self {
             stream,
             inbuf: Vec::new(),
+            security,
         }
     }
 
-    /// Serialize and send one outbound Raft message to the peer (the `drive_ready` -> wire path).
+    /// Serialize and send one outbound Raft message to the peer (the `drive_ready` -> wire path). Signs
+    /// it (emitting a `RaftAuth` frame) when the link's peer-auth mode signs and a key is configured;
+    /// otherwise sends a plain `Raft` frame.
     ///
     /// # Errors
     ///
     /// Returns [`PeerWireError::Decode`] / [`PeerWireError::Oversized`] if the message cannot be
     /// framed within the cap, or [`PeerWireError::Io`] on a write failure.
     pub fn send(&mut self, msg: &Message) -> Result<(), PeerWireError> {
-        let frame = encode_raft_message(msg)?;
+        let frame = match (
+            self.security.mode.sends_authed(),
+            self.security.key.as_ref(),
+        ) {
+            (true, Some(key)) => encode_raft_message_authed(msg, key)?,
+            _ => encode_raft_message(msg)?,
+        };
         self.stream.write_all(&frame)?;
         Ok(())
     }
@@ -413,8 +524,11 @@ impl<S: Read + Write> PeerLink<S> {
         // A heap read buffer (not a large stack array): 64 KiB per read pass.
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
-            // Try to decode a complete frame from what we already have.
-            if let Some((msg, consumed)) = decode_peer_frame(&self.inbuf, registry)? {
+            // Try to decode a complete frame from what we already have, under this link's peer-auth
+            // policy (verify a signed frame, reject a downgrade under `Required`).
+            if let Some((msg, consumed)) =
+                decode_peer_frame_secured(&self.inbuf, registry, &self.security)?
+            {
                 self.inbuf.drain(..consumed);
                 return Ok(Some(msg));
             }
@@ -494,6 +608,110 @@ mod tests {
         let registry = registry_with(&[1, 3]);
         let got = link.recv(&registry).expect("recv ok").expect("a message");
         assert_eq!(got, original);
+    }
+
+    // --- #1067: the interim HMAC-authenticated peer wire (RaftAuth / the rollout ladder). ---
+
+    fn keyed(mode: peer_auth::PeerAuthMode, secret: &[u8]) -> PeerSecurity {
+        PeerSecurity {
+            key: Some(std::sync::Arc::new(PeerKey::from_secret_bytes(secret))),
+            mode,
+        }
+    }
+
+    #[test]
+    fn a_signed_frame_verifies_and_round_trips_over_a_peer_link() {
+        let original = sample_message(3, 1);
+        let key = PeerKey::from_secret_bytes(b"cluster-secret");
+        let wire = encode_raft_message_authed(&original, &key).expect("sign");
+        // The frame carries the RaftAuth type tag (50), not the plain Raft tag (27).
+        assert_eq!(wire[4], FrameType::RaftAuth.as_u8());
+        let mut link = PeerLink::with_security(
+            io::Cursor::new(wire),
+            keyed(peer_auth::PeerAuthMode::Required, b"cluster-secret"),
+        );
+        let registry = registry_with(&[1, 3]);
+        let got = link.recv(&registry).expect("recv ok").expect("a message");
+        assert_eq!(got, original, "the signed round-trip is byte-faithful");
+    }
+
+    #[test]
+    fn peer_link_send_signs_when_the_mode_signs() {
+        let mut link = PeerLink::with_security(
+            io::Cursor::new(Vec::new()),
+            keyed(peer_auth::PeerAuthMode::Signed, b"s"),
+        );
+        link.send(&sample_message(2, 1)).expect("sign+send");
+        let wire = link.stream.into_inner();
+        assert_eq!(
+            wire[4],
+            FrameType::RaftAuth.as_u8(),
+            "a signing mode emits a RaftAuth frame"
+        );
+    }
+
+    #[test]
+    fn required_mode_rejects_a_plain_frame_as_a_downgrade() {
+        let plain = encode_raft_message(&sample_message(2, 1)).expect("encode");
+        let sec = keyed(peer_auth::PeerAuthMode::Required, b"s");
+        let registry = registry_with(&[1, 2]);
+        let err = decode_peer_frame_secured(&plain, &registry, &sec).unwrap_err();
+        assert!(
+            matches!(err, PeerWireError::MacMissing),
+            "an unsigned frame under Required is a downgrade rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn permissive_mode_accepts_both_plain_and_signed_frames() {
+        let msg = sample_message(2, 1);
+        let key = PeerKey::from_secret_bytes(b"s");
+        let sec = keyed(peer_auth::PeerAuthMode::Permissive, b"s");
+        let registry = registry_with(&[1, 2]);
+        let plain = encode_raft_message(&msg).expect("encode");
+        assert!(
+            decode_peer_frame_secured(&plain, &registry, &sec)
+                .unwrap()
+                .is_some(),
+            "permissive accepts a plain frame (a laggard peer)"
+        );
+        let signed = encode_raft_message_authed(&msg, &key).expect("sign");
+        assert!(
+            decode_peer_frame_secured(&signed, &registry, &sec)
+                .unwrap()
+                .is_some(),
+            "permissive also verifies a signed frame"
+        );
+    }
+
+    #[test]
+    fn a_frame_signed_with_a_different_secret_is_rejected() {
+        let signed = encode_raft_message_authed(
+            &sample_message(2, 1),
+            &PeerKey::from_secret_bytes(b"secret-a"),
+        )
+        .expect("sign");
+        let sec = keyed(peer_auth::PeerAuthMode::Required, b"secret-b");
+        let registry = registry_with(&[1, 2]);
+        let err = decode_peer_frame_secured(&signed, &registry, &sec).unwrap_err();
+        assert!(
+            matches!(err, PeerWireError::Auth(_)),
+            "a mismatched-secret MAC fails authentication, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_off_keyless_link_rejects_a_raftauth_frame_as_unexpected() {
+        let signed =
+            encode_raft_message_authed(&sample_message(2, 1), &PeerKey::from_secret_bytes(b"s"))
+                .expect("sign");
+        let registry = registry_with(&[1, 2]);
+        // `decode_peer_frame` is the Off default: no key, does not accept authed frames.
+        let err = decode_peer_frame(&signed, &registry).unwrap_err();
+        assert!(
+            matches!(err, PeerWireError::UnexpectedFrameType { tag } if tag == FrameType::RaftAuth.as_u8()),
+            "an off/keyless link treats a RaftAuth frame as an unexpected type, got {err:?}"
+        );
     }
 
     // --- The SIZE bound: an oversized frame is rejected pre-allocation. ---

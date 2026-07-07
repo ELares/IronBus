@@ -73,6 +73,7 @@ use raft::eraftpb::Message;
 
 use crate::cluster::membership::MembershipChange;
 use crate::cluster::metadata_group::{GroupError, MetadataRaftGroup};
+use crate::cluster::peer_auth::PeerSecurity;
 use crate::cluster::state_machine::{MetadataCommand, Placement};
 use crate::cluster::transport::{PeerLink, PeerRegistry, PeerWireError};
 
@@ -638,6 +639,42 @@ impl ClusterRuntime {
         F: Filesystem + 'static,
         C: Clock + Clone + 'static,
     {
+        Self::start_with_security(
+            config,
+            parent_fs,
+            clock,
+            log_config,
+            liveness,
+            &PeerSecurity::disabled(),
+        )
+    }
+
+    /// Like [`start_with_liveness`](Self::start_with_liveness) but with an explicit peer-wire
+    /// [`PeerSecurity`] policy (#1067): the shared HMAC key + rollout mode threaded into every per-peer
+    /// dialer (which SIGNs its outbound frames) and listener reader (which VERIFIES inbound frames).
+    /// [`start`](Self::start) / [`start_with_liveness`](Self::start_with_liveness) delegate here with
+    /// [`PeerSecurity::disabled`] (the plaintext peer wire, byte-for-byte today's behavior); the CLI
+    /// passes a real policy built from `--cluster-secret-file` + `--cluster-peer-auth`.
+    ///
+    /// # Errors
+    ///
+    /// As [`start`](Self::start).
+    ///
+    /// # Panics
+    ///
+    /// As [`start`](Self::start).
+    pub fn start_with_security<F, C>(
+        config: &ClusterConfig,
+        parent_fs: &F,
+        clock: C,
+        log_config: LogConfig,
+        liveness: LivenessConfig,
+        security: &PeerSecurity,
+    ) -> Result<Self, RuntimeError>
+    where
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+    {
         config.validate()?;
         let self_addr = config
             .self_addr()
@@ -701,9 +738,12 @@ impl ClusterRuntime {
         let mut dialers = Vec::with_capacity(dialer_specs.len());
         for (peer_id, addr, inbox) in dialer_specs {
             let shutdown_d = Arc::clone(&shutdown);
+            // The peer-auth policy (#1067) for this dialer's outbound link: it SIGNs each frame when the
+            // mode signs. Cloned per dialer (the key is an `Arc`, so this is cheap).
+            let security_d = security.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("ib-cluster-dial-{peer_id}"))
-                .spawn(move || run_dialer(peer_id, addr, inbox, &shutdown_d))
+                .spawn(move || run_dialer(peer_id, addr, inbox, &shutdown_d, security_d))
                 .expect("spawn cluster dialer thread");
             dialers.push(handle);
         }
@@ -714,9 +754,12 @@ impl ClusterRuntime {
         let shutdown_l = Arc::clone(&shutdown);
         let registry_l = Arc::clone(&registry);
         let inbound_tx_l = inbound_tx.clone();
+        // The peer-auth policy (#1067) for inbound links: the listener clones it into each per-connection
+        // reader, which VERIFIES a signed frame and (under `Required`) rejects an unsigned downgrade.
+        let security_l = security.clone();
         let listener_handle = std::thread::Builder::new()
             .name("ib-cluster-listen".to_string())
-            .spawn(move || run_listener(listener, inbound_tx_l, registry_l, shutdown_l))
+            .spawn(move || run_listener(listener, inbound_tx_l, registry_l, shutdown_l, security_l))
             .expect("spawn cluster listener thread");
 
         // The shared status snapshot the driver publishes each cycle, and the command channel the
@@ -1796,7 +1839,13 @@ fn route_outbound(outbound: Vec<Message>, outbound_tx: &BTreeMap<u64, PeerOutbou
 // A thread entry point: it OWNS its per-peer `inbox` (the receiver it drains) for the thread's
 // lifetime; a borrow would fight the 'static spawn bound.
 #[allow(clippy::needless_pass_by_value)]
-fn run_dialer(peer_id: u64, addr: SocketAddr, inbox: PeerInbox, shutdown: &AtomicBool) {
+fn run_dialer(
+    peer_id: u64,
+    addr: SocketAddr,
+    inbox: PeerInbox,
+    shutdown: &AtomicBool,
+    security: PeerSecurity,
+) {
     while !shutdown.load(Ordering::Acquire) {
         match TcpStream::connect_timeout(&addr, DIALER_RECONNECT_BACKOFF) {
             Ok(stream) => {
@@ -1806,7 +1855,9 @@ fn run_dialer(peer_id: u64, addr: SocketAddr, inbox: PeerInbox, shutdown: &Atomi
                 // frames whose delivery latency IS the election/commit latency — they must not sit in
                 // a Nagle buffer waiting for the peer's delayed ACK. Best-effort (latency-only).
                 crate::server::set_nodelay_best_effort(&stream);
-                let mut link = PeerLink::new(stream);
+                // The link SIGNs its outbound frames when the peer-auth mode signs (#1067); cloned per
+                // reconnect (the key is an `Arc`, so cheap).
+                let mut link = PeerLink::with_security(stream, security.clone());
                 pump_outbound_to_link(peer_id, &mut link, &inbox, shutdown);
             }
             Err(_) => {
@@ -1860,6 +1911,7 @@ fn run_listener(
     inbound_tx: Sender<Message>,
     registry: Arc<Mutex<PeerRegistry>>,
     shutdown: Arc<AtomicBool>,
+    security: PeerSecurity,
 ) {
     // Latches while a reader-thread spawn-failure episode is ongoing, so the failure is logged ONCE
     // per episode rather than once per refused link (#870): under thread/fd exhaustion the accept loop
@@ -1888,13 +1940,15 @@ fn run_listener(
                 let tx = inbound_tx.clone();
                 let reg = Arc::clone(&registry);
                 let sd = Arc::clone(&shutdown);
+                // The inbound reader VERIFIES under this node's peer-auth policy (#1067); cloned per link.
+                let sec = security.clone();
                 // Spawn a detached reader for this peer link. Previously the spawn `Result` was
                 // discarded with `let _ =`, silently dropping the accepted link (and tight-looping
                 // accept-then-drop) on an EAGAIN/ENOMEM spawn failure — masking peer link loss under
                 // thread/fd pressure (#870). Now surface the failure via tracing and back off.
                 let spawn_result = std::thread::Builder::new()
                     .name("ib-cluster-read".to_string())
-                    .spawn(move || run_reader(PeerLink::new(stream), tx, reg, sd));
+                    .spawn(move || run_reader(PeerLink::with_security(stream, sec), tx, reg, sd));
                 if super::on_reader_spawn_result(&spawn_result, &mut spawn_warned, "metadata peer")
                 {
                     sleep_interruptible(TICK_INTERVAL, &shutdown);
@@ -2428,6 +2482,93 @@ mod tests {
                 "3 voters agreed across the cluster"
             );
         }
+
+        for n in &mut nodes {
+            n.stop();
+        }
+    }
+
+    /// The interim HMAC peer authentication (#1067) END TO END: a 3-node cluster whose every node runs
+    /// in `required` mode with the SAME shared secret elects a leader and commits a metadata entry —
+    /// proving that SIGNED (`RaftAuth`) frames flow across the real dialer/reader peer links and drive
+    /// consensus (a required-mode node both signs its own frames AND accepts its peers' signed frames,
+    /// while rejecting any unsigned one). The plaintext counterpart is
+    /// `three_node_cluster_elects_a_leader_and_commits_a_metadata_entry`.
+    #[test]
+    fn three_node_cluster_forms_a_quorum_over_the_authenticated_peer_wire() {
+        let _serial = serial_guard();
+        let ids = [1u64, 2, 3];
+        let ports = free_ports(3);
+        let peers = peer_map(&ids, &ports);
+        let dirs: Vec<_> = ids
+            .iter()
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+
+        // Every node holds the SAME secret and runs `required` (signs every frame AND rejects any
+        // unsigned one) — the downgrade-proof end state.
+        let security = PeerSecurity {
+            key: Some(Arc::new(
+                crate::cluster::peer_auth::PeerKey::from_secret_bytes(
+                    b"a-shared-cluster-secret-of-at-least-32-bytes",
+                ),
+            )),
+            mode: crate::cluster::peer_auth::PeerAuthMode::Required,
+        };
+
+        let mut nodes: Vec<ClusterRuntime> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let cfg = ClusterConfig {
+                    node_id: id,
+                    peers: peers.clone(),
+                    role: StartRole::Voter,
+                    pending_learners: BTreeSet::new(),
+                };
+                let fs = StdFs::new(dirs[i].path().to_path_buf());
+                ClusterRuntime::start_with_security(
+                    &cfg,
+                    &fs,
+                    SystemClock::new(),
+                    LogConfig::new(64 * 1024).unwrap(),
+                    LivenessConfig::default(),
+                    &security,
+                )
+                .expect("start secured cluster node")
+            })
+            .collect();
+
+        let elected = wait_until(host_scaled(Duration::from_secs(20)), || {
+            nodes.iter().filter(|n| n.status().is_leader).count() == 1
+        });
+        assert!(
+            elected,
+            "a leader is elected over the HMAC-authenticated peer wire"
+        );
+
+        let leader_idx = nodes
+            .iter()
+            .position(|n| n.status().is_leader)
+            .expect("a leader");
+        nodes[leader_idx]
+            .propose_metadata(MetadataCommand::SetConfig {
+                key: "cluster.secured".to_string(),
+                value: "yes".to_string(),
+            })
+            .expect("propose");
+
+        let committed = wait_until(host_scaled(Duration::from_secs(20)), || {
+            nodes.iter().all(|n| n.status().applied_index >= 2)
+        });
+        assert!(
+            committed,
+            "the metadata entry commits across the quorum over SIGNED frames (applied: {:?})",
+            nodes
+                .iter()
+                .map(|n| n.status().applied_index)
+                .collect::<Vec<_>>()
+        );
 
         for n in &mut nodes {
             n.stop();

@@ -2039,19 +2039,24 @@ struct TransportSecurityFlags {
     /// to run a non-loopback bind today. It NEVER permits plaintext+anonymous: an auth identity is still
     /// required, and a loud startup WARNING is always emitted. Inert on loopback.
     insecure_plaintext_wire: bool,
-    /// `--cluster-secret-file <path>` (#1067): the shared-secret file for interim HMAC peer
-    /// authentication. RESERVED, NOT YET HONORED — the HMAC peer-frame layer is the follow-up
-    /// increment, so on a CLUSTERED serve a set value is a fail-closed startup refusal (a secret must
-    /// never imply peer authenticity this increment cannot yet deliver). Inert on a single-node broker,
-    /// which binds no peer wire. A PATH only; kept on the struct so the flag/env surface is stable and
-    /// the re-enable (when the HMAC layer lands) is local.
+    /// `--cluster-secret-file <path>` (#1067): the cluster-wide shared-secret file for interim HMAC peer
+    /// authentication. HONORED — a set value is StrictModes-checked, read, and SHA-256-derived into the
+    /// peer-wire HMAC key at serve, which HMAC-authenticates the raft METADATA peer wire against outsider
+    /// forgery. It does NOT cover the co-located data-plane replication wire (a follow-up increment) and
+    /// therefore does NOT by itself satisfy a non-loopback bind — it COMPLEMENTS, not replaces,
+    /// `--insecure-plaintext-peers`. A PATH reference, never inline material. Inert on a single-node broker.
     cluster_secret_file: Option<String>,
+    /// `--cluster-peer-auth <off|permissive|signed|required>` (#1067): the peer-auth ROLLOUT rung when a
+    /// secret is configured — the ladder for migrating a live cluster (off → permissive → signed →
+    /// required). Defaults to `required` (secure-by-default, downgrade-proof) when a secret is set;
+    /// meaningless without a secret (a non-`off` value with no secret is a fail-closed usage error).
+    cluster_peer_auth: Option<String>,
     /// `--insecure-plaintext-peers` (#1067): the EXPLICIT, loud opt-in that ALLOWS a NON-loopback
-    /// cluster PEER-listener bind — the peer-wire twin of `--insecure-plaintext-wire`. The raft /
-    /// data-plane peer wire is plaintext and (until the #1067 HMAC lands) authenticates peers only by a
-    /// spoofable claimed id, so a non-loopback peer bind is a fail-closed startup refusal unless the
-    /// operator explicitly accepts a plaintext, UNAUTHENTICATED peer wire with this flag; a loud
-    /// startup WARNING is always emitted. Inert for a single-node broker and for a loopback peer bind.
+    /// cluster PEER-listener bind — the peer-wire twin of `--insecure-plaintext-wire`. A non-loopback
+    /// peer bind is a fail-closed startup refusal unless the operator explicitly accepts the plaintext
+    /// peer wire with this flag; a loud startup WARNING is always emitted. It COMPLEMENTS
+    /// `--cluster-secret-file` (which hardens only the metadata wire): the opt-in acknowledges the
+    /// still-plaintext data-plane wire. Inert for a single-node broker and for a loopback bind.
     insecure_plaintext_peers: bool,
     /// `--max-preauth-connections`: the half-open (pre-auth) connection cap (default 128).
     max_preauth_connections: usize,
@@ -2535,11 +2540,13 @@ struct ServeFlags {
     /// (#107). It NEVER allows plaintext+anonymous (an auth identity is still required) and always emits
     /// a loud startup warning. Inert on loopback. A bare boolean flag.
     insecure_plaintext_wire: bool,
-    /// `--cluster-secret-file <path>` / `IRONBUS_CLUSTER_SECRET_FILE` (#1067): the shared-secret file
-    /// for interim HMAC peer authentication. RESERVED, NOT YET HONORED — on a clustered serve a set
-    /// value is a fail-closed startup refusal until the HMAC peer-frame layer lands (inert single-node).
-    /// A PATH reference, never inline material.
+    /// `--cluster-secret-file <path>` / `IRONBUS_CLUSTER_SECRET_FILE` (#1067): the cluster-wide
+    /// shared-secret file for interim HMAC peer authentication. HONORED — loaded + StrictModes-checked at
+    /// serve into the peer-wire HMAC key. A PATH reference, never inline material.
     cluster_secret_file: Option<String>,
+    /// `--cluster-peer-auth <off|permissive|signed|required>` / `IRONBUS_CLUSTER_PEER_AUTH` (#1067): the
+    /// peer-auth rollout rung; defaults to `required` when a secret is set. A string, parsed at serve.
+    cluster_peer_auth: Option<String>,
     /// `--insecure-plaintext-peers` / `IRONBUS_INSECURE_PLAINTEXT_PEERS` (#1067): the explicit, loud
     /// opt-in for a plaintext, unauthenticated NON-loopback cluster peer wire. A bare boolean flag.
     insecure_plaintext_peers: bool,
@@ -2913,10 +2920,14 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                 f.insecure_plaintext_wire = true;
                 i += 1;
             }
-            // The interim shared-secret file for HMAC peer authentication (#1067). RESERVED until the
-            // HMAC layer lands; a value takes the next token (a path).
+            // The interim cluster-wide shared-secret file for HMAC peer authentication (#1067); a value
+            // takes the next token (a path).
             "--cluster-secret-file" => {
                 f.cluster_secret_file = Some(take_value("--cluster-secret-file", args, &mut i)?);
+            }
+            // The peer-auth rollout rung (#1067): off|permissive|signed|required. A value (parsed at serve).
+            "--cluster-peer-auth" => {
+                f.cluster_peer_auth = Some(take_value("--cluster-peer-auth", args, &mut i)?);
             }
             // The EXPLICIT, loud plaintext-PEER-wire opt-in (#1067), the peer twin of
             // `--insecure-plaintext-wire`. A bare boolean flag (no value): advance ONE token.
@@ -3510,14 +3521,17 @@ fn parse_serve_flags_with_env_and_reader(
                 f.insecure_plaintext_wire,
                 env,
             )?,
-            // The interim peer-auth secret file (#1067): flag > env > default None. RESERVED until the
-            // HMAC layer lands (peer_bind_decision refuses a set value), but resolved here so the env
-            // path (`IRONBUS_CLUSTER_SECRET_FILE`) is honored the moment it is un-reserved.
+            // The interim peer-auth secret file (#1067): flag > env > default None. Loaded at serve into
+            // the peer-wire HMAC key; a set value authenticates the peer wire and satisfies a
+            // non-loopback peer bind.
             cluster_secret_file: resolve_opt_string(
                 "--cluster-secret-file",
                 f.cluster_secret_file,
                 env,
             ),
+            // The peer-auth rollout rung (#1067): flag > env > default None (=> `required` when a secret
+            // is set, parsed at serve). `IRONBUS_CLUSTER_PEER_AUTH` env path honored here.
+            cluster_peer_auth: resolve_opt_string("--cluster-peer-auth", f.cluster_peer_auth, env),
             // The explicit plaintext-PEER-wire opt-in (#1067): flag > env > default false, so the
             // `IRONBUS_INSECURE_PLAINTEXT_PEERS` env path and the flag resolve to one value the peer
             // bind decision sees.
@@ -4612,6 +4626,13 @@ fn validate_serve_invocation(
         // cert/key parse, so `--check-only` catches a bad-permission key or a malformed cert exactly
         // as a live start would. A no-op (plaintext) when no --tls-cert/--tls-key is configured.
         let _ = load_tls_termination(transport, audit)?;
+        // Validate the peer-wire security the SAME way serve does (#1067): StrictModes + length floor on
+        // --cluster-secret-file and the --cluster-peer-auth mode/secret consistency, gated on a cluster
+        // being configured (matching serve's own `cluster.is_some()` gate). Catches a bad-permission /
+        // too-short secret or a contradictory peer-auth mode at `--check-only`, with no side effect.
+        if cluster.is_some() {
+            let _ = load_peer_security(transport, audit)?;
+        }
     }
     #[cfg(not(unix))]
     {
@@ -5597,34 +5618,30 @@ struct PeerPlaintextOptin {
 
 /// THE FAIL-CLOSED PEER-BIND INVARIANT (#1067) — the peer-wire twin of [`wire_bind_decision`]. The
 /// raft / data-plane peer listeners (`cluster::serve` / `cluster::runtime`) bind this node's own address
-/// from the cluster address book, and — until interim HMAC peer authentication lands (the #1067 follow-up
-/// increment) — the peer wire is plaintext and authenticates peers only by a trivially SPOOFABLE claimed
-/// id (`PeerRegistry::authenticate`). So anyone who can reach a non-loopback peer port could forge raft
-/// frames and drive committed cluster state. This build therefore fails closed pre-listen:
+/// from the cluster address book. The peer wire is plaintext, so absent authentication a peer is trusted
+/// only by a trivially SPOOFABLE claimed id (`PeerRegistry::authenticate`) — anyone who can reach a
+/// non-loopback peer port could forge raft frames and drive committed cluster state. This build fails
+/// closed pre-listen unless the wire is authenticated or the operator explicitly accepts plaintext:
 ///
 /// - **no cluster** (single-node) -> ALLOWED, no-op: no peer listener is ever bound.
-/// - **`--cluster-secret-file` set** -> REFUSED (reserved): the HMAC layer is not yet wired, so a secret
-///   cannot yet authenticate the peer wire; a set value must not imply authenticity it cannot deliver.
 /// - **loopback peer bind** (`127.0.0.0/8` / `::1`) -> ALLOWED silently: the trust boundary is the host
 ///   (dev / CI / a single-host or loopback-harness cluster), byte-for-byte today's behavior.
-/// - **non-loopback, no opt-in** -> REFUSED: bind the peer listener on loopback (a single-host
-///   deployment), OR — for a multi-host cluster whose peer wire rides a mesh / private network / VPN —
-///   pass `--insecure-plaintext-peers` to explicitly accept a plaintext, unauthenticated wire.
+/// - **non-loopback, no opt-in** -> REFUSED: bind it on loopback, or pass `--insecure-plaintext-peers`.
 /// - **non-loopback, `--insecure-plaintext-peers`** -> ALLOWED as an explicit opt-in; a loud startup
 ///   WARNING is emitted by `cmd_serve`.
 ///
-/// DELIBERATE divergence from the client wire opt-in: that additionally requires an auth identity, but
-/// the peer wire has no per-peer auth table today, so `--insecure-plaintext-peers` grants a plaintext,
-/// UNAUTHENTICATED peer wire (the #1067 HMAC increment closes that gap). The peer address is already a
-/// resolved `SocketAddr` (from `--cluster-peer` parsing), so no re-resolution is needed; `is_loopback()`
-/// is correctly `false` for the `0.0.0.0` / `::` wildcards.
+/// IMPORTANT: `--cluster-secret-file` does NOT affect this bind decision and does NOT satisfy a
+/// non-loopback bind. It HMAC-authenticates only the raft METADATA peer wire (#1067 Increment 2); the
+/// co-located DATA-PLANE replication wire (ISR / fetch, on the same IP at `dataplane_addr`) is still
+/// plaintext, so the operator must still explicitly accept that plaintext wire with
+/// `--insecure-plaintext-peers`. The secret and the opt-in are COMPLEMENTARY: the secret hardens the
+/// consensus wire against outsider forgery, the opt-in acknowledges the still-plaintext data plane.
+/// Data-plane HMAC is the follow-up increment; per-node identity + confidentiality is mTLS #766.
 ///
-/// SCOPE: this guards the INTRA-cluster raft + data-plane consensus listeners — which share this node's
-/// address IP (`dataplane_addr` only shifts the port), so classifying the metadata self address covers
-/// both. It is a CLI-boundary policy: the server crate's `ClusterRuntime::start` does not itself enforce
-/// it. The cross-cluster serve / leaf-hub / federation listeners (#738/#766) are a DISTINCT wire not
-/// covered here, and cryptographic peer authenticity is the #1067 HMAC follow-up (this guard only closes
-/// the silently-plaintext non-loopback peer bind).
+/// The peer address is already a resolved `SocketAddr` (from `--cluster-peer` parsing), so no
+/// re-resolution is needed; `is_loopback()` is correctly `false` for the `0.0.0.0` / `::` wildcards. This
+/// is a CLI-boundary policy: `ClusterRuntime::start` does not itself enforce it. The cross-cluster serve
+/// / leaf-hub / federation listeners (#738/#766) are a DISTINCT wire not covered here.
 ///
 /// # Errors
 /// [`CliError::Usage`] if `--cluster-secret-file` is set (reserved/not-yet-honored), or if the peer bind
@@ -5640,12 +5657,6 @@ fn peer_bind_decision(
             plaintext_optin: None,
         });
     };
-    // RESERVED first, on any peer bind: the interim HMAC peer-auth layer (#1067 follow-up) is not wired,
-    // so a secret file cannot yet authenticate peers. Refuse fail-closed rather than let a configured
-    // secret imply an authenticity this increment does not deliver. Un-reserved when the HMAC lands.
-    if transport.cluster_secret_file.is_some() {
-        return Err(peer_secret_reserved_refusal());
-    }
     // The peer listener binds this node's OWN entry in the address book (`pub` fields, already a resolved
     // SocketAddr). A book with no self entry is a malformed config the validator rejects on its own path,
     // so treat an absent self here as nothing-to-bind rather than double-reporting.
@@ -5661,6 +5672,12 @@ fn peer_bind_decision(
             plaintext_optin: None,
         });
     }
+    // A non-loopback peer bind requires the explicit `--insecure-plaintext-peers` opt-in. NOTE: a
+    // `--cluster-secret-file` HMAC-authenticates only the raft METADATA peer wire (#1067 Increment 2);
+    // the co-located DATA-PLANE replication wire (ISR / fetch) is still plaintext, so a secret alone
+    // does NOT make a non-loopback bind safe and does NOT satisfy this guard — the operator must still
+    // explicitly accept the plaintext data-plane wire. (Data-plane HMAC is the follow-up increment.) The
+    // secret and the opt-in are therefore COMPLEMENTARY, not mutually exclusive.
     if !transport.insecure_plaintext_peers {
         return Err(peer_non_loopback_refusal(self_addr));
     }
@@ -6698,36 +6715,22 @@ fn wire_non_loopback_refusal(addr: &str) -> CliError {
     ))
 }
 
-/// The fatal usage error for a NON-loopback cluster peer bind with no explicit opt-in (#1067). The raft /
-/// data-plane peer wire is plaintext and does not yet cryptographically authenticate peers (it trusts a
-/// spoofable claimed id), so a peer listener reachable off the host could be fed forged frames. Names the
-/// peer address and the two honest ways forward.
+/// The fatal usage error for a NON-loopback cluster peer bind that is neither authenticated nor an
+/// explicit plaintext opt-in (#1067). The raft / data-plane peer wire is plaintext, so a listener
+/// reachable off the host could be fed forged frames unless the wire is HMAC-authenticated. Names the
+/// peer address and the honest ways forward.
 #[cfg(any(unix, test))]
 fn peer_non_loopback_refusal(addr: std::net::SocketAddr) -> CliError {
     CliError::Usage(format!(
         "refusing to start: the cluster peer listener binds a NON-loopback address `{addr}`, but the \
-         raft/data-plane peer wire is plaintext and does not yet cryptographically authenticate peers \
-         (#1067) — anyone who can reach it could forge peer/raft frames and drive committed cluster \
-         state. Bind the peer listener on loopback (a single-host deployment), OR — for a multi-host \
-         cluster whose peer wire is carried over a mesh / private network / VPN — pass \
-         --insecure-plaintext-peers to EXPLICITLY accept a plaintext, unauthenticated peer wire (a loud \
-         startup warning is emitted). Interim HMAC peer authentication is the #1067 follow-up increment."
+         peer wire is plaintext (#1067) — anyone who can reach it could forge peer frames. Bind the peer \
+         listener on loopback (a single-host deployment), OR — for a multi-host cluster whose peer wire \
+         is carried over a mesh / private network / VPN — pass --insecure-plaintext-peers to EXPLICITLY \
+         accept a plaintext peer wire (a loud startup warning is emitted). NOTE: --cluster-secret-file \
+         HMAC-hardens only the raft metadata wire against outsider forgery; the DATA-PLANE replication \
+         wire is still plaintext, so a secret does NOT by itself make a non-loopback bind safe and does \
+         NOT replace --insecure-plaintext-peers (data-plane authentication is a follow-up increment)."
     ))
-}
-
-/// The fatal usage error for `--cluster-secret-file` while the interim HMAC peer-auth layer is not yet
-/// wired (#1067). RESERVED, not-yet-honored: a configured secret must never imply a peer authenticity
-/// this increment cannot deliver, so a set value fails closed until the HMAC increment un-reserves it.
-#[cfg(any(unix, test))]
-fn peer_secret_reserved_refusal() -> CliError {
-    CliError::Usage(
-        "refusing to start: --cluster-secret-file (IRONBUS_CLUSTER_SECRET_FILE) is RESERVED and not \
-         yet honored — the interim HMAC peer-authentication layer (#1067) is a follow-up increment, so \
-         a secret file cannot yet authenticate the peer wire, and accepting one would falsely imply it \
-         does. Remove it until that increment lands; until then a non-loopback peer bind requires the \
-         explicit --insecure-plaintext-peers opt-in."
-            .to_string(),
-    )
 }
 
 /// The fatal usage error for `--insecure-plaintext-wire` on a non-loopback `--addr` with NO auth
@@ -6989,14 +6992,20 @@ fn cmd_serve(
     // explicit plaintext + UNAUTHENTICATED opt-in — emit the loud warning so an operator can never miss
     // that the cluster peer wire is exposed and forgeable. Inert for single-node / loopback (no optin).
     if let Some(optin) = &peer_bind.plaintext_optin {
+        let metadata_note = if transport.cluster_secret_file.is_some() {
+            "The raft METADATA wire IS HMAC-authenticated by --cluster-secret-file against outsider \
+             forgery; the DATA-PLANE wire is not."
+        } else {
+            "Both the raft metadata and data-plane wires are plaintext (configure --cluster-secret-file \
+             to HMAC-authenticate the metadata wire)."
+        };
         writeln!(
             out,
-            "WARNING: --insecure-plaintext-peers: the cluster PEER wire on {} is PLAINTEXT and does NOT \
-             cryptographically authenticate peers (#1067) — anyone who can reach it could forge \
-             raft/peer frames and drive committed cluster state. Protect the peer wire out of band (a \
-             mesh / private network / VPN), or bind it on loopback. Interim HMAC peer authentication is \
-             the #1067 follow-up.",
-            optin.addr,
+            "WARNING: --insecure-plaintext-peers: the cluster DATA-PLANE peer wire on {} is PLAINTEXT and \
+             unauthenticated (#1067) — a forged replication / ISR frame could drive committed cluster \
+             state or false durability. Protect the peer wire out of band (a mesh / private network / \
+             VPN), or bind it on loopback. {} Data-plane authentication is the #1067 follow-up increment.",
+            optin.addr, metadata_note,
         )?;
     }
 
@@ -7063,7 +7072,31 @@ fn cmd_serve(
             // under it. With NO cluster config the runtime is never constructed, so no `metaraft/`
             // dir, no peer listener, and no driver thread exist: the broker is byte-for-byte
             // today's (the single-node-default guarantee, owned right here by the `Option` check).
-            let cluster_runtime = start_cluster_runtime(cluster, data_dir, config)?;
+            // The peer-wire authentication policy (#1067), built + validated pre-listen ONLY when a
+            // cluster is configured (a stray --cluster-secret-file with no cluster is ignored, like the
+            // other cluster flags). The secret file's StrictModes check + the mode parse fail closed here.
+            let peer_security = if cluster.is_some() {
+                load_peer_security(transport, Some(&audit))?
+            } else {
+                ironbus_server::cluster::PeerSecurity::disabled()
+            };
+            // #1067: a transitional peer-auth rung (permissive/signed) still ACCEPTS unsigned metadata
+            // frames, so the metadata wire is not yet authenticated against an active attacker until the
+            // whole fleet reaches `required`. Warn so a migration rung is not mistaken for the end state.
+            if matches!(
+                peer_security.mode,
+                ironbus_server::cluster::PeerAuthMode::Permissive
+                    | ironbus_server::cluster::PeerAuthMode::Signed
+            ) {
+                writeln!(
+                    out,
+                    "WARNING: --cluster-peer-auth {:?}: this is a rollout MIGRATION rung — the raft \
+                     metadata peer wire still accepts unsigned frames, so it is not yet enforced against \
+                     an active attacker. Advance every node to `required` to enforce (#1067).",
+                    peer_security.mode,
+                )?;
+            }
+            let cluster_runtime = start_cluster_runtime(cluster, data_dir, config, &peer_security)?;
             // Construct + spawn + drive the DATA plane (#717) IFF a cluster runtime was started: it
             // captures the engine's off-actor read plane HERE (before the engine moves into the append
             // actor in `run_broker`), then a bootstrap thread waits for the committed placement, builds
@@ -7161,6 +7194,90 @@ fn cmd_serve(
 /// Starts the additive metadata-cluster runtime (#684, V2-C1) when a [`ClusterConfig`] is present,
 /// or returns `None` for the single-node default (no cluster flags) — the byte-for-byte-today path.
 ///
+/// Build the peer-wire [`PeerSecurity`](ironbus_server::cluster::PeerSecurity) policy (#1067) from the
+/// resolved transport flags at serve. A configured `--cluster-secret-file` is StrictModes-checked, read
+/// (a >= 32-raw-byte floor), and SHA-256-derived into the shared HMAC key; the `--cluster-peer-auth` rung
+/// (default `required` when a secret is set) governs enforcement. With no secret the peer wire is
+/// plaintext ([`PeerSecurity::disabled`](ironbus_server::cluster::PeerSecurity::disabled)); a non-`off`
+/// `--cluster-peer-auth` without a secret, or `off` WITH a secret, is a fail-closed usage error.
+///
+/// # Errors
+/// [`CliError::Usage`] on an unreadable / bad-permission / too-short secret file, an unknown
+/// `--cluster-peer-auth` value, or a contradictory mode/secret combination.
+#[cfg(unix)]
+fn load_peer_security(
+    transport: &TransportSecurityFlags,
+    audit: Option<&ironbus_server::audit::AuditEmitter>,
+) -> Result<ironbus_server::cluster::PeerSecurity, CliError> {
+    use ironbus_server::cluster::{PeerAuthMode, PeerKey, PeerSecurity};
+
+    // A minimum entropy floor: a trivially short/empty file cannot be a cluster secret.
+    const MIN_SECRET_BYTES: usize = 32;
+
+    let mode_str = transport.cluster_peer_auth.as_deref();
+    let Some(secret_path) = transport.cluster_secret_file.as_deref() else {
+        // No secret: the peer wire is plaintext. A non-`off` peer-auth mode has no key to sign/verify
+        // with, so it is a fail-closed usage error rather than a silent no-op.
+        if let Some(m) = mode_str {
+            if !m.eq_ignore_ascii_case("off") {
+                return Err(CliError::Usage(format!(
+                    "--cluster-peer-auth `{m}` requires --cluster-secret-file: there is no key to sign \
+                     or verify peer frames without a configured cluster secret. Set \
+                     --cluster-secret-file, or use --cluster-peer-auth off (the default with no secret)."
+                )));
+            }
+        }
+        return Ok(PeerSecurity::disabled());
+    };
+
+    // Fail-closed StrictModes owner-only check on the secret (audited on the serve path), before it is
+    // read — a group/world-readable secret refuses startup, exactly like the auth/TLS secret files.
+    strict_mode_check_secret_file_audited(secret_path, audit)?;
+    // Wrap the raw secret in Zeroizing so it is wiped on scope exit (both the length-floor early return
+    // and the success path), rather than lingering in a plain Vec after the key is derived.
+    let bytes = zeroize::Zeroizing::new(std::fs::read(secret_path).map_err(|e| {
+        CliError::Usage(format!(
+            "cannot read --cluster-secret-file `{secret_path}`: {e}"
+        ))
+    })?);
+    if bytes.len() < MIN_SECRET_BYTES {
+        return Err(CliError::Usage(format!(
+            "--cluster-secret-file `{secret_path}` is too short ({} bytes): a cluster peer secret must \
+             be at least {MIN_SECRET_BYTES} bytes of real entropy (e.g. \
+             `head -c 32 /dev/urandom > {secret_path}`). The SAME file must be present, byte-identical, \
+             on every node.",
+            bytes.len()
+        )));
+    }
+    let key = PeerKey::from_secret_bytes(&bytes);
+
+    // The rollout rung: `required` by default (secure-by-default, downgrade-proof from boot) when a
+    // secret is configured. `off` WITH a secret is contradictory (the secret would authenticate nothing).
+    let mode = match mode_str {
+        None => PeerAuthMode::Required,
+        Some(m) if m.eq_ignore_ascii_case("permissive") => PeerAuthMode::Permissive,
+        Some(m) if m.eq_ignore_ascii_case("signed") => PeerAuthMode::Signed,
+        Some(m) if m.eq_ignore_ascii_case("required") => PeerAuthMode::Required,
+        Some(m) if m.eq_ignore_ascii_case("off") => {
+            return Err(CliError::Usage(
+                "--cluster-peer-auth off with a --cluster-secret-file is contradictory: the secret \
+                 would authenticate nothing. Drop --cluster-secret-file to run a plaintext peer wire \
+                 (with --insecure-plaintext-peers off loopback), or use permissive|signed|required."
+                    .to_string(),
+            ));
+        }
+        Some(other) => {
+            return Err(CliError::Usage(format!(
+                "unknown --cluster-peer-auth `{other}`: expected one of off|permissive|signed|required."
+            )));
+        }
+    };
+    Ok(PeerSecurity {
+        key: Some(std::sync::Arc::new(key)),
+        mode,
+    })
+}
+
 /// This is the ONE call site of [`ClusterRuntime::start`] in the broker. It builds a fresh
 /// [`StdFs`] rooted at the SAME `data_dir` the engine uses (the runtime roots its `metaraft/`
 /// subdirectory under it) and a [`LogConfig`] from the SAME `--max-segment-bytes` the engine's
@@ -7178,6 +7295,7 @@ fn start_cluster_runtime(
     cluster: Option<&ClusterConfig>,
     data_dir: &Path,
     config: &ServeConfig,
+    peer_security: &ironbus_server::cluster::PeerSecurity,
 ) -> Result<Option<ClusterRuntime>, CliError> {
     let Some(cluster) = cluster else {
         // The single-node default: NOTHING cluster starts. No metaraft/, no listener, no thread.
@@ -7190,18 +7308,27 @@ fn start_cluster_runtime(
     // cluster log rolls like the data log; this is the only LogConfig knob the runtime takes.
     let log_config = LogConfig::new(config.max_segment_bytes)
         .map_err(|e| CliError::Internal(format!("cluster log config: {e}")))?;
-    ClusterRuntime::start(cluster, &fs, SystemClock::new(), log_config)
-        .map(Some)
-        .map_err(|e| match e {
-            // An invalid config (e.g. an unsupported peer-set size: the CLI layer guarantees a
-            // well-formed config, so this is the size rule the runtime owns) is an operator usage
-            // error (exit 1), naming the cluster flags.
-            RuntimeError::Config(m) => CliError::Usage(format!(
-                "invalid `--cluster-id`/`--cluster-peer` config: {m}"
-            )),
-            // A durable-open or peer-listener-bind failure is a runtime fault (exit 70).
-            other => CliError::Internal(format!("cannot start the metadata cluster: {other}")),
-        })
+    // Thread the peer-wire authentication policy (#1067) into the runtime: the dialers SIGN and the
+    // listener readers VERIFY under it. `PeerSecurity::disabled()` is the plaintext peer wire (default).
+    ClusterRuntime::start_with_security(
+        cluster,
+        &fs,
+        SystemClock::new(),
+        log_config,
+        ironbus_server::cluster::LivenessConfig::default(),
+        peer_security,
+    )
+    .map(Some)
+    .map_err(|e| match e {
+        // An invalid config (e.g. an unsupported peer-set size: the CLI layer guarantees a
+        // well-formed config, so this is the size rule the runtime owns) is an operator usage
+        // error (exit 1), naming the cluster flags.
+        RuntimeError::Config(m) => CliError::Usage(format!(
+            "invalid `--cluster-id`/`--cluster-peer` config: {m}"
+        )),
+        // A durable-open or peer-listener-bind failure is a runtime fault (exit 70).
+        other => CliError::Internal(format!("cannot start the metadata cluster: {other}")),
+    })
 }
 
 /// The fixed partition id the broker's default-stream log maps to in a clustered serve (#717). Today's
@@ -9585,9 +9712,11 @@ fn cmd_serve(
         // The explicit plaintext-wire opt-in (#629): consumed here too so the Windows `-D warnings`
         // build does not trip field-never-read on the new flag (the #288/#99 footgun).
         transport.insecure_plaintext_wire,
-        // The #1067 peer-wire fields (the fail-closed peer bind guard is Unix-serve-only, so the
-        // non-Unix stub must reach them too or the Windows `-D warnings` build trips field-never-read).
+        // The #1067 peer-wire fields (the fail-closed peer bind guard + peer-auth load are Unix-serve-only,
+        // so the non-Unix stub must reach them too or the Windows `-D warnings` build trips
+        // field-never-read).
         transport.cluster_secret_file.is_some(),
+        transport.cluster_peer_auth.is_some(),
         transport.insecure_plaintext_peers,
         transport.max_preauth_connections,
         transport.preauth_rate_per_ip,
@@ -19404,6 +19533,7 @@ mod tests {
             // The #1067 peer-wire fields default off/absent here; the peer_bind_decision tests
             // construct their own TransportSecurityFlags with these set.
             cluster_secret_file: None,
+            cluster_peer_auth: None,
             insecure_plaintext_peers: false,
             max_preauth_connections: DEFAULT_MAX_PREAUTH_CONNECTIONS,
             preauth_rate_per_ip: DEFAULT_PREAUTH_RATE_PER_IP,
@@ -19764,28 +19894,163 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
     }
 
     #[test]
-    fn peer_bind_cluster_secret_file_is_reserved_and_refused_on_any_bind() {
-        // --cluster-secret-file is RESERVED until the HMAC increment: a set value fails closed on ANY
-        // peer bind (checked BEFORE the loopback classification), so a secret never implies a peer
-        // authenticity this build cannot deliver — even a loopback bind with a secret is refused.
+    fn peer_bind_a_secret_alone_does_not_satisfy_a_non_loopback_bind() {
+        // #1067 Increment 2 (metadata-only scope): --cluster-secret-file HMAC-hardens ONLY the raft
+        // metadata wire; the data-plane wire is still plaintext, so a secret alone does NOT satisfy a
+        // non-loopback bind — it is still REFUSED without --insecure-plaintext-peers.
+        let cfg = cluster_self_bound("203.0.113.5:9001".parse().unwrap());
+        let e = peer_bind_decision(
+            Some(&cfg),
+            &peer_ts(Some("/etc/ironbus/cluster.secret"), false),
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(m.contains("203.0.113.5:9001"), "names the address: {m}");
+                assert!(
+                    m.contains("--insecure-plaintext-peers"),
+                    "still requires the opt-in: {m}"
+                );
+                assert!(
+                    m.contains("data-plane"),
+                    "explains the data-plane residual: {m}"
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_bind_a_secret_and_the_optin_together_are_complementary_and_allowed() {
+        // The secret hardens the metadata wire; --insecure-plaintext-peers accepts the still-plaintext
+        // data-plane wire. They are COMPLEMENTARY, not exclusive — a non-loopback bind with both is
+        // allowed and records the plaintext opt-in (for the loud warning).
+        let cfg = cluster_self_bound("203.0.113.5:9001".parse().unwrap());
+        let d = peer_bind_decision(
+            Some(&cfg),
+            &peer_ts(Some("/etc/ironbus/cluster.secret"), true),
+        )
+        .expect("secret + opt-in together are permitted");
+        assert_eq!(
+            d.plaintext_optin.expect("records the opt-in").addr,
+            "203.0.113.5:9001"
+        );
+    }
+
+    #[test]
+    fn peer_bind_a_loopback_bind_with_a_secret_is_still_allowed_silently() {
+        // A loopback bind with a secret configured is allowed silently (the secret hardens the metadata
+        // wire; loopback needs no opt-in).
         for addr in [
             SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9001)),
-            "203.0.113.5:9001".parse().unwrap(),
+            "[::1]:9001".parse().unwrap(),
         ] {
             let cfg = cluster_self_bound(addr);
-            let e = peer_bind_decision(
+            let d = peer_bind_decision(
                 Some(&cfg),
                 &peer_ts(Some("/etc/ironbus/cluster.secret"), false),
             )
-            .unwrap_err();
-            assert_eq!(e.exit_code(), EXIT_USAGE);
-            match e {
-                CliError::Usage(m) => {
-                    assert!(m.contains("--cluster-secret-file"), "names the flag: {m}");
-                    assert!(m.contains("RESERVED"), "states it is reserved: {m}");
-                }
-                other => panic!("expected Usage, got {other:?}"),
+            .expect("loopback + secret is fine");
+            assert!(d.plaintext_optin.is_none());
+        }
+    }
+
+    // --- #1067 Increment 2: the peer-wire HMAC key load + --cluster-peer-auth mode parsing. ---
+    #[cfg(unix)]
+    mod peer_security_load {
+        use super::*;
+
+        fn secret_file(bytes: &[u8]) -> tempfile::NamedTempFile {
+            // NamedTempFile is created 0600 + owned by us, so it passes the StrictModes secret check;
+            // writing via the path preserves that mode (an existing file's perms are untouched).
+            let f = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(f.path(), bytes).unwrap();
+            f
+        }
+
+        fn ts_peer_auth(secret: Option<&str>, mode: Option<&str>) -> TransportSecurityFlags {
+            TransportSecurityFlags {
+                cluster_secret_file: secret.map(str::to_string),
+                cluster_peer_auth: mode.map(str::to_string),
+                ..Default::default()
             }
+        }
+
+        #[test]
+        fn no_secret_is_the_disabled_plaintext_default() {
+            let sec = load_peer_security(&ts_peer_auth(None, None), None).unwrap();
+            assert_eq!(sec.mode, ironbus_server::cluster::PeerAuthMode::Off);
+            assert!(sec.key.is_none());
+        }
+
+        #[test]
+        fn a_secret_defaults_to_required_and_loads_a_key() {
+            let f = secret_file(&[0x5a; 32]);
+            let sec =
+                load_peer_security(&ts_peer_auth(Some(f.path().to_str().unwrap()), None), None)
+                    .unwrap();
+            assert_eq!(sec.mode, ironbus_server::cluster::PeerAuthMode::Required);
+            assert!(sec.key.is_some(), "a configured secret loads a key");
+        }
+
+        #[test]
+        fn explicit_modes_parse_case_insensitively() {
+            let f = secret_file(&[0x5a; 32]);
+            let p = f.path().to_str().unwrap();
+            for (s, expect) in [
+                (
+                    "permissive",
+                    ironbus_server::cluster::PeerAuthMode::Permissive,
+                ),
+                ("Signed", ironbus_server::cluster::PeerAuthMode::Signed),
+                ("REQUIRED", ironbus_server::cluster::PeerAuthMode::Required),
+            ] {
+                let sec = load_peer_security(&ts_peer_auth(Some(p), Some(s)), None).unwrap();
+                assert_eq!(sec.mode, expect, "mode `{s}` parses");
+            }
+        }
+
+        #[test]
+        fn off_with_a_secret_is_a_contradiction() {
+            let f = secret_file(&[0x5a; 32]);
+            let e = load_peer_security(
+                &ts_peer_auth(Some(f.path().to_str().unwrap()), Some("off")),
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(e, CliError::Usage(m) if m.contains("contradictory")));
+        }
+
+        #[test]
+        fn a_mode_without_a_secret_is_refused_but_off_is_ok() {
+            let e = load_peer_security(&ts_peer_auth(None, Some("required")), None).unwrap_err();
+            assert!(
+                matches!(e, CliError::Usage(m) if m.contains("requires --cluster-secret-file"))
+            );
+            assert!(
+                load_peer_security(&ts_peer_auth(None, Some("off")), None).is_ok(),
+                "off with no secret is the harmless default"
+            );
+        }
+
+        #[test]
+        fn a_too_short_secret_is_refused() {
+            let f = secret_file(b"short");
+            let e = load_peer_security(&ts_peer_auth(Some(f.path().to_str().unwrap()), None), None)
+                .unwrap_err();
+            assert!(matches!(e, CliError::Usage(m) if m.contains("too short")));
+        }
+
+        #[test]
+        fn an_unknown_mode_is_refused() {
+            let f = secret_file(&[0x5a; 32]);
+            let e = load_peer_security(
+                &ts_peer_auth(Some(f.path().to_str().unwrap()), Some("bogus")),
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(e, CliError::Usage(m) if m.contains("unknown --cluster-peer-auth")));
         }
     }
 
@@ -22020,7 +22285,13 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
         std::fs::create_dir_all(&plain_dir).unwrap();
         let _plain_guard = RemoveDirOnDrop(plain_dir.clone());
         let config = ServeConfig::bench_default();
-        let none = start_cluster_runtime(None, &plain_dir, &config).unwrap();
+        let none = start_cluster_runtime(
+            None,
+            &plain_dir,
+            &config,
+            &ironbus_server::cluster::PeerSecurity::disabled(),
+        )
+        .unwrap();
         assert!(none.is_none(), "no config -> no runtime");
         assert!(
             !plain_dir.join(METADATA_SUBDIR).exists(),
@@ -22045,9 +22316,14 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             role: ironbus_server::cluster::StartRole::Voter,
             pending_learners: std::collections::BTreeSet::new(),
         };
-        let mut runtime = start_cluster_runtime(Some(&cfg), &cluster_dir, &config)
-            .unwrap()
-            .expect("a configured 1-member cluster starts a runtime");
+        let mut runtime = start_cluster_runtime(
+            Some(&cfg),
+            &cluster_dir,
+            &config,
+            &ironbus_server::cluster::PeerSecurity::disabled(),
+        )
+        .unwrap()
+        .expect("a configured 1-member cluster starts a runtime");
 
         // The lone voter self-elects within a few seconds; poll so the test is not a fixed sleep.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -22118,9 +22394,14 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             role: ironbus_server::cluster::StartRole::Voter,
             pending_learners: std::collections::BTreeSet::new(),
         };
-        let mut runtime = start_cluster_runtime(Some(&cfg), &data_dir, &config)
-            .unwrap()
-            .expect("a configured cluster starts a runtime");
+        let mut runtime = start_cluster_runtime(
+            Some(&cfg),
+            &data_dir,
+            &config,
+            &ironbus_server::cluster::PeerSecurity::disabled(),
+        )
+        .unwrap()
+        .expect("a configured cluster starts a runtime");
 
         // Construct + spawn + drive the data plane (the #717 plumbing under test). No
         // `--cluster-peer-client` advertise map here (the #737 default: the NOT_LEADER redirect is

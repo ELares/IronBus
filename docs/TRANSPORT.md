@@ -339,39 +339,79 @@ already on the box, and local tooling and the same-host CLI (#15) must work with
 zero configuration. The moment the bind is non-loopback, the section 2.2 matrix
 applies with no further exception.
 
-### 2.5 The cluster peer wire: the same invariant, an interim opt-in (#1067)
+### 2.5 The cluster peer wire: the same invariant + interim HMAC authentication (#1067)
 
 The client wire is not the only listener a broker opens. A clustered broker
 (`--cluster-id` + `--cluster-peer`) also binds a **peer wire** — the raft metadata
 and data-plane replication listeners that carry consensus frames between nodes.
-That wire is plaintext today, and until interim HMAC peer authentication lands it
-authenticates a peer only by its *claimed* node id (`PeerRegistry`), which is
-trivially spoofable: anyone who can reach a peer port could forge raft/ISR frames
-and drive committed cluster state. So the same fail-closed bind invariant applies,
-enforced pre-listen by `peer_bind_decision`, the twin of §2.2/§2.3:
+That wire is plaintext, and absent authentication it trusts a peer only by its
+*claimed* node id (`PeerRegistry`), which is trivially spoofable: anyone who can
+reach a peer port could forge raft/ISR frames and drive committed cluster state. So
+the same fail-closed bind invariant applies, enforced pre-listen by
+`peer_bind_decision`, the twin of §2.2/§2.3:
 
 - **Single-node** (no cluster flags) → no peer listener is bound; the guard is
   inert (byte-for-byte the standalone broker).
 - **Loopback peer bind** (`127.0.0.0/8` / `::1`) → ALLOWED silently: the trust
   boundary is the host (dev, CI, a single-host or loopback-harness cluster).
-- **Non-loopback peer bind, no opt-in** → REFUSED before the listener opens. Bind
-  the peer wire on loopback (a single host, or a mesh / private network / VPN that
-  carries the peer traffic), or pass the explicit opt-in.
-- **Non-loopback peer bind, `--insecure-plaintext-peers`** → ALLOWED as an
-  explicit opt-in; a loud startup WARNING is always emitted.
-- **`--cluster-secret-file` set** → REFUSED (reserved): the shared-secret HMAC peer
-  authentication is a follow-up increment, so a configured secret cannot yet
-  authenticate the peer wire and must never imply that it does.
+- **Non-loopback peer bind, no opt-in** → REFUSED before the listener opens.
+- **Non-loopback peer bind, `--insecure-plaintext-peers`** → ALLOWED as an explicit
+  opt-in; a loud startup WARNING is always emitted.
 
-One deliberate divergence from the client wire (§2.4): the client plaintext opt-in
-*also* requires an auth identity, but the peer wire has no per-peer auth table
-today, so `--insecure-plaintext-peers` grants a plaintext **and unauthenticated**
-peer wire. That residual is closed by the interim shared-secret HMAC increment
-(#1067) — which makes a peer's claimed id cryptographically trustworthy — and,
-ultimately, by mTLS on the peer wire (#766). The HMAC layer un-reserves
-`--cluster-secret-file`, at which point a configured secret becomes the secure
-satisfier of a non-loopback peer bind (as a `--tls-cert` pair is for the client
-wire), and `--insecure-plaintext-peers` is no longer required.
+`--cluster-secret-file` does **not** change this bind decision (see the scope note
+below): it hardens the metadata wire but does not cover the still-plaintext
+data-plane wire, so a non-loopback bind still needs `--insecure-plaintext-peers`.
+The two are **complementary**, not mutually exclusive.
+
+**Interim HMAC peer authentication — the raft METADATA wire.** A cluster-wide
+`--cluster-secret-file` (a file of ≥ 32 random bytes, `head -c 32 /dev/urandom > f`,
+**byte-identical** on every node — a stray newline yields a different key and
+silently breaks auth — `chmod 0600`) is SHA-256-derived into a shared key. With it, a
+node HMAC-SHA256-signs each **raft metadata** peer frame (a distinct `RaftAuth` wire
+frame) and verifies inbound ones. The guarantee is **cluster-membership origin
+authentication + per-frame integrity**: a frame is proven to come from *a holder of
+the cluster secret*, defeating **outsider** spoofing of `from`. It is NOT per-node
+identity (one symmetric key, so a compromised secret-holder can still forge `from` —
+but raft already trusts every voter, so this grants an insider nothing new; per-node
+identity is mTLS #766), NOT confidentiality (the raft protobuf is still cleartext),
+and NOT anti-replay (raft's own term/index idempotence blunts replay). The HMAC uses
+the pure-Rust RustCrypto `sha2` already in the tree (no new dependency).
+
+**What is NOT authenticated (yet).** Only the raft *metadata* peer wire is signed.
+The co-located **data-plane replication wire** (per-partition ISR / fetch, on the
+same IP at `dataplane_addr`) is still plaintext — a forged `AckReplicated` could
+falsely raise a follower's durability frontier. That is why `--cluster-secret-file`
+does not satisfy a non-loopback bind on its own; the operator still accepts the
+plaintext data-plane wire with `--insecure-plaintext-peers`. Data-plane HMAC
+authentication is the follow-up increment.
+
+**Rollout ladder (`--cluster-peer-auth off|permissive|signed|required`).** A
+frame-format change cannot be flipped on a live cluster at once — a node that both
+signs and rejects-unsigned would split quorum from its un-upgraded peers. So send
+and accept are decoupled into four rungs, each accepting a superset of any peer's
+send format, so the fleet migrates one node at a time:
+
+| rung | sends | accepts |
+|---|---|---|
+| `off` (default, no secret) | plain | plain |
+| `permissive` | plain | plain + signed✓ |
+| `signed` | signed | plain + signed✓ |
+| `required` (default WITH a secret) | signed | signed✓ only |
+
+**A fresh cluster** sets the secret and boots straight to `required` (downgrade-proof).
+**An already-running cluster** must climb fleet-wide before enforcing: (0) deploy the
+Inc-2 binary with no secret (still all-plaintext, compatible); (1) distribute the
+identical secret and roll every node to `permissive`; (2) roll to `signed`; (3) roll
+to `required`. Skipping straight to `required` on a running cluster splits quorum.
+
+**Key rotation** follows the same `permissive→signed→required` dance, which means an
+already-`required` (authenticated) cluster transits `permissive` — a transient window
+in which every node again *sends plaintext* and *accepts unsigned* frames, i.e. the
+metadata wire's origin authentication is OFF for the duration. Rotate over a trusted /
+private segment and keep the window short; the auth-preserving alternative is a full
+cluster stop-and-restart onto the new secret (a brief availability trade for no
+plaintext window). The `permissive`/`signed` rungs emit a startup WARNING so a
+transitional rung is not mistaken for the enforced end state.
 
 **Scope of this guard.** "Peer wire" here means the **intra-cluster** listeners
 that carry raft consensus and per-partition ISR data-plane replication between the
