@@ -50,10 +50,15 @@ specified separately in #106.
 > connection-scoped auth model and the three-scope authorization (#631,
 > [AUTHENTICATION.md](AUTHENTICATION.md)) ship with it (bearer/password verify on
 > audited pure-Rust RustCrypto primitives). Server TLS AND mTLS (client-certificate
-> verification → SAN identity mapping) now both ship behind `--features tls`. What
-> REMAINS flagged: **client-side TLS** (the IronBus CLI/SDK verifying and connecting
-> to a TLS broker, and presenting a client cert for mTLS, #957) is the next TLS
-> increment; the crypto-provider supply-chain decision that
+> verification → SAN identity mapping) now both ship behind `--features tls`.
+> **Client-side TLS now ships too** (#957): the `ironbus-client` (sync) and
+> `ironbus-client-async` (tokio) libraries verify a broker's certificate and connect
+> inside a TLS 1.3 session — mandatory verification, no plaintext fallback — behind
+> each crate's non-default `tls` feature, and the IronBus **CLI** dials a TLS broker
+> when the active context sets `tls_ca` (with `tls_server_name` to override SNI, and
+> `tls_client_cert` + `tls_client_key` to present a client certificate for mTLS); on a
+> non-`tls` CLI build a TLS-configured context is REFUSED, never silently ignored. The
+> crypto-provider supply-chain decision that
 > once blocked all of this is RESOLVED (aws-lc-rs behind the `tls` feature,
 > ADR-0004, a documented `deny.toml` C-FFI exception like `zstd-sys`; the default
 > and `edge-min` builds stay byte-for-byte pure-Rust). The
