@@ -40,9 +40,12 @@ already in this directory (the *shape* should match; absolute numbers reflect t4
 ## Step 2 — 3 separate t4g instances, real network (the wire-to-wire number)
 Run one node per instance so the data plane crosses a real NIC:
 ```
-# node 1 (leader), node 2, node 3 — each on its own t4g, repo checked out
-ironbus serve --addr 0.0.0.0:7000 --data-dir /var/ib --storage disk \
-  --cluster-id 1 --cluster-peer 2=<node2-ip>:7100 --cluster-peer 3=<node3-ip>:7100 \
+# node 1 (leader), node 2, node 3 — each on its own t4g, repo checked out.
+# Non-loopback binds need the explicit plaintext opt-ins on this private benchmark network: the
+# client wire (--addr 0.0.0.0) takes --insecure-plaintext-wire (+ an --auth-config identity), and
+# the peer wire (--cluster-peer) takes --insecure-plaintext-peers (#629 / #1067).
+ironbus serve --addr 0.0.0.0:7000 --data-dir /var/ib --storage disk --insecure-plaintext-peers \
+  --cluster-id 1 --cluster-peer 1=<node1-ip>:7100 --cluster-peer 2=<node2-ip>:7100 --cluster-peer 3=<node3-ip>:7100 \
   --cluster-peer-client 1=<node1-ip>:7000 --cluster-peer-client 2=<node2-ip>:7000 --cluster-peer-client 3=<node3-ip>:7000
 # (node 2/3 symmetric with their own --cluster-id; cluster data plane = --addr +1, cross-cluster serve = --addr +2)
 ```

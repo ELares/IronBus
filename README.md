@@ -586,7 +586,11 @@ A real multi-node cluster ships today, behind two flags — and it degrades to t
 
 ```sh
 # on each of three nodes (adjust --cluster-id and the addresses):
-ironbus serve --data-dir /var/lib/ironbus --cluster-id 1 \
+# The peer wire is plaintext and not yet cryptographically peer-authenticated (#1067), so a
+# NON-loopback peer bind requires the explicit --insecure-plaintext-peers opt-in (carry the peer
+# traffic on a private network / VPN, or drop the flag once mTLS peer auth lands). A loopback
+# cluster needs no flag.
+ironbus serve --data-dir /var/lib/ironbus --cluster-id 1 --insecure-plaintext-peers \
   --cluster-peer 1=10.0.0.1:7900 --cluster-peer 2=10.0.0.2:7900 --cluster-peer 3=10.0.0.3:7900
 ```
 
