@@ -75,8 +75,11 @@ use ironbus_proto::message::{
 // an already-encoded `Connect` body. A verbatim port of the sync client's `connect_with` auth wiring;
 // the credential itself lives on the re-exported `ClientConfig::credential`.
 use ironbus_proto::message::append_connect_auth;
+use std::io;
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 /// The smallest per-read scratch size. Reading at least this many bytes even when the decoder asks
@@ -110,6 +113,14 @@ pub use ironbus_client::{
     StreamConsumerConfig, Truncation, TxnId, DEFAULT_STREAM_COMMIT_EVERY_BATCHES,
     DEFAULT_STREAM_FETCH_RECORDS,
 };
+
+// Re-export the SHARED client TLS config (ADR-0004 / #957) under the `tls` feature, so an async caller
+// can build [`ClientConfig::tls`] without depending on `ironbus-client` directly. This is the SAME type
+// the sync client uses — there is no async-specific TLS config; the async client just drives its handshake
+// on the tokio runtime. Brings `TlsClientConfig` into module scope for the async `Wire::connect_tls`.
+#[cfg(feature = "tls")]
+#[doc(no_inline)]
+pub use ironbus_client::{TlsClientConfig, TlsClientError};
 
 /// The proto body/codec types a caller constructs to drive [`AsyncClient`] (e.g. [`PubBody`]),
 /// re-exported so a caller can build requests without depending on `ironbus-proto` directly.
@@ -262,7 +273,7 @@ fn ingest_delivery(
 /// `Incomplete` read more bytes from the socket and append. The ONLY change is the read: tokio's
 /// `AsyncReadExt::read(...).await` in place of the blocking `std::io::Read::read`.
 async fn read_frame_from(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     buf: &mut Vec<u8>,
 ) -> Result<(FrameType, Vec<u8>), ClientError> {
     // Reused scratch for each socket read. `buf` grows ONLY via `extend_from_slice`, run
@@ -299,6 +310,131 @@ async fn read_frame_from(
     }
 }
 
+/// The transport under an [`AsyncClient`]: a plain tokio TCP stream, or — behind the `tls` feature and
+/// when [`ClientConfig::tls`] is set — a TLS 1.3 session over that stream. `AsyncClient` performs ALL of
+/// its IO through this enum, so the produce/consume/handshake paths are transport-agnostic. The async twin
+/// of the sync client's `Wire` (same Plain/Tls shape); it implements tokio's [`AsyncRead`]/[`AsyncWrite`]
+/// so the existing `read_frame_from` / `write_all` sites work UNCHANGED over either transport. There is no
+/// `try_clone` analog: the async client never splits its stream (its pipelined `produce_window` writes the
+/// whole window on the one owned stream), so a TLS session is never asked to span two owners.
+enum Wire {
+    /// A plaintext TCP connection (the default; the only variant on a non-`tls` build).
+    Plain(TcpStream),
+    /// A TLS 1.3 session over the TCP connection (broker verified; optional mTLS client cert). Boxed so
+    /// the large rustls connection state does not bloat the `Plain` variant.
+    #[cfg(feature = "tls")]
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl std::fmt::Debug for Wire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Wire::Plain(_) => f.write_str("Wire::Plain"),
+            #[cfg(feature = "tls")]
+            Wire::Tls(_) => f.write_str("Wire::Tls"),
+        }
+    }
+}
+
+impl Wire {
+    /// The local socket address of the underlying TCP connection (a stable per-connection seed for
+    /// transaction ids), whether plaintext or wrapped in TLS.
+    ///
+    /// # Errors
+    /// Returns the underlying [`std::io::Error`] when the OS cannot report the local address.
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Wire::Plain(s) => s.local_addr(),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.get_ref().0.local_addr(),
+        }
+    }
+
+    /// Read back the `TCP_NODELAY` state of the underlying socket (used by a test), whether plaintext or
+    /// wrapped in TLS.
+    #[cfg(test)]
+    fn nodelay(&self) -> io::Result<bool> {
+        match self {
+            Wire::Plain(s) => s.nodelay(),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.get_ref().0.nodelay(),
+        }
+    }
+
+    /// Establish a TLS 1.3 client session over an already-connected socket (#957): VERIFY the broker's
+    /// certificate against the configured trust anchor (mandatory — a verification failure returns an
+    /// error, never a silent fallback to plaintext), drive the async handshake to completion, and wrap.
+    /// The async twin of the sync client's `Wire::connect_tls`, using `tokio_rustls::TlsConnector` in
+    /// place of the blocking `complete_io`. The shared [`TlsClientConfig::build`] yields the rustls
+    /// `ClientConfig`; both crates resolve the SAME rustls 0.23, so the config type unifies.
+    #[cfg(feature = "tls")]
+    async fn connect_tls(socket: TcpStream, config: &TlsClientConfig) -> Result<Wire, ClientError> {
+        let client_config = config
+            .build()
+            .map_err(|e| ClientError::Tls(e.to_string()))?;
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from(config.server_name().to_string())
+                .map_err(|_| {
+                    ClientError::Tls(format!("invalid server name `{}`", config.server_name()))
+                })?;
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+        // Drive the TLS 1.3 handshake to completion. A certificate that does not verify, or a server
+        // name mismatch, fails HERE and returns the error — before any Connect frame is sent.
+        let tls = connector
+            .connect(server_name, socket)
+            .await
+            .map_err(ClientError::Io)?;
+        Ok(Wire::Tls(Box::new(tls)))
+    }
+}
+
+// `Wire` delegates every poll to the active variant. Both variants are `Unpin` (a tokio `TcpStream` is
+// `Unpin`, and a `Box<T>` is always `Unpin`), so `self.get_mut()` + `Pin::new(inner)` is sound without a
+// pin-projection crate.
+impl AsyncRead for Wire {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Wire::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Wire {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Wire::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Wire::Plain(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Wire::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// A connected async IronBus client over one [`tokio::net::TcpStream`].
 ///
 /// The async twin of [`ironbus_client::Client`]: it carries the same negotiated-capability state and
@@ -310,7 +446,7 @@ async fn read_frame_from(
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct AsyncClient {
-    stream: TcpStream,
+    stream: Wire,
     buf: Vec<u8>,
     /// The per-consumer MESSAGE credit NEGOTIATED for this connection, learned from the server's
     /// `Info` at handshake. `None` if the server did not advertise (an old/empty `Info`).
@@ -371,6 +507,17 @@ impl AsyncClient {
         // a failed setsockopt degrades latency only, never correctness, so it must not fail an
         // otherwise-successful connect.
         let _ = stream.set_nodelay(true);
+        // Wrap the socket: TLS 1.3 when `config.tls` is set (verify the broker + drive the handshake
+        // HERE, so a bad certificate fails the connect, never a silent plaintext fallback), else a
+        // zero-cost plaintext `Wire`. On a non-tls build every connection is plaintext. A verbatim port
+        // of the sync client's `connect_with` wrap, swapping the blocking handshake for the async one.
+        #[cfg(feature = "tls")]
+        let stream = match &config.tls {
+            Some(tls_config) => Wire::connect_tls(stream, tls_config).await?,
+            None => Wire::Plain(stream),
+        };
+        #[cfg(not(feature = "tls"))]
+        let stream = Wire::Plain(stream);
         let mut client = AsyncClient {
             stream,
             buf: Vec::new(),
@@ -405,6 +552,24 @@ impl AsyncClient {
         // wire the server parses with `parse_connect_auth`. With no credential (the default) nothing is
         // appended and the body stays the pre-#631 `Connect`, so an unauthenticated connect is unchanged.
         if let Some(cred) = &config.credential {
+            // The `Mtls` mechanism authenticates on the client CERTIFICATE presented at the TLS handshake
+            // — its `Connect` body carries no credential bytes (#957). Guard it client-side: sending
+            // `Mtls` without a configured client certificate would be rejected by the server as an
+            // authorization violation, so fail fast here with an actionable error instead. A verbatim port
+            // of the sync client's guard.
+            #[cfg(feature = "tls")]
+            if matches!(cred.mechanism, AuthMechanism::Mtls)
+                && !config
+                    .tls
+                    .as_ref()
+                    .is_some_and(TlsClientConfig::has_client_cert)
+            {
+                return Err(ClientError::Tls(
+                    "the Mtls credential authenticates on a client certificate, but none is \
+                     configured: set ClientConfig.tls to a TlsClientConfig::with_client_cert(...)"
+                        .to_string(),
+                ));
+            }
             append_connect_auth(&mut connect_body, cred).map_err(ClientError::Body)?;
         }
         client.send(FrameType::Connect, &connect_body).await?;

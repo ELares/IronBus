@@ -8,6 +8,18 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# TLS 1.3 async client transport (ADR-0004 / #766, client-side #957). The NON-DEFAULT feature that adds
+# `tokio-rustls` — the async adapter over the SAME rustls 0.23 + aws-lc-rs stack the sync client uses — so
+# the async client can VERIFY a broker's certificate and drive the TLS 1.3 handshake on the tokio runtime.
+# Off by default: the default async client links ZERO TLS code and stays byte-for-byte plain-TCP, pure-Rust.
+# `ironbus-client/tls` is forwarded so the SHARED `ClientConfig::tls` field and `TlsClientConfig` (the SAME
+# config type the sync client uses — there is no async-specific TLS config) are in scope here. As with the
+# sync client, `ironbus-server/tls` is forwarded ONLY to give this crate's own integration test a real
+# TLS-terminating broker to connect to (ironbus-server is a dev-dependency); it is a no-op for the shipped
+# `cargo build` of this library, so a downstream `--features tls` async client links only tokio-rustls.
+tls = ["dep:tokio-rustls", "ironbus-client/tls", "ironbus-server/tls"]
+
 [dependencies]
 # REUSE the sync client's public data types (ClientError, ClientConfig, Message, Fetch,
 # ProduceAck, DeadLetter, Truncation, Gap, TxnId, ...) verbatim — this crate is the async
@@ -29,6 +41,13 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
 ] }
+# TLS 1.3 async adapter (the `tls` feature only; the default build links none of this). `default-features
+# = false` drops tokio-rustls's ring-backed default provider, and `aws-lc-rs` selects the same provider as
+# the sync client — the async client is TLS 1.3-only with aws-lc-rs, never ring (ring is pulled into the
+# lock as an unbuilt optional only, verified unreachable via `cargo tree -i ring`, so the deny.toml ring
+# ban stays intact). tokio-rustls re-exports rustls 0.23, unified with the sync client's copy, so the
+# shared `TlsClientConfig::build()` `ClientConfig` plugs straight into `tokio_rustls::TlsConnector`.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 # The real broker, spawned in-process for the wire-compatibility round-trip test.

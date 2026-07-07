@@ -25,12 +25,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-/// Starts an in-process broker on a loopback port and returns its bound address, a shutdown flag, and
-/// the accept-loop thread handle. A faithful copy of the sync client's `start_server` /
-/// `start_server_with` / `spawn_serving` helpers: an in-memory engine driven by a `spawn_actor` append
-/// actor, served by the real `serve` accept loop on a blocking std thread.
-fn start_server() -> (SocketAddr, Arc<AtomicBool>, JoinHandle<()>) {
-    let engine = Engine::open(
+/// Opens the in-memory test engine shared by the plaintext and (feature-gated) TLS broker helpers: an
+/// `InMemoryFs` + `SystemClock` with the historical test `EngineConfig` (64 credit, no caps).
+fn open_engine() -> Engine<InMemoryFs, SystemClock> {
+    Engine::open(
         InMemoryFs::new(),
         SystemClock::new(),
         EngineConfig {
@@ -70,7 +68,15 @@ fn start_server() -> (SocketAddr, Arc<AtomicBool>, JoinHandle<()>) {
             dead_letter_expired: false,
         },
     )
-    .unwrap();
+    .unwrap()
+}
+
+/// Starts an in-process broker on a loopback port and returns its bound address, a shutdown flag, and
+/// the accept-loop thread handle. A faithful copy of the sync client's `start_server` /
+/// `start_server_with` / `spawn_serving` helpers: an in-memory engine driven by a `spawn_actor` append
+/// actor, served by the real `serve` accept loop on a blocking std thread.
+fn start_server() -> (SocketAddr, Arc<AtomicBool>, JoinHandle<()>) {
+    let engine = open_engine();
 
     // The engine is owned by the append actor; the wire server reaches it through the handle. The
     // actor join handle is detached: when the server thread stops, the actor's channel disconnects and
@@ -645,4 +651,128 @@ async fn async_streaming_consumer_durably_consumes_and_commits_against_a_real_se
     drop(c2);
     shutdown.store(true, Ordering::Release);
     handle.join().unwrap();
+}
+
+/// End-to-end async client TLS (ADR-0004 / #957), compiled only under `--features tls`. The async twin of
+/// the sync client's `a_client_produces_over_a_verified_tls_connection_and_a_wrong_anchor_is_rejected`:
+/// an `AsyncClient` VERIFIES a real TLS-terminating broker and produces over the encrypted session, while
+/// a client pointed at the WRONG trust anchor is rejected at the handshake (mandatory verification, no
+/// plaintext fallback).
+#[cfg(feature = "tls")]
+mod tls {
+    use super::*;
+    use ironbus_client_async::TlsClientConfig;
+
+    // A long-lived self-signed server cert + key for "localhost", and a DIFFERENT (wrong) trust anchor.
+    // The SAME embedded fixtures the sync client's TLS test uses (rcgen pulls banned ring, so no runtime
+    // cert generation).
+    const TLS_SERVER_CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBVzCB/aADAgECAhMjGIxpQAwb+081fMl2nX2WEMQ8MAoGCCqGSM49BAMCMB4x
+HDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIwIBcNMjAwMTAxMDAwMDAwWhgP
+MjEwMDAxMDEwMDAwMDBaMB4xHDAaBgNVBAMME2lyb25idXMtdGVzdC1zZXJ2ZXIw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+AoxgwFjAU
+BgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwIDSQAwRgIhAJ+smDY9Jybx
+FoJDOjOor9Cb56IyQQ64ts0roLO5NVx9AiEAnB1pAliacK3UDfG6xKEig12h4tzf
+UrjVOalNQ4uwFJg=
+-----END CERTIFICATE-----
+";
+    const TLS_SERVER_KEY: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWd4kisc5NnK6Nv0I
+RL0rrbnn9ozoIOti7I4eisF3CHWhRANCAAS4ZuCioex4thlFvAdYg6ER4GlPiFK/
+yqG6VNwt0cp7LoCwHmOkcr6JLYLNSa2mar9F2nTFk2cSj49+OzMYbF+A
+-----END PRIVATE KEY-----
+";
+    const TLS_OTHER_CERT: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBWjCCAQCgAwIBAgIUfIjY91xg+z0LSwh5bngCs73UQLswCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSaXJvbmJ1cy10ZXN0LW90aGVyMCAXDTIwMDEwMTAwMDAwMFoY
+DzIxMDAwMTAxMDAwMDAwWjAdMRswGQYDVQQDDBJpcm9uYnVzLXRlc3Qtb3RoZXIw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS/sQWpzoGIBq0tyDdZLN7918LWW/j0
++CsRiYQa+vfAdERrw1POkGOIed4wUocAT9+tMkOY/VB/OSbHJxeZwPSBoxwwGjAY
+BgNVHREEETAPgg1vdGhlci5pbnZhbGlkMAoGCCqGSM49BAMCA0gAMEUCIC4trwko
+Aq57VS5iw0sm+NFBdTHX5XSCUQvACWp0elXzAiEArjyI3F1SeVHMY/DKGtuy7J/3
+toYtkjmdU2eQ2pK/3gM=
+-----END CERTIFICATE-----
+";
+
+    /// Spins a TLS-terminating in-process broker: the same engine + append actor as [`start_server`], but
+    /// served by `serve_with_auth_connz_preauth_audit` with a `TlsTermination`, so every accepted
+    /// connection completes a TLS 1.3 handshake before the app-level `Connect`.
+    fn start_tls_server() -> (SocketAddr, Arc<AtomicBool>, JoinHandle<()>) {
+        let (handle_engine, _actor) = spawn_actor(open_engine(), DEFAULT_CHANNEL_BOUND);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_config =
+            ironbus_server::tls::server_config_from_pem(TLS_SERVER_CERT, TLS_SERVER_KEY).unwrap();
+        let tls = ironbus_server::server::TlsTermination::with_config(Arc::new(server_config));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                let clock = SystemClock::new();
+                let beacon =
+                    ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                let connz = Arc::new(ironbus_server::connz::ConnectionMetrics::new());
+                ironbus_server::server::serve_with_auth_connz_preauth_audit(
+                    &listener,
+                    &handle_engine,
+                    &shutdown,
+                    16,
+                    &clock,
+                    &beacon,
+                    None,
+                    &connz,
+                    None,
+                    None,
+                    tls,
+                )
+                .unwrap();
+            }
+        });
+        (addr, shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn async_client_produces_over_a_verified_tls_connection_and_a_wrong_anchor_is_rejected() {
+        let (addr, shutdown, handle) = start_tls_server();
+
+        // Correct trust anchor: verify the broker, connect over TLS 1.3, and produce.
+        let config = ClientConfig {
+            tls: Some(TlsClientConfig::new(TLS_SERVER_CERT.to_vec(), "localhost")),
+            ..Default::default()
+        };
+        let mut client = AsyncClient::connect_with(addr, &config)
+            .await
+            .expect("the async client verifies the broker and connects");
+        let offset = client
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"produced-over-async-client-tls",
+            })
+            .await
+            .expect("a produce travels over the TLS connection");
+        assert_eq!(offset, 0, "the produce is durable at offset 0");
+
+        // Wrong trust anchor: the server certificate does not verify, so the handshake FAILS at connect.
+        let bad = ClientConfig {
+            tls: Some(TlsClientConfig::new(TLS_OTHER_CERT.to_vec(), "localhost")),
+            ..Default::default()
+        };
+        assert!(
+            AsyncClient::connect_with(addr, &bad).await.is_err(),
+            "a client with the wrong trust anchor must be rejected at the TLS handshake"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        drop(client);
+        let _ = handle.join();
+    }
 }
