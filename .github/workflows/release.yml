@@ -58,9 +58,28 @@ jobs:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: sh scripts/ci/changelog-unreleased.sh CHANGELOG.md "$TAG"
 
+  version-gate:
+    name: tag version matches the manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      # A `v*` tag whose version does not equal `[workspace.package] version` in Cargo.toml means the
+      # prep PR forgot to bump the manifest (or the wrong tag was pushed): the shipped binary would
+      # report one version while the release claims another. FAIL here, before any binary is built —
+      # the build jobs `needs:` this gate — so a mislabeled artifact is never published. In the normal
+      # flow scripts/prepare-release.sh keeps the two in lockstep; this is the belt-and-suspenders
+      # check at tag time.
+      - name: assert the tag version equals the workspace version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: sh scripts/ci/assert-tag-version.sh "$TAG" Cargo.toml
+
   build:
     name: build (${{ matrix.target }})
-    needs: changelog-gate
+    needs: [changelog-gate, version-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -422,6 +441,29 @@ jobs:
             v0.*|v0) echo "value=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "value=false" >> "$GITHUB_OUTPUT" ;;
           esac
+      - name: render the release notes from the CHANGELOG
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The GitHub Release body is the curated `## [vX.Y.Z]` CHANGELOG section (the #128 gate
+          # already proved it non-empty) plus a fixed artifact/verify footer, NOT a hand-kept string
+          # that drifts from the log. release-notes.sh handles GitHub's 125000-char body cap: an
+          # oversized changelog is truncated at a line boundary with a link to the full CHANGELOG at
+          # the tag, so a large release still posts a short summary + link instead of failing.
+          mkdir -p dist
+          sh scripts/ci/release-notes.sh "$TAG" CHANGELOG.md "$REPO" dist/release-notes.md
+          echo "----- release notes preview (first 40 lines) -----"
+          head -n 40 dist/release-notes.md
+      # crates.io publish: DELIBERATELY SKIPPED. IronBus ships as a single binary over four channels
+      # (installer, .deb, container, checksummed GitHub Releases; see docs/DISTRIBUTION.md) and does
+      # NOT publish its library crates to crates.io — docs/CLIENT_SDKS.md pins the Rust crates "by git
+      # until a crates.io release", there is no CRATES_IO_TOKEN secret, and `[patch.crates-io]
+      # raft-proto` in Cargo.toml redirects a dependency to a vendored build-script-free codec that a
+      # real `cargo publish` would not carry. To ENABLE it later: add a `CRATES_IO_TOKEN` secret and a
+      # job that runs `cargo publish -p <crate>` in dependency order (proto/core/storage -> server ->
+      # client -> client-async -> cli), gated on `startsWith(github.ref, 'refs/tags/v')`.
       - name: create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -440,7 +482,7 @@ jobs:
             --title "$TAG" \
             --verify-tag \
             $prerelease_flag \
-            --notes "Static musl binaries for the three edge triples (x86_64, aarch64, armv7) and a .deb package per triple, each with a SHA256 checksum, a consolidated SHA256SUMS (over the binaries, the .deb packages, and the CycloneDX SBOM), a cargo-auditable SBOM (ironbus.sbom.json), a syft CycloneDX SBOM (ironbus.cyclonedx.json, scannable with syft/grype), and a keyless Sigstore build-provenance attestation over every artifact. Verify integrity with: sha256sum -c SHA256SUMS, and provenance with: gh attestation verify <artifact> --repo $REPO. The fail-closed installer (scripts/install.sh) verifies the checksum before installing; the distroless container image is built and (opt-in) published by the release workflow. See docs/DISTRIBUTION.md for all four channels and CHANGELOG.md for changes." \
+            --notes-file dist/release-notes.md \
             dist/ironbus-linux-amd64 \
             dist/ironbus-linux-amd64.sha256 \
             dist/ironbus-linux-arm64 \
