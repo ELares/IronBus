@@ -603,6 +603,53 @@ pub fn encode_deliver(msg: &DeliverBody<'_>, out: &mut Vec<u8>) -> Result<(), Bo
     Ok(())
 }
 
+/// Encodes a COMPLETE `Deliver` FRAME — the `[len:u32][type][body]` envelope — directly onto `out`,
+/// with NO intermediate frame-body `Vec` (#812's direct-into-out pattern, extended from the batch path
+/// to the per-record leased `Deliver`). Byte-identical to
+/// `encode_frame(FrameType::Deliver, &{a Vec built by encode_deliver(msg)})`, so the on-wire frame (and
+/// the record's payload bytes) is unchanged; it merely DROPS the redundant per-record memcpy into a
+/// temporary body `Vec`. On the hot leased-delivery path (`handle_flow` / `handle_fetch`) this saves one
+/// copy of each delivered record's `(offset, generation, flags, ts, key, headers, payload)` body.
+///
+/// The frame LENGTH is not known until the variable-length body (u16-framed key/headers, then payload)
+/// is written, so it is BACKPATCHED: a 4-byte placeholder is reserved, the body is appended via the
+/// single-source-of-truth [`encode_deliver`], then the measured length is written into the placeholder.
+/// This keeps the body layout owned solely by [`encode_deliver`] (no duplicated field arithmetic to
+/// drift), unlike the fixed-size [`encode_deliver_batch_frame`] header which can precompute its length.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the key or headers exceed `u16::MAX` (exactly as
+/// [`encode_deliver`]); on that error the partial frame is rolled back off `out`, leaving the buffer
+/// byte-for-byte as it was on entry.
+pub fn encode_deliver_frame(msg: &DeliverBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let frame_start = out.len();
+    // Reserve the 4-byte length prefix; patched once the body length below is known. The type byte
+    // follows it, exactly as `encode_frame`'s `[len:u32][type][body]` envelope.
+    out.extend_from_slice(&[0u8; 4]);
+    out.push(crate::frame::FrameType::Deliver.as_u8());
+    let body_start = out.len();
+    if let Err(e) = encode_deliver(msg, out) {
+        // A failed body encode leaves `out` untouched: roll the reserved prefix + type byte + any
+        // partial body off, so the caller sees the buffer exactly as before (it then stops the batch).
+        out.truncate(frame_start);
+        return Err(e);
+    }
+    // The frame length is the type byte plus the body just written. A delivered record's frame is the
+    // produced record's frame plus a tiny fixed prefix, and produce enforces the same `MAX_FRAME_LEN`
+    // cap on ingest, so this can never exceed the cap in practice; a `debug_assert` catches a violated
+    // invariant in test, matching `reply`/`encode_frame`'s debug-assert-only cap contract.
+    let body_len = out.len() - body_start;
+    let frame_len = 1 + body_len;
+    debug_assert!(
+        frame_len as u64 <= u64::from(crate::frame::MAX_FRAME_LEN),
+        "Deliver frame exceeded the frame cap"
+    );
+    // `frame_len <= MAX_FRAME_LEN` (a u32) in practice, so this conversion never truncates a real frame.
+    let frame_len = u32::try_from(frame_len).unwrap_or(u32::MAX);
+    out[frame_start..frame_start + 4].copy_from_slice(&frame_len.to_le_bytes());
+    Ok(())
+}
+
 /// Decodes a DELIVER body. The payload is whatever remains after the framed fields, so
 /// `body` MUST be exactly one frame's body.
 ///
@@ -3853,6 +3900,95 @@ mod tests {
         let (eh, eb) = decode_deliver_batch(&ebuf).unwrap();
         assert_eq!(eh, empty_header);
         assert!(eb.is_empty());
+    }
+
+    #[test]
+    fn encode_deliver_frame_is_byte_identical_to_the_two_copy_path() {
+        // L6 / #812: the single-pass per-record `Deliver` frame encoder must be byte-for-byte identical
+        // to the old `reply` path — `encode_frame(Deliver, &encode_deliver(...))` — so the on-wire frame
+        // is unchanged; it merely drops the intermediate frame-body Vec and one per-record memcpy.
+        use crate::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
+        // Cover a non-empty key, non-empty headers, and a payload — the full variable-length body — plus
+        // a distinctive generation so the fencing token round-trips.
+        let cases: &[DeliverBody<'_>] = &[
+            DeliverBody {
+                offset: 0xDEAD_BEEF_0102_0304,
+                generation: 0x0A0B_0C0D_0E0F_1011,
+                flags: 0x5A,
+                timestamp_ms: 0x0011_2233_4455_6677,
+                key: b"routing-key",
+                headers: b"content-type=app/x",
+                payload: b"the-delivered-payload-bytes",
+            },
+            // The all-empty variable fields (no key, no headers, empty payload): the minimal body.
+            DeliverBody {
+                offset: 0,
+                generation: 0,
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"",
+            },
+        ];
+        for msg in cases {
+            // OLD path: build the body Vec, then frame it.
+            let mut body = Vec::new();
+            encode_deliver(msg, &mut body).unwrap();
+            let mut old_frame = Vec::new();
+            encode_frame(FrameType::Deliver, &body, &mut old_frame).unwrap();
+
+            // NEW path: one pass directly into the buffer.
+            let mut new_frame = Vec::new();
+            encode_deliver_frame(msg, &mut new_frame).unwrap();
+
+            assert_eq!(
+                new_frame, old_frame,
+                "the single-pass Deliver frame is byte-identical to the two-copy path"
+            );
+
+            // And it decodes back through the normal frame + body path, unchanged.
+            let FrameDecode::Frame {
+                type_tag,
+                body: decoded_body,
+                consumed,
+            } = decode_frame(&new_frame).unwrap()
+            else {
+                panic!("a complete frame must decode");
+            };
+            assert_eq!(consumed, new_frame.len());
+            assert_eq!(FrameType::from_u8(type_tag), Some(FrameType::Deliver));
+            assert_eq!(&decode_deliver(decoded_body).unwrap(), msg);
+
+            // Appending into a NON-EMPTY buffer appends the frame without disturbing the existing bytes.
+            let mut buf = vec![0xAA, 0xBB];
+            encode_deliver_frame(msg, &mut buf).unwrap();
+            assert_eq!(&buf[..2], &[0xAA, 0xBB]);
+            assert_eq!(&buf[2..], new_frame.as_slice());
+        }
+
+        // A key over u16::MAX is a FieldTooLarge error, and it rolls the partial frame off `out`, leaving
+        // any pre-existing bytes untouched (byte-for-byte the `encode_deliver` FieldTooLarge behavior).
+        let huge = vec![0u8; usize::from(u16::MAX) + 1];
+        let msg = DeliverBody {
+            offset: 1,
+            generation: 2,
+            flags: 3,
+            timestamp_ms: 4,
+            key: &huge,
+            headers: b"",
+            payload: b"",
+        };
+        let mut buf = vec![0x11, 0x22];
+        assert!(matches!(
+            encode_deliver_frame(&msg, &mut buf),
+            Err(BodyError::FieldTooLarge)
+        ));
+        assert_eq!(
+            buf,
+            vec![0x11, 0x22],
+            "a failed encode leaves `out` untouched"
+        );
     }
 
     #[test]
