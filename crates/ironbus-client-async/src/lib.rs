@@ -548,6 +548,7 @@ impl AsyncClient {
                 // client's body, so a `--compression` broker ships this decode-capable client
                 // stored-compressed records verbatim.
                 understands_compressed_delivery: config.understands_compressed_delivery,
+                wants_subject_filter: false,
             },
             &mut connect_body,
         );

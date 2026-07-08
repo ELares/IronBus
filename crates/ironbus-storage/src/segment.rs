@@ -12,8 +12,9 @@ use crate::loss::{CapViolation, ReasonCode};
 use bytes::{Bytes, BytesMut};
 use ironbus_core::codec::{self, BodyChecksums, DecodeError, RecordView};
 use ironbus_core::format::{
-    COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_TRAILER_LEN, RECORD_XXH3_LEN,
-    SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, XXH3_PAYLOAD_THRESHOLD,
+    COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX,
+    RECORD_TRAILER_LEN, RECORD_XXH3_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
+    XXH3_PAYLOAD_THRESHOLD,
 };
 use ironbus_core::segment::{CompactionMeta, SegmentError, SegmentFooter, SegmentHeader};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
@@ -341,6 +342,12 @@ pub struct OwnedRecord {
     pub headers: Bytes,
     /// The record payload. A refcounted slice of the shared read buffer.
     pub payload: Bytes,
+    /// The stored SUBJECT this record was published on (#594), or EMPTY when the record carries no
+    /// subject (a plain `Pub`/`PubTo`). A refcounted slice of the shared read buffer, populated by
+    /// the materializing read path via [`ironbus_core::codec::decode_with_subject`]. The
+    /// subject-filtered consumer tests each record's subject against the group's pattern; a record
+    /// with no stored subject is treated as non-matching (never swallowed by a `>` catch-all).
+    pub subject: Bytes,
 }
 
 /// A CONTIGUOUS run of stored record frames returned WITHOUT materializing per-record
@@ -399,7 +406,7 @@ impl OwnedRecord {
     /// record built from it (its bytes are freed when the last slice drops). The view's slices were
     /// produced by `codec::decode`, which validates the whole frame's header and body CRC first, so a
     /// slice is only ever taken over an already-validated frame — never a window into a torn frame.
-    fn from_view(offset: Offset, buf: &Bytes, v: &RecordView<'_>) -> OwnedRecord {
+    fn from_view(offset: Offset, buf: &Bytes, v: &RecordView<'_>, subject: &[u8]) -> OwnedRecord {
         OwnedRecord {
             offset,
             seq: v.seq,
@@ -408,6 +415,10 @@ impl OwnedRecord {
             key: buf.slice_ref(v.key),
             headers: buf.slice_ref(v.headers),
             payload: buf.slice_ref(v.payload),
+            // The subject (#594) is a slice of the SAME shared read buffer the view borrows (it was
+            // decoded by `decode_with_subject` from `buf`), so this is one more refcount bump, no
+            // copy. Empty for a record with no stored subject.
+            subject: buf.slice_ref(subject),
         }
     }
 
@@ -425,7 +436,15 @@ impl OwnedRecord {
         } else {
             0
         };
-        RECORD_HEADER_LEN + body_len + xxh3_field + RECORD_TRAILER_LEN
+        // The optional subject field (#594) is counted in the frame size like the xxh3 field: a
+        // 2-byte length prefix, the subject bytes, and a 4-byte CRC, present only for a record that
+        // carries a stored subject. Empty subject adds nothing, so a plain record is unchanged.
+        let subject_field = if self.subject.is_empty() {
+            0
+        } else {
+            RECORD_SUBJECT_LEN_PREFIX + self.subject.len() + RECORD_SUBJECT_CRC_LEN
+        };
+        RECORD_HEADER_LEN + subject_field + body_len + xxh3_field + RECORD_TRAILER_LEN
     }
 }
 
@@ -582,6 +601,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         &mut self,
         offset: Offset,
         record: &RecordView<'_>,
+        subject: &[u8],
     ) -> Result<Offset, StorageError> {
         if self.record_count == u32::MAX {
             return Err(StorageError::SegmentFull);
@@ -596,7 +616,15 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         // `seal_compacted` flushes the pending tail before the footer, so the records are durably
         // in the file ahead of the commit (the footer/meta ordering is preserved).
         let before = self.pending.len();
-        if codec::encode(record, &mut self.pending).is_err() {
+        // Preserve a survivor's stored subject through compaction (#594): a non-empty subject
+        // re-encodes with the subject-storing codec path so the compacted copy keeps its subject
+        // field; an empty subject is byte-for-byte the historical re-encode.
+        let encoded = if subject.is_empty() {
+            codec::encode(record, &mut self.pending)
+        } else {
+            codec::encode_with_subject(record, subject, &mut self.pending)
+        };
+        if encoded.is_err() {
             self.pending.truncate(before);
             return Err(StorageError::SegmentFull);
         }
@@ -715,7 +743,35 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     /// overflow, [`StorageError::Record`] if the record is too large to frame, or an
     /// IO error from the write.
     pub fn append(&mut self, record: &RecordView<'_>) -> Result<Offset, StorageError> {
-        self.append_encoded(record, None)
+        self.append_encoded(record, b"", None)
+    }
+
+    /// Appends one record ALSO storing `subject` as the optional subject field (#594). Identical to
+    /// [`SegmentWriter::append`] except the frame carries the stored subject (with its own CRC); an
+    /// EMPTY `subject` is byte-for-byte [`SegmentWriter::append`].
+    ///
+    /// # Errors
+    /// Same as [`SegmentWriter::append`].
+    pub fn append_with_subject(
+        &mut self,
+        record: &RecordView<'_>,
+        subject: &[u8],
+    ) -> Result<Offset, StorageError> {
+        self.append_encoded(record, subject, None)
+    }
+
+    /// The precomputed-body-checksum twin of [`SegmentWriter::append_with_subject`] (#594/#830):
+    /// stores `subject` while trusting the caller-supplied body `checksums`.
+    ///
+    /// # Errors
+    /// Same as [`SegmentWriter::append`].
+    pub fn append_precomputed_with_subject(
+        &mut self,
+        record: &RecordView<'_>,
+        subject: &[u8],
+        checksums: BodyChecksums,
+    ) -> Result<Offset, StorageError> {
+        self.append_encoded(record, subject, Some(checksums))
     }
 
     /// Appends one record whose body checksums were PRE-COMPUTED off the single-writer actor on the
@@ -734,7 +790,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         record: &RecordView<'_>,
         checksums: BodyChecksums,
     ) -> Result<Offset, StorageError> {
-        self.append_encoded(record, Some(checksums))
+        self.append_encoded(record, b"", Some(checksums))
     }
 
     /// The shared body behind [`SegmentWriter::append`] and [`SegmentWriter::append_precomputed`]:
@@ -744,6 +800,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     fn append_encoded(
         &mut self,
         record: &RecordView<'_>,
+        subject: &[u8],
         precomputed: Option<BodyChecksums>,
     ) -> Result<Offset, StorageError> {
         if self.record_count == u32::MAX {
@@ -761,9 +818,20 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         // intermediate copy. The bytes reach the file at the next flush point; on encode failure
         // the buffer is truncated back so a rejected record leaves no partial frame behind.
         let before = self.pending.len();
-        let encoded = match precomputed {
-            Some(checksums) => codec::encode_precomputed(record, checksums, &mut self.pending),
-            None => codec::encode(record, &mut self.pending),
+        // A non-empty subject routes to the subject-storing codec path (#594), which lays down the
+        // optional subject field; an empty subject is byte-for-byte the historical frame.
+        let encoded = match (precomputed, subject.is_empty()) {
+            (Some(checksums), true) => {
+                codec::encode_precomputed(record, checksums, &mut self.pending)
+            }
+            (None, true) => codec::encode(record, &mut self.pending),
+            (Some(checksums), false) => codec::encode_precomputed_with_subject(
+                record,
+                subject,
+                checksums,
+                &mut self.pending,
+            ),
+            (None, false) => codec::encode_with_subject(record, subject, &mut self.pending),
         };
         if encoded.is_err() {
             self.pending.truncate(before);
@@ -1314,7 +1382,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         while cursor < body.len() {
             // A torn or corrupt frame ends the valid prefix; recovery skips the rest.
             // The bounded-loss report is produced by a later layer.
-            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+            let Ok((view, subject, consumed)) = codec::decode_with_subject(&body[cursor..]) else {
                 clean = false;
                 break;
             };
@@ -1325,8 +1393,9 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                     .saturating_add(records.len() as u64),
             );
             // The decode above validated the whole frame's CRC, so the view's slices are over an
-            // already-validated frame; `from_view` then refcount-slices them out of `body`.
-            records.push(OwnedRecord::from_view(offset, &body, &view));
+            // already-validated frame; `from_view` then refcount-slices them (and the subject, #594)
+            // out of `body`.
+            records.push(OwnedRecord::from_view(offset, &body, &view, subject));
             cursor += consumed;
         }
         Ok((records, cursor as u64, clean))
@@ -1526,6 +1595,21 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             // frame and full-CRC-validate it, exactly as the streaming recovery scan does.
             scratch.resize(RECORD_HEADER_LEN, 0);
             self.file.read_exact_at(&mut scratch, pos)?;
+            // A HAS_SUBJECT record (#594) carries a subject-length prefix immediately after the
+            // header, and the header-only length walk needs those extra bytes to size the frame.
+            // Read them into `scratch` before `decoded_len` when the flag is set and the region is
+            // long enough; a shorter region is a torn tail, which `decoded_len` then reports as
+            // Truncated (clean=false) below, exactly like any incomplete frame.
+            if RecordFlags::from_bits(scratch[ironbus_core::format::header_offsets::FLAGS])
+                .contains(RecordFlags::HAS_SUBJECT)
+                && remaining >= (RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX) as u64
+            {
+                scratch.resize(RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX, 0);
+                self.file.read_exact_at(
+                    &mut scratch[RECORD_HEADER_LEN..],
+                    pos + RECORD_HEADER_LEN as u64,
+                )?;
+            }
             let Ok(total) = codec::decoded_len(&scratch) else {
                 clean = false;
                 break;
@@ -1645,7 +1729,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let mut next_offset = start_offset.get();
         while cursor < body.len() && records.len() < max {
             // The SAME CRC-gated decode `scan_body` uses: a torn or corrupt frame ends the prefix.
-            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+            let Ok((view, subject, consumed)) = codec::decode_with_subject(&body[cursor..]) else {
                 break;
             };
             // Byte cap: stop BEFORE a record that would push the accumulated encoded frame bytes
@@ -1662,6 +1746,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 Offset::new(next_offset),
                 &body,
                 &view,
+                subject,
             ));
             next_offset = next_offset.saturating_add(1);
             cursor += consumed;
@@ -1834,7 +1919,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let mut max_timestamp_ms = 0u64;
         let mut prev_seq: Option<u64> = None;
         while cursor < body.len() {
-            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+            let Ok((view, subject, consumed)) = codec::decode_with_subject(&body[cursor..]) else {
                 // A torn or corrupt frame inside a COMMITTED compacted segment is bit-rot of acked
                 // data, NOT a crash-before-commit torn tail: the trailing footer AND meta block both
                 // decoded CRC-VALID above (~line 1663-1670), which PROVES this segment reached its
@@ -1866,7 +1951,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             let offset = Offset::new(base_off.wrapping_add(seq.wrapping_sub(base_seq)));
             max_timestamp_ms = max_timestamp_ms.max(view.timestamp_ms);
             // Frame CRC-validated by the decode above before the slice is taken.
-            records.push(OwnedRecord::from_view(offset, &body, &view));
+            records.push(OwnedRecord::from_view(offset, &body, &view, subject));
             cursor += consumed;
         }
         // The footer must describe THIS body and bind to THIS segment id.
@@ -2066,7 +2151,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let mut byte_total = 0usize;
         while cursor < body.len() && records.len() < max {
             // The SAME CRC-gated decode `scan_compacted` uses: a torn or corrupt frame ends the read.
-            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+            let Ok((view, subject, consumed)) = codec::decode_with_subject(&body[cursor..]) else {
                 break;
             };
             // Byte cap: stop BEFORE a survivor that would exceed `max_bytes`, but always admit the
@@ -2082,7 +2167,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             let seq = view.seq.get();
             let offset = Offset::new(base_off.wrapping_add(seq.wrapping_sub(base_seq)));
             // Frame CRC-validated by the decode above before the slice is taken.
-            records.push(OwnedRecord::from_view(offset, &body, &view));
+            records.push(OwnedRecord::from_view(offset, &body, &view, subject));
             cursor += consumed;
         }
         Ok(records)
@@ -3483,7 +3568,7 @@ mod tests {
             // advances synchronously even though the frame group-commits at seal).
             positions.push(w.write_pos());
             let off = Offset::new(base_offset + (s - base_seq));
-            w.append_at(off, &rec(s, &[u8::try_from(i).unwrap(); 6]))
+            w.append_at(off, &rec(s, &[u8::try_from(i).unwrap(); 6]), b"")
                 .unwrap();
         }
         let footer_start = w.write_pos();

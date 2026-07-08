@@ -9,4 +9,8 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     let _ = ironbus_core::codec::decode(data);
     let _ = ironbus_core::codec::decoded_len(data);
+    // #594: the subject-recovering decode path is on the filtered-delivery hot path and reads the
+    // optional stored-subject field (length prefix, subject bytes, its own CRC) from the same
+    // untrusted bytes, so it must be equally panic-free on any input.
+    let _ = ironbus_core::codec::decode_with_subject(data);
 });

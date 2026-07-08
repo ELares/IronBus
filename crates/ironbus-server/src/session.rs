@@ -36,7 +36,7 @@ use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
 use ironbus_core::lease::LeaseToken;
 use ironbus_core::resolve_cache::ResolveCache;
-use ironbus_core::subject::Subject;
+use ironbus_core::subject::{Subject, SubjectPattern};
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
@@ -389,6 +389,13 @@ pub struct Session {
     /// (backward-compatible): the safe choice for an unmarked consumer even on a `--compression lz4`
     /// broker.
     compressed_delivery_enabled: bool,
+    /// Whether this connection negotiated per-subject FILTERED consume (#594, V2-M2): set at `Connect`
+    /// time when the client advertised [`ironbus_proto::message::CONNECT_FLAG2_WANTS_SUBJECT_FILTER`].
+    /// When `true`, a `SubSubject` with `filter_mode = 1` is honored (the subject pattern is bound as
+    /// the work-group's filter). When `false` (an old client, one that opts out, or the empty `Connect`
+    /// body) the server FAIL-CLOSED rejects a filtered `SubSubject` with a typed error — an old client
+    /// can never be silently placed in filtered mode and shown a subset of the stream. Default `false`.
+    subject_filter_enabled: bool,
     /// The NAMED stream this connection's consume path is bound to (#588, M2-I10), `""` (the default
     /// stream) until a `SubTo` binds a named one. A `SubTo` sets BOTH this and `subscription` (the
     /// work-group within the stream); a plain `Sub`/`Unsub` resets it to the default stream. The Flow
@@ -1267,6 +1274,9 @@ impl Session {
         // pre-#430 consumer that would mis-decode the descriptor bytes never receives them — even on a
         // `--compression lz4` broker. This is the silent-corruption fix: the safe default is uncompressed.
         self.compressed_delivery_enabled = req.understands_compressed_delivery;
+        // The per-subject filtered-consume capability (#594): only a client that advertised this may
+        // send a filtered `SubSubject`; otherwise a filtered subscribe is fail-closed rejected.
+        self.subject_filter_enabled = req.wants_subject_filter;
         // A repeated Connect re-negotiates idempotently: reset the active named stream to the default
         // so a re-handshake never leaves a stale named-stream binding from a prior negotiation.
         self.stream = GroupName::default();
@@ -2319,6 +2329,15 @@ impl Session {
                             Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
                         }
                     }
+                    // A per-subject FILTERED run (#594): the group's durable cursor already advanced
+                    // past the whole non-matching span, so surface ONE coalesced gap marker (to a
+                    // gap-marker-capable consumer) and keep draining — the next poll delivers the match
+                    // after the run, exactly as the compaction-hole arm continues past a hole.
+                    Ok(Poll::Filtered { from, to }) => {
+                        if self.gap_marker_enabled {
+                            Self::emit_filtered_gap(out, &mut frame_body, from.get(), to.get());
+                        }
+                    }
                     // Nothing more deliverable right now: end the batch early.
                     Ok(Poll::Idle) => break,
                     Err(e) if e.is_fatal() => {
@@ -2595,6 +2614,14 @@ impl Session {
                     Ok(Poll::Compacted { from, to }) => {
                         if self.gap_marker_enabled {
                             Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
+                        }
+                    }
+                    // A per-subject FILTERED run (#594): the group cursor already advanced past the
+                    // non-matching span; surface ONE coalesced gap marker (to a capable consumer) and
+                    // keep draining, exactly as the compaction-hole arm does.
+                    Ok(Poll::Filtered { from, to }) => {
+                        if self.gap_marker_enabled {
+                            Self::emit_filtered_gap(out, &mut frame_body, from.get(), to.get());
                         }
                     }
                     // Nothing more deliverable right now: end the batch early (the no_wait / ready-now case).
@@ -3176,6 +3203,27 @@ impl Session {
                 to,
                 bytes_skipped: 0,
                 reason: gap_reason::COMPACTED,
+            },
+            frame_body,
+        );
+        reply(out, FrameType::GapMarker, frame_body);
+    }
+
+    /// Emits ONE coalesced FILTERED-skip gap marker (#594): a per-subject filtered consumer skipped
+    /// every offset in `[from, to)` because their stored subjects did not match the group filter (or
+    /// they carried no stored subject). Modeled byte-for-byte on [`Session::emit_compaction`] — the
+    /// same reusable scratch, the same single `GapMarker` frame — but with `reason = FILTERED`. Like
+    /// `emit_compaction` the `gap_marker_enabled` gate is at the CALL site: a non-capable consumer
+    /// takes the silent advance (the records are filtered either way, it just sees no marker).
+    /// `bytes_skipped` is `0`, matching the trim/compaction convention (the span is `to - from`).
+    fn emit_filtered_gap(out: &mut Vec<u8>, frame_body: &mut Vec<u8>, from: u64, to: u64) {
+        frame_body.clear();
+        encode_gap_marker(
+            &GapMarkerBody {
+                from,
+                to,
+                bytes_skipped: 0,
+                reason: gap_reason::FILTERED,
             },
             frame_body,
         );
@@ -4190,6 +4238,51 @@ impl Session {
             reply_err(out, "group name must be valid UTF-8");
             return Ok(());
         };
+        // PER-SUBJECT FILTERED consume (#594, filter_mode == 1): fail-closed on the capability, bind the
+        // subject PATTERN (wildcards allowed) as the work-group's filter, and consume the DEFAULT stream
+        // filtered. Scoped to the default stream this increment (D5); named-stream filtered consume is
+        // #594-B. A pre-#594 client (or one that opted out) can NEVER be silently placed in filtered
+        // mode — it is rejected with a typed error.
+        if decoded.filter_mode == 1 {
+            if !self.subject_filter_enabled {
+                reply_err(
+                    out,
+                    "subject filtering not negotiated (set wants_subject_filter)",
+                );
+                return Ok(());
+            }
+            // Validate the subject as a #567 PATTERN (wildcards allowed), distinct from the literal
+            // single-home resolve below. A malformed pattern is a typed reject, never a silent bind.
+            if let Err(e) = SubjectPattern::parse(subject) {
+                reply_err(out, &format!("invalid subject pattern: {e}"));
+                return Ok(());
+            }
+            // Store the pattern as the GROUP filter (D3: a per-group property shared by every consumer
+            // in the group, so the durable cursor stays coherent). The DEFAULT stream's group is used.
+            let group_owned = group.to_string();
+            let pattern_owned = subject.to_string();
+            let set = engine
+                .with(move |e| e.set_subject_filter_in(&group_owned, Some(&pattern_owned)))?;
+            if let Err(e) = set {
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
+                return Ok(());
+            }
+            // Bind this connection's consume path to the DEFAULT stream and the requested work-group.
+            self.stream = GroupName::from("");
+            self.subscription = GroupName::from(group);
+            self.registered_subscription = false;
+            self.joined_key_shared = false;
+            self.leased.clear();
+            reply(out, FrameType::Ok, &[]);
+            return Ok(());
+        }
+        // A filter_mode byte the server does not understand (a future mode) on an old server is
+        // fail-closed rejected rather than silently treated as single-home, so a client can never
+        // believe it got a filtered/other bind it did not.
+        if decoded.filter_mode != 0 {
+            reply_err(out, "unsupported sub-subject filter_mode");
+            return Ok(());
+        }
         // Resolve the subject to its single bound stream INSIDE the actor (through this connection's
         // cache, moved in and back out). A wildcard subject is parsed as a literal here only for the
         // single-home walk — `Subject::parse_literal` rejects a wildcard, so a wildcard subject that the
@@ -4420,6 +4513,9 @@ fn resolve_then_produce<F: Filesystem + Clone, C: Clock + Clone>(
     let stream = resolve_subject_cached(engine, cache, subject)?;
     // Route the append to the resolved stream's log via the id-routed produce (the default stream `""`
     // routes byte-for-byte through `produce`; a named stream appends to its own log + commit tick).
+    // The literal subject is PERSISTED with the record (#594) so a per-subject filtered consumer on
+    // the default stream can match it; the subject was validated `Subject::parse_literal` at resolve.
+    // A named stream drops the subject for now (D5 scopes filtered consume to the default stream).
     let view = Append {
         timestamp_ms: append.timestamp_ms,
         flags: RecordFlags::from_bits(append.flags),
@@ -4427,7 +4523,7 @@ fn resolve_then_produce<F: Filesystem + Clone, C: Clock + Clone>(
         headers: &append.headers,
         payload: &append.payload,
     };
-    engine.produce_in_stream(stream.name(), &view)
+    engine.produce_in_stream_with_subject(stream.name(), &view, subject.as_bytes())
 }
 
 /// The #438 compressed-descriptor SHAPE gate, shared by ALL FOUR produce verbs (`handle_pub`,
@@ -5411,6 +5507,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: false,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut body,
         );
@@ -6632,6 +6729,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: false,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut body,
         );
@@ -6790,6 +6888,7 @@ mod tests {
                 understands_deliver_batch,
                 understands_streams: false,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut body,
         );
@@ -9826,6 +9925,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: false,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut connect_body,
         );
@@ -11531,6 +11631,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: false,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut connect_body,
         );
@@ -11836,6 +11937,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: true,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut body,
         );
@@ -11925,6 +12027,7 @@ mod tests {
             &ironbus_proto::message::SubSubjectBody {
                 subject: b"order.us.created",
                 group: b"workers",
+                filter_mode: 0,
             },
             &mut subsub,
         )
@@ -12127,6 +12230,256 @@ mod tests {
         let (ty, body) = one_response(&out);
         assert_eq!(ty, FrameType::Err);
         assert!(String::from_utf8_lossy(&body).contains("not negotiated"));
+    }
+
+    // =================================================================================
+    // #594 (V2-M2): per-subject FILTERED consumer on the DEFAULT stream over the wire.
+    // A client advertises the filter + gap-marker capabilities, binds a broad pattern to the
+    // default stream, publishes an interleaved multi-subject stream, then a filtered SubSubject
+    // delivers ONLY matching records with ONE coalesced GapMarker(reason=FILTERED) per skipped run.
+    // =================================================================================
+
+    /// A Connect body advertising the streams, gap-marker, AND subject-filter capabilities (#594):
+    /// required to use a filtered `SubSubject` and to observe the `GapMarker(reason=FILTERED)` frames.
+    fn filtered_connect_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: true,
+                default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
+                understands_deliver_batch: false,
+                understands_streams: true,
+                understands_compressed_delivery: false,
+                wants_subject_filter: true,
+            },
+            &mut body,
+        );
+        body
+    }
+
+    /// Connects a filter-capable session against a fresh direct engine (#594).
+    fn connect_filtered() -> (DirectEngine<InMemoryFs, ManualClock>, Session, Vec<u8>) {
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &filtered_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+        out.clear();
+        (e, s, out)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn subject_filtered_consumer_delivers_only_matches_with_coalesced_gap_markers_over_the_wire() {
+        let (e, mut s, mut out) = connect_filtered();
+        // Bind a broad pattern to the DEFAULT stream ("") so several subjects can be published there.
+        let mut bind = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: b"",
+                pattern: b"msg.>",
+            },
+            &mut bind,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "bind to default stream"
+        );
+        out.clear();
+
+        // Build a PubSubject frame for a subject+payload (pure, no borrows).
+        let ps = |subject: &[u8], payload: &[u8]| -> Vec<u8> {
+            let mut p = Vec::new();
+            ironbus_proto::message::encode_pub_subject(
+                &ironbus_proto::message::PubSubjectBody {
+                    subject,
+                    pub_body: &pub_body(payload),
+                },
+                &mut p,
+            )
+            .unwrap();
+            frame(FrameType::PubSubject, &p)
+        };
+        // Publish an INTERLEAVED multi-subject stream on the default stream (offsets 0..6):
+        // MATCH, non, plain (no subject -> non-matching by D2), MATCH, non, MATCH.
+        for f in [
+            ps(b"msg.orders.a", b"A"), // 0 MATCH
+            ps(b"msg.audit.x", b"X"),  // 1 non-match
+        ] {
+            s.process(&e, &f, &mut out).unwrap();
+            assert_eq!(one_response(&out).0, FrameType::PubAck);
+            out.clear();
+        }
+        // A plain Pub (NO subject) lands in the default stream and is non-matching by D2.
+        s.process(&e, &frame(FrameType::Pub, &pub_body(b"P")), &mut out)
+            .unwrap(); // 2 plain
+        out.clear();
+        for f in [
+            ps(b"msg.orders.b", b"B"), // 3 MATCH
+            ps(b"msg.audit.y", b"Y"),  // 4 non-match
+            ps(b"msg.orders.c", b"C"), // 5 MATCH
+        ] {
+            s.process(&e, &f, &mut out).unwrap();
+            assert_eq!(one_response(&out).0, FrameType::PubAck);
+            out.clear();
+        }
+        assert_eq!(
+            e.engine_mut().committed_offset_in("").get(),
+            0,
+            "the default group has not consumed yet"
+        );
+
+        // FILTERED subscribe: bind the pattern `msg.orders.*` as the group filter (filter_mode = 1).
+        let mut subsub = Vec::new();
+        ironbus_proto::message::encode_sub_subject(
+            &ironbus_proto::message::SubSubjectBody {
+                subject: b"msg.orders.*",
+                group: b"w",
+                filter_mode: 1,
+            },
+            &mut subsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubSubject, &subsub), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "filtered subscribe accepted"
+        );
+        out.clear();
+        assert_eq!(
+            e.engine_mut().subject_filter_in("w"),
+            Some("msg.orders.*"),
+            "the pattern became the group filter"
+        );
+
+        // A Flow drains the filtered subscription: only the matching subjects are delivered, with ONE
+        // coalesced GapMarker(reason=FILTERED) per run of skipped offsets.
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let frames = decode_all(&out);
+        let payloads: Vec<Vec<u8>> = frames
+            .iter()
+            .filter(|(t, _)| *t == FrameType::Deliver)
+            .map(|(_, b)| decode_deliver(b).unwrap().payload.to_vec())
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            "only records whose subject matched were delivered: {frames:?}"
+        );
+        let markers: Vec<_> = frames
+            .iter()
+            .filter(|(t, _)| *t == FrameType::GapMarker)
+            .map(|(_, b)| ironbus_proto::message::decode_gap_marker(b).unwrap())
+            .collect();
+        assert_eq!(
+            markers.len(),
+            2,
+            "ONE coalesced gap marker per skipped run: {frames:?}"
+        );
+        assert!(
+            markers
+                .iter()
+                .all(|m| m.reason == ironbus_proto::message::gap_reason::FILTERED),
+            "each skip marker carries reason FILTERED"
+        );
+        assert_eq!((markers[0].from, markers[0].to), (1, 3), "first run [1,3)");
+        assert_eq!((markers[1].from, markers[1].to), (4, 5), "second run [4,5)");
+        // The delivered matches (0, 3, 5) are in-flight (leased, awaiting the consumer's ack, the push
+        // path); the SKIPPED offsets (1, 2, 4) were committed-past by the filter, so the counter
+        // accounts exactly the three skips. (The durable cursor advance + restart survival is proven
+        // end-to-end in the engine-level `a_subject_filtered_group_..._survives_restart` test.)
+        assert_eq!(
+            e.engine_mut().counters().filtered,
+            3,
+            "three offsets filtered"
+        );
+    }
+
+    #[test]
+    fn a_filtered_sub_subject_without_the_capability_is_fail_closed_rejected_over_the_wire() {
+        // A streams-capable client that did NOT advertise wants_subject_filter is REFUSED a filtered
+        // SubSubject with a typed Err — an old client can never be silently placed in filtered mode.
+        let (e, mut s, mut out) = connect_streams(); // streams but NOT subject-filter
+        let mut subsub = Vec::new();
+        ironbus_proto::message::encode_sub_subject(
+            &ironbus_proto::message::SubSubjectBody {
+                subject: b"msg.orders.*",
+                group: b"w",
+                filter_mode: 1,
+            },
+            &mut subsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubSubject, &subsub), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "a filtered subscribe without the capability is rejected"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("not negotiated"));
+        assert_eq!(
+            e.engine_mut().subject_filter_in("w"),
+            None,
+            "no filter was bound on the rejected subscribe"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_in_a_published_subject_is_rejected_over_the_wire() {
+        // The publish side is LITERAL-only: a wildcard in a PUBLISHED subject is rejected by
+        // `Subject::parse_literal` (fail-closed), never stored, even for a filter-capable client.
+        let (e, mut s, mut out) = connect_filtered();
+        let mut bind = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: b"",
+                pattern: b"msg.>",
+            },
+            &mut bind,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+            .unwrap();
+        out.clear();
+        let mut p = Vec::new();
+        ironbus_proto::message::encode_pub_subject(
+            &ironbus_proto::message::PubSubjectBody {
+                subject: b"msg.*", // a WILDCARD on the publish side
+                pub_body: &pub_body(b"x"),
+            },
+            &mut p,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::PubSubject, &p), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a wildcard in a published subject is rejected"
+        );
+        assert_eq!(
+            e.engine_mut().stream_head("").get(),
+            0,
+            "nothing was published"
+        );
     }
 
     #[test]
@@ -13081,6 +13434,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: true,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut body,
         );

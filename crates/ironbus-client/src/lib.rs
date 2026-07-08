@@ -1350,6 +1350,7 @@ impl Client {
                 // client verbatim; a caller wrapping a legacy consumer sets it `false` to force the
                 // broker to decompress before delivery.
                 understands_compressed_delivery: config.understands_compressed_delivery,
+                wants_subject_filter: false,
             },
             &mut connect_body,
         );
@@ -3436,6 +3437,9 @@ impl Client {
             &SubSubjectBody {
                 subject: subject.as_bytes(),
                 group: group.as_bytes(),
+                // The sync client subscribes single-home for now (#594); filtered consume is a
+                // client follow-up, so it never advertises the capability or sends filter_mode = 1.
+                filter_mode: 0,
             },
             &mut body,
         )

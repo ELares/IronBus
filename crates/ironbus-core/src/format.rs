@@ -14,6 +14,18 @@
 //! the field existed, so 8-byte-trailer parsing and `total_len`-authoritative framing
 //! are unchanged for it. CRC32C remains the resync-gating checksum.
 //!
+//! A record published on a SUBJECT (#594, V2-M2) carries the stored subject in an optional
+//! length-prefixed field signalled by the [`RecordFlags::HAS_SUBJECT`] bit: a
+//! [`RECORD_SUBJECT_LEN_PREFIX`]-byte `subject_len`, the subject bytes, then a
+//! [`RECORD_SUBJECT_CRC_LEN`]-byte CRC32C over the prefix and the subject. It sits IMMEDIATELY
+//! after the 36-byte header (at the fixed offset [`RECORD_HEADER_LEN`]) and BEFORE the stored
+//! body, and is counted in `total_len`. The fixed offset is what lets the header-only length
+//! walk read `subject_len` and size the whole frame from the header plus this prefix alone. A
+//! record WITHOUT the bit is byte-for-byte the pre-subject layout, and the body CRC32C/xxh3 and
+//! their threshold are computed over the stored body EXACTLY as before (the subject has its own
+//! CRC and never enters the body-checksum range). Because the bit is additive and an old reader
+//! never sets it (nor writes it), the on-disk [`FORMAT_VERSION`] stays `1`.
+//!
 //! This module defines only the layout constants and field offsets. Encoding and
 //! decoding live in a separate module so the numbers here are the single source of
 //! truth that both the codec and its tests refer to.
@@ -34,6 +46,22 @@ pub const RECORD_TRAILER_LEN: usize = 8;
 /// Size in bytes of the optional xxh3-64 checksum field (`xxh3: u64`, little-endian)
 /// that precedes the trailer on a record carrying the [`RecordFlags::HAS_XXH3`] bit.
 pub const RECORD_XXH3_LEN: usize = 8;
+
+/// Size in bytes of the length prefix (`subject_len: u16`, little-endian) that OPENS the optional
+/// subject field of a record carrying the [`RecordFlags::HAS_SUBJECT`] bit (#594, V2-M2). The
+/// subject field is `subject_len` then `subject_len` subject bytes then a [`RECORD_SUBJECT_CRC_LEN`]
+/// -byte CRC32C, placed immediately AFTER the 36-byte header and BEFORE the stored body, and counted
+/// in `total_len`. It sits at a FIXED offset ([`RECORD_HEADER_LEN`]) so the header-only length walk
+/// ([`crate::codec::decoded_len`]) can read `subject_len` and size the frame from the header plus
+/// this prefix alone. A record WITHOUT the bit is byte-for-byte the pre-subject layout.
+pub const RECORD_SUBJECT_LEN_PREFIX: usize = 2;
+
+/// Size in bytes of the CRC32C field that CLOSES the optional subject field of a record carrying the
+/// [`RecordFlags::HAS_SUBJECT`] bit (#594): `4`. It covers the `subject_len` prefix and the subject
+/// bytes (the bytes in `[RECORD_HEADER_LEN, RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX +
+/// subject_len)`), so a corrupted STORED subject is caught independently of the body CRC — the body
+/// CRC32C/xxh3 machinery and the stored-body layout stay byte-for-byte unchanged by the subject.
+pub const RECORD_SUBJECT_CRC_LEN: usize = 4;
 
 /// The byte range of the header that the `header_crc` field protects: `[0, 32)`.
 pub const RECORD_HEADER_CRC_RANGE: core::ops::Range<usize> = 0..32;

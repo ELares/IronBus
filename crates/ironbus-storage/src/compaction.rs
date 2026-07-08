@@ -309,8 +309,9 @@ where
             payload: &rec.payload,
         };
         // Write each survivor at its ORIGINAL offset/seq (no renumber). The writer keeps the
-        // sparse last_seq so the footer pins the last survivor's true sequence.
-        writer.append_at(rec.offset, &view)?;
+        // sparse last_seq so the footer pins the last survivor's true sequence. The survivor's
+        // stored subject (#594) is preserved so a compacted record still matches subject filters.
+        writer.append_at(rec.offset, &view, &rec.subject)?;
         last_seq = rec.seq;
     }
     let footer = SegmentFooter {

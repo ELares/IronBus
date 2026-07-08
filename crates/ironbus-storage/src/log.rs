@@ -258,6 +258,11 @@ enum AppendSource<'a> {
     Encode {
         record: &'a Append<'a>,
         precomputed: Option<BodyChecksums>,
+        /// The stored SUBJECT for this record (#594), or EMPTY for a plain publish. Carried
+        /// alongside the record (rather than on [`Append`]) so every existing produce path is
+        /// byte-for-byte unchanged and only the by-subject produce threads a non-empty value; it
+        /// routes to the subject-storing codec path in `write_source`.
+        subject: &'a [u8],
     },
     /// Copy an already-sealed, already-validated frame verbatim (via
     /// [`SegmentWriter::append_verbatim`]), skipping the redundant re-encode + re-checksum. `frame`
@@ -2668,6 +2673,50 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             AppendSource::Encode {
                 record,
                 precomputed: None,
+                subject: b"",
+            },
+            true,
+        )
+    }
+
+    /// Appends one record ALSO storing `subject` as the optional subject field (#594), otherwise
+    /// identical to [`Log::append`] (same cap/budget/roll prologue, id reservation, seek-index and
+    /// write-amplification accounting). An EMPTY `subject` is byte-for-byte [`Log::append`]; a
+    /// non-empty subject is stored with its own CRC inside the CRC'd record frame, immediately after
+    /// the header. The caller validates the subject grammar at the wire boundary.
+    ///
+    /// # Errors
+    /// Same as [`Log::append`].
+    pub fn append_with_subject(
+        &mut self,
+        record: &Append<'_>,
+        subject: &[u8],
+    ) -> Result<Offset, StorageError> {
+        self.append_inner(
+            AppendSource::Encode {
+                record,
+                precomputed: None,
+                subject,
+            },
+            true,
+        )
+    }
+
+    /// The precomputed-body-checksum twin of [`Log::append_with_subject`] (#594/#830).
+    ///
+    /// # Errors
+    /// Same as [`Log::append`].
+    pub fn append_precomputed_with_subject(
+        &mut self,
+        record: &Append<'_>,
+        checksums: BodyChecksums,
+        subject: &[u8],
+    ) -> Result<Offset, StorageError> {
+        self.append_inner(
+            AppendSource::Encode {
+                record,
+                precomputed: Some(checksums),
+                subject,
             },
             true,
         )
@@ -2693,6 +2742,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             AppendSource::Encode {
                 record,
                 precomputed: Some(checksums),
+                subject: b"",
             },
             true,
         )
@@ -2739,6 +2789,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             AppendSource::Encode {
                 record,
                 precomputed: None,
+                subject: b"",
             },
             false,
         )
@@ -2795,6 +2846,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             AppendSource::Encode {
                 record,
                 precomputed,
+                subject,
             } => {
                 let view = RecordView {
                     seq,
@@ -2807,11 +2859,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 let writer = self.active.as_mut().ok_or(StorageError::WriterFrozen)?;
                 let pos_before = writer.write_pos();
                 // Offload the body checksum onto the producing connection thread when it precomputed
-                // it (#830); otherwise the codec computes it here as before. The framed bytes are
-                // identical.
-                let offset = match precomputed {
-                    Some(checksums) => writer.append_precomputed(&view, checksums)?,
-                    None => writer.append(&view)?,
+                // it (#830); otherwise the codec computes it here as before. A non-empty subject
+                // (#594) routes to the subject-storing writer path, which lays down the optional
+                // subject field; an empty subject is byte-for-byte the historical frame.
+                let offset = match (precomputed, subject.is_empty()) {
+                    (Some(checksums), true) => writer.append_precomputed(&view, checksums)?,
+                    (None, true) => writer.append(&view)?,
+                    (Some(checksums), false) => {
+                        writer.append_precomputed_with_subject(&view, subject, checksums)?
+                    }
+                    (None, false) => writer.append_with_subject(&view, subject)?,
                 };
                 (offset, pos_before)
             }

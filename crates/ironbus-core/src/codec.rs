@@ -18,7 +18,8 @@
 
 use crate::format::{
     header_offsets as off, FORMAT_VERSION, MAX_RECORD_BYTES_CEILING, RECORD_HEADER_CRC_RANGE,
-    RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_TRAILER_LEN, RECORD_XXH3_LEN, XXH3_PAYLOAD_THRESHOLD,
+    RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX,
+    RECORD_TRAILER_LEN, RECORD_XXH3_LEN, XXH3_PAYLOAD_THRESHOLD,
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{RecordFlags, Seq};
@@ -121,6 +122,12 @@ pub enum DecodeError {
     /// is verified first, so this is reached only when the body passed CRC32C but failed
     /// the independent xxh3-64 (or the xxh3-64 field itself was corrupted).
     BadXxh3,
+    /// The stored subject's CRC32C did not match: the optional subject field of a
+    /// [`RecordFlags::HAS_SUBJECT`] record is corrupt (#594). Distinct from the body
+    /// checksums so a caller can tell the subject field, not the body, caught it. The
+    /// subject field carries its own CRC (over `subject_len` + subject bytes), independent
+    /// of the body CRC, so a corrupted stored subject is caught even though the body is intact.
+    BadSubjectCrc,
     /// The encoded length fields are internally inconsistent.
     BadLength,
     /// The encoded total length exceeds the format ceiling of 1 GiB.
@@ -147,6 +154,7 @@ impl core::fmt::Display for DecodeError {
             DecodeError::BadHeaderCrc => write!(f, "record header CRC mismatch"),
             DecodeError::BadBodyCrc => write!(f, "record body CRC mismatch"),
             DecodeError::BadXxh3 => write!(f, "record body xxh3-64 mismatch"),
+            DecodeError::BadSubjectCrc => write!(f, "record stored-subject CRC mismatch"),
             DecodeError::BadLength => write!(f, "record frame has inconsistent length fields"),
             DecodeError::TooLarge => write!(f, "record frame exceeds the maximum size"),
         }
@@ -163,7 +171,42 @@ impl std::error::Error for DecodeError {}
 /// Returns [`EncodeError::TooLarge`] if the total framed size would exceed the
 /// 1 GiB format ceiling.
 pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeError> {
-    encode_impl(rec, None, out)
+    encode_impl(rec, b"", None, out)
+}
+
+/// Encodes `rec` like [`encode`] but ALSO stores `subject` as the optional length-prefixed subject
+/// field (#594): a `subject_len: u16`, the subject bytes, then a CRC32C over the two, placed
+/// immediately after the header and before the body, with the [`RecordFlags::HAS_SUBJECT`] header bit
+/// set. An EMPTY `subject` is byte-for-byte identical to [`encode`] (the bit stays clear and no field
+/// is written), so a plain `Pub` publishing no subject is unchanged. The subject bytes are stored
+/// verbatim (the caller validates the subject grammar at ingest); the body CRC32C/xxh3 machinery and
+/// its threshold are UNCHANGED — they still cover only `key ++ headers ++ payload`.
+///
+/// # Errors
+/// [`EncodeError::TooLarge`] if the total framed size would exceed the 1 GiB ceiling, or the subject
+/// length would not fit the `u16` prefix.
+pub fn encode_with_subject(
+    rec: &RecordView<'_>,
+    subject: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<usize, EncodeError> {
+    encode_impl(rec, subject, None, out)
+}
+
+/// The subject-storing twin of [`encode_precomputed`] (#594/#830): stores `subject` as the optional
+/// subject field while trusting the caller-supplied body `checksums`. The subject has its OWN CRC
+/// (computed here, over the tiny subject field), independent of the offloaded body checksums, so the
+/// two never interact.
+///
+/// # Errors
+/// Same as [`encode_with_subject`].
+pub fn encode_precomputed_with_subject(
+    rec: &RecordView<'_>,
+    subject: &[u8],
+    checksums: BodyChecksums,
+    out: &mut Vec<u8>,
+) -> Result<usize, EncodeError> {
+    encode_impl(rec, subject, Some(checksums), out)
 }
 
 /// Encodes `rec` like [`encode`], but TRUSTS the caller-supplied `checksums` for the body instead of
@@ -187,15 +230,18 @@ pub fn encode_precomputed(
     checksums: BodyChecksums,
     out: &mut Vec<u8>,
 ) -> Result<usize, EncodeError> {
-    encode_impl(rec, Some(checksums), out)
+    encode_impl(rec, b"", Some(checksums), out)
 }
 
-/// The shared framing core behind [`encode`] and [`encode_precomputed`]. When `precomputed` is
-/// `Some`, the body checksums are trusted (computed off-actor, #830); when `None`, they are computed
-/// here over the body bytes just laid down, exactly as before. Either way the emitted frame layout is
-/// identical.
+/// The shared framing core behind [`encode`] and [`encode_precomputed`] (and their subject-storing
+/// twins). When `precomputed` is `Some`, the body checksums are trusted (computed off-actor, #830);
+/// when `None`, they are computed here over the body bytes just laid down, exactly as before. A
+/// non-empty `subject` is stored as the optional length-prefixed subject field between the header and
+/// the body (#594), with its own CRC; an empty `subject` reproduces the pre-subject frame byte for
+/// byte. Either way the emitted frame layout is deterministic.
 fn encode_impl(
     rec: &RecordView<'_>,
+    subject: &[u8],
     precomputed: Option<BodyChecksums>,
     out: &mut Vec<u8>,
 ) -> Result<usize, EncodeError> {
@@ -203,13 +249,26 @@ fn encode_impl(
     let hdr_len = u32::try_from(rec.headers.len()).map_err(|_| EncodeError::TooLarge)?;
     let payload_len = u32::try_from(rec.payload.len()).map_err(|_| EncodeError::TooLarge)?;
 
+    // HAS_SUBJECT is derived from a non-empty subject (like HAS_KEY from the key); an empty subject
+    // writes no field and leaves the bit clear, so a plain publish is byte-identical to before. The
+    // subject-length prefix is a `u16`, so an oversized subject is a typed reject, never a panic.
+    let has_subject = !subject.is_empty();
+    let subject_len = u16::try_from(subject.len()).map_err(|_| EncodeError::TooLarge)?;
+    let subject_field = if has_subject {
+        RECORD_SUBJECT_LEN_PREFIX + subject.len() + RECORD_SUBJECT_CRC_LEN
+    } else {
+        0
+    };
+
     let body_len = rec.key.len() + rec.headers.len() + rec.payload.len();
     // The xxh3-64 field is added for a stored body at or above the threshold. `body_len`
     // is the stored size (the bytes actually written: key + headers + payload), so the
-    // checksum protects exactly what lands on disk. See `XXH3_PAYLOAD_THRESHOLD`.
+    // checksum protects exactly what lands on disk. See `XXH3_PAYLOAD_THRESHOLD`. The subject
+    // field is NOT part of the body: it is counted in `total_len` but excluded from the body
+    // length and the xxh3 threshold, so the body-checksum machinery is unchanged by the subject.
     let has_xxh3 = body_len >= XXH3_PAYLOAD_THRESHOLD as usize;
     let xxh3_field = if has_xxh3 { RECORD_XXH3_LEN } else { 0 };
-    let total = RECORD_HEADER_LEN + body_len + xxh3_field + RECORD_TRAILER_LEN;
+    let total = RECORD_HEADER_LEN + subject_field + body_len + xxh3_field + RECORD_TRAILER_LEN;
     let total_u32 = u32::try_from(total).map_err(|_| EncodeError::TooLarge)?;
     if total_u32 > MAX_RECORD_BYTES_CEILING {
         return Err(EncodeError::TooLarge);
@@ -228,6 +287,12 @@ fn encode_impl(
     } else {
         RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_XXH3.bits())
     };
+    // HAS_SUBJECT is likewise derived, from the subject presence (decode enforces the agreement).
+    flags = if has_subject {
+        flags.with(RecordFlags::HAS_SUBJECT)
+    } else {
+        RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_SUBJECT.bits())
+    };
 
     // Header bytes [0, 32), then the header CRC at [32, 36).
     let mut header = [0u8; RECORD_HEADER_LEN];
@@ -244,6 +309,17 @@ fn encode_impl(
 
     out.reserve(total);
     out.extend_from_slice(&header);
+    // The optional subject field (#594): `subject_len` (u16), the subject bytes, then a CRC32C over
+    // both. It sits at the fixed post-header offset so `decoded_len` can read `subject_len` from the
+    // header plus this prefix alone. `subject_crc` covers the length prefix and the subject bytes, so
+    // a corrupted stored subject is caught by its own CRC independently of the body CRC.
+    if has_subject {
+        let subj_field_start = out.len();
+        out.extend_from_slice(&subject_len.to_le_bytes());
+        out.extend_from_slice(subject);
+        let subject_crc = crc32c::crc32c(&out[subj_field_start..]);
+        out.extend_from_slice(&subject_crc.to_le_bytes());
+    }
     let body_start = out.len();
     out.extend_from_slice(rec.key);
     out.extend_from_slice(rec.headers);
@@ -291,10 +367,20 @@ fn encode_impl(
 /// same first half [`decode`] performs, so a header this rejects, `decode` rejects too;
 /// a `codec` test pins that the returned length equals `decode`'s consumed length.
 ///
+/// For a [`RecordFlags::HAS_SUBJECT`] record (#594) the frame length depends on the stored
+/// subject length, which is NOT in the fixed header: it is a `subject_len: u16` at the FIXED
+/// offset [`RECORD_HEADER_LEN`] (immediately after the header). So this needs
+/// `RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX` bytes for a subject record — the header plus
+/// that 2-byte prefix — and returns [`DecodeError::Truncated`] if given fewer. A record WITHOUT
+/// the bit needs only the 36-byte header, exactly as before. `subject_len` is validated by the
+/// subject CRC in [`decode`]; a corrupted prefix here yields a total that then fails `decode`
+/// (fail-closed: recovery ends the valid prefix at that frame).
+///
 /// # Errors
-/// Returns [`DecodeError::Truncated`] if `header` is shorter than a record header, and
-/// the corrupt variants ([`DecodeError::BadMagic`], [`DecodeError::UnsupportedVersion`],
-/// [`DecodeError::BadHeaderCrc`], [`DecodeError::TooLarge`]) for a bad or oversize header.
+/// Returns [`DecodeError::Truncated`] if `header` is shorter than a record header (or than the
+/// header plus the subject-length prefix for a subject record), and the corrupt variants
+/// ([`DecodeError::BadMagic`], [`DecodeError::UnsupportedVersion`], [`DecodeError::BadHeaderCrc`],
+/// [`DecodeError::TooLarge`]) for a bad or oversize header.
 pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
     if header.len() < RECORD_HEADER_LEN {
         return Err(DecodeError::Truncated);
@@ -310,9 +396,23 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
     if crc32c::crc32c(&header[RECORD_HEADER_CRC_RANGE]) != stored_header_crc {
         return Err(DecodeError::BadHeaderCrc);
     }
+    let flags = RecordFlags::from_bits(header[off::FLAGS]);
+    // The optional subject field (#594) is counted in `total_len` and sized by the `subject_len`
+    // prefix that follows the header. The flags byte is inside the CRC-protected range, so
+    // HAS_SUBJECT is trusted here; the prefix is at the fixed post-header offset so this needs
+    // exactly 2 more bytes than the plain header to learn the frame length.
+    let subject_field: u64 = if flags.contains(RecordFlags::HAS_SUBJECT) {
+        if header.len() < RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX {
+            return Err(DecodeError::Truncated);
+        }
+        let subject_len = u64::from(read_u16(header, RECORD_HEADER_LEN));
+        RECORD_SUBJECT_LEN_PREFIX as u64 + subject_len + RECORD_SUBJECT_CRC_LEN as u64
+    } else {
+        0
+    };
     // The flags byte is inside the CRC-protected range, so HAS_XXH3 is trusted here and
     // its 8-byte field is counted in `total_len`, matching `decode`.
-    let xxh3_field = if RecordFlags::from_bits(header[off::FLAGS]).contains(RecordFlags::HAS_XXH3) {
+    let xxh3_field = if flags.contains(RecordFlags::HAS_XXH3) {
         RECORD_XXH3_LEN as u64
     } else {
         0
@@ -323,6 +423,7 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
         + u64::from(read_u32(header, off::HDR_LEN))
         + u64::from(read_u32(header, off::PAYLOAD_LEN))
         + RECORD_HEADER_LEN as u64
+        + subject_field
         + xxh3_field
         + RECORD_TRAILER_LEN as u64;
     if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
@@ -345,6 +446,26 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
 /// [`DecodeError::Truncated`] means more bytes may complete the frame; the other
 /// variants mean the frame is corrupt and must be skipped by recovery.
 pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
+    let (view, _subject, total) = decode_inner(input)?;
+    Ok((view, total))
+}
+
+/// Decodes one record frame like [`decode`] and ADDITIONALLY returns the stored subject (#594): the
+/// subject bytes for a [`RecordFlags::HAS_SUBJECT`] record, or an EMPTY slice for a record without a
+/// stored subject (a plain `Pub`/`PubTo`). The filtered-consumer delivery path uses this to recover
+/// each record's subject; plain [`decode`] validates and skips the subject field but does not return
+/// it, so every existing caller is unchanged. The returned subject borrows `input` (zero-copy).
+///
+/// # Errors
+/// Same as [`decode`], plus [`DecodeError::BadSubjectCrc`] if the stored subject's own CRC fails.
+pub fn decode_with_subject(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
+    decode_inner(input)
+}
+
+/// The shared decoder behind [`decode`] and [`decode_with_subject`]. Validates the whole frame
+/// (header CRC, subject CRC if present, body CRC, xxh3 if present) and returns the view, the stored
+/// subject slice (empty when the record carries none), and the consumed byte count.
+fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
     if input.len() < RECORD_HEADER_LEN {
         return Err(DecodeError::Truncated);
     }
@@ -364,8 +485,30 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
     }
 
     // The flags byte is inside the CRC-protected header range, so by here it is trusted:
-    // HAS_XXH3 sizes the optional 8-byte checksum field that precedes the trailer.
+    // HAS_XXH3 sizes the optional xxh3 field and HAS_SUBJECT the optional subject field.
     let flags = RecordFlags::from_bits(input[off::FLAGS]);
+    let has_subject = flags.contains(RecordFlags::HAS_SUBJECT);
+    // The subject-length prefix sits at the fixed post-header offset. Read it BEFORE sizing the
+    // frame; the prefix itself is protected by the subject CRC (verified below), so a corrupted
+    // prefix surfaces as a bad total (Truncated / BadLength) or a subject-CRC mismatch — fail-closed.
+    let subject_len = if has_subject {
+        if input.len() < RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX {
+            return Err(DecodeError::Truncated);
+        }
+        read_u16(input, RECORD_HEADER_LEN) as usize
+    } else {
+        0
+    };
+    // A HAS_SUBJECT record with a zero-length subject is malformed (the bit is derived from a
+    // NON-empty subject on encode), caught here rather than admitting a contradictory frame.
+    if has_subject && subject_len == 0 {
+        return Err(DecodeError::BadLength);
+    }
+    let subject_field: usize = if has_subject {
+        RECORD_SUBJECT_LEN_PREFIX + subject_len + RECORD_SUBJECT_CRC_LEN
+    } else {
+        0
+    };
     let xxh3_field: usize = if flags.contains(RecordFlags::HAS_XXH3) {
         RECORD_XXH3_LEN
     } else {
@@ -375,14 +518,15 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
     let key_len_u32 = read_u32(input, off::KEY_LEN);
     let hdr_len_u32 = read_u32(input, off::HDR_LEN);
     let payload_len_u32 = read_u32(input, off::PAYLOAD_LEN);
-    // Sum the three attacker-controlled u32 lengths in u64 so the total cannot
-    // overflow usize on a 32-bit target before it is bounded by the ceiling. The
-    // optional xxh3 field is counted in `total_len`, so include it here too. The
-    // `usize as u64` widening of the small fixed field sizes never truncates.
+    // Sum the attacker-controlled u32 lengths in u64 so the total cannot overflow usize on a
+    // 32-bit target before it is bounded by the ceiling. The optional subject and xxh3 fields are
+    // counted in `total_len`, so include them here too. The `usize as u64` widening of the small
+    // fixed field sizes never truncates.
     let total64 = u64::from(key_len_u32)
         + u64::from(hdr_len_u32)
         + u64::from(payload_len_u32)
         + RECORD_HEADER_LEN as u64
+        + subject_field as u64
         + xxh3_field as u64
         + RECORD_TRAILER_LEN as u64;
     if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
@@ -395,7 +539,7 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
     }
     let key_len = usize::try_from(key_len_u32).map_err(|_| DecodeError::TooLarge)?;
     let hdr_len = usize::try_from(hdr_len_u32).map_err(|_| DecodeError::TooLarge)?;
-    let body_len = total - RECORD_HEADER_LEN - RECORD_TRAILER_LEN - xxh3_field;
+    let body_len = total - RECORD_HEADER_LEN - subject_field - RECORD_TRAILER_LEN - xxh3_field;
 
     // HAS_KEY is a derived, frozen bit: it must agree with the key length. A frame
     // where they disagree was written by a buggy or hostile writer.
@@ -408,9 +552,23 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
         return Err(DecodeError::BadLength);
     }
 
-    let body = &input[RECORD_HEADER_LEN..RECORD_HEADER_LEN + body_len];
-    let xxh3_bytes =
-        &input[RECORD_HEADER_LEN + body_len..RECORD_HEADER_LEN + body_len + xxh3_field];
+    // The optional subject field precedes the body (#594): validate its own CRC over the length
+    // prefix and subject bytes, so a corrupted stored subject is caught independently of the body.
+    let subject: &[u8] = if has_subject {
+        let field = &input[RECORD_HEADER_LEN..RECORD_HEADER_LEN + subject_field];
+        let subject = &field[RECORD_SUBJECT_LEN_PREFIX..RECORD_SUBJECT_LEN_PREFIX + subject_len];
+        let stored_subject_crc = read_u32(field, RECORD_SUBJECT_LEN_PREFIX + subject_len);
+        if crc32c::crc32c(&field[..RECORD_SUBJECT_LEN_PREFIX + subject_len]) != stored_subject_crc {
+            return Err(DecodeError::BadSubjectCrc);
+        }
+        subject
+    } else {
+        &[]
+    };
+
+    let body_start = RECORD_HEADER_LEN + subject_field;
+    let body = &input[body_start..body_start + body_len];
+    let xxh3_bytes = &input[body_start + body_len..body_start + body_len + xxh3_field];
     let trailer = &input[total - RECORD_TRAILER_LEN..total];
     let stored_body_crc = read_u32(trailer, 0);
     if u64::from(read_u32(trailer, 4)) != total64 {
@@ -437,7 +595,7 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
         headers: &body[key_len..key_len + hdr_len],
         payload: &body[key_len + hdr_len..],
     };
-    Ok((view, total))
+    Ok((view, subject, total))
 }
 
 #[cfg(test)]
@@ -836,6 +994,123 @@ mod tests {
         assert_eq!(c1 + c2, buf.len());
         assert_eq!(g2.seq, Seq::new(2));
         assert_eq!(g2.payload, b"two!");
+    }
+
+    // ---- #594 subject field ----
+
+    fn subject_rec(payload: &[u8]) -> RecordView<'_> {
+        RecordView {
+            seq: Seq::new(5),
+            timestamp_ms: 99,
+            flags: RecordFlags::EMPTY,
+            key: b"k",
+            headers: b"h",
+            payload,
+        }
+    }
+
+    #[test]
+    fn subject_round_trips_and_sets_the_flag() {
+        // A published subject is recovered verbatim, the HAS_SUBJECT bit is set, and the body
+        // fields are untouched. `decoded_len` (given the header + subject prefix) agrees with the
+        // consumed length, and the streaming-recovery slice sizing works.
+        let rec = subject_rec(b"hello");
+        let mut buf = Vec::new();
+        let n = encode_with_subject(&rec, b"orders.eu.42", &mut buf).unwrap();
+        assert_eq!(n, buf.len());
+        let (view, subject, consumed) = decode_with_subject(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(subject, b"orders.eu.42");
+        assert!(view.flags.contains(RecordFlags::HAS_SUBJECT));
+        assert_eq!(view.key, b"k");
+        assert_eq!(view.headers, b"h");
+        assert_eq!(view.payload, b"hello");
+        // The header-only length walk needs the 2-byte subject-length prefix past the header.
+        let prefix = &buf[..RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX];
+        assert_eq!(decoded_len(prefix).unwrap(), consumed);
+        // The bare 36-byte header is not enough to size a subject frame.
+        assert_eq!(
+            decoded_len(&buf[..RECORD_HEADER_LEN]),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn empty_subject_is_byte_identical_and_has_no_field() {
+        // Encoding with an empty subject reproduces `encode` byte-for-byte (the bit stays clear),
+        // and a plain record decodes to an empty subject with the flag clear.
+        let rec = subject_rec(b"payload");
+        let mut with = Vec::new();
+        encode_with_subject(&rec, b"", &mut with).unwrap();
+        let mut plain = Vec::new();
+        encode(&rec, &mut plain).unwrap();
+        assert_eq!(with, plain, "empty subject == plain encode");
+        let (view, subject, _) = decode_with_subject(&plain).unwrap();
+        assert!(subject.is_empty());
+        assert!(!view.flags.contains(RecordFlags::HAS_SUBJECT));
+    }
+
+    #[test]
+    fn base_decode_skips_the_subject_field() {
+        // The plain `decode` (used by every non-filtered reader and the client) parses a subject
+        // frame correctly, exposing the body fields, without returning the subject.
+        let rec = subject_rec(b"body-bytes");
+        let mut buf = Vec::new();
+        encode_with_subject(&rec, b"metrics.cpu", &mut buf).unwrap();
+        let (view, consumed) = decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(view.payload, b"body-bytes");
+        assert_eq!(view.key, b"k");
+        assert!(view.flags.contains(RecordFlags::HAS_SUBJECT));
+    }
+
+    #[test]
+    fn subject_crc_corruption_is_caught() {
+        // Flipping a subject byte fails the subject's own CRC (distinct from the body CRC), so a
+        // corrupted stored subject is detected even though the body is intact.
+        let rec = subject_rec(b"body");
+        let mut buf = Vec::new();
+        encode_with_subject(&rec, b"a.b.c", &mut buf).unwrap();
+        // The subject bytes start right after the header + 2-byte length prefix.
+        buf[RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX] ^= 0x01;
+        assert_eq!(decode(&buf), Err(DecodeError::BadSubjectCrc));
+        assert_eq!(decode_with_subject(&buf), Err(DecodeError::BadSubjectCrc));
+    }
+
+    #[test]
+    fn subject_with_xxh3_body_round_trips() {
+        // A subject record whose body is at/over the xxh3 threshold carries BOTH the subject field
+        // and the xxh3 field; both are recovered and the frame decodes cleanly.
+        let payload = vec![0x7Eu8; XXH3_PAYLOAD_THRESHOLD as usize];
+        let rec = subject_rec(&payload);
+        let mut buf = Vec::new();
+        let n = encode_with_subject(&rec, b"big.subject", &mut buf).unwrap();
+        assert_eq!(n, buf.len());
+        let (view, subject, consumed) = decode_with_subject(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(subject, b"big.subject");
+        assert!(view.flags.contains(RecordFlags::HAS_SUBJECT));
+        assert!(view.flags.contains(RecordFlags::HAS_XXH3));
+        assert_eq!(view.payload, &payload[..]);
+        assert_eq!(
+            decoded_len(&buf[..RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX]).unwrap(),
+            consumed
+        );
+    }
+
+    #[test]
+    fn encode_precomputed_with_subject_is_byte_identical() {
+        // The off-actor checksum path with a subject produces a frame byte-identical to the
+        // compute-here path, and it decodes cleanly with the subject recovered.
+        let rec = subject_rec(b"payload");
+        let mut baseline = Vec::new();
+        encode_with_subject(&rec, b"s.u.b", &mut baseline).unwrap();
+        let checks = BodyChecksums::compute(rec.key, rec.headers, rec.payload);
+        let mut offloaded = Vec::new();
+        encode_precomputed_with_subject(&rec, b"s.u.b", checks, &mut offloaded).unwrap();
+        assert_eq!(baseline, offloaded);
+        let (_view, subject, _) = decode_with_subject(&offloaded).unwrap();
+        assert_eq!(subject, b"s.u.b");
     }
 }
 
