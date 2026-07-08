@@ -617,6 +617,16 @@ impl Session {
         &self.subscription
     }
 
+    /// The NAMED stream this connection's consume path is bound to (`""` is the default stream, #588).
+    /// Paired with [`Session::subscription`] it routes the connection's durable cursor checkpoint to
+    /// the right `(stream, group)` (#681): a named-stream consumer's committed position is checkpointed
+    /// to that stream's own `cursor-<hex(group)>.ckpt` and resumed after a restart, exactly like the
+    /// default stream's.
+    #[must_use]
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
     /// Whether this connection ever published a Level-2 (server+client-ack) produce (#497). The
     /// connection-cleanup path consults it so only an L2 producer routes the confirm-registry cleanup
     /// through the actor; an L0/L1-only or pure-consumer connection skips it entirely.

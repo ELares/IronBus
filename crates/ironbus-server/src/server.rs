@@ -763,8 +763,12 @@ where
     // single-node disconnect path is byte-for-byte unchanged.
     engine.drop_client_acks(member_id);
     let group = session.subscription().to_string();
+    // Flush the connection's durable cursor on clean disconnect, routed to its (stream, group) (#681):
+    // a named-stream consumer's committed position is made durable to that stream's own checkpoint, the
+    // default stream (`""`) stays byte-for-byte the historical `checkpoint_group`.
+    let stream = session.stream().to_string();
     let _ = engine.with(move |e| {
-        let _ = e.checkpoint_group(&group);
+        let _ = e.checkpoint_in_stream(&stream, &group);
     });
     outcome
 }
@@ -890,8 +894,12 @@ where
                 // no-op, never a hang.
                 if progress.committed_progress {
                     let group = session.subscription().to_string();
+                    // Route the checkpoint to the session's (stream, group) (#681): a named-stream
+                    // consumer persists its cursor to that stream's own `cursor-<hex(group)>.ckpt`, the
+                    // default stream (`""`) stays byte-for-byte the historical `maybe_checkpoint_group`.
+                    let stream = session.stream().to_string();
                     let _ = engine.with(move |e| {
-                        let _ = e.maybe_checkpoint_group(&group);
+                        let _ = e.maybe_checkpoint_in_stream(&stream, &group);
                     });
                 }
             }

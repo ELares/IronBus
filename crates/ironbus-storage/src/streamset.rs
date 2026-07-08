@@ -221,6 +221,14 @@ impl From<StorageError> for StreamError {
 /// `type_complexity` lint and reads as one value at the call site.
 pub type OpenedStreamSet<F, C> = (StreamSet<F, C>, BTreeMap<StreamId, StreamRecovery>);
 
+/// The opened NAMED-stream logs plus their per-stream recovery summaries, as returned by the shared
+/// [`StreamSet::recover_named_streams`] pass (the DEFAULT stream is added, or not, by the caller). A
+/// named type so the two-map tuple does not trip the `type_complexity` lint.
+type RecoveredNamedStreams<F, C> = (
+    BTreeMap<StreamId, Log<F, C>>,
+    BTreeMap<StreamId, StreamRecovery>,
+);
+
 /// A per-stream recovery summary: how the stream recovered (its bounded, reported loss), produced by
 /// [`StreamSet::open`] for every stream it opened. Because each stream recovers independently, every
 /// stream has its OWN summary; a torn stream's non-empty loss never appears under a sibling's id.
@@ -281,6 +289,15 @@ pub struct StreamSet<F: Filesystem, C: Clock> {
     /// budget, daily write budget). Per-stream config overrides are a future concern (per-stream
     /// retention is M2-I5); here one config governs all streams, matching the single-log broker.
     config: LogConfig,
+    /// The ROOT filesystem (the data-dir root, the parent of the reserved `streams/` subtree), held
+    /// so [`StreamSet::declare`] can root a newly-declared named stream's `streams/<hex>/` subdir
+    /// WITHOUT deriving it from a resident default-stream [`Log`]. This is what lets
+    /// [`StreamSet::open_named`] (#681) omit the inert `""` slot the engine used to double-open: the
+    /// root filesystem is retained here directly, so the default stream can be owned entirely by the
+    /// caller's own root [`Log`] (`Engine::log`) while the set still knows where to create named
+    /// streams. For [`StreamSet::open`] it is simply a clone of the same `fs` the default slot opened,
+    /// so both constructors root new streams identically.
+    root_fs: F,
 }
 
 impl<F: Filesystem, C: Clock> std::fmt::Debug for StreamSet<F, C> {
@@ -330,21 +347,76 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         clock: C,
         config: LogConfig,
     ) -> Result<OpenedStreamSet<F, C>, StorageError> {
-        let mut streams = BTreeMap::new();
-        let mut recoveries = BTreeMap::new();
-
         // 1) The DEFAULT stream "" = today's ROOT log, opened at the data-dir root. This is the
         //    EXISTING single-log open: it performs the #670 layout-marker check and the
         //    longest-valid-prefix recovery over the root segments, byte for byte as before. The
         //    StreamSet adds NOTHING to this path, so a deployment with no named stream is unchanged.
+        //    It is opened FIRST so its marker check fail-closes the whole boot before any
+        //    named-stream work.
         let root = Log::open(fs.clone(), clock.clone(), config)?;
+
+        // 2) Each NAMED stream already on disk under `streams/` (the shared named-recovery pass).
+        let (mut streams, mut recoveries) = Self::recover_named_streams(fs, &clock, config)?;
         recoveries.insert(StreamId::default_stream(), recovery_of(&root));
         streams.insert(StreamId::default_stream(), root);
 
-        // 2) Each NAMED stream already on disk under `streams/`. Probe WITHOUT creating the subtree
-        //    (so a single-log dir never grows a `streams/`): only if `streams/` exists do we
-        //    enumerate it. Each child directory whose name is a canonical hex-encoded stream name is
-        //    opened as an INDEPENDENT Log at `streams/<dir>/`; a foreign directory is skipped.
+        Ok((
+            StreamSet {
+                streams,
+                clock,
+                config,
+                root_fs: fs.clone(),
+            },
+            recoveries,
+        ))
+    }
+
+    /// Opens the stream set for the ENGINE's use (#681, the `""`-slot fold): recovers every NAMED
+    /// stream under `streams/` exactly as [`StreamSet::open`] does, but does NOT open the DEFAULT
+    /// `""` slot. The engine owns the root log directly (`Engine::log`) — opening it here too is the
+    /// inert read-only double-open #676 carried, which this constructor removes so the root is opened
+    /// EXACTLY ONCE (by `Engine::log`, which owns the authoritative #670 marker check + recovery).
+    /// The root filesystem is retained (in `root_fs`) so a subsequently-[`declare`](StreamSet::declare)d
+    /// named stream is still rooted under the same data directory.
+    ///
+    /// The returned recovery map carries ONLY the named streams (no `""` entry), and because the
+    /// default stream is absent from `self.streams`, the cross-stream [`commit_tick`](StreamSet::commit_tick)
+    /// and the frontier/count views operate purely on named streams — which is byte-for-byte the
+    /// pre-#681 behavior, since the engine never dirtied, synced, or read the inert `""` slot anyway.
+    ///
+    /// # Errors
+    /// Propagates a [`StorageError`] from opening/recovering any named stream or enumerating
+    /// `streams/`. The default stream's marker check is the CALLER's `Engine::log` open, not here.
+    pub fn open_named(
+        fs: &F,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<OpenedStreamSet<F, C>, StorageError> {
+        let (streams, recoveries) = Self::recover_named_streams(fs, &clock, config)?;
+        Ok((
+            StreamSet {
+                streams,
+                clock,
+                config,
+                root_fs: fs.clone(),
+            },
+            recoveries,
+        ))
+    }
+
+    /// Recovers every NAMED stream already on disk under `streams/`, returning the opened logs and
+    /// their per-stream recovery summaries (the DEFAULT stream is NOT touched here — the two
+    /// constructors add it, or not). Probes WITHOUT creating the subtree (so a single-log dir never
+    /// grows a `streams/`): only if `streams/` exists is it enumerated. Each child directory whose
+    /// name is a canonical hex-encoded stream name is opened as an INDEPENDENT Log at `streams/<dir>/`
+    /// in PARALLEL across a bounded worker set (#822); a foreign directory is skipped.
+    fn recover_named_streams(
+        fs: &F,
+        clock: &C,
+        config: LogConfig,
+    ) -> Result<RecoveredNamedStreams<F, C>, StorageError> {
+        let mut streams = BTreeMap::new();
+        let mut recoveries = BTreeMap::new();
         if fs.subdir_exists(STREAMS_SUBDIR).map_err(StorageError::Io)? {
             let streams_fs = fs.subdir(STREAMS_SUBDIR).map_err(StorageError::Io)?;
             // Enumerate the named-stream subtrees SERIALLY (cheap dir listing + name parse), skipping
@@ -379,15 +451,7 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
                 streams.insert(id.clone(), log);
             }
         }
-
-        Ok((
-            StreamSet {
-                streams,
-                clock,
-                config,
-            },
-            recoveries,
-        ))
+        Ok((streams, recoveries))
     }
 
     /// Declares (creating its `streams/<hex(name)>/` directory + a fresh [`Log`] on first use, or
@@ -419,14 +483,13 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         Ok(true)
     }
 
-    /// Borrows the root filesystem (the default stream's), the parent of the `streams/` subtree, so a
-    /// newly-declared named stream is rooted under the same data directory as every other stream. The
-    /// default stream is always present, so this never panics.
+    /// Borrows the root filesystem (the data-dir root), the parent of the `streams/` subtree, so a
+    /// newly-declared named stream is rooted under the same data directory as every other stream. It
+    /// is the retained `root_fs` (a clone of the `fs` the set was opened over) rather than a resident
+    /// default-stream [`Log`]'s filesystem, so [`StreamSet::open_named`] (which omits the `""` slot)
+    /// still roots new streams correctly.
     fn root_fs(&self) -> &F {
-        self.streams
-            .get(&StreamId::default_stream())
-            .expect("the default stream is always open")
-            .filesystem()
+        &self.root_fs
     }
 }
 
@@ -678,10 +741,21 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
         }
     }
 
-    /// The number of open streams, including the always-present default stream (so this is `>= 1`).
+    /// The number of open streams, including the default stream if this set carries it (an
+    /// [`StreamSet::open`] set does; an [`StreamSet::open_named`] set does not).
     #[must_use]
     pub fn len(&self) -> usize {
         self.streams.len()
+    }
+
+    /// The number of open NAMED streams (EXCLUDING the default `""` slot whether or not this set
+    /// carries it), so the count is correct for BOTH constructors (#681). An [`StreamSet::open_named`]
+    /// set has no `""` slot, so this equals `len()`; an [`StreamSet::open`] set carries the slot, so
+    /// this is `len() - 1`. Filtering rather than subtracting keeps the count right regardless of how
+    /// the set was opened.
+    #[must_use]
+    pub fn named_len(&self) -> usize {
+        self.streams.keys().filter(|id| !id.is_default()).count()
     }
 
     /// Whether the set has no streams. Always `false` (the default stream is always open); provided
@@ -860,6 +934,50 @@ mod tests {
             set.read_range(&b, Offset::ZERO, 100, None).unwrap().len(),
             1
         );
+    }
+
+    /// `open_named` (#681) omits the inert default `""` slot: the set carries ONLY named streams, yet
+    /// still recovers every named stream on disk AND can declare a new one (rooted via the retained
+    /// `root_fs`, not a resident default-stream log). This is the engine-side fold that lets
+    /// `Engine::log` be the single owner of the root.
+    #[test]
+    fn open_named_omits_the_default_slot_but_recovers_and_declares_named_streams() {
+        let fs = InMemoryFs::new();
+        let a = StreamId::named("alpha").unwrap();
+        let b = StreamId::named("beta").unwrap();
+        // First materialize two named streams (and the root layout) through the full `open`.
+        {
+            let (mut set, _) = open(&fs);
+            set.declare(&a).unwrap();
+            set.declare(&b).unwrap();
+            set.append_to(&a, &rec(b"a0")).unwrap();
+            set.append_to(&b, &rec(b"b0")).unwrap();
+            set.sync_all().unwrap();
+        }
+
+        // Reopen the ENGINE way: no `""` slot, but both named streams recover with their own data.
+        let (mut set, recoveries) = StreamSet::open_named(&fs, ManualClock::new(), cfg()).unwrap();
+        assert!(
+            !set.is_open(&StreamId::default_stream()),
+            "open_named carries NO default slot"
+        );
+        assert_eq!(set.stream_ids(), vec![a.clone(), b.clone()]);
+        // len() == named_len() because there is no default slot; both report 2.
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.named_len(), 2);
+        assert!(!recoveries.contains_key(&StreamId::default_stream()));
+        assert_eq!(set.read_range(&a, Offset::ZERO, 10, None).unwrap().len(), 1);
+        assert_eq!(set.read_range(&b, Offset::ZERO, 10, None).unwrap().len(), 1);
+
+        // Declaring a NEW named stream still works (rooted via the retained root_fs), and a
+        // commit_tick over the named streams never touches a (non-existent) default slot.
+        let c = StreamId::named("gamma").unwrap();
+        assert!(set.declare(&c).unwrap());
+        set.append_to(&c, &rec(b"c0")).unwrap();
+        let outcome = set.commit_tick();
+        assert!(outcome.froze.is_empty());
+        assert_eq!(set.named_len(), 3);
+        assert_eq!(set.read_range(&c, Offset::ZERO, 10, None).unwrap().len(), 1);
     }
 
     /// THE HEADLINE TEST — resilience isolation: corrupting a named stream's segment recovers THAT
