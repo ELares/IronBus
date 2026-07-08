@@ -2227,13 +2227,15 @@ impl Session {
                 // KeyOrdering::None path is unchanged. One poll = one actor round-trip; the actor flushes
                 // any pending produce batch first, so each poll sees a consistent durable head.
                 //
-                // A NAMED-stream consumer (#588) routes to the engine's id-routed `poll_in_stream` instead
-                // (its OWN log + per-stream competing work-group, #676/#679), reading the engine's monotonic
-                // `now` inside the job. The named path is plain competing (no key_shared/Tier-S/compaction
-                // this phase, the #676 scope), so it returns `Poll::Message`/`Poll::Idle`/an error — plus
-                // `Poll::Filtered` for a per-subject filtered named group (#594-B), handled by the same
-                // advisory arm below as the default stream's. The default stream (`self.stream` empty) is
-                // byte-for-byte the existing member-aware poll.
+                // A NAMED-stream consumer (#588) routes to the engine's id-routed `poll_in_stream_member`
+                // instead (its OWN log + per-stream work-group, #676/#679), reading the engine's monotonic
+                // `now` inside the job. That entry is MEMBER-AWARE: a key_shared named group (#64 follow-up)
+                // routes each record's key to its stable member exactly as the default stream does, and a
+                // plain competing named group ignores the member (byte-for-byte the historical named scan).
+                // It returns `Poll::Message`/`Poll::Idle`/an error — plus `Poll::Filtered` for a per-subject
+                // filtered named group (#594-B), handled by the same advisory arm below as the default
+                // stream's. The default stream (`self.stream` empty) is byte-for-byte the existing member-
+                // aware poll.
                 let group = self.subscription.clone();
                 let member = self.member_id;
                 let stream = self.stream.clone();
@@ -2242,7 +2244,7 @@ impl Session {
                         e.poll_now_in_member(&group, member)
                     } else {
                         let now = e.now_monotonic();
-                        e.poll_in_stream(&stream, &group, now)
+                        e.poll_in_stream_member(&stream, &group, member, now)
                     }
                 })?;
                 match poll {
@@ -3984,17 +3986,42 @@ impl Session {
             );
             return Ok(());
         }
+        // Leave any prior key_shared membership (of the OLD stream+group) BEFORE rebinding, so its keys
+        // re-route to the remaining members (#64 follow-up). This reads `self.stream`/`self.subscription`,
+        // so it must run before they are reassigned below; a no-op for a connection that had not joined.
+        self.leave_current_key_shared(engine)?;
         // Switching to a named stream abandons this connection's default-stream leases (they redeliver
         // there after the visibility timeout); the named subscription starts clean. The per-stream
         // work-group is created lazily on the first named poll under the per-stream group cap (#676).
         self.stream = GroupName::from(stream);
         self.subscription = GroupName::from(group);
-        // A named-stream consume is plain competing (#676): it does not register in the default-stream
-        // key_shared/broadcast subscriber sets, so leave any such default-stream membership/registration
-        // behind (a no-op for a connection that never had one) rather than stranding it.
+        // A named-stream consume does not register in the default-stream broadcast subscriber set (#676),
+        // so leave any such default-stream registration behind (a no-op for a connection that never had
+        // one) rather than stranding it. The key_shared membership below is per-(stream, group).
         self.registered_subscription = false;
-        self.joined_key_shared = false;
         self.leased.clear();
+        // If the named group is configured key_shared (#64 follow-up), put THIS stream's group into that
+        // mode and join as a member so this connection's keys route to it — the named twin of the default
+        // stream's SUB path. The same server-side `is_configured_key_shared(group)` set governs it (a
+        // group name configured key_shared is key_shared wherever it is used), but the router + membership
+        // live on the per-stream work-group, so two streams sharing a group name route over independent
+        // member sets. A failure to enable the mode leaves the group plain competing (surfaced on the
+        // first FLOW as today), so SubTo stays infallible here: only join when the mode is actually active.
+        let stream_name = self.stream.clone();
+        let sub = self.subscription.clone();
+        let member = self.member_id;
+        let joined = engine.with(move |e| {
+            if e.is_configured_key_shared(&sub)
+                && e.set_key_ordering_in_stream(&stream_name, &sub, KeyOrdering::KeyShared)
+                    .is_ok()
+            {
+                e.join_member_in_stream(&stream_name, &sub, member);
+                true
+            } else {
+                false
+            }
+        })?;
+        self.joined_key_shared = joined;
         reply(out, FrameType::Ok, &[]);
         Ok(())
     }
@@ -4391,9 +4418,16 @@ impl Session {
     ) -> Result<(), SessionError> {
         if self.joined_key_shared {
             let group = self.subscription.clone();
+            let stream = self.stream.clone();
             let member = self.member_id;
             engine.with(move |e| {
-                e.leave_member_in(&group, member);
+                // The membership is per-(stream, group) (#64 follow-up): a named-stream subscription
+                // leaves THIS stream's router, the default stream (`""`) the default-group router.
+                if stream.is_empty() {
+                    e.leave_member_in(&group, member);
+                } else {
+                    e.leave_member_in_stream(&stream, &group, member);
+                }
             })?;
             self.joined_key_shared = false;
         }
@@ -7489,6 +7523,135 @@ mod tests {
             delivered_payloads(&out),
             vec![b"second".to_vec()],
             "the second record delivers only after the first is acked"
+        );
+    }
+
+    /// Connects a streams-capable session with a given member id and `SubTo`-binds it to a NAMED
+    /// stream's work-group, for the named-stream `key_shared` wire test.
+    fn connect_streams_and_sub_to(
+        e: &DirectEngine<InMemoryFs, ManualClock>,
+        member: MemberId,
+        stream: &[u8],
+        group: &[u8],
+    ) -> Session {
+        let mut s = Session::with_member_id(member);
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
+                understands_deliver_batch: false,
+                understands_streams: true,
+                understands_compressed_delivery: false,
+                wants_subject_filter: false,
+            },
+            &mut body,
+        );
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Connect, &body), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(e, &sub_to_frame(stream, group), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "SubTo is acked");
+        s
+    }
+
+    #[test]
+    fn key_shared_over_the_wire_routes_a_named_stream_key_to_one_member_in_order() {
+        // End-to-end over the session layer (#64 follow-up): a configured key_shared group `SubTo`-bound
+        // on a NAMED stream, two member connections, keyed records. A key's records all go to its one
+        // owner, in offset order, and the non-owner never sees them — the named-stream twin of
+        // `key_shared_over_the_wire_routes_a_key_to_one_member_in_order`. The ack routes to the stream's
+        // own cursor and FREES the key so the next record delivers.
+        let e = DirectEngine::new(engine());
+        e.engine_mut()
+            .set_configured_key_shared_groups(["shared".to_string()]);
+        // The named stream must be resident before a SubTo can bind it.
+        e.engine_mut().declare_stream("orders").unwrap();
+        let m1 = MemberId::new(101);
+        let m2 = MemberId::new(202);
+        let mut s1 = connect_streams_and_sub_to(&e, m1, b"orders", b"shared");
+        let mut s2 = connect_streams_and_sub_to(&e, m2, b"orders", b"shared");
+        // The SubTo put the NAMED stream's group into key_shared mode and joined both members.
+        assert_eq!(
+            e.engine_mut().key_ordering_in_stream("orders", "shared"),
+            KeyOrdering::KeyShared
+        );
+        // Find a key owned by m1 on the named stream.
+        let key = (0..2000u32)
+            .map(|n| format!("k{n}").into_bytes())
+            .find(|k| {
+                matches!(
+                    e.engine_mut().route_decision_in_stream(
+                        "orders",
+                        "shared",
+                        m1,
+                        k,
+                        ironbus_core::types::Offset::ZERO
+                    ),
+                    Some(ironbus_core::keyshared::RouteDecision::Deliver)
+                )
+            })
+            .expect("a key owned by m1");
+        for p in [&b"first"[..], b"second"] {
+            e.engine_mut()
+                .produce_in_stream(
+                    "orders",
+                    &Append {
+                        timestamp_ms: 0,
+                        flags: RecordFlags::EMPTY,
+                        key: &key,
+                        headers: b"",
+                        payload: p,
+                    },
+                )
+                .unwrap();
+        }
+        // m2 (the non-owner) fetches: nothing for this key on the named stream.
+        let mut out = Vec::new();
+        s2.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            delivered_payloads(&out).is_empty(),
+            "the non-owner sees no record for the owner's key on the named stream"
+        );
+        // m1 (the owner) fetches: the first record only (the key is then busy).
+        out.clear();
+        s1.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"first".to_vec()],
+            "owner gets the first record only"
+        );
+        // Ack it (routes to the named stream's own cursor + frees the key); the second then delivers.
+        let frames = decode_all(&out);
+        let d = decode_deliver(&frames[0].1).unwrap();
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                offset: d.offset,
+                generation: d.generation,
+                op: AckOp::Ack,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        out.clear();
+        s1.process(&e, &frame(FrameType::Ack, &ack_body), &mut out)
+            .unwrap();
+        out.clear();
+        s1.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"second".to_vec()],
+            "the second record delivers only after the first is acked on the named stream"
         );
     }
 
