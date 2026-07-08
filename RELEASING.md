@@ -24,30 +24,76 @@ runs unproven steps.
 
 ## Cut a release
 
-The release workflow has a `changelog Unreleased is non-empty` gate (#128) that runs first and
-FAILS the whole release if `## [Unreleased]` in `CHANGELOG.md` has no content, so a release can
-never ship without an audit-trail entry. Tag a release only after the entries are present.
+Cutting a release is one command to prepare the tree, one reviewed PR, and one tag push. The
+`prepare-release.sh` script does the mechanical prep; the `Release` workflow does the build +
+publish. Nothing is published until you push the tag.
 
-1. Land all changes for the release via the normal PR flow (CI green, self-reviewed, merged).
-2. In a final PR: move the `## [Unreleased]` section of `CHANGELOG.md` under a new `## [vX.Y.Z]`
-   heading (the changelog gate matches that heading EXACTLY, so keep it `## [vX.Y.Z]` with no
-   trailing date — put the release date on a line under the heading), bump the workspace `version`
-   in the top-level `Cargo.toml` (`cargo build` reconciles `Cargo.lock`), and archive the release's
-   perf + coverage baselines under `docs/benchmarks/baselines/vX.Y.Z/` (see
-   [Regression-gate baselines](#regression-gate-baselines-perf--coverage) below).
-3. After it merges, tag the merge commit and push the tag:
+```sh
+# 1. Prepare the tree (edits only — no commit, no tag, no push):
+scripts/prepare-release.sh 0.2.0
+```
 
-   ```sh
-   git tag -s vX.Y.Z -m "vX.Y.Z"   # signed tag (or -a for annotated)
-   git push origin vX.Y.Z
-   ```
+`scripts/prepare-release.sh <X.Y.Z>` (validates the version is semver; idempotent):
 
-   The `Release` workflow can also be run from the Actions tab (`workflow_dispatch`) against an
-   existing tag.
+1. bumps `[workspace.package] version` in the top-level `Cargo.toml`,
+2. bumps the internal path-dependency `version = "..."` pins in every crate manifest so cargo's
+   published-version requirement stays in lockstep,
+3. reconciles `Cargo.lock` (`cargo update --workspace`; a deterministic in-place patch if `cargo` is
+   not on `PATH`),
+4. rolls `CHANGELOG.md`: moves `## [Unreleased]` under a new `## [vX.Y.Z]` heading with a
+   `_Released <date>._` sub-line, and inserts a fresh empty `## [Unreleased]`. The version heading is
+   kept EXACTLY `## [vX.Y.Z]` (no in-heading date) so the #128 changelog gate and the release-notes
+   extractor both match it; the date lives on the sub-line,
+5. scaffolds `docs/benchmarks/baselines/vX.Y.Z/` from the previous release's baselines (retagged, the
+   coverage number reset to the pending `null`), and
+6. prints the remaining steps.
 
-   Re-running the workflow for a tag that already has a published release fails at the
-   `gh release create` step (it does not clobber); delete the existing release first
-   (`gh release delete vX.Y.Z`) to rebuild it.
+Then, still by hand (the two owner decisions the script cannot make for you):
+
+- **Fill in the changelog** under `## [vX.Y.Z]` if it is empty. The release workflow's
+  `changelog Unreleased is non-empty` gate (#128) runs first and FAILS the whole release if the
+  section has no content, so a release can never ship without an audit-trail entry.
+- **Re-anchor the baselines** if you have fresh numbers — the scaffolded perf runs are carried over
+  from the previous tag for you to replace, and the coverage number is reset to the pending `null`
+  (see [Regression-gate baselines](#regression-gate-baselines-perf--coverage) below and the
+  scaffolded `docs/benchmarks/baselines/vX.Y.Z/README.md`). Also point the perf gate's `--baseline`
+  in `ci.yml` at the new tag's file.
+
+```sh
+# 2. Commit on a branch, open the release PR (CI green, reviewed, merged):
+git switch -c chore/release-v0.2.0
+git add -A
+git commit -s -m "chore(release): prepare v0.2.0"    # -s: DCO sign-off, per CONTRIBUTING.md
+gh pr create --fill
+
+# 3. After the PR merges, tag the merge commit and push the tag — this triggers the release:
+git tag -s v0.2.0 -m "v0.2.0"                          # signed tag (or -a for annotated)
+git push origin v0.2.0
+```
+
+Pushing the `v*` tag triggers the `Release` workflow (`.github/workflows/release.yml`), which:
+
+1. asserts the tag version equals the `[workspace.package]` version (`version-gate`, via
+   `scripts/ci/assert-tag-version.sh`) and the changelog section is non-empty (`changelog-gate`,
+   #128) — either failing loudly BEFORE any binary is built;
+2. cross-builds the three static musl binaries (the same `cross` matrix the CI `musl build` jobs
+   prove on every PR), packages a `.deb` per triple, and builds/pushes the distroless container;
+3. publishes the GitHub Release with the SHA256SUMS, both SBOMs, and the Sigstore attestation, using
+   release notes **extracted from the `## [vX.Y.Z]` CHANGELOG section** (`scripts/ci/release-notes.sh`).
+   If that section exceeds GitHub's 125000-char body limit, the notes are truncated at a line
+   boundary with a link to the full `CHANGELOG.md` at the tag.
+
+The `Release` workflow can also be run from the Actions tab (`workflow_dispatch`) against an existing
+tag. Re-running it for a tag that already has a published release fails at the `gh release create`
+step (it does not clobber); delete the existing release first (`gh release delete vX.Y.Z`) to rebuild
+it.
+
+> **crates.io.** IronBus does NOT publish its library crates to crates.io — it ships a single binary
+> over the four channels below, `docs/CLIENT_SDKS.md` pins the Rust crates "by git until a crates.io
+> release", and `[patch.crates-io] raft-proto` redirects a dependency to a vendored build-script-free
+> codec that a real `cargo publish` would not carry. The release workflow documents the enable path
+> (a `CRATES_IO_TOKEN` secret + a `cargo publish` job in dependency order) inline, next to the
+> `create the GitHub Release` step, for when that decision is made.
 
 ## Regression-gate baselines (perf + coverage)
 
