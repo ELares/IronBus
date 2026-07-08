@@ -44,13 +44,13 @@ use ironbus_proto::message::{
     decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit, decode_stream_declare,
     decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
     decode_txn_check_result, decode_txn_listen, decode_txn_prepare, decode_txn_resolve,
-    encode_dead_letter, encode_deliver, encode_deliver_batch_frame, encode_gap_marker, encode_info,
-    encode_not_leader, encode_produce_confirm, encode_pub_ack, encode_stream_info_response,
-    encode_truncated, encode_txn_resolve, gap_reason, parse_connect_auth, produce_confirm_status,
-    pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader,
-    DeliverBody, GapMarkerBody, InfoBody, NotLeaderBody, ProduceConfirmBody, PubAckBody,
-    StreamInfoResponseBody, TruncatedBody, TxnResolveBody, DEAD_LETTER_MAX_DELIVER,
-    PUB_WIRE_ONLY_FLAGS,
+    encode_dead_letter, encode_deliver, encode_deliver_batch_frame, encode_deliver_frame,
+    encode_gap_marker, encode_info, encode_not_leader, encode_produce_confirm, encode_pub_ack,
+    encode_stream_info_response, encode_truncated, encode_txn_resolve, gap_reason,
+    parse_connect_auth, produce_confirm_status, pub_ack_level, AckLevel, AckOp, ConsumeTier,
+    CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody, InfoBody,
+    NotLeaderBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody, TruncatedBody,
+    TxnResolveBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -2245,13 +2245,14 @@ impl Session {
                             headers: &d.record.headers,
                             payload: wire_payload.as_ref(),
                         };
-                        frame_body.clear();
-                        // The record's key/headers came through PUB (u16-bounded), so this cannot
-                        // exceed the field limit; on the impossible error, stop the batch.
-                        if encode_deliver(&msg, &mut frame_body).is_err() {
+                        // L6 direct-into-out (#812): frame the `Deliver` DIRECTLY onto `out` in one pass,
+                        // dropping the per-record memcpy through the `frame_body` scratch. Byte-identical
+                        // to the old `encode_deliver` + `reply` path. The record's key/headers came through
+                        // PUB (u16-bounded), so this cannot exceed the field limit; on the impossible
+                        // error the partial frame is rolled off `out` and the batch stops.
+                        if encode_deliver_frame(&msg, out).is_err() {
                             break;
                         }
-                        reply(out, FrameType::Deliver, &frame_body);
                         // Record ownership so only this session can later act on this lease (#175), and
                         // the message's byte size so the byte budget (#275) is derived from `leased`. The
                         // size is key + headers + payload, matching the engine's produced-bytes accounting.
@@ -2541,11 +2542,12 @@ impl Session {
                             headers: &d.record.headers,
                             payload: wire_payload.as_ref(),
                         };
-                        frame_body.clear();
-                        if encode_deliver(&msg, &mut frame_body).is_err() {
+                        // L6 direct-into-out (#812): frame the `Deliver` DIRECTLY onto `out`, dropping the
+                        // per-record memcpy through `frame_body`. Byte-identical to the old `encode_deliver`
+                        // + `reply` path; a failed encode rolls the partial frame off `out` and stops.
+                        if encode_deliver_frame(&msg, out).is_err() {
                             break;
                         }
-                        reply(out, FrameType::Deliver, &frame_body);
                         // Lease ownership and byte accounting are IDENTICAL to `handle_flow`: only this
                         // session can later act on the lease (#175), and the byte size feeds the byte budget
                         // (#275). At-least-once holds because the record stays leased until acked.

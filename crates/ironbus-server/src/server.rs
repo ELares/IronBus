@@ -868,6 +868,18 @@ where
                     return Ok(());
                 };
                 inbuf.drain(..progress.consumed);
+                // Remember how many bytes the trailing partial frame needs before the next pass.
+                needed = progress.needed;
+                // LEVER 5 — WRITE BEFORE THE CHECKPOINT HOP (median latency): put the response BYTES on
+                // the wire FIRST, then fire the checkpoint actor round-trip. The checkpoint is a lagging
+                // at-least-once optimization — it only bounds how many already-processed messages a crash
+                // REDELIVERS on restart, never correctness — so nothing in the response depends on it, and
+                // the byte can safely hit the wire before it. Writing first removes one cross-thread actor
+                // round-trip from directly in front of the client-visible response, shaving it off the
+                // delivery/ack median (the hop still runs every committing pass, just AFTER the write).
+                if !out.is_empty() {
+                    stream.write_all(&out)?;
+                }
                 // Persist the session's work-group cursor on the configured interval so a crash
                 // redelivers a bounded tail. ONLY when this pass actually advanced a committed cursor (an
                 // ack/flow/unsub): a ping- or connect-only pass skips the checkpoint entirely, so it
@@ -881,11 +893,6 @@ where
                     let _ = engine.with(move |e| {
                         let _ = e.maybe_checkpoint_group(&group);
                     });
-                }
-                // Remember how many bytes the trailing partial frame needs before the next pass.
-                needed = progress.needed;
-                if !out.is_empty() {
-                    stream.write_all(&out)?;
                 }
             }
             // A NON-BLOCKING read found no new bytes while the window is non-empty (#1045): a
