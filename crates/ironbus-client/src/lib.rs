@@ -431,6 +431,18 @@ pub struct ClientConfig {
     /// today's behavior. A caller checks [`Client::streams_enabled`] after connecting to learn whether
     /// the server confirmed it.
     pub understands_streams: bool,
+    /// Whether this client ADVERTISES that it can DECODE a compression-codec-encoded delivery — the
+    /// per-record `COMPRESSED` flag and `descriptor + codec-stream` payload a `--compression` broker
+    /// stores (#1066): when `true` (the DEFAULT), the `Connect` sets the
+    /// [`CONNECT_FLAG2_COMPRESSED_DELIVERY`] capability bit, so a `--compression lz4` broker ships
+    /// stored-compressed records to this client verbatim (which it decodes on read, as every client has
+    /// since #430). When `false`, the client does NOT advertise it, so the broker DECOMPRESSES a
+    /// stored-compressed record before delivering it — the plain payload, byte-for-byte the produced
+    /// bytes. The default is `true` because this client decodes compression; a caller that wraps a
+    /// legacy consumer which cannot decode the descriptor bytes sets it `false` to force uncompressed
+    /// delivery. The decoded `Message` payload is IDENTICAL either way; this only governs whether the
+    /// bytes travel compressed on the wire.
+    pub understands_compressed_delivery: bool,
     /// The connection-scoped authentication credential this client presents in its `Connect`
     /// handshake (#631, #884), or `None` (the default) for an unauthenticated connection. When
     /// `Some(cred)`, `connect_with` appends the auth section the broker verifies (via
@@ -496,6 +508,12 @@ impl Default for ClientConfig {
             // only the default-stream verbs exactly as before (#588). A caller that wants to address
             // named streams opts in by setting this.
             understands_streams: false,
+            // ON by default (#1066): this client decodes compression (every client has since #430), so
+            // it advertises the capability and a `--compression` broker may ship it stored-compressed
+            // records verbatim. This is safe by construction and preserves the broker's zero-CPU
+            // passthrough. A caller wrapping a legacy consumer that cannot decode the descriptor sets it
+            // `false` to force the broker to decompress before delivery (the silent-corruption guard).
+            understands_compressed_delivery: true,
             // None by default: an unconfigured client presents NO credential, so `connect_with`
             // appends no auth section and the `Connect` body is byte-for-byte the pre-#631 layout — an
             // unauthenticated connect to a no-auth broker is unchanged (#884). A caller opts into auth
@@ -1327,6 +1345,11 @@ impl Client {
                 // byte-for-byte the pre-#588 `Connect` and the client uses only the default-stream
                 // verbs; a caller opts in via the config to address named streams by id.
                 understands_streams: config.understands_streams,
+                // The compressed-delivery capability bit (#1066, the `flags2` byte). ON by default, so
+                // a `--compression` broker ships stored-compressed records to this (decode-capable)
+                // client verbatim; a caller wrapping a legacy consumer sets it `false` to force the
+                // broker to decompress before delivery.
+                understands_compressed_delivery: config.understands_compressed_delivery,
             },
             &mut connect_body,
         );

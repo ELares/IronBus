@@ -28,7 +28,9 @@ use bytes::Bytes;
 use ironbus_core::binding::{single_home, Resolution};
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::BodyChecksums;
-use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
+use ironbus_core::compress::{
+    decompress_payload, validate_descriptor_shape, NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES,
+};
 use ironbus_core::confirm::{ConfirmStatus, ReadyConfirm};
 use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
@@ -53,6 +55,7 @@ use ironbus_proto::message::{
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 use ironbus_storage::streamset::StreamId;
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -374,6 +377,18 @@ pub struct Session {
     /// connection uses ONLY the default-stream verbs (`Pub`/`Sub`/`Flow`/`Fetch`), which target the
     /// default stream `""` — byte-for-byte today's behavior. Default `false` (backward-compatible).
     streams_enabled: bool,
+    /// Whether this consumer negotiated COMPRESSED delivery (#1066): set at `Connect` time when the
+    /// client advertised [`ironbus_proto::message::CONNECT_FLAG2_COMPRESSED_DELIVERY`]. When `true`, a
+    /// stored-COMPRESSED record (a `--compression` broker's `descriptor + codec-stream` payload with the
+    /// `COMPRESSED` record flag) is delivered VERBATIM — the codec bytes and the flag pass through, the
+    /// broker's zero-CPU passthrough, which a #430+ client decodes. When `false` (an old client, one that
+    /// opts out, or the empty `Connect` body) a stored-COMPRESSED record is DECOMPRESSED before delivery
+    /// and the `COMPRESSED` bit is cleared, so a pre-#430 consumer that would mis-decode the descriptor
+    /// bytes receives the plain produced payload instead — the ONE silent-wrong-data path is closed.
+    /// UNCOMPRESSED records are unaffected either way (identity passthrough). Default `false`
+    /// (backward-compatible): the safe choice for an unmarked consumer even on a `--compression lz4`
+    /// broker.
+    compressed_delivery_enabled: bool,
     /// The NAMED stream this connection's consume path is bound to (#588, M2-I10), `""` (the default
     /// stream) until a `SubTo` binds a named one. A `SubTo` sets BOTH this and `subscription` (the
     /// work-group within the stream); a plain `Sub`/`Unsub` resets it to the default stream. The Flow
@@ -1244,6 +1259,14 @@ impl Session {
         // that did not advertise is REFUSED those verbs (a typed `Err`) and is never sent a streams
         // reply it did not ask for, so an old client uses only the default-stream verbs unchanged.
         self.streams_enabled = req.understands_streams;
+        // Negotiate COMPRESSED delivery (#1066): the capability is active exactly when this consumer
+        // advertised it can DECODE a compression-codec-encoded delivery. A capable consumer receives a
+        // stored-COMPRESSED record VERBATIM (the codec bytes + `COMPRESSED` flag, the broker's zero-CPU
+        // passthrough); one that did NOT advertise (an old client, or the empty `Connect`) has a
+        // stored-COMPRESSED record DECOMPRESSED before delivery with the `COMPRESSED` bit cleared, so a
+        // pre-#430 consumer that would mis-decode the descriptor bytes never receives them — even on a
+        // `--compression lz4` broker. This is the silent-corruption fix: the safe default is uncompressed.
+        self.compressed_delivery_enabled = req.understands_compressed_delivery;
         // A repeated Connect re-negotiates idempotently: reset the active named stream to the default
         // so a re-handshake never leaves a stale named-stream binding from a prior negotiation.
         self.stream = GroupName::default();
@@ -2182,14 +2205,24 @@ impl Session {
                 })?;
                 match poll {
                     Ok(Poll::Message(d)) => {
+                        // Gate the delivery encoding on the negotiated compressed-delivery capability
+                        // (#1066): a non-capable consumer gets a stored-COMPRESSED record DECOMPRESSED
+                        // with the COMPRESSED bit cleared; a capable consumer (and every uncompressed
+                        // record) passes through verbatim. `None` = the record cannot be safely
+                        // delivered, so stop the batch rather than ship a byte it cannot decode.
+                        let Some((wire_flags, wire_payload)) =
+                            self.deliver_encoding(d.record.flags.bits(), &d.record.payload)
+                        else {
+                            break;
+                        };
                         let msg = DeliverBody {
                             offset: d.offset.get(),
                             generation: d.token.generation,
-                            flags: d.record.flags.bits(),
+                            flags: wire_flags,
                             timestamp_ms: d.record.timestamp_ms,
                             key: &d.record.key,
                             headers: &d.record.headers,
-                            payload: &d.record.payload,
+                            payload: wire_payload.as_ref(),
                         };
                         frame_body.clear();
                         // The record's key/headers came through PUB (u16-bounded), so this cannot
@@ -2448,14 +2481,23 @@ impl Session {
                 let member = self.member_id;
                 match engine.with(move |e| e.poll_now_in_member(&group, member))? {
                     Ok(Poll::Message(d)) => {
+                        // Compressed-delivery gate (#1066), IDENTICAL to `handle_flow`: a non-capable
+                        // consumer gets a stored-COMPRESSED record decompressed (COMPRESSED bit cleared);
+                        // a capable consumer and every uncompressed record pass through verbatim. `None`
+                        // stops the batch rather than ship a byte the consumer cannot decode.
+                        let Some((wire_flags, wire_payload)) =
+                            self.deliver_encoding(d.record.flags.bits(), &d.record.payload)
+                        else {
+                            break;
+                        };
                         let msg = DeliverBody {
                             offset: d.offset.get(),
                             generation: d.token.generation,
-                            flags: d.record.flags.bits(),
+                            flags: wire_flags,
                             timestamp_ms: d.record.timestamp_ms,
                             key: &d.record.key,
                             headers: &d.record.headers,
-                            payload: &d.record.payload,
+                            payload: wire_payload.as_ref(),
                         };
                         frame_body.clear();
                         if encode_deliver(&msg, &mut frame_body).is_err() {
@@ -2640,7 +2682,8 @@ impl Session {
             want,
             max_bytes,
         ) {
-            let delivered = Self::serve_follower_read_outcome(outcome, out);
+            let delivered =
+                Self::serve_follower_read_outcome(outcome, self.compressed_delivery_enabled, out);
             // Terminate with the SAME FlowEnd a leader Tier-S batch uses, so the client frames a
             // follower-read response exactly like any other streaming batch. No keep-up auto-tune on the
             // follower path (the credit window is the leader engine's concern); a follower-read just serves
@@ -2655,11 +2698,19 @@ impl Session {
         // Serve the batch (raw-framed if the consumer advertised DeliverBatch, else per-record), getting
         // back how many records were delivered (`None` = a recoverable reject already replied as an Err,
         // which is the response terminator, so there is no keep-up and no FlowEnd to add).
+        let capable = self.compressed_delivery_enabled;
         let delivered = if self.deliver_batch_enabled {
-            Self::serve_stream_fetch_batch(engine, &group, member, start, want, max_bytes, out)?
+            // The RAW DeliverBatch path ships the on-disk frame bytes VERBATIM (including any stored
+            // COMPRESSED records), which is sound WITHOUT a compressed-delivery gate: decoding a raw
+            // batch means decoding the on-disk record layout, so a DeliverBatch-capable consumer is
+            // compression-capable by construction. The ACTIVE-tail per-record remainder is still gated
+            // via `capable` inside the fn. (#1066)
+            Self::serve_stream_fetch_batch(
+                engine, &group, member, start, want, max_bytes, capable, out,
+            )?
         } else {
             Self::serve_stream_fetch_per_record(
-                engine, &group, member, start, want, max_bytes, out,
+                engine, &group, member, start, want, max_bytes, capable, out,
             )?
         };
         let Some(delivered) = delivered else {
@@ -2681,6 +2732,43 @@ impl Session {
         Ok(())
     }
 
+    /// Chooses the WIRE encoding of a stored record's `(flags, payload)` for delivery to THIS consumer,
+    /// honoring the negotiated compressed-delivery capability (#1066). The instance method reads this
+    /// connection's `compressed_delivery_enabled`; see [`Session::deliver_encoding_for`] for the shared
+    /// logic (the lease-free Tier-S / follower-read serves are associated fns, so they pass the flag in).
+    fn deliver_encoding<'p>(&self, flags: u8, payload: &'p [u8]) -> Option<(u8, Cow<'p, [u8]>)> {
+        Self::deliver_encoding_for(self.compressed_delivery_enabled, flags, payload)
+    }
+
+    /// The shared compressed-delivery gate (#1066): given whether the consumer advertised it can decode
+    /// a compression-codec-encoded delivery, returns the `(wire_flags, wire_payload)` to put on the
+    /// `Deliver` frame, or `None` when the record cannot be safely delivered (never ship a bad byte).
+    ///
+    /// - A CAPABLE consumer, or an UNCOMPRESSED record, is the PASSTHROUGH: the stored flags and a
+    ///   borrowed payload go on the wire verbatim — zero copy, zero codec CPU, byte-for-byte today's
+    ///   behavior (the common case, and every record on a `--compression none` broker).
+    /// - A NON-capable consumer receiving a stored-COMPRESSED record is the #1066 FIX: the payload is
+    ///   DECOMPRESSED here and the `COMPRESSED` bit is cleared, so the consumer receives the plain
+    ///   produced payload it can actually read, never the descriptor bytes it would mis-decode. The
+    ///   default build is dict-free lz4, so [`NoDictionaries`] resolves every default-codec record; a
+    ///   decode failure (e.g. a zstd-with-dictionary record on an opt-in build, whose dictionary this
+    ///   dict-free resolver cannot supply) is FAIL-LOUD — `None`, so the caller stops the batch rather
+    ///   than deliver a byte the consumer cannot decode. It is NEVER silent corruption.
+    fn deliver_encoding_for(
+        capable: bool,
+        flags: u8,
+        payload: &[u8],
+    ) -> Option<(u8, Cow<'_, [u8]>)> {
+        let rf = RecordFlags::from_bits(flags);
+        if capable || !rf.contains(RecordFlags::COMPRESSED) {
+            return Some((flags, Cow::Borrowed(payload)));
+        }
+        let plain =
+            decompress_payload(rf, payload, &NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES)
+                .ok()?;
+        Some((flags & !RecordFlags::COMPRESSED.bits(), Cow::Owned(plain)))
+    }
+
     /// Emit a CLUSTER FOLLOWER-READ outcome (#735, half B) as per-record `Deliver` frames, returning the
     /// number of records written. The follower serves the committed prefix from its OWN read plane as a
     /// zero-copy [`RawSealedRead`] run; this decodes each CRC-framed record (re-validating the header AND
@@ -2690,7 +2778,11 @@ impl Session {
     /// never by a fencing token. A [`FollowerReadOutcome::ConfirmWithLeader`] (a latest/dirty read above
     /// the safe watermark) serves NOTHING here — never a speculative unconfirmed serve; the over-the-wire
     /// dirty-tier leader confirm is the flagged follow-up.
-    fn serve_follower_read_outcome(outcome: FollowerReadOutcome, out: &mut Vec<u8>) -> u32 {
+    fn serve_follower_read_outcome(
+        outcome: FollowerReadOutcome,
+        capable: bool,
+        out: &mut Vec<u8>,
+    ) -> u32 {
         let run = match outcome {
             FollowerReadOutcome::Served(read) => read.run,
             // A latest/dirty read above the safe watermark: do NOT speculatively serve unconfirmed bytes.
@@ -2710,15 +2802,23 @@ impl Session {
             let Ok((view, consumed)) = ironbus_core::codec::decode(&run.bytes[cursor..]) else {
                 break;
             };
+            // Compressed-delivery gate (#1066): a non-capable consumer gets a stored-COMPRESSED record
+            // decompressed (COMPRESSED bit cleared); a capable consumer and every uncompressed record
+            // pass through verbatim. `None` stops the run rather than ship an undecodable byte.
+            let Some((wire_flags, wire_payload)) =
+                Self::deliver_encoding_for(capable, view.flags.bits(), view.payload)
+            else {
+                break;
+            };
             let msg = DeliverBody {
                 offset,
                 // Lease-free Tier-S follower-read: generation 0, commit-by-offset (no fencing token).
                 generation: 0,
-                flags: view.flags.bits(),
+                flags: wire_flags,
                 timestamp_ms: view.timestamp_ms,
                 key: view.key,
                 headers: view.headers,
-                payload: view.payload,
+                payload: wire_payload.as_ref(),
             };
             frame_body.clear();
             if encode_deliver(&msg, &mut frame_body).is_err() {
@@ -2737,6 +2837,7 @@ impl Session {
     /// of records delivered (`Some(n)`), or `None` when a recoverable engine reject was surfaced as an
     /// `Err` terminator (so the caller adds no `FlowEnd`). Does NOT write the `FlowEnd`; the caller
     /// does, after the shared #552 keep-up check, so both batch halves terminate identically.
+    #[allow(clippy::too_many_arguments)]
     fn serve_stream_fetch_per_record<
         F: Filesystem + 'static,
         C: Clock + Clone + 'static,
@@ -2748,6 +2849,7 @@ impl Session {
         start: Offset,
         want: usize,
         max_bytes: Option<usize>,
+        capable: bool,
         out: &mut Vec<u8>,
     ) -> Result<Option<u32>, SessionError> {
         let group = group.clone();
@@ -2761,16 +2863,24 @@ impl Session {
                 // cleared and reused each iteration instead of a fresh `Vec` per delivered record.
                 let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
                 for record in &records {
+                    // Compressed-delivery gate (#1066): a non-capable consumer gets a stored-COMPRESSED
+                    // record decompressed (COMPRESSED bit cleared); a capable consumer and every
+                    // uncompressed record pass through verbatim. `None` stops the batch here.
+                    let Some((wire_flags, wire_payload)) =
+                        Self::deliver_encoding_for(capable, record.flags.bits(), &record.payload)
+                    else {
+                        break;
+                    };
                     let msg = DeliverBody {
                         offset: record.offset.get(),
                         // No lease, no fence: a streaming delivery carries generation 0. The consumer
                         // commits by offset (StreamCommit), never by a per-record fencing token.
                         generation: 0,
-                        flags: record.flags.bits(),
+                        flags: wire_flags,
                         timestamp_ms: record.timestamp_ms,
                         key: &record.key,
                         headers: &record.headers,
-                        payload: &record.payload,
+                        payload: wire_payload.as_ref(),
                     };
                     frame_body.clear();
                     if encode_deliver(&msg, &mut frame_body).is_err() {
@@ -2826,6 +2936,7 @@ impl Session {
         start: Offset,
         want: usize,
         max_bytes: Option<usize>,
+        capable: bool,
         out: &mut Vec<u8>,
     ) -> Result<Option<u32>, SessionError> {
         let group = group.clone();
@@ -2860,14 +2971,23 @@ impl Session {
                 // and reused each iteration instead of a fresh `Vec` per delivered record.
                 let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
                 for record in &tail {
+                    // Compressed-delivery gate (#1066) on the ACTIVE-tail per-record remainder: a
+                    // non-capable consumer gets a stored-COMPRESSED record decompressed (COMPRESSED bit
+                    // cleared); a capable consumer and every uncompressed record pass through verbatim.
+                    // (The raw SEALED prefix above ships verbatim — sound, see the call site.)
+                    let Some((wire_flags, wire_payload)) =
+                        Self::deliver_encoding_for(capable, record.flags.bits(), &record.payload)
+                    else {
+                        break;
+                    };
                     let msg = DeliverBody {
                         offset: record.offset.get(),
                         generation: 0,
-                        flags: record.flags.bits(),
+                        flags: wire_flags,
                         timestamp_ms: record.timestamp_ms,
                         key: &record.key,
                         headers: &record.headers,
-                        payload: &record.payload,
+                        payload: wire_payload.as_ref(),
                     };
                     frame_body.clear();
                     if encode_deliver(&msg, &mut frame_body).is_err() {
@@ -5242,6 +5362,7 @@ mod tests {
                 default_tier: None,
                 understands_deliver_batch: false,
                 understands_streams: false,
+                understands_compressed_delivery: false,
             },
             &mut body,
         );
@@ -6462,6 +6583,7 @@ mod tests {
                 default_tier: default_tier.map(ConsumeTier::as_u8),
                 understands_deliver_batch: false,
                 understands_streams: false,
+                understands_compressed_delivery: false,
             },
             &mut body,
         );
@@ -6619,6 +6741,7 @@ mod tests {
                 default_tier: None,
                 understands_deliver_batch,
                 understands_streams: false,
+                understands_compressed_delivery: false,
             },
             &mut body,
         );
@@ -9355,6 +9478,154 @@ mod tests {
         assert_eq!(back, original, "one decode recovers the original");
     }
 
+    // ---- Compressed-delivery capability gate (#1066) ----
+
+    /// A `Connect` body advertising the compressed-delivery capability (#1066).
+    fn compressed_delivery_connect_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                understands_compressed_delivery: true,
+                ..Default::default()
+            },
+            &mut body,
+        );
+        body
+    }
+
+    /// A large, highly compressible payload — well over the raw-store threshold, so a `--compression
+    /// lz4` engine stores it COMPRESSED (the #1066 fixture).
+    fn lz4_compressible_payload() -> Vec<u8> {
+        b"ironbus.telemetry.sensor.v1 compressed-delivery-gate #1066 "
+            .iter()
+            .copied()
+            .cycle()
+            .take(8192)
+            .collect()
+    }
+
+    /// The `(flags, payload)` of every `Deliver` frame in `out` (the wire form the consumer receives).
+    fn delivered_flags_and_payloads(out: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        decode_all(out)
+            .iter()
+            .filter(|(t, _)| *t == FrameType::Deliver)
+            .map(|(_, b)| {
+                let d = decode_deliver(b).unwrap();
+                (d.flags, d.payload.to_vec())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_non_capable_consumer_gets_uncompressed_delivery_from_an_lz4_broker() {
+        // THE #1066 FIX: on a `--compression lz4` broker a stored-COMPRESSED record is delivered
+        // DECOMPRESSED (the COMPRESSED bit CLEAR, the plain produced payload) to a consumer that did
+        // NOT advertise it can decode compression (an old/empty Connect) — never the descriptor bytes
+        // it would silently mis-decode. This is the ONE silent-wrong-data path, now closed.
+        use ironbus_core::compress::{compress_payload, CompressConfig};
+        let original = lz4_compressible_payload();
+        // The fixture genuinely compresses, so the lz4 engine stores it COMPRESSED — otherwise this
+        // test would be vacuous (a raw store would deliver `original` with no decompression exercised).
+        assert!(
+            compress_payload(&original, &CompressConfig::default())
+                .unwrap()
+                .compressed,
+            "the fixture must genuinely compress"
+        );
+
+        let e = DirectEngine::new(engine_lz4());
+        produce(&e, &original);
+        // A NON-capable consumer: the empty (old-client) Connect never advertises the capability.
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let delivered = delivered_flags_and_payloads(&out);
+        assert_eq!(delivered.len(), 1, "exactly one record delivered");
+        assert_eq!(
+            delivered[0].0 & RecordFlags::COMPRESSED.bits(),
+            0,
+            "the COMPRESSED bit is CLEARED for a non-capable consumer"
+        );
+        assert_eq!(
+            delivered[0].1, original,
+            "the non-capable consumer receives the PLAIN produced payload, not the descriptor bytes"
+        );
+    }
+
+    #[test]
+    fn a_capable_consumer_gets_compressed_delivery_from_an_lz4_broker() {
+        // The complement of the fix: a consumer that ADVERTISES the capability receives the stored
+        // record VERBATIM (COMPRESSED bit SET, the codec bytes) — the broker's zero-CPU passthrough —
+        // and those bytes decode back to the produced payload end-to-end.
+        let e = DirectEngine::new(engine_lz4());
+        let original = lz4_compressible_payload();
+        produce(&e, &original);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &compressed_delivery_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let delivered = delivered_flags_and_payloads(&out);
+        assert_eq!(delivered.len(), 1, "exactly one record delivered");
+        assert_ne!(
+            delivered[0].0 & RecordFlags::COMPRESSED.bits(),
+            0,
+            "the COMPRESSED bit is PRESERVED for a capable consumer"
+        );
+        assert_ne!(
+            delivered[0].1, original,
+            "a capable consumer receives the compressed codec bytes, not the plain payload"
+        );
+        let back = decompress_payload(
+            RecordFlags::from_bits(delivered[0].0),
+            &delivered[0].1,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            back, original,
+            "the compressed delivery decodes to the produced payload"
+        );
+    }
+
+    #[test]
+    fn a_connect_that_omits_the_compressed_delivery_bit_still_gets_uncompressed_delivery() {
+        // The gate keys on the SPECIFIC capability bit, not merely "empty vs non-empty Connect": a
+        // consumer that advertises OTHER capabilities (here gap-marker) but NOT compressed-delivery is
+        // still served DECOMPRESSED on an lz4 broker — the safe default holds for any client that does
+        // not opt into compressed delivery.
+        let e = DirectEngine::new(engine_lz4());
+        let original = lz4_compressible_payload();
+        produce(&e, &original);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &gap_marker_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let delivered = delivered_flags_and_payloads(&out);
+        assert_eq!(delivered.len(), 1, "exactly one record delivered");
+        assert_eq!(
+            delivered[0].0 & RecordFlags::COMPRESSED.bits(),
+            0,
+            "a client that did not advertise compressed delivery gets the COMPRESSED bit cleared"
+        );
+        assert_eq!(delivered[0].1, original, "and the plain produced payload");
+    }
+
     #[test]
     fn a_compressed_pub_over_garbage_is_rejected_and_appends_nothing() {
         // THE #438 TEETH: bit 0 over bytes that are not a descriptor used to be acked durably
@@ -9506,6 +9777,7 @@ mod tests {
                 default_tier: None,
                 understands_deliver_batch: false,
                 understands_streams: false,
+                understands_compressed_delivery: false,
             },
             &mut connect_body,
         );
@@ -11210,6 +11482,7 @@ mod tests {
                 default_tier: None,
                 understands_deliver_batch: false,
                 understands_streams: false,
+                understands_compressed_delivery: false,
             },
             &mut connect_body,
         );
@@ -11514,6 +11787,7 @@ mod tests {
                 default_tier: None,
                 understands_deliver_batch: false,
                 understands_streams: true,
+                understands_compressed_delivery: false,
             },
             &mut body,
         );
