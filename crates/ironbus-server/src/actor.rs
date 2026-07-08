@@ -1215,6 +1215,20 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         None
     }
 
+    /// Whether an idle consume long-poll should SPIN briefly before parking on the commit-notify
+    /// condvar (#1100). The SAME discriminant the produce path spins on (`reply_spin` =
+    /// `!Engine::commit_syncs_before_ack()`, #1032/#1026): `true` on the no-pre-ack-fsync tiers (memory
+    /// backend or a relaxed `interval`/`async`/`none` level) where a commit is poll-visible within
+    /// microseconds, so a bounded busy-poll catches the wake without the park/unpark round-trip whose
+    /// jitter tail is the p999 delivery regression; `false` on the fsync-barrier `sync` tier where a
+    /// commit is milliseconds away and spinning would only burn a core. The DEFAULT impl returns
+    /// `false` (the in-process test fixtures have no actor to bump the seam, so their long-poll never
+    /// waits anyway); [`EngineHandle`] overrides it with the snapshotted `reply_spin`. Consulted ONLY
+    /// alongside a live [`EngineAccess::commit_notify`] seam when `Session::consume_longpoll_ms > 0`.
+    fn consume_wait_spin(&self) -> bool {
+        false
+    }
+
     /// The CLUSTER produce-ack decision (#719) for one durable produce on connection `member`: called
     /// AFTER the local group-commit fsync returned `Appended(offset)`, with the `offset`, and the EXACT
     /// wire-`PubAck` frame bytes the session would otherwise write now.
@@ -1372,6 +1386,14 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         // The shared seam the append actor bumps on every durable-frontier advance (push delivery): an
         // idle long-polling consumer waits on this and wakes the instant a record commits.
         Some(EngineHandle::commit_notify(self))
+    }
+
+    fn consume_wait_spin(&self) -> bool {
+        // The SAME fixed-for-life discriminant the produce reply wait spins on (#1032): `reply_spin` =
+        // `!commit_syncs_before_ack()`, snapshotted at `spawn_actor`. On the no-pre-ack-fsync tiers a
+        // commit is poll-visible within microseconds, so an idle long-poll spins briefly to catch the
+        // commit-notify wake without the park round-trip (#1100); the fsync `sync` tier stays parked.
+        self.reply_spin
     }
 
     fn client_ack_disposition(

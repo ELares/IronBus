@@ -2321,6 +2321,9 @@ impl Session {
                     notify.wait_for_change(
                         snapshot,
                         std::time::Duration::from_millis(self.consume_longpoll_ms),
+                        // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
+                        // path's spin discriminant, so a real-fsync broker never burns a core here.
+                        engine.consume_wait_spin(),
                     );
                     continue;
                 }
@@ -2580,6 +2583,9 @@ impl Session {
                     notify.wait_for_change(
                         snapshot,
                         std::time::Duration::from_millis(self.consume_longpoll_ms),
+                        // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
+                        // path's spin discriminant, so a real-fsync broker never burns a core here.
+                        engine.consume_wait_spin(),
                     );
                     continue;
                 }
