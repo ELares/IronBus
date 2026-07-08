@@ -100,10 +100,13 @@ Commit the new seed. From then on the per-PR replay (below) guards it on every P
   night; a target file missing its `Cargo.toml` `[[bin]]` entry fails both lanes loudly. A
   target with no committed regression corpus yet fuzzes from scratch until seeds are promoted.
 - **Coverage regression:** the nightly `coverage` job emits the workspace line-coverage
-  percentage and retains `lcov.info`. The intended "coverage-below-last-release" gate
-  (compare to the last released tag's archived coverage, fail on an un-ratified drop) is
-  documented in `nightly.yml`; it stays informational until a release archives a baseline,
-  mirroring the #114 perf gate's baseline/no-op shape.
+  percentage and retains `lcov.info`. The "coverage-below-last-release" gate (compare to the
+  last released tag's archived coverage, fail on an un-tolerated drop) was ARMED at `v0.1.0`
+  (#1068): the `coverage-regression-gate` step reads
+  `docs/benchmarks/baselines/v0.1.0/coverage-baseline.json` and enforces
+  `current >= line_coverage_pct - tolerance_pct`, mirroring the #114 perf gate's baseline shape.
+  The baseline's `line_coverage_pct` is recorded by the maintainer from the first post-tag
+  nightly percentage (it is `null`/PENDING-no-op until then; see the baseline README).
 
 The build outputs, the discovered working corpora, and the crash artifacts are git-ignored;
 the regression corpus and `Cargo.lock` are committed so a soak is reproducible.

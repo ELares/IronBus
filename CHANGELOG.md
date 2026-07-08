@@ -1,10 +1,89 @@
 # Changelog
 
 All notable changes to IronBus are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
-to follow Semantic Versioning once it reaches a tagged release.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
+follows [Semantic Versioning](https://semver.org/) from the first tagged
+release (`v0.1.0`) onward. Pre-1.0, the public API and wire/on-disk formats may
+still change between minor versions; the frozen v1 record/segment format and the
+negotiated wire envelope are the stability anchors called out per entry.
 
 ## [Unreleased]
+
+## [v0.1.0]
+
+_Release date set at tag time by the maintainer (prepared 2026-07-07)._
+
+First formal, semver-tagged release of IronBus — the durable, single-binary edge
+message bus. This entry consolidates the full pre-release engineering campaign
+(all changes prior to the first `v*` tag) that previously accumulated under
+`[Unreleased]`; the exhaustive, per-change record follows below under the
+standard Keep-a-Changelog subsections. The campaign, grouped by theme:
+
+- **Durable storage engine.** Segmented write-ahead log with CRC-framed records,
+  a frozen v1 on-disk format, longest-valid-prefix recovery with bounded +
+  reported loss, and group-committed `fdatasync` as the durability boundary. The
+  pipelined sync tier (#1040/#1049) decouples the covering `fdatasync` into a
+  self-clocking group commit, and the configurable durable-write **io-mode**
+  (#1054, `buffered`/`direct`/`auto`) adds the metadata-free `O_DIRECT` barrier
+  that turns the real-EBS single-connection durable rows from a loss into a win
+  while keeping the full fsync guarantee. Segment preallocation (#330/#1047) and
+  the cross-stream commit coordinator (#564) round out the engine.
+- **Clustering & Raft.** Embedded metadata Raft group (tikv/raft-rs, vendored
+  build-script-free codec, #578/#580), quorum-fsync ISR gate, quarantine-never-
+  delete divergence detection (#611/#697), epoch-fenced promotion (#668),
+  leader-completeness election eligibility (#614/#615), cooperative learner
+  join/rebalance (#617), and the ratified cluster recovery invariants CI1–CI4.
+  The cluster **peer wire** is fail-closed bound and origin-authenticated with
+  interim shared-secret HMAC-SHA256 on both the raft-metadata and data-plane
+  wires (#1067 increments 1–3: #1094/#1095/#1097).
+- **Security: TLS 1.3 + mTLS.** Native TLS 1.3 termination and client transport
+  behind the non-default `tls` feature (ADR-0004, #766/#957): server-side
+  termination (#1086/#1087), verified-client-cert → SAN → auth identity mTLS
+  (#1089/#1090), and sync/async/CLI clients (#1091/#1092/#1093). Connection-scoped
+  authentication — bearer tokens (SHA-256 digest, constant-time compare) and
+  Argon2id passwords — plus zeroizing secret types (#631/#635).
+- **Client SDKs.** First-party Rust blocking and async clients, an official
+  dependency-light Go SDK speaking the frozen wire natively with 47 golden frame
+  vectors (#1021/#1037), subject-addressed verbs (#585), pipelined durable
+  producers (#508, Go `ProduceWindow` #1059), and runnable examples + a
+  getting-started guide across all three clients (#1022/#1056/#1058).
+- **Wire & format compatibility.** Frozen `[len][tag][body]` envelope with
+  capability-bit AND negotiation, hash-pinned wire tag map (#1081), the
+  cross-language golden-vector conformance that stops the Go decoder drifting
+  from the Rust encoders, and a `Connect` capability gate for compressed
+  delivery (#1066) that closes the one silent-wrong-data path to pre-#430
+  consumers.
+- **Compression.** lz4 block compression on by default (per-record cap), opt-in
+  zstd codec with the trained per-message-type dictionary lifecycle behind the
+  non-default `zstd` feature (#357/#78).
+- **Performance.** `TCP_NODELAY` on every data/cluster socket (#1028), the
+  self-clocking group-commit tier, concurrent-producer benchmarking (#1048),
+  opt-in event-driven commit-notify long-poll delivery (#1098, default off), and
+  matched-substrate benchmark studies vs Redpanda / NATS / Kafka with per-row
+  durability labels and full disclosures (#1023/#1050/#1051).
+- **Flow control & backpressure.** Consumer-credit auto-tuner (64→2048, RAM-
+  bounded, #552/#672), durable spill + deterministic reported shed.
+- **Observability.** JSON structured logging always-on, OTLP span export behind
+  the non-default `otlp` feature (#99), metrics surface, `/healthz`+`/readyz`
+  flipping on append-actor death (#922), and a structured JSON panic line before
+  abort (#1080).
+- **Supply chain & reproducibility.** `cargo-deny` license/advisory/ban gates,
+  C-FFI ban keeping the default graph pure-Rust, cargo-auditable + CycloneDX
+  SBOMs, byte-identical reproducible musl builds (#101), MSRV 1.78 floor, and a
+  weekly advisory rescan.
+- **Distribution.** Single static musl binary for three edge triples, `.deb`
+  per triple, distroless container, and a fail-closed `curl | sh` installer with
+  Sigstore provenance — over both the automatic rolling calendar-versioned
+  channel and this curated, tagged channel.
+
+### Security
+- Cluster peer-wire authentication (#1067) — the intra-cluster consensus + replication wire, previously silently plaintext and trusted only by a spoofable claimed node id, hardened in three increments. **Increment 1, fail-closed bind guard (#1094):** the raft and data-plane peer listeners bound ANY address with no guard, so a reachable non-loopback peer port let an outsider forge raft/ISR frames and drive committed cluster state. A pure, unit-tested `peer_bind_decision` (the peer-wire twin of the client-wire guard) now runs PRE-LISTEN in both `serve` and `config validate` / `--check-only`: a non-loopback peer bind fails closed unless the operator passes the new `--insecure-plaintext-peers` (honored, loud startup warning); loopback and single-node stay byte-for-byte unchanged. Added `--cluster-secret-file` (reserved fail-closed until Increment 2). No wire/consensus change. **Increment 2, interim HMAC on the raft metadata wire (#1095):** an HMAC-SHA256 origin-authentication + per-frame-integrity envelope keyed by a cluster-wide shared secret (`PeerKey`, a SHA-256 KDF over `--cluster-secret-file`, zeroized with a redacting `Debug`), hand-rolled over the pure-Rust `sha2` already in the tree (ZERO new dependency, RFC 4231-tested, constant-time `subtle` compare). A new append-only `FrameType::RaftAuth = 50` carries `[len][50][ver:1][mac:32][raft_pb]` whose inner body is byte-identical to a tag-27 body, so a downgrade is a tag check an un-upgraded/no-key receiver rejects. New `--cluster-peer-auth off|permissive|signed|required` (default `required` when a secret is present); the off→permissive→signed→required rollout ladder is quorum-safe (each accept-set a superset of any peer's send) and a fresh cluster boots straight to `required`. **Increment 3, data-plane HMAC (#1097):** the same envelope extended to every data-plane verb (FetchRecords/FetchResponse/AckReplicated/OffsetForLeaderEpoch/CommittedHwQuery) under a domain label DISTINCT from `RaftAuth` (so a key cannot cross-authenticate the two wires) via `FrameType::DataPlaneAuth = 51`, preserving the zero-copy 8 MiB `FetchResponse` fast path (the MAC streams over the borrowed outbound buffer, byte-identical to a materialize-then-seal reference). Honest guarantees: cluster-MEMBERSHIP origin auth defeating OUTSIDER `from`-spoofing (one symmetric key, not per-node identity — a compromised secret-holder is closed by mTLS #766), NOT confidentiality and NOT anti-replay (raft term/index idempotence blunts replay). Single-node and loopback clusters are inert; no consensus or on-disk format change beyond the two new self-describing auth tags (the format-registry gate + `docs/compat/versions.md` frame-tags hash re-pinned). Increments 2–3 adversarially reviewed (19- and multi-agent workflows); the metadata-only scope of Increment 2 (data-plane still needed `--insecure-plaintext-peers`) is closed by Increment 3.
+
+### Added
+- Event-driven commit-notify long-poll delivery (#1098), an OPT-IN, server-only latency lever, TUNABLE and OFF by default. An idle consumer polling an empty group returns an empty batch and is re-polled by the client on a timer, flooring its wakeup latency at one client poll interval; a `Flow`/`Fetch` that draws nothing now blocks briefly on a broker-wide commit-notify seam and re-polls the instant a record commits (or a budget elapses). New `commit_notify` module — a lock+condvar generation counter, lost-wakeup-safe (`wait_for_change(snapshot, timeout)` snapshots the seq before the poll batch) — owned by the append actor, which bumps it STRICTLY AFTER the durability work that advances the poll-visible frontier (pure observation, never reordering existing statements; over-bumping is harmless, under-bumping only costs latency) and shares it into every `EngineHandle` clone. `--consume-longpoll-ms` (flag > env > default) defaults to **0 = OFF**, byte-for-byte today's empty-and-return path, so it is a pure tunable with NO wire, client, or format-registry change; a `no_wait` fetch is exempt (single immediate pass) and v1 wake granularity is global (a spurious cross-stream wake just re-polls empty). Proven over a real spawned actor: `longpoll=0` returns `FlowEnd(0)` immediately, a concurrent produce wakes an idle consumer to `delivered=1` far below the budget, and a no-producer wait times out to `FlowEnd(0)` after ~the budget.
+
+### Fixed
+- Compressed delivery is now gated on a `Connect` capability bit (#1066), closing the ONE silent-wrong-data path in an otherwise fail-loud system. A default-on `--compression lz4` broker previously delivered stored-compressed `descriptor + codec-stream` bytes (with the COMPRESSED record flag set) VERBATIM to any consumer, including pre-#430 clients (rolling builds `2026.0609.2`–`2026.0610.7`) that mis-decode them during a normal broker-first upgrade — guarded until now only by prose in COMPATIBILITY.md. A new `CONNECT_FLAG2_COMPRESSED_DELIVERY` bit — the first bit of a NEWLY appended `flags2` byte (the historical `flags` byte's 8 bits are all allocated), emitted only when non-zero so a client that does not advertise it sends a body byte-for-byte the historical layout and an old reader ignores it — lets a consumer advertise it understands compressed delivery. A capable consumer gets the stored-compressed record verbatim (zero-CPU passthrough) on EVERY per-record Deliver path (Tier-W poll + fetch, Tier-S, follower-read, and the DeliverBatch active tail); a non-capable consumer (an old client, or the empty Connect) gets it DECOMPRESSED with the COMPRESSED bit cleared. The first-party Rust and async clients advertise the capability by default (so real clients keep getting compression); the safe default for an unknown consumer is uncompressed delivery, and a non-capable delivery that cannot be decompressed (a zstd-with-dictionary record on an opt-in build) fails loud, never corrupt. Mirrors the GapMarker (#292/#346) / DeliverBatch (#541) capability mechanism and replaces the prose-only COMPATIBILITY.md guard with an enforced gate.
 
 ### Removed
 - The **macOS cross-broker benchmark** — the README `## Benchmarks` macOS tables (IronBus vs Kafka/NATS), `docs/benchmarks/CROSS_BROKER_2026_07.md`, and its `cross-broker-harness/`. macOS `F_FULLFSYNC`/thermal/SSD variance makes it an unreliable benchmark substrate (every power-loss-safe broker floors at ~250 msg/s against the ~4 ms barrier), and its Redpanda-in-VM column — parenthesized and ~10× inflated by page-cache "durability" with no real barrier — misled readers into thinking Redpanda was an order of magnitude faster than IronBus. The authoritative IronBus-vs-Redpanda comparison is now solely on **matched substrates**: the Linux matched-VM study and the AWS **t4g / EBS** real-hardware run (`docs/benchmarks/REDPANDA_MATCHED_2026_07.md`), where IronBus wins or ties every durable row. The README Benchmarks section and the `REDPANDA_MATCHED` study were reworded to stand alone (no dangling references to the retired study). Docs only.
@@ -501,3 +580,6 @@ to follow Semantic Versioning once it reaches a tagged release.
 - `docs/DICTIONARY_LIFECYCLE.md`: the normative DESIGN spec (specified, not yet implemented) for trained per-message-type compression dictionaries (#78, parent #12). Specifies the offline `ironbus dict train` flow (per-type real-telemetry corpus, min/target sample floors, the `dicts/<dict_id>.zstd` output), a content-addressed `dict_id` (a u32 truncation of BLAKE3-256 of the dictionary bytes) that is collision-checked and refused fail-closed at train time so reuse is structurally impossible with no central registry, self-contained distribution (a per-segment on-disk `dicts/` sidecar PLUS the active set embedded in the static binary via `include_bytes!`, #17), the sidecar-first then embedded resolution order (so a binary downgrade never strands readable data), an unresolved dict_id routed through #8 as a NEW append-only loss reason `UnresolvedDictId` (code 7, label `unresolved_dict_id`, data-loss; codes 1-6 byte-identical, `schema_version` stays 1), append-only immutability/rotation (a re-train is a new dict_id, old data readable forever), the before/after per-batch ratio METHOD (one variable, real telemetry, the `ironbus bench`/#114 surface, on-device per #19) with the measured number left as a residual, and a proof the v1 frame's u32 dict_id reservation (`COMPRESSED` flag clear, `dict_id=0` unset in v1) makes this additive with no wire/on-disk break. The `ZDICT` training call, the sidecar IO, the embed, the reason emission, and the measured ratio are the impl follow-up. Linked from `docs/README.md`. Docs only, no source changed (refs #78).
 - `docs/EDGE_CONSTRAINTS.md`: the design synthesis for #20 (edge resource constraints). Writes the three missing pieces: the hardware-constraint-to-knob mapping table (one row per limit with its failure mode, governing knob, `tiny` default, and owning issue; conceptual knobs labelled SPECIFIED-NOT-YET-A-FIELD); the `tiny` profile fully specified with concrete defaults shown summing ~9 MiB under the 64 MiB ceiling and reachable in the single static binary (the auto-selection flag and RSS boot guard are the #115/#17/#87 residual, not claimed enforced); and the RTC-less clock model (monotonic `seq` is the sole, clock-independent, disk-durable ordering authority, wall-clock `timestamp` is producer-supplied advisory metadata with a Redis-Streams never-emit-a-smaller broker-timestamp rule, age retention is best-effort and fail-safe under a backward jump), tied to the `Clock` seam. Reconciles the four already-satisfied #20 criteria to RAM_BUDGET.md, DURABILITY.md, EDGE_RUN_DISCIPLINE.md, and ADR-0003; no contradictions found. Linked from `docs/README.md`. Docs only, no source changed (refs #20, #115, #117).
 - Documented the cross-platform durability barrier and resolved #153: an acknowledged produce always clears a true device write-barrier. On Linux (the production musl target) that is `fdatasync`/`fsync`; on Apple targets `std` maps both `sync_data` and `sync_all` to `fcntl(fd, F_FULLFSYNC)` (a real drive-cache flush, not a plain `fsync`), which is exactly what `StdFile` relies on, so no redundant `fcntl` wrapper is added. Verified against the `std::sys::fs::unix` source. IronBus deliberately keeps `std`'s no-`ENOTSUP`-fallback behaviour: a filesystem that cannot honour the barrier freezes the writer and stops acking rather than silently downgrading durability. Added a platform durability table to the usage guide, a load-bearing comment on the sync path, and an Apple-gated test that exercises the `F_FULLFSYNC` path.
+
+[Unreleased]: https://github.com/ELares/IronBus/compare/v0.1.0...HEAD
+[v0.1.0]: https://github.com/ELares/IronBus/releases/tag/v0.1.0

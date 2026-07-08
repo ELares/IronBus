@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "io-free-check"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "syn",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-bench"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hdrhistogram",
  "ironbus-client",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "bytes",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ironbus-core",
  "ironbus-proto",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-client-async"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ironbus-client",
  "ironbus-core",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-proto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "lz4_flex",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "base64ct",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "ironbus-storage"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytes",

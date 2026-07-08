@@ -122,26 +122,29 @@ jobs:
       # regression needs a human --ratify to block. The gate's fire/no-op/advisory/ratify logic is
       # unit + binary tested (the lib `regression` tests and `tests/regression_gate_cli.rs`), run by
       # the workspace `test` job above; this job additionally EXECUTES the shipped gate binary against
-      # the checked-in history fixture to prove the END-TO-END wiring. IMPORTANT: there is NO released
-      # tag / baseline history yet (v0.1.0 is the maintainer's action), so with no `--baseline` the
-      # gate GRACEFULLY NO-OPS (exit 0, logged "no baseline history yet") rather than failing. Once a
-      # release archives a baseline JSON, pass it via `--baseline` and the gate begins enforcing. The
+      # the checked-in history fixture to prove the END-TO-END wiring. ARMED at v0.1.0 (#1068): the
+      # release archived a baseline JSON (docs/benchmarks/baselines/v0.1.0/perf-baseline.json), so the
+      # gate now runs its ENFORCING path (`--baseline`) instead of the pre-release no-baseline no-op —
+      # an un-ratified rolling-median regression exits non-zero and (via pipefail) FAILS this step. The
       # LIVE per-device numbers come from the #111 macro-bench run on the reference edge device, which
-      # is a documented device residual, not a CI run; this job validates the GATE, not the runs.
-      - name: run the regression gate against the checked-in history (no baseline yet => no-op)
+      # is a documented device residual, not a CI run; this job validates the GATE against the checked-in
+      # history + the archived baseline (see the baseline README for the re-anchor note), not live runs.
+      - name: run the regression gate against the checked-in history (v0.1.0 baseline => enforcing)
         run: |
           set -euo pipefail
           cargo run --locked -p ironbus-bench --bin ironbus-regression-gate -- \
             --history crates/ironbus-bench/tests/fixtures/regression-history.json \
+            --baseline docs/benchmarks/baselines/v0.1.0/perf-baseline.json \
             | tee gate-output.txt
-          # Until the first release archives a baseline, assert the gate took the documented no-op
-          # path rather than silently doing something else. This line changes to a real --baseline
-          # invocation (dropping this grep) the moment a baseline JSON exists.
-          if ! grep -q 'no baseline history yet' gate-output.txt; then
-            echo "::error::the regression gate did not take the expected no-baseline no-op path"
+          # The gate now ENFORCES: a fired (un-ratified) regression exits 1 and fails this step via
+          # pipefail. Additionally assert the enforcing within-thresholds PASS path was taken, so a
+          # silent fallback to the no-baseline no-op (a moved/deleted/renamed baseline file) also fails
+          # rather than passing vacuously.
+          if ! grep -q 'all device medians within thresholds' gate-output.txt; then
+            echo "::error::the regression gate did not take the expected enforcing within-thresholds path (baseline missing, or a regression fired)"
             exit 1
           fi
-          echo "ok: regression gate no-ops gracefully with no baseline history (exit 0)"
+          echo "ok: regression gate enforced against the v0.1.0 baseline (within thresholds, exit 0)"
 
   consume-corpus-gate:
     name: consume corpus fairness gate (#554)

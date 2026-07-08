@@ -1,0 +1,6 @@
+{
+  "tag": "v0.1.0",
+  "line_coverage_pct": null,
+  "tolerance_pct": 1.0,
+  "note": "line_coverage_pct is intentionally null: the authoritative number is the workspace line-coverage percentage the nightly `coverage` lane (.github/workflows/nightly.yml) computes with `cargo llvm-cov --workspace --all-features` on the CI runner (which has the cmake/cc toolchain the all-features instrumented build needs). It cannot be faithfully reproduced off that runner. To ARM the coverage-regression gate: take the percentage the first post-v0.1.0-tag nightly prints (job log / step summary, and the retained lcov.info artifact), set line_coverage_pct to it here, and the nightly `coverage-regression-gate` step begins enforcing `current >= line_coverage_pct - tolerance_pct`. While null, the step logs a documented PENDING no-op (it does not fail), mirroring the perf gate's pre-baseline no-op."
+}

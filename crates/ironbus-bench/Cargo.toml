@@ -68,8 +68,8 @@ path = "src/bin/cluster_durability_bench.rs"
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.
-ironbus-client = { path = "../ironbus-client", version = "0.0.0" }
-ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
+ironbus-client = { path = "../ironbus-client", version = "0.1.0" }
+ironbus-proto = { path = "../ironbus-proto", version = "0.1.0" }
 # HdrHistogram for the latency tail (1 us to 60 s, 3 significant figures). The `serialization`
 # feature gives the standard V2+DEFLATE encoder so a run's RAW histogram is archived base64 and is
 # recomputable/mergeable across windows. MIT OR Apache-2.0.
@@ -91,9 +91,9 @@ serde_json = "1"
 # (a condvar gate, no OS scheduling), so the freeze ALWAYS lands in the recorded tail.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
-ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
-ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
+ironbus-server = { path = "../ironbus-server", version = "0.1.0" }
+ironbus-storage = { path = "../ironbus-storage", version = "0.1.0" }
+ironbus-core = { path = "../ironbus-core", version = "0.1.0" }
 
 [lints]
 workspace = true
