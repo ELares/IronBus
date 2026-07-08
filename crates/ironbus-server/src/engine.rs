@@ -5509,6 +5509,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// per-stream work-group (the same competing lease/cursor machinery, independent per stream, so
     /// the same group name in two streams is two unrelated cursors).
     ///
+    /// This is the PLAIN-COMPETING (member-agnostic) entry: it passes the default [`MemberId`] to the
+    /// deliver loop, which a plain competing group ignores. A `key_shared` named group (#64 follow-up)
+    /// needs the member-aware [`Engine::poll_in_stream_member`] so a record routes to its stable owner;
+    /// polling one through here would deliver by the default member and misroute, so callers that may
+    /// hit a `key_shared` named group use the member-aware entry.
+    ///
     /// # Errors
     /// [`EngineError::InvalidStreamName`] / [`EngineError::UnknownStream`] for a bad or never-declared
     /// named stream, [`EngineError::InvalidGroupName`] / [`EngineError::TooManyGroups`] from the group
@@ -5522,9 +5528,53 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if stream.is_empty() {
             return self.poll_in(group, now);
         }
+        let (id, flushed) = self.resolve_named_poll(stream, group, now)?;
+        self.deliver_from_named_stream(&id, group, MemberId::default(), now, flushed)
+    }
+
+    /// Member-aware twin of [`Engine::poll_in_stream`] (#64 follow-up), for a `key_shared` named-stream
+    /// group: the default stream routes to [`Engine::poll_in_member`] BYTE-FOR-BYTE; a NAMED stream
+    /// delivers off its own log with per-key ROUTING — a record's key maps to one live member by
+    /// rendezvous hash (the DEFAULT stream's exact [`KeyRouter`] mechanism, reused on the per-stream
+    /// [`WorkGroup`]), so every record sharing a key reaches the SAME member and per-key order is
+    /// preserved across the group's members. A `KeyOrdering::None` named group ignores `member` and is
+    /// byte-for-byte the plain competing [`Engine::poll_in_stream`] scan.
+    ///
+    /// # Errors
+    /// As [`Engine::poll_in_stream`].
+    pub fn poll_in_stream_member(
+        &mut self,
+        stream: &str,
+        group: &str,
+        member: MemberId,
+        now: u64,
+    ) -> Result<Poll, EngineError> {
+        if stream.is_empty() {
+            return self.poll_in_member(group, member, now);
+        }
+        let (id, flushed) = self.resolve_named_poll(stream, group, now)?;
+        self.deliver_from_named_stream(&id, group, member, now, flushed)
+    }
+
+    /// Resolves the named `stream` for a poll and ENSURES its work-group `group` exists (under the
+    /// per-stream group cap), returning the stream id + its durable head (#676). Shared by the plain
+    /// [`Engine::poll_in_stream`] and the member-aware [`Engine::poll_in_stream_member`] so the
+    /// existence + cap gate is written once. A named stream must be produced-to (declared) before it
+    /// can be consumed: an unknown stream is a typed rejection, never a silent empty read (matching
+    /// `StreamSet::read_range`). The cap is PER STREAM (each named stream gets its own `max_groups`
+    /// budget), so a noisy stream cannot starve a sibling's group slots.
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownStream`] for a never-declared stream, [`EngineError::InvalidStreamName`]
+    /// for a malformed name, [`EngineError::InvalidGroupName`] for a malformed group, or
+    /// [`EngineError::TooManyGroups`] if a new group would exceed the per-stream cap.
+    fn resolve_named_poll(
+        &mut self,
+        stream: &str,
+        group: &str,
+        now: u64,
+    ) -> Result<(StreamId, u64), EngineError> {
         let id = StreamId::named(stream)?;
-        // A named stream must be produced-to (declared) before it can be consumed: an unknown stream
-        // is a typed rejection, never a silent empty read (matching `StreamSet::read_range`).
         let Some(flushed) = self.streams.get(&id).map(|log| log.flushed_offset().get()) else {
             return Err(EngineError::UnknownStream {
                 name: stream.to_string(),
@@ -5533,9 +5583,6 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         validate_group_name(group)?;
         let lease_config = self.lease_config;
         let max_groups = self.max_groups;
-        // Resolve (creating lazily, under the per-stream group cap) this stream's work-group. The
-        // cap is PER STREAM (each named stream gets its own `max_groups` budget), so a noisy stream
-        // cannot starve a sibling's group slots — at least as strong as the default-stream bound.
         let named = self
             .named_streams
             .entry(id.clone())
@@ -5548,7 +5595,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 .groups
                 .insert(group.to_string(), WorkGroup::new(lease_config, now));
         }
-        self.deliver_from_named_stream(&id, group, now, flushed)
+        Ok((id, flushed))
     }
 
     /// The competing claim/deliver loop for a NAMED stream (#676), factored out of
@@ -5565,6 +5612,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// second read (`WorkGroup::pending_match`). An unfiltered group takes none of these branches, so
     /// the historical named-stream scan is byte-for-byte unchanged.
     ///
+    /// KEY-SHARED ROUTING (#64 follow-up): when the group carries a [`KeyRouter`] (bound via
+    /// [`Engine::set_key_ordering_in_stream`]) delivery is MEMBER-AWARE — the SAME rendezvous-hash
+    /// routing + per-key serialization the default stream's [`Engine::poll_in_member`] applies, over
+    /// the per-stream [`WorkGroup`]'s own router. Only a record whose key routes to `member` (or an
+    /// empty-keyed record, plain competing) is claimed and delivered to it, so every record sharing a
+    /// key reaches the same member and per-key order holds across the group. A record owned by ANOTHER
+    /// member is skipped WITHOUT a claim (never bumping its delivery count), left for its owner. A
+    /// `KeyOrdering::None` group has no router and takes NONE of the `key_shared` branches, so `member`
+    /// is ignored and the historical plain competing scan is byte-for-byte unchanged. The `key_shared`
+    /// path composes with the filter (a non-matching record is committed past regardless of member) and
+    /// the per-stream DLQ (a poison that routes to `member` dead-letters exactly as the plain path).
+    ///
     /// Each iteration resolves the group in its OWN scoped borrow: the per-record log read borrows
     /// `&self.streams` (a field DISJOINT from `self.named_streams`), so a persistent group borrow held
     /// across the read would be a borrow conflict; resolving the group fresh per use keeps the borrows
@@ -5574,6 +5633,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         &mut self,
         id: &StreamId,
         group: &str,
+        member: MemberId,
         now: u64,
         flushed: u64,
     ) -> Result<Poll, EngineError> {
@@ -5581,11 +5641,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // committed cursor + clone its filter, all in a SHORT scoped borrow so the borrow ends before
         // the loop re-borrows `self.named_streams` / `self.streams` per iteration. A stashed match sits
         // at (or above) `committed`, so it is drained BEFORE anything else, exactly as `poll_in` does.
+        // A key_shared group ALSO prunes its router's in-flight key map to the committed watermark here
+        // (mirrors `poll_in_member`), so a key whose record was committed elsewhere is no longer busy.
         enum Setup {
             Stashed(Delivery),
             Scan {
                 committed: u64,
                 filter: Option<String>,
+                key_shared: bool,
             },
         }
         let setup = match self.named_group_mut(id, group) {
@@ -5596,14 +5659,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 if let Some(d) = g.pending_match.take() {
                     Setup::Stashed(d)
                 } else {
+                    let committed = g.cursor.committed().get();
+                    // Prune the router's in-flight key map to the committed window (#64): only an offset
+                    // strictly below committed is acked, so its key is no longer busy. A no-op for a
+                    // plain competing group (no router). Bounds the per-key map to the in-flight window.
+                    if let Some(router) = g.router.as_mut() {
+                        router.retain_above(Offset::new(committed));
+                    }
                     Setup::Scan {
-                        committed: g.cursor.committed().get(),
+                        committed,
                         filter: g.filter.clone(),
+                        key_shared: g.router.is_some(),
                     }
                 }
             }
         };
-        let (committed, filter_str) = match setup {
+        let (committed, filter_str, key_shared) = match setup {
             Setup::Stashed(d) => {
                 // Zero-read delivery of the match a prior filtered scan parked after flushing its gap.
                 self.counters.delivered = self.counters.delivered.saturating_add(1);
@@ -5612,7 +5683,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 }
                 return Ok(Poll::Message(d));
             }
-            Setup::Scan { committed, filter } => (committed, filter),
+            Setup::Scan {
+                committed,
+                filter,
+                key_shared,
+            } => (committed, filter, key_shared),
         };
         // The group's subject pattern, PARSED once (the clone above is a short pattern string, once per
         // poll). `None` (unfiltered) leaves the scan byte-for-byte the historical named path.
@@ -5636,6 +5711,112 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let mut offset = committed;
         while offset < window_end {
             let off = Offset::new(offset);
+            // KEY_SHARED (#64 follow-up): a member-aware sub-scan that mirrors `poll_in_member`'s
+            // peek -> read -> route -> claim-on-deliver discipline, so an offset owned by ANOTHER member
+            // is never claimed (claiming would bump its delivery count for a record it never delivered).
+            // Every path here diverges (continue / return / break), so control NEVER falls through to the
+            // plain competing body below; a `KeyOrdering::None` group has `key_shared == false` and takes
+            // the unchanged plain path.
+            if key_shared {
+                // 1. PEEK claimability without claiming: skip an acked or actively-leased offset.
+                let claimable = match self.named_group_mut(id, group) {
+                    None => return Ok(Poll::Idle),
+                    Some(g) => !g.cursor.is_acked(off) && g.leases.is_claimable(off, now),
+                };
+                if !claimable {
+                    offset += 1;
+                    continue;
+                }
+                // 2. Read the record to learn its subject + key (immutable `&self.streams` borrow).
+                let record = match self.streams.get(id) {
+                    Some(log) => log.read_from(off, 1).map_err(EngineError::Storage)?,
+                    None => return Ok(Poll::Idle),
+                };
+                let Some(record) = record.into_iter().next() else {
+                    return Err(EngineError::MissingRecord { offset });
+                };
+                // 3. FILTER (#594-B) composes FIRST: a non-matching record is committed PAST for the
+                //    whole group (its subject never matches for any member) and the scan CONTINUES to
+                //    this member's next candidate. Silent (no `Poll::Filtered`): a key_shared member
+                //    already receives only a sparse per-key subset with no marker for not-its-key
+                //    offsets, so a filtered offset is the same shape. Claim+ack keeps the lease table
+                //    clean exactly as the plain filter path; claiming a non-matching record is
+                //    member-agnostic (it is filtered for every member), so it never mis-routes, and its
+                //    bumped delivery count is discarded with the committed-past record.
+                if let Some(pattern) = filter.as_ref() {
+                    if !Self::record_matches_subject_filter(pattern, &record) {
+                        if let Some(g) = self.named_group_mut(id, group) {
+                            if let Claim::Granted { token, .. } = g.leases.claim(off, now) {
+                                g.leases.ack(&token);
+                            }
+                            g.cursor.ack(off);
+                        }
+                        self.counters.filtered = self.counters.filtered.saturating_add(1);
+                        offset += 1;
+                        continue;
+                    }
+                }
+                // 4. ROUTE: this member takes the record only if its key rendezvous-routes to it and the
+                //    key is free. A not-owner / busy offset is skipped WITHOUT a claim, left for its owner
+                //    (or until the key's earlier in-flight record drains). A vanished router (mode
+                //    reverted mid-poll) is treated as not-deliverable-here and skipped.
+                let decision = self.named_group_mut(id, group).and_then(|g| {
+                    g.router
+                        .as_ref()
+                        .map(|r| r.decide(member, &record.key, off))
+                });
+                if decision != Some(RouteDecision::Deliver) {
+                    offset += 1;
+                    continue;
+                }
+                // 5. Routed here and the key is free: claim now (bumping the delivery count) and resolve
+                //    the 0/1/2-ack disposition, exactly as `poll_in_member` does.
+                let claim = self
+                    .named_group_mut(id, group)
+                    .map(|g| g.leases.claim(off, now));
+                let (token, deliveries) = match claim {
+                    None | Some(Claim::InFlight) => {
+                        offset += 1;
+                        continue;
+                    }
+                    Some(Claim::Exhausted) => return Err(EngineError::GenerationExhausted),
+                    Some(Claim::Granted { token, deliveries }) => (token, deliveries),
+                };
+                match self.delivery.disposition(deliveries) {
+                    Disposition::Deliver => {
+                        // Mark the key busy so its NEXT record does not route until this one drains,
+                        // preserving per-key order across the group's members.
+                        if let Some(g) = self.named_group_mut(id, group) {
+                            if let Some(r) = g.router.as_mut() {
+                                r.mark_in_flight(&record.key, off);
+                            }
+                        }
+                        self.counters.delivered += 1;
+                        if deliveries > 1 {
+                            self.counters.redelivered += 1;
+                        }
+                        return Ok(Poll::Message(Delivery {
+                            offset: off,
+                            token,
+                            deliveries,
+                            record,
+                        }));
+                    }
+                    Disposition::DeadLetter => {
+                        // Drop the lease and FREE the key, then dead-letter OUTSIDE the borrow (per-stream
+                        // DLQ, #1110) below, exactly as the plain path; clearing the key mirrors
+                        // `poll_in_member`'s DeadLetter arm so the poisoned key is not left busy forever.
+                        if let Some(g) = self.named_group_mut(id, group) {
+                            g.leases.ack(&token);
+                            if let Some(r) = g.router.as_mut() {
+                                r.clear_offset(off);
+                            }
+                        }
+                        dead_letter = Some((off, deliveries, record));
+                        break;
+                    }
+                }
+            }
             // Skip an already-acked offset and claim the next deliverable lease (scoped group borrow).
             let Some(claim) = self.named_group_mut(id, group).map(|g| {
                 if g.cursor.is_acked(off) {
@@ -5901,6 +6082,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         match g.leases.ack(token) {
             AckOutcome::Acked => {
                 g.cursor.ack(token.offset);
+                // key_shared (#64 follow-up): the key this offset held is now free, so its next record
+                // may route. A no-op for a plain competing named group (no router). A nack does NOT
+                // clear it (the same offset redelivers), so the key stays busy and per-key order holds.
+                if let Some(r) = g.router.as_mut() {
+                    r.clear_offset(token.offset);
+                }
                 self.counters.acks += 1;
                 AckResult::Acked
             }
@@ -9135,6 +9322,173 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .get(&id)
             .and_then(|s| s.groups.get(group))
             .and_then(|g| g.filter.as_deref())
+    }
+
+    /// The NAMED-stream twin of [`Engine::set_key_ordering_in`] (#64 follow-up): sets `group` OF the
+    /// named `stream` to [`KeyOrdering::KeyShared`] (attaching a fresh [`KeyRouter`] to that stream's
+    /// OWN [`WorkGroup`], no members yet) or back to [`KeyOrdering::None`] (dropping it, reverting to
+    /// plain competing). The router lives on the per-stream group keyed by `(stream, group)`, so the
+    /// same group name in two streams routes over two INDEPENDENT member sets. Re-applying `KeyShared`
+    /// never wipes the live-member set or in-flight key map. Like the default setter it re-applies the
+    /// mode server-side after open (never restored from disk); the per-stream CURSOR, however, is
+    /// durable (#681), so a resumed `key_shared` group resumes past its committed offsets. Creates the
+    /// stream's group if absent (validating the name + the PER-STREAM group cap); the named `stream`
+    /// must already be resident (declared via produce/bind). The default stream (`""`) routes to
+    /// [`Engine::set_key_ordering_in`] BYTE-FOR-BYTE.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed named name, [`EngineError::UnknownStream`] for
+    /// a never-declared stream, [`EngineError::InvalidGroupName`] for a malformed group name, or
+    /// [`EngineError::TooManyGroups`] if a new group would exceed the per-stream cap.
+    pub fn set_key_ordering_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        ordering: KeyOrdering,
+    ) -> Result<(), EngineError> {
+        if stream.is_empty() {
+            return self.set_key_ordering_in(group, ordering);
+        }
+        let id = StreamId::named(stream)?;
+        if self.streams.get(&id).is_none() {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        validate_group_name(group)?;
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        let lease_config = self.lease_config;
+        let max_groups = self.max_groups;
+        let named = self
+            .named_streams
+            .entry(id)
+            .or_insert_with(NamedStream::new);
+        if !named.groups.contains_key(group) {
+            if max_groups != 0 && named.groups.len() >= max_groups {
+                return Err(EngineError::TooManyGroups { max: max_groups });
+            }
+            named
+                .groups
+                .insert(group.to_string(), WorkGroup::new(lease_config, now));
+        }
+        if let Some(g) = named.groups.get_mut(group) {
+            match ordering {
+                KeyOrdering::KeyShared => {
+                    // Attach a router only if not already key_shared, so re-applying the mode never
+                    // wipes the live-member set or the in-flight key map.
+                    if g.router.is_none() {
+                        g.router = Some(KeyRouter::new());
+                    }
+                    // key_shared and broadcast are mutually exclusive (#288): clear the broadcast flag.
+                    g.broadcast = false;
+                }
+                KeyOrdering::None => g.router = None,
+            }
+        }
+        Ok(())
+    }
+
+    /// The current ordering mode of `group` OF the named `stream` (#64 follow-up), the twin of
+    /// [`Engine::key_ordering_in`]: [`KeyOrdering::KeyShared`] when that stream's group carries a live
+    /// router, else [`KeyOrdering::None`] (an unknown stream/group, or a plain competing group). The
+    /// default stream (`""`) reads the default-group mode.
+    #[must_use]
+    pub fn key_ordering_in_stream(&self, stream: &str, group: &str) -> KeyOrdering {
+        if stream.is_empty() {
+            return self.key_ordering_in(group);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return KeyOrdering::None;
+        };
+        match self
+            .named_streams
+            .get(&id)
+            .and_then(|s| s.groups.get(group))
+        {
+            Some(g) if g.router.is_some() => KeyOrdering::KeyShared,
+            _ => KeyOrdering::None,
+        }
+    }
+
+    /// Registers `member` as a live member of `group` OF the named `stream` (#64 follow-up), the twin
+    /// of [`Engine::join_member_in`]: the consumer joined, so its keys may now route to it under THIS
+    /// stream's own router. A no-op for a non-`key_shared` group (no member set) or an unknown
+    /// stream/group. Returns `true` if the live-member set changed. The default stream (`""`) joins the
+    /// default-group router.
+    pub fn join_member_in_stream(&mut self, stream: &str, group: &str, member: MemberId) -> bool {
+        if stream.is_empty() {
+            return self.join_member_in(group, member);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return false;
+        };
+        self.named_streams
+            .get_mut(&id)
+            .and_then(|s| s.groups.get_mut(group))
+            .and_then(|g| g.router.as_mut())
+            .is_some_and(|r| r.join(member))
+    }
+
+    /// Removes `member` from `group` OF the named `stream`'s live-member set (#64 follow-up), the twin
+    /// of [`Engine::leave_member_in`]: the consumer left or disconnected, so its keys re-route to their
+    /// new owners under THIS stream's router. Any record still in flight to the departed member stays
+    /// leased and drains or expires before its key frees (the drain-or-expire guard). A no-op for a
+    /// non-`key_shared` group or an unknown stream/group. Returns `true` if the set changed. The default
+    /// stream (`""`) leaves the default-group router.
+    pub fn leave_member_in_stream(&mut self, stream: &str, group: &str, member: MemberId) -> bool {
+        if stream.is_empty() {
+            return self.leave_member_in(group, member);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return false;
+        };
+        self.named_streams
+            .get_mut(&id)
+            .and_then(|s| s.groups.get_mut(group))
+            .and_then(|g| g.router.as_mut())
+            .is_some_and(|r| r.leave(member))
+    }
+
+    /// The number of busy keys (delivered-but-unacked, one per key) in `group` OF the named `stream`
+    /// (#64 follow-up), the twin of [`Engine::busy_keys_in`]; `0` for a plain competing group or an
+    /// unknown stream/group. The default stream (`""`) reads the default-group router.
+    #[must_use]
+    pub fn busy_keys_in_stream(&self, stream: &str, group: &str) -> usize {
+        if stream.is_empty() {
+            return self.busy_keys_in(group);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return 0;
+        };
+        self.named_streams
+            .get(&id)
+            .and_then(|s| s.groups.get(group))
+            .and_then(|g| g.router.as_ref())
+            .map_or(0, KeyRouter::busy_keys)
+    }
+
+    /// The current `key_shared` routing decision for delivering `offset` (carrying `key`) to `member` in
+    /// `group` OF the named `stream` (#64 follow-up), the twin of [`Engine::route_decision_in`], or
+    /// `None` for a non-`key_shared` group or an unknown stream/group. A read-only probe of THIS stream's
+    /// live router. The default stream (`""`) reads the default-group router.
+    #[must_use]
+    pub fn route_decision_in_stream(
+        &self,
+        stream: &str,
+        group: &str,
+        member: MemberId,
+        key: &[u8],
+        offset: Offset,
+    ) -> Option<RouteDecision> {
+        if stream.is_empty() {
+            return self.route_decision_in(group, member, key, offset);
+        }
+        let id = StreamId::named(stream).ok()?;
+        self.named_streams
+            .get(&id)
+            .and_then(|s| s.groups.get(group))
+            .and_then(|g| g.router.as_ref())
+            .map(|r| r.decide(member, key, offset))
     }
 
     /// Resolves a filtered subscribe's covering NAMED stream from its subject `pattern` (#594-B): the
@@ -15558,6 +15912,293 @@ mod tests {
         assert_eq!(e.busy_keys_in("g"), 1, "acking one frees its key");
         e.ack_in("g", &d1.token);
         assert_eq!(e.busy_keys_in("g"), 0);
+    }
+
+    // ---- key_shared routing on NAMED streams (#64 follow-up) ----
+
+    /// Produces a KEYED record to a NAMED stream, for the named-stream `key_shared` tests.
+    fn produce_keyed_stream(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Offset {
+        e.produce_in_stream(
+            stream,
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key,
+                headers: b"",
+                payload,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Produces a KEYED record carrying a stored SUBJECT to a NAMED stream, for the `key_shared` + filter
+    /// composition test.
+    fn produce_keyed_subject_stream(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        key: &[u8],
+        subject: &[u8],
+        payload: &[u8],
+    ) -> Offset {
+        e.produce_in_stream_with_subject(
+            stream,
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key,
+                headers: b"",
+                payload,
+            },
+            subject,
+        )
+        .unwrap()
+    }
+
+    /// Finds a key that rendezvous-routes EXCLUSIVELY to `owner` (never `other`) under the named
+    /// `stream`'s group router, so a test can assert per-key affinity is non-vacuous. Panics if none
+    /// found in a generous search.
+    fn key_owned_by_stream(
+        e: &Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        group: &str,
+        owner: MemberId,
+        other: MemberId,
+    ) -> Vec<u8> {
+        for n in 0..2000u32 {
+            let key = format!("k{n}").into_bytes();
+            let owns = matches!(
+                e.route_decision_in_stream(stream, group, owner, &key, Offset::ZERO),
+                Some(RouteDecision::Deliver)
+            );
+            let others = matches!(
+                e.route_decision_in_stream(stream, group, other, &key, Offset::ZERO),
+                Some(RouteDecision::Deliver)
+            );
+            if owns && !others {
+                return key;
+            }
+        }
+        panic!("no key routed exclusively to the owner");
+    }
+
+    #[test]
+    fn a_named_stream_key_shared_group_routes_each_key_to_one_stable_member() {
+        // #64 follow-up: the named-stream twin of `same_key_always_routes_to_the_same_live_member`. Two
+        // members in ONE key_shared group on a NAMED stream; every record sharing a key reaches the SAME
+        // member, in per-key offset order, and the other member never sees it. The router + membership
+        // live on the PER-STREAM work-group (keyed by (stream, group)), reusing the default rendezvous
+        // routing.
+        let (a, b) = (MemberId::new(10), MemberId::new(20));
+        let mut e = open(config(50, 5));
+        // The stream must be resident before its group can be put into key_shared mode.
+        e.declare_stream("orders").unwrap();
+        e.set_key_ordering_in_stream("orders", "g", KeyOrdering::KeyShared)
+            .unwrap();
+        assert_eq!(
+            e.key_ordering_in_stream("orders", "g"),
+            KeyOrdering::KeyShared
+        );
+        e.join_member_in_stream("orders", "g", a);
+        e.join_member_in_stream("orders", "g", b);
+        // A key that routes to `a` (and NOT `b`).
+        let key_a = key_owned_by_stream(&e, "orders", "g", a, b);
+        // Three key_a records interleaved with an other-keyed record.
+        let o0 = produce_keyed_stream(&mut e, "orders", &key_a, b"a0");
+        let _ = produce_keyed_stream(&mut e, "orders", b"other-key", b"x");
+        let o1 = produce_keyed_stream(&mut e, "orders", &key_a, b"a1");
+        let o2 = produce_keyed_stream(&mut e, "orders", &key_a, b"a2");
+        // The other member never gets a key_a record (it may get "other-key").
+        for expected in [o0, o1, o2] {
+            assert_eq!(
+                e.route_decision_in_stream("orders", "g", b, &key_a, expected),
+                Some(RouteDecision::NotOwner),
+                "key_a never routes to the non-owner"
+            );
+        }
+        // Drain member `a`: it receives the key_a records IN OFFSET ORDER (per-key order preserved).
+        for expected_off in [o0, o1, o2] {
+            loop {
+                match e.poll_in_stream_member("orders", "g", a, 0).unwrap() {
+                    Poll::Message(d) if d.record.key.as_ref() == key_a.as_slice() => {
+                        assert_eq!(
+                            d.offset, expected_off,
+                            "per-key offset order preserved on the named stream"
+                        );
+                        assert_eq!(e.ack_in_stream("orders", "g", &d.token), AckResult::Acked);
+                        break;
+                    }
+                    // An "other-key" record `a` also owns: ack and keep scanning for the key_a one.
+                    Poll::Message(d) => {
+                        assert_eq!(e.ack_in_stream("orders", "g", &d.token), AckResult::Acked);
+                    }
+                    Poll::Idle => panic!("member a should eventually get its key_a record"),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_plain_competing_named_group_is_unchanged_under_the_member_aware_entry() {
+        // #64 follow-up: a named group with NO key_shared config (KeyOrdering::None) is byte-for-byte the
+        // historical plain competing scan whether polled through the member-agnostic `poll_in_stream` or
+        // the member-aware `poll_in_stream_member` — the member is ignored and records deliver in offset
+        // order with no per-key affinity and no router.
+        let mut e = open(config(10, 5));
+        produce_to(&mut e, "orders", b"a"); // off0 (declares the stream)
+        produce_to(&mut e, "orders", b"b"); // off1
+        produce_to(&mut e, "orders", b"c"); // off2
+        assert_eq!(e.key_ordering_in_stream("orders", "g"), KeyOrdering::None);
+        // The member-aware entry on a None group delivers in plain competing order (member irrelevant).
+        let d0 = message(
+            e.poll_in_stream_member("orders", "g", MemberId::new(7), 0)
+                .unwrap(),
+        );
+        assert_eq!(d0.offset, Offset::new(0));
+        assert_eq!(d0.record.payload.as_ref(), b"a");
+        assert_eq!(e.ack_in_stream("orders", "g", &d0.token), AckResult::Acked);
+        // A DIFFERENT member id sees the NEXT record (no per-key affinity): plain competing.
+        let d1 = message(
+            e.poll_in_stream_member("orders", "g", MemberId::new(99), 0)
+                .unwrap(),
+        );
+        assert_eq!(d1.offset, Offset::new(1));
+        assert_eq!(e.ack_in_stream("orders", "g", &d1.token), AckResult::Acked);
+        // The member-agnostic entry still delivers the tail identically.
+        let d2 = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d2.offset, Offset::new(2));
+        assert_eq!(
+            e.busy_keys_in_stream("orders", "g"),
+            0,
+            "a plain competing group has no router / busy keys"
+        );
+        assert_eq!(e.key_ordering_in_stream("orders", "g"), KeyOrdering::None);
+    }
+
+    #[test]
+    fn a_named_stream_key_shared_group_composes_with_a_subject_filter() {
+        // #64 follow-up composing with #594-B: a key_shared named group that ALSO carries a subject
+        // filter delivers to a member ONLY records that both match the filter AND route to it; a
+        // non-matching record is committed PAST (filtered) regardless of member; per-key order holds
+        // across the filtered gap.
+        let (a, b) = (MemberId::new(1), MemberId::new(2));
+        let mut e = open(config(50, 5));
+        e.declare_stream("orders").unwrap();
+        e.set_key_ordering_in_stream("orders", "g", KeyOrdering::KeyShared)
+            .unwrap();
+        e.set_subject_filter_in_stream("orders", "g", Some("orders.*"))
+            .unwrap();
+        e.join_member_in_stream("orders", "g", a);
+        e.join_member_in_stream("orders", "g", b);
+        let key_a = key_owned_by_stream(&e, "orders", "g", a, b);
+        // All three records carry key_a (owner `a`); the middle one is non-matching (filtered).
+        let o0 = produce_keyed_subject_stream(&mut e, "orders", &key_a, b"orders.created", b"m0");
+        let _f = produce_keyed_subject_stream(&mut e, "orders", &key_a, b"audit.x.y", b"skip");
+        let o2 = produce_keyed_subject_stream(&mut e, "orders", &key_a, b"orders.shipped", b"m2");
+        // Routing is active: key_a is NotOwner for `b`.
+        assert_eq!(
+            e.route_decision_in_stream("orders", "g", b, &key_a, o0),
+            Some(RouteDecision::NotOwner)
+        );
+        // The non-owner `b` delivers NOTHING for key_a (it may filter the non-matching record).
+        match e.poll_in_stream_member("orders", "g", b, 0).unwrap() {
+            Poll::Idle => {}
+            other => panic!("the non-owner must get no key_a message, got {other:?}"),
+        }
+        // Member `a` drains: ONLY the matching key_a records, in order; the non-match is skipped.
+        let d0 = message(e.poll_in_stream_member("orders", "g", a, 0).unwrap());
+        assert_eq!(d0.offset, o0);
+        assert_eq!(d0.record.payload.as_ref(), b"m0");
+        assert_eq!(e.ack_in_stream("orders", "g", &d0.token), AckResult::Acked);
+        let d2 = message(e.poll_in_stream_member("orders", "g", a, 0).unwrap());
+        assert_eq!(
+            d2.offset, o2,
+            "per-key order preserved across the filtered gap"
+        );
+        assert_eq!(d2.record.payload.as_ref(), b"m2");
+        assert_eq!(e.ack_in_stream("orders", "g", &d2.token), AckResult::Acked);
+        // The non-matching record was committed past (filtered), never delivered.
+        assert!(
+            e.counters().filtered >= 1,
+            "the non-matching record was filtered"
+        );
+        assert!(matches!(
+            e.poll_in_stream_member("orders", "g", a, 0).unwrap(),
+            Poll::Idle
+        ));
+        // The whole run is committed past: two matches acked + one non-match filtered = 3 offsets.
+        assert_eq!(e.committed_offset_in_stream("orders", "g"), Offset::new(3));
+    }
+
+    #[test]
+    fn a_named_stream_key_shared_poison_is_dead_lettered_and_frees_its_key() {
+        // #64 follow-up composing with #1110: a poison (over max_deliver) that routes to a key_shared
+        // member on a named stream dead-letters to that stream's OWN DLQ, is committed past, and FREES
+        // its key (router.clear_offset) so the key is no longer busy after the move.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        let a = MemberId::new(1);
+        e.declare_stream("orders").unwrap();
+        e.set_key_ordering_in_stream("orders", "g", KeyOrdering::KeyShared)
+            .unwrap();
+        // The sole member owns every key, so the poison routes to it.
+        e.join_member_in_stream("orders", "g", a);
+        // Inline keyed produce (this engine's clock is an `Arc<ManualClock>`, so the `ManualClock`-typed
+        // `produce_keyed_stream` helper does not apply).
+        let off = e
+            .produce_in_stream(
+                "orders",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"poison-key",
+                    headers: b"",
+                    payload: b"payload",
+                },
+            )
+            .unwrap();
+        // Attempt 1 delivers to `a` and marks the key busy.
+        let d = message(
+            e.poll_in_stream_member("orders", "g", a, e.now_monotonic())
+                .unwrap(),
+        );
+        assert_eq!(d.offset, off);
+        assert_eq!(
+            e.busy_keys_in_stream("orders", "g"),
+            1,
+            "the delivered key is busy"
+        );
+        // Expire the lease; re-poll: attempt 2 exceeds max_deliver=1 and is dead-lettered (Parked).
+        clock.advance_monotonic_nanos(40);
+        match e
+            .poll_in_stream_member("orders", "g", a, e.now_monotonic())
+            .unwrap()
+        {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected the DeadLetter advisory (Parked), got {other:?}"),
+        }
+        assert_eq!(
+            e.committed_offset_in_stream("orders", "g"),
+            Offset::new(off.get() + 1),
+            "the poison is committed past"
+        );
+        assert_eq!(e.counters().dead_lettered, 1);
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "one record in the named stream's own DLQ"
+        );
+        assert_eq!(
+            e.busy_keys_in_stream("orders", "g"),
+            0,
+            "the dead-lettered key is freed for its next record"
+        );
     }
 
     // ----- Per-consumer BYTE budget passthrough (refs #65, #275) -----
