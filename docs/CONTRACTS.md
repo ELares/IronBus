@@ -306,6 +306,16 @@ stream that is only produced-to (never consumed) has no such file and resumes fr
 stream's (`Engine::checkpoint_all_groups`), and every one is resumed at open, so a named-stream
 consumer survives a restart exactly as a default-stream consumer does.
 
+A named stream's per-group durable ATTEMPT COUNTS (the `MaxDeliver`/poison-cap state, #681 DLQ
+follow-up) ride the **same rule**: the default stream's `attempts-<hex(group)>.ckpt` snapshot
+format, verbatim, rooted in the stream's own subdirectory —
+`streams/<hex(stream)>/attempts-<hex(group)>.ckpt` — flushed and resumed beside the cursor. So a
+poison message in flight on a named stream resumes at its true attempt number after a restart
+(never resetting to 1) exactly as on the default stream. Like the cursor, this is a new file
+LOCATION, not a new byte layout; a pre-follow-up broker simply ignores it and resumes that
+group's poison at attempt 1 (at-least-once safe). A group that has an `attempts-<hex>.ckpt` but
+no `cursor-<hex>.ckpt` (a poison in flight but never committed) is still rediscovered at open.
+
 ### DLQ redrive watermark (the offline redrive checkpoint, #299)
 
 Source: `crates/ironbus-storage/src/admin.rs`. The OFFLINE `admin dlq-redrive` verb records how
@@ -333,12 +343,15 @@ survives an unclean restart. Bounded by `max_in_flight` per group.
 | `crc`        | u32   | 4       | CRC32C over every preceding byte of the snapshot |
 
 `ATTEMPT_SNAPSHOT_MIN_LEN` = `1 + 4 + 4` = 9 bytes (no pairs). The default group's file is
-`attempts.ckpt`; a named group's is `attempts-<hex(name)>.ckpt`. It is its OWN two-slot
-checkpoint with a larger per-slot payload cap (`ATTEMPTS_PAYLOAD` = 32 KiB) than the 64-byte
-cursor slot, since the map scales with `max_in_flight`. The format is ADDITIVE to the prior
-model: a data directory written before #358 simply has no attempts file, which decodes as
-"no carried counts" (every in-flight message resumes at attempt 1, the historical behavior);
-a torn snapshot degrades the same way and never blocks open.
+`attempts.ckpt`; a named group's is `attempts-<hex(name)>.ckpt`. A NAMED stream's per-group
+attempt counts use the SAME `attempts-<hex(group)>.ckpt` file, rooted in that stream's own
+subdirectory (`streams/<hex(stream)>/attempts-<hex(group)>.ckpt`, #681 DLQ follow-up) — a new
+LOCATION, not a new byte layout. It is its OWN two-slot checkpoint with a larger per-slot
+payload cap (`ATTEMPTS_PAYLOAD` = 32 KiB) than the 64-byte cursor slot, since the map scales
+with `max_in_flight`. The format is ADDITIVE to the prior model: a data directory written
+before #358 simply has no attempts file, which decodes as "no carried counts" (every in-flight
+message resumes at attempt 1, the historical behavior); a torn snapshot degrades the same way
+and never blocks open.
 
 ---
 
@@ -351,6 +364,20 @@ data directory. A DLQ record reuses the exact record/segment format above: the o
 poison record is preserved verbatim (its `key`, `payload`, and original `timestamp_ms`),
 and the dead-letter metadata is packed as a fixed, self-describing prefix of the DLQ
 record's `headers` blob, ahead of the original headers.
+
+The DEFAULT stream's sink lives at the data-dir root `dlq/` (or the configured dead-letter
+EXCHANGE subdir, #551). A NAMED stream's poison (#681 DLQ follow-up) routes to that stream's
+OWN sink, `streams/<hex(stream)>/dlq/` — the same on-disk record format and the same
+crash-atomic, exactly-once move, keyed by `(stream, group, source_offset)` so dead-letters
+(and their per-group idempotency set) are ISOLATED per stream, co-located with the stream's
+log. This is a new LOCATION, not a new byte layout: the DLQ record format / `FORMAT_VERSION`
+is unchanged. The move ordering is identical to the default's: APPEND+FSYNC the forensic copy,
+THEN commit the source cursor (in memory; the named cursor's durability is the lagging #681
+checkpoint), so a crash between the two redelivers-and-re-poisons and the sink's rebuilt exact
+set makes the re-poison a no-op append (never lost, never doubled). The sink is opened lazily on
+a stream's first dead-letter (a stream that never poisons never creates `dlq/`) or eagerly at
+open when the subdir already exists, so the idempotency set is present before the first
+re-poison.
 
 ### DLQ headers metadata prefix (on-disk, within a DLQ record's `headers`)
 
@@ -810,13 +837,15 @@ is `""` (durable, `cursor.ckpt`); named groups are durable to their own
 `cursor-<hex>.ckpt`. A NAMED stream's per-group cursors are durable the same way, in the
 stream's own subdir (`streams/<hex(stream)>/cursor-<hex(group)>.ckpt`, #681), so a
 named-stream consumer resumes at its committed offset after a restart. The `LeaseTable`'s
-per-message delivery-attempt counts are ALSO durable (#358) FOR THE DEFAULT STREAM: each
-group's in-flight `{offset -> attempt}` map is checkpointed (default `attempts.ckpt`, named
-group `attempts-<hex>.ckpt`) so `MaxDeliver` survives an unclean restart. On open the table
+per-message delivery-attempt counts are ALSO durable (#358): each group's in-flight
+`{offset -> attempt}` map is checkpointed (default `attempts.ckpt`, named group
+`attempts-<hex>.ckpt`) so `MaxDeliver` survives an unclean restart. On open the table
 seeds its carried attempt counts so a redelivered message resumes at its true attempt number
-instead of resetting to 1. A named STREAM's durable attempt counts (its DLQ/`MaxDeliver`
-parity) are the flagged #681 follow-up, deferred with per-stream DLQ / key-shared / Tier-S /
-metrics; a named stream's cursor durability (this slice) does not depend on them.
+instead of resetting to 1. A NAMED stream now carries this the same way — its per-group attempt
+counts persist to `streams/<hex(stream)>/attempts-<hex(group)>.ckpt` and its poison messages
+dead-letter to its own `streams/<hex(stream)>/dlq/` sink (#681 DLQ follow-up), bringing named
+streams to full DLQ/`MaxDeliver` parity with the default stream. (Key-shared routing, the Tier-S
+streaming mode, and per-stream metric labels remain the flagged named-stream follow-ups.)
 
 ### LeaseToken (in-memory fencing token)
 
