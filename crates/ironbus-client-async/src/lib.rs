@@ -544,6 +544,10 @@ impl AsyncClient {
                 default_tier: config.default_consume_tier.map(ConsumeTier::as_u8),
                 understands_deliver_batch: config.understands_deliver_batch,
                 understands_streams: config.understands_streams,
+                // The compressed-delivery capability bit (#1066), ON by default — byte-for-byte the sync
+                // client's body, so a `--compression` broker ships this decode-capable client
+                // stored-compressed records verbatim.
+                understands_compressed_delivery: config.understands_compressed_delivery,
             },
             &mut connect_body,
         );

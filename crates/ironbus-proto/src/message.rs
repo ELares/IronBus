@@ -1238,8 +1238,27 @@ pub const CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH: u8 = 0b0100_0000;
 /// a pure capability flag (no associated value), so it occupies no slot in the v1 field block beyond
 /// this `flags` bit, exactly like [`CONNECT_FLAG_WANTS_GAP_MARKER`]. It is the LAST free bit (bit 7)
 /// of the handshake `flags` byte; a future capability needs an appended flags byte (the version+len
-/// framing already tolerates it).
+/// framing already tolerates it) — see [`CONNECT_FLAG2_COMPRESSED_DELIVERY`], the first such bit.
 pub const CONNECT_FLAG_UNDERSTANDS_STREAMS: u8 = 0b1000_0000;
+
+/// The FIRST bit of the `Connect` handshake's SECOND capability-flags byte (`flags2`, #1066), by which
+/// a consumer advertises that it UNDERSTANDS a compression-CODEC-encoded `Deliver` payload: the
+/// per-record `COMPRESSED` record flag and the `descriptor + codec-stream` payload shape a
+/// `--compression`-enabled broker stores and, by default, ships verbatim. When set, the server MAY
+/// deliver a stored-compressed record to this consumer with the `COMPRESSED` bit and codec bytes intact
+/// (the zero-CPU passthrough). When CLEAR (an old client, one that opts out, or the empty `Connect`
+/// body) the server DECOMPRESSES a stored-compressed record before delivery and clears the `COMPRESSED`
+/// bit, so a pre-#430 consumer that would mis-decode the descriptor bytes receives the plain payload —
+/// the #1066 silent-corruption fix. It is a pure capability flag (no associated value).
+///
+/// It lives in a SECOND flags byte because the historical `Connect` `flags` byte is FULL — bit 7
+/// ([`CONNECT_FLAG_UNDERSTANDS_STREAMS`]) was its last free bit. `flags2` is an APPENDED in-block byte
+/// that follows the v1 fixed fields and any appended `default_ack_level`/`default_tier`; it is emitted
+/// ONLY when non-zero, so a client that advertises no `flags2` capability sends a body byte-for-byte the
+/// historical layout, and an old reader (which stops after the v1 fields) ignores it. A future flags2
+/// capability takes the next bit of this same byte; a future appended VALUE field must follow the
+/// whole `flags2` byte so this single-byte read stays forward-compatible.
+pub const CONNECT_FLAG2_COMPRESSED_DELIVERY: u8 = 0b0000_0001;
 
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
@@ -1312,10 +1331,12 @@ pub const INFO_FLAG_STREAMS: u8 = 0b1000_0000;
 /// follows), then the v1 block: `flags: u8`, `requested_credit: u32 LE`, `requested_credit_bytes:
 /// u64 LE`, then — each ONLY when its presence bit is set, in this fixed order — an APPENDED
 /// `default_ack_level: u8` (#494, when [`CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL`]) and an APPENDED
-/// `default_tier: u8` (#543, when [`CONNECT_FLAG_HAS_DEFAULT_TIER`]). Each appended byte is OMITTED
+/// `default_tier: u8` (#543, when [`CONNECT_FLAG_HAS_DEFAULT_TIER`]), then — LAST — an APPENDED
+/// `flags2: u8` SECOND capability-flags byte (#1066, [`CONNECT_FLAG2_COMPRESSED_DELIVERY`]), present
+/// ONLY when non-zero (the historical `flags` byte is full). Each appended byte is OMITTED
 /// (and `field_len` shrinks by it) when its field is absent; the encoder and decoder walk them in the
 /// SAME conditional order, so an absent earlier byte never shifts a present later one. A request with
-/// neither appended byte is byte-for-byte the historical body. Any bytes past `field_len` (a FUTURE
+/// none of these appended bytes is byte-for-byte the historical body. Any bytes past `field_len` (a FUTURE
 /// version's appended fields, e.g. the #71 `wire_protocol_version`) are TOLERATED and ignored by a v1
 /// reader. An empty body is the all-absent default.
 // Each bool is a DISTINCT negotiated wire CAPABILITY flag (gap-marker / streaming / deliver-batch /
@@ -1373,6 +1394,16 @@ pub struct ConnectBody {
     /// never sent a streams reply it did not request. A pure capability flag, so it adds no block slot
     /// beyond its `flags` bit.
     pub understands_streams: bool,
+    /// Whether this consumer UNDERSTANDS a compression-codec-encoded `Deliver` payload — the per-record
+    /// `COMPRESSED` flag and `descriptor + codec-stream` shape a `--compression` broker stores (#1066):
+    /// the [`CONNECT_FLAG2_COMPRESSED_DELIVERY`] capability bit (the first bit of the appended `flags2`
+    /// byte). When `true`, the server may ship a stored-compressed record verbatim (COMPRESSED bit +
+    /// codec bytes) for this consumer to decode. When `false` (the default, an old client, or the empty
+    /// `Connect` body) the server DECOMPRESSES a stored-compressed record before delivery and clears the
+    /// COMPRESSED bit, so a pre-#430 consumer that cannot decode the descriptor never receives it — the
+    /// silent-corruption fix. Advertising it sets a bit in the appended `flags2` byte (emitted only when
+    /// non-zero), so a client that leaves it `false` sends a body byte-for-byte the historical layout.
+    pub understands_compressed_delivery: bool,
 }
 
 /// The number of bytes in the `Connect` v1 known-field block with NO appended bytes (#494, #543):
@@ -1495,14 +1526,24 @@ pub const CONNECT_AUTH_SECTION_MARKER: u8 = 0xA7;
 /// [`decode_connect`] accepts both.
 pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     out.push(HANDSHAKE_BODY_VERSION);
+    // The SECOND capability-flags byte (#1066): the historical `flags` byte is full, so a new PURE
+    // capability rides here. It is an APPENDED in-block byte, emitted ONLY when non-zero (below), so a
+    // request that advertises no `flags2` capability keeps the body byte-for-byte the historical layout.
+    let mut flags2 = 0u8;
+    if req.understands_compressed_delivery {
+        flags2 |= CONNECT_FLAG2_COMPRESSED_DELIVERY;
+    }
     // The block length is the historical fixed block plus ONE byte for each present appended field, in
-    // declared order (ack-level, then tier). An all-absent request encodes the historical length and
-    // bytes verbatim (byte-identity, #494/#543).
+    // declared order (ack-level, tier, then flags2). An all-absent request encodes the historical length
+    // and bytes verbatim (byte-identity, #494/#543/#1066).
     let mut field_len = CONNECT_V1_FIELD_LEN;
     if req.default_ack_level.is_some() {
         field_len += 1;
     }
     if req.default_tier.is_some() {
+        field_len += 1;
+    }
+    if flags2 != 0 {
         field_len += 1;
     }
     out.extend_from_slice(&field_len.to_le_bytes());
@@ -1542,6 +1583,12 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     }
     if let Some(tier) = req.default_tier {
         out.push(tier);
+    }
+    // The appended `flags2` byte (#1066) follows the tier byte, present ONLY when a flags2 capability is
+    // set. The decoder reads it after tier from whatever remains in the block, so a clear flags2 keeps
+    // the body byte-for-byte the historical layout and an old reader ignores the (absent) byte.
+    if flags2 != 0 {
+        out.push(flags2);
     }
 }
 
@@ -1601,6 +1648,12 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     // encoder wrote them, so a present tier byte is read from the right offset whether or not the
     // ack-level byte preceded it. Read AFTER ack-level; a clear bit (or short block) reads no byte.
     let default_tier = (flags & CONNECT_FLAG_HAS_DEFAULT_TIER != 0).then(|| fr.u8().unwrap_or(0));
+    // The appended `flags2` byte (#1066) is the FIRST byte of the block PAST the v1 fixed fields and the
+    // conditional ack-level/tier bytes. An old body (which stops there) leaves nothing, so `unwrap_or(0)`
+    // reads no capability and every `flags2` bit is clear — byte-for-byte the historical decode. A future
+    // in-block additive VALUE field MUST follow the whole `flags2` byte, so reading exactly this one byte
+    // stays forward-compatible (an unknown later byte is tolerated and ignored, as it is today).
+    let flags2 = fr.u8().unwrap_or(0);
     let requested_credit = (flags & CONNECT_FLAG_HAS_CREDIT != 0).then_some(credit);
     let requested_credit_bytes =
         (flags & CONNECT_FLAG_HAS_CREDIT_BYTES != 0).then_some(credit_bytes);
@@ -1608,6 +1661,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     let understands_streaming = flags & CONNECT_FLAG_UNDERSTANDS_STREAMING != 0;
     let understands_deliver_batch = flags & CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH != 0;
     let understands_streams = flags & CONNECT_FLAG_UNDERSTANDS_STREAMS != 0;
+    let understands_compressed_delivery = flags2 & CONNECT_FLAG2_COMPRESSED_DELIVERY != 0;
     Ok(ConnectBody {
         requested_credit,
         requested_credit_bytes,
@@ -1617,6 +1671,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         default_tier,
         understands_deliver_batch,
         understands_streams,
+        understands_compressed_delivery,
     })
 }
 
@@ -3119,6 +3174,7 @@ mod tests {
             default_tier: None,
             understands_deliver_batch: false,
             understands_streams: false,
+            understands_compressed_delivery: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -4299,8 +4355,9 @@ mod tests {
             default_tier in proptest::option::of(any::<u8>()),
             understands_deliver_batch in any::<bool>(),
             understands_streams in any::<bool>(),
+            understands_compressed_delivery in any::<bool>(),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch, understands_streams };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch, understands_streams, understands_compressed_delivery };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -4359,7 +4416,7 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false, understands_streams: false };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false, understands_streams: false, understands_compressed_delivery: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
@@ -4450,6 +4507,7 @@ mod tests {
                 default_tier: None,
                 understands_deliver_batch: false,
                 understands_streams: false,
+                understands_compressed_delivery: false,
             }
         );
     }
@@ -4475,6 +4533,7 @@ mod tests {
                 default_tier: Some(1),
                 understands_deliver_batch: true,
                 understands_streams: true,
+                understands_compressed_delivery: false,
             },
             &mut full,
         );
@@ -4523,6 +4582,7 @@ mod tests {
                     default_tier: Some(1),
                     understands_deliver_batch: false,
                     understands_streams: false,
+                    understands_compressed_delivery: false,
                 },
                 &mut body,
             );
@@ -4672,6 +4732,7 @@ mod tests {
             default_tier: None,
             understands_deliver_batch: false,
             understands_streams: false,
+            understands_compressed_delivery: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -4939,6 +5000,7 @@ mod tests {
             default_tier: None,
             understands_deliver_batch: false,
             understands_streams: false,
+            understands_compressed_delivery: false,
         };
         let mut pre = Vec::new();
         encode_connect(&no_level, &mut pre);
@@ -5032,6 +5094,7 @@ mod tests {
             default_tier: None,
             understands_deliver_batch: false,
             understands_streams: false,
+            understands_compressed_delivery: false,
         };
         let mut pre = Vec::new();
         encode_connect(&none, &mut pre);
@@ -5144,6 +5207,7 @@ mod tests {
             default_tier: Some(ConsumeTier::Streaming.as_u8()),
             understands_deliver_batch: false,
             understands_streams: false,
+            understands_compressed_delivery: false,
         };
         let mut buf = Vec::new();
         encode_connect(&both, &mut buf);
@@ -5205,6 +5269,7 @@ mod tests {
                 default_tier: None,
                 understands_deliver_batch: false,
                 understands_streams: false,
+                understands_compressed_delivery: false,
             }
         );
 
@@ -5272,6 +5337,76 @@ mod tests {
         );
         assert_eq!(decode_info(&ibuf).unwrap(), info);
         assert!(!decode_info(&[]).unwrap().streams);
+    }
+
+    // ===== Compressed-delivery capability (#1066) =====
+
+    #[test]
+    fn connect_carries_the_compressed_delivery_capability_in_a_second_flags_byte() {
+        // #1066: a compression-decode-capable consumer sets CONNECT_FLAG2_COMPRESSED_DELIVERY, the
+        // FIRST bit of the APPENDED `flags2` byte (the historical `flags` byte is full). The bit
+        // round-trips, appends EXACTLY ONE block byte (the flags2 byte), and an EMPTY (old-client)
+        // Connect never advertises it — so an old consumer decodes to "not capable" and the server
+        // decompresses before delivery.
+        let req = ConnectBody {
+            understands_compressed_delivery: true,
+            ..ConnectBody::default()
+        };
+        let mut buf = Vec::new();
+        encode_connect(&req, &mut buf);
+        // The capability rides `flags2`, NOT the historical `flags` byte at index 3.
+        assert_eq!(
+            buf[3] & CONNECT_FLAG2_COMPRESSED_DELIVERY,
+            0,
+            "the capability does NOT ride the historical (full) flags byte"
+        );
+        let mut plain = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut plain);
+        assert_eq!(
+            buf.len(),
+            plain.len() + 1,
+            "advertising the capability appends exactly one flags2 block byte"
+        );
+        // The appended flags2 byte is the LAST block byte and carries the capability bit.
+        assert_eq!(
+            buf[buf.len() - 1] & CONNECT_FLAG2_COMPRESSED_DELIVERY,
+            CONNECT_FLAG2_COMPRESSED_DELIVERY,
+            "the flags2 byte carries the compressed-delivery capability bit"
+        );
+        assert_eq!(decode_connect(&buf).unwrap(), req);
+        // An EMPTY (old-client) Connect never advertises the capability, and a body that leaves it
+        // clear is byte-for-byte the historical layout (no flags2 byte, no length change).
+        assert!(!decode_connect(&[]).unwrap().understands_compressed_delivery);
+        assert!(
+            !decode_connect(&plain)
+                .unwrap()
+                .understands_compressed_delivery
+        );
+    }
+
+    #[test]
+    fn a_clear_compressed_delivery_capability_is_byte_for_byte_the_historical_connect() {
+        // #1066: leaving the capability clear must NOT change the wire — the flags2 byte is emitted
+        // ONLY when non-zero, so an all-else-equal body with the capability off is byte-identical to
+        // one built without the field (the field defaults false).
+        let with_field = ConnectBody {
+            requested_credit: Some(4096),
+            wants_gap_marker: true,
+            understands_compressed_delivery: false,
+            ..ConnectBody::default()
+        };
+        let without = ConnectBody {
+            requested_credit: Some(4096),
+            wants_gap_marker: true,
+            ..ConnectBody::default()
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        encode_connect(&with_field, &mut a);
+        encode_connect(&without, &mut b);
+        assert_eq!(
+            a, b,
+            "a clear compressed-delivery capability appends no byte"
+        );
     }
 
     #[test]

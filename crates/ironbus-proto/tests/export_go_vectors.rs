@@ -83,6 +83,7 @@ fn connect_fields(req: &ConnectBody, auth: Option<&AuthCredential>) -> String {
             "{{\"requested_credit\":{},\"requested_credit_bytes\":{},\"wants_gap_marker\":{},",
             "\"default_ack_level\":{},\"understands_streaming\":{},\"default_tier\":{},",
             "\"understands_deliver_batch\":{},\"understands_streams\":{},",
+            "\"understands_compressed_delivery\":{},",
             "\"auth_mechanism\":{},\"auth_material_hex\":{}}}"
         ),
         opt_u32(req.requested_credit),
@@ -93,6 +94,7 @@ fn connect_fields(req: &ConnectBody, auth: Option<&AuthCredential>) -> String {
         opt_u8(req.default_tier),
         req.understands_deliver_batch,
         req.understands_streams,
+        req.understands_compressed_delivery,
         mechanism,
         material,
     )
@@ -275,6 +277,7 @@ fn build_vectors() -> Vec<Vector> {
         default_tier: Some(1),
         understands_deliver_batch: true,
         understands_streams: true,
+        understands_compressed_delivery: true,
     };
     let mut body = Vec::new();
     encode_connect(&full, &mut body);

@@ -136,14 +136,34 @@ storage flag:
   unchanged. It is an ADDITIVE flag only: the `FrameType` tag vocabulary is unchanged (the
   `type_tags_have_their_exact_frozen_wire_values` pin still holds).
 
-### Mixed-version rollout with write-path compression (#430)
+### Mixed-version rollout with write-path compression (#430, gated by #1066)
 
 Upgrading only the broker flips real compression on by default (`serve --compression` defaults
-to `lz4`), and a pre-#430 client receives the descriptor + codec stream bytes verbatim with the
-`COMPRESSED` bit set, which is spec-legal but silently different from the produced payload. The
-operational rule is therefore: upgrade consumers to a #430+ client FIRST, or run the broker with
-`--compression none` during the transition. A client downgrade after compressed data exists
-regresses those consumers to the raw stored bytes for every compressed record still retained.
+to `lz4`). Compressed DELIVERY is now GATED on a `Connect` capability bit
+(`CONNECT_FLAG2_COMPRESSED_DELIVERY`, #1066), so this is no longer a silent-corruption path — it
+is enforced at the wire, not just documented here:
+
+- A consumer that ADVERTISES the capability (every #430+ client does by default —
+  `ClientConfig::understands_compressed_delivery`, on by default) receives a stored-compressed
+  record VERBATIM (the `descriptor + codec-stream` bytes with the `COMPRESSED` bit set) and decodes
+  it, exactly as before. The broker's zero-CPU passthrough is preserved.
+- A consumer that does NOT advertise it (a pre-#430 client, one that opts out, or the EMPTY
+  old-client `Connect` body) is served the record DECOMPRESSED — the plain produced payload with the
+  `COMPRESSED` bit CLEARED. The broker decompresses per-delivery for that consumer; the STORED record
+  is unaffected (this is a per-consumer delivery-encoding decision, not a re-store).
+
+The result: a normal broker-first upgrade is safe even with released pre-#430 clients
+(2026.0609.2 – 2026.0610.7) still connected — they transparently receive uncompressed deliveries.
+Running the broker with `--compression none` is therefore no longer REQUIRED for the transition
+(it remains available as a blanket opt-out). The gate mirrors the `GapMarker` (#292/#346) and
+`DeliverBatch` (#541) capability mechanism. A consumer that advertises `DeliverBatch` is
+compression-capable by construction (decoding a raw batch means decoding the on-disk record layout,
+including `COMPRESSED` records), so the raw-batch path ships verbatim without a separate gate.
+
+Note (opt-in `zstd` builds): the broker's per-delivery decompression for a non-capable consumer uses
+the dictionary-free resolver, which covers every default `lz4` (and dict-less `zstd`) record. A
+`zstd`-with-trained-dictionary record delivered to a non-capable consumer FAILS LOUD (the record is
+dropped from that batch) rather than shipping undecodable bytes — never silent corruption.
 
 ### The Connect/Info handshake bodies are an ADDITIVE, version-prefixed change (#292)
 
