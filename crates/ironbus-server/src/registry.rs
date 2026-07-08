@@ -1139,7 +1139,7 @@ impl StreamConsumerRegistry {
     /// existing stream.
     pub fn record_dead_lettered(&mut self, name: &[u8]) {
         self.record(name, |s| {
-            s.dead_lettered = s.dead_lettered.saturating_add(1)
+            s.dead_lettered = s.dead_lettered.saturating_add(1);
         });
     }
 
