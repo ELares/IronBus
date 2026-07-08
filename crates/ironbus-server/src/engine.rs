@@ -982,6 +982,25 @@ pub enum Poll {
         /// The first present offset after the hole, exclusive: delivery resumes here.
         to: Offset,
     },
+    /// A per-subject FILTERED group's cursor advanced across a run of NON-MATCHING offsets (#594,
+    /// V2-M2): every record in `[from, to)` carried a stored subject that did NOT match the group's
+    /// subject filter (or carried NO stored subject — a plain `Pub`/`PubTo`, treated as non-matching,
+    /// D2), so they are permanently skipped for THIS filtered group. The engine has ALREADY acked the
+    /// group's durable cursor past the whole `[from, to)` run before returning (and the advance is
+    /// checkpointed like any commit, so it survives a restart), so the next poll resumes at `to` and
+    /// the same run never re-signals. The record AT `to` — the next match — is delivered on the
+    /// FOLLOWING poll, exactly as `Compacted` defers the post-hole record. The caller surfaces this as
+    /// a `GapMarker` with `reason = FILTERED` to a gap-marker-capable consumer; a non-capable consumer
+    /// takes the silent advance (the records are correctly filtered either way, it just sees no
+    /// marker). Distinct from `Compacted`: a filtered hole's offsets are still PRESENT in the log and
+    /// delivered to an unfiltered group — the absence is per-filter, not physical.
+    Filtered {
+        /// The first skipped (non-matching) offset, inclusive: where the filtered run begins.
+        from: Offset,
+        /// The first offset after the run, exclusive: where scanning stopped (the next match, or the
+        /// delivery-window end). Delivery resumes here on the next poll.
+        to: Offset,
+    },
     /// Nothing is deliverable right now (all caught up, or the in-flight window is full).
     Idle,
 }
@@ -1208,6 +1227,15 @@ pub struct Counters {
     /// non-idempotent broker is byte-identical. Saturating; exposed as the
     /// `ironbus_producer_out_of_order_total` counter.
     pub producer_out_of_order: u64,
+    /// Records SKIPPED by a per-subject FILTERED consumer (#594, V2-M2): a record whose stored subject
+    /// did NOT match the work-group's subject filter (or that carried no stored subject at all — a
+    /// plain publish, treated as non-matching), so the filtered group committed its cursor past it
+    /// without delivering. This is the "filtered out, not delivered" bucket: it is the marquee
+    /// wildcard-subscription cost signal (an operator watches it to size a subscription's selectivity),
+    /// and it is ALWAYS accounted, never a silent drop. Zero unless a filtered `SubSubject` is bound,
+    /// so a broker with no filtered consumers is byte-identical. Saturating; exposed as the
+    /// `ironbus_filtered_total` counter.
+    pub filtered: u64,
 }
 
 /// The recovery-event counter family (#575): the FLAGSHIP corruption-recovery metrics NATS has no
@@ -1353,7 +1381,9 @@ const COUNTERS_SNAPSHOT_VERSION: u8 = 1;
 /// The TTL family (#549) appended one more trailing field (`expired`), same rule: a pre-#549
 /// snapshot reads it as zero, and a newer snapshot decodes on an old binary (the trailing field is
 /// ignored).
-const COUNTERS_FIELD_COUNT: usize = 26;
+/// The subject-filter family (#594) appended one more trailing field (`filtered`), same rule: a
+/// pre-#594 snapshot reads it as zero, and a newer snapshot decodes on an old binary (ignored).
+const COUNTERS_FIELD_COUNT: usize = 28;
 
 impl Counters {
     /// Serializes the counters into a small versioned little-endian byte string for the durable
@@ -1407,6 +1437,9 @@ impl Counters {
             // family: a pre-M8 snapshot is too short to hold it (it reads as zero). Operational, no
             // replay reconciliation, so the resumed value is the snapshot-only lower bound.
             self.producer_out_of_order,
+            // The per-subject FILTERED skip counter (#594), appended last: a pre-#594 snapshot is too
+            // short to hold it (it reads as zero). Operational, no replay reconciliation.
+            self.filtered,
         ] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -1471,6 +1504,9 @@ impl Counters {
             // The idempotent-producer out-of-order rejection counter (V2-M8) at field 26: a pre-M8
             // snapshot reads it as zero (the tolerant decode). Operational, no replay reconciliation.
             producer_out_of_order: field(26),
+            // The per-subject FILTERED skip counter (#594) at field 27: a pre-#594 snapshot reads it
+            // as zero (the tolerant decode). Operational, no replay reconciliation.
+            filtered: field(27),
         }
     }
 }
@@ -2414,6 +2450,27 @@ struct WorkGroup {
     /// it is orthogonal to `broadcast` and `router` and does NOT clear them (a future Connect-default
     /// tier negotiation, M1-I9, may layer policy on top; this flag is the per-group selector only).
     streaming: bool,
+    /// The per-GROUP subject FILTER (#594, V2-M2): the validated wildcard subject PATTERN string a
+    /// filtered `SubSubject` (`filter_mode = 1`) bound to this work-group, or `None` for an ordinary
+    /// (unfiltered) group. It is a group property so the shared cursor stays coherent (D3): every
+    /// consumer in a filtered group sees the SAME pattern and the SAME durable cursor, which advances
+    /// past skipped (non-matching) offsets. Stored as the owned pattern STRING and re-parsed to a
+    /// borrowing [`SubjectPattern`] once per poll (zero-alloc). When set, [`Engine::poll_in`] delivers
+    /// only records whose stored subject matches and coalesces each run of skipped offsets into one
+    /// `Poll::Filtered`. In-memory only (re-applied server-side on the group's first filtered
+    /// `SubSubject`, like `broadcast`/`router`/`streaming`), so it is never restored from disk here;
+    /// the durable CURSOR, however, does survive a restart, so a resumed group resumes past the
+    /// offsets it already filtered.
+    filter: Option<String>,
+    /// A matched record STASHED by a filtered scan that had to flush a coalesced `Poll::Filtered`
+    /// gap BEFORE delivering it (#594). Because the gap marker must precede the match at its `to`
+    /// offset, and one poll yields one `Poll`, the scan returns the gap and parks the already-read,
+    /// already-leased match here; the NEXT poll delivers it from the stash with NO second read of
+    /// its frame. This is what keeps a filtered consumer's per-record READ cost equal to an
+    /// unfiltered one (no re-scan cliff) even on a densely interleaved stream — each record is read
+    /// exactly once. The stashed lease stays in-flight (at-least-once unaffected), and a stash is
+    /// only ever set for a `Deliver` disposition, so it never bypasses dead-lettering.
+    pending_match: Option<Delivery>,
 }
 
 /// What happens to an evicted group's `group_last_checkpointed` entry (#432): `Keep` leaves it
@@ -2453,6 +2510,12 @@ impl WorkGroup {
             // `set_streaming_in` after open, never restored from disk here (the mode is re-applied,
             // exactly like `broadcast` / `router`).
             streaming: false,
+            // No subject filter by default (#594): an ordinary group delivers every record. A
+            // filtered `SubSubject` sets this server-side via `set_subject_filter_in`, re-applied
+            // after open exactly like `broadcast`/`router`/`streaming` (never restored from disk).
+            filter: None,
+            // No stashed filtered match on a fresh/resumed group.
+            pending_match: None,
         }
     }
 }
@@ -4115,6 +4178,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(offset)
     }
 
+    /// The subject-storing variant of [`Engine::produce`] (#594): a single publish-by-subject group
+    /// commit that persists `subject` as the record's optional subject field, so a per-subject
+    /// filtered consumer on the default stream can match it. Identical to [`Engine::produce`] in every
+    /// other effect (append no-sync, one covering durability barrier, post-sync bookkeeping).
+    ///
+    /// # Errors
+    /// Same as [`Engine::produce`].
+    pub fn produce_with_subject(
+        &mut self,
+        message: &Append<'_>,
+        subject: &[u8],
+    ) -> Result<Offset, EngineError> {
+        let offset = self.append_no_sync_with_subject(message, subject)?;
+        self.commit_batch()?;
+        Ok(offset)
+    }
+
     // ===================================================================================
     // ID-ROUTED produce / consume / ack (#676, V2-M2-I2b — thread the StreamSet through the
     // Engine). These entry points carry a STREAM ID. The default stream `""` routes to today's
@@ -4151,12 +4231,33 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     where
         F: Clone,
     {
+        self.produce_in_stream_with_subject(stream, message, b"")
+    }
+
+    /// The subject-storing variant of [`Engine::produce_in_stream`] (#594): persists `subject` as the
+    /// record's optional subject field on the DEFAULT stream so a per-subject filtered consumer can
+    /// match it. This increment scopes filtered consume to the default stream (D5), so a NAMED stream
+    /// falls back to the existing subject-less named-stream append (the subject is not stored there —
+    /// a named-stream filtered consume is a flagged follow-up, #594-B). The default stream ("") routes
+    /// to [`Engine::produce_with_subject`].
+    ///
+    /// # Errors
+    /// Same as [`Engine::produce_in_stream`].
+    pub fn produce_in_stream_with_subject(
+        &mut self,
+        stream: &str,
+        message: &Append<'_>,
+        subject: &[u8],
+    ) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
         // The default stream is today's root log, byte-for-byte: route straight to the existing
-        // single-log produce on `self.log`. NOTHING about the default path changes when a stream id
-        // is supplied as `""` — an old client (no stream id) and a new client naming `""` are
-        // indistinguishable from the historical broker.
+        // single-log produce on `self.log`, persisting the subject (#594). NOTHING about the default
+        // path changes when a stream id is supplied as `""` — an old client (no stream id) and a new
+        // client naming `""` are indistinguishable from the historical broker.
         if stream.is_empty() {
-            return self.produce(message);
+            return self.produce_with_subject(message, subject);
         }
         // READ-ONLY MIRROR guard (#623): a client produce to a configured cross-cluster mirror is
         // rejected fail-closed BEFORE any declare/append, so a mirror's only writer stays the geo
@@ -5413,7 +5514,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// rejection and increments `produce_rejected`; any other storage error propagates. Nothing is
     /// written and no statistic moves on an error.
     pub fn append_no_sync(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
-        self.append_no_sync_checked(message, None)
+        self.append_no_sync_checked(message, None, b"")
+    }
+
+    /// The subject-storing variant of [`Engine::append_no_sync`] (#594): stores `subject` as the
+    /// record's optional subject field so a per-subject filtered consumer can match it. Threads the
+    /// subject through the SAME compression seam, drop-oldest policy, and counter bookkeeping; the
+    /// subject rides its own frame field (its own CRC) and never enters the body-compression path.
+    ///
+    /// # Errors
+    /// Same as [`Engine::append_no_sync`].
+    pub fn append_no_sync_with_subject(
+        &mut self,
+        message: &Append<'_>,
+        subject: &[u8],
+    ) -> Result<Offset, EngineError> {
+        self.append_no_sync_checked(message, None, subject)
     }
 
     /// The body-checksum-offload variant of [`Engine::append_no_sync`] (issue #830): `precomputed`
@@ -5433,6 +5549,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         &mut self,
         message: &Append<'_>,
         precomputed: Option<BodyChecksums>,
+        subject: &[u8],
     ) -> Result<Offset, EngineError> {
         // The write-path compression seam (#430, ADR-0003). The pass-through guard on an ALREADY
         // COMPRESSED message is load-bearing: the wire legally delivers bit 0 set (a producer may
@@ -5488,7 +5605,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         } else {
             None
         };
-        let offset = match self.append_with_policy(to_append, effective_precomputed) {
+        let offset = match self.append_with_policy(to_append, effective_precomputed, subject) {
             Ok(offset) => offset,
             Err(e) => {
                 // A drop-new shed: count the rejection (a shed-rate signal) but advance no produce
@@ -5586,7 +5703,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Some(req) = dedup else {
             // No dedup requested: identical to the historical no-dedup append.
             return self
-                .append_no_sync_checked(message, precomputed)
+                .append_no_sync_checked(message, precomputed, b"")
                 .map(AppendOutcome::Appended);
         };
         // The idempotent-producer SEQUENCE path (V2-M8): when the publish carried a `seq`, route
@@ -5616,7 +5733,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     self.counters.dedup_out_of_window =
                         self.counters.dedup_out_of_window.saturating_add(1);
                 }
-                let offset = self.append_no_sync_checked(message, precomputed)?;
+                let offset = self.append_no_sync_checked(message, precomputed, b"")?;
                 // Record the mapping at append time (offset assigned), so a same-batch duplicate is
                 // caught before the covering fsync. The reply is still parked behind that fsync, so a
                 // dedup hit never returns an offset that is not (or will not be) durable.
@@ -5683,7 +5800,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 // sequenced produce's high-water can be persisted on the next checkpoint tick (and a
                 // file-creation IO error fails the produce rather than silently losing durability).
                 self.ensure_producer_seq_checkpoint()?;
-                let offset = self.append_no_sync_checked(message, precomputed)?;
+                let offset = self.append_no_sync_checked(message, precomputed, b"")?;
                 // Advance the high-water at append time (offset assigned), so a same-batch retry of
                 // this seq dedups before the covering fsync. The reply is still parked behind that
                 // fsync, so a duplicate never returns an offset that is not (or will not be) durable.
@@ -6468,31 +6585,38 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         &mut self,
         message: &Append<'_>,
         precomputed: Option<BodyChecksums>,
+        subject: &[u8],
     ) -> Result<Offset, StorageError> {
-        match self.log_append(message, precomputed) {
+        match self.log_append(message, precomputed, subject) {
             Ok(offset) => Ok(offset),
             // Only the genuine disk-full byte-cap shed is reclaimable by a reap, so only it may drive
             // the `DropOldest` reclaim-then-retry loop. The daily-write-budget shed and any other
             // storage error (a frozen writer, an oversized record) propagate unchanged; under DropNew
             // every rejection is final too.
             Err(e) if e.is_at_capacity() && self.disk_full_policy == DiskFullPolicy::DropOldest => {
-                self.make_room_then_append(message, precomputed, e)
+                self.make_room_then_append(message, precomputed, subject, e)
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Dispatches to [`Log::append`] or [`Log::append_precomputed`] (#830): when the producing
-    /// connection thread precomputed the body checksums off the actor, trust them; otherwise compute
-    /// them on the append path as before. The on-disk frame is byte-identical either way.
+    /// Dispatches to [`Log::append`] or [`Log::append_precomputed`] (#830), storing the optional
+    /// `subject` (#594) via the subject-aware log path when non-empty: when the producing connection
+    /// thread precomputed the body checksums off the actor, trust them; otherwise compute them on the
+    /// append path as before. The on-disk frame is byte-identical either way, plus the subject field.
     fn log_append(
         &mut self,
         message: &Append<'_>,
         precomputed: Option<BodyChecksums>,
+        subject: &[u8],
     ) -> Result<Offset, StorageError> {
-        match precomputed {
-            Some(checksums) => self.log.append_precomputed(message, checksums),
-            None => self.log.append(message),
+        match (precomputed, subject.is_empty()) {
+            (Some(checksums), true) => self.log.append_precomputed(message, checksums),
+            (None, true) => self.log.append(message),
+            (Some(checksums), false) => self
+                .log
+                .append_precomputed_with_subject(message, checksums, subject),
+            (None, false) => self.log.append_with_subject(message, subject),
         }
     }
 
@@ -6505,6 +6629,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         &mut self,
         message: &Append<'_>,
         precomputed: Option<BodyChecksums>,
+        subject: &[u8],
         at_capacity: StorageError,
     ) -> Result<Offset, StorageError> {
         let mut last = at_capacity;
@@ -6545,7 +6670,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // Retry the append now that space was freed. A success ends the loop; another
             // at-capacity means one freed segment was not enough, so loop and free more (the loop
             // terminates because each pass either frees a segment or hits the active-only guard).
-            match self.log_append(message, precomputed) {
+            match self.log_append(message, precomputed, subject) {
                 Ok(offset) => return Ok(offset),
                 Err(e) if e.is_at_capacity() => {
                     last = e;
@@ -6935,6 +7060,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // poll (deliverable or idle) keeps the polled group alive against the next sweep.
         g.last_activity = now;
         g.touched = true;
+        // Deliver a match a prior filtered scan STASHED after flushing its coalesced gap (#594),
+        // BEFORE anything else: the record was already read and leased, so this is a zero-read
+        // delivery of the match that immediately follows the just-emitted gap. Drained first so it
+        // is never lost to a below-earliest reset (a stashed match sits above `committed`).
+        if let Some(d) = g.pending_match.take() {
+            self.counters.delivered = self.counters.delivered.saturating_add(1);
+            if d.deliveries > 1 {
+                self.counters.redelivered = self.counters.redelivered.saturating_add(1);
+            }
+            return Ok(Poll::Message(d));
+        }
         let committed = g.cursor.committed().get();
         // Below-earliest truncation signal (#84): if this group's next-deliverable offset (its
         // committed cursor) is below the oldest retained record, its data was force-reaped out from
@@ -6984,6 +7120,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // Whether the scan committed past at least one INLINE-reclaimed expired record (#549), so the
         // consumer-lag floor is synced ONCE after the borrow ends (no per-record `&mut self` call).
         let mut expired_inline = false;
+        // The per-subject FILTER (#594): the group's subject pattern, CLONED once so the immutable
+        // pattern borrow does not conflict with the mutable group access in the scan (the clone is a
+        // short pattern string, once per poll). `None` (unfiltered) leaves the scan byte-for-byte the
+        // historical path. `filtered_from` accumulates the START of the current run of skipped
+        // (non-matching) offsets, coalesced into ONE `Poll::Filtered` at the next match or window end.
+        let filter_str = g.filter.clone();
+        let filter = filter_str
+            .as_deref()
+            .and_then(|p| SubjectPattern::parse(p).ok());
+        let mut filtered_from: Option<u64> = None;
         while offset < window_end {
             let off = Offset::new(offset);
             if g.cursor.is_acked(off) {
@@ -7065,6 +7211,56 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         offset += 1;
                         continue;
                     }
+                    // PER-SUBJECT FILTER (#594, V2-M2): a filtered group delivers ONLY records whose
+                    // stored subject matches its pattern. A NON-match (or a record with no stored
+                    // subject — a plain publish, treated as non-matching, D2) is committed past WITHOUT
+                    // delivery (the lease just claimed is released, the durable cursor advances, the
+                    // key-router offset is cleared) and the run of skips is accumulated. When a MATCH
+                    // ends a pending run, the coalesced `Poll::Filtered` is surfaced FIRST and the match
+                    // is deferred to the next poll (the lease is released so it re-claims), exactly as
+                    // the compaction-hole path defers the post-hole record. An unfiltered group takes
+                    // neither branch, so the hot scan is byte-for-byte unchanged.
+                    if let Some(pattern) = filter.as_ref() {
+                        if !Self::record_matches_subject_filter(pattern, &record) {
+                            g.leases.ack(&token);
+                            g.cursor.ack(off);
+                            if let Some(router) = g.router.as_mut() {
+                                router.clear_offset(off);
+                            }
+                            self.counters.filtered = self.counters.filtered.saturating_add(1);
+                            if filtered_from.is_none() {
+                                filtered_from = Some(offset);
+                            }
+                            offset += 1;
+                            continue;
+                        }
+                        if let Some(from) = filtered_from.take() {
+                            // Flush the coalesced skip run BEFORE delivering this match. To avoid a
+                            // second read of the match (the re-scan cliff), STASH the already-read,
+                            // already-leased match for the next poll to deliver — but ONLY when its
+                            // disposition is `Deliver`; a `DeadLetter` match (over max-deliver) is rare,
+                            // so release its lease and let the next poll re-derive the dead-letter after
+                            // the gap, keeping the poison path unchanged. Either way, surface the gap
+                            // span `[from, off)` now.
+                            match self.delivery.disposition(deliveries) {
+                                Disposition::Deliver => {
+                                    g.pending_match = Some(Delivery {
+                                        offset: off,
+                                        token,
+                                        deliveries,
+                                        record,
+                                    });
+                                }
+                                Disposition::DeadLetter => {
+                                    g.leases.ack(&token);
+                                }
+                            }
+                            return Ok(Poll::Filtered {
+                                from: Offset::new(from),
+                                to: off,
+                            });
+                        }
+                    }
                     match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => {
                             self.counters.delivered += 1;
@@ -7089,6 +7285,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     }
                 }
             }
+        }
+        // Flush a coalesced FILTERED-skip run that reached the window end (or that preceded a
+        // break for a dead-letter/expired capture) (#594): the durable cursor was already advanced
+        // past `[filtered_from, offset)`, so sync the consumer-lag floor for the advance and surface
+        // ONE `Poll::Filtered` for the whole run. This runs BEFORE the dead-letter/expired handling
+        // so the gap marker precedes any advisory for a later poison record; that record is
+        // re-derived on the next poll (its capture here is discarded, the cursor never advanced past
+        // it), so nothing is lost.
+        if let Some(from) = filtered_from {
+            let committed = self
+                .groups
+                .get(group)
+                .map_or(0, |g| g.cursor.committed().get());
+            self.sync_consumer_lag(group, committed);
+            return Ok(Poll::Filtered {
+                from: Offset::new(from),
+                to: Offset::new(offset),
+            });
         }
         // An EXPIRED-and-DLX'd message (#551) routes to the dead-letter exchange OUTSIDE the group
         // borrow (the sink append needs `&mut self`), exactly as the max-deliver dead-letter does.
@@ -7207,6 +7421,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return false;
         }
         is_expired(ttl, record.timestamp_ms, now_unix_millis)
+    }
+
+    /// Whether `record`'s STORED subject matches the filtered group's `pattern` (#594). A record with
+    /// NO stored subject (a plain `Pub`/`PubTo`) is NON-MATCHING (D2): it is never swallowed by a `>`
+    /// catch-all — a filter only ever delivers records that were explicitly published on a subject. A
+    /// stored subject that is not valid UTF-8 or not a valid literal subject is likewise non-matching
+    /// (fail-closed), so a corrupted or malformed stored subject can never spuriously match.
+    fn record_matches_subject_filter(pattern: &SubjectPattern<'_>, record: &OwnedRecord) -> bool {
+        if record.subject.is_empty() {
+            return false;
+        }
+        match core::str::from_utf8(&record.subject) {
+            Ok(text) => match Subject::parse_literal(text) {
+                Ok(subject) => pattern.matches(&subject),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
     }
 
     /// Whether an EXPIRED record should be routed to a dead-letter exchange (V2-M4, #549/#551): only
@@ -8139,6 +8371,55 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn is_streaming_in(&self, group: &str) -> bool {
         self.groups.get(group).is_some_and(|g| g.streaming)
+    }
+
+    /// Binds a per-subject FILTER `pattern` to `group` (#594, V2-M2), or clears it (`None`). A filtered
+    /// group delivers ONLY records whose stored subject matches `pattern`, emitting a
+    /// `GapMarker`(`reason = FILTERED`) across each coalesced run of skipped offsets. The filter is a
+    /// per-GROUP property (D3), so every consumer in the group shares the SAME pattern and the SAME
+    /// durable cursor — the cursor advances past skipped offsets, staying coherent across competing
+    /// consumers. This mirrors [`Engine::set_streaming_in`] / [`Engine::set_broadcast_in`]: it creates
+    /// the group if absent (validating the name and the group cap) and re-applies the mode server-side
+    /// after open (the mode is not restored from disk; the CURSOR, however, is durable). The `pattern`
+    /// must be a valid #567 subject pattern (wildcards allowed); it is validated here before it is
+    /// stored, so [`Engine::poll_in`]'s per-record re-parse is infallible.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidGroupName`] for a malformed name, [`EngineError::TooManyGroups`] if a new
+    /// group would exceed the per-engine cap, or [`EngineError::InvalidSubject`] for a malformed
+    /// pattern.
+    pub fn set_subject_filter_in(
+        &mut self,
+        group: &str,
+        pattern: Option<&str>,
+    ) -> Result<(), EngineError> {
+        // Validate the pattern BEFORE creating the group, so a bad pattern never mints a group.
+        if let Some(p) = pattern {
+            SubjectPattern::parse(p).map_err(EngineError::InvalidSubject)?;
+        }
+        if !self.groups.contains_key(group) {
+            validate_group_name(group)?;
+            if self.max_groups != 0 && self.groups.len() >= self.max_groups {
+                return Err(EngineError::TooManyGroups {
+                    max: self.max_groups,
+                });
+            }
+        }
+        let now = self.log.now_monotonic();
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config, now));
+        g.filter = pattern.map(str::to_string);
+        Ok(())
+    }
+
+    /// The bound per-subject filter pattern for `group` (#594), or `None` for an unfiltered or unknown
+    /// group. Used by tests and observability to confirm a filtered subscription took effect.
+    #[must_use]
+    pub fn subject_filter_in(&self, group: &str) -> Option<&str> {
+        self.groups.get(group).and_then(|g| g.filter.as_deref())
     }
 
     /// Serves a Tier-S STREAMING fetch (#544, M1-I7): a CONTIGUOUS batch of records starting at the
@@ -9676,6 +9957,7 @@ mod tests {
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
                 Poll::Truncated { .. } => panic!("unexpected truncation"),
                 Poll::Compacted { .. } => panic!("unexpected compaction"),
+                Poll::Filtered { .. } => panic!("unexpected filtered"),
             }
         }
         assert_eq!(
@@ -9727,6 +10009,7 @@ mod tests {
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
                 Poll::Truncated { .. } => panic!("unexpected truncation"),
                 Poll::Compacted { .. } => panic!("unexpected compaction"),
+                Poll::Filtered { .. } => panic!("unexpected filtered"),
             }
         }
         // A 64-byte slot holds the leading 3 acked-ahead runs (offsets 1, 3, 5), so those are
@@ -10520,6 +10803,170 @@ mod tests {
     }
 
     #[test]
+    fn a_subject_filtered_group_delivers_only_matches_advances_the_cursor_and_survives_restart() {
+        // #594 (V2-M2): an interleaved multi-subject default stream plus a `msg.orders.*` group filter
+        // delivers ONLY matching records, coalesces each run of skipped offsets into ONE Poll::Filtered,
+        // advances the DURABLE group cursor past the filtered offsets, and — after a checkpoint + reopen
+        // — never re-delivers or re-filters them (the durable cursor survived the restart).
+        fn ps(e: &mut Engine<InMemoryFs, ManualClock>, subject: &[u8], payload: &[u8]) {
+            e.produce_with_subject(
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                },
+                subject,
+            )
+            .unwrap();
+        }
+        let mut e = open(config(100, 5));
+        // offsets 0..6: MATCH, non, plain (no subject -> non-matching by D2), MATCH, non, MATCH.
+        ps(&mut e, b"msg.orders.a", b"A"); // 0 MATCH
+        ps(&mut e, b"msg.audit.x", b"X"); // 1 non-match
+        produce(&mut e, b"P"); // 2 a plain publish, NO stored subject -> non-matching (D2)
+        ps(&mut e, b"msg.orders.b", b"B"); // 3 MATCH
+        ps(&mut e, b"msg.audit.y", b"Y"); // 4 non-match
+        ps(&mut e, b"msg.orders.c", b"C"); // 5 MATCH
+
+        e.set_subject_filter_in("w", Some("msg.orders.*")).unwrap();
+        assert_eq!(e.subject_filter_in("w"), Some("msg.orders.*"));
+
+        // Drain the filtered group, acking matches and collecting the coalesced skip spans.
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        loop {
+            match e.poll_in("w", 0).unwrap() {
+                Poll::Message(d) => {
+                    delivered.push(d.record.payload.to_vec());
+                    e.ack_in("w", &d.token);
+                }
+                Poll::Filtered { from, to } => {
+                    assert!(from.get() < to.get(), "a filtered span is non-empty");
+                    spans.push((from.get(), to.get()));
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            delivered,
+            vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            "only records whose subject matched `msg.orders.*` were delivered"
+        );
+        // ONE coalesced span per run of skips: [1,3) covers the audit record AND the subject-less plain
+        // publish; [4,5) covers the second audit record.
+        assert_eq!(spans, vec![(1, 3), (4, 5)]);
+        // Every skip is accounted, never silently dropped: 3 filtered offsets (1, 2, 4).
+        assert_eq!(e.counters().filtered, 3);
+        // The durable group cursor advanced PAST the filtered offsets to the head (all 6 consumed).
+        assert_eq!(e.committed_offset_in("w"), Offset::new(6));
+
+        // Persist the cursor and REOPEN: the filtered advance must survive the restart (the default
+        // cursor is durable, D-note in the plan).
+        e.checkpoint_group("w").unwrap();
+        let fs = e.into_filesystem();
+        let mut e = Engine::open(fs, ManualClock::new(), config(100, 5)).unwrap();
+        assert_eq!(
+            e.committed_offset_in("w"),
+            Offset::new(6),
+            "the filtered cursor survived the restart"
+        );
+        // The filter is in-memory (re-applied server-side after open, like broadcast/streaming), so a
+        // real reconnect re-sends it; re-set it and confirm the group is caught up (no re-delivery, no
+        // re-skip of the already-consumed prefix).
+        e.set_subject_filter_in("w", Some("msg.orders.*")).unwrap();
+        assert!(
+            matches!(e.poll_in("w", 0).unwrap(), Poll::Idle),
+            "nothing is re-delivered or re-filtered after the restart"
+        );
+    }
+
+    // #594 benchmark: the NATS-beating claim is that a per-subject filtered consumer's cost is
+    // ~= an unfiltered consumer's over the SAME dense interleaved stream — no re-scan cliff (NATS
+    // JetStream re-filters the whole stream per filtered consumer). Run in RELEASE:
+    //   cargo test -p ironbus-server --release -- --ignored --nocapture subject_filter_bench
+    #[test]
+    #[ignore = "benchmark, run explicitly in release with --nocapture"]
+    #[allow(clippy::cast_precision_loss)] // record counts are far below f64's exact-integer range
+    fn subject_filter_bench_filtered_vs_unfiltered() {
+        use std::time::Instant;
+        let n: u64 = 200_000;
+        let mut e = open(config(u32::try_from(n).unwrap(), 5));
+        // A DENSE interleaved multi-subject default stream: even offsets match `orders.*`, odd don't.
+        for i in 0..n {
+            let subject = if i % 2 == 0 {
+                format!("orders.{i}")
+            } else {
+                format!("audit.{i}")
+            };
+            e.produce_with_subject(
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"payload-16-bytes",
+                },
+                subject.as_bytes(),
+            )
+            .unwrap();
+        }
+
+        // UNFILTERED baseline: an ordinary group drains every record once (deliver + ack).
+        let t0 = Instant::now();
+        let mut u_delivered = 0u64;
+        loop {
+            match e.poll_in("u", 0).unwrap() {
+                Poll::Message(d) => {
+                    u_delivered += 1;
+                    e.ack_in("u", &d.token);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let unfiltered = t0.elapsed();
+
+        // FILTERED: a `orders.*` group scans the SAME stream once, delivering matches and skipping
+        // (coalesced) non-matches. It reads every record exactly once, like the unfiltered drain.
+        e.set_subject_filter_in("f", Some("orders.*")).unwrap();
+        let t1 = Instant::now();
+        let mut f_delivered = 0u64;
+        let mut f_skipped = 0u64;
+        loop {
+            match e.poll_in("f", 0).unwrap() {
+                Poll::Message(d) => {
+                    f_delivered += 1;
+                    e.ack_in("f", &d.token);
+                }
+                Poll::Filtered { from, to } => f_skipped += to.get() - from.get(),
+                Poll::Idle => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let filtered = t1.elapsed();
+
+        assert_eq!(u_delivered, n, "unfiltered delivered every record");
+        assert_eq!(f_delivered, n / 2, "filtered delivered only matches");
+        assert_eq!(f_skipped, n / 2, "filtered skipped only non-matches");
+        let uf_rate = n as f64 / unfiltered.as_secs_f64() / 1e6;
+        let ff_rate = n as f64 / filtered.as_secs_f64() / 1e6;
+        println!("#594 subject-filter benchmark ({n} interleaved records, InMemoryFs):");
+        println!(
+            "  UNFILTERED drain: {unfiltered:?}  ({uf_rate:.2} M records/s scanned, {u_delivered} delivered)"
+        );
+        println!(
+            "  FILTERED   drain: {filtered:?}  ({ff_rate:.2} M records/s scanned, {f_delivered} delivered, {f_skipped} skipped)"
+        );
+        println!(
+            "  filtered/unfiltered scan-cost ratio: {:.2}x (claim: ~= 1.0, no re-scan cliff)",
+            filtered.as_secs_f64() / unfiltered.as_secs_f64()
+        );
+    }
+
+    #[test]
     fn an_invalid_group_name_is_rejected_before_allocation() {
         let mut e = open(config(10, 5));
         produce(&mut e, b"a");
@@ -10646,6 +11093,7 @@ mod tests {
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
                 Poll::Truncated { .. } => panic!("unexpected truncation"),
                 Poll::Compacted { .. } => panic!("unexpected compaction"),
+                Poll::Filtered { .. } => panic!("unexpected filtered"),
             }
         }
         assert_eq!(
@@ -11278,6 +11726,7 @@ mod tests {
             // The idempotent-producer out-of-order rejection counter (V2-M8), appended after TTL;
             // non-zero so the round-trip proves the new trailing field is carried.
             producer_out_of_order: 1357,
+            filtered: 246,
         };
         let encoded = counters.encode_snapshot();
         assert_eq!(Counters::decode_snapshot(&encoded), counters);
@@ -11980,6 +12429,7 @@ mod tests {
                     Poll::Parked { .. } => {}
                     Poll::Truncated { .. } => panic!("unexpected truncation"),
                     Poll::Compacted { .. } => panic!("unexpected compaction"),
+                    Poll::Filtered { .. } => panic!("unexpected filtered"),
                     Poll::Idle => break,
                 }
                 now += 1;
@@ -12376,6 +12826,7 @@ mod tests {
                     Poll::Parked { .. } => {}
                     Poll::Truncated { .. } => panic!("unexpected truncation"),
                     Poll::Compacted { .. } => panic!("unexpected compaction"),
+                    Poll::Filtered { .. } => panic!("unexpected filtered"),
                     Poll::Idle => break,
                 }
                 lease_now += 1;
@@ -12691,6 +13142,7 @@ mod tests {
                 Poll::Idle => break,
                 Poll::Truncated { .. } => panic!("must not re-truncate the same gap"),
                 Poll::Compacted { .. } => panic!("unexpected compaction"),
+                Poll::Filtered { .. } => panic!("unexpected filtered"),
                 Poll::Parked { .. } => {}
             }
         }
@@ -12727,6 +13179,7 @@ mod tests {
                     }
                     Poll::Truncated { .. } => panic!("a caught-up consumer is never truncated"),
                     Poll::Compacted { .. } => panic!("unexpected compaction"),
+                    Poll::Filtered { .. } => panic!("unexpected filtered"),
                     Poll::Parked { .. } => {}
                     Poll::Idle => break,
                 }

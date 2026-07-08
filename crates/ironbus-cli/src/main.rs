@@ -14743,6 +14743,7 @@ mod tests {
                 key: Bytes::from_static(b"pk"),
                 headers: Bytes::new(),
                 payload: Bytes::from(format!("poison-{i}").into_bytes()),
+                subject: Bytes::new(),
             };
             sink.append_poison("orders", &src, 6).unwrap();
         }

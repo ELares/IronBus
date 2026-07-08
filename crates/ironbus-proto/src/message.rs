@@ -1026,6 +1026,14 @@ pub mod gap_reason {
     /// compaction work; no path emits it yet, but the wire reason is pinned so compaction is purely
     /// additive when it lands.
     pub const COMPACTED: u8 = 2;
+    /// The span was SKIPPED by a per-subject FILTERED consumer (#594, V2-M2): the offsets in the
+    /// hole carried a stored subject that did NOT match the work-group's subject filter (or carried
+    /// NO stored subject at all — a plain `Pub`/`PubTo`, treated as non-matching), so they are
+    /// permanently absent from THIS filtered group's delivery stream. The group's durable cursor was
+    /// advanced past the whole run before the marker, so the gap never re-signals and survives a
+    /// restart. Unlike `COMPACTED` (a physically-absent offset run), a filtered hole's offsets are
+    /// still present in the log and delivered to an UNFILTERED group; the absence is per-filter.
+    pub const FILTERED: u8 = 3;
 }
 
 /// A consumer-visible gap marker (the `GapMarker` frame body, #346, refs #59, #9): the broker tells
@@ -1307,6 +1315,18 @@ pub const CONNECT_FLAG_UNDERSTANDS_STREAMS: u8 = 0b1000_0000;
 /// whole `flags2` byte so this single-byte read stays forward-compatible.
 pub const CONNECT_FLAG2_COMPRESSED_DELIVERY: u8 = 0b0000_0001;
 
+/// The SECOND bit of the `Connect` handshake's `flags2` byte (#594, V2-M2), by which a consumer
+/// advertises that it UNDERSTANDS the per-subject FILTERED consume mode: a `SubSubject` with
+/// `filter_mode = 1` binds a wildcard subject PATTERN as the work-group's filter, and the broker
+/// delivers ONLY records whose stored subject matches, emitting a `GapMarker`
+/// ([`gap_reason::FILTERED`]) across each coalesced run of skipped offsets. When set, the server may
+/// honor `filter_mode = 1` on this connection's `SubSubject`. When CLEAR (an old client, one that
+/// opts out, or the empty `Connect` body) the server FAIL-CLOSED rejects a filtered `SubSubject`:
+/// an old client can never be silently placed in filtered mode (it would otherwise see a subset of
+/// the stream with no way to know why). It is a pure capability flag, so it adds no `flags2` slot
+/// beyond this bit; it takes the next free bit after [`CONNECT_FLAG2_COMPRESSED_DELIVERY`].
+pub const CONNECT_FLAG2_WANTS_SUBJECT_FILTER: u8 = 0b0000_0010;
+
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
 /// and a client then keeps its own local credit (backward-compat).
@@ -1451,6 +1471,14 @@ pub struct ConnectBody {
     /// silent-corruption fix. Advertising it sets a bit in the appended `flags2` byte (emitted only when
     /// non-zero), so a client that leaves it `false` sends a body byte-for-byte the historical layout.
     pub understands_compressed_delivery: bool,
+    /// Whether this consumer UNDERSTANDS the per-subject FILTERED consume mode (#594): the
+    /// [`CONNECT_FLAG2_WANTS_SUBJECT_FILTER`] capability bit (the second bit of the appended `flags2`
+    /// byte). When `true`, the server may honor a `SubSubject` with `filter_mode = 1`, binding a
+    /// wildcard subject pattern as the group filter. When `false` (the default, an old client, or the
+    /// empty `Connect` body) the server FAIL-CLOSED rejects a filtered `SubSubject`, so an old client
+    /// is never silently placed in filtered mode. Advertising it sets a bit in the same appended
+    /// `flags2` byte, so leaving it `false` keeps the body byte-for-byte the historical layout.
+    pub wants_subject_filter: bool,
 }
 
 /// The number of bytes in the `Connect` v1 known-field block with NO appended bytes (#494, #543):
@@ -1579,6 +1607,9 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     let mut flags2 = 0u8;
     if req.understands_compressed_delivery {
         flags2 |= CONNECT_FLAG2_COMPRESSED_DELIVERY;
+    }
+    if req.wants_subject_filter {
+        flags2 |= CONNECT_FLAG2_WANTS_SUBJECT_FILTER;
     }
     // The block length is the historical fixed block plus ONE byte for each present appended field, in
     // declared order (ack-level, tier, then flags2). An all-absent request encodes the historical length
@@ -1709,6 +1740,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     let understands_deliver_batch = flags & CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH != 0;
     let understands_streams = flags & CONNECT_FLAG_UNDERSTANDS_STREAMS != 0;
     let understands_compressed_delivery = flags2 & CONNECT_FLAG2_COMPRESSED_DELIVERY != 0;
+    let wants_subject_filter = flags2 & CONNECT_FLAG2_WANTS_SUBJECT_FILTER != 0;
     Ok(ConnectBody {
         requested_credit,
         requested_credit_bytes,
@@ -1719,6 +1751,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         understands_deliver_batch,
         understands_streams,
         understands_compressed_delivery,
+        wants_subject_filter,
     })
 }
 
@@ -3067,24 +3100,39 @@ pub fn decode_pub_subject(body: &[u8]) -> Result<PubSubjectBody<'_>, BodyError> 
 /// rejects unbound/ambiguous, fail-closed).
 ///
 /// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
-/// `subject: u16-len + bytes`, `group: u16-len + bytes`. Trailing block bytes are tolerated.
+/// `subject: u16-len + bytes`, `group: u16-len + bytes`, and an OPTIONAL `filter_mode: u8` appended in
+/// the block ONLY when non-zero (#594). Trailing block bytes are tolerated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubSubjectBody<'a> {
     /// The subject to subscribe on (a literal or wildcard pattern, validated server-side).
     pub subject: &'a [u8],
     /// The work-group name (empty selects the default group), validated server-side.
     pub group: &'a [u8],
+    /// How the broker binds this subscription (#594): `0` = today's SINGLE-HOME bind (resolve the
+    /// subject to its one covering stream and consume the whole stream, byte-for-byte the historical
+    /// behavior); `1` = per-subject FILTERED consume (bind the subject PATTERN as the work-group's
+    /// filter and deliver only matching records, with a `GapMarker` across each skipped run). An
+    /// APPENDED block byte written ONLY when non-zero, so mode `0` keeps the body byte-for-byte the
+    /// historical layout and an old decoder (which stops after `group`) reads no filter. Filtered mode
+    /// (`1`) is honored ONLY when the connection advertised [`CONNECT_FLAG2_WANTS_SUBJECT_FILTER`];
+    /// otherwise the server fail-closed rejects it — an old client can never be silently filtered.
+    pub filter_mode: u8,
 }
 
 /// Encodes a `SubSubject` body onto the end of `out` (#585): the version byte, the field-block length,
-/// then the subject and group, each `u16`-length-prefixed.
+/// then the subject and group, each `u16`-length-prefixed. The `filter_mode` byte (#594) is appended
+/// to the block ONLY when non-zero, so a single-home subscribe (`filter_mode = 0`) is byte-for-byte
+/// the historical body.
 ///
 /// # Errors
 /// Returns [`BodyError::FieldTooLarge`] if the subject or group exceeds the `u16` wire limit.
 pub fn encode_sub_subject(req: &SubSubjectBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
     let subj_len = u16::try_from(req.subject.len()).map_err(|_| BodyError::FieldTooLarge)?;
     let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
-    let field_len = u16::try_from(2 + req.subject.len() + 2 + req.group.len())
+    // The filter_mode byte is appended (and counted in the block length) only when non-zero, so
+    // mode 0 reproduces the pre-#594 body exactly and an old decoder ignores the absent byte.
+    let filter_field = usize::from(req.filter_mode != 0);
+    let field_len = u16::try_from(2 + req.subject.len() + 2 + req.group.len() + filter_field)
         .map_err(|_| BodyError::FieldTooLarge)?;
     out.push(STREAM_WIRE_BODY_VERSION);
     out.extend_from_slice(&field_len.to_le_bytes());
@@ -3092,11 +3140,16 @@ pub fn encode_sub_subject(req: &SubSubjectBody<'_>, out: &mut Vec<u8>) -> Result
     out.extend_from_slice(req.subject);
     out.extend_from_slice(&group_len.to_le_bytes());
     out.extend_from_slice(req.group);
+    if req.filter_mode != 0 {
+        out.push(req.filter_mode);
+    }
     Ok(())
 }
 
 /// Decodes a `SubSubject` body (#585), cap-before-alloc and panic-free. A short body or an over-cap
-/// subject is a typed [`BodyError`]; an EMPTY body is [`BodyError::Truncated`].
+/// subject is a typed [`BodyError`]; an EMPTY body is [`BodyError::Truncated`]. The `filter_mode` byte
+/// (#594) is read from whatever follows `group` in the block, defaulting to `0` (single-home) when
+/// absent — an old body omits it, so this stays forward+backward compatible.
 ///
 /// # Errors
 /// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap subject, or
@@ -3112,7 +3165,16 @@ pub fn decode_sub_subject(body: &[u8]) -> Result<SubSubjectBody<'_>, BodyError> 
     let mut fr = Reader::new(block);
     let subject = read_subject(&mut fr)?;
     let group = fr.var()?;
-    Ok(SubSubjectBody { subject, group })
+    // The appended filter_mode byte follows `group` in the block; an old body (which stops after
+    // `group`) leaves nothing, so `unwrap_or(0)` reads the single-home default — byte-for-byte the
+    // historical decode. A future in-block field must follow this byte, so reading exactly it here
+    // stays forward-compatible (trailing block bytes are already tolerated).
+    let filter_mode = fr.u8().unwrap_or(0);
+    Ok(SubSubjectBody {
+        subject,
+        group,
+        filter_mode,
+    })
 }
 
 #[cfg(test)]
@@ -3187,6 +3249,37 @@ mod tests {
     }
 
     #[test]
+    fn gap_marker_filtered_reason_is_byte_frozen() {
+        // #594: the per-subject FILTERED gap reason (3) is a byte-frozen conformance vector. It rides
+        // the SAME 25-byte GapMarker frame (no new tag); the span `[from, to)` reports the coalesced
+        // run of skipped offsets and `bytes_skipped` is 0 (a filtered hole is byte-untracked, its span
+        // is the record count `to - from`).
+        assert_eq!(
+            gap_reason::FILTERED,
+            3,
+            "the filtered reason id is frozen at 3"
+        );
+        let marker = GapMarkerBody {
+            from: 1,
+            to: 3,
+            bytes_skipped: 0,
+            reason: gap_reason::FILTERED,
+        };
+        let mut buf = Vec::new();
+        encode_gap_marker(&marker, &mut buf);
+        assert_eq!(buf.len(), 25);
+        // The exact on-wire bytes: from=1, to=3, bytes_skipped=0 (all LE u64), then reason=3.
+        let expected: [u8; 25] = [
+            1, 0, 0, 0, 0, 0, 0, 0, // from = 1
+            3, 0, 0, 0, 0, 0, 0, 0, // to = 3
+            0, 0, 0, 0, 0, 0, 0, 0, // bytes_skipped = 0
+            3, // reason = gap_reason::FILTERED
+        ];
+        assert_eq!(buf.as_slice(), &expected, "byte-frozen FILTERED gap marker");
+        assert_eq!(decode_gap_marker(&buf).unwrap(), marker);
+    }
+
+    #[test]
     fn gap_marker_rejects_a_short_or_overlong_body() {
         assert_eq!(decode_gap_marker(&[0u8; 24]), Err(BodyError::Truncated));
         assert_eq!(decode_gap_marker(&[0u8; 26]), Err(BodyError::TrailingBytes));
@@ -3222,6 +3315,7 @@ mod tests {
             understands_deliver_batch: false,
             understands_streams: false,
             understands_compressed_delivery: false,
+            wants_subject_filter: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -4404,7 +4498,7 @@ mod tests {
 
             // SubSubject: subject + group.
             let mut buf = Vec::new();
-            encode_sub_subject(&SubSubjectBody { subject: &subject, group: &group }, &mut buf).unwrap();
+            encode_sub_subject(&SubSubjectBody { subject: &subject, group: &group, filter_mode: 0 }, &mut buf).unwrap();
             let v = decode_sub_subject(&buf).unwrap();
             prop_assert_eq!(v.subject, subject.as_slice());
             prop_assert_eq!(v.group, group.as_slice());
@@ -4493,7 +4587,7 @@ mod tests {
             understands_streams in any::<bool>(),
             understands_compressed_delivery in any::<bool>(),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch, understands_streams, understands_compressed_delivery };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch, understands_streams, understands_compressed_delivery, wants_subject_filter: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -4552,7 +4646,7 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false, understands_streams: false, understands_compressed_delivery: false };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false, understands_streams: false, understands_compressed_delivery: false, wants_subject_filter: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
@@ -4644,6 +4738,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: false,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             }
         );
     }
@@ -4670,6 +4765,7 @@ mod tests {
                 understands_deliver_batch: true,
                 understands_streams: true,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             },
             &mut full,
         );
@@ -4719,6 +4815,7 @@ mod tests {
                     understands_deliver_batch: false,
                     understands_streams: false,
                     understands_compressed_delivery: false,
+                    wants_subject_filter: false,
                 },
                 &mut body,
             );
@@ -4869,6 +4966,7 @@ mod tests {
             understands_deliver_batch: false,
             understands_streams: false,
             understands_compressed_delivery: false,
+            wants_subject_filter: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -5137,6 +5235,7 @@ mod tests {
             understands_deliver_batch: false,
             understands_streams: false,
             understands_compressed_delivery: false,
+            wants_subject_filter: false,
         };
         let mut pre = Vec::new();
         encode_connect(&no_level, &mut pre);
@@ -5231,6 +5330,7 @@ mod tests {
             understands_deliver_batch: false,
             understands_streams: false,
             understands_compressed_delivery: false,
+            wants_subject_filter: false,
         };
         let mut pre = Vec::new();
         encode_connect(&none, &mut pre);
@@ -5344,6 +5444,7 @@ mod tests {
             understands_deliver_batch: false,
             understands_streams: false,
             understands_compressed_delivery: false,
+            wants_subject_filter: false,
         };
         let mut buf = Vec::new();
         encode_connect(&both, &mut buf);
@@ -5406,6 +5507,7 @@ mod tests {
                 understands_deliver_batch: false,
                 understands_streams: false,
                 understands_compressed_delivery: false,
+                wants_subject_filter: false,
             }
         );
 
@@ -6230,11 +6332,57 @@ mod tests {
             (&b"metric.cpu"[..], &b""[..]),     // empty group selects the default group
         ] {
             let mut buf = Vec::new();
-            encode_sub_subject(&SubSubjectBody { subject, group }, &mut buf).unwrap();
+            encode_sub_subject(
+                &SubSubjectBody {
+                    subject,
+                    group,
+                    filter_mode: 0,
+                },
+                &mut buf,
+            )
+            .unwrap();
             let decoded = decode_sub_subject(&buf).unwrap();
             assert_eq!(decoded.subject, subject);
             assert_eq!(decoded.group, group);
+            assert_eq!(decoded.filter_mode, 0);
         }
+    }
+
+    #[test]
+    fn sub_subject_filter_mode_round_trips_and_is_additive() {
+        // #594: filter_mode 0 is byte-for-byte the historical body; mode 1 appends exactly one block
+        // byte and round-trips, and an old-shaped body (no filter byte) decodes as mode 0.
+        let mut plain = Vec::new();
+        encode_sub_subject(
+            &SubSubjectBody {
+                subject: b"orders.*",
+                group: b"w",
+                filter_mode: 0,
+            },
+            &mut plain,
+        )
+        .unwrap();
+        let mut filtered = Vec::new();
+        encode_sub_subject(
+            &SubSubjectBody {
+                subject: b"orders.*",
+                group: b"w",
+                filter_mode: 1,
+            },
+            &mut filtered,
+        )
+        .unwrap();
+        assert_eq!(
+            filtered.len(),
+            plain.len() + 1,
+            "filter_mode appends exactly one block byte"
+        );
+        assert_eq!(decode_sub_subject(&plain).unwrap().filter_mode, 0);
+        assert_eq!(decode_sub_subject(&filtered).unwrap().filter_mode, 1);
+        // The filtered decode still recovers subject + group intact.
+        let d = decode_sub_subject(&filtered).unwrap();
+        assert_eq!(d.subject, b"orders.*");
+        assert_eq!(d.group, b"w");
     }
 
     #[test]

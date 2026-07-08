@@ -305,6 +305,7 @@ fn negative_fixtures() {
             key: Bytes::new(),
             headers: Bytes::new(),
             payload: Bytes::from(payload(offset)),
+            subject: Bytes::new(),
         }
     }
     let prefix: Vec<OwnedRecord> = (0..4).map(|i| rec(i, i)).collect();

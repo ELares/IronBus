@@ -648,6 +648,7 @@ mod tests {
             key: Bytes::copy_from_slice(key),
             headers: Bytes::copy_from_slice(headers),
             payload: Bytes::copy_from_slice(payload),
+            subject: Bytes::new(),
         }
     }
 

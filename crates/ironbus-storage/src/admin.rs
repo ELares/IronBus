@@ -1519,6 +1519,7 @@ mod tests {
             key: Bytes::copy_from_slice(key),
             headers: Bytes::copy_from_slice(headers),
             payload: Bytes::copy_from_slice(payload),
+            subject: Bytes::new(),
         }
     }
 
@@ -1735,6 +1736,7 @@ mod tests {
             key: Bytes::from_static(b"k"),
             headers: Bytes::from_static(b"hdr"),
             payload: Bytes::from(compressed_payload.clone()),
+            subject: Bytes::new(),
         };
         sink.append_poison("orders", &src, 6).unwrap();
 

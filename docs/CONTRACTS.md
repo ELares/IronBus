@@ -62,10 +62,11 @@ Source: `types.rs`. Unknown bits are preserved on read so a future writer can ad
 | `0b0000_0001` | `COMPRESSED` | the payload is a compressed object: a self-describing codec descriptor then the codec stream (see [Compressed payload descriptor](#compressed-payload-descriptor-when-compressed-is-set)). CLEAR means the payload is raw |
 | `0b0000_0010` | `HAS_KEY`    | the record carries a key; DERIVED from `key_len != 0`, never taken from the caller |
 | `0b0000_0100` | `HAS_XXH3`   | the record carries the xxh3-64 field; DERIVED from the stored body reaching the threshold |
+| `0b0000_1000` | `HAS_SUBJECT` | the record carries a stored subject field (#594); DERIVED from a non-empty subject, never taken from the caller. See [Optional subject field](#optional-subject-field-on-disk-conditional) |
 
-`KNOWN` is `0b0000_0111`. `decode` rejects a frame whose `HAS_KEY` disagrees with
-`key_len != 0`, or whose `HAS_XXH3` disagrees with `body_len >= XXH3_PAYLOAD_THRESHOLD`,
-as `BadLength`.
+`KNOWN` is `0b0000_1111`. `decode` rejects a frame whose `HAS_KEY` disagrees with
+`key_len != 0`, whose `HAS_XXH3` disagrees with `body_len >= XXH3_PAYLOAD_THRESHOLD`, or
+whose `HAS_SUBJECT` is set with a zero-length subject, as `BadLength`.
 
 ### Compressed payload descriptor (when `COMPRESSED` is set)
 
@@ -112,6 +113,22 @@ by `HAS_XXH3`. A record below the threshold has no field and no flag, so its lay
 byte-for-byte the pre-xxh3 layout. CRC32C is verified first and remains the
 resync-gating checksum; an xxh3-64 mismatch is the distinct `BadXxh3` error.
 
+### Optional subject field (on-disk, conditional)
+
+When a record is published on a SUBJECT (#594, V2-M2), a `HAS_SUBJECT` record carries an
+optional subject field placed IMMEDIATELY AFTER the 36-byte header and BEFORE the body:
+`subject_len: u16` (`RECORD_SUBJECT_LEN_PREFIX` = 2 bytes, little-endian), then `subject_len`
+subject bytes, then `subject_crc: u32` (`RECORD_SUBJECT_CRC_LEN` = 4 bytes, CRC32C over the
+length prefix and the subject bytes). The whole field is counted in `total_len`. Its FIXED
+post-header offset is what lets the header-only length walk (`codec::decoded_len`) size a
+subject frame from the header plus the 2-byte prefix alone. The subject has its OWN CRC,
+independent of the body — the body CRC32C/xxh3 machinery and their threshold are computed over
+`key ++ headers ++ payload` EXACTLY as before, unchanged by the subject. A record without the
+bit has no field and is byte-for-byte the pre-subject layout, so `FORMAT_VERSION` stays `1`. A
+corrupted stored subject is the distinct `BadSubjectCrc` error. A record published via plain
+`Pub`/`PubTo` carries no subject and the bit is clear; such a record is treated as NON-MATCHING
+by any subject filter (never swallowed by a `>` catch-all).
+
 ### RecordTrailer (on-disk, 8 bytes)
 
 | offset (from frame start) | field      | type | notes |
@@ -122,12 +139,13 @@ resync-gating checksum; an xxh3-64 mismatch is the distinct `BadXxh3` error.
 ### Relationships and limits
 
 ```
-total_len = 36 (header) + key_len + hdr_len + payload_len + (HAS_XXH3 ? 8 : 0) + 8 (trailer)
+total_len = 36 (header) + (HAS_SUBJECT ? 2 + subject_len + 4 : 0)
+          + key_len + hdr_len + payload_len + (HAS_XXH3 ? 8 : 0) + 8 (trailer)
 ```
 
 A record is intact only when: `magic` matches, `version` == 1, `header_crc` passes,
-the trailing `total_len` equals the computed total, `body_crc` passes, and (if present)
-the `xxh3-64` matches.
+the trailing `total_len` equals the computed total, `body_crc` passes, (if present) the
+`subject_crc` matches, and (if present) the `xxh3-64` matches.
 
 - `DEFAULT_MAX_RECORD_BYTES` = 16 MiB (`16 * 1024 * 1024`), the default hard cap on a
   single record's total size.
@@ -646,7 +664,7 @@ already-frozen `loss-report.v1` skip record.
 | `from`          | u64  | 8     | the first absent offset (inclusive): where the hole begins (the last delivered offset plus one) |
 | `to`            | u64  | 8     | the first present offset after the hole (exclusive): delivery resumes here, and the next record (if any) carries this offset |
 | `bytes_skipped` | u64  | 8     | the reported bytes lost in the hole (from `loss-report.v1`); `0` when the cause is byte-untracked (a plain retention/trim reap, whose span is the record count `to - from`) |
-| `reason`        | u8   | 1     | why the span is absent: `1` = `gap_reason::TRIMMED` (a retention / disk-full drop-oldest reap), `2` = `gap_reason::COMPACTED` (#337 key-compaction; EMITTED since #411 when a gap-marker-capable consumer reads across a mid-stream compacted hole). An unknown future value is TOLERATED by a reader (decoded verbatim, never an error), so the reason field grows without a new frame |
+| `reason`        | u8   | 1     | why the span is absent: `1` = `gap_reason::TRIMMED` (a retention / disk-full drop-oldest reap), `2` = `gap_reason::COMPACTED` (#337 key-compaction; EMITTED since #411 when a gap-marker-capable consumer reads across a mid-stream compacted hole), `3` = `gap_reason::FILTERED` (#594 per-subject filtered consumer; the offsets in `[from, to)` did not match the group's subject filter, or carried no stored subject — a per-filter absence, the offsets are still present for an unfiltered group). An unknown future value is TOLERATED by a reader (decoded verbatim, never an error), so the reason field grows without a new frame |
 
 Trailing bytes are rejected; the `reason` byte is NOT validated by the codec (an unknown reason is a
 valid, tolerated marker). The frame is the OPT-IN, richer twin of `Truncated`: for a trim, `to ==

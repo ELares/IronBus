@@ -278,6 +278,7 @@ fn build_vectors() -> Vec<Vector> {
         understands_deliver_batch: true,
         understands_streams: true,
         understands_compressed_delivery: true,
+        wants_subject_filter: false,
     };
     let mut body = Vec::new();
     encode_connect(&full, &mut body);
@@ -895,6 +896,7 @@ fn build_vectors() -> Vec<Vector> {
         &SubSubjectBody {
             subject: b"order.*.created",
             group: b"workers",
+            filter_mode: 0,
         },
         &mut body,
     )

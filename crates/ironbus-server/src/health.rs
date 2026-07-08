@@ -1061,6 +1061,9 @@ fn broker_core_lines(
          # HELP ironbus_expired_total Messages expired by a per-message/per-stream TTL and reclaimed by retention (skipped on read, not delivered, not dead-lettered).\n\
          # TYPE ironbus_expired_total counter\n\
          ironbus_expired_total {expired}\n\
+         # HELP ironbus_filtered_total Records skipped by a per-subject filtered consumer because their stored subject did not match the work-group filter (the wildcard-subscription selectivity signal).\n\
+         # TYPE ironbus_filtered_total counter\n\
+         ironbus_filtered_total {filtered}\n\
          # HELP ironbus_dlq_records_total Records durably written to the dead-letter sink (the DLQ depth, survives restart).\n\
          # TYPE ironbus_dlq_records_total counter\n\
          ironbus_dlq_records_total {dlq_records}\n\
@@ -1096,6 +1099,7 @@ fn broker_core_lines(
         redelivered = counters.redelivered,
         dead_lettered = counters.dead_lettered,
         expired = counters.expired,
+        filtered = counters.filtered,
         acks = counters.acks,
         segments_reaped = counters.segments_reaped,
         segments_force_reaped = counters.segments_force_reaped,
@@ -4783,6 +4787,7 @@ mod tests {
                         Poll::Parked { .. } => {}
                         Poll::Truncated { .. } => panic!("unexpected truncation"),
                         Poll::Compacted { .. } => panic!("unexpected compaction"),
+                        Poll::Filtered { .. } => panic!("unexpected filtered"),
                         Poll::Idle => break,
                     }
                 }
@@ -4837,6 +4842,7 @@ mod tests {
                         Poll::Parked { .. } => {}
                         Poll::Truncated { .. } => panic!("unexpected truncation"),
                         Poll::Compacted { .. } => panic!("unexpected compaction"),
+                        Poll::Filtered { .. } => panic!("unexpected filtered"),
                         Poll::Idle => break,
                     }
                 }
@@ -5174,6 +5180,9 @@ mod tests {
         // The TTL expiry-and-reclaim counter (V2-M4, #549): a resilience drop signal alongside
         // dead_lettered (an expired-and-reclaimed message is accounted here, not silently dropped).
         "ironbus_expired_total",
+        // The per-subject filtered-consumer skip counter (#594): the wildcard-subscription
+        // selectivity signal, alongside the other resilience/observability counters.
+        "ironbus_filtered_total",
         "ironbus_dlq_records_total",
         "ironbus_acks_total",
         "ironbus_segments_reaped_total",
@@ -5344,6 +5353,7 @@ mod tests {
         ("ironbus_redelivered_total", "counter"),
         ("ironbus_dead_lettered_total", "counter"),
         ("ironbus_expired_total", "counter"),
+        ("ironbus_filtered_total", "counter"),
         ("ironbus_dlq_records_total", "counter"),
         ("ironbus_acks_total", "counter"),
         ("ironbus_segments_reaped_total", "counter"),
