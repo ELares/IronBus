@@ -2346,18 +2346,21 @@ fn recover_named_groups<F: Filesystem>(
 }
 
 /// Resumes every NAMED stream's per-group consumer cursor from its own
-/// `streams/<hex(name)>/cursor-<hex(group)>.ckpt` (#681), the per-stream twin of
-/// [`recover_named_groups`]: for each recovered named stream in `streams`, it lists that stream's OWN
-/// subdirectory for cursor checkpoints, decodes each group's [`AckCursor`] snapshot, and rebuilds the
-/// group clamped to THAT stream's durable head. A named stream with no cursor file (only ever
+/// `streams/<hex(name)>/cursor-<hex(group)>.ckpt` PLUS its `attempts-<hex(group)>.ckpt` (#681 + its
+/// DLQ follow-up), the per-stream twin of [`recover_named_groups`]: for each recovered named stream in
+/// `streams`, it lists that stream's OWN subdirectory for BOTH cursor and attempts checkpoints, decodes
+/// each group's [`AckCursor`] snapshot and its durable per-message attempt counts, and rebuilds the
+/// group clamped to THAT stream's durable head. A named stream with no such file (only ever
 /// produced-to) is omitted, so it stays lazy-on-first-consume exactly as before. The default stream
 /// `""` is never a key here (it uses [`Engine::groups`]) and is skipped.
 ///
 /// This mirrors the default stream's durable-resume EXACTLY — same `AckCursor` snapshot format, same
-/// dual-slot [`Checkpoint`], same `resume_cursor_from_snapshot` clamp — so there is no parallel
-/// format; the only difference is the file's LOCATION (the stream's own subdir). A torn or short
-/// snapshot degrades to a lower committed watermark (at-least-once safe, redelivering only
-/// already-acked records), never a phantom offset past the head.
+/// attempt-count snapshot (#358), same dual-slot [`Checkpoint`], same `resume_cursor_from_snapshot`
+/// clamp — so there is no parallel format; the only difference is the files' LOCATION (the stream's own
+/// subdir). A torn or short snapshot degrades to a lower committed watermark / no carried counts
+/// (at-least-once safe, redelivering only already-acked records and resuming a poison at attempt 1),
+/// never a phantom offset past the head. A group with an attempts file but no cursor file (a poison in
+/// flight but never committed) is still discovered so its rising attempt count is not lost.
 ///
 /// # Errors
 /// Propagates a storage error from listing a stream's subdir or opening/reading a cursor checkpoint.
@@ -2377,22 +2380,42 @@ fn recover_named_stream_groups<F: Filesystem, C: Clock>(
         let flushed = log.flushed_offset().get();
         let fs = log.filesystem();
         let mut ns = NamedStream::new();
-        // Every cursor checkpoint in THIS stream's subdir, skipping segment/foreign files (the
-        // storage helper parses only canonical `cursor.ckpt` / `cursor-<hex>.ckpt` names).
-        for (group, file_name) in ironbus_storage::naming::cursor_checkpoint_names(fs)? {
+        // Discover every durable group of THIS stream from BOTH its cursor file AND its attempts file
+        // (the #681 DLQ follow-up brings the default stream's #358 union to the named path): a group
+        // whose poison was in flight but never committed has an `attempts-<hex>.ckpt` yet no
+        // `cursor-<hex>.ckpt` (the cursor write is gated on the watermark advancing), so iterating only
+        // cursor files would orphan its durable attempt counts and re-poison from attempt 1 after a
+        // crash. The union of the two filename sets, with a fresh cursor for an attempts-only group,
+        // recovers both — exactly as `recover_named_groups` does for the default stream's named groups.
+        let mut names = std::collections::BTreeSet::new();
+        for file in fs.list()? {
+            if let Some(group) = ironbus_storage::naming::parse_cursor_checkpoint_name(&file) {
+                names.insert(group);
+            } else if let Some(group) = parse_group_attempts_name(&file) {
+                names.insert(group);
+            }
+        }
+        for group in names {
             // A named-stream group is always non-empty (`poll_in_stream` validates it), so a bare
-            // `cursor.ckpt` (empty group) in a stream subdir is foreign — skip anything that fails the
-            // group-name rule rather than resurrect it.
+            // `cursor.ckpt` / `attempts.ckpt` (empty group) in a stream subdir is foreign — skip
+            // anything that fails the group-name rule rather than resurrect it.
             if validate_group_name(&group).is_err() {
                 continue;
             }
-            let (_, recovered) = Checkpoint::open(fs.open(&file_name)?)?;
-            let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
+            // Resume the cursor from `cursor-<hex>.ckpt` if present, else start fresh at offset 0 (the
+            // attempts-only case, a poison in flight but never committed). Then seed the durable
+            // per-message attempt counts from `attempts-<hex>.ckpt`, clamped exactly like the default
+            // stream (#358), so `MaxDeliver` and the poison-cap survive a restart in every named stream.
+            let cursor_name = group_checkpoint_name(&group);
+            let cursor = if fs.exists(&cursor_name)? {
+                let (_, recovered) = Checkpoint::open(fs.open(&cursor_name)?)?;
+                resume_cursor_from_snapshot(recovered.as_deref(), flushed)
+            } else {
+                AckCursor::new()
+            };
             let committed = cursor.committed().get();
-            // No per-stream durable ATTEMPT counts this slice (the #681 DLQ/MaxDeliver follow-up), so
-            // the group resumes with a fresh lease table — at-least-once safe, byte-for-byte the
-            // pre-#681 named-stream consume behavior minus the cursor loss.
-            let g = resume_work_group(cursor, None, lease, opened_at, flushed);
+            let recovered_a = read_group_attempts(fs, &group)?;
+            let g = resume_work_group(cursor, recovered_a.as_deref(), lease, opened_at, flushed);
             ns.group_last_checkpointed.insert(group.clone(), committed);
             ns.groups.insert(group, g);
         }
@@ -2903,6 +2926,17 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
     /// evidence of a dropped message).
     dlq_config: LogConfig,
+    /// The per-NAMED-stream durable dead-letter SINKS (#681 follow-up), the per-stream twin of `dlq`
+    /// above: each named stream's poison records route to a sink rooted in THAT stream's OWN
+    /// subdirectory (`streams/<hex(name)>/dlq/`), co-located with — and recovered beside — its log,
+    /// the `dlq/` subdir pattern generalized (exactly as its cursor checkpoints are, #681). Keyed by
+    /// [`StreamId`] so dead-letters (and the per-group exact-offset idempotency set) are ISOLATED per
+    /// stream; the group is the key WITHIN a stream's sink. Each entry is opened LAZILY on that
+    /// stream's first dead-letter (so a stream that never poisons never creates its `dlq/`), or
+    /// EAGERLY by [`Engine::open`] when the subdir already exists, so the idempotency set is rebuilt
+    /// before the first poison redelivers after a crash. Empty for a deployment that never
+    /// dead-letters a named stream, so the default and no-poison paths cost nothing.
+    named_dlq: BTreeMap<StreamId, DlqSink<F, C>>,
     /// The durable TRANSACTIONAL HALF-MESSAGE store (V2-M8, #640): the `txn/` sub-log that buffers
     /// prepared (half) messages INVISIBLE to consumers and their commit/rollback op-markers, plus the
     /// in-memory lifecycle table it rebuilds at open. Opened LAZILY on the first `TxnPrepare` (so a
@@ -3281,6 +3315,38 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         } else {
             None
         };
+        // Eagerly open (recovering its per-group idempotency set) EACH named stream's own dead-letter
+        // sink IF its `streams/<hex(name)>/dlq/` subdir already exists from a prior run (#681 follow-up),
+        // the per-stream twin of the default eager open above: a named-stream poison that was fsynced to
+        // the sink but whose (lagging) cursor commit was lost to a crash must be recognized as
+        // already-dead-lettered on its redelivery, so the exact-offset set is present before the first
+        // re-poison. Iterate EVERY recovered stream (not just those with a consumer cursor): a stream
+        // that dead-lettered but never checkpointed a cursor/attempts file is absent from
+        // `named_streams` yet still has a durable `dlq/`, and its record must be reopened so the depth
+        // metric and the idempotency set are correct. A stream that never dead-lettered has no `dlq/`
+        // subdir and stays unopened (lazy), so a no-poison deployment never materializes one.
+        let mut named_dlq: BTreeMap<StreamId, DlqSink<F, C>> = BTreeMap::new();
+        for id in streams.stream_ids() {
+            if id.is_default() {
+                continue;
+            }
+            let Some(stream_log) = streams.get(&id) else {
+                continue;
+            };
+            if stream_log
+                .filesystem()
+                .subdir_exists(DLQ_SUBDIR)
+                .unwrap_or(false)
+            {
+                let sink = DlqSink::open_at(
+                    stream_log.filesystem(),
+                    DLQ_SUBDIR,
+                    stream_log.clock_clone(),
+                    dlq_config,
+                )?;
+                named_dlq.insert(id, sink);
+            }
+        }
 
         // The TRANSACTIONAL HALF-MESSAGE store's log (V2-M8, #640) shares the main log's segment
         // sizing but is NEVER byte-capped: a prepared half message is an undelivered durable payload
@@ -3374,6 +3440,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             last_dead_lettered: None,
             dlq,
             dlq_config,
+            // The per-named-stream dead-letter sinks (#681 follow-up), eagerly opened above for every
+            // recovered stream whose `dlq/` subdir already exists; the rest open lazily on first poison.
+            named_dlq,
             // The transactional half-message store (V2-M8, #640): opened above iff the `txn/` subdir
             // already exists, else `None` until the first `TxnPrepare` lazily creates it. A
             // non-transactional broker keeps this `None`, so the produce/consume hot path is unchanged.
@@ -4280,6 +4349,46 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(())
     }
 
+    /// Durably writes a NAMED stream's work-group in-flight attempt-count snapshot to
+    /// `streams/<hex(name)>/attempts-<hex(group)>.ckpt` (#681 DLQ follow-up), the per-stream twin of
+    /// [`Engine::write_group_attempts`] and the companion to [`Engine::write_named_group_checkpoint`].
+    /// The file lives in the STREAM's OWN subdirectory (resolved via that stream's log filesystem), so
+    /// a named-stream consumer's poison-cap state is co-located with — and recovers beside — its own
+    /// log and cursor, the `dlq/` subdir pattern generalized. Same [`AttemptsCheckpoint`] snapshot as
+    /// the default stream: no parallel format, only a different location. Reopened per write so the
+    /// crash-safe two-slot sequence continues correctly. A no-op for an absent stream/group.
+    ///
+    /// # Errors
+    /// Propagates a storage error from opening or writing the checkpoint file.
+    fn write_named_group_attempts(
+        &mut self,
+        id: &StreamId,
+        group: &str,
+    ) -> Result<(), EngineError> {
+        let pairs = match self.named_streams.get(id).and_then(|s| s.groups.get(group)) {
+            Some(g) => g.leases.attempt_counts(),
+            None => return Ok(()),
+        };
+        let payload = attempts_snapshot_payload(&pairs);
+        let name = group_attempts_name(group);
+        let file = {
+            let Some(log) = self.streams.get(id) else {
+                return Ok(());
+            };
+            let fs = log.filesystem();
+            if fs.exists(&name)? {
+                fs.open(&name)?
+            } else {
+                let f = fs.create_new(&name)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            }
+        };
+        let (mut cp, _) = AttemptsCheckpoint::open(file)?;
+        cp.write(&payload)?;
+        Ok(())
+    }
+
     /// Durably records a NAMED stream's work-group committed cursor (#681), the per-stream twin of
     /// [`Engine::checkpoint_group`]: writes the cursor iff its watermark advanced since the last
     /// checkpoint OR it carries an acked-ahead set (so an out-of-order ack that has not yet moved the
@@ -4295,6 +4404,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let committed = g.cursor.committed().get();
         let has_ahead = !g.cursor.ahead_ranges().is_empty();
+        let has_in_flight = g.leases.in_flight() > 0;
         let last = self
             .named_streams
             .get(id)
@@ -4303,6 +4413,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .unwrap_or(0);
         if committed > last || has_ahead {
             self.write_named_group_checkpoint(id, group, committed)?;
+        }
+        // Persist this named-stream group's durable attempt counts (#681 DLQ follow-up) when the cursor
+        // advanced OR any lease is in flight — a redelivery escalates a poison's attempt count WITHOUT
+        // moving the cursor, so a retried poison must still record its rising count, exactly as the
+        // default stream's `checkpoint_group` does (#358). This is what makes the attempt-count-resume
+        // (a poison in flight resumes its attempt number after a restart) hold on the named path.
+        if committed > last || has_in_flight {
+            self.write_named_group_attempts(id, group)?;
         }
         Ok(())
     }
@@ -4331,6 +4449,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .unwrap_or(0);
         if committed.saturating_sub(last) >= self.checkpoint_interval.max(1) {
             self.write_named_group_checkpoint(id, group, committed)?;
+            // Persist the named-stream group's attempt counts on the same interval cadence (#681 DLQ
+            // follow-up), exactly as `maybe_checkpoint_group` does for the default stream (#358).
+            self.write_named_group_attempts(id, group)?;
             Ok(true)
         } else {
             Ok(false)
@@ -5501,6 +5622,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .as_deref()
             .and_then(|p| SubjectPattern::parse(p).ok());
         let mut filtered_from: Option<u64> = None;
+        // A poison message (claimed but over max-deliver) to DEAD-LETTER to this stream's own DLQ,
+        // captured so the crash-atomic per-stream DLQ move runs OUTSIDE the per-record group borrow —
+        // the sink append needs `&mut self`, the same reason the default stream captures-and-breaks
+        // (#681 DLQ follow-up). Its lease is released the moment it is captured, so the in-flight
+        // bookkeeping is correct regardless of the move's result.
+        let mut dead_letter: Option<(Offset, u32, OwnedRecord)> = None;
         // The delivery window: at most `max_in_flight` offsets above the committed cursor, never past
         // the durable end — the SAME window as the default-stream poll.
         let window_end = committed
@@ -5598,29 +5725,148 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     }));
                 }
                 Disposition::DeadLetter => {
-                    // No per-stream DLQ yet (#676 scope): commit PAST the poison message so it never
-                    // redelivers (at-least-once preserved; the forensic DLQ copy is the flagged
-                    // follow-up). The default stream keeps its full crash-atomic DLQ move unchanged.
+                    // CAPTURE the poison and break: the crash-atomic per-stream DLQ move (forensic
+                    // copy + the `DeadLetter` advisory via `Poll::Parked`) and the cursor commit happen
+                    // BELOW, after this scoped group borrow is released (the sink append needs
+                    // `&mut self`), exactly as the default stream's poll does (#681 DLQ follow-up). The
+                    // lease is dropped HERE so the in-flight bookkeeping is correct regardless of the
+                    // move's result. `dead_lettered` is bumped by the move (once, after the durable
+                    // append), never here, so the count is never double-charged.
                     if let Some(g) = self.named_group_mut(id, group) {
                         g.leases.ack(&token);
-                        g.cursor.ack(off);
                     }
-                    self.counters.dead_lettered = self.counters.dead_lettered.saturating_add(1);
-                    offset += 1;
+                    dead_letter = Some((off, deliveries, record));
+                    break;
                 }
             }
         }
         // Flush a coalesced FILTERED-skip run that reached the window end (#594-B): the durable per-
         // stream cursor was already advanced past `[filtered_from, offset)`, so surface ONE
         // `Poll::Filtered` for the whole run. (No `sync_consumer_lag` here: the default-stream lag
-        // registry is not keyed by named-stream groups; the named cursor's durability is #681's.)
+        // registry is not keyed by named-stream groups; the named cursor's durability is #681's.) A
+        // terminal dead-letter capture always leaves `filtered_from` None (the filtered-match path
+        // returns its gap inline), so a gap run and a poison capture never coexist here.
         if let Some(from) = filtered_from {
             return Ok(Poll::Filtered {
                 from: Offset::new(from),
                 to: Offset::new(offset),
             });
         }
+        // A poison captured above: run the crash-atomic per-stream DLQ move OUTSIDE the group borrow —
+        // APPEND+FSYNC the forensic copy to this stream's own `dlq/` sink, THEN commit the cursor past
+        // it and return `Poll::Parked` (the session maps it to the `DeadLetter` advisory). Byte-for-byte
+        // the default stream's `dead_letter_in`, keyed to this stream's own sink (#681 DLQ follow-up).
+        if let Some((off, deliveries, record)) = dead_letter {
+            return self.named_dead_letter_in(id, group, off, deliveries, record);
+        }
         Ok(Poll::Idle)
+    }
+
+    /// Lazily opens (recovering its per-group dead-lettered offset set) a NAMED stream's own durable
+    /// DLQ sink on first use, returning a mutable borrow (#681 DLQ follow-up). The sink is rooted at
+    /// that stream's `streams/<hex(name)>/dlq/` subdir (its log's own filesystem), so a named stream's
+    /// dead-letters are ISOLATED per stream and co-located with its log — the per-stream twin of
+    /// [`Engine::dlq_sink`]. Created on the stream's first dead-letter (so a stream that never poisons
+    /// never creates `dlq/`), or eagerly by [`Engine::open`] when the subdir already exists. Opening
+    /// rebuilds the exact dead-lettered offset set from the durable records, so the idempotency key is
+    /// present before the first (re-)append regardless of whether the eager open ran.
+    ///
+    /// # Errors
+    /// Propagates a storage error from opening the sink, or a missing-stream surface (unreachable: the
+    /// poll path read a record off this stream's log immediately before capturing the poison).
+    fn named_dlq_sink(&mut self, id: &StreamId) -> Result<&mut DlqSink<F, C>, EngineError> {
+        if !self.named_dlq.contains_key(id) {
+            let Some(log) = self.streams.get(id) else {
+                // Unreachable: the poll captured the poison from a record just read off this log.
+                return Err(EngineError::MissingRecord { offset: 0 });
+            };
+            let sink = DlqSink::open_at(
+                log.filesystem(),
+                DLQ_SUBDIR,
+                log.clock_clone(),
+                self.dlq_config,
+            )?;
+            self.named_dlq.insert(id.clone(), sink);
+        }
+        // Just-inserted above when absent, so this is always Some.
+        self.named_dlq
+            .get_mut(id)
+            .ok_or(EngineError::MissingRecord { offset: 0 })
+    }
+
+    /// Performs the crash-atomic, EXACTLY-ONCE dead-letter move for a poison message of NAMED stream
+    /// `id`'s work-group `group` at source offset `off` after `attempt` deliveries (#681 DLQ follow-up),
+    /// then commits that group's cursor past it and returns [`Poll::Parked`]. The per-stream twin of
+    /// [`Engine::dead_letter_in`], keyed to this stream's OWN sink.
+    ///
+    /// The ordering is the SAME crash-safety contract as the default stream: APPEND the poison record
+    /// to the durable per-stream DLQ sink and FSYNC it, THEN commit the source cursor (in memory; the
+    /// named cursor's durability is the lagging #681 checkpoint). A crash between the two leaves the
+    /// source uncommitted (it redelivers and is re-poisoned) and the DLQ record already durable; on
+    /// reopen the eagerly-/lazily-rebuilt per-group EXACT dead-lettered set makes the re-poison a no-op
+    /// append so the message is committed-past WITHOUT a duplicate DLQ write. A configured dead-letter
+    /// EXCHANGE records the reason (mirroring the default's max-deliver append); with none this is the
+    /// reason-less v1 append, byte-identical to the default stream's fixed-DLQ max-deliver path.
+    ///
+    /// The lease was already dropped by the caller, so on success the message holds no lease and never
+    /// redelivers.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the DLQ append or its fsync; on any error the source cursor is
+    /// NOT committed, so the poison redelivers rather than being lost or half-moved.
+    fn named_dead_letter_in(
+        &mut self,
+        id: &StreamId,
+        group: &str,
+        off: Offset,
+        attempt: u32,
+        record: OwnedRecord,
+    ) -> Result<Poll, EngineError> {
+        // Idempotency: if this EXACT (group, source offset) is already durably in this stream's DLQ, do
+        // NOT append a second copy (the #800 exact-membership rule). This is the path a redelivered-
+        // then-re-poisoned message takes after a crash between the DLQ append and the cursor commit.
+        let already = self
+            .named_dlq_sink(id)?
+            .already_dead_lettered(group, off.get());
+        if !already {
+            // APPEND to the sink and FSYNC, BEFORE committing the source cursor. A storage error
+            // propagates WITHOUT committing the source, so the move simply did not happen and the
+            // message redelivers, never lost and never half-moved. A configured dead-letter EXCHANGE
+            // records the reason (max-deliver); with none this is the reason-less v1 append, so a named
+            // stream's fixed-DLQ record is byte-identical to the default stream's.
+            if self.dead_letter_exchange.is_some() {
+                self.named_dlq_sink(id)?.append_dead_letter(
+                    group,
+                    &record,
+                    attempt,
+                    DeadLetterReason::MaxDeliverExceeded,
+                )?;
+            } else {
+                self.named_dlq_sink(id)?
+                    .append_poison(group, &record, attempt)?;
+            }
+        }
+        // The DLQ record is now durable (or was already), so commit the source cursor past the poison:
+        // drop nothing, never redeliver. In-memory here (the named cursor's durability is the lagging
+        // #681 checkpoint), the idempotent set covering the crash window as described above.
+        let committed = if let Some(g) = self.named_group_mut(id, group) {
+            g.cursor.ack(off);
+            g.cursor.committed().get()
+        } else {
+            // Unreachable: the poll path resolved this group immediately before capturing the poison.
+            off.get().saturating_add(1)
+        };
+        self.counters.dead_lettered = self.counters.dead_lettered.saturating_add(1);
+        self.last_dead_lettered = Some(off);
+        // #800: prune this stream's DLQ dedup set below the group's committed watermark — those source
+        // offsets can never redeliver or re-poison, bounding the per-group set by the in-flight window.
+        if let Some(sink) = self.named_dlq.get_mut(id) {
+            sink.prune_below(group, committed);
+        }
+        Ok(Poll::Parked {
+            offset: off,
+            record,
+        })
     }
 
     /// Mutably borrows work-group `group` of NAMED stream `id`, or `None` if the stream or group is
@@ -9488,14 +9734,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.last_dead_lettered
     }
 
-    /// The number of records durably written to the DLQ sink (the dead-letter depth, #63): the
+    /// The number of records durably written to the DLQ sink(s) (the dead-letter depth, #63): the
     /// records present when the sink was opened plus every poison record appended since. Zero when
-    /// nothing has been dead-lettered (the sink is then never even opened). Exposed on `/metrics`
+    /// nothing has been dead-lettered (a sink is then never even opened). Exposed on `/metrics`
     /// as `ironbus_dlq_records_total`. Unlike `dead_lettered` (an in-memory counter reset on
-    /// restart), this is reconstructed from the durable sink, so it survives a restart.
+    /// restart), this is reconstructed from the durable sink, so it survives a restart. Sums the
+    /// default stream's sink AND every NAMED stream's own per-stream sink (#681 DLQ follow-up), so the
+    /// operator's dead-letter depth accounts for poison in every stream.
     #[must_use]
     pub fn dlq_records(&self) -> u64 {
-        self.dlq.as_ref().map_or(0, DlqSink::records)
+        let default = self.dlq.as_ref().map_or(0, DlqSink::records);
+        self.named_dlq
+            .values()
+            .map(DlqSink::records)
+            .fold(default, u64::saturating_add)
     }
 
     /// The highest source offset the DLQ dedup set CURRENTLY tracks for `group`, or `None` if the
@@ -18526,6 +18778,341 @@ mod tests {
             matches!(e2.poll_in_stream("orders", "g", 0).unwrap(), Poll::Idle),
             "the stream is fully drained after the resumed consume"
         );
+    }
+
+    #[test]
+    fn a_named_stream_poison_message_is_dead_lettered_to_its_own_dlq_and_committed_past() {
+        // THE #681 DLQ follow-up (the named-stream twin of the default stream's
+        // `a_poisoned_message_is_durably_written_to_the_dlq_and_committed_past`): a poison message on a
+        // NAMED stream, redelivered past max_deliver, is DEAD-LETTERED — a forensic copy lands in that
+        // stream's OWN `streams/<hex(name)>/dlq/` sink, the consumer gets a `DeadLetter` advisory
+        // (`Poll::Parked`), and the source cursor is committed past so it never redelivers. Before this
+        // slice the named path committed a poison past with NO forensic copy (the data-integrity gap).
+        use ironbus_storage::dlq::{read_dead_letter_entries, DlqEntry, DLQ_SUBDIR};
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        // Produce ONE poison record to the named stream `orders` with a distinct key/headers/payload,
+        // so the forensic copy can be asserted verbatim.
+        let off = e
+            .produce_in_stream(
+                "orders",
+                &Append {
+                    timestamp_ms: 42,
+                    flags: RecordFlags::EMPTY,
+                    key: b"poison-key",
+                    headers: b"poison-hdr",
+                    payload: b"the-poison-payload",
+                },
+            )
+            .unwrap();
+        // First delivery (attempt 1, within max_deliver = 1). `now` is threaded from the clock seam so
+        // the lease's visibility window is measured against the advancing manual clock.
+        let d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        assert_eq!(d.offset, off);
+        // Expire the lease, then re-poll: attempt 2 exceeds max_deliver and is dead-lettered, surfaced
+        // as `Poll::Parked` (which the session maps to the `DeadLetter` advisory).
+        clock.advance_monotonic_nanos(40);
+        match e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off, "the poison was dead-lettered"),
+            other => panic!("expected Parked (the DeadLetter advisory), got {other:?}"),
+        }
+        // The source group committed PAST the poison (it never redelivers); the counter + depth moved.
+        assert_eq!(
+            e.committed_offset_in_stream("orders", "g"),
+            Offset::new(off.get() + 1)
+        );
+        assert!(
+            matches!(
+                e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap(),
+                Poll::Idle
+            ),
+            "the poison is committed-past, not redelivered"
+        );
+        assert_eq!(e.counters().dead_lettered, 1);
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "one record in the named stream's DLQ depth"
+        );
+        // The DEFAULT stream's DLQ was never touched: named-stream dead-letters are isolated per stream
+        // in the stream's OWN subdir, never the root `dlq/`.
+        assert!(
+            !probe.subdir_exists(DLQ_SUBDIR).unwrap(),
+            "the ROOT dlq/ must not exist for a named-stream poison"
+        );
+        drop(e);
+
+        // Read the named stream's OWN DLQ sink (`streams/<hex(orders)>/dlq/`): the forensic copy holds
+        // the ORIGINAL timestamp, key, headers, and payload, under group `g` at the poison attempt.
+        let stream_fs = probe
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("orders"))
+            .unwrap();
+        let entries = read_dead_letter_entries(&stream_fs, DLQ_SUBDIR).unwrap();
+        assert_eq!(entries.len(), 1);
+        let DlqEntry {
+            group,
+            source_offset,
+            attempt,
+            timestamp_ms,
+            key,
+            headers,
+            payload,
+            ..
+        } = &entries[0];
+        assert_eq!(group, "g", "recorded under the named-stream group");
+        assert_eq!(*source_offset, off.get());
+        assert_eq!(
+            *attempt, 2,
+            "poisoned on the 2nd attempt (over max_deliver 1)"
+        );
+        assert_eq!(
+            *timestamp_ms, 42,
+            "the original enqueue timestamp is preserved"
+        );
+        assert_eq!(key, b"poison-key");
+        assert_eq!(headers, b"poison-hdr");
+        assert_eq!(payload, b"the-poison-payload");
+
+        // The DLQ depth SURVIVES a restart for a named stream too: `Engine::open` eagerly re-opens the
+        // stream's sink (rebuilding its idempotency set + record count) because `dlq/` already exists.
+        let e2 = Engine::open(
+            probe,
+            std::sync::Arc::new(ManualClock::new()),
+            config(10, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            e2.dlq_records(),
+            1,
+            "the named-stream DLQ depth is rebuilt at open"
+        );
+    }
+
+    #[test]
+    fn a_named_stream_poison_attempt_count_survives_a_restart_and_reaches_its_dlq() {
+        // THE TEETH (the named-stream twin of the default stream's #358
+        // `a_named_groups_attempt_count_survives_a_restart_and_reaches_its_dlq`): a poison on a NAMED
+        // stream, retried MaxDeliver-1 times, then crashed+restarted, must resume at its true attempt
+        // number (NOT reset to 1) and reach that stream's DLQ after MaxDeliver TOTAL attempts. This
+        // leans on #681's durable per-stream checkpoints, now carrying the attempt counts too.
+        use ironbus_storage::dlq::{read_dead_letter_entries, DLQ_SUBDIR};
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        // max_deliver = 3: the 4th attempt is poison. Deliver twice pre-crash (still under the cap).
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 3)).unwrap();
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"poison",
+            },
+        )
+        .unwrap();
+        for attempt in 1..=2u32 {
+            let d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+            assert_eq!(d.deliveries, attempt);
+            clock.advance_monotonic_nanos(40);
+        }
+        // Flush the named stream's cursor AND attempt counts (a clean-shutdown flush).
+        e.checkpoint_in_stream("orders", "g").unwrap();
+        drop(e);
+
+        // CRASH+RESTART: the lease table is empty, but the durable per-stream attempt count carries 2.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), config(10, 3)).unwrap();
+        // The FIRST redelivery after the restart is attempt 3 (resumed 2 + 1), NOT 1.
+        let d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        assert_eq!(
+            d.deliveries, 3,
+            "the named stream resumed at attempt 3 across the restart, not 1"
+        );
+        // Expire it: the next poll is attempt 4, which exceeds max_deliver (3) and dead-letters.
+        clock2.advance_monotonic_nanos(40);
+        match e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, Offset::ZERO),
+            other => panic!("expected the poison to be dead-lettered, got {other:?}"),
+        }
+        assert_eq!(e.dlq_records(), 1, "reaches the DLQ after MaxDeliver TOTAL");
+        assert_eq!(
+            e.committed_offset_in_stream("orders", "g"),
+            Offset::new(1),
+            "committed past the poison"
+        );
+        drop(e);
+
+        // The DLQ entry records attempt 4 (MaxDeliver + 1), proving the count was TOTAL across the
+        // restart (not a fresh 2 after a reset), and it lives in the named stream's OWN sink.
+        let stream_fs = probe
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("orders"))
+            .unwrap();
+        let entries = read_dead_letter_entries(&stream_fs, DLQ_SUBDIR).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].group, "g");
+        assert_eq!(
+            entries[0].attempt, 4,
+            "the poison attempt is MaxDeliver + 1 = 4, counted across the restart"
+        );
+    }
+
+    #[test]
+    fn a_named_stream_poison_re_poisoned_after_a_crash_is_not_double_dead_lettered() {
+        // The crash-atomic idempotency contract on the named path (the twin of the default stream's
+        // #800 exact-offset dedup): the DLQ record is fsynced BEFORE the (lagging, in-memory) cursor
+        // commit, so a crash between the two leaves the source uncommitted. On restart the poison
+        // redelivers and re-poisons, but the stream's eagerly-reopened dedup set (rebuilt from the
+        // durable record) recognizes the EXACT source offset as already dead-lettered and commits it
+        // past WITHOUT a second append — exactly one DLQ entry, never lost and never doubled.
+        use ironbus_storage::dlq::{read_dead_letter_entries, DLQ_SUBDIR};
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 7,
+                flags: RecordFlags::EMPTY,
+                key: b"k",
+                headers: b"h",
+                payload: b"poison",
+            },
+        )
+        .unwrap();
+        // Drive it to the dead-letter (append+fsync happen here), but DO NOT checkpoint the cursor:
+        // dropping the engine now simulates a crash after the durable DLQ append but before the
+        // (lagging) cursor commit reached disk.
+        let _ = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        clock.advance_monotonic_nanos(40);
+        match e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, Offset::ZERO),
+            other => panic!("expected Parked, got {other:?}"),
+        }
+        assert_eq!(e.dlq_records(), 1);
+        drop(e); // crash WITHOUT a cursor checkpoint: the source cursor advance is lost.
+
+        // Restart: the source is uncommitted, so the poison redelivers and re-poisons. The eagerly
+        // reopened per-stream dedup set suppresses the duplicate append.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e2 =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), config(10, 1)).unwrap();
+        assert_eq!(
+            e2.dlq_records(),
+            1,
+            "the durable DLQ record was rebuilt at open, not lost"
+        );
+        // Redeliver (attempt 1 again after the crash), expire, and re-poison.
+        let d = message(
+            e2.poll_in_stream("orders", "g", e2.now_monotonic())
+                .unwrap(),
+        );
+        assert_eq!(d.offset, Offset::ZERO, "the uncommitted poison redelivered");
+        clock2.advance_monotonic_nanos(40);
+        match e2
+            .poll_in_stream("orders", "g", e2.now_monotonic())
+            .unwrap()
+        {
+            Poll::Parked { offset, .. } => assert_eq!(offset, Offset::ZERO),
+            other => panic!("expected Parked on the re-poison, got {other:?}"),
+        }
+        // Committed past now, and STILL exactly one DLQ record: the re-poison was a no-op append.
+        assert_eq!(e2.committed_offset_in_stream("orders", "g"), Offset::new(1));
+        assert_eq!(
+            e2.dlq_records(),
+            1,
+            "the re-poison after the crash did NOT write a second DLQ copy"
+        );
+        drop(e2);
+
+        let stream_fs = probe
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("orders"))
+            .unwrap();
+        let entries = read_dead_letter_entries(&stream_fs, DLQ_SUBDIR).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one durable dead-letter across the crash+re-poison"
+        );
+    }
+
+    #[test]
+    fn named_stream_dead_letters_are_isolated_across_streams() {
+        // Per-(stream, group) isolation: the SAME group name poisoning in two named streams lands in
+        // two INDEPENDENT per-stream sinks, and neither touches the root default DLQ. This is what
+        // "key it by (stream_id, group)" buys — a noisy stream's dead-letters never mingle with a
+        // sibling's forensic record.
+        use ironbus_storage::dlq::{read_dead_letter_entries, DLQ_SUBDIR};
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        for stream in ["a", "b"] {
+            e.produce_in_stream(
+                stream,
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: stream.as_bytes(),
+                },
+            )
+            .unwrap();
+        }
+        // Poison the SAME group name `g` in both streams.
+        for stream in ["a", "b"] {
+            let _ = message(e.poll_in_stream(stream, "g", e.now_monotonic()).unwrap());
+        }
+        clock.advance_monotonic_nanos(40);
+        for stream in ["a", "b"] {
+            match e.poll_in_stream(stream, "g", e.now_monotonic()).unwrap() {
+                Poll::Parked { .. } => {}
+                other => panic!("expected Parked for {stream}, got {other:?}"),
+            }
+        }
+        assert_eq!(e.dlq_records(), 2, "one poison per stream sink");
+        drop(e);
+
+        // Each stream's OWN sink holds exactly its OWN one poison, and the ROOT dlq/ was never created.
+        assert!(
+            !probe.subdir_exists(DLQ_SUBDIR).unwrap(),
+            "the default stream's root dlq/ is untouched"
+        );
+        for stream in ["a", "b"] {
+            let stream_fs = probe
+                .subdir(STREAMS_SUBDIR)
+                .unwrap()
+                .subdir(&stream_subdir_name(stream))
+                .unwrap();
+            let entries = read_dead_letter_entries(&stream_fs, DLQ_SUBDIR).unwrap();
+            assert_eq!(entries.len(), 1, "stream {stream} holds its own one poison");
+            assert_eq!(entries[0].group, "g");
+            assert_eq!(entries[0].payload, stream.as_bytes());
+        }
     }
 
     #[test]
