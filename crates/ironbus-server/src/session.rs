@@ -2160,22 +2160,38 @@ impl Session {
         // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
         // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
         let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
-        // Event-driven long-poll (push delivery), PER-STREAM (#1100 L2): grab THIS consumer's stream
-        // cell ONCE — keyed by `self.stream` (`""` for the default/root stream, else the named stream
-        // this Flow polls) — and snapshot its generation BEFORE the poll batch (per-stream lost-wakeup
-        // safety: a commit to THIS stream racing the snapshot bumps its cell past the snapshot, so the
-        // wait predicate is already false and never parks). Run the delivery drain, and if it drew
-        // NOTHING and long-poll is configured, block up to the budget on THAT cell and re-run the drain
-        // EXACTLY ONCE. A commit to a DIFFERENT stream never wakes this waiter (the thundering-herd fix),
-        // and a named-stream commit now wakes it early instead of eating its full budget. The repoll is
-        // safe from `delivered == 0`: nothing was leased, no frame was emitted, and the
-        // credit/ceiling/AIMD bounds were computed above and stay unconsumed, so a second drain is
-        // byte-for-byte a fresh batch. A `None` seam or a zero budget skips straight to the unchanged
-        // tail. Holding the cell (not re-looking-it-up) guarantees the snapshot and the wait target the
-        // SAME cell.
+        // Event-driven long-poll (push delivery), PER-STREAM (#1100 L2) with a REMAINING-BUDGET RE-WAIT
+        // loop (#1100 L3): grab THIS consumer's stream cell ONCE — keyed by `self.stream` (`""` for the
+        // default/root stream, else the named stream this Flow polls). Each pass snapshots the cell's
+        // generation FRESH BEFORE its drain (per-pass lost-wakeup safety: a commit to THIS stream racing
+        // the snapshot bumps its cell past the snapshot, so the wait predicate is already false and never
+        // parks — and re-snapshotting each pass is also what makes the NEXT wait actually park instead of
+        // returning at once on a stale, already-advanced generation). It runs the delivery drain, and if
+        // that drew NOTHING and long-poll is configured, it blocks on THAT cell for its REMAINING budget
+        // and re-drains — repeating until a drain delivers or the TOTAL `consume_longpoll_ms` budget is
+        // spent. This replaces the old fixed 2-attempt (wait-once / repoll-once) cap: a SPURIOUS wake —
+        // the cell advanced but this consumer's own re-poll drew nothing because a COMPETING-GROUP peer
+        // (or key_shared routing) drained the woken record first — now RE-WAITS its remaining budget
+        // instead of returning empty and bouncing the client to a full round-trip. A commit to a
+        // DIFFERENT stream never wakes this waiter (the thundering-herd fix), and a named-stream commit
+        // wakes it early instead of eating its full budget. Every re-drain is safe from `delivered == 0`:
+        // nothing was leased and the credit/ceiling/AIMD bounds were computed above ONCE and stay
+        // unconsumed, so each drain is byte-for-byte a fresh batch. A `None` seam or a zero budget takes
+        // exactly ONE drain and skips straight to the unchanged tail (default-off is byte-for-byte the
+        // historical single pass, no wait). Holding the cell (not re-looking-it-up) guarantees each pass's
+        // snapshot and its wait target the SAME cell.
+        //
+        // TIME SOURCE: the budget is a REAL-TIME window measured with `std::time::Instant`, mirroring
+        // `StreamCell::wait_for_change`'s own internal `Instant` clock — the wait blocks real time, so the
+        // remaining-budget accounting must read the same real clock. The injected `Clock`/`ManualClock`
+        // does not advance during a real park, so keying the loop off it would never terminate.
         let longpoll_cell = engine.commit_notify().map(|n| n.cell(&self.stream));
-        let longpoll_snapshot = longpoll_cell.as_ref().map(|c| c.seq());
-        for longpoll_attempt in 0..2u8 {
+        let longpoll_budget = std::time::Duration::from_millis(self.consume_longpoll_ms);
+        let longpoll_start = std::time::Instant::now();
+        loop {
+            // FRESH per-pass generation snapshot, taken BEFORE this pass's drain (lost-wakeup safety and
+            // stale-snapshot avoidance, see above).
+            let longpoll_snapshot = longpoll_cell.as_ref().map(|c| c.seq());
             for _ in 0..credits {
                 // The byte budget binds (#275): stop once in-flight bytes have reached the budget, unless
                 // this connection holds nothing in-flight (the floor-of-one). A budget of 0 is unlimited,
@@ -2316,21 +2332,26 @@ impl Session {
                     }
                 }
             }
-            // Long-poll decision (push delivery): the drain drew NOTHING on the FIRST attempt and a budget
-            // + a commit-notify seam are both configured, so block until a commit advances the durable
-            // frontier (or the budget elapses) and repoll EXACTLY ONCE. Any other outcome — a non-empty
-            // drain, the second attempt, a zero budget, or no seam (a non-actor engine) — breaks to the
-            // unchanged tail below, which runs EXACTLY once regardless.
-            if longpoll_attempt == 0 && delivered == 0 && self.consume_longpoll_ms > 0 {
+            // Long-poll re-wait decision (push delivery, #1100 L3): the drain drew NOTHING and a budget +
+            // a commit-notify seam are both configured, so block on THIS stream's cell for the REMAINING
+            // budget (recomputed from the loop's start each pass, so the TOTAL wait can never exceed
+            // `consume_longpoll_ms` no matter how many spurious wakes intervene) until a commit advances
+            // the frontier or that remaining budget elapses, then re-drain. A delivered drain, a zero
+            // budget, no seam (a non-actor engine), or an exhausted budget (`remaining == 0`) all break to
+            // the unchanged tail below, which runs EXACTLY once after the loop resolves.
+            if delivered == 0 && self.consume_longpoll_ms > 0 {
                 if let (Some(cell), Some(snapshot)) = (&longpoll_cell, longpoll_snapshot) {
-                    cell.wait_for_change(
-                        snapshot,
-                        std::time::Duration::from_millis(self.consume_longpoll_ms),
-                        // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
-                        // path's spin discriminant, so a real-fsync broker never burns a core here.
-                        engine.consume_wait_spin(),
-                    );
-                    continue;
+                    let remaining = longpoll_budget.saturating_sub(longpoll_start.elapsed());
+                    if !remaining.is_zero() {
+                        cell.wait_for_change(
+                            snapshot,
+                            remaining,
+                            // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
+                            // path's spin discriminant, so a real-fsync broker never burns a core here.
+                            engine.consume_wait_spin(),
+                        );
+                        continue;
+                    }
                 }
             }
             break;
@@ -2455,17 +2476,26 @@ impl Session {
         // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
         // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
         let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
-        // Event-driven long-poll (push delivery), PER-STREAM (#1100 L2): the batch twin of the
-        // `handle_flow` wrap. This batch-fetch path polls the DEFAULT/root stream (`poll_now_in_member`),
-        // so it grabs the default stream's cell (`""`) — the cell it snapshots and waits on must match
-        // the stream it polls, so a default commit wakes it and a named-stream commit does not disturb
-        // it. Snapshot the cell's generation BEFORE the drain, and if the drain drew NOTHING re-run it
-        // EXACTLY ONCE after waking on a commit (or the budget elapsing). A `no_wait` fetch (#489) is
-        // EXEMPT: it is contractually a single immediate pass, so the wait is skipped and it returns as
-        // today.
+        // Event-driven long-poll (push delivery), PER-STREAM (#1100 L2) with the REMAINING-BUDGET RE-WAIT
+        // loop (#1100 L3): the batch twin of the `handle_flow` wrap. This batch-fetch path polls the
+        // DEFAULT/root stream (`poll_now_in_member`), so it grabs the default stream's cell (`""`) — the
+        // cell it snapshots and waits on must match the stream it polls, so a default commit wakes it and
+        // a named-stream commit does not disturb it. Each pass snapshots the cell's generation FRESH
+        // BEFORE its drain, and if the drain drew NOTHING it blocks for the REMAINING budget and
+        // re-drains, repeating until a drain delivers or the TOTAL `consume_longpoll_ms` budget is spent
+        // (replacing the old fixed 2-attempt cap, so a spurious wake whose record a competing peer drained
+        // first re-waits its remaining budget instead of returning empty). A `no_wait` fetch (#489) is
+        // EXEMPT: it is contractually a single immediate pass, so the wait is skipped entirely and it
+        // returns as today. The budget is a real-time `Instant` window (matching
+        // `StreamCell::wait_for_change`), and each drain is a byte-for-byte fresh batch (nothing leased,
+        // the credit/AIMD bounds computed once above and unconsumed). See `handle_flow` for the full
+        // per-pass lost-wakeup / time-source rationale.
         let longpoll_cell = engine.commit_notify().map(|n| n.cell(""));
-        let longpoll_snapshot = longpoll_cell.as_ref().map(|c| c.seq());
-        for longpoll_attempt in 0..2u8 {
+        let longpoll_budget = std::time::Duration::from_millis(self.consume_longpoll_ms);
+        let longpoll_start = std::time::Instant::now();
+        loop {
+            // FRESH per-pass generation snapshot, taken BEFORE this pass's drain.
+            let longpoll_snapshot = longpoll_cell.as_ref().map(|c| c.seq());
             for _ in 0..credits {
                 // The deadline binds (#489): once the monotonic clock has reached it, end the batch with
                 // whatever was gathered. Skipped for a no-wait / no-deadline fetch (`deadline` is `None`).
@@ -2579,24 +2609,25 @@ impl Session {
                     }
                 }
             }
-            // Long-poll decision (push delivery), the `handle_flow` twin plus the `no_wait` exemption: an
-            // empty FIRST drain on a waiting fetch with a configured budget + seam blocks until a commit
-            // advances the frontier (or the budget elapses) and repolls ONCE; any other outcome (delivered,
-            // second attempt, zero budget, no seam, or `no_wait`) falls through to the unchanged tail.
-            if longpoll_attempt == 0
-                && delivered == 0
-                && self.consume_longpoll_ms > 0
-                && !req.no_wait
-            {
+            // Long-poll re-wait decision (push delivery, #1100 L3), the `handle_flow` twin plus the
+            // `no_wait` exemption: an empty drain on a waiting fetch with a configured budget + seam blocks
+            // on the default cell for the REMAINING budget (recomputed from the loop start each pass, so
+            // the TOTAL wait never exceeds `consume_longpoll_ms`) and re-drains; a delivered drain, a zero
+            // budget, no seam, an exhausted budget, or a `no_wait` fetch all fall through to the unchanged
+            // tail, which runs EXACTLY once after the loop resolves.
+            if delivered == 0 && self.consume_longpoll_ms > 0 && !req.no_wait {
                 if let (Some(cell), Some(snapshot)) = (&longpoll_cell, longpoll_snapshot) {
-                    cell.wait_for_change(
-                        snapshot,
-                        std::time::Duration::from_millis(self.consume_longpoll_ms),
-                        // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
-                        // path's spin discriminant, so a real-fsync broker never burns a core here.
-                        engine.consume_wait_spin(),
-                    );
-                    continue;
+                    let remaining = longpoll_budget.saturating_sub(longpoll_start.elapsed());
+                    if !remaining.is_zero() {
+                        cell.wait_for_change(
+                            snapshot,
+                            remaining,
+                            // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
+                            // path's spin discriminant, so a real-fsync broker never burns a core here.
+                            engine.consume_wait_spin(),
+                        );
+                        continue;
+                    }
                 }
             }
             break;
@@ -13192,6 +13223,119 @@ mod tests {
              budget, took {elapsed:?}"
         );
         drop(s);
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    // ---- Remaining-budget re-wait loop (#1100 L3) -----------------------------------------------
+
+    #[test]
+    fn longpoll_total_wait_is_bounded_by_the_budget_across_the_rewait_loop() {
+        // #1100 L3 remaining-budget recompute: with NO producer the re-wait loop must return FlowEnd(0)
+        // after ~ONE budget, never accumulating multiple full-budget waits. Each pass recomputes the
+        // REMAINING budget from a single start instant, so once the first (timed-out) wait has spent the
+        // whole budget the next pass sees `remaining == 0` and breaks. A naive loop that re-passed the
+        // FULL budget every pass would instead wait ~2x (or spin forever), which the upper bound catches.
+        let budget_ms = 500u64;
+        let (handle, actor) = longpoll_rig(budget_ms);
+        let mut s = longpoll_consumer(&handle);
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        s.process(
+            &handle,
+            &frame(FrameType::Flow, &10u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(
+            flow_end_count(&out),
+            0,
+            "no producer: the batch ends empty after the budget"
+        );
+        // LOWER bound: it actually waited ~the budget (half is a wide, timer-granularity-safe floor).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "the consumer must wait ~the budget, took {elapsed:?}"
+        );
+        // UPPER bound: the TOTAL wait is capped at ~ONE budget (plus generous scheduler slack). A broken
+        // recompute that re-passed the full budget each pass would land at ~2x (~1000 ms) or hang; this
+        // 800 ms ceiling clears the correct ~500 ms wait with 300 ms of slack and still fails a 2x bug.
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "the TOTAL wait must stay within ~one budget (remaining-budget recompute), took {elapsed:?}"
+        );
+        drop(s);
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn longpoll_re_waits_after_a_competing_peer_drains_the_woken_record() {
+        // #1100 L3 headline case: TWO consumers share the default COMPETING group and both long-poll it
+        // empty. A first produce wakes BOTH; exactly one (competing) wins the record, so the OTHER's own
+        // re-poll draws NOTHING — a spurious wake. Under the old fixed 2-attempt cap that loser returned
+        // FlowEnd(0) at the first wake; the remaining-budget re-wait loop instead RE-WAITS its remaining
+        // budget and delivers a SECOND record that lands later within the same budget. Net: BOTH consumers
+        // deliver exactly one record, both well within the budget (neither times out empty). The assertion
+        // is symmetric, so it does not depend on WHICH consumer wins the first record (an inherent
+        // competing-group race). R2 is produced only well AFTER the R1 winner has returned, so the winner's
+        // single batch cannot sweep both records and strand the loser at the timeout.
+        let budget_ms = 4_000u64;
+        let (handle, actor) = longpoll_rig(budget_ms);
+        let mut a = longpoll_consumer(&handle);
+        let mut b = longpoll_consumer(&handle);
+        // Both consumers long-poll the empty default (competing) group, each on its own thread, returning
+        // its delivered count + how long its Flow took.
+        let ha = handle.clone();
+        let hb = handle.clone();
+        let ta = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let start = std::time::Instant::now();
+            a.process(&ha, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+                .unwrap();
+            (flow_end_count(&out), start.elapsed())
+        });
+        let tb = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let start = std::time::Instant::now();
+            b.process(&hb, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+                .unwrap();
+            (flow_end_count(&out), start.elapsed())
+        });
+        // Let both reach their park, then commit R1 (wakes both; one wins it, the other re-polls empty and
+        // re-waits). Well after the R1 winner has returned, commit R2 for the re-waiting loser.
+        let producer = handle.clone();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        producer
+            .produce(longpoll_append(b"first"))
+            .expect("a clean produce of R1");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        producer
+            .produce(longpoll_append(b"second"))
+            .expect("a clean produce of R2");
+        let (count_a, elapsed_a) = ta.join().unwrap();
+        let (count_b, elapsed_b) = tb.join().unwrap();
+        // Both delivered exactly one record: the R1 winner promptly, the loser after re-waiting for R2.
+        // Under the old cap the loser would be FlowEnd(0) (it returned empty at the spurious wake).
+        assert_eq!(
+            count_a, 1,
+            "consumer A must deliver exactly one record (took {elapsed_a:?})"
+        );
+        assert_eq!(
+            count_b, 1,
+            "consumer B must deliver exactly one record (took {elapsed_b:?})"
+        );
+        // Both returned FAR below the 4 s budget — proving the loser RE-WAITED and delivered R2 rather
+        // than timing out empty at ~budget.
+        assert!(
+            elapsed_a < std::time::Duration::from_secs(2)
+                && elapsed_b < std::time::Duration::from_secs(2),
+            "both consumers must deliver well within the budget (a: {elapsed_a:?}, b: {elapsed_b:?})"
+        );
+        // Drop EVERY handle clone (the thread-owned `ha`/`hb` already dropped on join) so the actor's
+        // last sender closes and it can shut down; otherwise `actor.join()` would block forever.
+        drop(producer);
         drop(handle);
         actor.join().unwrap();
     }
