@@ -5203,6 +5203,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .map_or(Offset::ZERO, Log::flushed_offset)
     }
 
+    /// Visit the durable poll frontier (`flushed_offset`) of the DEFAULT stream AND every open NAMED
+    /// stream (#1100 L2): calls `f("", head)` first — the ROOT log's authoritative head, exactly what
+    /// [`Engine::flushed_offset`] reports and what a default-stream consumer polls, since the
+    /// [`StreamSet`]'s own `""` slot is an inert never-written re-open — then `f(name, head)` for each
+    /// named stream in deterministic order. A pure read used by the append actor's PER-STREAM
+    /// commit-notify to bump only the cells whose frontier advanced. O(open streams); a default-only
+    /// deployment visits exactly one entry, so the common path stays a single atomic head read.
+    pub fn for_each_poll_frontier<G: FnMut(&str, u64)>(&self, mut f: G) {
+        f("", self.log.flushed_offset().get());
+        self.streams.for_each_named_frontier(f);
+    }
+
     /// The number of OPEN named streams (#676), EXCLUDING the always-present default stream: `0` for
     /// a deployment that never named a stream. (The [`StreamSet`] always carries its `""` slot, so we
     /// subtract it to report the named count an operator cares about.)

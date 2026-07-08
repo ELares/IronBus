@@ -663,6 +663,21 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
         self.streams.keys().cloned().collect()
     }
 
+    /// Visit each NAMED stream's durable head (`flushed_offset`), calling `f(name, head)` in
+    /// deterministic (name) order and SKIPPING the inert default `""` slot (whose authoritative head
+    /// lives on the engine's root [`Log`], not this set's default entry). Allocation-free — no
+    /// intermediate `Vec` — so the append actor's per-stream commit-notify frontier scan (push
+    /// delivery, #1100 L2) costs one atomic head read per open named stream and nothing when none
+    /// exist.
+    pub fn for_each_named_frontier<G: FnMut(&str, u64)>(&self, mut f: G) {
+        for (id, log) in &self.streams {
+            if id.is_default() {
+                continue;
+            }
+            f(id.name(), log.flushed_offset().get());
+        }
+    }
+
     /// The number of open streams, including the always-present default stream (so this is `>= 1`).
     #[must_use]
     pub fn len(&self) -> usize {

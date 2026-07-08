@@ -2160,16 +2160,21 @@ impl Session {
         // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
         // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
         let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
-        // Event-driven long-poll (push delivery): snapshot the commit-notify generation BEFORE the poll
-        // batch (lost-wakeup safety — a commit racing the snapshot leaves the wait predicate already
-        // false), run the delivery drain, and if it drew NOTHING and long-poll is configured, block up
-        // to the budget on the seam and re-run the drain EXACTLY ONCE. The repoll is safe from
-        // `delivered == 0`: nothing was leased, no frame was emitted, and the credit/ceiling/AIMD bounds
-        // were computed above and stay unconsumed, so a second drain is byte-for-byte a fresh batch. A
-        // `None` seam or a zero budget skips straight to the unchanged tail. Granularity is GLOBAL: a
-        // spurious cross-stream wake just re-polls empty, exactly today's timer-driven re-poll.
-        let longpoll_notify = engine.commit_notify();
-        let longpoll_snapshot = longpoll_notify.map(|n| n.seq());
+        // Event-driven long-poll (push delivery), PER-STREAM (#1100 L2): grab THIS consumer's stream
+        // cell ONCE — keyed by `self.stream` (`""` for the default/root stream, else the named stream
+        // this Flow polls) — and snapshot its generation BEFORE the poll batch (per-stream lost-wakeup
+        // safety: a commit to THIS stream racing the snapshot bumps its cell past the snapshot, so the
+        // wait predicate is already false and never parks). Run the delivery drain, and if it drew
+        // NOTHING and long-poll is configured, block up to the budget on THAT cell and re-run the drain
+        // EXACTLY ONCE. A commit to a DIFFERENT stream never wakes this waiter (the thundering-herd fix),
+        // and a named-stream commit now wakes it early instead of eating its full budget. The repoll is
+        // safe from `delivered == 0`: nothing was leased, no frame was emitted, and the
+        // credit/ceiling/AIMD bounds were computed above and stay unconsumed, so a second drain is
+        // byte-for-byte a fresh batch. A `None` seam or a zero budget skips straight to the unchanged
+        // tail. Holding the cell (not re-looking-it-up) guarantees the snapshot and the wait target the
+        // SAME cell.
+        let longpoll_cell = engine.commit_notify().map(|n| n.cell(&self.stream));
+        let longpoll_snapshot = longpoll_cell.as_ref().map(|c| c.seq());
         for longpoll_attempt in 0..2u8 {
             for _ in 0..credits {
                 // The byte budget binds (#275): stop once in-flight bytes have reached the budget, unless
@@ -2317,8 +2322,8 @@ impl Session {
             // drain, the second attempt, a zero budget, or no seam (a non-actor engine) — breaks to the
             // unchanged tail below, which runs EXACTLY once regardless.
             if longpoll_attempt == 0 && delivered == 0 && self.consume_longpoll_ms > 0 {
-                if let (Some(notify), Some(snapshot)) = (longpoll_notify, longpoll_snapshot) {
-                    notify.wait_for_change(
+                if let (Some(cell), Some(snapshot)) = (&longpoll_cell, longpoll_snapshot) {
+                    cell.wait_for_change(
                         snapshot,
                         std::time::Duration::from_millis(self.consume_longpoll_ms),
                         // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
@@ -2450,12 +2455,16 @@ impl Session {
         // One reusable scratch buffer for this batch's per-record frame bodies (#826): cleared and
         // reused each iteration instead of allocating a fresh `Vec` per delivered record/advisory.
         let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
-        // Event-driven long-poll (push delivery): the batch twin of the `handle_flow` wrap — snapshot
-        // the commit-notify generation BEFORE the drain, and if the drain drew NOTHING re-run it EXACTLY
-        // ONCE after waking on a commit (or the budget elapsing). A `no_wait` fetch (#489) is EXEMPT: it
-        // is contractually a single immediate pass, so the wait is skipped and it returns as today.
-        let longpoll_notify = engine.commit_notify();
-        let longpoll_snapshot = longpoll_notify.map(|n| n.seq());
+        // Event-driven long-poll (push delivery), PER-STREAM (#1100 L2): the batch twin of the
+        // `handle_flow` wrap. This batch-fetch path polls the DEFAULT/root stream (`poll_now_in_member`),
+        // so it grabs the default stream's cell (`""`) — the cell it snapshots and waits on must match
+        // the stream it polls, so a default commit wakes it and a named-stream commit does not disturb
+        // it. Snapshot the cell's generation BEFORE the drain, and if the drain drew NOTHING re-run it
+        // EXACTLY ONCE after waking on a commit (or the budget elapsing). A `no_wait` fetch (#489) is
+        // EXEMPT: it is contractually a single immediate pass, so the wait is skipped and it returns as
+        // today.
+        let longpoll_cell = engine.commit_notify().map(|n| n.cell(""));
+        let longpoll_snapshot = longpoll_cell.as_ref().map(|c| c.seq());
         for longpoll_attempt in 0..2u8 {
             for _ in 0..credits {
                 // The deadline binds (#489): once the monotonic clock has reached it, end the batch with
@@ -2579,8 +2588,8 @@ impl Session {
                 && self.consume_longpoll_ms > 0
                 && !req.no_wait
             {
-                if let (Some(notify), Some(snapshot)) = (longpoll_notify, longpoll_snapshot) {
-                    notify.wait_for_change(
+                if let (Some(cell), Some(snapshot)) = (&longpoll_cell, longpoll_snapshot) {
+                    cell.wait_for_change(
                         snapshot,
                         std::time::Duration::from_millis(self.consume_longpoll_ms),
                         // Spin-before-park (#1100) on the no-pre-ack-fsync tiers only — the produce
@@ -13013,6 +13022,174 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_millis(200),
             "the consumer must wait out ~the budget, took {elapsed:?}"
+        );
+        drop(s);
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    // ---- Per-stream commit-notify (#1100 L2): fan-out + named-stream early wake -----------------
+
+    /// A streams-capable consumer: connects advertising `understands_streams` so it may `SubTo` a
+    /// named stream, its long-poll budget seeded from the engine-config snapshot as the serve path does.
+    fn longpoll_streams_consumer(
+        handle: &crate::actor::EngineHandle<InMemoryFs, ManualClock>,
+    ) -> Session {
+        let mut s = Session::new().with_consume_longpoll_ms(handle.consume_longpoll_ms());
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
+                understands_deliver_batch: false,
+                understands_streams: true,
+                understands_compressed_delivery: false,
+            },
+            &mut body,
+        );
+        let mut out = Vec::new();
+        s.process(handle, &frame(FrameType::Connect, &body), &mut out)
+            .unwrap();
+        s
+    }
+
+    /// A `SubTo(stream, group)` wire frame.
+    fn sub_to_frame(stream: &[u8], group: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_sub_to(
+            &ironbus_proto::message::SubToBody {
+                stream_id: stream,
+                group,
+            },
+            &mut body,
+        )
+        .unwrap();
+        frame(FrameType::SubTo, &body)
+    }
+
+    /// A Level-1 owned produce to a NAMED stream through the actor's `with` job, mirroring
+    /// `longpoll_append` but routed to the named stream's own log. Returns once the produce commits.
+    fn produce_to_named_stream(
+        handle: &crate::actor::EngineHandle<InMemoryFs, ManualClock>,
+        stream: &'static str,
+        payload: &'static [u8],
+    ) {
+        handle
+            .with(move |e| {
+                e.produce_in_stream(
+                    stream,
+                    &ironbus_storage::log::Append {
+                        timestamp_ms: 0,
+                        flags: ironbus_core::types::RecordFlags::EMPTY,
+                        key: b"",
+                        headers: b"",
+                        payload,
+                    },
+                )
+            })
+            .expect("actor alive")
+            .expect("a clean named-stream produce");
+    }
+
+    #[test]
+    fn longpoll_named_stream_wakes_early_on_its_own_commit() {
+        // #1100 L2: a consumer long-polling a NAMED stream wakes on a commit to THAT stream, far below
+        // its budget — where L1 (which bumped only on the root log's frontier) stranded it to the full
+        // timeout. Proves the actor now observes per-stream frontiers and bumps the named stream's cell.
+        let budget_ms = 2_000u64;
+        let (handle, actor) = longpoll_rig(budget_ms);
+        // Declare the named stream (empty) so the consumer can bind + poll it before any record exists.
+        handle
+            .with(|e| e.declare_stream("orders"))
+            .expect("actor alive")
+            .expect("declare");
+        let mut s = longpoll_streams_consumer(&handle);
+        let mut out = Vec::new();
+        // Bind the consumer to the named stream's work-group; SubTo replies Ok.
+        s.process(&handle, &sub_to_frame(b"orders", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "SubTo is accepted");
+        out.clear();
+        // A producer publishes to "orders" shortly after the consumer begins long-polling it empty.
+        let producer = handle.clone();
+        let jh = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            produce_to_named_stream(&producer, "orders", b"hello");
+        });
+        let start = std::time::Instant::now();
+        s.process(
+            &handle,
+            &frame(FrameType::Flow, &10u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        jh.join().unwrap();
+        assert_eq!(
+            flow_end_count(&out),
+            1,
+            "the named-stream record is delivered on the per-stream commit-notify wakeup"
+        );
+        // Well below the 2 s budget: a broken per-stream bump would only free it at the ~2 s timeout.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "the named-stream delivery must arrive well before the budget, took {elapsed:?}"
+        );
+        drop(s);
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn longpoll_named_stream_waiter_is_not_woken_by_a_default_stream_commit() {
+        // #1100 L2 THUNDERING-HERD FIX, end-to-end: a consumer long-polling the named stream "orders"
+        // is NOT woken by a produce to the DEFAULT stream — that commit bumps only the default cell, so
+        // the "orders" waiter sleeps on its own cell and times out empty. Under L1's single global
+        // counter this default produce would have woken every idle consumer (the herd L2 kills).
+        let budget_ms = 400u64;
+        let (handle, actor) = longpoll_rig(budget_ms);
+        handle
+            .with(|e| e.declare_stream("orders"))
+            .expect("actor alive")
+            .expect("declare");
+        let mut s = longpoll_streams_consumer(&handle);
+        let mut out = Vec::new();
+        s.process(&handle, &sub_to_frame(b"orders", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "SubTo is accepted");
+        out.clear();
+        // A producer commits to the DEFAULT stream while the "orders" consumer long-polls.
+        let producer = handle.clone();
+        let jh = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            producer
+                .produce(longpoll_append(b"on-default"))
+                .expect("a clean default-stream produce");
+        });
+        let start = std::time::Instant::now();
+        s.process(
+            &handle,
+            &frame(FrameType::Flow, &10u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        jh.join().unwrap();
+        assert_eq!(
+            flow_end_count(&out),
+            0,
+            "a default-stream commit must NOT deliver to a named-stream long-poller"
+        );
+        // It must have waited out ~the budget rather than being spuriously woken by the default commit.
+        // The 200 ms floor (half the 400 ms budget) is a wide, timer-granularity-safe margin.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "a named-stream waiter must NOT wake on a default-stream commit; it must wait out its \
+             budget, took {elapsed:?}"
         );
         drop(s);
         drop(handle);

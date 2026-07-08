@@ -49,7 +49,7 @@
 //! - No lost replies / no deadlock: every command gets exactly one reply; a closed channel is a typed
 //!   [`ActorGone`], never a panic, so neither side hangs forever if the other dies.
 
-use crate::commit_notify::CommitNotify;
+use crate::commit_notify::{CommitNotify, StreamCell};
 use crate::engine::{AsyncCommit, DiskFullPolicy, Engine, EngineError};
 use crate::flusher::{spawn_flusher, FlushJob, SyncDone};
 use crate::liveness::ActorWatchdog;
@@ -59,6 +59,7 @@ use ironbus_core::clock::Clock;
 use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
@@ -1900,34 +1901,96 @@ struct PipelineRig<File> {
     max_dirty_bytes: u64,
 }
 
-/// Signals the commit-notify wakeup seam (push delivery) IFF the DURABLE poll frontier advanced since
-/// `last_notified`. Pure observation on the actor thread: it reads [`Engine::flushed_offset`] — the
-/// exact head [`Engine::poll_now_in_member`] serves up to, which under the sync tier advances only at
-/// barrier completion — and, only when it grew, records the new head and [`CommitNotify::bump`]s every
-/// idle long-polling consumer awake to re-poll. Called STRICTLY AFTER the durability work that may have
-/// advanced the frontier, so it never reorders any commit/append/release. OVER-bumping is harmless (a
-/// woken waiter that still finds nothing re-waits or times out); UNDER-bumping only costs a consumer a
-/// little latency (it falls back to its long-poll timeout). Cheap on the steady-state path: one offset
-/// read + compare, and the `bump` (a short lock + `notify_all`) runs only on a real advance.
-///
-/// SCOPE (v1): this observes ONLY the DEFAULT/root log's `flushed_offset`. A commit to a NAMED stream
-/// (#588 — its OWN per-stream log, served by `poll_in_stream`) does NOT advance this frontier, so a
-/// consumer long-polling a named stream gets NO early wakeup; it is TIMEOUT-BACKSTOPPED (still correct —
-/// it re-polls and delivers when its budget elapses, exactly the pre-push-delivery behavior for that
-/// consumer). Observing per-stream frontiers (a bump keyed by the stream that committed) is the
-/// documented per-stream-granularity refinement, deferred with the global-granularity note.
-fn notify_frontier_advance<F, C>(
-    engine: &Engine<F, C>,
-    commit_notify: &CommitNotify,
-    last_notified: &mut u64,
-) where
-    F: Filesystem,
-    C: Clock + Clone,
-{
-    let head = engine.flushed_offset().get();
-    if head > *last_notified {
-        *last_notified = head;
-        commit_notify.bump();
+/// One tracked stream in the actor's [`FrontierTracker`]: the last durable head it has already
+/// signalled for this stream, plus a CACHED handle to that stream's [`StreamCell`] so a per-batch
+/// advance bumps it WITHOUT re-locking the commit-notify registry each commit.
+struct TrackedStream {
+    /// The last durable poll frontier already signalled to this stream's long-polling consumers. Only
+    /// a head STRICTLY GREATER than this bumps (and then advances this), so a re-observation of an
+    /// unchanged head is a no-op.
+    last_notified: u64,
+    /// This stream's wakeup cell (get-or-created from the registry once, then cached here). Bumped
+    /// directly on advance — no registry lock on the steady path.
+    cell: Arc<StreamCell>,
+}
+
+/// The append actor's PER-STREAM commit-notify frontier tracker (push delivery, #1100 L2). For each
+/// stream it has observed — the default `""` and every named stream (#588) — it holds the last durable
+/// head it signalled and a cached [`StreamCell`] handle, so a per-batch advance scan bumps ONLY the
+/// streams whose frontier actually grew (the default log AND any named-stream log that advanced),
+/// waking only those streams' waiters. Built ONCE per actor when long-poll is enabled and NEVER touched
+/// on a default-off broker, so the produce hot path is byte-for-byte unchanged when push delivery is
+/// off. Replaces L1's single `last_notified: u64` (which only ever observed the root log).
+struct FrontierTracker {
+    /// stream name -> its last-signalled head + cached wakeup cell.
+    per_stream: HashMap<Arc<str>, TrackedStream>,
+}
+
+impl FrontierTracker {
+    /// Seed the tracker with EVERY currently-open stream's RECOVERED head, WITHOUT bumping — so a
+    /// broker that recovered a non-empty log does not spuriously wake (there are no waiters at spawn
+    /// anyway); only advances AFTER spawn signal. Called once at actor entry when long-poll is enabled.
+    fn seed<F, C>(engine: &Engine<F, C>, commit_notify: &CommitNotify) -> FrontierTracker
+    where
+        F: Filesystem,
+        C: Clock + Clone,
+    {
+        let mut per_stream: HashMap<Arc<str>, TrackedStream> = HashMap::new();
+        engine.for_each_poll_frontier(|name, head| {
+            let cell = commit_notify.cell(name);
+            per_stream.insert(
+                Arc::from(name),
+                TrackedStream {
+                    last_notified: head,
+                    cell,
+                },
+            );
+        });
+        FrontierTracker { per_stream }
+    }
+
+    /// Signal every stream whose DURABLE poll frontier advanced since it was last signalled: scan the
+    /// default log AND every named-stream log, and for each one whose head grew, record the new head
+    /// and [`StreamCell::bump`] THAT stream's cell (waking only its waiters). Called STRICTLY AFTER the
+    /// durability work that may have advanced any frontier, so it never reorders a commit/append/
+    /// release. OVER-bumping a stream is harmless (a woken waiter that still finds nothing re-waits or
+    /// times out); UNDER-bumping only costs that stream's waiters a little latency (they fall back to
+    /// their long-poll timeout). Cheap on the steady state: one head read + compare per open stream,
+    /// and a `bump` (a short per-cell lock + `notify_all`) only on a real advance.
+    ///
+    /// A stream FIRST observed here (declared + produced during the run, so it was absent from the
+    /// spawn-time seed) is registered on the spot with `last_notified = 0`; because its first records
+    /// jump the head to `> 0`, it BUMPS immediately, so a consumer already parked on the freshly
+    /// declared stream wakes on its first commit rather than eating its full budget (over-bump is
+    /// harmless if there is no waiter yet).
+    fn notify_advances<F, C>(&mut self, engine: &Engine<F, C>, commit_notify: &CommitNotify)
+    where
+        F: Filesystem,
+        C: Clock + Clone,
+    {
+        let per_stream = &mut self.per_stream;
+        engine.for_each_poll_frontier(|name, head| {
+            if let Some(tracked) = per_stream.get_mut(name) {
+                if head > tracked.last_notified {
+                    tracked.last_notified = head;
+                    tracked.cell.bump();
+                }
+            } else {
+                let cell = commit_notify.cell(name);
+                // First observation post-seed: seed at 0 so a stream that committed its first records
+                // this very batch (head > 0) still wakes any already-parked waiter. Over-bump is safe.
+                if head > 0 {
+                    cell.bump();
+                }
+                per_stream.insert(
+                    Arc::from(name),
+                    TrackedStream {
+                        last_notified: head,
+                        cell,
+                    },
+                );
+            }
+        });
     }
 }
 
@@ -1983,13 +2046,11 @@ where
     // (no `flushed_offset` read, no lock, no `notify_all` per commit). Only a long-poll-enabled broker
     // seeds the last-signalled frontier and bumps on advance.
     let longpoll_enabled = consume_longpoll_ms != 0;
-    // The last durable poll frontier this actor has already signalled to long-polling consumers: seeded
-    // to the recovered head so only real ADVANCES bump the seam. Unused (and unread) when off.
-    let mut last_notified = if longpoll_enabled {
-        engine.flushed_offset().get()
-    } else {
-        0
-    };
+    // The PER-STREAM commit-notify frontier tracker (#1100 L2): seeded to every open stream's recovered
+    // head so only real ADVANCES bump, and it bumps ONLY the cells whose stream advanced (the default
+    // log AND any named-stream log). `None` (and never built) when long-poll is off, so the group-commit
+    // hot path never touches it. Replaces L1's single root-log `last_notified`.
+    let mut frontiers = longpoll_enabled.then(|| FrontierTracker::seed(&engine, commit_notify));
     // The per-pass command batch, hoisted and reused across drains exactly like `pending` above (#828):
     // each pass `clear()`s it and `drain(..)`s it empty, so its backing capacity is retained instead of
     // freed and regrown-from-zero every batch. This actor is the single serialization point for all
@@ -2097,9 +2158,10 @@ where
         // Push delivery (OPT-IN): only when long-poll is enabled does the covering commit's frontier
         // advance wake an idle long-polling consumer. When off this branch is skipped entirely, so the
         // group-commit boundary stays byte-for-byte the historical path. STRICTLY AFTER the flush (pure
-        // observation; a bump reads the now-current `flushed_offset`), never reordered with it.
-        if longpoll_enabled {
-            notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+        // observation; a bump reads the now-current per-stream `flushed_offset`s), never reordered with
+        // it. Bumps ONLY the streams that advanced this batch (#1100 L2), not every idle consumer.
+        if let Some(frontiers) = frontiers.as_mut() {
+            frontiers.notify_advances(&engine, commit_notify);
         }
         // The batch just changed the durable byte total (an append grows it; a post-commit retention
         // reap can shrink it), so refresh the connection-thread fast-reject gate with the now-current
@@ -2167,14 +2229,11 @@ where
     // so the pipelined group-commit path is byte-for-byte the historical one (no `flushed_offset` probe,
     // no lock, no `notify_all`). Only a long-poll-enabled broker seeds the frontier and bumps on advance.
     let longpoll_enabled = consume_longpoll_ms != 0;
-    // The last durable poll frontier already signalled to long-polling consumers: in this (sync) tier
+    // The PER-STREAM commit-notify frontier tracker (#1100 L2): in this (sync) tier a stream's
     // `flushed_offset` advances only at barrier completion, so a bump means a record just became
-    // poll-visible. Seeded to the recovered head so only real advances signal; unused when off.
-    let mut last_notified = if longpoll_enabled {
-        engine.flushed_offset().get()
-    } else {
-        0
-    };
+    // poll-visible on THAT stream. Seeded to every open stream's recovered head so only real advances
+    // signal; `None` (never built) when off. Replaces L1's single root-log `last_notified`.
+    let mut frontiers = longpoll_enabled.then(|| FrontierTracker::seed(&engine, commit_notify));
     let mut pipeline = Pipeline {
         parked: VecDeque::new(),
         in_flight: None,
@@ -2211,9 +2270,9 @@ where
                     // frontier advances while the command channel is idle, so wake any long-polling
                     // consumer to re-poll the moment the barrier completes. Skipped entirely when off, so
                     // the idle-wait path is unchanged. STRICTLY AFTER the completion is folded in — pure
-                    // observation of the now-current `flushed_offset`.
-                    if longpoll_enabled {
-                        notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+                    // observation of the now-current per-stream `flushed_offset`s (#1100 L2).
+                    if let Some(frontiers) = frontiers.as_mut() {
+                        frontiers.notify_advances(&engine, commit_notify);
                     }
                     continue;
                 }
@@ -2320,9 +2379,10 @@ where
         // `finish_pass` would miss it and strand the consumer until its timeout. An ASYNC barrier instead
         // leaves the frontier unchanged now (this is a no-op) and is caught by the `wait_one_completion`
         // bump when it completes. Skipped entirely when off, so the pass-end path is unchanged. Pure
-        // observation of the now-current `flushed_offset`; never reorders the durability work above.
-        if longpoll_enabled {
-            notify_frontier_advance(&engine, commit_notify, &mut last_notified);
+        // observation of the now-current per-stream `flushed_offset`s; never reorders the durability
+        // work above. Bumps ONLY the streams that advanced this pass (#1100 L2).
+        if let Some(frontiers) = frontiers.as_mut() {
+            frontiers.notify_advances(&engine, commit_notify);
         }
         refresh_cap_gate(cap_gate, &mut engine);
         engine.codel_queue_empty();
