@@ -2267,8 +2267,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 tail_reason = Some(ReasonCode::TornTail);
                 break;
             }
-            // Ensure the window holds this frame's header, then learn the frame length. `need` is
-            // widened to a full window (bounded by the region) so one read serves many frames.
+            // Ensure the window holds this frame's header, then learn the frame length.
             self.fill_window(
                 &mut win,
                 &mut win_start,
@@ -2278,6 +2277,28 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             )?;
             let mut rel =
                 usize::try_from(pos - win_start).map_err(|_| StorageError::SegmentFull)?;
+            // A HAS_SUBJECT record (#594) carries a subject-length prefix immediately after the
+            // header, and the header-only length walk needs those extra bytes to size the frame.
+            // `fill_window(need=36)` may leave EXACTLY 36-37 bytes buffered at a window edge (it
+            // returns early once `have >= need`), so ensure 38 bytes are windowed before
+            // `decoded_len` when the flag is set and the region is long enough — mirroring
+            // `walk_sparse_positions`. A shorter region is a torn tail, which `decoded_len` then
+            // reports as `Truncated` below (ended as a corrupt/torn header), exactly like any
+            // incomplete frame. The flags byte is untrusted here, but `decoded_len`'s header-CRC
+            // check is the real gate; peeking it only decides how many bytes to buffer.
+            if RecordFlags::from_bits(win[rel + ironbus_core::format::header_offsets::FLAGS])
+                .contains(RecordFlags::HAS_SUBJECT)
+                && remaining >= (RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX) as u64
+            {
+                self.fill_window(
+                    &mut win,
+                    &mut win_start,
+                    pos,
+                    (RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX) as u64,
+                    remaining,
+                )?;
+                rel = usize::try_from(pos - win_start).map_err(|_| StorageError::SegmentFull)?;
+            }
             let Ok(total) = codec::decoded_len(&win[rel..]) else {
                 // A bad magic, version, or header CRC: a corrupt header ends the valid prefix.
                 tail_reason = Some(ReasonCode::CorruptRecordHeader);
@@ -2441,6 +2462,84 @@ mod tests {
         assert_eq!(scan.records[0].payload.as_ref(), b"one");
         assert_eq!(scan.records[2].seq, Seq::new(2));
         assert_eq!(scan.records[2].payload.as_ref(), b"three");
+    }
+
+    /// Builds a SEALED segment whose record at index `written-6` STRADDLES the first recovery read
+    /// window such that exactly 37 of its bytes are windowed (it starts at body offset
+    /// `RECOVERY_WINDOW_BYTES - 37`), with five more records fully on disk after it. The straddling
+    /// record carries a stored subject when `use_subject`, else it is plain. Returns the file and the
+    /// total records written. (#594 / PR #1107 regression fixture.)
+    fn build_window_straddling_segment(use_subject: bool) -> (Arc<InMemoryFile>, u64) {
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        // The straddling frame's START must land at body offset `RECOVERY_WINDOW_BYTES - 37`, so
+        // exactly 37 of its bytes fall inside the first `RECOVERY_WINDOW_BYTES` read.
+        let target = RECOVERY_WINDOW_BYTES - 37;
+        let big_frame = RECORD_HEADER_LEN + 1000 + RECORD_TRAILER_LEN;
+        let mut body = 0usize;
+        let mut seq = 0u64;
+        while body + big_frame <= target - 63 {
+            w.append(&rec(seq, &vec![0xABu8; 1000])).unwrap();
+            body += big_frame;
+            seq += 1;
+        }
+        // Close the remaining gap EXACTLY with one filler record so the next frame starts at `target`.
+        let remaining = target - body;
+        assert!(remaining >= RECORD_HEADER_LEN + RECORD_TRAILER_LEN);
+        let filler_payload = remaining - RECORD_HEADER_LEN - RECORD_TRAILER_LEN;
+        w.append(&rec(seq, &vec![0xCDu8; filler_payload])).unwrap();
+        body += RECORD_HEADER_LEN + filler_payload + RECORD_TRAILER_LEN;
+        seq += 1;
+        assert_eq!(
+            body, target,
+            "the straddling frame must start exactly at the window edge minus 37"
+        );
+        // The straddling record (subject or a plain control), then several records fully on disk.
+        if use_subject {
+            w.append_with_subject(&rec(seq, b"x"), b"orders.eu.1")
+                .unwrap();
+        } else {
+            w.append(&rec(seq, b"x")).unwrap();
+        }
+        seq += 1;
+        for _ in 0..5 {
+            w.append(&rec(seq, b"tail")).unwrap();
+            seq += 1;
+        }
+        w.seal().unwrap();
+        (file, seq)
+    }
+
+    #[test]
+    fn a_subject_frame_straddling_the_recovery_window_recovers_without_data_loss() {
+        // #594 (PR #1107 adversarial finding): the STREAMING crash-recovery walk fills only
+        // RECORD_HEADER_LEN bytes before `decoded_len`, but a HAS_SUBJECT frame needs
+        // RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX to read `subject_len`. When such a frame
+        // straddled the read window with only 36-37 bytes buffered, `decoded_len` returned Truncated
+        // and the walk mis-read the valid frame as a torn tail — silently dropping it AND every
+        // record after it. Assert full recovery for the subject case; the plain control at the
+        // identical position proves the guard is the subject case, not the positioning.
+        for use_subject in [false, true] {
+            let (file, written) = build_window_straddling_segment(use_subject);
+            let scan = SegmentReader::open(Arc::clone(&file))
+                .unwrap()
+                .scan_recovery()
+                .unwrap();
+            assert_eq!(
+                scan.record_count, written,
+                "streaming recovery dropped records (use_subject={use_subject}): a window-straddling \
+                 HAS_SUBJECT frame must never be mis-read as a torn tail"
+            );
+            assert!(
+                scan.clean,
+                "the segment recovered clean (use_subject={use_subject})"
+            );
+            assert_eq!(
+                scan.last_seq,
+                Seq::new(written - 1),
+                "the last seq is recovered"
+            );
+        }
     }
 
     #[test]
