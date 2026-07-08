@@ -251,6 +251,15 @@ const DEFAULT_MAX_GROUPS: usize = ironbus_server::engine::DEFAULT_MAX_GROUPS;
 /// never counted against it.
 const DEFAULT_MAX_STREAMS: usize = ironbus_server::engine::DEFAULT_MAX_STREAMS;
 
+/// The default per-NAMED-stream CONSUMER-METRIC cardinality cap for `serve` (#600, the #681
+/// named-stream metrics follow-up), aliased to the engine's
+/// [`ironbus_server::engine::DEFAULT_MAX_METRIC_STREAMS`] so the CLI default and the engine default are
+/// a single source of truth. It bounds how many distinct named streams get their own per-stream
+/// consumer series on `/metrics` before folding into `{stream="__other__"}`, keeping the scrape
+/// cardinality bounded no matter how many streams exist. `0` resolves to (and any value is clamped to)
+/// the engine's hard backstop; the default is 1024.
+const DEFAULT_MAX_METRIC_STREAMS: usize = ironbus_server::engine::DEFAULT_MAX_METRIC_STREAMS;
+
 /// The default idle window after which an idle, fully-caught-up, lease-free NAMED work-group is
 /// evicted for `serve` (refs #277, #240), in MILLISECONDS, aliased to the engine's
 /// [`ironbus_server::engine::DEFAULT_GROUP_IDLE_EVICT_MS`] so the CLI and engine default are a single
@@ -9925,6 +9934,7 @@ fn open_engine_with<F: Filesystem + Clone>(
             // group past the cap is rejected by the engine before it allocates.
             max_groups: config.max_groups,
             max_streams: config.max_streams,
+            max_metric_streams: DEFAULT_MAX_METRIC_STREAMS,
             // Idle named-group eviction (refs #277, #240): the lifecycle reclaim that completes the
             // #240 cap. `0` = disabled (off, the default), a non-zero value is the idle window in ms
             // after which a fully-caught-up, lease-free named group is reclaimed. Never deletes a
@@ -15521,6 +15531,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 max_streams: DEFAULT_MAX_STREAMS,
+                max_metric_streams: DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -16471,6 +16482,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 max_streams: DEFAULT_MAX_STREAMS,
+                max_metric_streams: DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -16558,6 +16570,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 max_streams: DEFAULT_MAX_STREAMS,
+                max_metric_streams: DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -20806,6 +20819,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 max_streams: DEFAULT_MAX_STREAMS,
+                max_metric_streams: DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -20892,6 +20906,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 max_streams: DEFAULT_MAX_STREAMS,
+                max_metric_streams: DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,

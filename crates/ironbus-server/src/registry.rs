@@ -900,6 +900,316 @@ impl ThroughputRegistry {
     }
 }
 
+/// The HARD allocation cap on the number of distinct per-stream CONSUMER metric series
+/// [`StreamConsumerRegistry`] preallocates (#600, the #681 named-stream metrics follow-up). It is
+/// the fixed backstop that keeps the registry's memory a compile-time constant regardless of the
+/// operator's `max_metric_streams` setting: the configured cardinality cap is CLAMPED to this, so a
+/// misconfigured huge value can never grow the preallocated arrays past this ceiling (the exact OOM
+/// the whole bounded registry exists to prevent). The configured cap can only LOWER the fold
+/// threshold below this, never raise the allocation. Sized to match [`MAX_CONSUMER_SERIES`] so the
+/// per-stream metric surface has the same generous-but-finite ceiling as the lag / throughput ones.
+pub const MAX_METRIC_STREAM_SERIES: usize = MAX_CONSUMER_SERIES;
+
+/// The synthetic `stream` label every over-cap per-stream consumer series folds into (#600), so the
+/// TOTAL delivered/acked/dead-lettered/filtered across the un-labelled streams stays visible even
+/// once distinct stream labels are refused at the configured cap. A DISTINCT spelling from the
+/// throughput/lag `__overflow__` fold on purpose: this fold is driven by the CONFIGURABLE
+/// `max_metric_streams` cap (an operator's cardinality budget), not the fixed 1024-series backstop,
+/// so `__other__` reads as "streams past your metric budget" rather than "past the hard ceiling".
+pub const OTHER_STREAM_LABEL: &str = "__other__";
+
+/// One per-stream CONSUMER metric series (#600): the inline (heap-free) stream label plus the four
+/// monotonic counts mirroring what the DEFAULT stream emits globally — records DELIVERED, ACKED,
+/// DEAD-LETTERED (poison), and FILTERED (per-subject skip) for one NAMED stream. Fixed size, so an
+/// array of these has a fixed memory cost, exactly like [`ThroughputSeries`] / [`ConsumerSeries`].
+#[derive(Clone, Copy)]
+struct StreamConsumerSeries {
+    /// The stream label, stored inline as a fixed byte buffer (no heap allocation).
+    label: [u8; MAX_CONSUMER_LABEL_BYTES],
+    /// The used length of `label` (a fixed-width `u16` for a portable per-series size).
+    label_len: u16,
+    /// Whether this slot is occupied.
+    used: bool,
+    /// Message deliveries handed out to this stream's consumers (a redelivery counts again),
+    /// monotonic — the per-stream twin of the global `ironbus_delivered_total`.
+    delivered: u64,
+    /// Commits via ack in this stream's work-groups (monotonic) — the per-stream
+    /// `ironbus_acks_total`.
+    acked: u64,
+    /// Poison messages dead-lettered to this stream's own DLQ (monotonic) — the per-stream
+    /// `ironbus_dead_lettered_total`.
+    dead_lettered: u64,
+    /// Records skipped by a per-subject filtered consumer on this stream (monotonic) — the
+    /// per-stream `ironbus_filtered_total`.
+    filtered: u64,
+}
+
+impl StreamConsumerSeries {
+    const EMPTY: StreamConsumerSeries = StreamConsumerSeries {
+        label: [0u8; MAX_CONSUMER_LABEL_BYTES],
+        label_len: 0,
+        used: false,
+        delivered: 0,
+        acked: 0,
+        dead_lettered: 0,
+        filtered: 0,
+    };
+
+    /// Copies `name`'s (possibly truncated) stored key into the inline label buffer and marks used.
+    /// Allocation-free (a fixed-size `copy_from_slice` into the preallocated buffer).
+    fn store_label(&mut self, name: &[u8]) {
+        let key = stored_key(name);
+        let n = key.len().min(MAX_CONSUMER_LABEL_BYTES);
+        if let (Some(dst), Some(src)) = (self.label.get_mut(..n), key.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        self.label_len = u16::try_from(n).unwrap_or(u16::MAX);
+        self.used = true;
+    }
+
+    /// The rendered label as a `&str` (the stored bytes are a prefix of a validated graphic-ASCII
+    /// stream name, so valid UTF-8; a defensive failure renders empty rather than panicking).
+    fn label_str(&self) -> &str {
+        let stored = self.label.get(..usize::from(self.label_len)).unwrap_or(&[]);
+        core::str::from_utf8(stored).unwrap_or("")
+    }
+}
+
+/// The per-NAMED-stream CONSUMER metric registry (#600, closing the #681 named-stream metrics
+/// follow-up): records DELIVERED / ACKED / DEAD-LETTERED / FILTERED per NAMED stream, as monotonic
+/// counters keyed by the stream LABEL, so an operator sees each named stream's consumer activity —
+/// the per-stream parity of the counters the default stream already emits globally.
+///
+/// # BOUNDED CARDINALITY (the #600 crux)
+///
+/// Adding a per-stream label MUST NOT let an unbounded number of stream names explode the metric
+/// series count and OOM the very node the metrics protect. Two nested bounds enforce this:
+///
+/// - A CONFIGURABLE cap (`cap`, from [`crate::engine::EngineConfig::max_metric_streams`]): the first
+///   `cap` distinct streams each get their OWN labelled series; every stream past it folds into ONE
+///   `{stream="__other__"}` bucket (its four counts add into the shared overflow ledger), so the
+///   total labelled series is `cap + 1` REGARDLESS of how many distinct streams exist. A brand-new
+///   over-cap stream bumps `labels_dropped` once (the cardinality-pressure signal), never per record.
+/// - A HARD backstop ([`MAX_METRIC_STREAM_SERIES`]): `cap` is CLAMPED to it at construction and the
+///   two series arrays are PREALLOCATED at it, so the registry's memory is a fixed compile-time
+///   ceiling even if an operator misconfigures a huge `max_metric_streams`. The config can only LOWER
+///   the fold threshold, never grow the allocation.
+///
+/// Like the throughput registry these are pure MONOTONIC COUNTERS (each event adds one), so the
+/// over-cap fold is the trivially-idempotent case — an over-cap stream's increments just add into the
+/// bounded overflow ledger, whose per-label slots also make `labels_dropped` count each DISTINCT
+/// refused stream exactly once (up to the ledger capacity, then a documented coarse fallback). The
+/// `{stream="__other__"}` line renders the SUM over that ledger.
+///
+/// Allocation-free on the steady-state record path (an existing stream resolves O(1) via the
+/// label->slot side-index, the #486 pattern); the once-per-new-stream claim records the mapping off
+/// the hot path. Never walks the log or the disk. The DEFAULT stream ("") is NEVER recorded here — it
+/// keeps its byte-for-byte-unchanged global counters — so a deployment that never names a stream
+/// costs nothing and emits no per-stream series.
+pub struct StreamConsumerRegistry {
+    /// The fixed-capacity primary series array (a boxed slice of exactly [`MAX_METRIC_STREAM_SERIES`]
+    /// slots), allocated ONCE at construction. A new stream takes the first free slot until `cap`;
+    /// past `cap` it folds into the overflow ledger.
+    series: Box<[StreamConsumerSeries]>,
+    /// The number of occupied primary slots in `series` (at most `cap`).
+    len: usize,
+    /// The CONFIGURED cardinality cap: the number of distinct streams that get their own labelled
+    /// series before the `__other__` fold begins. Clamped to `[1, MAX_METRIC_STREAM_SERIES]` at
+    /// construction (a `0`/over-cap setting resolves to the safe default backstop), so it is always a
+    /// valid primary index bound and never exceeds the preallocated array.
+    cap: usize,
+    /// A label->slot side-index so a record for an existing stream resolves O(1), preallocated at the
+    /// hard cap so a claim never resizes it on the hot path. One entry per occupied primary series,
+    /// plus one per distinct over-cap stream tracked in the bounded overflow ledger (mapped via
+    /// [`OVERFLOW_INDEX_BASE`](StreamConsumerRegistry::OVERFLOW_INDEX_BASE)).
+    slot_index: HashMap<Box<[u8]>, usize>,
+    /// The BOUNDED overflow fold-ledger (mirrors [`ThroughputRegistry`]'s): up to
+    /// [`MAX_METRIC_STREAM_SERIES`] inline entries, one per DISTINCT over-cap stream, so a re-record of
+    /// a folded stream adds into ITS slot and `labels_dropped` counts each distinct stream ONCE on its
+    /// first fold. Allocated once; part of the fixed memory ceiling, NOT an unbounded per-stream map.
+    overflow_ledger: Box<[StreamConsumerSeries]>,
+    /// The number of occupied slots in `overflow_ledger` (the count of DISTINCT folded streams).
+    overflow_ledger_len: usize,
+    /// `ironbus_stream_consumer_labels_dropped_total`: the number of DISTINCT streams refused a
+    /// primary series at `cap`. Bumps only on the FIRST fold of a distinct stream, NEVER per record.
+    labels_dropped: u64,
+}
+
+impl StreamConsumerRegistry {
+    /// The `slot_index` value offset that distinguishes an OVERFLOW-LEDGER slot from a primary-series
+    /// slot: a stored value `>= OVERFLOW_INDEX_BASE` is `OVERFLOW_INDEX_BASE + ledger_slot`. Sized at
+    /// the HARD backstop (not the configured `cap`), so the two index spaces never collide even when
+    /// `cap` is lowered by config.
+    const OVERFLOW_INDEX_BASE: usize = MAX_METRIC_STREAM_SERIES;
+
+    /// Builds the registry with a configured cardinality cap of `max_metric_streams`. The cap is
+    /// CLAMPED into `[1, MAX_METRIC_STREAM_SERIES]`: `0` (or any value at/above the backstop) resolves
+    /// to the hard cap, so per-stream labels are always BOUNDED — unlike the `0 = unlimited`
+    /// convention of the resource caps, an unbounded metric cardinality is the footgun this exists to
+    /// prevent. The two series arrays are preallocated at the hard backstop, so the memory is a fixed
+    /// ceiling regardless of the configured cap.
+    #[must_use]
+    pub fn new(max_metric_streams: usize) -> StreamConsumerRegistry {
+        let cap = if max_metric_streams == 0 {
+            MAX_METRIC_STREAM_SERIES
+        } else {
+            max_metric_streams.min(MAX_METRIC_STREAM_SERIES)
+        };
+        StreamConsumerRegistry {
+            series: vec![StreamConsumerSeries::EMPTY; MAX_METRIC_STREAM_SERIES].into_boxed_slice(),
+            len: 0,
+            cap,
+            slot_index: HashMap::with_capacity(MAX_METRIC_STREAM_SERIES + MAX_OVERFLOW_LEDGER),
+            overflow_ledger: vec![StreamConsumerSeries::EMPTY; MAX_OVERFLOW_LEDGER]
+                .into_boxed_slice(),
+            overflow_ledger_len: 0,
+            labels_dropped: 0,
+        }
+    }
+
+    /// Resolves (or claims, or folds) the series for stream `name` and applies `apply` to its counts.
+    /// O(1) and allocation-free for an EXISTING stream — a primary series OR an already-folded over-cap
+    /// stream. A brand-new stream claims a free primary slot below `cap`, then a bounded
+    /// overflow-ledger slot past it (the only allocations, once per distinct stream, off the
+    /// steady-state path); `labels_dropped` counts each DISTINCT refused stream ONCE. The closure
+    /// receives `&mut StreamConsumerSeries` so it can bump any of the four counters.
+    fn record(&mut self, name: &[u8], apply: impl Fn(&mut StreamConsumerSeries)) {
+        let key = stored_key(name);
+        // An EXISTING stream — a primary series OR an already-folded over-cap stream — resolves O(1).
+        if let Some(&idx) = self.slot_index.get(key) {
+            if idx >= Self::OVERFLOW_INDEX_BASE {
+                if let Some(slot) = self
+                    .overflow_ledger
+                    .get_mut(idx - Self::OVERFLOW_INDEX_BASE)
+                {
+                    apply(slot);
+                    return;
+                }
+            } else if let Some(slot) = self.series.get_mut(idx) {
+                apply(slot);
+                return;
+            }
+        }
+        // A brand-new stream with a free primary slot (below the CONFIGURED cap): claim it and record
+        // its key->slot mapping so the next record resolves it in O(1).
+        if self.len < self.cap {
+            if let Some(slot) = self.series.get_mut(self.len) {
+                slot.store_label(name);
+                apply(slot);
+                self.slot_index.insert(Box::from(key), self.len);
+                self.len += 1;
+                return;
+            }
+        }
+        // At the configured cap: a brand-new DISTINCT over-cap stream folds into the bounded overflow
+        // ledger (counted ONCE), so a re-record of it resolves O(1) above next time.
+        if self.overflow_ledger_len < MAX_OVERFLOW_LEDGER {
+            if let Some(slot) = self.overflow_ledger.get_mut(self.overflow_ledger_len) {
+                slot.store_label(name);
+                apply(slot);
+                self.slot_index.insert(
+                    Box::from(key),
+                    Self::OVERFLOW_INDEX_BASE + self.overflow_ledger_len,
+                );
+                self.overflow_ledger_len += 1;
+                self.labels_dropped = self.labels_dropped.saturating_add(1);
+                return;
+            }
+        }
+        // Even the bounded ledger is saturated (more distinct over-cap streams than its capacity over
+        // the broker's life): count the distinct drop, but do NOT fold its counts (it cannot be tracked
+        // without a slot). The `__other__` totals are then a documented LOWER BOUND; `labels_dropped`
+        // still flags the pressure. The same coarse, monotonic, never-grows-wrong fallback the
+        // throughput / lag registries use.
+        self.labels_dropped = self.labels_dropped.saturating_add(1);
+    }
+
+    /// Records one message DELIVERED to stream `name`'s consumers (#600). Allocation-free for an
+    /// existing stream.
+    pub fn record_delivered(&mut self, name: &[u8]) {
+        self.record(name, |s| s.delivered = s.delivered.saturating_add(1));
+    }
+
+    /// Records one ACK committed in stream `name` (#600). Allocation-free for an existing stream.
+    pub fn record_acked(&mut self, name: &[u8]) {
+        self.record(name, |s| s.acked = s.acked.saturating_add(1));
+    }
+
+    /// Records one poison message DEAD-LETTERED for stream `name` (#600). Allocation-free for an
+    /// existing stream.
+    pub fn record_dead_lettered(&mut self, name: &[u8]) {
+        self.record(name, |s| {
+            s.dead_lettered = s.dead_lettered.saturating_add(1)
+        });
+    }
+
+    /// Records one record FILTERED (per-subject skip) on stream `name` (#600). Allocation-free for an
+    /// existing stream.
+    pub fn record_filtered(&mut self, name: &[u8]) {
+        self.record(name, |s| s.filtered = s.filtered.saturating_add(1));
+    }
+
+    /// Invokes `f(label, delivered, acked, dead_lettered, filtered)` for each occupied DISTINCT
+    /// primary series. O(number of series), allocation-free; the `__other__` fold is emitted by the
+    /// caller via the accessors below.
+    pub fn for_each_series<F: FnMut(&str, u64, u64, u64, u64)>(&self, mut f: F) {
+        for slot in self.series.iter().take(self.len) {
+            if slot.used {
+                f(
+                    slot.label_str(),
+                    slot.delivered,
+                    slot.acked,
+                    slot.dead_lettered,
+                    slot.filtered,
+                );
+            }
+        }
+    }
+
+    /// Whether the `__other__` fold is in use (at least one stream refused a primary series at `cap`).
+    #[must_use]
+    pub fn has_overflow(&self) -> bool {
+        self.overflow_ledger_len > 0 || self.labels_dropped > 0
+    }
+
+    /// The folded (`{stream="__other__"}`) delivered/acked/dead-lettered/filtered counts: the sum over
+    /// the bounded overflow ledger. A documented LOWER BOUND if the ledger ever saturated.
+    #[must_use]
+    pub fn overflow_counts(&self) -> (u64, u64, u64, u64) {
+        self.overflow_ledger
+            .iter()
+            .take(self.overflow_ledger_len)
+            .fold((0u64, 0u64, 0u64, 0u64), |(d, a, dl, f), s| {
+                (
+                    d.saturating_add(s.delivered),
+                    a.saturating_add(s.acked),
+                    dl.saturating_add(s.dead_lettered),
+                    f.saturating_add(s.filtered),
+                )
+            })
+    }
+
+    /// The count of DISTINCT streams refused a primary series at `cap` (the
+    /// `ironbus_stream_consumer_labels_dropped_total` cardinality-pressure signal). Counts each
+    /// distinct stream once (on its first fold), never per record.
+    #[must_use]
+    pub fn labels_dropped(&self) -> u64 {
+        self.labels_dropped
+    }
+
+    /// The number of occupied distinct primary series (for the cap/overflow tests and operators).
+    #[must_use]
+    pub fn series_len(&self) -> usize {
+        self.len
+    }
+
+    /// The CONFIGURED cardinality cap (clamped), for the tests and operators.
+    #[must_use]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+}
+
 /// The per-ack-level (Level 0/1/2) produce counters (#571): a FIXED three-slot array indexed by
 /// [`AckLevel::as_u8`], so the cardinality is bounded BY CONSTRUCTION (a closed three-value enum, no
 /// overflow fold needed). Each slot is the count of records accepted at that ack level
@@ -960,6 +1270,11 @@ pub struct MetricRegistry {
     /// The per-stream/per-group THROUGHPUT registry (#571): records produced per stream and consumed
     /// per group, bounded at [`MAX_CONSUMER_SERIES`] distinct labels with an `__overflow__` fold.
     throughput: ThroughputRegistry,
+    /// The per-NAMED-stream CONSUMER metric registry (#600): delivered/acked/dead-lettered/filtered per
+    /// named stream, bounded at the configured `max_metric_streams` cap (clamped to
+    /// [`MAX_METRIC_STREAM_SERIES`]) with an `{stream="__other__"}` fold. The DEFAULT stream is never
+    /// recorded here (its global counters stay unchanged).
+    stream_consumers: StreamConsumerRegistry,
     /// The per-ack-level (0/1/2) produce counters (#571): a fixed three-slot array, bounded by the
     /// closed [`AckLevel`] enum (no overflow fold needed).
     ack_levels: AckLevelCounters,
@@ -979,11 +1294,15 @@ impl MetricRegistry {
     /// Builds the registry, capturing the build version and the open-time wall/monotonic instants
     /// from the clock seam. `start_time_unix_seconds` and `start_monotonic_nanos` come from the
     /// caller's [`ironbus_core::clock::Clock`] read, never a raw `now()`.
+    ///
+    /// `max_metric_streams` is the CONFIGURABLE per-stream consumer-metric cardinality cap (#600),
+    /// clamped to [`MAX_METRIC_STREAM_SERIES`] and defaulted from `0`; see [`StreamConsumerRegistry`].
     #[must_use]
     pub fn new(
         build_version: &'static str,
         start_time_unix_seconds: u64,
         start_monotonic_nanos: u64,
+        max_metric_streams: usize,
     ) -> MetricRegistry {
         MetricRegistry {
             fsync_duration: FixedHistogram::default(),
@@ -993,6 +1312,7 @@ impl MetricRegistry {
             consume_latency: FixedHistogram::default(),
             consumer_lag: ConsumerLagRegistry::default(),
             throughput: ThroughputRegistry::default(),
+            stream_consumers: StreamConsumerRegistry::new(max_metric_streams),
             ack_levels: AckLevelCounters::default(),
             build_version,
             start_time_unix_seconds,
@@ -1061,6 +1381,30 @@ impl MetricRegistry {
         self.throughput.record_consumed(name);
     }
 
+    /// Records one message DELIVERED to NAMED stream `name`'s consumers (#600). Allocation-free for an
+    /// existing stream; a brand-new stream claims a bounded series slot (or folds into `__other__` at
+    /// the configured `max_metric_streams` cap). The DEFAULT stream is never recorded here.
+    pub fn record_stream_delivered(&mut self, name: &[u8]) {
+        self.stream_consumers.record_delivered(name);
+    }
+
+    /// Records one ACK committed in NAMED stream `name` (#600). Allocation-free for an existing stream.
+    pub fn record_stream_acked(&mut self, name: &[u8]) {
+        self.stream_consumers.record_acked(name);
+    }
+
+    /// Records one poison DEAD-LETTERED for NAMED stream `name` (#600). Allocation-free for an existing
+    /// stream.
+    pub fn record_stream_dead_lettered(&mut self, name: &[u8]) {
+        self.stream_consumers.record_dead_lettered(name);
+    }
+
+    /// Records one record FILTERED (per-subject skip) on NAMED stream `name` (#600). Allocation-free
+    /// for an existing stream.
+    pub fn record_stream_filtered(&mut self, name: &[u8]) {
+        self.stream_consumers.record_filtered(name);
+    }
+
     /// Records one record accepted at ack level `level` (#571). Allocation-free (a fixed-index bump).
     pub fn record_ack_level(&mut self, level: AckLevel) {
         self.ack_levels.record(level);
@@ -1107,6 +1451,13 @@ impl MetricRegistry {
     #[must_use]
     pub fn throughput(&self) -> &ThroughputRegistry {
         &self.throughput
+    }
+
+    /// The per-NAMED-stream consumer metric registry (#600), for the scrape rendering and the
+    /// cap/`__other__` tests.
+    #[must_use]
+    pub fn stream_consumers(&self) -> &StreamConsumerRegistry {
+        &self.stream_consumers
     }
 
     /// The per-ack-level (0/1/2) produce counters (#571), for the scrape rendering.
@@ -1160,10 +1511,24 @@ pub fn registry_memory_ceiling_bytes() -> usize {
     // of the hard ceiling, not open-ended terms.
     let throughput_series = MAX_CONSUMER_SERIES * core::mem::size_of::<ThroughputSeries>();
     let throughput_overflow = MAX_OVERFLOW_LEDGER * core::mem::size_of::<ThroughputSeries>();
+    // The per-NAMED-stream consumer arrays (#600): a primary series array plus a bounded overflow
+    // fold-ledger, BOTH preallocated at the HARD [`MAX_METRIC_STREAM_SERIES`] backstop (NOT the
+    // configured `max_metric_streams`, which only lowers the fold threshold), so the memory is a fixed
+    // ceiling regardless of the operator's cardinality setting.
+    let stream_consumer_series =
+        MAX_METRIC_STREAM_SERIES * core::mem::size_of::<StreamConsumerSeries>();
+    let stream_consumer_overflow =
+        MAX_OVERFLOW_LEDGER * core::mem::size_of::<StreamConsumerSeries>();
     // The fixed core state held inline in MetricRegistry (the two histograms plus the scalar
     // self-info and lag-registry bookkeeping). This is the fixed sub-100-series core cost.
     let core = core::mem::size_of::<MetricRegistry>();
-    consumer_series + overflow_ledger + throughput_series + throughput_overflow + core
+    consumer_series
+        + overflow_ledger
+        + throughput_series
+        + throughput_overflow
+        + stream_consumer_series
+        + stream_consumer_overflow
+        + core
 }
 
 #[cfg(test)]
@@ -1501,7 +1866,7 @@ mod tests {
     fn the_overflow_fold_path_does_not_allocate() {
         // The engine drives the fold on every ack, so the fold (claim + re-commit update) must be
         // allocation-free just like the under-cap commit path.
-        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
         reg.record_appended();
         // Fill the distinct-series cap OUTSIDE the counted window.
         for i in 0..MAX_CONSUMER_SERIES {
@@ -1534,7 +1899,7 @@ mod tests {
 
     #[test]
     fn uptime_is_monotonic_derived() {
-        let reg = MetricRegistry::new("9.9.9", 1_700_000_000, 5_000_000_000);
+        let reg = MetricRegistry::new("9.9.9", 1_700_000_000, 5_000_000_000, 0);
         // 8 s after the open-time monotonic origin (5 s).
         assert_eq!(reg.uptime_seconds(13_000_000_000), 8);
         // A monotonic reading before the origin (cannot happen for a real clock) saturates to 0.
@@ -1575,30 +1940,49 @@ mod tests {
             per_throughput <= MAX_CONSUMER_LABEL_BYTES + 24,
             "per-throughput-series cost drifted above label[64] + three words: {per_throughput}"
         );
+        // The per-NAMED-stream consumer series (#600) is a parallel capped array (four monotonic
+        // consumer counts per stream), preallocated at the HARD [`MAX_METRIC_STREAM_SERIES`] backstop
+        // with its own bounded overflow ledger, all fixed-width so it is identical across targets. The
+        // configured `max_metric_streams` only lowers the FOLD threshold; it never grows the allocation
+        // past this backstop, so the ceiling stays a compile-time constant.
+        let per_stream_consumer = core::mem::size_of::<StreamConsumerSeries>();
+        assert!(
+            per_stream_consumer >= MAX_CONSUMER_LABEL_BYTES,
+            "the inline per-stream consumer label buffer must be stored, not heaped: {per_stream_consumer}"
+        );
+        assert!(
+            per_stream_consumer <= MAX_CONSUMER_LABEL_BYTES + 40,
+            "per-stream-consumer-series cost drifted above label[64] + five words: {per_stream_consumer}"
+        );
         // The overflow fold-ledgers are SECOND capped arrays of the same per-entry cost, also
         // preallocated at their caps, so they too are fixed terms independent of live-label count. The
-        // ceiling is exactly the four capped arrays (lag series + lag overflow + throughput series +
-        // throughput overflow) plus the fixed core.
+        // ceiling is exactly the six capped arrays (lag series + lag overflow + throughput series +
+        // throughput overflow + stream-consumer series + stream-consumer overflow) plus the fixed core.
         assert_eq!(
             ceiling,
             MAX_CONSUMER_SERIES * per_series
                 + MAX_OVERFLOW_LEDGER * per_series
                 + MAX_CONSUMER_SERIES * per_throughput
                 + MAX_OVERFLOW_LEDGER * per_throughput
+                + MAX_METRIC_STREAM_SERIES * per_stream_consumer
+                + MAX_OVERFLOW_LEDGER * per_stream_consumer
                 + core::mem::size_of::<MetricRegistry>()
         );
-        // The signed-off ceiling: the four capped series arrays (the lag series + its overflow ledger,
-        // the throughput series + its overflow ledger) are the dominant terms and together are well
-        // under 512 KiB, so the whole registry is a small fixed slice of the 64 MiB edge RAM budget,
-        // INDEPENDENT of record count or disk size. (~80-88 bytes/series x 1024 x 4 arrays ~= 340 KiB.)
+        // The signed-off ceiling: the six capped series arrays (the lag series + its overflow ledger,
+        // the throughput series + its overflow ledger, the per-stream consumer series + its overflow
+        // ledger) are the dominant terms and together are well under 768 KiB, so the whole registry is
+        // a small fixed slice of the 64 MiB edge RAM budget, INDEPENDENT of record count, disk size, or
+        // the number of live streams. (~80-104 bytes/series x 1024 x 6 arrays ~= 550 KiB.)
         assert!(
-            ceiling < 512 * 1024,
-            "registry ceiling {ceiling} bytes exceeded the documented 512 KiB sign-off"
+            ceiling < 768 * 1024,
+            "registry ceiling {ceiling} bytes exceeded the documented 768 KiB sign-off"
         );
-        // The core (non-consumer-series) state is a fixed sub-100-series cost: a handful of
-        // histograms and scalars, well under 1 KiB.
+        // The core (non-consumer-series) INLINE state is a fixed sub-100-series cost: a handful of
+        // fixed-bucket histograms, the four bounded registries' fat-pointer/HashMap bookkeeping (the
+        // big series arrays live on the heap, counted above — NOT here), and a few scalars. Well under
+        // 2 KiB, and independent of any live-label count.
         assert!(
-            core::mem::size_of::<MetricRegistry>() < 1024,
+            core::mem::size_of::<MetricRegistry>() < 2048,
             "core registry state is not the fixed small term it is documented as"
         );
     }
@@ -1608,7 +1992,7 @@ mod tests {
         // Build the registry and pre-touch its consumer series OUTSIDE the counted window (claiming a
         // series slot copies the label into the preallocated array; the test asserts the STEADY-STATE
         // hot path, where the series already exists, allocates nothing).
-        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
         reg.set_consumer_committed(b"orders", 0);
         reg.set_consumer_committed(b"billing", 0);
         // The steady-state append + commit + observe hot path: advance the head, observe both
@@ -1634,7 +2018,7 @@ mod tests {
         // must be allocation-free on the STEADY-STATE hot path (an existing label), so leaving them on
         // is affordable on the edge box, exactly like the lag registry. Pre-touch the labels OUTSIDE
         // the counted window (claiming a series slot copies the label into the preallocated array).
-        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
         reg.record_stream_produced(b""); // the default stream
         reg.record_group_consumed(b"orders");
         let allocs = count_allocs(|| {
@@ -1667,7 +2051,7 @@ mod tests {
         // #571: past MAX_CONSUMER_SERIES distinct labels, a new label is REFUSED its own series and its
         // counts FOLD into `__overflow__`, bounding the series memory (the cardinality firewall the
         // registry enforces). `labels_dropped` counts each DISTINCT refused label once.
-        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
         // Fill exactly to the cap with distinct stream labels, each produced once.
         for i in 0..MAX_CONSUMER_SERIES {
             reg.record_stream_produced(format!("stream-{i}").as_bytes());
@@ -1705,10 +2089,144 @@ mod tests {
     fn the_throughput_overflow_label_is_invisible_until_a_label_is_dropped() {
         // #571: a healthy broker (under the cap) emits NO `__overflow__` throughput series, so the
         // overflow line only appears once cardinality pressure forced a fold.
-        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
         reg.record_stream_produced(b"orders");
         reg.record_group_consumed(b"orders");
         assert!(!reg.throughput().has_overflow());
+    }
+
+    #[test]
+    fn the_stream_consumer_registry_records_the_four_counts_per_named_stream() {
+        // #600: each NAMED stream gets its own delivered/acked/dead-lettered/filtered counts, keyed by
+        // stream label, mirroring what the default stream emits globally. Two streams are independent.
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
+        reg.record_stream_delivered(b"orders");
+        reg.record_stream_delivered(b"orders");
+        reg.record_stream_acked(b"orders");
+        reg.record_stream_filtered(b"orders");
+        reg.record_stream_dead_lettered(b"orders");
+        reg.record_stream_delivered(b"billing");
+        reg.record_stream_acked(b"billing");
+        reg.record_stream_acked(b"billing");
+        let mut seen: std::collections::BTreeMap<String, (u64, u64, u64, u64)> =
+            std::collections::BTreeMap::new();
+        reg.stream_consumers().for_each_series(
+            |label, delivered, acked, dead_lettered, filtered| {
+                seen.insert(
+                    label.to_string(),
+                    (delivered, acked, dead_lettered, filtered),
+                );
+            },
+        );
+        assert_eq!(seen.get("orders"), Some(&(2, 1, 1, 1)));
+        assert_eq!(seen.get("billing"), Some(&(1, 2, 0, 0)));
+        assert_eq!(reg.stream_consumers().series_len(), 2);
+        assert!(!reg.stream_consumers().has_overflow());
+        assert_eq!(reg.stream_consumers().labels_dropped(), 0);
+    }
+
+    #[test]
+    fn the_stream_consumer_cardinality_is_bounded_by_the_configured_cap_and_folds_into_other() {
+        // #600 CRUX: with a CONFIGURED cap of 3, the first 3 distinct streams get their own labelled
+        // series and every stream past the cap folds into ONE `__other__` bucket, so the total labelled
+        // series stays `cap + 1` REGARDLESS of how many distinct streams exist. `labels_dropped` counts
+        // each DISTINCT refused stream once (never per record). This is the bound that stops a per-
+        // stream label from exploding the series count and OOMing the node.
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 3);
+        assert_eq!(
+            reg.stream_consumers().cap(),
+            3,
+            "the configured cap is honored"
+        );
+        // The 3 in-cap streams each get their own series.
+        for s in ["a", "b", "c"] {
+            reg.record_stream_delivered(s.as_bytes());
+        }
+        assert_eq!(reg.stream_consumers().series_len(), 3);
+        assert!(
+            !reg.stream_consumers().has_overflow(),
+            "at the cap exactly, no fold yet"
+        );
+        // 200 MORE distinct over-cap streams, each delivered+acked twice: all fold into __other__.
+        for i in 0..200 {
+            let name = format!("over-{i}");
+            reg.record_stream_delivered(name.as_bytes());
+            reg.record_stream_delivered(name.as_bytes());
+            reg.record_stream_acked(name.as_bytes());
+            reg.record_stream_acked(name.as_bytes());
+        }
+        let sc = reg.stream_consumers();
+        assert_eq!(
+            sc.series_len(),
+            3,
+            "the labelled series array NEVER grows past the configured cap, whatever the stream count"
+        );
+        assert!(sc.has_overflow());
+        assert_eq!(
+            sc.labels_dropped(),
+            200,
+            "each DISTINCT over-cap stream is counted once, never per record"
+        );
+        let (delivered, acked, dead_lettered, filtered) = sc.overflow_counts();
+        assert_eq!(
+            delivered, 400,
+            "200 streams x 2 deliveries fold into __other__"
+        );
+        assert_eq!(acked, 400, "200 streams x 2 acks fold into __other__");
+        assert_eq!(dead_lettered, 0);
+        assert_eq!(filtered, 0);
+    }
+
+    #[test]
+    fn the_stream_consumer_other_bucket_is_invisible_until_a_stream_is_dropped() {
+        // #600: under the cap, NO `__other__` bucket is emitted, so a healthy broker's exposition only
+        // grows the fold line once cardinality pressure forced it.
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 2);
+        reg.record_stream_delivered(b"a");
+        reg.record_stream_delivered(b"b");
+        assert!(!reg.stream_consumers().has_overflow());
+        reg.record_stream_delivered(b"c"); // third distinct stream, cap is 2
+        assert!(reg.stream_consumers().has_overflow());
+    }
+
+    #[test]
+    fn the_configured_stream_metric_cap_is_clamped_to_the_hard_backstop() {
+        // #600: `0` resolves to the hard backstop (never 0-series or unlimited), and an over-backstop
+        // value is clamped down, so the preallocated arrays — and thus the memory — are ALWAYS bounded
+        // by MAX_METRIC_STREAM_SERIES regardless of what an operator configures.
+        assert_eq!(
+            StreamConsumerRegistry::new(0).cap(),
+            MAX_METRIC_STREAM_SERIES
+        );
+        assert_eq!(
+            StreamConsumerRegistry::new(usize::MAX).cap(),
+            MAX_METRIC_STREAM_SERIES,
+            "a misconfigured huge cap is clamped to the hard backstop"
+        );
+        assert_eq!(StreamConsumerRegistry::new(10).cap(), 10);
+    }
+
+    #[test]
+    fn the_stream_consumer_record_path_is_allocation_free_for_existing_streams() {
+        // #600: after each distinct stream's first record (which claims a slot), the steady-state record
+        // path is allocation-free (an O(1) side-index lookup + a borrowed count bump), so leaving the
+        // per-stream consumer metrics on is affordable on the edge box, exactly like the throughput one.
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
+        for s in ["orders", "billing", "audit"] {
+            reg.record_stream_delivered(s.as_bytes()); // first touch claims the slot (may allocate)
+        }
+        let allocs = count_allocs(|| {
+            for _ in 0..1000u64 {
+                reg.record_stream_delivered(b"orders");
+                reg.record_stream_acked(b"billing");
+                reg.record_stream_filtered(b"audit");
+                reg.record_stream_dead_lettered(b"orders");
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "the steady-state per-stream consumer record path allocated {allocs} times"
+        );
     }
 
     #[test]
@@ -1716,7 +2234,7 @@ mod tests {
         // #570: the produce->ack / deliver / consume request-path histograms record into the SAME
         // fixed bucket set, and their observe is allocation-free just like fsync/append (so leaving
         // the request-path latency metrics on is affordable on the edge box).
-        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
         let allocs = count_allocs(|| {
             for _ in 0..1000u64 {
                 reg.observe_produce_ack_nanos(250_000); // <= 0.0005 s bucket 0
@@ -1747,7 +2265,7 @@ mod tests {
         // for_each_series visit plus the cumulative-bucket reads) must allocate nothing. (The
         // string formatting the real /metrics body does is a separate, already-bounded concern; this
         // pins that the registry's read side is allocation-free.)
-        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0, 0);
         reg.record_appended();
         for i in 0..500u64 {
             reg.set_consumer_committed(format!("c{i}").as_bytes(), 0);

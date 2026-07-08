@@ -1618,6 +1618,7 @@ fn registry_body(registry: &crate::registry::MetricRegistry, now_monotonic: u64)
     );
     consumer_lag_lines(&mut s, registry);
     throughput_lines(&mut s, registry);
+    stream_consumer_lines(&mut s, registry);
     ack_level_lines(&mut s, registry);
     self_monitoring_lines(&mut s, registry, now_monotonic);
     s
@@ -1687,6 +1688,122 @@ fn throughput_lines(s: &mut String, registry: &crate::registry::MetricRegistry) 
         s,
         "ironbus_throughput_labels_dropped_total {}",
         tp.labels_dropped()
+    );
+}
+
+/// Renders the per-NAMED-stream CONSUMER series (#600, closing the #681 named-stream metrics
+/// follow-up): records DELIVERED / ACKED / DEAD-LETTERED / FILTERED per NAMED stream
+/// (`ironbus_stream_{delivered,acked,dead_lettered,filtered}_total{stream}`) — the per-stream parity
+/// of the counters the default stream emits GLOBALLY (`ironbus_delivered_total` etc.). The DEFAULT
+/// stream is never recorded here, so its global counters stay byte-for-byte unchanged.
+///
+/// BOUNDED CARDINALITY (the #600 crux): up to the CONFIGURED `max_metric_streams` distinct streams
+/// each get their own labelled series, then further streams fold into ONE `{stream="__other__"}`
+/// bucket (emitted only once a stream has been dropped, so a healthy broker omits it), plus the
+/// unlabeled `ironbus_stream_consumer_labels_dropped_total` cardinality-pressure counter. The `stream`
+/// label is a bounded, overflow-folded STREAM NAME (never a per-message / per-offset value), so the
+/// cardinality is firewall-safe. Each of the four labelled `_total` families is emitted as a whole
+/// block (one HELP/TYPE then every sample, then its `__other__` fold), so a family is CONTIGUOUS in
+/// the exposition. All four labelled sample lines carry a label, so they are pinned only in
+/// `FROZEN_METRIC_TYPES` (the unlabeled-`_total` resilience-taxonomy test excludes them by
+/// construction); the unlabeled `*_labels_dropped_total` is a never-silent cardinality-cap event, so
+/// it is ALSO in `FROZEN_RESILIENCE_COUNTERS`, exactly like `ironbus_throughput_labels_dropped_total`.
+fn stream_consumer_lines(s: &mut String, registry: &crate::registry::MetricRegistry) {
+    let sc = registry.stream_consumers();
+    let (other_delivered, other_acked, other_dead_lettered, other_filtered) = sc.overflow_counts();
+    let other = crate::registry::OTHER_STREAM_LABEL;
+    let has_overflow = sc.has_overflow();
+
+    // Each family is one HELP/TYPE + every per-stream sample + the `__other__` fold, emitted as a
+    // whole block so the family stays contiguous (a strict Prometheus parser requires it).
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_stream_delivered_total Message deliveries handed out per NAMED stream (a redelivery counts again; capped cardinality, over-cap streams fold into stream=\"__other__\")."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_stream_delivered_total counter");
+    sc.for_each_series(|label, delivered, _acked, _dead, _filtered| {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_delivered_total{{stream=\"{}\"}} {delivered}",
+            escape_label(label)
+        );
+    });
+    if has_overflow {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_delivered_total{{stream=\"{other}\"}} {other_delivered}"
+        );
+    }
+
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_stream_acked_total Commits via ack per NAMED stream (capped cardinality, over-cap streams fold into stream=\"__other__\")."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_stream_acked_total counter");
+    sc.for_each_series(|label, _delivered, acked, _dead, _filtered| {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_acked_total{{stream=\"{}\"}} {acked}",
+            escape_label(label)
+        );
+    });
+    if has_overflow {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_acked_total{{stream=\"{other}\"}} {other_acked}"
+        );
+    }
+
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_stream_dead_lettered_total Poison messages dead-lettered per NAMED stream (capped cardinality, over-cap streams fold into stream=\"__other__\")."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_stream_dead_lettered_total counter");
+    sc.for_each_series(|label, _delivered, _acked, dead_lettered, _filtered| {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_dead_lettered_total{{stream=\"{}\"}} {dead_lettered}",
+            escape_label(label)
+        );
+    });
+    if has_overflow {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_dead_lettered_total{{stream=\"{other}\"}} {other_dead_lettered}"
+        );
+    }
+
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_stream_filtered_total Records skipped by a per-subject filtered consumer per NAMED stream (capped cardinality, over-cap streams fold into stream=\"__other__\")."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_stream_filtered_total counter");
+    sc.for_each_series(|label, _delivered, _acked, _dead, filtered| {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_filtered_total{{stream=\"{}\"}} {filtered}",
+            escape_label(label)
+        );
+    });
+    if has_overflow {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_filtered_total{{stream=\"{other}\"}} {other_filtered}"
+        );
+    }
+
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_stream_consumer_labels_dropped_total NAMED-stream consumer-metric stream labels refused a distinct series at the configured max_metric_streams cap (folded into __other__)."
+    );
+    let _ = writeln!(
+        s,
+        "# TYPE ironbus_stream_consumer_labels_dropped_total counter"
+    );
+    let _ = writeln!(
+        s,
+        "ironbus_stream_consumer_labels_dropped_total {}",
+        sc.labels_dropped()
     );
 }
 
@@ -2595,6 +2712,7 @@ mod tests {
             max_groups: crate::engine::DEFAULT_MAX_GROUPS,
             // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
             max_streams: 0,
+            max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
             group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: 0,
             disk_full_policy: DiskFullPolicy::DropNew,
@@ -3033,6 +3151,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -3729,7 +3848,7 @@ mod tests {
     fn metrics_renders_the_overflow_saturated_gauge() {
         use crate::registry::{MetricRegistry, MAX_CONSUMER_SERIES, MAX_OVERFLOW_LEDGER};
 
-        let mut registry = MetricRegistry::new(env!("CARGO_PKG_VERSION"), 0, 0);
+        let mut registry = MetricRegistry::new(env!("CARGO_PKG_VERSION"), 0, 0, 0);
         registry.seed_head(1);
 
         // A fresh registry has not saturated: the gauge renders 0 with a `gauge` TYPE line and no
@@ -3780,6 +3899,110 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)] // one exposition test asserting many per-stream metric lines.
+    fn metrics_renders_per_named_stream_consumer_series_with_bounded_cardinality() {
+        // #600 (closes the #681 named-stream metrics follow-up): the per-stream consumer families carry
+        // a `stream` label per NAMED stream with the right values, and streams past the CONFIGURED
+        // `max_metric_streams` cap fold into ONE `{stream="__other__"}` bucket so the series count stays
+        // bounded (the #600 crux) — driven straight through the private `registry_body` renderer.
+        use crate::registry::{MetricRegistry, OTHER_STREAM_LABEL};
+
+        // A registry with a configured cap of just 2 distinct streams.
+        let mut registry = MetricRegistry::new(env!("CARGO_PKG_VERSION"), 0, 0, 2);
+
+        // AT REST: the HELP/TYPE lines are present, but there is NO per-stream sample and NO `__other__`
+        // fold yet (a broker that never named a stream emits none), and the cap counter reads 0.
+        let at_rest = registry_body(&registry, 0);
+        for ty in [
+            "ironbus_stream_delivered_total",
+            "ironbus_stream_acked_total",
+            "ironbus_stream_dead_lettered_total",
+            "ironbus_stream_filtered_total",
+        ] {
+            assert!(
+                at_rest.contains(&format!("# TYPE {ty} counter")),
+                "missing TYPE line for {ty}: {at_rest}"
+            );
+        }
+        assert!(
+            at_rest.contains("\nironbus_stream_consumer_labels_dropped_total 0\n"),
+            "{at_rest}"
+        );
+        // No `__other__` fold SAMPLE line yet (the HELP text mentions the label, so match the sample
+        // line shape specifically, not the descriptive prose).
+        assert!(
+            !at_rest.contains("ironbus_stream_delivered_total{stream=\"__other__\"}"),
+            "no __other__ fold until a stream is dropped: {at_rest}"
+        );
+        assert!(
+            !at_rest.contains("ironbus_stream_delivered_total{stream="),
+            "no per-stream sample at rest: {at_rest}"
+        );
+
+        // Two IN-CAP streams get their own labelled series with the correct values.
+        for _ in 0..2 {
+            registry.record_stream_delivered(b"orders");
+        }
+        registry.record_stream_acked(b"orders");
+        registry.record_stream_filtered(b"orders");
+        registry.record_stream_dead_lettered(b"orders");
+        registry.record_stream_delivered(b"billing");
+        // Two OVER-CAP streams (past the cap of 2) fold into `__other__`: delivered 1 + 1 = 2, acked 1.
+        registry.record_stream_delivered(b"audit");
+        registry.record_stream_acked(b"audit");
+        registry.record_stream_delivered(b"telemetry");
+
+        let body = registry_body(&registry, 0);
+        // In-cap per-stream values.
+        assert!(
+            body.contains("ironbus_stream_delivered_total{stream=\"orders\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("ironbus_stream_acked_total{stream=\"orders\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("ironbus_stream_filtered_total{stream=\"orders\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("ironbus_stream_dead_lettered_total{stream=\"orders\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("ironbus_stream_delivered_total{stream=\"billing\"} 1"),
+            "{body}"
+        );
+        // The over-cap streams fold into ONE `__other__` bucket, and get NO series of their own.
+        assert!(
+            body.contains(&format!(
+                "ironbus_stream_delivered_total{{stream=\"{OTHER_STREAM_LABEL}\"}} 2"
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ironbus_stream_acked_total{{stream=\"{OTHER_STREAM_LABEL}\"}} 1"
+            )),
+            "{body}"
+        );
+        assert!(
+            !body.contains("stream=\"audit\""),
+            "an over-cap stream must NOT get its own series (bounded cardinality): {body}"
+        );
+        assert!(
+            !body.contains("stream=\"telemetry\""),
+            "an over-cap stream must NOT get its own series (bounded cardinality): {body}"
+        );
+        // Exactly TWO distinct streams were dropped at the cap.
+        assert!(
+            body.contains("\nironbus_stream_consumer_labels_dropped_total 2\n"),
+            "{body}"
+        );
+    }
+
     /// Like [`start`] but with a hard durable-log byte cap, so the rejection path is exercised.
     fn start_with_cap(
         max_total_bytes: u64,
@@ -3808,6 +4031,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -3956,6 +4180,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -4037,6 +4262,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -4315,6 +4541,7 @@ mod tests {
                     max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                     // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                     max_streams: 0,
+                    max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                     group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                     ram_ceiling_bytes: 0,
                     disk_full_policy: DiskFullPolicy::DropNew,
@@ -4374,6 +4601,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -4536,6 +4764,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -4678,6 +4907,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -4899,6 +5129,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
@@ -5274,6 +5505,15 @@ mod tests {
         // sample lines are excluded from this unlabeled-`_total` set by construction and pinned only in
         // `FROZEN_METRIC_TYPES`.
         "ironbus_throughput_labels_dropped_total",
+        // The per-NAMED-stream consumer-metric cardinality-cap counter (#600, the #681 named-stream
+        // metrics follow-up): a stream label refused a distinct series at the CONFIGURED
+        // `max_metric_streams` cap was folded into `{stream="__other__"}`. A cardinality-pressure
+        // signal, never a silent drop, so it belongs in the frozen taxonomy, exactly like
+        // `ironbus_throughput_labels_dropped_total`. The four labelled per-stream consumer SAMPLE
+        // counters (`ironbus_stream_{delivered,acked,dead_lettered,filtered}_total{stream}`) all carry
+        // a LABEL, so their sample lines are excluded from this unlabeled-`_total` set by construction
+        // and pinned only in `FROZEN_METRIC_TYPES`.
+        "ironbus_stream_consumer_labels_dropped_total",
     ];
 
     #[test]
@@ -5470,6 +5710,17 @@ mod tests {
         ("ironbus_group_consumed_total", "counter"),
         ("ironbus_throughput_labels_dropped_total", "counter"),
         ("ironbus_produce_ack_level_total", "counter"),
+        // Per-NAMED-stream consumer counters (#600, the #681 named-stream metrics follow-up): the four
+        // labelled per-stream sample counters (delivered/acked/dead_lettered/filtered — the `stream`
+        // label is a bounded, `__other__`-folded NAME, never a per-message value) mirroring what the
+        // default stream emits globally, plus the unlabeled cardinality-cap counter (ALSO in
+        // FROZEN_RESILIENCE_COUNTERS). The DEFAULT stream is never labelled here, so its global
+        // counters are byte-for-byte unchanged.
+        ("ironbus_stream_delivered_total", "counter"),
+        ("ironbus_stream_acked_total", "counter"),
+        ("ironbus_stream_dead_lettered_total", "counter"),
+        ("ironbus_stream_filtered_total", "counter"),
+        ("ironbus_stream_consumer_labels_dropped_total", "counter"),
         // Connection signals (connz, #572): one LABELED counter family
         // `ironbus_connections_total{state}` (the `state` label is a fixed four-value enum, so the
         // cardinality is bounded by construction — NEVER a per-connection-id label) plus the open
@@ -5949,6 +6200,7 @@ mod tests {
                 max_groups: 100,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
@@ -6163,6 +6415,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -6383,6 +6636,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
@@ -6699,6 +6953,7 @@ mod tests {
                 max_groups: 100,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,

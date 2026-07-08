@@ -387,6 +387,19 @@ pub struct EngineConfig {
     /// default stream are always allowed (the default does not count). `0` means UNLIMITED, matching the
     /// other `0` = off bounds; the default is [`DEFAULT_MAX_STREAMS`] (1024), an edge profile lowers it.
     pub max_streams: usize,
+    /// The per-NAMED-stream CONSUMER-METRIC cardinality cap (#600, the #681 named-stream metrics
+    /// follow-up): how many distinct NAMED streams each get their own labelled per-stream consumer
+    /// series (`ironbus_stream_{delivered,acked,dead_lettered,filtered}_total{stream}`) on `/metrics`
+    /// before further streams fold into ONE `{stream="__other__"}` bucket, so the `/metrics` series
+    /// count stays bounded no matter how many streams exist. A SEPARATE knob from `max_streams` so an
+    /// operator can allow many streams yet keep the scrape/TSDB cardinality independently bounded.
+    /// UNLIKE the `0 = unlimited` resource caps, `0` here resolves to (and any value is CLAMPED to) the
+    /// hard [`crate::registry::MAX_METRIC_STREAM_SERIES`] backstop — an unbounded metric cardinality is
+    /// the exact OOM this bounds, so the cap can only LOWER the fold threshold, never unbound it; the
+    /// registry's preallocated arrays are a fixed ceiling regardless. Default
+    /// [`DEFAULT_MAX_METRIC_STREAMS`] (1024). The DEFAULT stream is never labelled here (its global
+    /// counters are byte-for-byte unchanged), so a deployment that never names a stream costs nothing.
+    pub max_metric_streams: usize,
     /// How long a NAMED, NON-default work-group may sit IDLE before it is EVICTED (reclaimed from
     /// memory), in MILLISECONDS (refs #277, #240, #9): the deferred lifecycle half of #240. The cap
     /// (`max_groups`) BOUNDS the number of live groups; this RECLAIMS the idle ones, so a long-lived
@@ -2025,6 +2038,19 @@ pub const DEFAULT_MAX_GROUPS: usize = 1024;
 /// lowers it. See [`EngineConfig::max_streams`].
 pub const DEFAULT_MAX_STREAMS: usize = 1024;
 
+/// The default per-NAMED-stream CONSUMER-METRIC cardinality cap (#600, closing the #681 named-stream
+/// metrics follow-up): the number of distinct NAMED streams that each get their own labelled
+/// `ironbus_stream_{delivered,acked,dead_lettered,filtered}_total{stream}` series before further
+/// streams fold into ONE `{stream="__other__"}` bucket, bounding the `/metrics` series count. It is a
+/// SEPARATE knob from [`DEFAULT_MAX_STREAMS`] so an operator can allow many streams yet keep the
+/// metric cardinality (the TSDB / scrape cost) independently in check. UNLIKE the `0 = unlimited`
+/// resource caps, an unbounded metric cardinality is the OOM footgun this exists to prevent, so `0`
+/// resolves to (and every value is clamped to) the hard [`crate::registry::MAX_METRIC_STREAM_SERIES`]
+/// backstop — the cap can only LOWER the fold threshold, never unbound it. Default matches
+/// [`DEFAULT_MAX_STREAMS`] so a default deployment gets a per-stream series for every stream it
+/// allows; an edge profile lowers it.
+pub const DEFAULT_MAX_METRIC_STREAMS: usize = 1024;
+
 /// The default idle window after which a fully-caught-up, lease-free NAMED work-group is evicted
 /// from memory (refs #277, #240), in MILLISECONDS. `0` means DISABLED (never evict), the default:
 /// named groups are only just becoming wire-reachable, eviction is a reclaim not a correctness
@@ -3436,7 +3462,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             fsync: LatencyHistogram::default(),
             // The bounded metric registry (#97), from the clock seam; its head and per-consumer
             // floors are seeded from the recovered state after construction.
-            registry: MetricRegistry::new(crate_version(), start_time_unix_seconds, opened_at),
+            registry: MetricRegistry::new(
+                crate_version(),
+                start_time_unix_seconds,
+                opened_at,
+                config.max_metric_streams,
+            ),
             last_dead_lettered: None,
             dlq,
             dlq_config,
@@ -5681,6 +5712,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 if d.deliveries > 1 {
                     self.counters.redelivered = self.counters.redelivered.saturating_add(1);
                 }
+                // Per-stream metric parity (#600): mirror the global delivered bump onto this NAMED
+                // stream's own bounded series (the default stream never reaches this path).
+                self.registry.record_stream_delivered(id.name().as_bytes());
                 return Ok(Poll::Message(d));
             }
             Setup::Scan {
@@ -5752,6 +5786,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                             g.cursor.ack(off);
                         }
                         self.counters.filtered = self.counters.filtered.saturating_add(1);
+                        // Per-stream metric parity (#600): this NAMED stream's own filtered count.
+                        self.registry.record_stream_filtered(id.name().as_bytes());
                         offset += 1;
                         continue;
                     }
@@ -5795,6 +5831,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         if deliveries > 1 {
                             self.counters.redelivered += 1;
                         }
+                        // Per-stream metric parity (#600): this NAMED stream's own delivered count.
+                        self.registry.record_stream_delivered(id.name().as_bytes());
                         return Ok(Poll::Message(Delivery {
                             offset: off,
                             token,
@@ -5857,6 +5895,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         g.cursor.ack(off);
                     }
                     self.counters.filtered = self.counters.filtered.saturating_add(1);
+                    // Per-stream metric parity (#600): this NAMED stream's own filtered count.
+                    self.registry.record_stream_filtered(id.name().as_bytes());
                     if filtered_from.is_none() {
                         filtered_from = Some(offset);
                     }
@@ -5898,6 +5938,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     if deliveries > 1 {
                         self.counters.redelivered += 1;
                     }
+                    // Per-stream metric parity (#600): this NAMED stream's own delivered count.
+                    self.registry.record_stream_delivered(id.name().as_bytes());
                     return Ok(Poll::Message(Delivery {
                         offset: off,
                         token,
@@ -6039,6 +6081,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         self.counters.dead_lettered = self.counters.dead_lettered.saturating_add(1);
         self.last_dead_lettered = Some(off);
+        // Per-stream metric parity (#600): this NAMED stream's own dead-lettered (poison) count.
+        self.registry
+            .record_stream_dead_lettered(id.name().as_bytes());
         // #800: prune this stream's DLQ dedup set below the group's committed watermark — those source
         // offsets can never redeliver or re-poison, bounding the per-group set by the in-flight window.
         if let Some(sink) = self.named_dlq.get_mut(id) {
@@ -6089,6 +6134,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     r.clear_offset(token.offset);
                 }
                 self.counters.acks += 1;
+                // Per-stream metric parity (#600): this NAMED stream's own acked count (the default
+                // stream returned early above, so this only ever records a named stream).
+                self.registry.record_stream_acked(id.name().as_bytes());
                 AckResult::Acked
             }
             AckOutcome::Fenced => AckResult::Fenced,
@@ -10631,6 +10679,7 @@ mod tests {
             disk_full_policy: DiskFullPolicy::DropNew,
             max_groups: DEFAULT_MAX_GROUPS,
             max_streams: DEFAULT_MAX_STREAMS,
+            max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
             // Eviction OFF by default in the shared test config (#277); the eviction tests build a
             // config with a non-zero window explicitly so the golden-path tests stay unaffected.
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
@@ -19527,6 +19576,162 @@ mod tests {
             e.poll_in_stream("orders", "g", 0).unwrap(),
             Poll::Idle
         ));
+    }
+
+    // Collects the per-NAMED-stream consumer metric registry (#600) into a name -> (delivered, acked,
+    // dead_lettered, filtered) map for the wiring assertions below.
+    fn stream_metric_counts<C: ironbus_core::clock::Clock + Clone>(
+        e: &Engine<InMemoryFs, C>,
+    ) -> std::collections::BTreeMap<String, (u64, u64, u64, u64)> {
+        let mut seen = std::collections::BTreeMap::new();
+        e.registry().stream_consumers().for_each_series(
+            |label, delivered, acked, dead_lettered, filtered| {
+                seen.insert(
+                    label.to_string(),
+                    (delivered, acked, dead_lettered, filtered),
+                );
+            },
+        );
+        seen
+    }
+
+    #[test]
+    fn named_stream_deliver_and_ack_record_per_stream_metrics_while_default_stays_global_only() {
+        // #600 (closes the #681 named-stream metrics follow-up): a named stream's deliver + ack bump
+        // ITS OWN per-stream consumer series, while the DEFAULT stream ("") is NEVER labelled — its
+        // global counters stay byte-for-byte unchanged. Every stream still bumps the SHARED global
+        // counters (so the aggregate behavior the default stream contributes to is untouched).
+        let mut e = open(config(10, 5));
+        // Named stream `orders`: produce 2, deliver + ack both.
+        produce_to(&mut e, "orders", b"o0");
+        produce_to(&mut e, "orders", b"o1");
+        let d0 = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(e.ack_in_stream("orders", "g", &d0.token), AckResult::Acked);
+        let d1 = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(e.ack_in_stream("orders", "g", &d1.token), AckResult::Acked);
+        // Default stream "" through the SAME id-routed entry points: produce 1, deliver + ack.
+        produce_to(&mut e, "", b"d0");
+        let dd = message(e.poll_in_stream("", "g", 0).unwrap());
+        assert_eq!(e.ack_in_stream("", "g", &dd.token), AckResult::Acked);
+
+        // The GLOBAL counters count every stream's deliveries/acks exactly as before (default
+        // unchanged): 2 named + 1 default = 3 delivered, 3 acked.
+        let c = e.counters();
+        assert_eq!(
+            c.delivered, 3,
+            "global delivered counts default AND named, unchanged"
+        );
+        assert_eq!(c.acks, 3, "global acks counts default AND named, unchanged");
+
+        // The per-stream registry (#600) has ONLY the NAMED stream's own counts; the default stream is
+        // never given a per-stream series.
+        let seen = stream_metric_counts(&e);
+        assert_eq!(
+            seen.get("orders"),
+            Some(&(2, 2, 0, 0)),
+            "the named stream carries its own delivered/acked"
+        );
+        assert_eq!(
+            seen.get(""),
+            None,
+            "the DEFAULT stream is never labelled per-stream"
+        );
+        assert_eq!(e.registry().stream_consumers().series_len(), 1);
+        assert!(!e.registry().stream_consumers().has_overflow());
+    }
+
+    #[test]
+    fn a_named_stream_filtered_skip_records_a_per_stream_filtered_metric() {
+        // #600: a per-subject filtered consumer on a NAMED stream records the skip in THAT stream's own
+        // `filtered` metric (the per-stream twin of the global `ironbus_filtered_total`).
+        let mut e = open(config(100, 5));
+        // offset 0: a 3-token subject that does NOT match `orders.*`; offset 1: a matching 2-token one.
+        e.produce_in_stream_with_subject(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"skip",
+            },
+            b"orders.audit.x",
+        )
+        .unwrap();
+        e.produce_in_stream_with_subject(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"take",
+            },
+            b"orders.a",
+        )
+        .unwrap();
+        e.set_subject_filter_in_stream("orders", "w", Some("orders.*"))
+            .unwrap();
+        // Drain: the non-match is filtered (skip), the match is delivered + acked.
+        loop {
+            match e.poll_in_stream("orders", "w", 0).unwrap() {
+                Poll::Message(d) => {
+                    assert_eq!(e.ack_in_stream("orders", "w", &d.token), AckResult::Acked);
+                }
+                Poll::Filtered { .. } => {}
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        let seen = stream_metric_counts(&e);
+        assert_eq!(
+            seen.get("orders"),
+            Some(&(1, 1, 0, 1)),
+            "the named stream records 1 delivered, 1 acked, 1 filtered (the skipped non-match)"
+        );
+    }
+
+    #[test]
+    fn a_named_stream_dead_letter_records_a_per_stream_dead_lettered_metric() {
+        // #600: a poison message dead-lettered on a NAMED stream records it in THAT stream's own
+        // `dead_lettered` metric (the per-stream twin of the global `ironbus_dead_lettered_total`).
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 1),
+        )
+        .unwrap();
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"k",
+                headers: b"",
+                payload: b"poison",
+            },
+        )
+        .unwrap();
+        // Attempt 1 delivers within max_deliver = 1; expire the lease; attempt 2 exceeds it and is
+        // dead-lettered (surfaced as Poll::Parked).
+        let _d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        clock.advance_monotonic_nanos(40);
+        assert!(matches!(
+            e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap(),
+            Poll::Parked { .. }
+        ));
+        assert_eq!(
+            e.counters().dead_lettered,
+            1,
+            "the global counter is unchanged"
+        );
+        let seen = stream_metric_counts(&e);
+        assert_eq!(
+            seen.get("orders"),
+            Some(&(1, 0, 1, 0)),
+            "the named stream records 1 delivered (attempt 1) and 1 dead-lettered"
+        );
     }
 
     // A config with an explicit named-stream cap (#863), so a test exercises the bound without

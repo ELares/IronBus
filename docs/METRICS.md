@@ -590,6 +590,43 @@ in a bounded ledger so `*_labels_dropped_total` counts each distinct dropped lab
 label (an O(1) side-index lookup); the registry's memory ceiling now covers the
 throughput series array and its overflow ledger too (signed off below).
 
+### Per-NAMED-stream consumer counters (#600, the #681 named-stream metrics follow-up)
+
+```
+ironbus_stream_delivered_total{stream=...}            message deliveries handed out per NAMED stream (a redelivery counts again)
+ironbus_stream_acked_total{stream=...}                commits via ack per NAMED stream
+ironbus_stream_dead_lettered_total{stream=...}        poison messages dead-lettered per NAMED stream
+ironbus_stream_filtered_total{stream=...}             per-subject filtered-consumer skips per NAMED stream
+ironbus_stream_consumer_labels_dropped_total          distinct streams refused a series at the max_metric_streams cap (folded into __other__)
+```
+
+The per-stream parity of the counters the **default** stream emits globally
+(`ironbus_delivered_total` / `ironbus_acks_total` / `ironbus_dead_lettered_total` /
+`ironbus_filtered_total`), keyed by the NAMED stream. The **DEFAULT stream is never
+labelled here** — its global counters stay byte-for-byte unchanged, and every stream
+still contributes to those globals exactly as before.
+
+**Bounded cardinality (the #600 crux).** Adding a per-stream label must not let an
+unbounded number of stream names explode the series count and OOM the node. Two nested
+bounds enforce it:
+
+- A **configurable** cap, `EngineConfig::max_metric_streams` (default 1024): the first
+  `max_metric_streams` distinct streams each get their own labelled series; every stream
+  past it folds into ONE `{stream="__other__"}` bucket, so the total labelled series is
+  `cap + 1` regardless of how many distinct streams exist. A new over-cap stream bumps
+  `ironbus_stream_consumer_labels_dropped_total` once (never per record).
+- A **hard backstop**, `MAX_METRIC_STREAM_SERIES` (1024): the cap is clamped to it and
+  the series arrays are preallocated at it, so the registry memory is a fixed ceiling
+  even if an operator misconfigures a huge value (the cap can only LOWER the fold
+  threshold, never grow the allocation). Unlike the `0 = unlimited` resource caps, `0`
+  here resolves to the backstop — an unbounded metric cardinality is the exact OOM this
+  bounds.
+
+The `stream` label is a bounded, `__other__`-folded NAME (never a per-message / per-offset
+value), so it is firewall-safe (the #576 allowlist). Recording is allocation-free for an
+existing stream (an O(1) side-index lookup); the registry's memory ceiling covers this
+registry's series array and its overflow ledger too (signed off below).
+
 ### Connection signals — "connz" (#572)
 
 ```
