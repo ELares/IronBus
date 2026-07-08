@@ -87,6 +87,7 @@ fn engine_config_with_credit(consumer_credit: u32, max_in_flight: u32) -> Engine
         max_groups: DEFAULT_MAX_GROUPS,
         // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
         max_streams: 0,
+        max_metric_streams: 1024,
         group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
         disk_full_policy: DiskFullPolicy::DropNew,
         // The RAM-headroom ceiling is off in the bench broker (#118): the bench samples real RSS
