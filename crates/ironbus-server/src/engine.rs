@@ -2721,11 +2721,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// named streams already on disk recover, and a named stream is `declare`d on its first produce.
     ///
     /// The DEFAULT stream `""` is served entirely by [`Engine::log`] above (byte-for-byte today): the
-    /// engine's [`StreamSet`] is opened via [`StreamSet::open_named`] (#681) and holds ONLY named
-    /// streams — it no longer carries a `""` slot at all, so [`Engine::log`] is the SINGLE owner of the
-    /// root and the inert read-only double-open #676 carried is GONE. The default stream's produce /
-    /// consume / durability / recovery / metrics are untouched, and a deployment that never names a
-    /// stream never materializes `streams/`.
+    /// engine NEVER appends to, syncs, or reads the `StreamSet`'s own `""` slot, so the default
+    /// stream's produce / consume / durability / recovery / metrics are untouched and a deployment
+    /// that never names a stream never materializes `streams/` (the `StreamSet`'s `""` slot is an
+    /// inert re-open of the root that is never written — see the scope note in the PR; folding the
+    /// default fully INTO the `StreamSet` is a flagged #681 follow-up).
     ///
     /// The cross-stream group-commit [`StreamSet::commit_tick`] (#678/#564) coordinates the durability
     /// barrier across the DIRTIED named streams: a produce pass touching K named streams commits with
@@ -3099,11 +3099,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if config.max_in_flight == 0 {
             return Err(EngineError::ZeroMaxInFlight);
         }
-        // Open the DEFAULT stream's root log AND the per-named-stream StreamSet substrate (#676, #681).
-        // The root log is opened as the SOLE owner (authoritative recovery: truncating + reporting any
-        // torn tail, byte for byte as before); the StreamSet (`open_named`) recovers only the named
-        // streams under `streams/` and never re-opens the root — the inert `""` double-open #676 carried
-        // is folded away (#681). See [`Engine::open_log_and_streams`].
+        // Open the DEFAULT stream's root log AND the per-named-stream StreamSet substrate (#676). The
+        // root log is opened FIRST so it owns the authoritative recovery (truncating + reporting any
+        // torn tail, byte for byte as before); the StreamSet then re-opens the already-clean root for
+        // its inert `""` slot and recovers the named streams. See [`Engine::open_log_and_streams`].
         let (log, streams) = Self::open_log_and_streams(fs, clock, config.log)?;
 
         // Open (creating if absent) the cursor checkpoint through the log's filesystem.
@@ -3426,20 +3425,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// an append. Pass a [`CompactionConfig`](ironbus_storage::compaction::CompactionConfig) with
     /// `enabled: true` to turn it on; the default is disabled.
     /// Opens the DEFAULT stream's root [`Log`] and the per-NAMED-stream [`StreamSet`] substrate over
-    /// the SAME data directory (#676, #681):
-    ///   1. the root log, from the ORIGINAL `fs`: today's single-log open, which performs the #670
-    ///      layout-marker check and the longest-valid-prefix recovery, TRUNCATING any torn
-    ///      active-segment tail and REPORTING that loss — byte for byte as before. It is the SOLE and
-    ///      authoritative owner of the root, opened EXACTLY ONCE.
-    ///   2. the [`StreamSet`], from a CLONE of `fs`, via [`StreamSet::open_named`]: it recovers each
-    ///      NAMED stream under `streams/` independently and does NOT re-open the root (#681 folds away
-    ///      the inert read-only `""` slot #676 double-opened). The set retains the root filesystem
-    ///      only to root a later `declare`. A data dir with no `streams/` subtree opens with an empty
-    ///      named set and never materializes `streams/`, so the disk image is unchanged.
+    /// the SAME data directory (#676), in the load-bearing ORDER:
+    ///   1. the root log FIRST, from the ORIGINAL `fs`: today's single-log open, which performs the
+    ///      #670 layout-marker check and the longest-valid-prefix recovery, TRUNCATING any torn
+    ///      active-segment tail and REPORTING that loss — byte for byte as before. It owns the
+    ///      authoritative recovery of the root.
+    ///   2. the [`StreamSet`] SECOND, from a CLONE of `fs`: its inert `""` slot is a read-only re-open
+    ///      of the now-already-recovered root that the engine NEVER writes (the default stream is
+    ///      served by the root `Log`), and it recovers each NAMED stream under `streams/`
+    ///      independently. A data dir with no `streams/` subtree opens with only the inert `""` slot
+    ///      and never materializes `streams/`, so the disk image is unchanged.
     ///
-    /// Because the [`StreamSet`] no longer opens the root, the double-open (and the ordering hazard it
-    /// created — a [`StreamSet`] root-open repairing the torn tail before the authoritative open could
-    /// report the loss) is GONE: the root's recovery-loss is reported once, by the single root open.
+    /// The order matters: a [`StreamSet`] open BEFORE the root open would recover (repair) the torn
+    /// tail first, so the root's own open would then find it already clean and report ZERO loss,
+    /// masking the recovery-loss the existing tests (and the loss report) assert. (Folding the default
+    /// fully INTO the [`StreamSet`] to drop the inert duplicate `""` slot is a flagged follow-up: it
+    /// turns out NOT to be inert — the second `Log::open` also trims the root active segment's
+    /// preallocated tail — so the removal needs its own PR that preserves that on-disk shape, #681.)
     ///
     /// # Errors
     /// Propagates a storage error from either open (including the fail-closed layout-version check).
@@ -3454,7 +3456,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let fs_for_streams = fs.clone();
         let log = Log::open(fs, clock.clone(), config)?;
         let (streams, _stream_recoveries) =
-            StreamSet::open_named(&fs_for_streams, clock, config).map_err(EngineError::Storage)?;
+            StreamSet::open(&fs_for_streams, clock, config).map_err(EngineError::Storage)?;
         Ok((log, streams))
     }
 
@@ -5542,10 +5544,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
 
     /// Visit the durable poll frontier (`flushed_offset`) of the DEFAULT stream AND every open NAMED
     /// stream (#1100 L2): calls `f("", head)` first — the ROOT log's authoritative head, exactly what
-    /// [`Engine::flushed_offset`] reports and what a default-stream consumer polls (the engine's
-    /// [`StreamSet`] holds only named streams since #681, so the default head is read straight from
-    /// [`Engine::log`]) — then `f(name, head)` for each named stream in deterministic order via
-    /// [`StreamSet::for_each_named_frontier`]. A pure read used by the append actor's PER-STREAM
+    /// [`Engine::flushed_offset`] reports and what a default-stream consumer polls, since the
+    /// [`StreamSet`]'s own `""` slot is an inert never-written re-open — then `f(name, head)` for each
+    /// named stream in deterministic order. A pure read used by the append actor's PER-STREAM
     /// commit-notify to bump only the cells whose frontier advanced. O(open streams); a default-only
     /// deployment visits exactly one entry, so the common path stays a single atomic head read.
     pub fn for_each_poll_frontier<G: FnMut(&str, u64)>(&self, mut f: G) {
@@ -5553,14 +5554,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.streams.for_each_named_frontier(f);
     }
 
-    /// The number of OPEN named streams (#676), EXCLUDING the default stream: `0` for a deployment
-    /// that never named a stream. Since #681 the engine's [`StreamSet`] is opened via
-    /// [`StreamSet::open_named`] and no longer carries the inert `""` slot, so this is
-    /// [`StreamSet::named_len`] (which filters the default out regardless, staying correct if the set
-    /// is ever built the other way).
+    /// The number of OPEN named streams (#676), EXCLUDING the always-present default stream: `0` for
+    /// a deployment that never named a stream. (The [`StreamSet`] always carries its `""` slot, so we
+    /// subtract it to report the named count an operator cares about.)
     #[must_use]
     pub fn named_stream_count(&self) -> usize {
-        self.streams.named_len()
+        // The StreamSet's `len()` includes its inert default `""` slot; the named count is the rest.
+        self.streams.len().saturating_sub(1)
     }
 
     /// Refuses materializing a NEW named stream once the resident-stream count has reached `max_streams`
