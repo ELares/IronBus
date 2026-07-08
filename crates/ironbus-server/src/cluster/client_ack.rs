@@ -54,6 +54,7 @@ use ironbus_storage::fs::Filesystem;
 use super::ack_level::ClusterAckLevel;
 use super::dataplane::{AckDisposition, FollowerReadOutcome};
 use super::isr::AckReplicatedBody;
+use super::peer_auth::PeerSecurity;
 use super::read_consistency::ReadTier;
 use super::serve::DataPlaneServer;
 
@@ -156,6 +157,13 @@ pub struct ClientAckGate<F: Filesystem, C: Clock> {
     /// fail-closed / never-serve-unconfirmed semantics. Read with `Relaxed` (a single scalar; no other
     /// state is ordered against it).
     confirm_timeout_millis: AtomicU64,
+    /// The peer-wire authentication policy (#1067 Increment 3) for the dirty-tier committed-HW CONFIRM
+    /// mini-link: the confirm dials a PEER data-plane link ([`query_leader_committed_hw`](super::serve::query_leader_committed_hw)),
+    /// so under a `Required` cluster it must SIGN the query and VERIFY the response like every other
+    /// data-plane frame — otherwise a `Required` leader rejects the plain confirm as a downgrade and the
+    /// follower-read fails closed to the clean tier. [`PeerSecurity::disabled`] (the default) is the
+    /// plaintext confirm the in-process tests drive.
+    security: PeerSecurity,
 }
 
 impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
@@ -175,7 +183,21 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
             status: None,
             // PRODUCTION default — the dirty-tier confirm bounds at 500 ms unless overridden (#739).
             confirm_timeout_millis: AtomicU64::new(HW_CONFIRM_DEFAULT_MILLIS),
+            // No peer authentication by default (plaintext confirm); the runtime installs a real policy
+            // via `with_peer_security` on a clustered serve (#1067 Inc 3).
+            security: PeerSecurity::disabled(),
         }
+    }
+
+    /// Install the peer-wire authentication policy (#1067 Increment 3) used for the dirty-tier committed-HW
+    /// CONFIRM mini-link, returning the gate. On a clustered serve the runtime supplies the SAME
+    /// [`PeerSecurity`] the rest of the data-plane wire uses, so the confirm signs/verifies consistently (a
+    /// `Required` leader would otherwise reject the plain confirm as a downgrade). Builder-style; a
+    /// non-cluster broker never builds the gate, so this never runs off-cluster.
+    #[must_use]
+    pub fn with_peer_security(mut self, security: PeerSecurity) -> Self {
+        self.security = security;
+        self
     }
 
     /// Install the node-id -> CLIENT-address advertise map (#735) used to fill the `NOT_LEADER` leader
@@ -589,7 +611,12 @@ impl<F: Filesystem + Clone, C: Clock> ClientAckGate<F, C> {
         // it). `None` on no route / timeout / link error -> fail closed (the clean tier).
         let confirm_timeout = self.confirm_timeout();
         let confirmed_hw = leader_data_addr.and_then(|addr| {
-            super::serve::query_leader_committed_hw(addr, partition, confirm_timeout)
+            super::serve::query_leader_committed_hw(
+                addr,
+                partition,
+                confirm_timeout,
+                &self.security,
+            )
         });
         // RAISE the bar to the confirmed HW (never lower it): the re-serve uses `max(known, confirmed)`,
         // so it serves up to `min(own_flushed, raised_bar)`. On a FAILED confirm `confirmed_hw` is `None`,
