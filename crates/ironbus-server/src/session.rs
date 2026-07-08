@@ -2230,9 +2230,10 @@ impl Session {
                 // A NAMED-stream consumer (#588) routes to the engine's id-routed `poll_in_stream` instead
                 // (its OWN log + per-stream competing work-group, #676/#679), reading the engine's monotonic
                 // `now` inside the job. The named path is plain competing (no key_shared/Tier-S/compaction
-                // this phase, the #676 scope), so it returns only `Poll::Message`/`Poll::Idle`/an error; the
-                // advisory arms below are unreachable for it but cost nothing. The default stream
-                // (`self.stream` empty) is byte-for-byte the existing member-aware poll.
+                // this phase, the #676 scope), so it returns `Poll::Message`/`Poll::Idle`/an error — plus
+                // `Poll::Filtered` for a per-subject filtered named group (#594-B), handled by the same
+                // advisory arm below as the default stream's. The default stream (`self.stream` empty) is
+                // byte-for-byte the existing member-aware poll.
                 let group = self.subscription.clone();
                 let member = self.member_id;
                 let stream = self.stream.clone();
@@ -4249,10 +4250,10 @@ impl Session {
             return Ok(());
         };
         // PER-SUBJECT FILTERED consume (#594, filter_mode == 1): fail-closed on the capability, bind the
-        // subject PATTERN (wildcards allowed) as the work-group's filter, and consume the DEFAULT stream
-        // filtered. Scoped to the default stream this increment (D5); named-stream filtered consume is
-        // #594-B. A pre-#594 client (or one that opted out) can NEVER be silently placed in filtered
-        // mode — it is rejected with a typed error.
+        // subject PATTERN (wildcards allowed) as the work-group's filter, and consume the covering
+        // stream filtered — the DEFAULT stream (#594-A) OR a covering NAMED stream (#594-B). A pre-#594
+        // client (or one that opted out) can NEVER be silently placed in filtered mode — it is rejected
+        // with a typed error.
         if decoded.filter_mode == 1 {
             if !self.subject_filter_enabled {
                 reply_err(
@@ -4267,18 +4268,27 @@ impl Session {
                 reply_err(out, &format!("invalid subject pattern: {e}"));
                 return Ok(());
             }
-            // Store the pattern as the GROUP filter (D3: a per-group property shared by every consumer
-            // in the group, so the durable cursor stays coherent). The DEFAULT stream's group is used.
+            // Resolve the covering NAMED stream from the pattern's bindings and bind the filter on THAT
+            // stream's group (#594-B); a filter not owned by exactly one named stream resolves to the
+            // DEFAULT stream (`""`), keeping the #594-A default-stream path BYTE-FOR-BYTE. The filter is
+            // a per-GROUP property (D3: shared by every consumer in the group, so the durable cursor
+            // stays coherent). Resolve + bind run in ONE actor job.
             let group_owned = group.to_string();
             let pattern_owned = subject.to_string();
-            let set = engine
-                .with(move |e| e.set_subject_filter_in(&group_owned, Some(&pattern_owned)))?;
+            let (resolved_stream, set) = engine.with(move |e| {
+                let stream = e
+                    .covering_named_stream_for_filter(&pattern_owned)
+                    .map_or_else(String::new, |id| id.name().to_string());
+                let set =
+                    e.set_subject_filter_in_stream(&stream, &group_owned, Some(&pattern_owned));
+                (stream, set)
+            })?;
             if let Err(e) = set {
                 reply_err_coded(out, e.code().as_str(), &e.to_string());
                 return Ok(());
             }
-            // Bind this connection's consume path to the DEFAULT stream and the requested work-group.
-            self.stream = GroupName::from("");
+            // Bind this connection's consume path to the resolved stream (`""` = default) + the group.
+            self.stream = GroupName::from(resolved_stream.as_str());
             self.subscription = GroupName::from(group);
             self.registered_subscription = false;
             self.joined_key_shared = false;
@@ -4523,9 +4533,10 @@ fn resolve_then_produce<F: Filesystem + Clone, C: Clock + Clone>(
     let stream = resolve_subject_cached(engine, cache, subject)?;
     // Route the append to the resolved stream's log via the id-routed produce (the default stream `""`
     // routes byte-for-byte through `produce`; a named stream appends to its own log + commit tick).
-    // The literal subject is PERSISTED with the record (#594) so a per-subject filtered consumer on
-    // the default stream can match it; the subject was validated `Subject::parse_literal` at resolve.
-    // A named stream drops the subject for now (D5 scopes filtered consume to the default stream).
+    // The literal subject is PERSISTED with the record (#594) so a per-subject filtered consumer can
+    // match it — on the default stream (#594-A) AND on the resolved NAMED stream (#594-B); the subject
+    // was validated `Subject::parse_literal` at resolve. `produce_in_stream_with_subject` routes the
+    // subject to whichever log the stream resolved to.
     let view = Append {
         timestamp_ms: append.timestamp_ms,
         flags: RecordFlags::from_bits(append.flags),
@@ -12489,6 +12500,208 @@ mod tests {
             e.engine_mut().stream_head("").get(),
             0,
             "nothing was published"
+        );
+    }
+
+    // =================================================================================
+    // #594-B (V2-M2): per-subject FILTERED consumer on a NAMED stream over the wire. A client binds a
+    // wildcard subtree to a NAMED stream, publishes an interleaved multi-subject stream there, then a
+    // filtered SubSubject (`orders.*`) single-home-resolves the covering NAMED stream and delivers ONLY
+    // matching records with ONE coalesced GapMarker(reason=FILTERED) per skipped run — the named-stream
+    // twin of the #594-A default-stream wire test.
+    // =================================================================================
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_named_stream_filtered_consumer_delivers_only_matches_with_coalesced_gap_markers_over_the_wire(
+    ) {
+        let (e, mut s, mut out) = connect_filtered();
+        // Bind the subtree `orders.>` to the NAMED stream "orders" (this also DECLARES it). Every
+        // `orders.*`/`orders.*.*` publish now single-homes to "orders".
+        let mut bind = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: b"orders",
+                pattern: b"orders.>",
+            },
+            &mut bind,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "bind to named stream");
+        out.clear();
+
+        // A PubSubject frame builder (subject-addressed -> resolves to "orders" via the binding).
+        let ps = |subject: &[u8], payload: &[u8]| -> Vec<u8> {
+            let mut p = Vec::new();
+            ironbus_proto::message::encode_pub_subject(
+                &ironbus_proto::message::PubSubjectBody {
+                    subject,
+                    pub_body: &pub_body(payload),
+                },
+                &mut p,
+            )
+            .unwrap();
+            frame(FrameType::PubSubject, &p)
+        };
+        // Publish an INTERLEAVED multi-subject stream on the NAMED stream (offsets 0..6 on "orders"):
+        // MATCH, non (3-token), plain PubTo (no subject -> non-matching by D2), MATCH, non, MATCH.
+        for f in [
+            ps(b"orders.a", b"A"),       // 0 MATCH
+            ps(b"orders.audit.x", b"X"), // 1 non-match (3 tokens)
+        ] {
+            s.process(&e, &f, &mut out).unwrap();
+            assert_eq!(one_response(&out).0, FrameType::PubAck);
+            out.clear();
+        }
+        // An explicit-id PubTo to "orders" lands there with NO subject -> non-matching by D2.
+        let mut pubto = Vec::new();
+        ironbus_proto::message::encode_pub_to(
+            &ironbus_proto::message::PubToBody {
+                stream_id: b"orders",
+                pub_body: &pub_body(b"P"),
+            },
+            &mut pubto,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::PubTo, &pubto), &mut out)
+            .unwrap(); // 2 subject-less
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        out.clear();
+        for f in [
+            ps(b"orders.b", b"B"),       // 3 MATCH
+            ps(b"orders.audit.y", b"Y"), // 4 non-match
+            ps(b"orders.c", b"C"),       // 5 MATCH
+        ] {
+            s.process(&e, &f, &mut out).unwrap();
+            assert_eq!(one_response(&out).0, FrameType::PubAck);
+            out.clear();
+        }
+        assert_eq!(
+            e.engine_mut().stream_head("orders").get(),
+            6,
+            "all six landed on the named stream"
+        );
+        assert_eq!(
+            e.engine_mut().stream_head("").get(),
+            0,
+            "the default stream is untouched"
+        );
+
+        // FILTERED subscribe: pattern `orders.*`, filter_mode = 1. It single-home-resolves the covering
+        // NAMED stream ("orders") and binds the filter on THAT stream's group.
+        let mut subsub = Vec::new();
+        ironbus_proto::message::encode_sub_subject(
+            &ironbus_proto::message::SubSubjectBody {
+                subject: b"orders.*",
+                group: b"w",
+                filter_mode: 1,
+            },
+            &mut subsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubSubject, &subsub), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "filtered named subscribe accepted"
+        );
+        out.clear();
+        assert_eq!(
+            e.engine_mut().subject_filter_in_stream("orders", "w"),
+            Some("orders.*"),
+            "the pattern became the NAMED stream group's filter"
+        );
+        assert_eq!(
+            e.engine_mut().subject_filter_in("w"),
+            None,
+            "the DEFAULT stream group was NOT bound a filter (the divert went to the named stream)"
+        );
+
+        // A Flow drains the filtered NAMED subscription: only the matching subjects are delivered, with
+        // ONE coalesced GapMarker(reason=FILTERED) per run of skipped offsets.
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let frames = decode_all(&out);
+        let payloads: Vec<Vec<u8>> = frames
+            .iter()
+            .filter(|(t, _)| *t == FrameType::Deliver)
+            .map(|(_, b)| decode_deliver(b).unwrap().payload.to_vec())
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            "only records whose subject matched were delivered off the named stream: {frames:?}"
+        );
+        let markers: Vec<_> = frames
+            .iter()
+            .filter(|(t, _)| *t == FrameType::GapMarker)
+            .map(|(_, b)| ironbus_proto::message::decode_gap_marker(b).unwrap())
+            .collect();
+        assert_eq!(
+            markers.len(),
+            2,
+            "ONE coalesced gap marker per skipped run: {frames:?}"
+        );
+        assert!(
+            markers
+                .iter()
+                .all(|m| m.reason == ironbus_proto::message::gap_reason::FILTERED),
+            "each skip marker carries reason FILTERED"
+        );
+        assert_eq!((markers[0].from, markers[0].to), (1, 3), "first run [1,3)");
+        assert_eq!((markers[1].from, markers[1].to), (4, 5), "second run [4,5)");
+        // The three skipped offsets (1, 2, 4) were committed-past by the filter on the NAMED stream.
+        assert_eq!(
+            e.engine_mut().counters().filtered,
+            3,
+            "three offsets filtered on the named stream"
+        );
+    }
+
+    #[test]
+    fn a_filtered_named_sub_subject_without_the_capability_is_fail_closed_rejected_over_the_wire() {
+        // A streams-capable client that did NOT advertise wants_subject_filter is REFUSED a filtered
+        // SubSubject EVEN WHEN a covering NAMED binding exists — the capability gate precedes the
+        // covering-stream resolution, so resolution can never bypass fail-closed.
+        let (e, mut s, mut out) = connect_streams(); // streams but NOT subject-filter
+        let mut bind = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: b"orders",
+                pattern: b"orders.>",
+            },
+            &mut bind,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+            .unwrap();
+        out.clear();
+        let mut subsub = Vec::new();
+        ironbus_proto::message::encode_sub_subject(
+            &ironbus_proto::message::SubSubjectBody {
+                subject: b"orders.*",
+                group: b"w",
+                filter_mode: 1,
+            },
+            &mut subsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubSubject, &subsub), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "a filtered subscribe without the capability is rejected on the named path too"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("not negotiated"));
+        assert_eq!(
+            e.engine_mut().subject_filter_in_stream("orders", "w"),
+            None,
+            "no filter was bound on the named stream by the rejected subscribe"
         );
     }
 

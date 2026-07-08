@@ -472,6 +472,31 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
         }
     }
 
+    /// The subject-storing twin of [`append_to`](StreamSet::append_to) (#594-B): routes one append to
+    /// stream `id` ALSO persisting `subject` as the record's optional subject field, so a per-subject
+    /// filtered consumer on a NAMED stream can match it. An EMPTY `subject` is byte-for-byte
+    /// [`append_to`](StreamSet::append_to) (the subject rides its own frame field with its own CRC and
+    /// never enters the body-compression path). The caller validated the subject grammar at the wire
+    /// boundary.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] wrapping a `NotFound` if `id` is not an open stream (declare it
+    /// first), else propagates the underlying [`Log::append_with_subject`] [`StorageError`] unchanged.
+    pub fn append_to_with_subject(
+        &mut self,
+        id: &StreamId,
+        record: &Append<'_>,
+        subject: &[u8],
+    ) -> Result<Offset, StorageError> {
+        match self.streams.get_mut(id) {
+            Some(log) => log.append_with_subject(record, subject),
+            None => Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("stream {:?} is not open (declare it first)", id.name()),
+            ))),
+        }
+    }
+
     /// Reads up to `max_records` records (and at most `max_bytes` encoded frame bytes, if set) from
     /// stream `id` starting at `start`, routing the read to that stream's log. Returns an empty vec
     /// for an unopened stream is NOT done — an unopened stream is an error, so a typo'd id is not
@@ -818,6 +843,43 @@ mod tests {
         assert_eq!(o.len(), 2);
         assert_eq!(&*o[0].payload, b"orders-0");
         assert_eq!(&*o[1].payload, b"orders-1");
+    }
+
+    /// `append_to_with_subject` persists the record's subject field on a NAMED stream and it round-trips
+    /// through a reopen (#594-B); an EMPTY subject is byte-for-byte the subject-less `append_to`.
+    #[test]
+    fn append_to_with_subject_round_trips_on_a_named_stream_and_survives_reopen() {
+        let fs = InMemoryFs::new();
+        let orders = StreamId::named("orders").unwrap();
+        {
+            let (mut set, _) = open(&fs);
+            set.declare(&orders).unwrap();
+            // A subject-bearing append, a subject-less one (empty subject == append_to), another subject.
+            set.append_to_with_subject(&orders, &rec(b"A"), b"orders.a")
+                .unwrap();
+            set.append_to_with_subject(&orders, &rec(b"P"), b"")
+                .unwrap();
+            set.append_to_with_subject(&orders, &rec(b"B"), b"orders.b")
+                .unwrap();
+            set.sync_all().unwrap();
+        }
+        // Reopen and read back: the stored subject rides the frame and recovers with the record.
+        let (set, _) = open(&fs);
+        let o = set.read_range(&orders, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(o.len(), 3);
+        assert_eq!(
+            (&*o[0].payload, &*o[0].subject),
+            (&b"A"[..], &b"orders.a"[..])
+        );
+        assert_eq!(
+            (&*o[1].payload, &*o[1].subject),
+            (&b"P"[..], &b""[..]),
+            "an empty subject stores a subject-less record"
+        );
+        assert_eq!(
+            (&*o[2].payload, &*o[2].subject),
+            (&b"B"[..], &b"orders.b"[..])
+        );
     }
 
     /// Reopening recovers EVERY stream independently with its own durable data.

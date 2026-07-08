@@ -2689,6 +2689,55 @@ impl BindingTable {
     }
 }
 
+/// Whether every literal subject matched by `filter` is ALSO matched by `binding` (#594-B): the
+/// pattern-SUBSET test that resolves a filtered subscribe's covering stream. Both are #567 patterns
+/// (`*` = any one token, a final `>` = one-or-more trailing tokens). Token-aligned, mirroring
+/// [`SubjectPattern::matches`] but with a PATTERN on the subject side:
+///   - `binding` `>` covers one-or-more remaining tokens, so it covers the filter iff the filter has
+///     at least one token left (the same one-or-more rule `matches` applies to a literal subject);
+///   - a `filter` `>` matches arbitrarily-long tails, which a `binding` single token (`*` or literal)
+///     cannot cover — only a `binding` `>` does (handled above), so a filter `>` opposite a non-`>`
+///     binding token is NOT covered;
+///   - `binding` `*` covers ANY single filter token (literal or `*`); a `binding` literal covers ONLY
+///     the identical filter literal (a filter `*` there would match tokens the literal does not, so it
+///     is not covered);
+///   - with neither trailing `>`, the token counts must be equal (a shorter filter matches subjects
+///     the longer binding does not, and vice-versa).
+///
+/// So `orders.* ⊆ orders.>` and `orders.* ⊆ orders.*` are covered; `orders.created.* ⊄ orders.*` and
+/// `svc.orders.* ⊄ svc.*.created` are not.
+// The `Some(">")` and `None` filter arms below share a body (`return false`) but are DISTINCT cases —
+// a filter `>` opposite a single binding token vs. a filter that ran out of tokens — and must stay
+// ORDERED (the `Some(">")` guard must precede the `Some(ft)` catch-all, else a filter `>` would be
+// mis-handled as an ordinary token). Kept separate for clarity; merging them would reorder incorrectly.
+#[allow(clippy::match_same_arms)]
+fn filter_covered_by_binding(filter: &SubjectPattern<'_>, binding: &SubjectPattern<'_>) -> bool {
+    let mut f = filter.tokens();
+    let mut b = binding.tokens();
+    loop {
+        match b.next() {
+            // A binding `>` (grammar-guaranteed final) covers one-or-more remaining tokens: covered iff
+            // the filter still has at least one token to be covered.
+            Some(">") => return f.next().is_some(),
+            Some(bt) => match f.next() {
+                // A filter `>` matches longer tails than any single binding token can cover.
+                Some(">") => return false,
+                // Binding `*` covers any single filter token; a binding literal covers only its twin.
+                Some(ft) => {
+                    if bt != "*" && bt != ft {
+                        return false;
+                    }
+                }
+                // Filter exhausted but the binding needs another (non-`>`) token: the filter matches
+                // shorter subjects the binding does not.
+                None => return false,
+            },
+            // Binding exhausted (no trailing `>`): covered iff the filter is also exhausted.
+            None => return f.next().is_none(),
+        }
+    }
+}
+
 struct NamedStream {
     /// This stream's competing work-groups, keyed by group name, byte-for-byte the SAME machinery
     /// as the default stream's [`Engine::groups`] — independent per stream so the same group NAME
@@ -4473,11 +4522,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     }
 
     /// The subject-storing variant of [`Engine::produce_in_stream`] (#594): persists `subject` as the
-    /// record's optional subject field on the DEFAULT stream so a per-subject filtered consumer can
-    /// match it. This increment scopes filtered consume to the default stream (D5), so a NAMED stream
-    /// falls back to the existing subject-less named-stream append (the subject is not stored there —
-    /// a named-stream filtered consume is a flagged follow-up, #594-B). The default stream ("") routes
-    /// to [`Engine::produce_with_subject`].
+    /// record's optional subject field so a per-subject filtered consumer can match it — on the DEFAULT
+    /// stream (#594-A) AND on a NAMED stream (#594-B). The default stream ("") routes to
+    /// [`Engine::produce_with_subject`]; a named stream appends via the subject-aware
+    /// [`StreamSet::append_to_with_subject`] so its own log carries the subject field, then commits with
+    /// the same cross-stream group-commit tick. An EMPTY `subject` is byte-for-byte the subject-less
+    /// named append (a plain `PubTo` leaves the record subject-less, treated as non-matching, D2).
     ///
     /// # Errors
     /// Same as [`Engine::produce_in_stream`].
@@ -4516,13 +4566,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .entry(id.clone())
             .or_insert_with(NamedStream::new);
         // Append to THIS stream's log (a single-`Log` append; appending to X never touches Y, so
-        // per-record cost stays flat as streams grow), then make it durable with the cross-stream
+        // per-record cost stays flat as streams grow), PERSISTING the subject (#594-B) so a filtered
+        // consumer on this named stream can match it, then make it durable with the cross-stream
         // group-commit tick. The tick syncs ONLY the dirtied streams; because the engine never
         // dirties the StreamSet's `""` slot (the default stream lives on `self.log`), the default
-        // stream's durability is entirely unaffected.
+        // stream's durability is entirely unaffected. An empty `subject` is byte-for-byte the
+        // historical subject-less named append.
         let offset = self
             .streams
-            .append_to(&id, message)
+            .append_to_with_subject(&id, message, subject)
             .map_err(EngineError::Storage)?;
         // Per-stream PRODUCE throughput (#571): one record produced to THIS named stream, keyed by its
         // name (bounded + overflow-folded so an unbounded stream cardinality cannot OOM the node). The
@@ -5384,10 +5436,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// is that stream's durable head. Re-instantiates the SAME primitives the default stream uses —
     /// the [`AckCursor`], the [`LeaseTable`] claim/ack, the 0/1/2-ack disposition — per stream.
     ///
+    /// PER-SUBJECT FILTER (#594-B): when the group carries a subject filter (bound via
+    /// [`Engine::set_subject_filter_in_stream`]) this applies the SAME mechanism the default stream's
+    /// [`Engine::poll_in`] uses — a non-matching record is committed PAST without delivery (its lease
+    /// released, the DURABLE per-stream cursor advanced, #681), each run of skips coalesced into ONE
+    /// `Poll::Filtered`, and the match that ends a run STASHED so the next poll delivers it with no
+    /// second read (`WorkGroup::pending_match`). An unfiltered group takes none of these branches, so
+    /// the historical named-stream scan is byte-for-byte unchanged.
+    ///
     /// Each iteration resolves the group in its OWN scoped borrow: the per-record log read borrows
     /// `&self.streams` (a field DISJOINT from `self.named_streams`), so a persistent group borrow held
     /// across the read would be a borrow conflict; resolving the group fresh per use keeps the borrows
     /// non-overlapping. `id`/`group` are guaranteed present by the caller, so the lookups never miss.
+    #[allow(clippy::too_many_lines)]
     fn deliver_from_named_stream(
         &mut self,
         id: &StreamId,
@@ -5395,15 +5456,51 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         now: u64,
         flushed: u64,
     ) -> Result<Poll, EngineError> {
-        // Stamp the polled group active and read its committed cursor in a SHORT scoped borrow, so the
-        // borrow ends before the loop re-borrows `self.named_streams` per iteration.
-        let Some(committed) = self.named_group_mut(id, group).map(|g| {
-            g.last_activity = now;
-            g.touched = true;
-            g.cursor.committed().get()
-        }) else {
-            return Ok(Poll::Idle);
+        // Stamp the polled group active, DRAIN any stashed filtered match (#594-B), and read its
+        // committed cursor + clone its filter, all in a SHORT scoped borrow so the borrow ends before
+        // the loop re-borrows `self.named_streams` / `self.streams` per iteration. A stashed match sits
+        // at (or above) `committed`, so it is drained BEFORE anything else, exactly as `poll_in` does.
+        enum Setup {
+            Stashed(Delivery),
+            Scan {
+                committed: u64,
+                filter: Option<String>,
+            },
+        }
+        let setup = match self.named_group_mut(id, group) {
+            None => return Ok(Poll::Idle),
+            Some(g) => {
+                g.last_activity = now;
+                g.touched = true;
+                if let Some(d) = g.pending_match.take() {
+                    Setup::Stashed(d)
+                } else {
+                    Setup::Scan {
+                        committed: g.cursor.committed().get(),
+                        filter: g.filter.clone(),
+                    }
+                }
+            }
         };
+        let (committed, filter_str) = match setup {
+            Setup::Stashed(d) => {
+                // Zero-read delivery of the match a prior filtered scan parked after flushing its gap.
+                self.counters.delivered = self.counters.delivered.saturating_add(1);
+                if d.deliveries > 1 {
+                    self.counters.redelivered = self.counters.redelivered.saturating_add(1);
+                }
+                return Ok(Poll::Message(d));
+            }
+            Setup::Scan { committed, filter } => (committed, filter),
+        };
+        // The group's subject pattern, PARSED once (the clone above is a short pattern string, once per
+        // poll). `None` (unfiltered) leaves the scan byte-for-byte the historical named path.
+        // `filtered_from` accumulates the START of the current run of skipped (non-matching) offsets,
+        // coalesced into ONE `Poll::Filtered` at the next match or the window end.
+        let filter = filter_str
+            .as_deref()
+            .and_then(|p| SubjectPattern::parse(p).ok());
+        let mut filtered_from: Option<u64> = None;
         // The delivery window: at most `max_in_flight` offsets above the committed cursor, never past
         // the durable end — the SAME window as the default-stream poll.
         let window_end = committed
@@ -5439,6 +5536,54 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             let Some(record) = record.into_iter().next() else {
                 return Err(EngineError::MissingRecord { offset });
             };
+            // PER-SUBJECT FILTER (#594-B): a filtered group delivers ONLY records whose stored subject
+            // matches. A non-match (or a subject-less record, D2) is committed past WITHOUT delivery
+            // (release the lease, advance the DURABLE cursor, #681) and its skip accumulated; a MATCH
+            // that ends a pending run flushes ONE coalesced `Poll::Filtered` and STASHES the match for
+            // the next poll — reusing the exact `poll_in` machinery so the named path never re-reads a
+            // record (no re-scan cliff). An unfiltered group skips this whole block.
+            if let Some(pattern) = filter.as_ref() {
+                if !Self::record_matches_subject_filter(pattern, &record) {
+                    if let Some(g) = self.named_group_mut(id, group) {
+                        g.leases.ack(&token);
+                        g.cursor.ack(off);
+                    }
+                    self.counters.filtered = self.counters.filtered.saturating_add(1);
+                    if filtered_from.is_none() {
+                        filtered_from = Some(offset);
+                    }
+                    offset += 1;
+                    continue;
+                }
+                if let Some(from) = filtered_from.take() {
+                    // Flush the coalesced skip run BEFORE delivering this match. STASH the already-read,
+                    // already-leased match for the next poll (a `Deliver` disposition) so it is not read
+                    // twice; a rare `DeadLetter` match releases its lease and is re-derived after the gap
+                    // (the poison path stays the normal named DeadLetter arm below). Either way surface
+                    // the gap span `[from, off)` now.
+                    match self.delivery.disposition(deliveries) {
+                        Disposition::Deliver => {
+                            if let Some(g) = self.named_group_mut(id, group) {
+                                g.pending_match = Some(Delivery {
+                                    offset: off,
+                                    token,
+                                    deliveries,
+                                    record,
+                                });
+                            }
+                        }
+                        Disposition::DeadLetter => {
+                            if let Some(g) = self.named_group_mut(id, group) {
+                                g.leases.ack(&token);
+                            }
+                        }
+                    }
+                    return Ok(Poll::Filtered {
+                        from: Offset::new(from),
+                        to: off,
+                    });
+                }
+            }
             match self.delivery.disposition(deliveries) {
                 Disposition::Deliver => {
                     self.counters.delivered += 1;
@@ -5464,6 +5609,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     offset += 1;
                 }
             }
+        }
+        // Flush a coalesced FILTERED-skip run that reached the window end (#594-B): the durable per-
+        // stream cursor was already advanced past `[filtered_from, offset)`, so surface ONE
+        // `Poll::Filtered` for the whole run. (No `sync_consumer_lag` here: the default-stream lag
+        // registry is not keyed by named-stream groups; the named cursor's durability is #681's.)
+        if let Some(from) = filtered_from {
+            return Ok(Poll::Filtered {
+                from: Offset::new(from),
+                to: Offset::new(offset),
+            });
         }
         Ok(Poll::Idle)
     }
@@ -8660,6 +8815,118 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.groups.get(group).and_then(|g| g.filter.as_deref())
     }
 
+    /// The NAMED-stream twin of [`Engine::set_subject_filter_in`] (#594-B): binds a per-subject FILTER
+    /// `pattern` to `group` OF the named `stream` (or clears it, `None`). The filter lives on that
+    /// stream's OWN [`WorkGroup`] (the same per-group property as the default stream, D3), so
+    /// [`Engine::deliver_from_named_stream`] delivers only the stream's records whose stored subject
+    /// matches and coalesces each run of skipped offsets into one `Poll::Filtered`. Like the default
+    /// setter it re-applies the mode server-side after open (never restored from disk); the per-stream
+    /// CURSOR, however, is durable (#681), so a resumed filtered group resumes past the offsets it
+    /// already filtered. It creates the stream's group if absent (validating the name and the PER-STREAM
+    /// group cap) and mirrors the named stream's consumer state; the named `stream` must already be a
+    /// resident stream (declared via produce/bind), else this is an [`EngineError::UnknownStream`].
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed named name, [`EngineError::UnknownStream`] for
+    /// a never-declared stream, [`EngineError::InvalidGroupName`] for a malformed group name,
+    /// [`EngineError::TooManyGroups`] if a new group would exceed the per-stream cap, or
+    /// [`EngineError::InvalidSubject`] for a malformed pattern.
+    pub fn set_subject_filter_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        pattern: Option<&str>,
+    ) -> Result<(), EngineError> {
+        // The default stream routes to the default-group setter BYTE-FOR-BYTE (#594-A), so a caller that
+        // resolves the covering stream to `""` gets exactly the historical default-stream filter bind.
+        if stream.is_empty() {
+            return self.set_subject_filter_in(group, pattern);
+        }
+        // Validate the pattern BEFORE creating the group, so a bad pattern never mints a group.
+        if let Some(p) = pattern {
+            SubjectPattern::parse(p).map_err(EngineError::InvalidSubject)?;
+        }
+        let id = StreamId::named(stream)?;
+        // The stream must be resident (its log open) before a filtered group can bind to it — a filter
+        // on an unknown stream is a typed reject, never a silent bind to a stream that does not exist.
+        if self.streams.get(&id).is_none() {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        validate_group_name(group)?;
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        let lease_config = self.lease_config;
+        let max_groups = self.max_groups;
+        let named = self
+            .named_streams
+            .entry(id)
+            .or_insert_with(NamedStream::new);
+        if !named.groups.contains_key(group) {
+            if max_groups != 0 && named.groups.len() >= max_groups {
+                return Err(EngineError::TooManyGroups { max: max_groups });
+            }
+            named
+                .groups
+                .insert(group.to_string(), WorkGroup::new(lease_config, now));
+        }
+        if let Some(g) = named.groups.get_mut(group) {
+            g.filter = pattern.map(str::to_string);
+        }
+        Ok(())
+    }
+
+    /// The bound per-subject filter pattern for `group` of the named `stream` (#594-B), or `None` for an
+    /// unfiltered/unknown group or stream. The named twin of [`Engine::subject_filter_in`], for tests
+    /// and observability. The default stream (`""`) reads the default-group filter.
+    #[must_use]
+    pub fn subject_filter_in_stream(&self, stream: &str, group: &str) -> Option<&str> {
+        if stream.is_empty() {
+            return self.subject_filter_in(group);
+        }
+        let id = StreamId::named(stream).ok()?;
+        self.named_streams
+            .get(&id)
+            .and_then(|s| s.groups.get(group))
+            .and_then(|g| g.filter.as_deref())
+    }
+
+    /// Resolves a filtered subscribe's covering NAMED stream from its subject `pattern` (#594-B): the
+    /// single named stream whose subject bindings COVER the filter (every literal subject the filter
+    /// could match is bound to that one stream), or `None` when the filter is not owned by exactly one
+    /// named stream. `None` keeps the caller on the DEFAULT-stream filtered path (#594-A), so a filter
+    /// bound to `""` (or to no stream, or ambiguously to two), stays byte-for-byte the historical
+    /// default-stream behavior — never a silent divert.
+    ///
+    /// The wire `SubSubject` carries no stream id (its body is unchanged), so the covering stream is
+    /// derived here from the routing bindings. `Subject::parse_literal` rejects a wildcard, so the
+    /// literal-matching routing trie cannot resolve a wildcard filter; instead this reduces the binding
+    /// registry directly: a binding `(bp -> stream)` COVERS the filter iff every subject the filter
+    /// matches also matches `bp` (a pattern-subset test, [`filter_covered_by_binding`]). Distinct
+    /// covering streams are single-home reduced — exactly one NAMED stream routes there, otherwise the
+    /// default path is kept (conservative: zero/ambiguous/default all fall back, never a wrong divert).
+    #[must_use]
+    pub fn covering_named_stream_for_filter(&self, pattern: &str) -> Option<StreamId> {
+        let filter = SubjectPattern::parse(pattern).ok()?;
+        // Collect the DISTINCT streams whose bound pattern covers the filter (a stream may cover it via
+        // several of its own patterns — count it once, so its own overlap is not spuriously ambiguous).
+        let mut covering: Vec<StreamId> = Vec::new();
+        for (bp, stream) in &self.bindings.entries {
+            let Ok(binding) = SubjectPattern::parse(bp) else {
+                continue;
+            };
+            if filter_covered_by_binding(&filter, &binding) && !covering.contains(stream) {
+                covering.push(stream.clone());
+            }
+        }
+        // Single-home: divert to a NAMED stream ONLY when it is the sole covering stream. Zero, two-or-
+        // more, or a sole DEFAULT (`""`) covering stream all return `None` (keep the #594-A path).
+        match covering.as_slice() {
+            [one] if !one.name().is_empty() => Some(one.clone()),
+            _ => None,
+        }
+    }
+
     /// Serves a Tier-S STREAMING fetch (#544, M1-I7): a CONTIGUOUS batch of records starting at the
     /// consumer-managed `start_offset`, bounded by `max_records` / `max_bytes` and the flushed
     /// frontier — with NO lease grant, NO generation fence, and NO per-record cursor write. This is the
@@ -11202,6 +11469,167 @@ mod tests {
             "  filtered/unfiltered scan-cost ratio: {:.2}x (claim: ~= 1.0, no re-scan cliff)",
             filtered.as_secs_f64() / unfiltered.as_secs_f64()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_named_stream_subject_filtered_group_delivers_only_matches_and_survives_restart() {
+        // #594-B (V2-M2): the named-stream twin of the default-stream filtered-consumer test. An
+        // interleaved multi-subject NAMED stream plus an `orders.*` group filter delivers ONLY matching
+        // records, coalesces each run of skipped offsets into ONE Poll::Filtered, advances the stream's
+        // DURABLE per-group cursor (#681) past the filtered offsets, and — after a checkpoint + reopen —
+        // never re-delivers or re-filters them (the durable cursor survived the restart).
+        fn ps(e: &mut Engine<InMemoryFs, ManualClock>, subject: &[u8], payload: &[u8]) {
+            e.produce_in_stream_with_subject(
+                "orders",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                },
+                subject,
+            )
+            .unwrap();
+        }
+        let mut e = open(config(100, 5));
+        // offsets 0..6 on the NAMED stream "orders": MATCH, non, plain (no subject -> non-matching by
+        // D2), MATCH, non, MATCH.
+        ps(&mut e, b"orders.a", b"A"); // 0 MATCH
+        ps(&mut e, b"orders.audit.x", b"X"); // 1 non-match (3 tokens)
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"P",
+            },
+        )
+        .unwrap(); // 2 plain named publish, NO stored subject -> non-matching (D2)
+        ps(&mut e, b"orders.b", b"B"); // 3 MATCH
+        ps(&mut e, b"orders.audit.y", b"Y"); // 4 non-match
+        ps(&mut e, b"orders.c", b"C"); // 5 MATCH
+
+        // The named stream carries all 6; the DEFAULT stream is untouched (cross-stream isolation).
+        assert_eq!(e.stream_head("orders").get(), 6);
+        assert_eq!(
+            e.stream_head("").get(),
+            0,
+            "the default stream is untouched"
+        );
+
+        e.set_subject_filter_in_stream("orders", "w", Some("orders.*"))
+            .unwrap();
+        assert_eq!(e.subject_filter_in_stream("orders", "w"), Some("orders.*"));
+
+        // Drain the filtered NAMED group, acking matches and collecting the coalesced skip spans.
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        loop {
+            match e.poll_in_stream("orders", "w", 0).unwrap() {
+                Poll::Message(d) => {
+                    delivered.push(d.record.payload.to_vec());
+                    assert_eq!(e.ack_in_stream("orders", "w", &d.token), AckResult::Acked);
+                }
+                Poll::Filtered { from, to } => {
+                    assert!(from.get() < to.get(), "a filtered span is non-empty");
+                    spans.push((from.get(), to.get()));
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            delivered,
+            vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            "only records whose subject matched `orders.*` were delivered on the named stream"
+        );
+        // ONE coalesced span per run of skips: [1,3) covers the 3-token audit record AND the
+        // subject-less plain publish; [4,5) covers the second audit record.
+        assert_eq!(spans, vec![(1, 3), (4, 5)]);
+        // Every skip is accounted, never silently dropped: 3 filtered offsets (1, 2, 4).
+        assert_eq!(e.counters().filtered, 3);
+        // The DURABLE named-stream group cursor advanced PAST the filtered offsets to the head.
+        assert_eq!(e.committed_offset_in_stream("orders", "w"), Offset::new(6));
+        // The DEFAULT stream's group never saw any of this (cross-stream isolation).
+        assert_eq!(e.committed_offset_in("w"), Offset::ZERO);
+
+        // Persist the named cursor and REOPEN: the filtered advance must survive the restart, leaning
+        // on the #681 durable per-stream cursor.
+        e.checkpoint_in_stream("orders", "w").unwrap();
+        let fs = e.into_filesystem();
+        let mut e = Engine::open(fs, ManualClock::new(), config(100, 5)).unwrap();
+        assert_eq!(
+            e.committed_offset_in_stream("orders", "w"),
+            Offset::new(6),
+            "the filtered named-stream cursor survived the restart"
+        );
+        // The filter is in-memory (re-applied server-side after open, like the default stream); a real
+        // reconnect re-sends it. Re-set it and confirm the group is caught up (no re-delivery, no
+        // re-skip of the already-consumed prefix).
+        e.set_subject_filter_in_stream("orders", "w", Some("orders.*"))
+            .unwrap();
+        assert!(
+            matches!(e.poll_in_stream("orders", "w", 0).unwrap(), Poll::Idle),
+            "nothing is re-delivered or re-filtered on the named stream after the restart"
+        );
+    }
+
+    #[test]
+    fn filter_covered_by_binding_is_the_pattern_subset_relation() {
+        // #594-B: the covering-stream resolver's pattern-subset test — every subject the FILTER matches
+        // is also matched by the BINDING. Drives which named stream a filtered subscribe routes to.
+        fn covered(filter: &str, binding: &str) -> bool {
+            filter_covered_by_binding(
+                &SubjectPattern::parse(filter).unwrap(),
+                &SubjectPattern::parse(binding).unwrap(),
+            )
+        }
+        // A `>` binding covers any filter under its prefix (the common "stream owns a subtree" case).
+        assert!(covered("orders.*", "orders.>"));
+        assert!(covered("orders.created.*", "orders.>"));
+        assert!(covered("orders.created.>", "orders.>"));
+        assert!(covered("orders.a", "orders.>"));
+        // Identical patterns cover; a `*` binding covers a literal or a `*` at that token.
+        assert!(covered("orders.*", "orders.*"));
+        assert!(covered("orders.created", "orders.*"));
+        // NOT covered: the filter reaches subjects the binding does not.
+        assert!(!covered("orders.created.*", "orders.*")); // 3-token filter, 2-token binding
+        assert!(!covered("svc.orders.*", "svc.*.created")); // svc.orders.deleted escapes the binding
+        assert!(!covered("orders.>", "orders.*")); // `>` tails exceed a single `*`
+        assert!(!covered("orders.*", "orders.created")); // `*` matches tokens a literal does not
+        assert!(!covered("billing.*", "orders.>")); // disjoint prefix
+        assert!(!covered("orders", "orders.>")); // `>` needs >=1 trailing token
+    }
+
+    #[test]
+    fn covering_named_stream_for_filter_resolves_single_home_else_default() {
+        // #594-B: the resolver diverts a filtered subscribe to a NAMED stream ONLY when exactly one
+        // named stream's bindings cover the filter; zero / ambiguous / a default-bound cover all keep
+        // the #594-A default-stream path (returns `None`).
+        let mut e = open(config(100, 5));
+        // No bindings yet: unresolvable -> default path.
+        assert_eq!(e.covering_named_stream_for_filter("orders.*"), None);
+        // Bind `orders.>` to the NAMED stream "orders": `orders.*` is now covered by exactly it.
+        e.bind_subject("orders", "orders.>").unwrap();
+        assert_eq!(
+            e.covering_named_stream_for_filter("orders.*")
+                .as_ref()
+                .map(StreamId::name),
+            Some("orders")
+        );
+        // A filter no named binding covers -> default path.
+        assert_eq!(e.covering_named_stream_for_filter("billing.*"), None);
+        // Bind the SAME subtree to a SECOND named stream: now `orders.*` is ambiguous -> default path.
+        e.bind_subject("orders-mirror", "orders.>").unwrap();
+        assert_eq!(e.covering_named_stream_for_filter("orders.*"), None);
+        // A filter covered ONLY by a DEFAULT-stream binding stays on the default path (byte-identical to
+        // #594-A): bind `audit.>` to the default stream `""`.
+        e.bind_subject("", "audit.>").unwrap();
+        assert_eq!(e.covering_named_stream_for_filter("audit.*"), None);
     }
 
     #[test]
