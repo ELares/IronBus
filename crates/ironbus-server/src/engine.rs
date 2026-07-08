@@ -387,6 +387,24 @@ pub struct EngineConfig {
     /// default stream are always allowed (the default does not count). `0` means UNLIMITED, matching the
     /// other `0` = off bounds; the default is [`DEFAULT_MAX_STREAMS`] (1024), an edge profile lowers it.
     pub max_streams: usize,
+    /// The cap on the number of OPEN (fd-resident) NAMED streams — the `max_open_streams` hot-set LRU
+    /// (#565, M2-I4). A broker with many named streams cannot keep every per-stream log open (each pins
+    /// a file descriptor + its active-segment write buffers); this bounds the OPEN working set. When
+    /// opening (or reopening) a named stream would exceed this cap, the engine EVICTS the
+    /// least-recently-used open stream — flushing its durable state (its committed cursor #681, its DLQ
+    /// #1110, its in-flight attempt counts) and CLOSING its `Log` (releasing the fd + buffers) — while
+    /// leaving its on-disk `streams/<hex>/` subtree fully intact, then LAZILY REOPENS + per-stream
+    /// recovers it on its next access. An evict/reopen cycle is behaviorally identical to a per-stream
+    /// restart: no committed record is lost, re-delivered, or double-dead-lettered.
+    ///
+    /// ORTHOGONAL to [`EngineConfig::max_streams`]: `max_streams` bounds how many distinct streams may
+    /// EXIST (inodes/dirs — a fail-closed REJECT of a NEW stream), while `max_open_streams` bounds how
+    /// many are RESIDENT at once (fds/RAM — a transparent EVICT-and-reopen), so a deployment can allow a
+    /// large stream catalog yet keep only a bounded hot set open. The DEFAULT stream `""` is served by
+    /// the root [`Engine::log`] and is NEVER evicted (it is not counted here). `0` means UNLIMITED
+    /// (never evict — every declared stream stays resident, the pre-#565 behavior), matching the other
+    /// `0` = off bounds; the default is [`DEFAULT_MAX_OPEN_STREAMS`] (1024), an edge profile lowers it.
+    pub max_open_streams: usize,
     /// The per-NAMED-stream CONSUMER-METRIC cardinality cap (#600, the #681 named-stream metrics
     /// follow-up): how many distinct NAMED streams each get their own labelled per-stream consumer
     /// series (`ironbus_stream_{delivered,acked,dead_lettered,filtered}_total{stream}`) on `/metrics`
@@ -1727,6 +1745,12 @@ pub struct EngineConfigSnapshot {
     /// [`EngineError::TooManyStreams`] BEFORE any `Log` is opened; an already-resident stream and the
     /// default stream are always allowed. The default stream does not count toward the cap.
     pub max_streams: usize,
+    /// The cap on the number of OPEN (fd-resident) NAMED streams — the `max_open_streams` hot-set LRU
+    /// (#565, `0` = unlimited / never evict). Bounds the resident file descriptors + segment buffers to
+    /// the hot working set; the least-recently-used stream's log is closed (and reopened from disk on
+    /// demand) when opening one more would exceed this. Orthogonal to `max_streams` (which bounds how
+    /// many streams may EXIST); the default stream is never evicted and does not count.
+    pub max_open_streams: usize,
     /// The idle-eviction window for a named group in NANOSECONDS (`0` = disabled).
     pub group_idle_evict_nanos: u64,
     /// The lease visibility timeout in nanoseconds.
@@ -2037,6 +2061,19 @@ pub const DEFAULT_MAX_GROUPS: usize = 1024;
 /// an fd + dir + `Log` per name until fds/inodes/RAM are exhausted. `0` = unlimited; an edge profile
 /// lowers it. See [`EngineConfig::max_streams`].
 pub const DEFAULT_MAX_STREAMS: usize = 1024;
+
+/// The default cap on the number of OPEN (fd-resident) NAMED streams — the `max_open_streams` hot-set
+/// LRU bound (#565, M2-I4). A broker with many named streams cannot keep every per-stream log open
+/// (each pins a file descriptor + segment write buffers); this bounds the OPEN working set and closes
+/// the least-recently-used stream's log when opening one more would exceed the cap, reopening it from
+/// disk on demand. It is ORTHOGONAL to [`DEFAULT_MAX_STREAMS`]: `max_streams` bounds how many distinct
+/// streams may EXIST (inodes/dirs, a fail-closed REJECT), while `max_open_streams` bounds how many are
+/// RESIDENT at once (fds/RAM, a transparent EVICT-and-reopen), so a deployment can allow a very large
+/// stream catalog yet keep only a bounded hot set open. `0` = UNLIMITED (never evict — every declared
+/// stream stays resident, the pre-#565 behavior), matching the `0` = off convention of the other
+/// bounds. The default matches [`DEFAULT_MAX_STREAMS`] (1024); an edge profile lowers it. See
+/// [`EngineConfig::max_open_streams`].
+pub const DEFAULT_MAX_OPEN_STREAMS: usize = 1024;
 
 /// The default per-NAMED-stream CONSUMER-METRIC cardinality cap (#600, closing the #681 named-stream
 /// metrics follow-up): the number of distinct NAMED streams that each get their own labelled
@@ -2403,53 +2440,74 @@ fn recover_named_stream_groups<F: Filesystem, C: Clock>(
         let Some(log) = streams.get(&id) else {
             continue;
         };
-        let flushed = log.flushed_offset().get();
-        let fs = log.filesystem();
-        let mut ns = NamedStream::new();
-        // Discover every durable group of THIS stream from BOTH its cursor file AND its attempts file
-        // (the #681 DLQ follow-up brings the default stream's #358 union to the named path): a group
-        // whose poison was in flight but never committed has an `attempts-<hex>.ckpt` yet no
-        // `cursor-<hex>.ckpt` (the cursor write is gated on the watermark advancing), so iterating only
-        // cursor files would orphan its durable attempt counts and re-poison from attempt 1 after a
-        // crash. The union of the two filename sets, with a fresh cursor for an attempts-only group,
-        // recovers both — exactly as `recover_named_groups` does for the default stream's named groups.
-        let mut names = std::collections::BTreeSet::new();
-        for file in fs.list()? {
-            if let Some(group) = ironbus_storage::naming::parse_cursor_checkpoint_name(&file) {
-                names.insert(group);
-            } else if let Some(group) = parse_group_attempts_name(&file) {
-                names.insert(group);
-            }
-        }
-        for group in names {
-            // A named-stream group is always non-empty (`poll_in_stream` validates it), so a bare
-            // `cursor.ckpt` / `attempts.ckpt` (empty group) in a stream subdir is foreign — skip
-            // anything that fails the group-name rule rather than resurrect it.
-            if validate_group_name(&group).is_err() {
-                continue;
-            }
-            // Resume the cursor from `cursor-<hex>.ckpt` if present, else start fresh at offset 0 (the
-            // attempts-only case, a poison in flight but never committed). Then seed the durable
-            // per-message attempt counts from `attempts-<hex>.ckpt`, clamped exactly like the default
-            // stream (#358), so `MaxDeliver` and the poison-cap survive a restart in every named stream.
-            let cursor_name = group_checkpoint_name(&group);
-            let cursor = if fs.exists(&cursor_name)? {
-                let (_, recovered) = Checkpoint::open(fs.open(&cursor_name)?)?;
-                resume_cursor_from_snapshot(recovered.as_deref(), flushed)
-            } else {
-                AckCursor::new()
-            };
-            let committed = cursor.committed().get();
-            let recovered_a = read_group_attempts(fs, &group)?;
-            let g = resume_work_group(cursor, recovered_a.as_deref(), lease, opened_at, flushed);
-            ns.group_last_checkpointed.insert(group.clone(), committed);
-            ns.groups.insert(group, g);
-        }
+        let ns = recover_one_named_stream(log, lease, opened_at)?;
+        // A stream only ever produced-to (no cursor/attempts files) recovers an EMPTY `NamedStream`; it
+        // stays absent from the map (lazy-on-first-consume) exactly as before.
         if !ns.groups.is_empty() {
             out.insert(id, ns);
         }
     }
     Ok(out)
+}
+
+/// Recovers ONE named stream's durable per-group consumer state (committed cursor #681 + in-flight
+/// attempt counts #358) from that stream's own `streams/<hex(name)>/` subdir — the per-stream body of
+/// [`recover_named_stream_groups`], factored out so the hot-set LRU REOPEN path (#565) resumes an
+/// evicted stream's cursors by EXACTLY the same recovery boot runs. A reopen is therefore behaviorally
+/// a per-stream restart: the returned [`NamedStream`] carries the committed watermark (so committed
+/// records never redeliver) and the carried attempt counts (so a poison never re-counts from 1), and an
+/// empty result (a produce-only / genuinely-new stream) is a fresh, no-groups `NamedStream`.
+///
+/// # Errors
+/// Propagates a storage error from listing the stream's subdir or opening/reading a checkpoint file.
+fn recover_one_named_stream<F: Filesystem, C: Clock>(
+    log: &Log<F, C>,
+    lease: LeaseConfig,
+    opened_at: u64,
+) -> Result<NamedStream, EngineError> {
+    let flushed = log.flushed_offset().get();
+    let fs = log.filesystem();
+    let mut ns = NamedStream::new();
+    // Discover every durable group of THIS stream from BOTH its cursor file AND its attempts file
+    // (the #681 DLQ follow-up brings the default stream's #358 union to the named path): a group
+    // whose poison was in flight but never committed has an `attempts-<hex>.ckpt` yet no
+    // `cursor-<hex>.ckpt` (the cursor write is gated on the watermark advancing), so iterating only
+    // cursor files would orphan its durable attempt counts and re-poison from attempt 1 after a
+    // crash. The union of the two filename sets, with a fresh cursor for an attempts-only group,
+    // recovers both — exactly as `recover_named_groups` does for the default stream's named groups.
+    let mut names = std::collections::BTreeSet::new();
+    for file in fs.list()? {
+        if let Some(group) = ironbus_storage::naming::parse_cursor_checkpoint_name(&file) {
+            names.insert(group);
+        } else if let Some(group) = parse_group_attempts_name(&file) {
+            names.insert(group);
+        }
+    }
+    for group in names {
+        // A named-stream group is always non-empty (`poll_in_stream` validates it), so a bare
+        // `cursor.ckpt` / `attempts.ckpt` (empty group) in a stream subdir is foreign — skip
+        // anything that fails the group-name rule rather than resurrect it.
+        if validate_group_name(&group).is_err() {
+            continue;
+        }
+        // Resume the cursor from `cursor-<hex>.ckpt` if present, else start fresh at offset 0 (the
+        // attempts-only case, a poison in flight but never committed). Then seed the durable
+        // per-message attempt counts from `attempts-<hex>.ckpt`, clamped exactly like the default
+        // stream (#358), so `MaxDeliver` and the poison-cap survive a restart in every named stream.
+        let cursor_name = group_checkpoint_name(&group);
+        let cursor = if fs.exists(&cursor_name)? {
+            let (_, recovered) = Checkpoint::open(fs.open(&cursor_name)?)?;
+            resume_cursor_from_snapshot(recovered.as_deref(), flushed)
+        } else {
+            AckCursor::new()
+        };
+        let committed = cursor.committed().get();
+        let recovered_a = read_group_attempts(fs, &group)?;
+        let g = resume_work_group(cursor, recovered_a.as_deref(), lease, opened_at, flushed);
+        ns.group_last_checkpointed.insert(group.clone(), committed);
+        ns.groups.insert(group, g);
+    }
+    Ok(ns)
 }
 
 /// Reconstructs a group's carried attempt counts from a recovered `attempts.ckpt` payload, clamped
@@ -2907,6 +2965,22 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// with [`EngineError::TooManyStreams`] before its `Log` is opened, bounding the fds/inodes/RAM one
     /// client can pin. `0` means unlimited. See [`EngineConfig::max_streams`].
     max_streams: usize,
+    /// The cap on the number of OPEN (fd-resident) NAMED streams — the `max_open_streams` hot-set LRU
+    /// (#565): when opening one more would exceed this, the least-recently-used open stream is EVICTED
+    /// (its durable state flushed, its `Log` closed) and reopened from disk on demand. `0` = unlimited
+    /// (never evict). ORTHOGONAL to `max_streams` (which bounds how many streams may EXIST, tracked by
+    /// `known_named_streams`); this bounds only the RESIDENT set. See [`EngineConfig::max_open_streams`],
+    /// [`Engine::ensure_named_stream_open`], and [`Engine::evict_named_stream`].
+    max_open_streams: usize,
+    /// The set of EVERY named stream that has ever been declared (produced-to / declared / bound),
+    /// whether or not it is currently OPEN (#565): the authoritative "does this stream EXIST" set that
+    /// SURVIVES a hot-set LRU eviction (which closes the `Log` but leaves the on-disk subtree and this
+    /// entry). It decouples the two caps: `max_streams` (#863) is enforced against `known_named_streams.len()`
+    /// (distinct streams that EXIST), NOT the shrinking OPEN count, so eviction can never let a flood of
+    /// distinct stream names slip past the existence cap; and a consume/ack of an EVICTED stream is
+    /// recognized as KNOWN (reopen it) rather than UNKNOWN (reject it). Seeded at open from every
+    /// recovered named stream and bounded by `max_streams`. The default stream `""` is never a member.
+    known_named_streams: std::collections::BTreeSet<StreamId>,
     /// The idle window in NANOSECONDS after which a fully-caught-up, lease-free NAMED group is
     /// evicted from memory (#277): the configured `group_idle_evict_ms` converted to nanoseconds at
     /// open (the clock seam is in nanoseconds). `0` means DISABLED (never evict). The sweep
@@ -3405,6 +3479,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // evaluated in source order (a later read of `config` would then be a
         // borrow-after-partial-move). All knobs default to inert.
         let backpressure = Backpressure::from_engine_config(&config);
+        // Seed the "which named streams EXIST" set (#565) from every recovered named stream, so the
+        // existence cap (`max_streams`) and the reopen-vs-reject decision are correct BEFORE any client
+        // touches a stream. This survives a hot-set LRU eviction (which drops the open `Log`), so an
+        // evicted-then-consumed stream is recognized as KNOWN (reopened), never UNKNOWN (rejected).
+        let known_named_streams: std::collections::BTreeSet<StreamId> = streams
+            .stream_ids()
+            .into_iter()
+            .filter(|id| !id.is_default())
+            .collect();
         let mut engine = Engine {
             log,
             // The per-named-stream LOG substrate (#676), opened above; recovered named streams (if
@@ -3448,6 +3531,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             disk_full_policy: config.disk_full_policy,
             max_groups: config.max_groups,
             max_streams: config.max_streams,
+            // The hot-set LRU open cap (#565); `0` = unlimited (never evict). Boot-time recovery below
+            // opens EVERY on-disk named stream, so if that exceeds the cap the engine immediately evicts
+            // the least-recently-used ones down to it (their state is already durable on disk).
+            max_open_streams: config.max_open_streams,
+            known_named_streams,
             // The idle-eviction window (#277), converted from milliseconds to the clock seam's
             // nanoseconds and saturated rather than overflowed. `0` (disabled) stays 0, so the
             // sweep is a no-op unless an operator opts in.
@@ -3564,6 +3652,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // past a record the log actually holds (a snapshot written slightly ahead of a torn-tail
         // recovery degrades to at-least-once for that producer rather than returning a phantom offset).
         engine.seed_producer_seq_from_recovered(recovered_seq.as_deref(), flushed, opened_at);
+
+        // ENFORCE the hot-set LRU open cap at boot (#565): recovery above opened EVERY on-disk named
+        // stream, which may exceed `max_open_streams`. Evict the least-recently-used ones down to the
+        // cap so the resident-fd invariant (`open named streams <= max_open_streams`) holds immediately
+        // after open, not only once runtime traffic drives an eviction. Each victim's state was just
+        // recovered from disk and is already durable, so eviction here just re-checkpoints (a no-op when
+        // unchanged) and releases the fd + buffers; the stream reopens from disk on its next access.
+        engine.evict_open_streams_down_to_cap()?;
+
         Ok(engine)
     }
 
@@ -4709,14 +4806,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             });
         }
         let id = StreamId::named(stream)?;
-        // #863: cap the resident-stream COUNT before opening a new stream's log (fd/inode/RAM bound).
+        // #863: cap the DISTINCT-stream count before materializing a NEW stream (inode/dir bound).
         self.check_stream_cap(&id)?;
-        // Declare-on-first-produce: open the named stream's independent log under `streams/<hex>/`
-        // (idempotent — a no-op if already open) and mirror it in the per-stream consumer state.
-        self.streams.declare(&id).map_err(EngineError::Storage)?;
-        self.named_streams
-            .entry(id.clone())
-            .or_insert_with(NamedStream::new);
+        // Declare-on-first-produce THROUGH the hot-set LRU (#565): open (or lazily REOPEN + per-stream
+        // recover) this named stream's independent log under `streams/<hex>/`, evicting the
+        // least-recently-used open stream first if opening one more would exceed `max_open_streams`, and
+        // mark it most-recently-used. Idempotent for an already-open stream (just refreshes its recency).
+        self.ensure_named_stream_open(&id)?;
         // Append to THIS stream's log (a single-`Log` append; appending to X never touches Y, so
         // per-record cost stays flat as streams grow), PERSISTING the subject (#594-B) so a filtered
         // consumer on this named stream can match it, then make it durable with the cross-stream
@@ -5508,22 +5604,27 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Ok(false);
         }
         let id = StreamId::named(stream)?;
-        // #863: cap the resident-stream COUNT before opening a new stream's log (fd/inode/RAM bound).
+        // #863: cap the DISTINCT-stream count before materializing a NEW stream (inode/dir bound).
         self.check_stream_cap(&id)?;
-        let created = self.streams.declare(&id).map_err(EngineError::Storage)?;
-        // Mirror the per-stream consumer state so a subsequent consume resolves the same way a
-        // produce-declared stream does (idempotent: an existing entry is left untouched).
-        self.named_streams
-            .entry(id)
-            .or_insert_with(NamedStream::new);
+        // Open (or reopen) through the hot-set LRU (#565); `created` is whether this is the stream's
+        // FIRST-ever declaration — a re-declare of an existing stream (including one the LRU evicted) is
+        // `false`, since reopening an evicted stream creates no new distinct stream.
+        let created = self.ensure_named_stream_open(&id)?;
         Ok(created)
     }
 
-    /// Whether the named stream `stream` EXISTS (is open) (#588): the engine-side of the `StreamInfo`
-    /// wire verb's existence bit. The default stream (the EMPTY name) ALWAYS exists. A named stream
-    /// exists once it has been declared (via [`Engine::declare_stream`] or declare-on-first-produce).
-    /// A malformed named name reports `false` (it can never have been declared), never an error — the
-    /// wire layer fails a malformed id closed before this is reached, so this is a pure existence read.
+    /// Whether the named stream `stream` EXISTS (#588): the engine-side of the `StreamInfo` wire verb's
+    /// existence bit AND the filtered-subscribe existence gate. The default stream (the EMPTY name)
+    /// ALWAYS exists. A named stream exists once it has been declared (via [`Engine::declare_stream`] or
+    /// declare-on-first-produce). A malformed named name reports `false` (it can never have been
+    /// declared), never an error — the wire layer fails a malformed id closed before this is reached, so
+    /// this is a pure existence read.
+    ///
+    /// Tested against `known_named_streams` (existence), NOT the OPEN set (#565): a stream the hot-set
+    /// LRU EVICTED still EXISTS (its on-disk subtree is intact, it reopens on next access), so it must
+    /// report `true` — else a subscribe or `StreamInfo` on an evicted stream would wrongly see it as
+    /// gone. Use [`is_named_stream_resident`](Self::is_named_stream_resident) for the narrower "is its
+    /// log currently OPEN" question.
     #[must_use]
     pub fn stream_exists(&self, stream: &str) -> bool {
         if stream.is_empty() {
@@ -5532,7 +5633,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Ok(id) = StreamId::named(stream) else {
             return false;
         };
-        self.streams.get(&id).is_some()
+        self.known_named_streams.contains(&id)
+    }
+
+    /// Whether the named stream `stream`'s log is currently OPEN (fd-resident) rather than evicted by
+    /// the `max_open_streams` hot-set LRU (#565). The default stream is always resident. Distinct from
+    /// [`stream_exists`](Self::stream_exists): an EVICTED stream still EXISTS (reopening on next access)
+    /// but is not resident. This is the clean seam the #566 per-stream retention respects (retention
+    /// acts on the OPEN working set), and it is what the resident-stream tests observe. A malformed or
+    /// never-declared name is not resident.
+    #[must_use]
+    pub fn is_named_stream_resident(&self, stream: &str) -> bool {
+        if stream.is_empty() {
+            return true;
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return false;
+        };
+        self.streams.is_open(&id)
     }
 
     /// Polls the stream named `stream` in work-group `group` (#676): the default stream routes to
@@ -5606,6 +5724,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         now: u64,
     ) -> Result<(StreamId, u64), EngineError> {
         let id = StreamId::named(stream)?;
+        // Reopen a KNOWN stream the hot-set LRU evicted (resuming its durable cursors/attempts from
+        // disk), or reject a never-declared one (#565). A consume never CREATES a stream (only a
+        // produce/declare/bind does), so an unknown stream is a typed reject, never a silent empty read.
+        if !self.ensure_named_stream_resident(&id)? {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
         let Some(flushed) = self.streams.get(&id).map(|log| log.flushed_offset().get()) else {
             return Err(EngineError::UnknownStream {
                 name: stream.to_string(),
@@ -6115,6 +6241,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Ok(id) = StreamId::named(stream) else {
             return AckResult::Fenced;
         };
+        // An ack IS an access: keep an actively-acked OPEN stream hot in the hot-set LRU (#565). We do
+        // NOT reopen on ack — an ack of an EVICTED stream is Fenced below because its in-flight lease was
+        // dropped on eviction (exactly as a restart drops in-flight leases), so the message simply
+        // redelivers on the stream's next poll rather than committing against a stale token.
+        if self.streams.is_open(&id) {
+            self.streams.touch(&id);
+        }
         let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
         let Some(named) = self.named_streams.get_mut(&id) else {
             return AckResult::Fenced;
@@ -6206,23 +6339,201 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// new resource); `max_streams == 0` disables the cap. The caller passes the NAMED stream id (the
     /// default stream is materialized at open and never routed through here).
     ///
-    /// Residency is tested against `self.streams` (the authoritative open-stream map that
-    /// [`named_stream_count`](Self::named_stream_count) also counts), NOT the lazily-populated
-    /// `self.named_streams` consumer-state cache: a stream RECOVERED at open lives in `self.streams`
-    /// but is absent from `named_streams` until first touched. Reading `named_streams` here would count
-    /// a recovered stream against the cap yet treat a produce TO it as "new", so an operator who
-    /// restarted with `max_streams`-or-more on-disk streams could never produce to them again (the
-    /// produce is rejected BEFORE the `or_insert` that would register it — a permanent wedge). Reading
-    /// the same map the count comes from keeps the exemption and the count consistent.
+    /// Existence is tested against `self.known_named_streams` — the set of every named stream that has
+    /// ever been declared, whether or not it is currently OPEN (#565) — NOT the shrinking OPEN count
+    /// ([`named_stream_count`](Self::named_stream_count)). This is what keeps the two caps ORTHOGONAL:
+    /// once the hot-set LRU can CLOSE a stream's log, the open count no longer equals the number of
+    /// distinct streams that EXIST, so counting the open set would let a flood of distinct stream names
+    /// slip past the existence cap (each one evicting a predecessor yet leaving its `streams/<hex>/`
+    /// subtree on disk — unbounded inode growth, the exact #863 attack). Counting `known_named_streams`
+    /// bounds distinct EXISTENCE (inodes/dirs) while `max_open_streams` independently bounds RESIDENCE
+    /// (fds/RAM). An ALREADY-KNOWN stream (including one the LRU evicted) is always allowed — reopening
+    /// it creates no new distinct stream. `max_streams == 0` disables the cap.
     fn check_stream_cap(&self, id: &StreamId) -> Result<(), EngineError> {
         if self.max_streams != 0
-            && self.streams.get(id).is_none()
-            && self.named_stream_count() >= self.max_streams
+            && !self.known_named_streams.contains(id)
+            && self.known_named_streams.len() >= self.max_streams
         {
             return Err(EngineError::TooManyStreams {
                 max: self.max_streams,
             });
         }
+        Ok(())
+    }
+
+    // ===================================================================================
+    // THE max_open_streams HOT-SET LRU (#565, M2-I4): open-on-demand / evict-LRU / reopen-from-disk.
+    //
+    // A broker with many named streams cannot keep every per-stream log open (each pins an fd + its
+    // active-segment write buffers). `max_open_streams` bounds the OPEN working set: opening one more
+    // stream than the cap allows EVICTS the least-recently-used open stream — flushing its durable
+    // state (cursor #681, DLQ #1110, attempt counts #358) and closing its `Log` — then that stream
+    // REOPENS from disk on its next access. An evict/reopen cycle is behaviorally a per-stream restart:
+    // no committed record is lost, redelivered, or double-dead-lettered. The DEFAULT stream `""` is
+    // served by `self.log` and is NEVER evicted. `max_open_streams == 0` disables eviction entirely
+    // (every declared stream stays resident, the pre-#565 behavior).
+    // ===================================================================================
+
+    /// Ensures NAMED stream `id` is OPEN and marks it MOST-recently-used (#565), OPENING it if needed —
+    /// which for a KNOWN (previously-declared) stream the LRU evicted is a lazy REOPEN + per-stream
+    /// recovery from disk, and for a genuinely-new stream is a first open. When opening would exceed
+    /// `max_open_streams`, the least-recently-used open stream is EVICTED first (durable state flushed,
+    /// log closed) to make room. Returns whether the stream was NEWLY created (its first-ever open) vs
+    /// already-existing (already open, or a reopen of an evicted stream).
+    ///
+    /// This is the single choke point every CREATE path (produce / declare / bind) routes through, so
+    /// the open-set invariant, the LRU order, and the existence set (`known_named_streams`) are
+    /// maintained in exactly one place. The caller has already enforced the EXISTENCE cap
+    /// ([`check_stream_cap`](Self::check_stream_cap)) for a new stream.
+    ///
+    /// # Errors
+    /// Propagates a storage error from evicting a victim, opening the stream's log, or re-recovering
+    /// its durable groups.
+    fn ensure_named_stream_open(&mut self, id: &StreamId) -> Result<bool, EngineError> {
+        debug_assert!(
+            !id.is_default(),
+            "the default stream is never routed through the LRU"
+        );
+        if self.streams.is_open(id) {
+            // Already resident: just refresh its recency so an actively-used stream is not the next
+            // eviction victim (the LRU-reorders-on-access property).
+            self.streams.touch(id);
+            return Ok(false);
+        }
+        // A KNOWN stream that is not open was EVICTED; its durable consumer state must be re-recovered
+        // from disk on reopen (else its committed cursor would reset to 0 and mass-redeliver — the exact
+        // bug this feature must not introduce). A genuinely-new stream has no such state.
+        let known = self.known_named_streams.contains(id);
+        // Make room BEFORE opening: evict the LRU until opening one more stays within the cap.
+        self.evict_to_open_cap()?;
+        // Open (first open) or REOPEN (recovering the durable log from disk) the stream's `Log`.
+        self.streams.declare(id).map_err(EngineError::Storage)?;
+        // Rebuild the per-stream consumer state: recover the durable cursors/attempts for a reopened
+        // KNOWN stream (resume exactly where it left off), or a fresh empty `NamedStream` for a new one.
+        let ns = if known {
+            let now = self.log.now_monotonic();
+            let log = self
+                .streams
+                .get(id)
+                .ok_or(EngineError::MissingRecord { offset: 0 })?;
+            recover_one_named_stream(log, self.lease_config, now)?
+        } else {
+            NamedStream::new()
+        };
+        self.named_streams.insert(id.clone(), ns);
+        self.known_named_streams.insert(id.clone());
+        self.streams.touch(id);
+        Ok(!known)
+    }
+
+    /// Ensures a KNOWN named stream `id` is RESIDENT for a CONSUME/ACK access (#565): reopening +
+    /// re-recovering it from disk if the LRU evicted it, and marking it most-recently-used. Returns
+    /// `Ok(true)` if the stream is now open, or `Ok(false)` if it was NEVER declared — the consume path
+    /// turns that into [`EngineError::UnknownStream`] (a consume never CREATES a stream, unlike a
+    /// produce). Unlike [`ensure_named_stream_open`](Self::ensure_named_stream_open) this refuses to
+    /// materialize a brand-new stream.
+    ///
+    /// # Errors
+    /// Propagates a storage error from a reopen (eviction of a victim, log open, or group recovery).
+    fn ensure_named_stream_resident(&mut self, id: &StreamId) -> Result<bool, EngineError> {
+        if !self.streams.is_open(id) && !self.known_named_streams.contains(id) {
+            return Ok(false); // never declared -> UnknownStream at the call site
+        }
+        // Open (touch) or evicted-but-known (reopen): `ensure_named_stream_open` takes the reopen branch
+        // because the stream is known, so it never creates a new distinct stream here.
+        self.ensure_named_stream_open(id)?;
+        Ok(true)
+    }
+
+    /// Evicts least-recently-used open named streams until opening ONE more would stay within
+    /// `max_open_streams` (#565): a no-op when the cap is unlimited (`0`) or the open set is already
+    /// below it. Called before opening/reopening a named stream.
+    ///
+    /// # Errors
+    /// Propagates a storage error from flushing an evicted stream's durable state or closing its log.
+    fn evict_to_open_cap(&mut self) -> Result<(), EngineError> {
+        if self.max_open_streams == 0 {
+            return Ok(());
+        }
+        // At/over the cap means adding one more would exceed it: evict down to `cap - 1` so the imminent
+        // open lands the open count at exactly the cap.
+        while self.streams.open_named_count() >= self.max_open_streams {
+            let Some(victim) = self.streams.lru_victim() else {
+                break; // no named stream open to evict (only possible when the cap is 0-ish)
+            };
+            self.evict_named_stream(&victim)?;
+        }
+        Ok(())
+    }
+
+    /// Evicts least-recently-used open named streams until the open count is AT OR BELOW
+    /// `max_open_streams` (#565): the boot-time enforcement, called once after open (recovery opens
+    /// every on-disk named stream, which may exceed the cap). A no-op when the cap is unlimited or the
+    /// recovered open set already fits.
+    ///
+    /// # Errors
+    /// Propagates a storage error from flushing an evicted stream's durable state or closing its log.
+    fn evict_open_streams_down_to_cap(&mut self) -> Result<(), EngineError> {
+        if self.max_open_streams == 0 {
+            return Ok(());
+        }
+        while self.streams.open_named_count() > self.max_open_streams {
+            let Some(victim) = self.streams.lru_victim() else {
+                break;
+            };
+            self.evict_named_stream(&victim)?;
+        }
+        Ok(())
+    }
+
+    /// Evicts one NAMED stream from the OPEN set (#565): the flush-before-close eviction step. In order:
+    ///   1. SYNC the stream's log so every appended record is durable on disk (dropping the `Log`
+    ///      discards its unflushed `pending` buffer, so an un-synced tail would be lost);
+    ///   2. persist EVERY group's committed cursor (#681) AND in-flight attempt counts (#358) at the
+    ///      current watermark, UNCONDITIONALLY (like the idle-group eviction #277), BEFORE dropping the
+    ///      in-memory consumer state — else the committed position / poison-cap would be lost and reopen
+    ///      would redeliver / re-poison;
+    ///   3. DROP the in-memory consumer state and the DLQ sink handle (the DLQ's records are already
+    ///      durable — `append_poison` fsyncs in-band — and its per-group idempotency set rebuilds
+    ///      lazily from those records on the next reopen, so a poison is never double-dead-lettered);
+    ///   4. CLOSE the log, releasing the fd + segment buffers, leaving `streams/<hex>/` intact on disk.
+    ///
+    /// The stream stays in `known_named_streams` (it still EXISTS), so a later access reopens + recovers
+    /// it. The default stream is never a victim (it is not in the LRU). A sync/checkpoint error
+    /// propagates WITHOUT dropping the stream, so a disk fault never costs a committed position — the
+    /// stream stays open and a later eviction retries.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the log sync or a checkpoint write.
+    fn evict_named_stream(&mut self, id: &StreamId) -> Result<(), EngineError> {
+        debug_assert!(!id.is_default(), "the default stream is never evicted");
+        if !self.streams.is_open(id) {
+            return Ok(());
+        }
+        // 1) Flush-before-close: make the log's appended records durable BEFORE the fd is dropped.
+        self.streams.sync_stream(id).map_err(EngineError::Storage)?;
+        // 2) Persist each group's committed cursor + attempt counts at the current watermark, before the
+        //    in-memory state is dropped. Unconditional (not the interval gate) so the LATEST committed
+        //    position is durable even if no interval checkpoint fired since the last ack.
+        let groups: Vec<String> = self
+            .named_streams
+            .get(id)
+            .map(|s| s.groups.keys().cloned().collect())
+            .unwrap_or_default();
+        for group in &groups {
+            let committed = self
+                .named_streams
+                .get(id)
+                .and_then(|s| s.groups.get(group))
+                .map_or(0, |g| g.cursor.committed().get());
+            self.write_named_group_checkpoint(id, group, committed)?;
+            self.write_named_group_attempts(id, group)?;
+        }
+        // 3) Drop the in-memory consumer state + DLQ handle (both are reconstructable from disk).
+        self.named_streams.remove(id);
+        self.named_dlq.remove(id);
+        // 4) Close the log (release fd + buffers); the on-disk subtree is untouched, so a reopen recovers.
+        self.streams.close(id);
         Ok(())
     }
 
@@ -6263,14 +6574,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             StreamId::default_stream()
         } else {
             let id = StreamId::named(stream)?;
-            // #863: cap the resident-stream COUNT before opening a new stream's log (fd/inode/RAM bound).
+            // #863: cap the DISTINCT-stream count before materializing a NEW stream (inode/dir bound).
             self.check_stream_cap(&id)?;
-            // Declare-on-bind: the stream must have a log to receive a subject-addressed publish later,
-            // exactly as declare-on-first-produce gives the id-routed path one (idempotent).
-            self.streams.declare(&id).map_err(EngineError::Storage)?;
-            self.named_streams
-                .entry(id.clone())
-                .or_insert_with(NamedStream::new);
+            // Declare-on-bind THROUGH the hot-set LRU (#565): the stream must have a log to receive a
+            // subject-addressed publish later, exactly as declare-on-first-produce gives the id-routed
+            // path one (idempotent; evicts the least-recently-used open stream first if over the cap).
+            self.ensure_named_stream_open(&id)?;
             id
         };
         // Register + rebuild + swap (advances the generation; rolls back on a fork-bound rejection).
@@ -9779,8 +10088,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return self.stream_fetch_in(group, member, start_offset, max_records, max_bytes);
         }
         let id = StreamId::named(stream)?;
-        // The stream must be resident: consuming an unknown (never-declared) stream is a typed reject.
-        if self.streams.get(&id).is_none() {
+        // Reopen a KNOWN stream the hot-set LRU evicted (resuming its durable cursor from disk), else
+        // reject a never-declared one (#565): a streaming fetch is a consume, so it resumes an evicted
+        // stream but never creates a new one.
+        if !self.ensure_named_stream_resident(&id)? {
             return Err(EngineError::UnknownStream {
                 name: stream.to_string(),
             });
@@ -10085,6 +10396,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return self.stream_commit_in(group, up_to);
         }
         let id = StreamId::named(stream)?;
+        // Reopen a KNOWN stream the hot-set LRU evicted (resuming its durable cursor from disk), else
+        // reject a never-declared one (#565): a streaming commit is a consumer-managed-offset access, so
+        // it resumes an evicted stream but never creates a new one.
+        if !self.ensure_named_stream_resident(&id)? {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
         // Read THIS stream's durable window + monotonic clock in one scoped borrow, copying the values
         // out so the borrow of `self.streams` ends before the group cursor mutation below.
         let (durable_head, earliest_retained, now) = match self.streams.get(&id) {
@@ -10604,6 +10923,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             max_deliver: self.delivery.max_deliver(),
             max_groups: self.max_groups,
             max_streams: self.max_streams,
+            max_open_streams: self.max_open_streams,
             group_idle_evict_nanos: self.group_idle_evict_nanos,
             visibility_nanos: self.lease_config.visibility_nanos,
             hard_cap_nanos: self.lease_config.hard_cap_nanos,
@@ -10679,6 +10999,10 @@ mod tests {
             disk_full_policy: DiskFullPolicy::DropNew,
             max_groups: DEFAULT_MAX_GROUPS,
             max_streams: DEFAULT_MAX_STREAMS,
+            // Hot-set LRU OFF by default in the shared test config (#565, `0` = unlimited / never
+            // evict): the pre-#565 behavior (every declared stream stays resident), so existing tests
+            // are byte-for-byte unchanged. The LRU tests build a config with a small explicit cap.
+            max_open_streams: 0,
             max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
             // Eviction OFF by default in the shared test config (#277); the eviction tests build a
             // config with a non-zero window explicitly so the golden-path tests stay unaffected.
@@ -20110,6 +20434,266 @@ mod tests {
             matches!(e2.poll_in_stream("orders", "g", 0).unwrap(), Poll::Idle),
             "the stream is fully drained after the resumed consume"
         );
+    }
+
+    // ======================= M2-I4 (#565): the max_open_streams hot-set LRU =======================
+
+    /// With the open cap at N, opening the (N+1)th named stream evicts the least-recently-used one, so
+    /// the OPEN set never exceeds N. The DEFAULT stream is served by the root log — never counted, never
+    /// evicted — and its own data/consume path is unaffected by the named-stream churn.
+    #[test]
+    fn max_open_streams_lru_bounds_the_open_set_and_never_evicts_the_default() {
+        let mut e = open(EngineConfig {
+            max_open_streams: 2,
+            ..config(10, 5)
+        });
+        // The default stream stays resident throughout, independent of the named hot set.
+        e.produce(&append_at(b"d0")).unwrap();
+        produce_to(&mut e, "a", b"a0");
+        produce_to(&mut e, "b", b"b0");
+        assert_eq!(e.named_stream_count(), 2, "a and b fill the open cap");
+        assert!(e.is_named_stream_resident("a") && e.is_named_stream_resident("b"));
+
+        // Opening a THIRD named stream evicts the least-recently-used (a) to stay within the cap.
+        produce_to(&mut e, "c", b"c0");
+        assert_eq!(
+            e.named_stream_count(),
+            2,
+            "the open set stays <= the cap after opening a 3rd stream"
+        );
+        assert!(
+            !e.is_named_stream_resident("a"),
+            "the LRU stream (a) was evicted"
+        );
+        assert!(e.is_named_stream_resident("b") && e.is_named_stream_resident("c"));
+        // The evicted stream still EXISTS (it reopens on demand); the default is always resident.
+        assert!(e.stream_exists("a"), "an evicted stream still exists");
+        assert!(
+            e.is_named_stream_resident(""),
+            "the default stream is never evicted"
+        );
+
+        // The default stream's OWN data + consume path is byte-for-byte unaffected by the eviction churn.
+        let dd = message(e.poll_in_stream("", "g", 0).unwrap());
+        assert_eq!(dd.record.payload.as_ref(), b"d0");
+        assert_eq!(e.ack_in_stream("", "g", &dd.token), AckResult::Acked);
+    }
+
+    /// THE KEY DURABILITY TEST: evicting + reopening a stream is behaviorally identical to a per-stream
+    /// restart — its committed cursor AND its uncommitted tail resume exactly from disk, with NO
+    /// committed record redelivered and NO uncommitted record lost. The eviction is the ONLY thing that
+    /// persists the cursor here (no interval checkpoint fired), so this directly exercises the
+    /// flush-before-close ordering.
+    #[test]
+    fn a_named_stream_survives_evict_and_reopen_like_a_per_stream_restart() {
+        let mut e = open(EngineConfig {
+            max_open_streams: 1,
+            ..config(10, 5)
+        });
+        // Stream A: four durable records; consume + ack the first two (committing its cursor to 2).
+        for p in [&b"a0"[..], b"a1", b"a2", b"a3"] {
+            produce_to(&mut e, "A", p);
+        }
+        for expected in [&b"a0"[..], b"a1"] {
+            let d = message(e.poll_in_stream("A", "g", 0).unwrap());
+            assert_eq!(d.record.payload.as_ref(), expected);
+            assert_eq!(e.ack_in_stream("A", "g", &d.token), AckResult::Acked);
+        }
+        assert_eq!(e.committed_offset_in_stream("A", "g"), Offset::new(2));
+        assert!(e.is_named_stream_resident("A"));
+
+        // EVICT A by opening a sibling B (cap is 1): A's cursor is flushed, then its log is closed.
+        produce_to(&mut e, "B", b"b0");
+        assert!(
+            !e.is_named_stream_resident("A"),
+            "A was evicted to make room for B"
+        );
+        assert!(e.is_named_stream_resident("B"));
+
+        // REOPEN A by consuming it — it recovers from disk exactly where it left off. The FIRST poll
+        // resumes at the committed cursor (offset 2 = a2), NOT from 0: the acked a0/a1 never redeliver.
+        let d2 = message(e.poll_in_stream("A", "g", 0).unwrap());
+        assert!(e.is_named_stream_resident("A"), "A reopened on access");
+        assert_eq!(
+            e.committed_offset_in_stream("A", "g"),
+            Offset::new(2),
+            "the committed cursor survived the evict/reopen"
+        );
+        assert_eq!(d2.offset, Offset::new(2));
+        assert_eq!(
+            d2.record.payload.as_ref(),
+            b"a2",
+            "resumes at the committed cursor, not from 0 — no committed record redelivered"
+        );
+        assert_eq!(e.ack_in_stream("A", "g", &d2.token), AckResult::Acked);
+        // The uncommitted TAIL (a3) survived the close/reopen intact and delivers in order.
+        let d3 = message(e.poll_in_stream("A", "g", 0).unwrap());
+        assert_eq!(d3.offset, Offset::new(3));
+        assert_eq!(
+            d3.record.payload.as_ref(),
+            b"a3",
+            "the uncommitted tail is intact"
+        );
+        assert_eq!(e.ack_in_stream("A", "g", &d3.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in_stream("A", "g"), Offset::new(4));
+        assert!(
+            matches!(e.poll_in_stream("A", "g", 0).unwrap(), Poll::Idle),
+            "A is fully drained — nothing lost, nothing redelivered across the evict/reopen"
+        );
+    }
+
+    /// Accessing a stream promotes it to most-recently-used, so a recently-touched stream is NOT the
+    /// next eviction victim — the LRU reorders on access (the hot working set is retained).
+    #[test]
+    fn accessing_a_named_stream_reorders_the_lru_so_it_is_not_the_next_victim() {
+        let mut e = open(EngineConfig {
+            max_open_streams: 2,
+            ..config(10, 5)
+        });
+        produce_to(&mut e, "a", b"a0"); // open a           -> LRU order [a, b] after next line
+        produce_to(&mut e, "b", b"b0"); // open b           -> [a(lru), b]
+        produce_to(&mut e, "a", b"a1"); // touch a          -> [b(lru), a]
+                                        // Opening c evicts the LRU (b), NOT the recently-touched a.
+        produce_to(&mut e, "c", b"c0");
+        assert!(
+            e.is_named_stream_resident("a"),
+            "the recently-touched a is NOT evicted"
+        );
+        assert!(!e.is_named_stream_resident("b"), "the LRU b is evicted");
+        assert!(e.is_named_stream_resident("c"));
+        assert_eq!(e.named_stream_count(), 2);
+    }
+
+    /// A poison already dead-lettered + committed-past on a stream is NEVER re-dead-lettered or
+    /// redelivered across an evict/reopen: the DLQ's durable records + the per-group idempotency set are
+    /// reconstructed from disk on reopen exactly as a restart reconstructs them (the DLQ/attempts half
+    /// of the round-trip invariant — no double-dead-letter).
+    #[test]
+    fn a_dead_lettered_named_stream_is_not_double_dead_lettered_across_evict_reopen() {
+        use ironbus_storage::dlq::{read_dead_letter_entries, DLQ_SUBDIR};
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        // max_deliver = 1 so the 2nd attempt poisons; open cap = 1 so a sibling produce evicts A.
+        let mut e = Engine::open(
+            fs,
+            std::sync::Arc::clone(&clock),
+            EngineConfig {
+                max_open_streams: 1,
+                ..config(10, 1)
+            },
+        )
+        .unwrap();
+        let off = e
+            .produce_in_stream(
+                "A",
+                &Append {
+                    timestamp_ms: 7,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"poison",
+                },
+            )
+            .unwrap();
+        // Deliver once (attempt 1), expire the lease, re-deliver: attempt 2 exceeds max_deliver and is
+        // dead-lettered + committed past.
+        let d = message(e.poll_in_stream("A", "g", e.now_monotonic()).unwrap());
+        assert_eq!(d.offset, off);
+        clock.advance_monotonic_nanos(40);
+        match e.poll_in_stream("A", "g", e.now_monotonic()).unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected the poison to dead-letter (Parked), got {other:?}"),
+        }
+        assert_eq!(e.counters().dead_lettered, 1);
+        assert_eq!(e.dlq_records(), 1, "one poison in A's DLQ before eviction");
+        assert_eq!(
+            e.committed_offset_in_stream("A", "g"),
+            Offset::new(off.get() + 1)
+        );
+
+        // EVICT A (flush cursor + attempts, close log; the DLQ records stay on disk) by producing to B.
+        e.produce_in_stream("B", &append_at(b"b0")).unwrap();
+        assert!(!e.is_named_stream_resident("A"), "A was evicted");
+
+        // REOPEN A by consuming it: it recovers cursor-past-the-poison from disk, so the poison is NOT
+        // redelivered and therefore NOT re-dead-lettered.
+        assert!(
+            matches!(
+                e.poll_in_stream("A", "g", e.now_monotonic()).unwrap(),
+                Poll::Idle
+            ),
+            "the committed-past poison is not redelivered after reopen"
+        );
+        assert_eq!(
+            e.committed_offset_in_stream("A", "g"),
+            Offset::new(off.get() + 1),
+            "A's cursor resumed past the poison"
+        );
+        assert_eq!(
+            e.counters().dead_lettered,
+            1,
+            "no second dead-letter across the evict/reopen"
+        );
+
+        // The DLQ on DISK still holds EXACTLY ONE record for A — no duplicate was ever written.
+        let stream_fs = probe
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("A"))
+            .unwrap();
+        let entries = read_dead_letter_entries(&stream_fs, DLQ_SUBDIR).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one durable DLQ record — never double-dead-lettered"
+        );
+    }
+
+    /// Boot-time enforcement: recovery opens EVERY on-disk named stream, so if that exceeds
+    /// `max_open_streams` the engine evicts the least-recently-used ones down to the cap at open — the
+    /// resident-fd invariant holds immediately after a restart, not only once runtime traffic drives an
+    /// eviction. The evicted streams still EXIST and reopen (recovering their data) on demand.
+    #[test]
+    fn boot_evicts_recovered_streams_down_to_the_open_cap() {
+        let fs = InMemoryFs::new();
+        {
+            // Create three named streams with no open cap (all resident), each with its own record.
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            for (s, p) in [("a", &b"a0"[..]), ("b", b"b0"), ("c", b"c0")] {
+                produce_to(&mut e, s, p);
+            }
+            assert_eq!(e.named_stream_count(), 3);
+            e.checkpoint_all_groups().unwrap();
+        }
+        // Reopen with an open cap of 1: recovery opens all three, then boot-eviction closes two.
+        let mut e2 = Engine::open(
+            fs,
+            ManualClock::new(),
+            EngineConfig {
+                max_open_streams: 1,
+                ..config(10, 5)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            e2.named_stream_count(),
+            1,
+            "boot evicted the recovered streams down to the open cap"
+        );
+        // All three still EXIST and reopen on demand with their durable data intact.
+        for (s, p) in [("a", &b"a0"[..]), ("b", b"b0"), ("c", b"c0")] {
+            assert!(e2.stream_exists(s), "{s} still exists after boot eviction");
+            let d = message(e2.poll_in_stream(s, "g", 0).unwrap());
+            assert_eq!(
+                d.record.payload.as_ref(),
+                p,
+                "{s} reopened with its own data"
+            );
+        }
     }
 
     #[test]

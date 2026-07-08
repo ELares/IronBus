@@ -658,6 +658,7 @@ fn build_config(setup: &Setup) -> EngineConfig {
         // Named-stream cap OFF (#863, `0` = unlimited): the conformance vectors assume the
         // historical unbounded behavior, so the golden bytes are unchanged by the cap.
         max_streams: 0,
+        max_open_streams: 0,
         // Per-stream consumer-metric cap (#600): observability only, does not affect the golden bytes.
         max_metric_streams: 1024,
         group_idle_evict_ms: 0,

@@ -2712,6 +2712,7 @@ mod tests {
             max_groups: crate::engine::DEFAULT_MAX_GROUPS,
             // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
             max_streams: 0,
+            max_open_streams: 0,
             max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
             group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: 0,
@@ -3151,6 +3152,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -4031,6 +4033,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -4180,6 +4183,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes,
@@ -4262,6 +4266,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -4541,6 +4546,7 @@ mod tests {
                     max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                     // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                     max_streams: 0,
+                    max_open_streams: 0,
                     max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                     group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                     ram_ceiling_bytes: 0,
@@ -4601,6 +4607,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -4764,6 +4771,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -4907,6 +4915,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -5129,6 +5138,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -6200,6 +6210,7 @@ mod tests {
                 max_groups: 100,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
@@ -6415,6 +6426,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -6608,6 +6620,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // +1 line for the #565 `max_open_streams` EngineConfig field
     fn admin_resilience_reports_frozen_after_an_integrity_freeze() {
         // The resilience sub-resource surfaces the integrity freeze (#16: never silent). Drive a real
         // writer freeze (an armed fatal fsync on the fault filesystem) and assert `/admin` reports
@@ -6636,6 +6649,7 @@ mod tests {
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
@@ -6953,6 +6967,7 @@ mod tests {
                 max_groups: 100,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
@@ -7251,6 +7266,7 @@ mod tests {
                 max_groups: 100,
                 // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
                 max_streams: 0,
+                max_open_streams: 0,
                 group_idle_evict_nanos: 0,
                 visibility_nanos: 1234,
                 hard_cap_nanos: 5678,
