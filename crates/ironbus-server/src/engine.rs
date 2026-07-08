@@ -2345,6 +2345,64 @@ fn recover_named_groups<F: Filesystem>(
     Ok(group_last_checkpointed)
 }
 
+/// Resumes every NAMED stream's per-group consumer cursor from its own
+/// `streams/<hex(name)>/cursor-<hex(group)>.ckpt` (#681), the per-stream twin of
+/// [`recover_named_groups`]: for each recovered named stream in `streams`, it lists that stream's OWN
+/// subdirectory for cursor checkpoints, decodes each group's [`AckCursor`] snapshot, and rebuilds the
+/// group clamped to THAT stream's durable head. A named stream with no cursor file (only ever
+/// produced-to) is omitted, so it stays lazy-on-first-consume exactly as before. The default stream
+/// `""` is never a key here (it uses [`Engine::groups`]) and is skipped.
+///
+/// This mirrors the default stream's durable-resume EXACTLY — same `AckCursor` snapshot format, same
+/// dual-slot [`Checkpoint`], same `resume_cursor_from_snapshot` clamp — so there is no parallel
+/// format; the only difference is the file's LOCATION (the stream's own subdir). A torn or short
+/// snapshot degrades to a lower committed watermark (at-least-once safe, redelivering only
+/// already-acked records), never a phantom offset past the head.
+///
+/// # Errors
+/// Propagates a storage error from listing a stream's subdir or opening/reading a cursor checkpoint.
+fn recover_named_stream_groups<F: Filesystem, C: Clock>(
+    streams: &StreamSet<F, C>,
+    lease: LeaseConfig,
+    opened_at: u64,
+) -> Result<BTreeMap<StreamId, NamedStream>, EngineError> {
+    let mut out = BTreeMap::new();
+    for id in streams.stream_ids() {
+        if id.is_default() {
+            continue;
+        }
+        let Some(log) = streams.get(&id) else {
+            continue;
+        };
+        let flushed = log.flushed_offset().get();
+        let fs = log.filesystem();
+        let mut ns = NamedStream::new();
+        // Every cursor checkpoint in THIS stream's subdir, skipping segment/foreign files (the
+        // storage helper parses only canonical `cursor.ckpt` / `cursor-<hex>.ckpt` names).
+        for (group, file_name) in ironbus_storage::naming::cursor_checkpoint_names(fs)? {
+            // A named-stream group is always non-empty (`poll_in_stream` validates it), so a bare
+            // `cursor.ckpt` (empty group) in a stream subdir is foreign — skip anything that fails the
+            // group-name rule rather than resurrect it.
+            if validate_group_name(&group).is_err() {
+                continue;
+            }
+            let (_, recovered) = Checkpoint::open(fs.open(&file_name)?)?;
+            let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
+            let committed = cursor.committed().get();
+            // No per-stream durable ATTEMPT counts this slice (the #681 DLQ/MaxDeliver follow-up), so
+            // the group resumes with a fresh lease table — at-least-once safe, byte-for-byte the
+            // pre-#681 named-stream consume behavior minus the cursor loss.
+            let g = resume_work_group(cursor, None, lease, opened_at, flushed);
+            ns.group_last_checkpointed.insert(group.clone(), committed);
+            ns.groups.insert(group, g);
+        }
+        if !ns.groups.is_empty() {
+            out.insert(id, ns);
+        }
+    }
+    Ok(out)
+}
+
 /// Reconstructs a group's carried attempt counts from a recovered `attempts.ckpt` payload, clamped
 /// to the durable log head `flushed` and the resumed committed watermark `committed`: a carried
 /// count is only meaningful for an offset that still exists (`< flushed`) and has NOT been committed
@@ -2528,15 +2586,16 @@ impl WorkGroup {
 /// durability); this struct holds only the per-stream CONSUMER state that mirrors the default
 /// stream's group machinery.
 ///
-/// Scope (#676): a named stream's consume path here re-instantiates the SAME competing
+/// Scope (#676, #681): a named stream's consume path here re-instantiates the SAME competing
 /// work-group primitives the default stream uses — the [`AckCursor`], the [`LeaseTable`], the
-/// 0/1/2 ack spectrum — independently per stream. The richer sub-paths a named stream does NOT
-/// yet thread (a per-stream DLQ, retry-throttle, key-shared routing, the Tier-S streaming mode,
-/// durable per-group cursor/attempt checkpoints, and the per-stream metric LABELS) are FLAGGED as
-/// follow-ups (M2-I5 retention, M2-I14 metrics); they are inert here, never REMOVED from the
-/// default stream. A named stream's groups are in-memory only for now (its consumer position does
-/// not survive a restart — only its LOG recovers, via the `StreamSet`), the explicit trade this
-/// reviewable slice makes.
+/// 0/1/2 ack spectrum — independently per stream, PLUS the durable per-group cursor (#681): each
+/// group's committed watermark is checkpointed to its own `streams/<hex(name)>/cursor-<hex(group)>.ckpt`
+/// (the default stream's `cursor-<hex>.ckpt` machinery, scoped to the stream's subdir) and RESUMED at
+/// open, so a named-stream consumer resumes at its committed offset after a restart. The richer
+/// sub-paths a named stream does NOT yet thread (a per-stream DLQ, retry-throttle + durable
+/// per-message ATTEMPT checkpoints, key-shared routing, the Tier-S streaming mode, and the per-stream
+/// metric LABELS) are FLAGGED as the #681 follow-up (M2-I5 retention, M2-I14 metrics); they are inert
+/// here, never REMOVED from the default stream.
 /// The subject->stream BINDING table (#585, V2-M2-I9): the authoritative registry of
 /// `(SubjectPattern -> StreamId)` bindings PLUS the wait-free routing trie ([`SublistSnapshot`]) it
 /// compiles to. The registry (`entries`) is the source of truth a rebuild reads; the `snapshot` is the
@@ -2634,8 +2693,14 @@ struct NamedStream {
     /// This stream's competing work-groups, keyed by group name, byte-for-byte the SAME machinery
     /// as the default stream's [`Engine::groups`] — independent per stream so the same group NAME
     /// in stream A and stream B is two unrelated cursors (the per-stream-groups isolation #676
-    /// requires). The default group `""` is created lazily on the first consume of this stream.
+    /// requires). A group is created lazily on the first consume of this stream, or RESUMED at open
+    /// from its durable `streams/<hex(name)>/cursor-<hex(group)>.ckpt` (#681).
     groups: BTreeMap<String, WorkGroup>,
+    /// The last committed offset durably CHECKPOINTED per group of THIS stream (#681), the per-stream
+    /// twin of [`Engine::group_last_checkpointed`]: the interval gate reads it so a resumed or hot
+    /// group does not re-write an unchanged cursor, and a write records the newly-durable watermark
+    /// here. A group missing from the map has never been checkpointed (treated as `0`).
+    group_last_checkpointed: BTreeMap<String, u64>,
 }
 
 impl NamedStream {
@@ -2643,6 +2708,7 @@ impl NamedStream {
     fn new() -> NamedStream {
         NamedStream {
             groups: BTreeMap::new(),
+            group_last_checkpointed: BTreeMap::new(),
         }
     }
 }
@@ -2659,7 +2725,7 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// stream's produce / consume / durability / recovery / metrics are untouched and a deployment
     /// that never names a stream never materializes `streams/` (the `StreamSet`'s `""` slot is an
     /// inert re-open of the root that is never written — see the scope note in the PR; folding the
-    /// default fully INTO the `StreamSet` is the follow-up that removes that inert slot).
+    /// default fully INTO the `StreamSet` is a flagged #681 follow-up).
     ///
     /// The cross-stream group-commit [`StreamSet::commit_tick`] (#678/#564) coordinates the durability
     /// barrier across the DIRTIED named streams: a produce pass touching K named streams commits with
@@ -3124,6 +3190,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             flushed,
         )?;
 
+        // Resume each NAMED stream's per-group consumer cursor from its own
+        // `streams/<hex(name)>/cursor-<hex(group)>.ckpt` (#681), the per-stream twin of
+        // `recover_named_groups` above: a named-stream consumer resumes at its committed offset after
+        // a restart instead of redelivering the whole log. Each stream's cursors are clamped to THAT
+        // stream's own durable head (read from its recovered log in `streams`). A stream that was only
+        // ever produced-to (never consumed) has no cursor file and stays absent from `named_streams`,
+        // so the lazy-on-first-consume path is unchanged for it.
+        let named_streams = recover_named_stream_groups(&streams, config.lease, opened_at)?;
+
         // The DLQ sink's log shares the main log's segment sizing but is NEVER byte-capped: a
         // poison record is the durable evidence of a dropped message and must not itself be shed.
         let dlq_config = LogConfig {
@@ -3194,13 +3269,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The per-named-stream LOG substrate (#676), opened above; recovered named streams (if
             // any) are already in it. The default stream is served by `log`, never this set's `""`.
             streams,
-            // The per-named-stream CONSUMER state (#676): EMPTY at open. A named stream gets its
-            // entry on its first produce (alongside the StreamSet `declare`); its work-groups are
-            // created lazily on first consume. A deployment that never names a stream keeps this
-            // empty, so the default path is byte-for-byte today. (Recovering a named stream's
-            // consumer cursors across a restart is the flagged #60-style follow-up; today only the
-            // named stream's LOG recovers, via the StreamSet.)
-            named_streams: BTreeMap::new(),
+            // The per-named-stream CONSUMER state (#676, #681): RESUMED at open from each stream's
+            // durable per-group cursor checkpoints (`recover_named_stream_groups` above), so a
+            // named-stream consumer resumes at its committed offset after a restart. A stream that was
+            // only produced-to (never consumed) has no cursor file and is absent here until its first
+            // consume lazily creates its entry; a deployment that never names a stream keeps this
+            // empty, so the default path is byte-for-byte today.
+            named_streams,
             // The subject->stream binding table (#585): EMPTY at open (no subject is bound until a
             // client `BindSubject`s one). Bindings are in-memory only this phase — a stream's subject
             // bindings do NOT survive a restart (only its LOG recovers, via the StreamSet); durable
@@ -3364,7 +3439,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// The order matters: a [`StreamSet`] open BEFORE the root open would recover (repair) the torn
     /// tail first, so the root's own open would then find it already clean and report ZERO loss,
     /// masking the recovery-loss the existing tests (and the loss report) assert. (Folding the default
-    /// fully INTO the [`StreamSet`] to drop the inert duplicate `""` slot is the flagged follow-up.)
+    /// fully INTO the [`StreamSet`] to drop the inert duplicate `""` slot is a flagged follow-up: it
+    /// turns out NOT to be inert — the second `Log::open` also trims the root active segment's
+    /// preallocated tail — so the removal needs its own PR that preserves that on-disk shape, #681.)
     ///
     /// # Errors
     /// Propagates a storage error from either open (including the fail-closed layout-version check).
@@ -4056,6 +4133,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         for name in names {
             self.checkpoint_group(&name)?;
         }
+        // Flush every NAMED stream's per-group consumer cursor (#681), the per-stream twin of the
+        // default-stream loop above: a clean operator shutdown persists every named-stream consumer's
+        // committed position so a restart resumes it instead of redelivering the whole stream. Snapshot
+        // the (stream, group) pairs first so the `&mut self` checkpoint calls do not borrow
+        // `named_streams` across the loop. Each `checkpoint_named_group` is a no-op for a group whose
+        // watermark has not advanced (and carries no acked-ahead set) since its last checkpoint.
+        let mut stream_groups: Vec<(StreamId, String)> = Vec::new();
+        for (id, ns) in &self.named_streams {
+            for group in ns.groups.keys() {
+                stream_groups.push((id.clone(), group.clone()));
+            }
+        }
+        for (id, group) in stream_groups {
+            self.checkpoint_named_group(&id, &group)?;
+        }
         // Flush the idempotent-producer SEQUENCE high-waters (V2-M8) on the clean-shutdown barrier too,
         // AFTER the cursors are flushed (so the durable head the high-waters clamp against is advanced)
         // and BEFORE the observability-only counters. CORRECTNESS state: a restart after a clean stop
@@ -4091,6 +4183,151 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.group_last_checkpointed
             .insert(group.to_string(), committed);
         Ok(())
+    }
+
+    /// Writes a NAMED stream's work-group cursor snapshot to `streams/<hex(name)>/cursor-<hex(group)>.ckpt`
+    /// (#681), the per-stream twin of [`Engine::write_group_checkpoint`]. The checkpoint lives in the
+    /// STREAM's OWN subdirectory (resolved via that stream's log filesystem), so a named stream's
+    /// consumer cursors are co-located with — and recover beside — its own log, mirroring the
+    /// DLQ-subdir pattern. Same `AckCursor` snapshot payload and same dual-slot [`Checkpoint`] as the
+    /// default stream: no parallel format, only a different location. Creates the file (and syncs the
+    /// directory) on first use, and reopens it per write so the crash-safe two-slot sequence continues.
+    ///
+    /// A no-op (`Ok(())`) if the stream or group is not resident, or if the stream's log is not open
+    /// (a produce must have declared it first), so a stray checkpoint call never allocates or panics.
+    fn write_named_group_checkpoint(
+        &mut self,
+        id: &StreamId,
+        group: &str,
+        committed: u64,
+    ) -> Result<(), EngineError> {
+        // Snapshot the cursor payload from the per-stream consumer state (short immutable borrow).
+        let payload = match self.named_streams.get(id).and_then(|s| s.groups.get(group)) {
+            Some(g) => snapshot_payload(&g.cursor),
+            None => return Ok(()),
+        };
+        let name = group_checkpoint_name(group);
+        // Resolve the file on THIS stream's own subdir filesystem (disjoint field from
+        // `named_streams`), creating + dir-syncing it on first use exactly as the default path does.
+        let file = {
+            let Some(log) = self.streams.get(id) else {
+                return Ok(());
+            };
+            let fs = log.filesystem();
+            if fs.exists(&name)? {
+                fs.open(&name)?
+            } else {
+                let f = fs.create_new(&name)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            }
+        };
+        let (mut cp, _) = Checkpoint::open(file)?;
+        cp.write(&payload)?;
+        if let Some(s) = self.named_streams.get_mut(id) {
+            s.group_last_checkpointed
+                .insert(group.to_string(), committed);
+        }
+        Ok(())
+    }
+
+    /// Durably records a NAMED stream's work-group committed cursor (#681), the per-stream twin of
+    /// [`Engine::checkpoint_group`]: writes the cursor iff its watermark advanced since the last
+    /// checkpoint OR it carries an acked-ahead set (so an out-of-order ack that has not yet moved the
+    /// watermark is still made durable). Like the default, it is a lagging at-least-once optimization
+    /// — a crash redelivers only a bounded tail, never an acked offset. No per-stream attempt
+    /// checkpoint this slice (the #681 DLQ/MaxDeliver follow-up). A no-op for an absent stream/group.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    fn checkpoint_named_group(&mut self, id: &StreamId, group: &str) -> Result<(), EngineError> {
+        let Some(g) = self.named_streams.get(id).and_then(|s| s.groups.get(group)) else {
+            return Ok(());
+        };
+        let committed = g.cursor.committed().get();
+        let has_ahead = !g.cursor.ahead_ranges().is_empty();
+        let last = self
+            .named_streams
+            .get(id)
+            .and_then(|s| s.group_last_checkpointed.get(group))
+            .copied()
+            .unwrap_or(0);
+        if committed > last || has_ahead {
+            self.write_named_group_checkpoint(id, group, committed)?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Engine::maybe_checkpoint_group`] but for a NAMED stream's work-group (#681): checkpoints
+    /// it only if its committed cursor advanced at least `checkpoint_interval` since its last
+    /// checkpoint, so a hot named-stream consumer writes its cursor on a bounded cadence rather than
+    /// per ack. A no-op for an absent stream/group.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    fn maybe_checkpoint_named_group(
+        &mut self,
+        id: &StreamId,
+        group: &str,
+    ) -> Result<bool, EngineError> {
+        let Some(g) = self.named_streams.get(id).and_then(|s| s.groups.get(group)) else {
+            return Ok(false);
+        };
+        let committed = g.cursor.committed().get();
+        let last = self
+            .named_streams
+            .get(id)
+            .and_then(|s| s.group_last_checkpointed.get(group))
+            .copied()
+            .unwrap_or(0);
+        if committed.saturating_sub(last) >= self.checkpoint_interval.max(1) {
+            self.write_named_group_checkpoint(id, group, committed)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The STREAM-AWARE durable cursor flush (#681): routes the default stream (`""`) to
+    /// [`Engine::checkpoint_group`] BYTE-FOR-BYTE, and a NAMED stream to its per-stream
+    /// [`Engine::checkpoint_named_group`]. This is the entry point the server's connection-close flush
+    /// calls with the session's `(stream, group)`, so a named-stream consumer's committed position is
+    /// made durable on a clean disconnect exactly as the default stream's is. A malformed named-stream
+    /// name is a no-op (it can never have been a resident stream).
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    pub fn checkpoint_in_stream(&mut self, stream: &str, group: &str) -> Result<(), EngineError> {
+        if stream.is_empty() {
+            return self.checkpoint_group(group);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return Ok(());
+        };
+        self.checkpoint_named_group(&id, group)
+    }
+
+    /// The STREAM-AWARE interval-gated cursor flush (#681): routes the default stream (`""`) to
+    /// [`Engine::maybe_checkpoint_group`] BYTE-FOR-BYTE, and a NAMED stream to its per-stream
+    /// [`Engine::maybe_checkpoint_named_group`]. This is the entry point the server's per-pass
+    /// committed-progress checkpoint calls with the session's `(stream, group)`, so a hot named-stream
+    /// consumer persists its cursor on the same bounded cadence as the default stream. A malformed
+    /// named-stream name is a no-op.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    pub fn maybe_checkpoint_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+    ) -> Result<bool, EngineError> {
+        if stream.is_empty() {
+            return self.maybe_checkpoint_group(group);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return Ok(false);
+        };
+        self.maybe_checkpoint_named_group(&id, group)
     }
 
     /// Ensures a NAMED work-group is live in memory, RESUMING it from its durable `cursor-<hex>.ckpt`
@@ -4207,9 +4444,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     // absent, so an old client (and every existing caller) reaches the default stream unchanged.
     // The client-facing WIRE frames that carry a stream id (StreamDeclare / PubTo / SubTo) are
     // M2-I10 (#588) — NOT in this PR; the engine is merely READY to receive a stream id. The named
-    // stream's consume path here is the COMPETING work-group only; a named stream's DLQ,
-    // retry-throttle, key-shared routing, Tier-S streaming, durable per-group cursors, and per-stream
-    // metric labels are FLAGGED follow-ups (never removed from the default stream).
+    // stream's consume path here is the COMPETING work-group with a DURABLE per-group cursor (#681 —
+    // checkpointed to `streams/<hex(name)>/cursor-<hex(group)>.ckpt` and resumed at open); a named
+    // stream's DLQ, retry-throttle + durable ATTEMPT counts, key-shared routing, Tier-S streaming, and
+    // per-stream metric labels remain FLAGGED follow-ups (never removed from the default stream).
     // ===================================================================================
 
     /// Produces `message` to the stream named `stream` (#676): the default stream (the EMPTY name)
@@ -17779,9 +18017,9 @@ mod tests {
     #[test]
     fn recovery_reopens_all_streams_engine_state() {
         // RECOVERY (#676): after a restart, the engine reopens the default stream AND every named
-        // stream's log, so produced records on each stream survive and remain consumable. (Named
-        // streams' CONSUMER cursors are in-memory for now — the flagged #60-style follow-up — so this
-        // asserts the LOG of each stream recovers and redelivers its records, the durable guarantee.)
+        // stream's log, so produced records on each stream survive and remain consumable. (This
+        // asserts the LOG of each stream recovers and redelivers its records; the per-stream CONSUMER
+        // cursor durability is covered by `a_named_stream_consumer_cursor_survives_a_restart` below.)
         let fs = InMemoryFs::new();
         {
             let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
@@ -17808,6 +18046,162 @@ mod tests {
         assert_eq!(a.record.payload.as_ref(), b"alpha-survives");
         let b = message(e2.poll_in_stream("beta", "g", 0).unwrap());
         assert_eq!(b.record.payload.as_ref(), b"beta-survives");
+    }
+
+    #[test]
+    fn a_named_stream_consumer_cursor_survives_a_restart() {
+        // THE #681 durable-cursor test (the named-stream twin of the default stream's cursor
+        // durability): a named-stream consumer commits some offsets, the broker shuts down cleanly
+        // (`checkpoint_all_groups`), and after a restart consumption RESUMES from the persisted cursor
+        // — never from 0, never re-delivering an acked record.
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            for p in [&b"o0"[..], b"o1", b"o2", b"o3"] {
+                produce_to(&mut e, "orders", p);
+            }
+            // Consume + ack the first TWO records of stream `orders` in group `g`.
+            for expected in [&b"o0"[..], b"o1"] {
+                let d = message(e.poll_in_stream("orders", "g", 0).unwrap());
+                assert_eq!(d.record.payload.as_ref(), expected);
+                assert_eq!(e.ack_in_stream("orders", "g", &d.token), AckResult::Acked);
+            }
+            assert_eq!(e.committed_offset_in_stream("orders", "g"), Offset::new(2));
+            // A clean operator shutdown flushes EVERY live group's cursor — including the named
+            // stream's (#681). Before this slice the named-stream cursor was in-memory only and this
+            // flush was a no-op for it.
+            e.checkpoint_all_groups().unwrap();
+        }
+
+        // Restart over the SAME filesystem.
+        let mut e2 = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        // The committed cursor SURVIVED: the consumer resumes at offset 2, not 0.
+        assert_eq!(
+            e2.committed_offset_in_stream("orders", "g"),
+            Offset::new(2),
+            "the named-stream consumer cursor survived the restart"
+        );
+        // The next poll delivers offset 2 (`o2`) — the already-acked o0/o1 are NOT redelivered.
+        let d2 = message(e2.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d2.offset, Offset::new(2));
+        assert_eq!(
+            d2.record.payload.as_ref(),
+            b"o2",
+            "consumption resumes at the persisted cursor, not from 0"
+        );
+        assert_eq!(e2.ack_in_stream("orders", "g", &d2.token), AckResult::Acked);
+        let d3 = message(e2.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d3.offset, Offset::new(3));
+        assert_eq!(e2.ack_in_stream("orders", "g", &d3.token), AckResult::Acked);
+        assert_eq!(e2.committed_offset_in_stream("orders", "g"), Offset::new(4));
+        assert!(
+            matches!(e2.poll_in_stream("orders", "g", 0).unwrap(), Poll::Idle),
+            "the stream is fully drained after the resumed consume"
+        );
+    }
+
+    #[test]
+    fn named_stream_durable_cursors_are_isolated_across_streams_and_from_the_default() {
+        // The durable cursors recover PER (stream, group): the SAME group name in two named streams
+        // resumes to two INDEPENDENT committed offsets, and neither disturbs the default stream's own
+        // durable cursor. A named stream that was only produced-to (never consumed) recovers with NO
+        // cursor (fresh at 0), the lazy-on-first-consume path unchanged.
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            for _ in 0..3 {
+                produce(&mut e, b"d"); // default stream
+                produce_to(&mut e, "a", b"a"); // named stream `a`
+                produce_to(&mut e, "b", b"b"); // named stream `b`
+            }
+            produce_to(&mut e, "coldproduce", b"c"); // produced-to but never consumed
+
+            // Advance each group to a DISTINCT committed offset in group `g`.
+            for _ in 0..1 {
+                let d = message(e.poll_in_stream("a", "g", 0).unwrap());
+                e.ack_in_stream("a", "g", &d.token);
+            }
+            for _ in 0..2 {
+                let d = message(e.poll_in_stream("b", "g", 0).unwrap());
+                e.ack_in_stream("b", "g", &d.token);
+            }
+            // The default stream's own durable group cursor advances by 3.
+            for _ in 0..3 {
+                let d = message(e.poll(0).unwrap());
+                e.ack(&d.token);
+            }
+            assert_eq!(e.committed_offset_in_stream("a", "g"), Offset::new(1));
+            assert_eq!(e.committed_offset_in_stream("b", "g"), Offset::new(2));
+            assert_eq!(e.committed_offset(), Offset::new(3));
+            e.checkpoint_all_groups().unwrap();
+        }
+
+        let mut e2 = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        // Each (stream, group) resumed to its OWN committed offset — independent cursors.
+        assert_eq!(
+            e2.committed_offset_in_stream("a", "g"),
+            Offset::new(1),
+            "stream a group g resumed independently"
+        );
+        assert_eq!(
+            e2.committed_offset_in_stream("b", "g"),
+            Offset::new(2),
+            "stream b group g (same name) resumed to its OWN offset"
+        );
+        assert_eq!(
+            e2.committed_offset(),
+            Offset::new(3),
+            "the default stream's durable cursor is unaffected"
+        );
+        // The never-consumed stream recovered fresh at 0 (no cursor file), then delivers from 0.
+        assert_eq!(
+            e2.committed_offset_in_stream("coldproduce", "g"),
+            Offset::ZERO
+        );
+        let c = message(e2.poll_in_stream("coldproduce", "g", 0).unwrap());
+        assert_eq!(c.offset, Offset::ZERO);
+        assert_eq!(c.record.payload.as_ref(), b"c");
+
+        // Resumed streams deliver from their persisted positions, not from 0.
+        let a = message(e2.poll_in_stream("a", "g", 0).unwrap());
+        assert_eq!(a.offset, Offset::new(1));
+        let b = message(e2.poll_in_stream("b", "g", 0).unwrap());
+        assert_eq!(b.offset, Offset::new(2));
+    }
+
+    #[test]
+    fn a_named_stream_cursor_is_durable_via_the_interval_and_disconnect_flush() {
+        // The interval-gated + explicit named-stream checkpoint paths (`maybe_checkpoint_in_stream` /
+        // `checkpoint_in_stream`) both make the cursor durable, mirroring the default stream's
+        // per-pass and connection-close hooks (#60/#681). Here a tiny checkpoint interval forces the
+        // interval path to fire mid-consume, so the cursor is durable WITHOUT relying on the shutdown
+        // flush.
+        let fs = InMemoryFs::new();
+        // checkpoint_interval = 1: every committed offset crosses the interval, so the per-pass
+        // `maybe_checkpoint_in_stream` writes the cursor as it advances.
+        let cfg = EngineConfig {
+            checkpoint_interval: 1,
+            ..config(10, 5)
+        };
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), cfg.clone()).unwrap();
+            for p in [&b"x0"[..], b"x1", b"x2"] {
+                produce_to(&mut e, "orders", p);
+            }
+            for _ in 0..2 {
+                let d = message(e.poll_in_stream("orders", "g", 0).unwrap());
+                e.ack_in_stream("orders", "g", &d.token);
+                // The stream-aware interval flush (what the server drives on committed_progress).
+                assert!(e.maybe_checkpoint_in_stream("orders", "g").unwrap());
+            }
+            // Deliberately DO NOT call checkpoint_all_groups: the interval writes must stand alone.
+        }
+        let e2 = Engine::open(fs, ManualClock::new(), cfg).unwrap();
+        assert_eq!(
+            e2.committed_offset_in_stream("orders", "g"),
+            Offset::new(2),
+            "the interval-flushed named-stream cursor survived without a shutdown flush"
+        );
     }
 
     #[test]

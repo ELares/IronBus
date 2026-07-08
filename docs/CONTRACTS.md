@@ -294,6 +294,18 @@ ahead set) through the same dual-slot CRC checkpoint, so the broker's recovery r
 natively. The canonical filename helper is `ironbus_storage::naming::cursor_checkpoint_name`,
 which the engine and the offline verb share so the names cannot drift.
 
+These cursor files live at the DATA-DIR ROOT for the DEFAULT stream `""`. A NAMED stream's
+per-group consumer cursors (V2-M2, #681) use the **same snapshot format and the same
+`cursor-<hex(group)>.ckpt` filename**, but rooted in **that stream's own subdirectory** —
+`streams/<hex(stream)>/cursor-<hex(group)>.ckpt` — so a stream's consumer cursors are
+co-located with (and recover beside) its own log, the `dlq/` subdir pattern generalized. This
+is a NEW file LOCATION, not a new byte layout: the payload is byte-identical to the default
+stream's cursor snapshot, so the format registry / `FORMAT_VERSION` is unchanged. A named
+stream that is only produced-to (never consumed) has no such file and resumes fresh at offset
+0. On a clean shutdown every live named-stream group's cursor is flushed alongside the default
+stream's (`Engine::checkpoint_all_groups`), and every one is resumed at open, so a named-stream
+consumer survives a restart exactly as a default-stream consumer does.
+
 ### DLQ redrive watermark (the offline redrive checkpoint, #299)
 
 Source: `crates/ironbus-storage/src/admin.rs`. The OFFLINE `admin dlq-redrive` verb records how
@@ -795,11 +807,16 @@ Per work-group consumer state over the shared log: an independent committed `Ack
 plus its own in-flight `LeaseTable`. The lease generation space is per-group, so a
 `LeaseToken` is only meaningful within the group it was delivered from. The default group
 is `""` (durable, `cursor.ckpt`); named groups are durable to their own
-`cursor-<hex>.ckpt`. The `LeaseTable`'s per-message delivery-attempt counts are ALSO
-durable (#358): each group's in-flight `{offset -> attempt}` map is checkpointed (default
-`attempts.ckpt`, named `attempts-<hex>.ckpt`) so `MaxDeliver` survives an unclean restart.
-On open the table seeds its carried attempt counts so a redelivered message resumes at its
-true attempt number instead of resetting to 1.
+`cursor-<hex>.ckpt`. A NAMED stream's per-group cursors are durable the same way, in the
+stream's own subdir (`streams/<hex(stream)>/cursor-<hex(group)>.ckpt`, #681), so a
+named-stream consumer resumes at its committed offset after a restart. The `LeaseTable`'s
+per-message delivery-attempt counts are ALSO durable (#358) FOR THE DEFAULT STREAM: each
+group's in-flight `{offset -> attempt}` map is checkpointed (default `attempts.ckpt`, named
+group `attempts-<hex>.ckpt`) so `MaxDeliver` survives an unclean restart. On open the table
+seeds its carried attempt counts so a redelivered message resumes at its true attempt number
+instead of resetting to 1. A named STREAM's durable attempt counts (its DLQ/`MaxDeliver`
+parity) are the flagged #681 follow-up, deferred with per-stream DLQ / key-shared / Tier-S /
+metrics; a named stream's cursor durability (this slice) does not depend on them.
 
 ### LeaseToken (in-memory fencing token)
 
