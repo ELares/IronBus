@@ -9199,6 +9199,82 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.groups.get(group).is_some_and(|g| g.streaming)
     }
 
+    /// The NAMED-stream twin of [`Engine::set_streaming_in`] (#681 follow-up, Tier-S for named streams):
+    /// marks `group` OF the named `stream` a TIER-S STREAMING consumer (or clears it). A streaming named
+    /// group is served by [`Engine::stream_fetch_in_stream`] / [`Engine::stream_commit_in_stream`] off
+    /// that stream's OWN log with NO lease and NO per-record cursor write, durability coming from the
+    /// periodic named [`Engine::stream_commit_in_stream`] — the SAME lease-free contract the default
+    /// stream's streaming tier uses, keyed by `(stream, group)`. It lives on that stream's own
+    /// [`WorkGroup`] (the same per-group property as the default stream), so the same group name in two
+    /// streams carries two INDEPENDENT streaming cursors. Mirrors [`Engine::set_subject_filter_in_stream`]
+    /// / [`Engine::set_key_ordering_in_stream`]: it re-applies the mode server-side after open (never
+    /// restored from disk; the per-stream CURSOR, however, is durable, #681), creates the stream's group
+    /// if absent (validating the name and the PER-STREAM group cap), and requires the named `stream` to
+    /// already be resident (declared via produce/bind). The default stream (`""`) routes to
+    /// [`Engine::set_streaming_in`] BYTE-FOR-BYTE.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed named name, [`EngineError::UnknownStream`] for
+    /// a never-declared stream, [`EngineError::InvalidGroupName`] for a malformed group name, or
+    /// [`EngineError::TooManyGroups`] if a new group would exceed the per-stream cap.
+    pub fn set_streaming_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        streaming: bool,
+    ) -> Result<(), EngineError> {
+        if stream.is_empty() {
+            return self.set_streaming_in(group, streaming);
+        }
+        let id = StreamId::named(stream)?;
+        // The stream must be resident (its log open) before a streaming group can bind to it — a Tier-S
+        // mark on an unknown stream is a typed reject, never a silent bind to a stream that does not exist
+        // (matching the named filter / key-shared setters).
+        if self.streams.get(&id).is_none() {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        validate_group_name(group)?;
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        let lease_config = self.lease_config;
+        let max_groups = self.max_groups;
+        let named = self
+            .named_streams
+            .entry(id)
+            .or_insert_with(NamedStream::new);
+        if !named.groups.contains_key(group) {
+            if max_groups != 0 && named.groups.len() >= max_groups {
+                return Err(EngineError::TooManyGroups { max: max_groups });
+            }
+            named
+                .groups
+                .insert(group.to_string(), WorkGroup::new(lease_config, now));
+        }
+        if let Some(g) = named.groups.get_mut(group) {
+            g.streaming = streaming;
+        }
+        Ok(())
+    }
+
+    /// Whether `group` OF the named `stream` is a TIER-S STREAMING consumer (#681 follow-up), the twin of
+    /// [`Engine::is_streaming_in`]: `true` when that stream's group is marked streaming, `false` for an
+    /// unknown stream/group or a plain competing named group. The default stream (`""`) reads the
+    /// default-group mode.
+    #[must_use]
+    pub fn is_streaming_in_stream(&self, stream: &str, group: &str) -> bool {
+        if stream.is_empty() {
+            return self.is_streaming_in(group);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return false;
+        };
+        self.named_streams
+            .get(&id)
+            .and_then(|s| s.groups.get(group))
+            .is_some_and(|g| g.streaming)
+    }
+
     /// Binds a per-subject FILTER `pattern` to `group` (#594, V2-M2), or clears it (`None`). A filtered
     /// group delivers ONLY records whose stored subject matches `pattern`, emitting a
     /// `GapMarker`(`reason = FILTERED`) across each coalesced run of skipped offsets. The filter is a
@@ -9617,6 +9693,84 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.stream_fetch_in(DEFAULT_GROUP, member, start_offset, max_records, max_bytes)
     }
 
+    /// The NAMED-stream twin of [`Engine::stream_fetch_in`] (#681 follow-up, Tier-S for named streams):
+    /// serves a CONTIGUOUS batch of records from the named `stream`'s OWN log starting at the
+    /// consumer-managed `start_offset`, bounded by `max_records` / `max_bytes` and that stream's flushed
+    /// frontier — with NO lease grant, NO generation fence, and NO per-record cursor write, exactly the
+    /// lease-free contract the default stream's `stream_fetch_in` provides. It REUSES the SAME shared read
+    /// primitive ([`Log::read_range`]) on the per-stream log, so a named streaming fetch and a default one
+    /// differ only in WHICH log they read; the bookkeeping is byte-for-byte identical. `group` must be a
+    /// STREAMING group of `stream` (declared via [`Engine::set_streaming_in_stream`]); a fetch on a
+    /// non-streaming named group is rejected with the same wrong-mode error `stream_fetch_in` uses, so a
+    /// client cannot bypass the named Tier-W lease path by accident.
+    ///
+    /// `_member` is accepted for symmetry with the member-aware named poll and future per-member streaming
+    /// policy but is NOT used: a streaming consumer manages its own offset, so the contiguous read is not
+    /// member-routed — the SAME choice the default stream's `stream_fetch_in` makes (so a `key_shared`
+    /// named group that is ALSO marked streaming serves the full contiguous run, key routing inert on the
+    /// streaming path, matching the default). The default stream (`""`) routes to
+    /// [`Engine::stream_fetch_in`] BYTE-FOR-BYTE.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed name, [`EngineError::UnknownStream`] for a
+    /// never-declared stream, [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming
+    /// group of `stream`, or a storage error reading the durable prefix.
+    pub fn stream_fetch_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamBatch, EngineError> {
+        // The DEFAULT stream ("") delegates to `stream_fetch_in` (which itself ignores the member on the
+        // contiguous read). A NAMED stream is likewise not member-routed on the streaming path (see the
+        // doc), so `member` is only forwarded to the default delegate and otherwise unreferenced below.
+        if stream.is_empty() {
+            return self.stream_fetch_in(group, member, start_offset, max_records, max_bytes);
+        }
+        let id = StreamId::named(stream)?;
+        // The stream must be resident: consuming an unknown (never-declared) stream is a typed reject.
+        if self.streams.get(&id).is_none() {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        // A streaming fetch belongs to a STREAMING named group ONLY (the same wrong-mode guard as
+        // `stream_fetch_in`): a Tier-W named group must keep using the poll/Fetch path.
+        if !self.is_streaming_in_stream(stream, group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        // A fetch IS activity: refresh the named group's idle stamp and mark it touched so its committed
+        // cursor pins the per-stream retention floor, exactly like the default streaming fetch. The
+        // `named_group_mut` borrow ends before the read below (disjoint fields), so the borrows never
+        // overlap.
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        if let Some(g) = self.named_group_mut(&id, group) {
+            g.last_activity = now;
+            g.touched = true;
+        }
+        // The contiguous read off THIS stream's durable, flushed prefix — the SAME `Log::read_range`
+        // primitive the default streaming fetch and the Tier-W named poll use. NO lease, NO cursor write.
+        let Some(log) = self.streams.get(&id) else {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        };
+        let records = log.read_range(start_offset, max_records, max_bytes)?;
+        // Resume one past the last record served (or `start_offset` when empty), mirroring
+        // `stream_fetch_in`'s `next_offset`.
+        let next_offset = records.last().map_or(start_offset, |r| {
+            r.offset.checked_next().unwrap_or(r.offset)
+        });
+        self.counters.delivered = self.counters.delivered.saturating_add(records.len() as u64);
+        Ok(StreamBatch {
+            records,
+            next_offset,
+        })
+    }
+
     /// Serves a Tier-S STREAMING fetch as RAW on-disk frame bytes (#541, M1-I5): the zero-copy twin of
     /// [`Engine::stream_fetch_in`] used to deliver a contiguous run as ONE `DeliverBatch` frame. It runs
     /// the IDENTICAL group-mode guard, activity refresh, and `delivered`-counter accounting as
@@ -9700,6 +9854,80 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.stream_fetch_raw_in(DEFAULT_GROUP, member, start_offset, max_records, max_bytes)
     }
 
+    /// The NAMED-stream twin of [`Engine::stream_fetch_raw_in`] (#681 follow-up): serves a named-stream
+    /// Tier-S fetch as RAW on-disk frame bytes (the zero-copy `DeliverBatch` half), reusing the SAME
+    /// per-stream [`Log::read_range_raw`] + [`Log::read_range`] primitives on the named `stream`'s own
+    /// log. It runs the IDENTICAL existence + wrong-mode guard, activity refresh, and `delivered`-counter
+    /// accounting as [`Engine::stream_fetch_in_stream`], so the raw and per-record named streaming fetches
+    /// are interchangeable on the wire (the records reconstructed from `raw` plus `tail` are EXACTLY the
+    /// records `stream_fetch_in_stream` would return for the same window). NO lease, NO fence, NO cursor
+    /// write. The default stream (`""`) routes to [`Engine::stream_fetch_raw_in`] BYTE-FOR-BYTE.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed name, [`EngineError::UnknownStream`] for a
+    /// never-declared stream, [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming
+    /// group of `stream`, or a storage error reading the durable prefix.
+    pub fn stream_fetch_raw_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamRawBatch, EngineError> {
+        // As `stream_fetch_in_stream`: `member` is only forwarded to the default-stream delegate; the
+        // named streaming raw read is not member-routed.
+        if stream.is_empty() {
+            return self.stream_fetch_raw_in(group, member, start_offset, max_records, max_bytes);
+        }
+        let id = StreamId::named(stream)?;
+        if self.streams.get(&id).is_none() {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        // The same wrong-mode guard as `stream_fetch_raw_in`: a raw fetch is the same Tier-S streaming
+        // fetch, only the delivery encoding differs.
+        if !self.is_streaming_in_stream(stream, group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        if let Some(g) = self.named_group_mut(&id, group) {
+            g.last_activity = now;
+            g.touched = true;
+        }
+        let Some(log) = self.streams.get(&id) else {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        };
+        // The contiguous SEALED prefix as raw on-disk frame bytes (zero-copy), plus the resume point for
+        // anything this single-segment raw read did not serve — the SAME primitive the default path uses.
+        let (raw, tail_from) = log.read_range_raw(start_offset, max_records, max_bytes)?;
+        // Materialize the ACTIVE-tail remainder (if any), bounded by the records the raw run did NOT
+        // already serve and the residual byte budget, so raw + tail never exceeds the request — identical
+        // to `stream_fetch_raw_in`.
+        let raw_count = usize::try_from(raw.record_count).unwrap_or(usize::MAX);
+        let tail = match tail_from {
+            Some(from) if raw_count < max_records => {
+                let remaining = max_records - raw_count;
+                log.read_range(from, remaining, max_bytes)?
+            }
+            _ => Vec::new(),
+        };
+        let next_offset = tail.last().map_or(raw.next_offset, |r| {
+            r.offset.checked_next().unwrap_or(r.offset)
+        });
+        let total = raw.record_count.saturating_add(tail.len() as u64);
+        self.counters.delivered = self.counters.delivered.saturating_add(total);
+        Ok(StreamRawBatch {
+            raw,
+            tail,
+            next_offset,
+        })
+    }
+
     /// Commits a Tier-S STREAMING group's cursor up to the EXCLUSIVE offset `up_to` (#544, M1-I7): the
     /// consumer's PERIODIC, cumulative "everything below `up_to` is durably processed" checkpoint. It
     /// REUSES the broadcast cumulative-ack cursor primitive ([`AckCursor::commit_up_to`]) — no new
@@ -9778,6 +10006,90 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// As [`Engine::stream_commit_in`].
     pub fn stream_commit(&mut self, up_to: Offset) -> Result<(), EngineError> {
         self.stream_commit_in(DEFAULT_GROUP, up_to)
+    }
+
+    /// The NAMED-stream twin of [`Engine::stream_commit_in`] (#681 follow-up): advances the streaming
+    /// `group` OF the named `stream`'s per-stream cursor up to the EXCLUSIVE offset `up_to` — the named
+    /// streaming consumer's periodic cumulative durability checkpoint. It REUSES the SAME
+    /// [`AckCursor::commit_up_to`] primitive the default streaming commit and the named per-message ack
+    /// ([`Engine::ack_in_stream`]) drive, on that stream's OWN cursor, so a committed named streaming
+    /// consumer frees its per-stream retention exactly like a named ack. Like `ack_in_stream` (and unlike
+    /// the default `stream_commit_in`) it does NOT fire the designated-confirm hook: that L2-produce
+    /// confirm path is a default-stream concern, and the named ack path already omits it. Because a
+    /// streaming group grants NO leases, the commit only advances the watermark (no `release_below`). It
+    /// is idempotent and monotonic. `up_to` is validated against THIS stream's durable, retained window
+    /// BEFORE the cursor is touched. The per-stream cursor is durably checkpointed by the SAME periodic
+    /// #681 named-cursor checkpoint (no new durability path, no on-disk format change). The default stream
+    /// (`""`) routes to [`Engine::stream_commit_in`] BYTE-FOR-BYTE.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed name, [`EngineError::UnknownStream`] for a
+    /// never-declared stream, [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming
+    /// group of `stream`, or [`EngineError::CumulativeAckOutOfRange`] if `up_to` is past that stream's
+    /// durable head or below its earliest retained offset.
+    pub fn stream_commit_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        up_to: Offset,
+    ) -> Result<(), EngineError> {
+        if stream.is_empty() {
+            return self.stream_commit_in(group, up_to);
+        }
+        let id = StreamId::named(stream)?;
+        // Read THIS stream's durable window + monotonic clock in one scoped borrow, copying the values
+        // out so the borrow of `self.streams` ends before the group cursor mutation below.
+        let (durable_head, earliest_retained, now) = match self.streams.get(&id) {
+            Some(log) => (
+                log.flushed_offset().get(),
+                log.earliest_offset().get(),
+                log.now_monotonic(),
+            ),
+            None => {
+                return Err(EngineError::UnknownStream {
+                    name: stream.to_string(),
+                })
+            }
+        };
+        // Streaming named groups only: the verb belongs to a consumer-managed-offset group (the same
+        // wrong-mode guard as `stream_commit_in`).
+        if !self.is_streaming_in_stream(stream, group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        // Validate `up_to` against the durable, retained window BEFORE touching the cursor — identical to
+        // `stream_commit_in`. Either bound leaves the committed position exactly as it was.
+        let up_to_raw = up_to.get();
+        if up_to_raw > durable_head || up_to_raw < earliest_retained {
+            return Err(EngineError::CumulativeAckOutOfRange {
+                up_to: up_to_raw,
+                earliest_retained,
+                durable_head,
+            });
+        }
+        // Resolve the per-stream group via direct field access (not `named_group_mut`, whose `&mut self`
+        // borrow would block the `self.counters` update below): the group is present because the
+        // streaming-mode guard above passed. Advance the single streaming cursor; `commit_up_to` is
+        // idempotent + monotonic (a re-commit never regresses the floor). NO `release_below`: a streaming
+        // group holds no leases. The `g` borrow (of `self.named_streams`) ends before `self.counters`.
+        let Some(g) = self
+            .named_streams
+            .get_mut(&id)
+            .and_then(|s| s.groups.get_mut(group))
+        else {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        };
+        g.last_activity = now;
+        g.touched = true;
+        let before = g.cursor.committed().get();
+        let advanced = if g.cursor.commit_up_to(up_to) {
+            g.cursor.committed().get().saturating_sub(before)
+        } else {
+            0
+        };
+        // Count each newly-committed offset as an ack on the SAME counter the named per-message ack drives
+        // (`ack_in_stream`), so the resilience taxonomy is unchanged (no new counter).
+        self.counters.acks = self.counters.acks.saturating_add(advanced);
+        Ok(())
     }
 
     /// Nacks the message named by `token`, requeueing it for redelivery and fencing the
@@ -10383,6 +10695,180 @@ mod tests {
             Poll::Message(d) => d,
             other => panic!("expected a message, got {other:?}"),
         }
+    }
+
+    /// Produces `payload` to the NAMED stream `stream` (declares-on-first-produce), for the named Tier-S
+    /// engine tests (#681 follow-up).
+    fn produce_named(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        payload: &[u8],
+    ) -> Offset {
+        e.produce_in_stream(
+            stream,
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn named_stream_fetch_in_stream_reads_its_own_log_lease_free_and_isolated() {
+        // #681 follow-up: `stream_fetch_in_stream` serves a contiguous run off the NAMED stream's OWN log
+        // with NO lease and NO cursor write — the lease-free Tier-S contract, reusing `Log::read_range`.
+        // A fetch on a group NOT marked streaming is the wrong-mode reject; an unknown stream is typed.
+        let mut e = open(config(100, 5));
+        for i in 0..6u8 {
+            produce_named(&mut e, "orders", &[i]);
+        }
+        // A default-stream produce must NOT leak into the named fetch (cross-stream isolation).
+        produce(&mut e, b"default-only");
+
+        // Before the group is marked streaming, a streaming fetch is rejected wrong-mode.
+        assert!(matches!(
+            e.stream_fetch_in_stream("orders", "g", MemberId::default(), Offset::ZERO, 100, None),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        e.set_streaming_in_stream("orders", "g", true).unwrap();
+        assert!(e.is_streaming_in_stream("orders", "g"));
+
+        let batch = e
+            .stream_fetch_in_stream("orders", "g", MemberId::default(), Offset::ZERO, 100, None)
+            .unwrap();
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .map(|r| r.payload.to_vec())
+                .collect::<Vec<_>>(),
+            (0..6u8).map(|i| vec![i]).collect::<Vec<_>>(),
+            "reads exactly the named stream's own records"
+        );
+        assert_eq!(
+            batch.next_offset.get(),
+            6,
+            "resumes one past the last record"
+        );
+        // NO cursor write: the named group's committed cursor stays at 0 after a lease-free fetch.
+        assert_eq!(e.committed_offset_in_stream("orders", "g").get(), 0);
+        // An unknown stream is a typed reject, never a silent empty read.
+        assert!(matches!(
+            e.stream_fetch_in_stream("missing", "g", MemberId::default(), Offset::ZERO, 100, None),
+            Err(EngineError::UnknownStream { .. })
+        ));
+        // The DEFAULT stream ("") routes to `stream_fetch_in` byte-for-byte.
+        e.set_streaming_in("dg", true).unwrap();
+        let def = e
+            .stream_fetch_in_stream("", "dg", MemberId::default(), Offset::ZERO, 100, None)
+            .unwrap();
+        assert_eq!(
+            def.records.len(),
+            1,
+            "the default-stream route reads the default log"
+        );
+    }
+
+    #[test]
+    fn named_stream_fetch_raw_in_stream_serves_the_same_window_as_the_per_record_fetch() {
+        // The raw (DeliverBatch) named fetch serves EXACTLY the records the per-record named fetch does
+        // for the same window — same total count, same resume offset, reusing `Log::read_range_raw`.
+        let mut e = open(config(100, 5));
+        for i in 0..10u8 {
+            produce_named(&mut e, "orders", &[i]);
+        }
+        e.set_streaming_in_stream("orders", "g", true).unwrap();
+        let per = e
+            .stream_fetch_in_stream(
+                "orders",
+                "g",
+                MemberId::default(),
+                Offset::new(2),
+                100,
+                None,
+            )
+            .unwrap();
+        let raw = e
+            .stream_fetch_raw_in_stream(
+                "orders",
+                "g",
+                MemberId::default(),
+                Offset::new(2),
+                100,
+                None,
+            )
+            .unwrap();
+        let raw_total = raw.raw.record_count + raw.tail.len() as u64;
+        assert_eq!(
+            raw_total,
+            per.records.len() as u64,
+            "raw + tail == the per-record window"
+        );
+        assert_eq!(raw.next_offset, per.next_offset, "same resume offset");
+        assert_eq!(per.records.len(), 8, "the window [2, 10) is served");
+    }
+
+    #[test]
+    fn named_stream_commit_in_stream_advances_only_that_cursor_and_validates_range() {
+        // `stream_commit_in_stream` advances the NAMED group's OWN cursor, validates `up_to` against THIS
+        // stream's durable window, rejects a non-streaming group wrong-mode, and is idempotent/monotonic.
+        let mut e = open(config(100, 5));
+        for i in 0..8u8 {
+            produce_named(&mut e, "orders", &[i]);
+        }
+        e.set_streaming_in_stream("orders", "g", true).unwrap();
+        // A commit on a non-streaming named group is wrong-mode (the pull path uses acks).
+        assert!(matches!(
+            e.stream_commit_in_stream("orders", "pull", Offset::new(2)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        // `up_to` past this stream's durable head is out-of-range (cursor untouched).
+        assert!(matches!(
+            e.stream_commit_in_stream("orders", "g", Offset::new(99)),
+            Err(EngineError::CumulativeAckOutOfRange { .. })
+        ));
+        assert_eq!(e.committed_offset_in_stream("orders", "g").get(), 0);
+        // A valid commit advances only the named cursor.
+        e.stream_commit_in_stream("orders", "g", Offset::new(5))
+            .unwrap();
+        assert_eq!(e.committed_offset_in_stream("orders", "g").get(), 5);
+        assert_eq!(
+            e.committed_offset_in_stream("", "g").get(),
+            0,
+            "the default stream's same-named cursor is untouched"
+        );
+        // A lower re-commit is an idempotent no-op success; the watermark never regresses.
+        e.stream_commit_in_stream("orders", "g", Offset::new(2))
+            .unwrap();
+        assert_eq!(e.committed_offset_in_stream("orders", "g").get(), 5);
+        // An unknown stream is a typed reject.
+        assert!(matches!(
+            e.stream_commit_in_stream("missing", "g", Offset::new(0)),
+            Err(EngineError::UnknownStream { .. })
+        ));
+    }
+
+    #[test]
+    fn set_streaming_in_stream_routes_the_default_and_rejects_an_unknown_stream() {
+        // The named streaming-mode setter routes the DEFAULT stream ("") to `set_streaming_in`
+        // byte-for-byte, and rejects a never-declared named stream (typed), mirroring the named filter /
+        // key-shared setters.
+        let mut e = open(config(100, 5));
+        e.set_streaming_in_stream("", "g", true).unwrap();
+        assert!(
+            e.is_streaming_in("g"),
+            "the default route marks the default group"
+        );
+        assert!(e.is_streaming_in_stream("", "g"));
+        assert!(matches!(
+            e.set_streaming_in_stream("missing", "g", true),
+            Err(EngineError::UnknownStream { .. })
+        ));
+        assert!(!e.is_streaming_in_stream("missing", "g"));
     }
 
     // --- The pipelined async-commit API (#1040): begin/complete/tail/fail + passthroughs ---

@@ -2752,6 +2752,11 @@ impl Session {
         let start = Offset::new(req.start_offset);
         let group = self.subscription.clone();
         let member = self.member_id;
+        // The NAMED stream this streaming fetch targets (#681 follow-up), `""` for the DEFAULT stream. A
+        // named-stream streaming consumer routes its contiguous read to that stream's OWN log via the
+        // engine's `*_in_stream` twins (threaded into the serve helpers below); the default stream is
+        // byte-for-byte unchanged.
+        let stream = self.stream.clone();
         // CLUSTER FOLLOWER-READ over the wire (#735, half B): if this node FOLLOWS the partition, serve the
         // Tier-S streaming fetch from its OWN follower read plane via the #723 read-consistency tiers —
         // fail-closed by the SAFE committed watermark `min(own_flushed, known_committed_hw)`, so a follower
@@ -2763,21 +2768,31 @@ impl Session {
         // A `Some` outcome means this node follows the partition: serve from the follower run (or, for a
         // latest/dirty read above the safe bar, reply an empty batch — never a speculative unconfirmed
         // serve; the dirty-tier leader confirm over the wire is the flagged follow-up).
-        if let Some(outcome) = engine.cluster_follower_consume(
-            crate::cluster::client_ack::DEFAULT_PARTITION,
-            ReadTier::FollowerCommitted,
-            start,
-            want,
-            max_bytes,
-        ) {
-            let delivered =
-                Self::serve_follower_read_outcome(outcome, self.compressed_delivery_enabled, out);
-            // Terminate with the SAME FlowEnd a leader Tier-S batch uses, so the client frames a
-            // follower-read response exactly like any other streaming batch. No keep-up auto-tune on the
-            // follower path (the credit window is the leader engine's concern); a follower-read just serves
-            // its committed prefix.
-            reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
-            return Ok(());
+        //
+        // NAMED streams (#681 follow-up) are NOT in the cluster follower-read plane (that plane is the
+        // DEFAULT stream / DEFAULT_PARTITION concern), so only the default stream consults it — a named
+        // streaming fetch falls straight through to the local (leader/local-engine) serve below, keyed by
+        // (stream_id, group).
+        if self.stream.is_empty() {
+            if let Some(outcome) = engine.cluster_follower_consume(
+                crate::cluster::client_ack::DEFAULT_PARTITION,
+                ReadTier::FollowerCommitted,
+                start,
+                want,
+                max_bytes,
+            ) {
+                let delivered = Self::serve_follower_read_outcome(
+                    outcome,
+                    self.compressed_delivery_enabled,
+                    out,
+                );
+                // Terminate with the SAME FlowEnd a leader Tier-S batch uses, so the client frames a
+                // follower-read response exactly like any other streaming batch. No keep-up auto-tune on
+                // the follower path (the credit window is the leader engine's concern); a follower-read
+                // just serves its committed prefix.
+                reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
+                return Ok(());
+            }
         }
         // A consumer that advertised the DeliverBatch capability (#541) takes the RAW-FRAMED batch path:
         // a contiguous run ships as ONE `DeliverBatch` (the on-disk frame bytes verbatim, sendfile-ready
@@ -2794,11 +2809,11 @@ impl Session {
             // compression-capable by construction. The ACTIVE-tail per-record remainder is still gated
             // via `capable` inside the fn. (#1066)
             Self::serve_stream_fetch_batch(
-                engine, &group, member, start, want, max_bytes, capable, out,
+                engine, &stream, &group, member, start, want, max_bytes, capable, out,
             )?
         } else {
             Self::serve_stream_fetch_per_record(
-                engine, &group, member, start, want, max_bytes, capable, out,
+                engine, &stream, &group, member, start, want, max_bytes, capable, out,
             )?
         };
         let Some(delivered) = delivered else {
@@ -2932,6 +2947,7 @@ impl Session {
         E: EngineAccess<F, C>,
     >(
         engine: &E,
+        stream: &GroupName,
         group: &GroupName,
         member: MemberId,
         start: Offset,
@@ -2941,10 +2957,17 @@ impl Session {
         out: &mut Vec<u8>,
     ) -> Result<Option<u32>, SessionError> {
         let group = group.clone();
+        // Route by stream: a NAMED-stream streaming consumer (#681 follow-up) reads its OWN per-stream log
+        // via `stream_fetch_in_stream`; the DEFAULT stream (`stream` empty) routes to `stream_fetch_in`
+        // BYTE-FOR-BYTE (the engine method itself dispatches on the empty name). Both are the SAME
+        // lease-free contiguous read — only the log differs.
+        let stream = stream.clone();
         // ONE actor round-trip serves the whole contiguous batch — the heart of the Tier-S win versus
         // the N per-record round-trips the Tier-W poll loop makes. The engine reads off the shared
         // durable read path, claims no lease, and writes no cursor.
-        match engine.with(move |e| e.stream_fetch_in(&group, member, start, want, max_bytes))? {
+        match engine.with(move |e| {
+            e.stream_fetch_in_stream(&stream, &group, member, start, want, max_bytes)
+        })? {
             Ok(StreamBatch { records, .. }) => {
                 let mut delivered = 0u32;
                 // One reusable scratch buffer for this batch's per-record frame bodies (#826):
@@ -3019,6 +3042,7 @@ impl Session {
         E: EngineAccess<F, C>,
     >(
         engine: &E,
+        stream: &GroupName,
         group: &GroupName,
         member: MemberId,
         start: Offset,
@@ -3028,7 +3052,13 @@ impl Session {
         out: &mut Vec<u8>,
     ) -> Result<Option<u32>, SessionError> {
         let group = group.clone();
-        match engine.with(move |e| e.stream_fetch_raw_in(&group, member, start, want, max_bytes))? {
+        // Route by stream (#681 follow-up): a NAMED stream reads its OWN per-stream log via
+        // `stream_fetch_raw_in_stream`; the DEFAULT stream (`stream` empty) routes to `stream_fetch_raw_in`
+        // BYTE-FOR-BYTE. Same lease-free raw contiguous read — only the log differs.
+        let stream = stream.clone();
+        match engine.with(move |e| {
+            e.stream_fetch_raw_in_stream(&stream, &group, member, start, want, max_bytes)
+        })? {
             Ok(StreamRawBatch { raw, tail, .. }) => {
                 let mut delivered: u32 = 0;
                 // The contiguous SEALED prefix as ONE DeliverBatch: the on-disk frame bytes verbatim. A
@@ -3131,7 +3161,11 @@ impl Session {
         };
         let group = group.to_string();
         let up_to = Offset::new(commit.up_to);
-        match engine.with(move |e| e.stream_commit_in(&group, up_to))? {
+        // Route by stream (#681 follow-up): a NAMED-stream streaming consumer commits its OWN per-stream
+        // cursor via `stream_commit_in_stream`; the DEFAULT stream (`self.stream` empty) routes to
+        // `stream_commit_in` BYTE-FOR-BYTE (the engine method dispatches on the empty name).
+        let stream = self.stream.clone();
+        match engine.with(move |e| e.stream_commit_in_stream(&stream, &group, up_to))? {
             // A committed (or idempotent no-op) streaming commit: the generic body-less success. There
             // is no per-connection lease to release (Tier-S grants none), so unlike the broadcast
             // cumulative-ack path there is no `self.leased` bookkeeping here.
@@ -4022,6 +4056,22 @@ impl Session {
             }
         })?;
         self.joined_key_shared = joined;
+        // Apply the connection's negotiated DEFAULT consume tier (#543 / #681 follow-up) to the newly-
+        // subscribed NAMED group, the twin of the default stream's `handle_sub` marking: mark THIS stream's
+        // group streaming ONLY when the connection default is Tier-S, and NEVER clear it, so a `SubTo` that
+        // does not explicitly pick a tier consumes at the connection's Tier-S default on its OWN per-stream
+        // cursor (keyed by (stream, group)). Best-effort at SubTo time (the streaming fetch re-checks the
+        // mode and rejects a non-streaming group), so `SubTo` stays infallible for the tier selection and a
+        // transient engine error does not strand the subscription. The default tier is already gated by the
+        // streaming capability bit at Connect (a Tier-S default is forced to Tier-W when the client did not
+        // advertise the capability), so a pre-streaming client never reaches this branch.
+        if self.default_tier == ConsumeTier::Streaming {
+            let stream_name = self.stream.clone();
+            let sub = self.subscription.clone();
+            engine.with(move |e| {
+                let _ = e.set_streaming_in_stream(&stream_name, &sub, true);
+            })?;
+        }
         reply(out, FrameType::Ok, &[]);
         Ok(())
     }
@@ -7036,6 +7086,537 @@ mod tests {
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Ok);
         s
+    }
+
+    // ===== NAMED-stream Tier-S STREAMING consume (#681 follow-up) ================================
+    //
+    // These mirror the DEFAULT-stream Tier-S suite above, but drive a NAMED stream: the same
+    // consumer-managed-offset StreamFetch / StreamCommit, served off the named stream's OWN log via the
+    // engine's `*_in_stream` twins, keyed by (stream, group). A pull/competing named consumer is
+    // unaffected (it never marks its group streaming), and the streaming path composes with the named
+    // key-shared / filter modes exactly as the default stream's streaming path does (routing/filter are
+    // INERT on the contiguous streaming read — the same choice `stream_fetch_in` makes).
+
+    /// A streams-capable + streaming-capable connect body for the named Tier-S tests: advertises
+    /// `understands_streaming` (negotiate the streaming tier), `understands_streams` (so `SubTo` binds a
+    /// named stream), an optional connection `default_tier`, and optionally the `DeliverBatch` capability.
+    fn named_streaming_connect_body(
+        default_tier: Option<ConsumeTier>,
+        understands_deliver_batch: bool,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming: true,
+                default_tier: default_tier.map(ConsumeTier::as_u8),
+                understands_deliver_batch,
+                understands_streams: true,
+                understands_compressed_delivery: false,
+                wants_subject_filter: false,
+            },
+            &mut body,
+        );
+        body
+    }
+
+    /// Produces a record with explicit key/headers/payload to a NAMED stream (declares-on-first-produce),
+    /// the named twin of `produce_kh`.
+    fn produce_named_kh<C: Clock + Clone>(
+        e: &DirectEngine<InMemoryFs, C>,
+        stream: &str,
+        key: &[u8],
+        headers: &[u8],
+        payload: &[u8],
+    ) {
+        e.engine_mut()
+            .produce_in_stream(
+                stream,
+                &Append {
+                    timestamp_ms: 42,
+                    flags: RecordFlags::EMPTY,
+                    key,
+                    headers,
+                    payload,
+                },
+            )
+            .unwrap();
+    }
+
+    /// Marks the named `stream`'s `group` streaming, connects a streams+streaming-capable session (with
+    /// the `DeliverBatch` capability iff `deliver_batch`), and `SubTo`s the named group. The named twin of
+    /// `batch_session`; the stream must already be resident (produce to it first).
+    fn named_streaming_session<C: Clock + Clone + 'static>(
+        e: &DirectEngine<InMemoryFs, C>,
+        stream: &[u8],
+        group: &[u8],
+        deliver_batch: bool,
+    ) -> Session {
+        let st = core::str::from_utf8(stream).unwrap();
+        let g = core::str::from_utf8(group).unwrap();
+        e.engine_mut().set_streaming_in_stream(st, g, true).unwrap();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            e,
+            &frame(
+                FrameType::Connect,
+                &named_streaming_connect_body(None, deliver_batch),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(e, &sub_to_frame(stream, group), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "SubTo accepted");
+        s
+    }
+
+    /// A `StreamFetch` wire frame for the consumer-managed window `[start, start+max_records)`.
+    fn stream_fetch_frame(start: u64, max_records: u32, max_bytes: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        ironbus_proto::message::encode_stream_fetch(
+            &ironbus_proto::message::StreamFetchBody {
+                start_offset: start,
+                max_records,
+                max_bytes,
+            },
+            &mut b,
+        );
+        frame(FrameType::StreamFetch, &b)
+    }
+
+    /// The offsets of the per-record `Deliver` frames in `out`, in order.
+    fn delivered_offsets(out: &[u8]) -> Vec<u64> {
+        decode_all(out)
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, body)| decode_deliver(body).unwrap().offset)
+            .collect()
+    }
+
+    #[test]
+    fn named_stream_tier_s_per_record_delivers_the_contiguous_run() {
+        // A NAMED-stream Tier-S consumer receives the whole contiguous run off the named stream's OWN log
+        // as per-record `Deliver` frames terminated by one FlowEnd — the streaming path, keyed by
+        // (stream, group). The DEFAULT stream's same-named group is untouched (cross-stream isolation).
+        let e = DirectEngine::new(engine());
+        for i in 0..12u8 {
+            produce_named_kh(&e, "orders", &[i, 7], &[i, 9], &[i; 5]);
+        }
+        // A record on the DEFAULT stream's `g` must NOT leak into the named consumer's run.
+        produce(&e, b"default-only");
+
+        let mut s = named_streaming_session(&e, b"orders", b"g", false);
+        let mut out = Vec::new();
+        s.process(&e, &stream_fetch_frame(0, 100, 0), &mut out)
+            .unwrap();
+        let frames = decode_all(&out);
+        // Per-record Deliver frames (no DeliverBatch: this consumer is batch-incapable) + one FlowEnd(12).
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "a batch-incapable named consumer gets per-record Deliver frames"
+        );
+        let offs = delivered_offsets(&out);
+        assert_eq!(
+            offs,
+            (0..12).collect::<Vec<_>>(),
+            "the whole named run, in order"
+        );
+        // Payloads reconstruct exactly (proving it read the NAMED log, not the default one).
+        let payloads: Vec<Vec<u8>> = decode_all(&out)
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, b)| decode_deliver(b).unwrap().payload.to_vec())
+            .collect();
+        assert_eq!(payloads, (0..12u8).map(|i| vec![i; 5]).collect::<Vec<_>>());
+        let end = frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::FlowEnd)
+            .unwrap();
+        assert_eq!(
+            end.1,
+            12u32.to_le_bytes(),
+            "FlowEnd counts every named record"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn named_stream_tier_s_batch_matches_per_record() {
+        // #681 follow-up DIFFERENTIAL (mirrors the default `deliver_batch_yields_the_same_records...`): a
+        // batch-capable NAMED consumer's StreamFetch is answered with a `DeliverBatch` whose decoded
+        // records are BYTE-FOR-BYTE the records a per-record NAMED consumer gets as N `Deliver` frames.
+        let e = DirectEngine::new(engine());
+        for i in 0..12u8 {
+            produce_named_kh(&e, "orders", &[i, 7], &[i, 9, 9], &[i; 5]);
+        }
+        let mut batch_s = named_streaming_session(&e, b"orders", b"g", true);
+        let mut plain_s = named_streaming_session(&e, b"orders", b"g2", false);
+
+        let req = stream_fetch_frame(0, 100, 0);
+
+        let mut batch_out = Vec::new();
+        batch_s.process(&e, &req, &mut batch_out).unwrap();
+        let batch_frames = decode_all(&batch_out);
+        assert!(
+            batch_frames
+                .iter()
+                .any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "a batch-capable named consumer is served a DeliverBatch"
+        );
+        assert!(
+            !batch_frames.iter().any(|(ty, _)| *ty == FrameType::Deliver),
+            "the whole sealed named run ships as ONE batch, no per-record Deliver"
+        );
+        let batch_body = &batch_frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::DeliverBatch)
+            .unwrap()
+            .1;
+        let from_batch = decode_batch_records(batch_body);
+
+        let mut plain_out = Vec::new();
+        plain_s.process(&e, &req, &mut plain_out).unwrap();
+        let plain_frames = decode_all(&plain_out);
+        let from_plain: Vec<_> = plain_frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, body)| {
+                let d = decode_deliver(body).unwrap();
+                (
+                    d.offset,
+                    d.generation,
+                    d.flags,
+                    d.timestamp_ms,
+                    d.key.to_vec(),
+                    d.headers.to_vec(),
+                    d.payload.to_vec(),
+                )
+            })
+            .collect();
+
+        assert_eq!(from_batch.len(), 12, "all 12 named records delivered");
+        assert_eq!(
+            from_batch, from_plain,
+            "the named batch decodes to EXACTLY the per-record Deliver run (offsets, CRC verified)"
+        );
+        let batch_end = batch_frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::FlowEnd)
+            .unwrap();
+        let plain_end = plain_frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::FlowEnd)
+            .unwrap();
+        assert_eq!(batch_end.1, plain_end.1, "same FlowEnd delivered count");
+        assert_eq!(batch_end.1, 12u32.to_le_bytes());
+    }
+
+    #[test]
+    fn named_stream_tier_s_reconstructs_offsets_and_resumes_from_a_mid_run_start() {
+        // Consumer-managed offset on a NAMED stream: a batch starting at a non-zero offset reconstructs
+        // each offset positionally and a bounded fetch resumes exactly where it left off (no gap/overlap).
+        let e = DirectEngine::new(engine());
+        for i in 0..20u8 {
+            produce_named_kh(&e, "orders", b"", b"", &[i]);
+        }
+        let mut s = named_streaming_session(&e, b"orders", b"g", true);
+
+        let fetch = |s: &mut Session, start: u64, max: u32| -> Vec<u64> {
+            let mut out = Vec::new();
+            s.process(&e, &stream_fetch_frame(start, max, 0), &mut out)
+                .unwrap();
+            let mut offs = Vec::new();
+            for (ty, body) in decode_all(&out) {
+                if ty == FrameType::DeliverBatch {
+                    for r in decode_batch_records(&body) {
+                        offs.push(r.0);
+                    }
+                }
+            }
+            offs
+        };
+        assert_eq!(fetch(&mut s, 5, 5), vec![5, 6, 7, 8, 9]);
+        assert_eq!(fetch(&mut s, 10, 5), vec![10, 11, 12, 13, 14]);
+        assert_eq!(fetch(&mut s, 0, 100), (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn named_stream_tier_s_flow_control_matches_the_default() {
+        // FLOW-CONTROL / CREDIT: a named streaming fetch is bounded by the SAME per-consumer credit
+        // window as the default stream (#552/#464 floor). With more records than the initial window, a
+        // huge `max_records` still delivers only a window's worth — and the count is IDENTICAL to a
+        // default-stream consumer given the same record count, proving the credit path is shared.
+        let e = DirectEngine::new(engine());
+        for i in 0..150u32 {
+            produce(&e, &i.to_le_bytes()); // default stream `gd`
+            produce_named_kh(&e, "orders", b"", b"", &i.to_le_bytes());
+        }
+        // Default-stream streaming consumer.
+        e.engine_mut().set_streaming_in("gd", true).unwrap();
+        let mut def_s = Session::new();
+        let mut def_out = Vec::new();
+        def_s
+            .process(
+                &e,
+                &frame(
+                    FrameType::Connect,
+                    &named_streaming_connect_body(None, false),
+                ),
+                &mut def_out,
+            )
+            .unwrap();
+        def_out.clear();
+        def_s
+            .process(&e, &frame(FrameType::Sub, b"gd"), &mut def_out)
+            .unwrap();
+        def_out.clear();
+        def_s
+            .process(&e, &stream_fetch_frame(0, 100_000, 0), &mut def_out)
+            .unwrap();
+        let def_count = delivered_offsets(&def_out).len();
+
+        // Named-stream streaming consumer, identical fetch.
+        let mut nm_s = named_streaming_session(&e, b"orders", b"g", false);
+        let mut nm_out = Vec::new();
+        nm_s.process(&e, &stream_fetch_frame(0, 100_000, 0), &mut nm_out)
+            .unwrap();
+        let nm_count = delivered_offsets(&nm_out).len();
+
+        assert!(
+            def_count < 150,
+            "the credit window bound the default fetch (flow-control engaged)"
+        );
+        assert_eq!(
+            nm_count, def_count,
+            "the named streaming fetch is bounded by the SAME credit window as the default"
+        );
+        // The FlowEnd count matches the delivered count on the named path.
+        let nm_end = decode_all(&nm_out)
+            .into_iter()
+            .find(|(ty, _)| *ty == FrameType::FlowEnd)
+            .unwrap()
+            .1;
+        assert_eq!(nm_end, u32::try_from(nm_count).unwrap().to_le_bytes());
+    }
+
+    #[test]
+    fn named_stream_tier_s_commit_advances_only_that_streams_cursor() {
+        // StreamCommit on a NAMED streaming group advances THAT stream's per-stream cursor (durably
+        // pinned, #681) and NOTHING else: the default stream's same-named cursor stays at zero, and a
+        // re-commit is an idempotent no-op success.
+        let e = DirectEngine::new(engine());
+        for i in 0..10u8 {
+            produce_named_kh(&e, "orders", b"", b"", &[i]);
+        }
+        let mut s = named_streaming_session(&e, b"orders", b"g", false);
+        let mut out = Vec::new();
+        // Commit up_to = 6 (exclusive) on the named group.
+        let mut cb = Vec::new();
+        ironbus_proto::message::encode_stream_commit(
+            &ironbus_proto::message::StreamCommitBody {
+                up_to: 6,
+                group: b"g",
+            },
+            &mut cb,
+        );
+        s.process(&e, &frame(FrameType::StreamCommit, &cb), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "named streaming commit succeeds"
+        );
+        assert_eq!(
+            e.engine_mut()
+                .committed_offset_in_stream("orders", "g")
+                .get(),
+            6,
+            "the NAMED stream's cursor advanced to the committed offset"
+        );
+        assert_eq!(
+            e.engine_mut().committed_offset_in_stream("", "g").get(),
+            0,
+            "the DEFAULT stream's same-named cursor is untouched (cross-stream isolation)"
+        );
+        // Idempotent re-commit below the watermark: still Ok, cursor unchanged.
+        out.clear();
+        let mut cb2 = Vec::new();
+        ironbus_proto::message::encode_stream_commit(
+            &ironbus_proto::message::StreamCommitBody {
+                up_to: 3,
+                group: b"g",
+            },
+            &mut cb2,
+        );
+        s.process(&e, &frame(FrameType::StreamCommit, &cb2), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "a re-commit is an idempotent success"
+        );
+        assert_eq!(
+            e.engine_mut()
+                .committed_offset_in_stream("orders", "g")
+                .get(),
+            6,
+            "the cursor never regresses on a lower re-commit"
+        );
+    }
+
+    #[test]
+    fn named_stream_tier_s_rejects_a_fetch_on_a_non_streaming_group_and_pull_is_unchanged() {
+        // A pull/competing NAMED consumer is UNCHANGED: its group is never marked streaming, a StreamFetch
+        // on it is rejected wrong-mode (the client must use Flow/poll), and a plain Flow still delivers +
+        // acks byte-for-byte the historical named pull path.
+        let e = DirectEngine::new(engine());
+        for i in 0..5u8 {
+            produce_named_kh(&e, "orders", b"", b"", &[i]);
+        }
+        // A streams-capable consumer that did NOT mark its group streaming (a pull consumer).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(
+                FrameType::Connect,
+                &named_streaming_connect_body(None, false),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &sub_to_frame(b"orders", b"pull"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        out.clear();
+        // StreamFetch on the non-streaming named group is rejected (wrong-mode), never a silent serve.
+        s.process(&e, &stream_fetch_frame(0, 100, 0), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a streaming fetch on a NON-streaming named group is rejected"
+        );
+        assert!(
+            !e.engine_mut().is_streaming_in_stream("orders", "pull"),
+            "a pull named group is never streaming"
+        );
+        out.clear();
+        // The pull path is unchanged: a plain Flow delivers the named run.
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_offsets(&out),
+            (0..5).collect::<Vec<_>>(),
+            "the pull named consumer still receives its run via Flow, unchanged"
+        );
+    }
+
+    #[test]
+    fn named_stream_tier_s_composes_with_key_shared_like_the_default() {
+        // COMPOSE (streaming + key-shared): a named group that is BOTH key_shared (#1111) and streaming
+        // serves the FULL contiguous run — key routing is INERT on the consumer-managed streaming read,
+        // exactly as `stream_fetch_in` ignores the member on the default stream. Distinct keys, all
+        // delivered in offset order.
+        let e = DirectEngine::new(engine());
+        for i in 0..8u8 {
+            // Distinct keys so key_shared routing WOULD split them across members on the pull path.
+            produce_named_kh(&e, "orders", &[i], b"", &[i]);
+        }
+        e.engine_mut()
+            .set_key_ordering_in_stream("orders", "g", KeyOrdering::KeyShared)
+            .unwrap();
+        let mut s = named_streaming_session(&e, b"orders", b"g", false);
+        let mut out = Vec::new();
+        s.process(&e, &stream_fetch_frame(0, 100, 0), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_offsets(&out),
+            (0..8).collect::<Vec<_>>(),
+            "streaming serves the full contiguous run regardless of key routing (routing inert)"
+        );
+    }
+
+    #[test]
+    fn named_stream_tier_s_composes_with_filter_like_the_default() {
+        // COMPOSE (streaming + filter): a named group with a per-subject filter (#594-B) that is ALSO
+        // streaming delivers EVERY record in the contiguous window — the filter is INERT on the streaming
+        // read, matching the default stream's streaming path (which also ignores the group filter).
+        let e = DirectEngine::new(engine());
+        // Interleave matching and non-matching subjects; the pull path would skip the non-matching ones.
+        let subjects: [&[u8]; 6] = [b"a.b", b"z.z", b"a.b", b"z.z", b"a.b", b"z.z"];
+        for (i, subj) in subjects.iter().enumerate() {
+            e.engine_mut()
+                .produce_in_stream_with_subject(
+                    "orders",
+                    &Append {
+                        timestamp_ms: 0,
+                        flags: RecordFlags::EMPTY,
+                        key: b"",
+                        headers: b"",
+                        payload: &[u8::try_from(i).unwrap()],
+                    },
+                    subj,
+                )
+                .unwrap();
+        }
+        // Bind a filter that matches only "a.b" — inert on the streaming path.
+        e.engine_mut()
+            .set_subject_filter_in_stream("orders", "g", Some("a.b"))
+            .unwrap();
+        let mut s = named_streaming_session(&e, b"orders", b"g", false);
+        let mut out = Vec::new();
+        s.process(&e, &stream_fetch_frame(0, 100, 0), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_offsets(&out),
+            (0..6).collect::<Vec<_>>(),
+            "streaming delivers EVERY record in the window; the group filter is inert on this tier"
+        );
+    }
+
+    #[test]
+    fn named_stream_tier_s_default_tier_marks_the_group_on_sub_to() {
+        // Connection DEFAULT tier (#543) on the NAMED path: a streaming-default connection that `SubTo`s a
+        // named stream WITHOUT explicitly selecting a tier has that named group marked streaming, the twin
+        // of the default stream's `handle_sub` marking — so an unmarked named SUB streams.
+        let e = DirectEngine::new(engine());
+        produce_named_kh(&e, "orders", b"", b"", b"x");
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(
+                FrameType::Connect,
+                &named_streaming_connect_body(Some(ConsumeTier::Streaming), false),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &sub_to_frame(b"orders", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "SubTo accepted");
+        assert!(
+            e.engine_mut().is_streaming_in_stream("orders", "g"),
+            "an unmarked named SUB adopts the connection's Tier-S default"
+        );
+        // And it consumes at Tier-S: a StreamFetch is served (not wrong-mode rejected).
+        out.clear();
+        s.process(&e, &stream_fetch_frame(0, 100, 0), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_offsets(&out),
+            vec![0],
+            "the Tier-S-default named group streams"
+        );
     }
 
     #[test]
