@@ -589,10 +589,20 @@ impl<F: Filesystem, C: Clock> HubPushReceiver<F, C> {
     /// The sync happens BEFORE the response is sent, so an ack the leaf receives ALWAYS reflects durably-
     /// appended hub data — the leaf never advances its push cursor past data the hub has not synced.
     ///
+    /// Two integrity disciplines guard against duplicating replicated data on a retry (#807):
+    /// - VALIDATE BEFORE DURABLE APPEND. The full frame run is decoded and its count checked against the
+    ///   leaf's claim BEFORE ANY frame is appended. A count mismatch is rejected with NO durable side
+    ///   effect, so a leaf that re-pushes the same malformed request can never append the span twice.
+    /// - IDEMPOTENT RE-PUSH. The hub de-dups on the offset it already tracks — its log's next offset, which
+    ///   (each pushed record maps 1:1 to one hub append) IS the leaf offset accepted through. A push whose
+    ///   claimed span is at/below that head — a retry after a lost ack, or a duplicate — is acked as a
+    ///   no-op WITHOUT re-appending; a partial-overlap retry appends only the new suffix.
+    ///
     /// # Errors
     /// - [`LeafError::CorruptFrame`] if any frame fails CRC re-validation (fail-closed; the durably-synced
     ///   prefix's accepted-through is still returned via the response path by the caller).
-    /// - [`LeafError::RecordCountMismatch`] if the byte run does not hold the claimed count.
+    /// - [`LeafError::RecordCountMismatch`] if a fully-decoded byte run does not hold the claimed count —
+    ///   returned with NOTHING appended (all-or-nothing).
     /// - [`LeafError::Storage`] if a hub append / sync fails.
     pub fn apply_push(&mut self, req: &LeafPushRequest) -> Result<PushOutcome, LeafError> {
         let from = req.from_leaf_offset;
@@ -602,24 +612,70 @@ impl<F: Filesystem, C: Clock> HubPushReceiver<F, C> {
                 accepted_through_leaf_offset: from,
             });
         }
-        // Walk the verbatim frame bytes, RE-VALIDATING and appending one frame at a time. `codec::decode`
-        // is the intact-record predicate; only a passing frame is appended. A failure stops the walk,
-        // syncs the validated prefix, and is surfaced — the hub NEVER appends a byte it has not validated.
-        let mut at = 0usize;
-        let mut appended = 0u64;
+
+        // The hub's applied head IN LEAF-OFFSET TERMS. Each pushed record maps 1:1 to one hub append, so
+        // the hub log's next offset IS the leaf offset the hub has durably accepted through — the same
+        // anchor the leaf's push cursor tracks. This is the de-dup key; we do NOT invent a parallel one.
+        let hub_head = self.log.next_offset().get();
+        let claimed_end = from.saturating_add(u64::from(req.record_count));
+
+        // IDEMPOTENT RE-PUSH (#807): the whole claimed span [from, claimed_end) is already at/below the hub
+        // head — a retry after a lost ack, or a duplicate push. ACK it as a no-op WITHOUT re-appending, so
+        // the leaf advances its cursor past the already-applied span instead of duplicating it.
+        if claimed_end <= hub_head {
+            return Ok(PushOutcome {
+                appended: 0,
+                accepted_through_leaf_offset: claimed_end,
+            });
+        }
+        // A partial-overlap retry (e.g. a crash after sync-before-ack, re-pushed in a larger batch): the
+        // leading `already` records of this push are the hub head's; skip exactly those, append the rest.
+        let already = hub_head.saturating_sub(from);
+
+        // VALIDATE BEFORE DURABLE APPEND (#807): decode (CRC-re-validate) every frame FIRST, appending
+        // NOTHING. `codec::decode` is the intact-record predicate. We collect the decoded views and stop at
+        // the first corrupt frame. The hub NEVER appends a byte it has not validated, and — crucially — a
+        // count mismatch is rejected below with no frame yet on disk, so a retry cannot duplicate.
         let bytes = req.frame_bytes.as_ref();
+        let mut frames = Vec::new();
+        let mut at = 0usize;
+        let mut corrupt: Option<(u64, DecodeError)> = None;
         while at < bytes.len() {
-            let at_leaf_offset = from + appended;
-            let (view, frame_len) = match codec::decode(&bytes[at..]) {
-                Ok(decoded) => decoded,
-                Err(reason) => {
-                    self.log.sync()?;
-                    return Err(LeafError::CorruptFrame {
-                        at_leaf_offset,
-                        reason,
-                    });
+            match codec::decode(&bytes[at..]) {
+                Ok((view, frame_len)) => {
+                    frames.push(view);
+                    at += frame_len;
                 }
-            };
+                Err(reason) => {
+                    // The corrupt frame's leaf offset is `from` + the count of frames decoded before it.
+                    corrupt = Some((from.saturating_add(frames.len() as u64), reason));
+                    break;
+                }
+            }
+        }
+
+        // A FULLY-decoded run must carry exactly the claimed count. Reject a mismatch with NO durable
+        // append (all-or-nothing) — the #807 fix. A corrupt run is instead surfaced below as CorruptFrame,
+        // which (unchanged) keeps + acks its validated prefix; the count is unknowable past a torn frame.
+        if corrupt.is_none() {
+            let actual = u32::try_from(frames.len()).unwrap_or(u32::MAX);
+            if actual != req.record_count {
+                return Err(LeafError::RecordCountMismatch {
+                    claimed: req.record_count,
+                    actual,
+                });
+            }
+        }
+
+        // Append the NEW suffix only, skipping the `already`-applied leading frames of an overlap retry,
+        // then a single fsync (the group-commit shape). On the normal in-order first push `already == 0`,
+        // so every validated frame is appended exactly as before — the success path is byte-for-byte
+        // unchanged. The ack the caller sends after the sync reflects durably-synced data.
+        let skip = usize::try_from(already)
+            .unwrap_or(usize::MAX)
+            .min(frames.len());
+        let mut appended = 0u64;
+        for view in &frames[skip..] {
             let append = Append {
                 timestamp_ms: view.timestamp_ms,
                 flags: view.flags,
@@ -629,22 +685,18 @@ impl<F: Filesystem, C: Clock> HubPushReceiver<F, C> {
             };
             self.log.append(&append)?;
             appended += 1;
-            at += frame_len;
         }
-        // Durably commit the appended batch (one fsync per push — the group-commit shape). The ack the
-        // caller sends after this reflects durably-synced data.
         self.log.sync()?;
 
-        let actual = u32::try_from(appended).unwrap_or(u32::MAX);
-        if actual != req.record_count {
-            return Err(LeafError::RecordCountMismatch {
-                claimed: req.record_count,
-                actual,
+        if let Some((at_leaf_offset, reason)) = corrupt {
+            return Err(LeafError::CorruptFrame {
+                at_leaf_offset,
+                reason,
             });
         }
         Ok(PushOutcome {
             appended,
-            accepted_through_leaf_offset: from + appended,
+            accepted_through_leaf_offset: claimed_end,
         })
     }
 }
@@ -1336,6 +1388,153 @@ mod tests {
         );
         // The good prefix WAS appended (the hub never blind-trusts, but it keeps the validated prefix).
         assert_eq!(hub.log().read_from(Offset::new(0), 10).unwrap().len(), 1);
+    }
+
+    /// Encode `payloads` as a contiguous run of CRC-framed records — the verbatim `frame_bytes` a leaf
+    /// push carries. Each payload becomes one self-delimiting frame the hub re-validates.
+    fn frame_run(payloads: &[&[u8]]) -> Bytes {
+        let mut out = Vec::new();
+        for (i, p) in payloads.iter().enumerate() {
+            ironbus_core::codec::encode(
+                &ironbus_core::codec::RecordView {
+                    seq: ironbus_core::types::Seq::new(i as u64),
+                    timestamp_ms: 1,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: p,
+                },
+                &mut out,
+            )
+            .unwrap();
+        }
+        Bytes::from(out)
+    }
+
+    #[test]
+    fn a_count_mismatch_push_appends_nothing_and_never_duplicates_on_repush() {
+        let hub_log = Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        let mut hub = HubPushReceiver::new(hub_log);
+
+        // 2 valid frames but the request CLAIMS 3 — a malformed / retrying leaf (#807).
+        let bad = LeafPushRequest {
+            stream: "orders".to_string(),
+            from_leaf_offset: 0,
+            record_count: 3,
+            frame_bytes: frame_run(&[b"a", b"b"]),
+        };
+        // REJECTED — and, THE FIX, with NOTHING durably appended (validate before durable append).
+        let err = hub.apply_push(&bad).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LeafError::RecordCountMismatch {
+                    claimed: 3,
+                    actual: 2
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            hub.log().read_from(Offset::new(0), 10).unwrap().len(),
+            0,
+            "a count mismatch leaves the hub log UNCHANGED (no durable side effect)"
+        );
+
+        // Unacked, the leaf re-pushes the SAME malformed span: still rejected, still nothing on disk — the
+        // old code appended the span again here, duplicating unbounded across reconnects.
+        let err2 = hub.apply_push(&bad).unwrap_err();
+        assert!(
+            matches!(err2, LeafError::RecordCountMismatch { .. }),
+            "got {err2:?}"
+        );
+        assert_eq!(
+            hub.log().read_from(Offset::new(0), 10).unwrap().len(),
+            0,
+            "re-pushing the mismatch still appends nothing (no duplication)"
+        );
+
+        // A corrected, well-formed push of the same span appends it EXACTLY ONCE.
+        let good = LeafPushRequest {
+            stream: "orders".to_string(),
+            from_leaf_offset: 0,
+            record_count: 2,
+            frame_bytes: frame_run(&[b"a", b"b"]),
+        };
+        let out = hub.apply_push(&good).unwrap();
+        assert_eq!(out.appended, 2);
+        assert_eq!(out.accepted_through_leaf_offset, 2);
+        let recs = hub.log().read_from(Offset::new(0), 10).unwrap();
+        assert_eq!(recs.len(), 2, "the corrected span appears exactly once");
+        assert_eq!(recs[0].payload.as_ref(), b"a");
+        assert_eq!(recs[1].payload.as_ref(), b"b");
+    }
+
+    #[test]
+    fn an_idempotent_repush_of_an_applied_span_is_a_no_op_ack() {
+        let hub_log = Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        let mut hub = HubPushReceiver::new(hub_log);
+        let push = LeafPushRequest {
+            stream: "orders".to_string(),
+            from_leaf_offset: 0,
+            record_count: 2,
+            frame_bytes: frame_run(&[b"x", b"y"]),
+        };
+        // First apply: appended, synced, acked through offset 2.
+        let out = hub.apply_push(&push).unwrap();
+        assert_eq!((out.appended, out.accepted_through_leaf_offset), (2, 2));
+
+        // The ack is LOST, so the leaf's cursor never advanced and it re-pushes the SAME span. The hub
+        // de-dups on its own head and ACKs a NO-OP — no re-append, no duplicate (#807).
+        let again = hub.apply_push(&push).unwrap();
+        assert_eq!(
+            again.appended, 0,
+            "an already-applied span re-appends nothing"
+        );
+        assert_eq!(
+            again.accepted_through_leaf_offset, 2,
+            "still acked through the same head so the leaf advances"
+        );
+        assert_eq!(
+            hub.log().read_from(Offset::new(0), 10).unwrap().len(),
+            2,
+            "the span appears exactly once"
+        );
+    }
+
+    #[test]
+    fn a_partial_overlap_repush_appends_only_the_new_suffix() {
+        let hub_log = Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        let mut hub = HubPushReceiver::new(hub_log);
+        // Apply the span [0, 2).
+        let first = LeafPushRequest {
+            stream: "orders".to_string(),
+            from_leaf_offset: 0,
+            record_count: 2,
+            frame_bytes: frame_run(&[b"0", b"1"]),
+        };
+        assert_eq!(hub.apply_push(&first).unwrap().appended, 2);
+
+        // A crash-recovery re-push from the SAME cursor re-batches larger — [0, 4): the leading 2 records
+        // overlap the hub head, the trailing 2 are new. Only the new suffix is appended, in order.
+        let bigger = LeafPushRequest {
+            stream: "orders".to_string(),
+            from_leaf_offset: 0,
+            record_count: 4,
+            frame_bytes: frame_run(&[b"0", b"1", b"2", b"3"]),
+        };
+        let out = hub.apply_push(&bigger).unwrap();
+        assert_eq!(out.appended, 2, "only the 2 new records are appended");
+        assert_eq!(out.accepted_through_leaf_offset, 4);
+        let recs = hub.log().read_from(Offset::new(0), 10).unwrap();
+        assert_eq!(
+            recs.len(),
+            4,
+            "the span [0, 4) appears exactly once, in order"
+        );
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("{i}").as_bytes());
+        }
     }
 
     #[test]
