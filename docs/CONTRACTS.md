@@ -63,10 +63,13 @@ Source: `types.rs`. Unknown bits are preserved on read so a future writer can ad
 | `0b0000_0010` | `HAS_KEY`    | the record carries a key; DERIVED from `key_len != 0`, never taken from the caller |
 | `0b0000_0100` | `HAS_XXH3`   | the record carries the xxh3-64 field; DERIVED from the stored body reaching the threshold |
 | `0b0000_1000` | `HAS_SUBJECT` | the record carries a stored subject field (#594); DERIVED from a non-empty subject, never taken from the caller. See [Optional subject field](#optional-subject-field-on-disk-conditional) |
+| `0b0001_0000` | `HAS_STREAM_TAG` | the record carries a stored stream-tag field (#597, the shared-WAL demux key); DERIVED from a non-empty tag, never taken from the caller. MUTUALLY EXCLUSIVE with `HAS_SUBJECT` (both use the fixed post-header slot). See [Optional stream-tag field](#optional-stream-tag-field-on-disk-conditional) |
 
-`KNOWN` is `0b0000_1111`. `decode` rejects a frame whose `HAS_KEY` disagrees with
-`key_len != 0`, whose `HAS_XXH3` disagrees with `body_len >= XXH3_PAYLOAD_THRESHOLD`, or
-whose `HAS_SUBJECT` is set with a zero-length subject, as `BadLength`.
+`KNOWN` is `0b0001_1111`. `decode` rejects a frame whose `HAS_KEY` disagrees with
+`key_len != 0`, whose `HAS_XXH3` disagrees with `body_len >= XXH3_PAYLOAD_THRESHOLD`, whose
+`HAS_SUBJECT` is set with a zero-length subject, whose `HAS_STREAM_TAG` is set with a zero-length
+tag, or which sets BOTH `HAS_SUBJECT` and `HAS_STREAM_TAG` (they share the post-header slot), as
+`BadLength`.
 
 ### Compressed payload descriptor (when `COMPRESSED` is set)
 
@@ -129,6 +132,25 @@ corrupted stored subject is the distinct `BadSubjectCrc` error. A record publish
 `Pub`/`PubTo` carries no subject and the bit is clear; such a record is treated as NON-MATCHING
 by any subject filter (never swallowed by a `>` catch-all).
 
+### Optional stream-tag field (on-disk, conditional)
+
+When a record is written to a SHARED WAL (#597, V2-M2, the shared-WAL fallback for high stream
+counts), a `HAS_STREAM_TAG` record carries an optional stream-tag field that is STRUCTURALLY
+IDENTICAL to the subject field and placed at the SAME fixed slot IMMEDIATELY AFTER the 36-byte header
+and BEFORE the body: `stream_tag_len: u16` (`RECORD_STREAM_TAG_LEN_PREFIX` = 2 bytes, little-endian),
+then `stream_tag_len` tag bytes (the validated stream name), then `stream_tag_crc: u32`
+(`RECORD_STREAM_TAG_CRC_LEN` = 4 bytes, CRC32C over the length prefix and the tag bytes). The whole
+field is counted in `total_len`. It is the demux key that names the stream a record belongs to when
+many streams share ONE interleaved commit log (`ironbus_storage::shared_wal::SharedWal`), so the log
+stays per-stream-addressable on read and recovery. The tag is MUTUALLY EXCLUSIVE with a stored
+subject: both occupy the fixed post-header slot, so `decode` rejects a frame that sets BOTH bits as
+`BadLength`, and the header-only length walk (`codec::decoded_len`) reads the `u16` at the fixed offset
+whichever of the two fields is present. The tag has its OWN CRC, independent of the body — the body
+CRC32C/xxh3 machinery is unchanged (`key ++ headers ++ payload`), so a corrupted demux key is the
+distinct `BadStreamTagCrc` fail-closed reject, never a silent cross-stream mis-delivery. A record
+without the bit has no field and is byte-for-byte the pre-tag layout, so `FORMAT_VERSION` stays `1`
+and a default per-stream-log deployment (which never sets the bit) is unchanged.
+
 ### RecordTrailer (on-disk, 8 bytes)
 
 | offset (from frame start) | field      | type | notes |
@@ -139,9 +161,13 @@ by any subject filter (never swallowed by a `>` catch-all).
 ### Relationships and limits
 
 ```
-total_len = 36 (header) + (HAS_SUBJECT ? 2 + subject_len + 4 : 0)
+total_len = 36 (header) + (HAS_STREAM_TAG ? 2 + stream_tag_len + 4 : 0)
+          + (HAS_SUBJECT ? 2 + subject_len + 4 : 0)
           + key_len + hdr_len + payload_len + (HAS_XXH3 ? 8 : 0) + 8 (trailer)
 ```
+
+`HAS_STREAM_TAG` and `HAS_SUBJECT` are mutually exclusive, so at most one of the two optional
+post-header fields is present in any frame.
 
 A record is intact only when: `magic` matches, `version` == 1, `header_crc` passes,
 the trailing `total_len` equals the computed total, `body_crc` passes, (if present) the

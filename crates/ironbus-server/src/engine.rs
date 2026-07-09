@@ -613,6 +613,22 @@ pub struct EngineConfig {
     /// against a long-poll-enabled broker simply gets its empty batches later (once a commit or the
     /// budget wakes it) instead of instantly.
     pub consume_longpoll_ms: u64,
+    /// How named streams are STORED — the storage-mode selector (#597, M2-I13). The SAFE default is
+    /// [`StorageMode::PerStreamLogs`] (today's per-stream [`ironbus_storage::streamset::StreamSet`]
+    /// logs, byte-for-byte), so the shared-WAL fallback is strictly OPT-IN and an existing deployment
+    /// is unchanged. [`StorageMode::SharedWal`] selects the high-stream-count density fallback where
+    /// many named streams share ONE tagged commit log ([`ironbus_storage::shared_wal::SharedWal`]),
+    /// trading per-stream resilience isolation for density (see the type docs for the tradeoff).
+    ///
+    /// **Wiring status (surfaced, #597):** the shared-WAL storage PRIMITIVE — tagged interleaved
+    /// append, per-stream demux read, and index-rebuilding recovery — is implemented and tested at the
+    /// storage layer ([`ironbus_storage::shared_wal::SharedWal`]). Threading it through the engine's
+    /// `produce_in_stream`/`poll_in_stream`/`ack_in_stream` and recovery paths in place of the
+    /// per-stream `StreamSet` is the deferred follow-up (like #693's deferred cooperative rebalance);
+    /// until then [`Engine::open`] fail-closed REJECTS a config that selects [`StorageMode::SharedWal`]
+    /// with a typed error rather than silently running per-stream (an honest opt-in, never a silent
+    /// no-op). The default [`StorageMode::PerStreamLogs`] path is completely untouched.
+    pub storage_mode: ironbus_storage::shared_wal::StorageMode,
 }
 
 /// One PIPELINED async commit in flight (#1040): the engine-level pairing of the storage
@@ -3379,6 +3395,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     {
         if config.max_in_flight == 0 {
             return Err(EngineError::ZeroMaxInFlight);
+        }
+        // The shared-WAL storage fallback (#597) is implemented + tested at the storage layer
+        // (ironbus_storage::shared_wal::SharedWal) but its engine wiring is the deferred follow-up.
+        // Fail closed on the opt-in rather than silently running the per-stream default, so the mode
+        // switch is honest (never a silent no-op). Surfaced via the existing Storage error channel to
+        // avoid minting a wire error code for an open-time-only rejection. The DEFAULT (per-stream
+        // logs) proceeds untouched.
+        if config.storage_mode == ironbus_storage::shared_wal::StorageMode::SharedWal {
+            return Err(EngineError::Storage(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "shared-WAL storage mode (#597) is implemented at the storage layer \
+                 (ironbus_storage::shared_wal::SharedWal) but its engine produce/consume/recovery \
+                 wiring is the deferred follow-up; use the default per-stream-logs storage mode",
+            ))));
         }
         // Open the DEFAULT stream's root log AND the per-named-stream StreamSet substrate (#676). The
         // root log is opened FIRST so it owns the authoritative recovery (truncating + reporting any
@@ -11961,6 +11991,7 @@ mod tests {
     fn config(max_in_flight: u32, max_deliver: u32) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default(),
             // 30 ns visibility, 100 ns cap, so tests advance time in small integers.
             lease: LeaseConfig {
@@ -12346,6 +12377,7 @@ mod tests {
         assert_eq!(DEFAULT_SYNC_MAX_DIRTY_BYTES, 16 * 1024 * 1024);
         let e = open(EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             sync_max_dirty_bytes: 123,
             ..config(10, 5)
         });
@@ -12381,6 +12413,7 @@ mod tests {
     fn small_segment_config() -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 200,
                 ..LogConfig::default()
@@ -12655,6 +12688,29 @@ mod tests {
             Engine::open(InMemoryFs::new(), ManualClock::new(), config(0, 5)),
             Err(EngineError::ZeroMaxInFlight)
         ));
+    }
+
+    #[test]
+    fn open_rejects_shared_wal_storage_mode_until_engine_wiring_lands() {
+        // #597: selecting the shared-WAL storage fallback fails closed at open with a typed
+        // Unsupported error (the honest opt-in — never a silent run of the per-stream default), because
+        // the storage PRIMITIVE (ironbus_storage::shared_wal::SharedWal) is implemented + tested but its
+        // engine produce/consume/recovery wiring is the deferred follow-up.
+        let cfg = EngineConfig {
+            storage_mode: ironbus_storage::shared_wal::StorageMode::SharedWal,
+            ..config(10, 5)
+        };
+        match Engine::open(InMemoryFs::new(), ManualClock::new(), cfg) {
+            Err(EngineError::Storage(StorageError::Io(e))) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+            }
+            // `_` (not a bound var) avoids formatting the Ok(Engine), which is not `Debug`.
+            _ => {
+                panic!("expected shared-WAL mode to be rejected at open with an Unsupported error")
+            }
+        }
+        // The DEFAULT (per-stream logs) opens fine — the mode switch is the only difference.
+        assert!(Engine::open(InMemoryFs::new(), ManualClock::new(), config(10, 5)).is_ok());
     }
 
     #[test]
@@ -13645,6 +13701,7 @@ mod tests {
     fn config_with_max_groups(max_groups: usize) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             max_groups,
             ..config(10, 5)
         }
@@ -16584,6 +16641,7 @@ mod tests {
     fn config_with_ttl(default_message_ttl_ms: u64) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms,
             ..config(64, 5)
         }
@@ -16595,6 +16653,7 @@ mod tests {
     fn config_with_dlx_for_expired(default_message_ttl_ms: u64, exchange: &str) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms,
             dead_letter_exchange: Some(exchange.to_string()),
             dead_letter_expired: true,
@@ -16803,6 +16862,7 @@ mod tests {
         let probe = fs.clone();
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms: 1_000,
             dead_letter_exchange: Some("dlx-unused".to_string()),
             dead_letter_expired: false, // routing OFF: reclaim, do not dead-letter
@@ -18558,6 +18618,7 @@ mod tests {
     fn config_with_idle_evict_ms(group_idle_evict_ms: u64) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             group_idle_evict_ms,
             ..config(10, 5)
         }
@@ -18658,6 +18719,7 @@ mod tests {
         // cap previously rejected it.
         let mut e = open(EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             max_groups: 3, // default + 2 named groups fill the cap
             group_idle_evict_ms: 10,
             ..config(10, 5)
@@ -19084,6 +19146,7 @@ mod tests {
     fn config_with_dedup(max_ids: usize, window_nanos: u64) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             dedup: ironbus_core::dedup::DedupConfig {
                 max_ids,
                 window_nanos,
@@ -19522,6 +19585,7 @@ mod tests {
     ) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             durability_level: level,
             flush_interval_ms,
             flush_max_bytes,
@@ -19808,6 +19872,7 @@ mod tests {
         };
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: small_segment,
             durability_level: DurabilityLevel::Async,
             flush_interval_ms: 0,
@@ -19846,6 +19911,7 @@ mod tests {
             clock,
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: small_segment,
                 ..config(10, 5)
             },
@@ -19952,6 +20018,7 @@ mod tests {
         let headroom = 64u64;
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             wal_fsync_headroom_bytes: headroom,
             ..config_durability(DurabilityLevel::Async, 0, 0)
         };
@@ -20007,6 +20074,7 @@ mod tests {
         let headroom = 64u64;
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             wal_fsync_headroom_bytes: headroom,
             ..config_durability(DurabilityLevel::Async, 0, 0)
         };
@@ -20044,6 +20112,7 @@ mod tests {
         // it can only ever THROTTLE (and with the actor's drain it admits), never lose, never shed.
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             wal_fsync_headroom_bytes: 8,
             ..config(10, 5)
         };
@@ -20613,6 +20682,7 @@ mod tests {
     fn lz4_config() -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             compression: Codec::Lz4,
             ..config(10, 5)
         }
@@ -20872,6 +20942,7 @@ mod tests {
 
         let mut none = open(EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: capped_log,
             ..config(10, 5)
         });
@@ -20901,6 +20972,7 @@ mod tests {
 
         let mut lz4 = open(EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: capped_log,
             compression: Codec::Lz4,
             ..config(10, 5)
@@ -21514,6 +21586,7 @@ mod tests {
     fn config_with_max_streams(max_streams: usize) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             max_streams,
             ..config(10, 5)
         }

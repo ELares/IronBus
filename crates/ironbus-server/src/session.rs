@@ -5424,6 +5424,7 @@ mod tests {
     fn test_config() -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             compression: ironbus_core::compress::Codec::None,
             log: LogConfig::default(),
             lease: LeaseConfig {
@@ -5531,6 +5532,7 @@ mod tests {
             clock,
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -5590,6 +5592,7 @@ mod tests {
             clock,
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
@@ -5913,6 +5916,7 @@ mod tests {
             ManualClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 200,
@@ -6437,6 +6441,7 @@ mod tests {
             ManualClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 max_in_flight: 100_000,
                 consumer_credit: 2048,
                 consumer_credit_bytes,
@@ -7963,6 +7968,7 @@ mod tests {
             ManualClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig {
                     max_segment_bytes: 160,
                     ..LogConfig::default()
@@ -8522,6 +8528,7 @@ mod tests {
             clock,
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -9717,6 +9724,7 @@ mod tests {
                 ManualClock::new(),
                 EngineConfig {
                     consume_longpoll_ms: 0,
+                    storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                     compression: ironbus_core::compress::Codec::None,
                     log: LogConfig::default().with_max_total_bytes(one),
                     lease: LeaseConfig {
@@ -10123,6 +10131,7 @@ mod tests {
             clock,
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -10187,6 +10196,7 @@ mod tests {
             clock,
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -10402,6 +10412,7 @@ mod tests {
             ManualClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::Lz4,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -11450,6 +11461,7 @@ mod tests {
             clock,
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {

@@ -3324,6 +3324,7 @@ mod tests {
     fn config() -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -3454,6 +3455,7 @@ mod tests {
     fn config_headroom(level: crate::engine::DurabilityLevel, headroom_bytes: u64) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             durability_level: level,
             wal_fsync_headroom_bytes: headroom_bytes,
             ..config()
@@ -3488,6 +3490,7 @@ mod tests {
     fn config_capped(cap: u64, policy: DiskFullPolicy) -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default().with_max_total_bytes(cap),
             disk_full_policy: policy,
             ..config()
@@ -4580,6 +4583,7 @@ mod tests {
         let (fs, control) = FaultFs::new(InMemoryFs::new());
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             durability_level: crate::engine::DurabilityLevel::Interval,
             flush_max_bytes: 1,
             ..config()
@@ -4747,6 +4751,7 @@ mod tests {
     fn config_faf() -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             fire_and_forget_msg_rate: 10,
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: 100,
@@ -5235,6 +5240,7 @@ mod tests {
         for seed in 0..8u64 {
             let cfg = EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig {
                     max_segment_bytes: 192,
                     ..LogConfig::default()
@@ -5362,6 +5368,7 @@ mod tests {
         // (a parked reply with no flight and a dead writer) this transition exists to kill.
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 192,
                 ..LogConfig::default()
@@ -5484,6 +5491,7 @@ mod tests {
         // can have run). The stale Ok completion is then a FULL no-op, exactly as in T5(b).
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 192,
                 ..LogConfig::default()
@@ -5636,6 +5644,7 @@ mod tests {
         // afterward (the meter-drift livelock regression, T10b).
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 192,
                 ..LogConfig::default()
@@ -5827,6 +5836,7 @@ mod tests {
         // record rides its OWN barrier (dispatch-before-block, so no deadlock either).
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             sync_max_dirty_bytes: 64,
             ..config()
         };
@@ -5907,6 +5917,7 @@ mod tests {
         // while B is still throttled and unacked, and every later wait is a timed recv.
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             sync_max_dirty_bytes: 64,
             ..config()
         };
@@ -6295,6 +6306,7 @@ mod tests {
         // WHEN fsyncs happen, never what lands on disk.
         let cfg = || EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 512,
                 ..LogConfig::default()
@@ -6753,6 +6765,7 @@ mod tests {
         // produce would reap inside H1's inline `commit_batch` and mask the mutant.
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 256,
                 ..LogConfig::default()
@@ -6813,6 +6826,7 @@ mod tests {
         // point; it must never stay parked on an otherwise idle broker.
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 256,
                 ..LogConfig::default()
@@ -6870,6 +6884,7 @@ mod tests {
         // SUCCESSFUL sync, writer still writable. Inspect the Pipeline state directly.
         let cfg = EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig {
                 max_segment_bytes: 256,
                 ..LogConfig::default()

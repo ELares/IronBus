@@ -33,6 +33,7 @@ fn open_engine() -> Engine<InMemoryFs, SystemClock> {
         SystemClock::new(),
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),

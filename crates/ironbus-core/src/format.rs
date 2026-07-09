@@ -26,6 +26,19 @@
 //! CRC and never enters the body-checksum range). Because the bit is additive and an old reader
 //! never sets it (nor writes it), the on-disk [`FORMAT_VERSION`] stays `1`.
 //!
+//! A record written to a SHARED WAL (#597, V2-M2-I13 — the shared-WAL fallback for high stream
+//! counts) carries a stored STREAM TAG in an optional length-prefixed field signalled by the
+//! [`RecordFlags::HAS_STREAM_TAG`] bit: a [`RECORD_STREAM_TAG_LEN_PREFIX`]-byte `stream_tag_len`, the
+//! tag bytes, then a [`RECORD_STREAM_TAG_CRC_LEN`]-byte CRC32C over the prefix and the tag. It is
+//! STRUCTURALLY IDENTICAL to the subject field (a length-prefixed, self-CRC'd blob at the fixed
+//! post-header offset [`RECORD_HEADER_LEN`]) and is MUTUALLY EXCLUSIVE with it: a shared-WAL record
+//! carries a tag (the demux key that names its stream in the interleaved shared log), a
+//! subject-published record carries a subject, never both, and the codec rejects a frame that sets
+//! both bits. Because the bit is additive and the default per-stream-log layout never sets it, a log
+//! written without shared-WAL mode is byte-for-byte unchanged and the on-disk [`FORMAT_VERSION`]
+//! stays `1` (the same downgrade caveat as the subject: an old reader mis-frames a `HAS_STREAM_TAG`
+//! record as `BadBodyCrc`, so cross-feature DOWNGRADE past a shared-WAL log is unsupported).
+//!
 //! This module defines only the layout constants and field offsets. Encoding and
 //! decoding live in a separate module so the numbers here are the single source of
 //! truth that both the codec and its tests refer to.
@@ -62,6 +75,23 @@ pub const RECORD_SUBJECT_LEN_PREFIX: usize = 2;
 /// subject_len)`), so a corrupted STORED subject is caught independently of the body CRC — the body
 /// CRC32C/xxh3 machinery and the stored-body layout stay byte-for-byte unchanged by the subject.
 pub const RECORD_SUBJECT_CRC_LEN: usize = 4;
+
+/// Size in bytes of the length prefix (`stream_tag_len: u16`, little-endian) that OPENS the optional
+/// stream-tag field of a record carrying the [`RecordFlags::HAS_STREAM_TAG`] bit (#597): `2`. The
+/// stream-tag field is `stream_tag_len` then `stream_tag_len` tag bytes then a
+/// [`RECORD_STREAM_TAG_CRC_LEN`]-byte CRC32C, placed immediately AFTER the 36-byte header and BEFORE
+/// the stored body, counted in `total_len`. It sits at the SAME fixed offset ([`RECORD_HEADER_LEN`])
+/// the subject field uses and is MUTUALLY EXCLUSIVE with it, so the header-only length walk
+/// ([`crate::codec::decoded_len`]) reads the `u16` at [`RECORD_HEADER_LEN`] whichever of the two
+/// fields is present. A record WITHOUT the bit is byte-for-byte the pre-tag layout.
+pub const RECORD_STREAM_TAG_LEN_PREFIX: usize = 2;
+
+/// Size in bytes of the CRC32C field that CLOSES the optional stream-tag field of a record carrying
+/// the [`RecordFlags::HAS_STREAM_TAG`] bit (#597): `4`. It covers the `stream_tag_len` prefix and the
+/// tag bytes, so a corrupted STORED tag is caught independently of the body CRC — the demux key can
+/// never be silently mis-read, which would cross-deliver a record to the wrong stream. The body
+/// CRC32C/xxh3 machinery and the stored-body layout stay byte-for-byte unchanged by the tag.
+pub const RECORD_STREAM_TAG_CRC_LEN: usize = 4;
 
 /// The byte range of the header that the `header_crc` field protects: `[0, 32)`.
 pub const RECORD_HEADER_CRC_RANGE: core::ops::Range<usize> = 0..32;
@@ -263,6 +293,16 @@ mod tests {
         assert_eq!(SEGMENT_HEADER_LEN, 64);
         assert_eq!(SEGMENT_FOOTER_LEN, 32);
         assert_eq!(RECORD_HEADER_CRC_RANGE, 0..32);
+    }
+
+    #[test]
+    fn frozen_optional_field_prefix_sizes() {
+        // The subject (#594) and stream-tag (#597) fields are structurally identical
+        // length-prefixed self-CRC'd blobs at the same fixed post-header offset, mutually exclusive.
+        assert_eq!(RECORD_SUBJECT_LEN_PREFIX, 2);
+        assert_eq!(RECORD_SUBJECT_CRC_LEN, 4);
+        assert_eq!(RECORD_STREAM_TAG_LEN_PREFIX, 2);
+        assert_eq!(RECORD_STREAM_TAG_CRC_LEN, 4);
     }
 
     #[test]

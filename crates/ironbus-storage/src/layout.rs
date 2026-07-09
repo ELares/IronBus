@@ -77,6 +77,16 @@ pub const STREAMS_SUBDIR: &str = "streams";
 /// so a deployment that never partitions never materializes `pstreams/` (its disk image is unchanged).
 pub const PARTITIONED_STREAMS_SUBDIR: &str = "pstreams";
 
+/// The reserved data-dir subtree for the SHARED WAL (M2-I13, #597 — the shared-WAL fallback for high
+/// stream counts): ONE [`crate::shared_wal::SharedWal`] commit log holding every shared-mode named
+/// stream's records interleaved and tagged, rooted at `shared-wal/`. It is a SEPARATE subtree from
+/// [`STREAMS_SUBDIR`] and [`PARTITIONED_STREAMS_SUBDIR`] so a shared-WAL commit log is never mistaken
+/// for a plain named-stream log (per-stream scanners read only `streams/`, and the shared-WAL scanner
+/// reads only here). ADDITIVE: created only when shared-WAL storage mode is selected, so a default
+/// per-stream-log deployment never materializes `shared-wal/` and its on-disk image is unchanged. A
+/// v1 reader that predates this subtree simply ignores it (it is not `streams/` and not the root log).
+pub const SHARED_WAL_SUBDIR: &str = "shared-wal";
+
 /// The on-disk file name of the layout marker. It deliberately does NOT match the `seg-<hex>.log`
 /// or `cursor*.ckpt` naming, so segment enumeration ([`crate::naming::segment_ids`]) and cursor
 /// discovery skip it as a foreign file.

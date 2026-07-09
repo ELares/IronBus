@@ -40,6 +40,12 @@ pub mod quarantine;
 /// the snapshot after each commit/seal).
 pub mod read_plane;
 pub mod segment;
+/// A [`SharedWal`](shared_wal::SharedWal): ONE shared commit log holding MANY named streams' records,
+/// interleaved and TAGGED by stream, demultiplexed per-stream on read and recovery (#597, V2-M2-I13 —
+/// the shared-WAL fallback for high stream counts). The explicit density-over-isolation tradeoff
+/// against the per-stream [`streamset::StreamSet`] default: `N` streams cost ONE segment set and fd,
+/// not `N`. See the module docs for the demux-key/CRC guarantees and the reduced-contract tradeoff.
+pub mod shared_wal;
 pub mod sim;
 /// A [`StreamSet`](streamset::StreamSet): N independently-opened, independently-recovered IronBus
 /// logs over one filesystem (#563, V2-M2). The DEFAULT stream `""` is today's root log (byte
