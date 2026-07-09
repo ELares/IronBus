@@ -14,7 +14,7 @@ only the packaging. There are four channels, each fail-closed verified before it
 There are two release CHANNELS the GitHub Releases come from:
 
 - A **rolling, calendar-versioned** release published AUTOMATICALLY on EVERY push to main
-  (`.github/workflows/rolling-release.yml`), versioned `YYYY.MMDD.N` (the UTC date plus a per-day
+  (`.github/workflows/rolling-release.yml`), versioned `YYMM.1DD.1{Build}` (the UTC date plus a per-day
   build number). Each rolling build ships the three static musl binaries, their per-binary
   `.sha256`, a consolidated `SHA256SUMS`, and a keyless Sigstore build-provenance attestation. It is
   a NORMAL release, so GitHub's `releases/latest` (and therefore the `curl | sh` installer's default
@@ -23,7 +23,7 @@ There are two release CHANNELS the GitHub Releases come from:
   release". It carries NO changelog gate (rolling builds are continuous, not curated) and does not
   attach the `.deb`. It DOES publish the distroless container image: every rolling build pushes a
   multi-arch (amd64/arm64/armv7) image to `ghcr.io/elares/ironbus`, tagged `:latest` and
-  `:YYYY.MMDD.N`, so the registry image is the live, continuously-published one (#334).
+  `:YYMM.1DD.1{Build}`, so the registry image is the live, continuously-published one (#334).
 - A **formal, tagged** release cut on a `v*` tag by the maintainer (`.github/workflows/release.yml`).
   This is the curated channel: it adds the `.deb` per triple, the syft CycloneDX SBOM, and a
   changelog gate (an empty `## [Unreleased]` FAILS the release before any binary is built), and it
@@ -258,7 +258,7 @@ release binaries (no recompile) and pushes a `linux/amd64` + `linux/arm64` + `li
 multi-arch manifest to `ghcr.io/elares/ironbus`, tagged with the calendar version AND `:latest`:
 
 - `ghcr.io/elares/ironbus:latest` always tracks the newest rolling build.
-- `ghcr.io/elares/ironbus:YYYY.MMDD.N` pins a specific rolling build.
+- `ghcr.io/elares/ironbus:YYMM.1DD.1{Build}` pins a specific rolling build.
 
 The formal `v*` channel (`.github/workflows/release.yml`) pushes the same multi-arch manifest on a
 tag, tagged `:vX.Y.Z` plus `:latest` (a 0.x prerelease pushes only the version tag, never moving
@@ -312,7 +312,7 @@ picks the matching asset. Verify integrity with `sha256sum -c SHA256SUMS` and pr
 `gh attestation verify <binary> --repo ELares/IronBus`.
 
 These releases come from the two channels above: the **rolling** channel (automatic on every main
-push, `YYYY.MMDD.N`, the three binaries + `SHA256SUMS` + provenance) and the **formal** `v*` channel
+push, `YYMM.1DD.1{Build}`, the three binaries + `SHA256SUMS` + provenance) and the **formal** `v*` channel
 (which additionally attaches the cargo-auditable and CycloneDX SBOMs, the `.deb` packages, and rides
 the changelog gate). The `curl | sh` installer and the `releases/latest` default both resolve to the
 newest rolling build. Details in [RELEASING.md](../RELEASING.md#what-the-release-produces).

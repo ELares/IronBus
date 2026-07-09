@@ -4,8 +4,8 @@ IronBus ships as a single static `musl` binary for three edge triples, through t
 channels:
 
 - **Rolling, calendar-versioned** releases, published AUTOMATICALLY on EVERY push to main by the
-  `Rolling release` workflow (`.github/workflows/rolling-release.yml`). The version is `YYYY.MMDD.N`
-  (the UTC date plus a per-day build number, e.g. `2026.0609.1` then `2026.0609.2`, resetting the
+  `Rolling release` workflow (`.github/workflows/rolling-release.yml`). The version is `YYMM.1DD.1{Build}`
+  (the UTC date plus a per-day build number, e.g. `2607.108.11` then `2607.108.12`, resetting the
   next day). Each rolling build publishes the three static musl binaries, their per-binary
   `.sha256`, a consolidated `SHA256SUMS`, and a Sigstore build-provenance attestation, as a NORMAL
   release, so `releases/latest` (and the `curl | sh` installer's default) always points at the

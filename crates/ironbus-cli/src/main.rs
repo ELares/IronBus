@@ -1461,7 +1461,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         // `ironbus <version>` and exit 0, so an operator (and the CI cross-build smoke, #100) can
         // identify the build with no broker, no data dir, and no socket. The version is the
         // compile-time `IRONBUS_BUILD_VERSION` if set (the rolling-release workflow stamps the
-        // calendar version `YYYY.MMDD.N` there) and otherwise the workspace package version from
+        // calendar version `YYMM.1DD.1{Build}` there) and otherwise the workspace package version from
         // Cargo's `CARGO_PKG_VERSION` (the normal dev/CI/test case). `option_env!` is read at
         // compile time and leaves `Cargo.lock` untouched, so it never breaks `cargo build
         // --locked` the way a `Cargo.toml` version bump would (the lockfile pins the workspace
