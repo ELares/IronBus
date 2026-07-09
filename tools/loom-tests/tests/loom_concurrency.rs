@@ -47,7 +47,7 @@
 #![cfg(loom)]
 
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use loom::sync::Arc;
+use loom::sync::{Arc, Mutex};
 use loom::thread;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
 
@@ -894,6 +894,600 @@ fn produce_gate_l0_fold_never_consumes_an_l1_fast_reject_delta() {
         assert_eq!(
             l0_sum, 1,
             "the L0 shed folded exactly once and was never consumed by an L1 fold"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// MODEL 6: the 2-STREAM CROSS-COMMIT group-commit barrier (V2-M2-I3, #564/#823/#678, issue #603).
+//
+// Real symbol cross-reference: `ironbus_storage::streamset::StreamSet::commit_tick`
+// (`crates/ironbus-storage/src/streamset.rs:638`) generalizes the single-log group-commit ACROSS the
+// per-stream logs. In ONE tick over the DIRTIED streams it runs three passes:
+//   - PASS 1 flush (`streamset.rs:659`, `Log::flush_no_sync` `log.rs:3110`): drain each dirtied
+//     stream's pending bytes to the page cache;
+//   - PASS 2 barrier FAN-OUT (`streamset.rs:698`, `log.rs:1061` `par_sync_data_only`): issue the K
+//     covering `fdatasync`s (`Log::sync_data_only` `log.rs:3172`) CONCURRENTLY across a bounded
+//     scoped-worker set that POPS `(tag, &mut Log)` barriers off a SHARED `Mutex<Vec<..>>` work queue
+//     (`log.rs:1083`/`:1105`) and runs the fsync OUTSIDE the lock, then JOINS every worker
+//     (`log.rs:1130`) before ANY ack releases;
+//   - PASS 3 release (`streamset.rs:705`): reassemble the results BY TAG (`streamset.rs:700`
+//     `sort_unstable_by_key(ord)` + `dirtied[ord]`) and, for each stream whose barrier returned Ok,
+//     advance ITS durable head (`Log::advance_synced_offset_after_external_sync` `log.rs:3207`, which
+//     sets `flushed=synced=next` `log.rs:3213` then `publish_flushed` Release `read_plane.rs:725`);
+//     a frozen stream (barrier Err, `log.rs:3181`) is NOT advanced (`streamset.rs:712`), its acks stay
+//     parked (`CommitOutcome::froze` `streamset.rs:253`).
+//
+// The #603 hazard this models: coordinating one barrier across streams introduces NEW interleavings
+// that could corrupt one stream's index while committing another. The invariants (each stream's M1
+// I1 byte-index / I2 read_range coverage, generalized to the cross-stream tick) that must hold under
+// EVERY interleaving: each stream's barrier runs EXACTLY once (no lost/duplicated fsync), PASS 3 maps
+// each barrier result to ITS OWN stream's head + data (no cross-map), every stream's head is monotone
+// and covered by its own flushed bytes, a frozen stream never advances, and no cross-stream ordering
+// is promised or needed. As the file preamble states, loom has no bounded queue / `ArcSwap`, so the
+// shared work queue's atomic `Vec::pop` is modeled with an atomic CLAIM cursor (the same convention
+// MODEL 2 uses for the bounded `sync_channel`): a non-atomic claim would let two workers win one
+// barrier — a lost fsync while PASS 3 still advanced that stream's head, an I2 break loom would find.
+// ---------------------------------------------------------------------------------------------
+
+/// The number of streams dirtied in the modeled tick: two (tag 0 = stream "A", tag 1 = stream "B").
+/// Bounded at 2 so the barrier fan-out stays inside loom's <= 3-thread / <= 4-op budget.
+const DIRTIED_STREAMS: usize = 2;
+
+/// A faithful replica of the cross-stream `commit_tick` state for two dirtied streams: the PASS-1
+/// flushed bytes, the shared barrier work-queue claim cursor, the per-stream barrier completion, and
+/// the per-stream published durable head. Indexed BY TAG (the ordinal `commit_tick` reassembles by),
+/// so a cross-map (advancing stream X's head from stream Y's barrier/data) is representable — and
+/// asserted against.
+struct TwoStreamCommit {
+    /// PASS-1 flushed record bytes per stream (`Log::flush_no_sync`, `streamset.rs:659`). Written
+    /// Relaxed BEFORE the barrier; each stream's own head, when advanced, must cover THESE bytes.
+    data: [AtomicUsize; DIRTIED_STREAMS],
+    /// The SHARED barrier work-queue claim cursor: the atomic stand-in for the `Mutex<Vec<(usize,
+    /// &mut Log)>>::pop` in `par_sync_data_only` (`log.rs:1083`/`:1105`). Each worker `fetch_add`s
+    /// (`AcqRel`) to claim a UNIQUE tag `< DIRTIED_STREAMS`, so two workers can NEVER run the same
+    /// fd's `fdatasync` (no lost/duplicated barrier — the MODEL-2 atomic-reservation teeth).
+    claim: AtomicUsize,
+    /// Per-stream barrier completion, indexed by tag: set to 1 by the claiming worker AFTER its
+    /// `fdatasync` (`Log::sync_data_only` Ok, `log.rs:3172`), Release; read Acquire by PASS 3 so the
+    /// head advance happens-after the barrier it depends on.
+    barrier_ran: [AtomicUsize; DIRTIED_STREAMS],
+    /// Per-stream published durable head, indexed by tag: advanced in PASS 3 (Release) ONLY after the
+    /// JOIN, and ONLY for a stream whose barrier returned Ok (`advance_synced_offset_after_external_sync`
+    /// `log.rs:3207` + `publish_flushed` `read_plane.rs:725`). Stays 0 for a frozen stream.
+    head: [AtomicUsize; DIRTIED_STREAMS],
+}
+
+impl TwoStreamCommit {
+    fn new() -> TwoStreamCommit {
+        TwoStreamCommit {
+            data: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            claim: AtomicUsize::new(0),
+            barrier_ran: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            head: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        }
+    }
+
+    /// PASS 1: flush stream `tag`'s record bytes to the page cache (Relaxed store), before the barrier.
+    fn flush(&self, tag: usize, bytes: usize) {
+        self.data[tag].store(bytes, Ordering::Relaxed);
+    }
+
+    /// PASS 2, one barrier worker: atomically CLAIM the next barrier off the shared queue, run that
+    /// stream's `fdatasync`, and publish its completion (Release). Returns the tag it claimed so the
+    /// actor can assert the two workers claimed the two DISTINCT streams (exactly-once). Mirrors a
+    /// `par_sync_data_only` participant popping one `(tag, &mut Log)` and running `sync_data_only`.
+    fn run_one_barrier(&self) -> usize {
+        // AcqRel `fetch_add`: hands this worker a UNIQUE tag, exactly as the mutex-guarded `Vec::pop`
+        // hands each participant a distinct barrier. With two workers and two barriers each worker
+        // claims exactly one tag in `0..DIRTIED_STREAMS`.
+        let tag = self.claim.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            tag < DIRTIED_STREAMS,
+            "a worker claimed a barrier past the dirtied set: the shared queue handed out a \
+             duplicate/overrun tag (a lost or double-run fsync)"
+        );
+        // Run this fd's covering fdatasync (modeled as a no-op success) and publish completion Release
+        // so PASS 3's Acquire load of `barrier_ran[tag]` happens-after the barrier.
+        self.barrier_ran[tag].store(1, Ordering::Release);
+        tag
+    }
+
+    /// PASS 3 (serial on the actor, AFTER the join): for each stream whose barrier returned, advance
+    /// ITS OWN head from ITS OWN flushed bytes (Release), mapped by tag — never cross-mapped. A stream
+    /// whose barrier did not run stays frozen (head 0).
+    fn release_after_join(&self) {
+        for tag in 0..DIRTIED_STREAMS {
+            // Acquire: pairs with the worker's Release, so reading the flushed bytes below is safe.
+            if self.barrier_ran[tag].load(Ordering::Acquire) == 1 {
+                let covered = self.data[tag].load(Ordering::Relaxed);
+                self.head[tag].store(covered, Ordering::Release);
+            }
+        }
+    }
+
+    /// Observe stream `tag`'s published durable head (Acquire), as a lock-free consumer would.
+    fn head(&self, tag: usize) -> usize {
+        self.head[tag].load(Ordering::Acquire)
+    }
+}
+
+#[test]
+fn two_stream_commit_tick_runs_each_barrier_once_and_maps_it_to_its_own_head() {
+    // The cross-stream barrier fan-out (`streamset.rs:638` + `log.rs:1061`): the actor flushes both
+    // dirtied streams (PASS 1), two barrier workers claim the two DISTINCT barriers off the shared
+    // queue and fdatasync concurrently (PASS 2), the actor JOINS both, then advances each stream's head
+    // BY TAG (PASS 3). 3 threads (actor + 2 workers), <= 2 shared ops per worker. Invariants over EVERY
+    // interleaving: each barrier is claimed & run EXACTLY once (no lost/duplicated fsync), and each
+    // stream's head reflects ITS OWN barrier + ITS OWN flushed bytes (no cross-map — the #603 "corrupt
+    // one stream's index while committing another" hazard).
+    model_counted("two_stream_commit_barrier_fanout", || {
+        let commit = Arc::new(TwoStreamCommit::new());
+        // PASS 1 (serial on the actor, before the fan-out): both dirtied streams' bytes reach the page
+        // cache. Distinct byte values (10 for A, 20 for B) so a cross-map surfaces as a wrong head.
+        commit.flush(0, 10);
+        commit.flush(1, 20);
+
+        // PASS 2: two barrier workers, each claims one DISTINCT barrier off the shared queue and syncs.
+        let w0 = {
+            let commit = Arc::clone(&commit);
+            thread::spawn(move || commit.run_one_barrier())
+        };
+        let w1 = {
+            let commit = Arc::clone(&commit);
+            thread::spawn(move || commit.run_one_barrier())
+        };
+        // JOIN every barrier before ANY ack releases (`log.rs:1130`): PASS 3 is sequenced strictly
+        // after this.
+        let t0 = w0.join().expect("barrier worker 0");
+        let t1 = w1.join().expect("barrier worker 1");
+
+        // The two workers claimed the two DISTINCT streams: each barrier ran EXACTLY once, none lost,
+        // none doubled (the shared-queue atomic-claim teeth — a non-atomic claim lets loom find a
+        // collision, exactly MODEL 2's lost-item race).
+        let mut claimed = [t0, t1];
+        claimed.sort_unstable();
+        assert_eq!(
+            claimed,
+            [0, 1],
+            "each stream's covering fdatasync is claimed & run EXACTLY once (no lost/duplicated barrier)"
+        );
+
+        // PASS 3 (serial, after the join): advance each head by tag from its own barrier + own bytes.
+        commit.release_after_join();
+        // No cross-map: stream A's head covers A's own flushed bytes (10), B's covers B's (20). A bug
+        // that reassembled the barrier results out of tag order would land B's coverage on A's head.
+        assert_eq!(
+            commit.head(0),
+            10,
+            "stream A's durable head reflects A's OWN barrier + A's OWN flushed bytes (no cross-map)"
+        );
+        assert_eq!(
+            commit.head(1),
+            20,
+            "stream B's durable head reflects B's OWN barrier + B's OWN flushed bytes (no cross-map)"
+        );
+    });
+}
+
+/// A faithful replica of two streams' READ-PLANE publish/observe (`read_plane.rs:22`-`:34`), indexed
+/// by stream: the flushed record bytes (`data`) and the read-visible durable head/frontier (`head`).
+/// The tick's PASS 3 publishes each stream's head with RELEASE after its bytes; a lock-free consumer
+/// observes a stream's head with ACQUIRE then its bytes — the #539 read plane, per stream, with NO
+/// lock and NO actor round-trip.
+struct TwoStreamPlane {
+    /// Per-stream flushed record bytes (the `SealedSnapshot`/active bytes a commit makes visible,
+    /// `read_plane.rs:218`). Written Relaxed BEFORE the stream's head; read AFTER it.
+    data: [AtomicUsize; DIRTIED_STREAMS],
+    /// Per-stream read-visible durable head (the flushed frontier, `read_plane.rs:724`
+    /// `publish_flushed`): a 0/1 published flag here. Published Release (PASS 3,
+    /// `advance_synced_offset_after_external_sync`), observed Acquire (`read_plane.rs:732`/`:758`).
+    head: [AtomicUsize; DIRTIED_STREAMS],
+}
+
+impl TwoStreamPlane {
+    fn new() -> TwoStreamPlane {
+        TwoStreamPlane {
+            data: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            head: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        }
+    }
+
+    /// PASS 3 publish of stream `stream`: store its flushed bytes (Relaxed) THEN publish its head with
+    /// Release, so a consumer that observes the head is guaranteed to see the bytes it covers.
+    fn commit(&self, stream: usize, bytes: usize) {
+        self.data[stream].store(bytes, Ordering::Relaxed);
+        self.head[stream].store(1, Ordering::Release);
+    }
+
+    /// Lock-free consumer on stream `stream`: observe its head with Acquire FIRST, then its bytes.
+    /// Returns `(head, bytes)` it saw (`read_plane.rs:758` load `flushed` Acquire then `sealed`).
+    fn observe(&self, stream: usize) -> (usize, usize) {
+        let head = self.head[stream].load(Ordering::Acquire);
+        let bytes = self.data[stream].load(Ordering::Relaxed);
+        (head, bytes)
+    }
+}
+
+#[test]
+fn a_consumer_on_one_stream_sees_only_its_own_covered_head_while_the_sibling_commits() {
+    // The cross-thread READ-PLANE seam under a 2-stream tick: the actor commits BOTH dirtied streams'
+    // heads via `publish_flushed` (Release, `read_plane.rs:725`) in ONE tick, while lock-free consumers
+    // on each stream observe their own head (Acquire, `read_plane.rs:758`). Per-stream I2 coverage: a
+    // consumer on A observing A's head implies A's OWN bytes are visible. Cross-stream isolation (the
+    // #603 read-side hazard): A's read plane is a DISJOINT atomic from B's, so A's consumer must NEVER
+    // observe B's bytes through A's head — A commits bytes=1, B commits bytes=2, so any leak of B into A
+    // surfaces as `bytes == 2`. 3 threads (actor + consumer A + consumer B), <= 4 ops on the actor.
+    model_counted("two_stream_read_plane_isolation", || {
+        let plane = Arc::new(TwoStreamPlane::new());
+        // The single tick publishes BOTH streams' heads (PASS 3), A then B, on the actor thread.
+        let actor = {
+            let plane = Arc::clone(&plane);
+            thread::spawn(move || {
+                plane.commit(0, 1);
+                plane.commit(1, 2);
+            })
+        };
+        // Consumer on B runs on its own thread; consumer on A runs here — both fully interleave the tick.
+        let consumer_b = {
+            let plane = Arc::clone(&plane);
+            thread::spawn(move || plane.observe(1))
+        };
+        let (head_a, bytes_a) = plane.observe(0);
+        // A's head is monotone (only ever 0 or its one published flag) and, when observed, implies A's
+        // OWN bytes are visible — never B's (isolation + per-stream I2 coverage).
+        assert!(
+            head_a <= 1,
+            "stream A's head never exceeds its one published value"
+        );
+        if head_a == 1 {
+            assert_eq!(
+                bytes_a, 1,
+                "observing A's head implies A's OWN bytes (1) are visible, never B's (2) — cross-stream \
+                 isolation + I2 coverage"
+            );
+        }
+        let (head_b, bytes_b) = consumer_b.join().expect("consumer B");
+        assert!(
+            head_b <= 1,
+            "stream B's head never exceeds its one published value"
+        );
+        if head_b == 1 {
+            assert_eq!(
+                bytes_b, 2,
+                "observing B's head implies B's OWN bytes (2) are visible, never A's (1)"
+            );
+        }
+        actor.join().expect("commit actor");
+        // After the tick both streams are fully published and each head covers ITS OWN bytes.
+        assert_eq!(
+            plane.observe(0),
+            (1, 1),
+            "stream A fully published after the tick"
+        );
+        assert_eq!(
+            plane.observe(1),
+            (1, 2),
+            "stream B fully published after the tick"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// MODEL 7: 2-STREAM FAULT INJECTION — crash/torn point mid-tick + per-stream recovery isolation
+// (#563, issue #603).
+//
+// Real symbol cross-reference: the per-stream recovery isolation `StreamSet` promises
+// (`streamset.rs:21`-`:30`, `:227` `StreamRecovery`) crossed with the per-stream I2 the cross-stream
+// tick enforces (`streamset.rs:626`, `engine.rs:5035` froze -> `WriterFrozen`). In one tick stream A's
+// barrier SUCCEEDS — its head is advanced/published (`advance_synced_offset_after_external_sync`
+// `log.rs:3207`) so its acks release (I2, ack-implies-durable) — while stream B's barrier FREEZES
+// (`Log::sync_data_only` Err => `self.active=None` `log.rs:3181`), so PASS 3 does NOT advance B's head
+// (`streamset.rs:712`) and B's acks stay parked (`CommitOutcome::froze` `streamset.rs:253`).
+//
+// A crash at an ARBITRARY point of this interleave must satisfy the recovery invariant: a committed
+// (head-published) record SURVIVES; an uncommitted/frozen record is NOT falsely durable; and the two
+// streams recover INDEPENDENTLY (A committing never durablizes B; B freezing never un-durablizes A).
+// Recovery is a pure function of each stream's own durable bytes (`streamset.rs:26`), so a torn B
+// cannot shorten A. loom explores every interleave of the actor's publishes against a RECOVERY reader
+// that observes the durable image at that point — "the crash sees whatever memory is visible then."
+//
+// FAITHFUL-SCOPE caveat (mirroring the file preamble on the real SeqCst fsync counter): loom models
+// the MEMORY-ORDERING half of the durability contract — the head is published Release ONLY AFTER its
+// covering `fdatasync`, so observing a published head at crash time IMPLIES the bytes are safely on
+// disk. The `fdatasync`/persistence itself is not a loom primitive; the ORDERING that gates the head
+// publish on the fsync (the thing a bug would weaken) is exactly what is under test.
+// ---------------------------------------------------------------------------------------------
+
+/// A faithful replica of the durable image a crash mid-tick would leave: two streams' flushed bytes
+/// plus their published heads, where stream A committed and stream B FROZE. A recovery observes this
+/// image; the invariant is asserted over every interleaving.
+struct TwoStreamCrash {
+    /// Per-stream flushed record bytes (in the page cache after PASS 1). Written Relaxed. Being in the
+    /// page cache does NOT make a record durable — only a PUBLISHED head does (that is the whole point).
+    data: [AtomicUsize; DIRTIED_STREAMS],
+    /// Per-stream published durable head (0 = not durable). A is advanced Release after its SUCCESSFUL
+    /// barrier; B FREEZES so its head is NEVER advanced (stays 0). Observing a head at crash time is a
+    /// recovery reading the persisted `synced_offset`; a 0 head means recovery truncates that stream's
+    /// un-synced tail (not falsely durable).
+    head: [AtomicUsize; DIRTIED_STREAMS],
+}
+
+impl TwoStreamCrash {
+    fn new() -> TwoStreamCrash {
+        TwoStreamCrash {
+            data: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            head: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        }
+    }
+
+    /// The actor's tick where stream A commits (barrier Ok) and stream B freezes (barrier Err). PASS 1
+    /// flushes BOTH streams' bytes to the page cache; PASS 3 publishes ONLY A's head (Release) — B's
+    /// frozen barrier leaves B's head un-advanced (its acks parked), exactly `commit_tick`'s freeze path.
+    fn commit_a_ok_b_frozen(&self) {
+        // PASS 1 flush (both dirtied): the bytes are in the page cache but NOT yet durable.
+        self.data[0].store(1, Ordering::Relaxed);
+        self.data[1].store(2, Ordering::Relaxed);
+        // PASS 3: A's barrier returned Ok -> advance/publish A's head (Release). This is the only place
+        // a head is published, and it happens-after A's (modeled successful) fdatasync.
+        self.head[0].store(1, Ordering::Release);
+        // Stream B's barrier FROZE (`log.rs:3181`): its head is deliberately NOT advanced. B's un-synced
+        // tail must never be reported durable.
+    }
+
+    /// A recovery/crash reader: read each stream's persisted durable head (Acquire) and its bytes. The
+    /// Acquire on the head pairs with the actor's Release, so a published head implies its bytes are
+    /// visible (the memory-ordering half of "durable-implies-present").
+    fn recover(&self) -> [(usize, usize); DIRTIED_STREAMS] {
+        let mut out = [(0, 0); DIRTIED_STREAMS];
+        for (stream, slot) in out.iter_mut().enumerate() {
+            let head = self.head[stream].load(Ordering::Acquire);
+            let bytes = self.data[stream].load(Ordering::Relaxed);
+            *slot = (head, bytes);
+        }
+        out
+    }
+}
+
+#[test]
+fn a_crash_mid_tick_keeps_the_committed_stream_and_never_falsely_durablizes_the_frozen_one() {
+    // A crash at an arbitrary point of a tick where stream A committed and stream B FROZE. 2 threads
+    // (actor + recovery reader). Recovery invariant over EVERY interleaving:
+    //   - committed A SURVIVES: if recovery observes A's head, A's bytes are present (I2, via the
+    //     Release/Acquire that gates the head publish on the covering fdatasync);
+    //   - frozen B is NOT falsely durable: B's head is NEVER published, so recovery truncates B's tail;
+    //   - the two recover INDEPENDENTLY (#563): A committing does not durablize B, B freezing does not
+    //     un-durablize A.
+    model_counted("two_stream_crash_recovery_isolation", || {
+        let image = Arc::new(TwoStreamCrash::new());
+        let actor = {
+            let image = Arc::clone(&image);
+            thread::spawn(move || image.commit_a_ok_b_frozen())
+        };
+        // The crash: read the durable image at some interleaved point.
+        let [(head_a, bytes_a), (head_b, _bytes_b)] = image.recover();
+        // Committed stream A: monotone head, and a published head implies its record survived.
+        assert!(
+            head_a <= 1,
+            "stream A's durable head is monotone (0 or its one published value)"
+        );
+        if head_a == 1 {
+            assert_eq!(
+                bytes_a, 1,
+                "a committed (head-published) record SURVIVES the crash — durable-implies-present (I2)"
+            );
+        }
+        // Frozen stream B: its head is NEVER published, so an uncommitted record is never falsely
+        // durable, regardless of the interleaving. (B's bytes may or may not be in the page cache; a 0
+        // head means recovery truncates them — they are NOT durable.)
+        assert_eq!(
+            head_b, 0,
+            "a FROZEN stream's durable head never advances — its un-synced tail is not falsely durable"
+        );
+        actor.join().expect("commit actor");
+        // After the actor finishes: A recovered committed, B recovered to its own pre-freeze prefix —
+        // independently (the per-stream recovery-isolation property, #563).
+        let [(final_a, _), (final_b, _)] = image.recover();
+        assert_eq!(
+            (final_a, final_b),
+            (1, 0),
+            "A recovers committed and B recovers to its own durable prefix, INDEPENDENTLY (#563)"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// MODEL 8: EVICTION CONCURRENCY — a consumer racing a stream's evict/reopen (max_open_streams hot-set
+// LRU, M2-I4 #565, issue #603).
+//
+// Real symbol cross-reference: `StreamSet::close` (`streamset.rs:824`) EVICTS a named stream by
+// DROPPING its `Log` — releasing the fd AND the read plane's `sealed: ArcSwap<SealedSnapshot>`
+// (`read_plane.rs:22`) — while its on-disk `streams/<hex>/` subtree stays intact; `StreamSet::declare`
+// (`streamset.rs:442`) REOPENS it via `Log::open`, recovering its durable prefix and republishing a
+// fresh sealed snapshot. A lock-free consumer reads the read plane by LOADING (cloning) the snapshot
+// Arc (`read_plane.rs:759` `sealed.load()`), which PINS it: even after the stream is evicted, the
+// consumer's pinned clone keeps that immutable snapshot alive by refcount until the consumer releases
+// it — the same recycle-only-after-last-reference contract MODEL 3 pins for `ConnectionSlot`/`Arc`.
+//
+// This models the genuinely-concurrent seam eviction introduces: a consumer that RACED the evict/reopen
+// of the stream whose snapshot it pinned must never use-after-free, and the snapshot must drop EXACTLY
+// once (loom's Arc panics on a double free or a leak). CROSS-STREAM isolation to the OTHER stream is
+// STRUCTURAL, not a race: each stream is an INDEPENDENT `Log` with its OWN disjoint read plane
+// (`streamset.rs:36`, "opening stream X touches only X's directory"), so evicting/reopening B cannot
+// reach A's snapshot — there is no shared memory between an A-consumer and a B-evict for loom to
+// permute. The model asserts that isolation by construction (a disjoint stream-A snapshot the
+// maintenance thread never touches) and keeps the RACY state on the evicted stream's own plane.
+//
+// FAITHFUL-SCOPE caveat: loom has no `ArcSwap`, so the atomically-swapped, refcounted `sealed` pointer
+// is modeled with a `loom::sync::Mutex<Option<Arc<Snapshot>>>` (`load` clones the Arc = a pin, evict
+// TAKEs it, reopen PUTs a fresh one). The property under test — refcount lifetime + drop-exactly-once
+// across the swap — does not rest on the ArcSwap-vs-Mutex ordering distinction (both give at least the
+// Acquire/Release the pin needs); the file preamble's faithful-stand-in caveat applies.
+// ---------------------------------------------------------------------------------------------
+
+/// A stream's immutable SEALED read-plane snapshot (`read_plane.rs:218` `SealedSnapshot`), pinned by a
+/// consumer that clones its Arc. It must stay valid for as long as ANY consumer pins it, even after
+/// the stream is evicted (its `Log` — and the set's clone of this Arc — dropped).
+struct Snapshot {
+    /// The durable offset this snapshot covers (its sealed prefix end). Read through a PINNED Arc; must
+    /// remain a valid read for every consumer that pinned it, across an evict of the owning stream.
+    covers: usize,
+    /// Live consumer pins on THIS snapshot (inside a read). Raised Acquire before the read, lowered
+    /// Release after — the pin discipline MODEL 3 mirrors for `ConnectionSlot`.
+    live_pins: AtomicUsize,
+    /// Out-of-band witness (Relaxed `std` flag, OUTSIDE the modeled shared state) set at Drop if this
+    /// snapshot was ever dropped while a consumer still pinned it — a use-after-free analog. Must stay 0
+    /// in every interleaving: the Arc refcount keeps an evicted snapshot alive until its last pin
+    /// releases. Held via its own `Arc` so it OUTLIVES the snapshot and can be asserted after all drops.
+    freed_while_pinned: Arc<StdAtomicUsize>,
+}
+
+impl Snapshot {
+    fn new(covers: usize, freed_while_pinned: Arc<StdAtomicUsize>) -> Snapshot {
+        Snapshot {
+            covers,
+            live_pins: AtomicUsize::new(0),
+            freed_while_pinned,
+        }
+    }
+
+    /// A consumer reading THROUGH a pinned snapshot: raise the pin (Acquire), read `covers` (must be a
+    /// valid read because we hold a strong ref), lower the pin (Release). Mirrors `read_plane`'s
+    /// `read_range` reading the sealed snapshot it loaded.
+    fn consume(&self) -> usize {
+        self.live_pins.fetch_add(1, Ordering::AcqRel);
+        let covered = self.covers;
+        self.live_pins.fetch_sub(1, Ordering::AcqRel);
+        covered
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // Runs EXACTLY once (loom's Arc enforces it). If any consumer still pinned this snapshot when
+        // it dropped, that is a use-after-free analog — record it. A correct refcount guarantees the
+        // last Arc (the set's or a consumer's) drops only after every pin has been released, so this is
+        // always 0.
+        if self.live_pins.load(Ordering::Acquire) != 0 {
+            self.freed_while_pinned.store(1, StdOrdering::Relaxed);
+        }
+    }
+}
+
+/// A stream's read-plane sealed-snapshot SLOT: the `ArcSwap<SealedSnapshot>` stand-in
+/// (`read_plane.rs:22`). `None` = the stream is EVICTED/closed (`StreamSet::close` dropped its `Log`),
+/// its on-disk subtree intact; `Some` = open, holding the current immutable snapshot.
+struct StreamReadPlane {
+    /// The atomically-swapped, refcounted sealed snapshot. `Mutex<Option<Arc<..>>>` is the loom
+    /// stand-in for `ArcSwap` (see the model's faithful-scope caveat).
+    sealed: Mutex<Option<Arc<Snapshot>>>,
+}
+
+impl StreamReadPlane {
+    fn open(covers: usize, freed_while_pinned: Arc<StdAtomicUsize>) -> StreamReadPlane {
+        StreamReadPlane {
+            sealed: Mutex::new(Some(Arc::new(Snapshot::new(covers, freed_while_pinned)))),
+        }
+    }
+
+    /// Consumer LOAD: clone the current snapshot Arc if the stream is open (a PIN), else `None` (the
+    /// stream was evicted). Mirrors `read_plane.rs:759` `sealed.load()`.
+    fn load_pin(&self) -> Option<Arc<Snapshot>> {
+        self.sealed.lock().expect("sealed slot poisoned").clone()
+    }
+
+    /// EVICT the stream: drop the set's clone of the snapshot Arc (`StreamSet::close` `streamset.rs:824`
+    /// dropping the `Log`). A consumer that already pinned the old snapshot keeps it alive by refcount.
+    fn evict(&self) {
+        *self.sealed.lock().expect("sealed slot poisoned") = None;
+    }
+
+    /// REOPEN the stream: install a fresh recovered snapshot (`StreamSet::declare` `streamset.rs:442` ->
+    /// `Log::open` recovering the durable prefix and republishing the read plane).
+    fn reopen(&self, covers: usize, freed_while_pinned: Arc<StdAtomicUsize>) {
+        *self.sealed.lock().expect("sealed slot poisoned") =
+            Some(Arc::new(Snapshot::new(covers, freed_while_pinned)));
+    }
+}
+
+#[test]
+fn a_consumer_pinning_a_snapshot_is_safe_across_the_streams_evict_and_reopen() {
+    // A consumer on stream B loads (pins) B's sealed snapshot and reads through it, RACING the
+    // maintenance thread evicting B (dropping the set's snapshot Arc) and reopening B (installing a
+    // fresh recovered snapshot). 3 threads (B-consumer + maintenance + a disjoint A-consumer proving
+    // cross-stream isolation), few ops each. Invariants over EVERY interleaving:
+    //   - NO use-after-free: a consumer that pinned B's old snapshot before the evict reads it safely
+    //     (the refcount keeps it alive); loom's Arc enforces drop-EXACTLY-once (no double free, no leak);
+    //   - the reopened snapshot covers a NON-REGRESSING durable prefix (recovery restores B's durable
+    //     records, `streamset.rs:815`-`:817` "reopen recovers from disk like a per-stream restart");
+    //   - the OTHER stream A's disjoint snapshot is never touched by B's evict/reopen (isolation).
+    model_counted("stream_evict_reopen_pinned_snapshot", || {
+        // The freed-while-pinned witnesses (one per snapshot generation) OUTLIVE their snapshots.
+        let witness_b0 = Arc::new(StdAtomicUsize::new(0));
+        let witness_b1 = Arc::new(StdAtomicUsize::new(0));
+        let witness_a = Arc::new(StdAtomicUsize::new(0));
+        // Stream B opens with a snapshot covering durable offset 5.
+        let plane_b = Arc::new(StreamReadPlane::open(5, Arc::clone(&witness_b0)));
+        // Stream A (the OTHER stream) has its OWN disjoint plane the maintenance NEVER touches.
+        let plane_a = Arc::new(StreamReadPlane::open(9, Arc::clone(&witness_a)));
+
+        // Maintenance: evict B, then reopen B with a recovered snapshot whose coverage does not regress
+        // below the durable prefix (5). This races the B-consumer's load/pin.
+        let maintenance = {
+            let plane_b = Arc::clone(&plane_b);
+            let witness_b1 = Arc::clone(&witness_b1);
+            thread::spawn(move || {
+                plane_b.evict();
+                plane_b.reopen(5, witness_b1);
+            })
+        };
+        // A consumer on B: load (pin) whatever snapshot is current and read through it. If it raced
+        // BEFORE the evict it pins the old snapshot (kept alive by refcount); if AFTER, it sees `None`
+        // (evicted) or the reopened snapshot — all three are safe.
+        let consumer_b = {
+            let plane_b = Arc::clone(&plane_b);
+            thread::spawn(move || {
+                if let Some(snap) = plane_b.load_pin() {
+                    let covers = snap.consume();
+                    // A pinned snapshot always covers a valid durable prefix (never regressed below 5).
+                    assert!(
+                        covers >= 5,
+                        "a pinned snapshot covers a non-regressing durable prefix (reopen recovers it)"
+                    );
+                }
+            })
+        };
+        // A consumer on the OTHER stream A, on this thread: its disjoint snapshot is unaffected by B.
+        if let Some(snap) = plane_a.load_pin() {
+            assert_eq!(
+                snap.consume(),
+                9,
+                "the OTHER stream's snapshot is untouched by B's evict/reopen (per-stream isolation)"
+            );
+        }
+
+        consumer_b.join().expect("stream-B consumer");
+        maintenance.join().expect("evict/reopen maintenance");
+
+        // No snapshot — B's original (dropped by the evict or the last consumer pin), B's reopened, or
+        // A's disjoint one — was ever freed while a consumer still pinned it. Every join above
+        // establishes happens-before with the thread that dropped the last Arc, so each witness store
+        // is visible here. loom's Arc separately enforces that each snapshot dropped EXACTLY once.
+        assert_eq!(
+            witness_b0.load(StdOrdering::Relaxed),
+            0,
+            "stream B's ORIGINAL snapshot was never freed while a racing consumer pinned it (no UAF \
+             across the evict)"
+        );
+        assert_eq!(
+            witness_b1.load(StdOrdering::Relaxed),
+            0,
+            "stream B's REOPENED snapshot was never freed while pinned"
+        );
+        assert_eq!(
+            witness_a.load(StdOrdering::Relaxed),
+            0,
+            "stream A's snapshot was never freed while pinned (untouched by B's evict/reopen)"
         );
     });
 }
