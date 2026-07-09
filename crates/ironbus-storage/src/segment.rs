@@ -2527,12 +2527,36 @@ mod tests {
         assert_eq!(scan.records[2].payload.as_ref(), b"three");
     }
 
+    /// The optional stored field the window-straddling frame in [`build_window_straddling_segment`]
+    /// carries. `Plain` is the control (no post-header prefix); `Subject` (#594) and `StreamTag`
+    /// (#597) each prepend a `u16` length prefix IMMEDIATELY after the record header — the exact bytes
+    /// the header-only recovery walk must buffer before it can size the frame, and the bytes that fell
+    /// outside the read window in the #594-A / #597 straddle bug. The two flags share the same
+    /// [`has_post_header_prefix_field`] gate and `RECORD_SUBJECT_LEN_PREFIX` width, so the straddle
+    /// exercises the identical recovery path for either.
+    #[derive(Clone, Copy)]
+    enum StraddleField {
+        Plain,
+        Subject,
+        StreamTag,
+    }
+
+    impl StraddleField {
+        fn label(self) -> &'static str {
+            match self {
+                StraddleField::Plain => "plain",
+                StraddleField::Subject => "subject",
+                StraddleField::StreamTag => "stream_tag",
+            }
+        }
+    }
+
     /// Builds a SEALED segment whose record at index `written-6` STRADDLES the first recovery read
     /// window such that exactly 37 of its bytes are windowed (it starts at body offset
     /// `RECOVERY_WINDOW_BYTES - 37`), with five more records fully on disk after it. The straddling
-    /// record carries a stored subject when `use_subject`, else it is plain. Returns the file and the
-    /// total records written. (#594 / PR #1107 regression fixture.)
-    fn build_window_straddling_segment(use_subject: bool) -> (Arc<InMemoryFile>, u64) {
+    /// record carries a stored subject (#594) or stream tag (#597) per `field`, else it is plain.
+    /// Returns the file and the total records written. (#594 / #597 / PR #1107 regression fixture.)
+    fn build_window_straddling_segment(field: StraddleField) -> (Arc<InMemoryFile>, u64) {
         let file = Arc::new(InMemoryFile::new());
         let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
         // The straddling frame's START must land at body offset `RECOVERY_WINDOW_BYTES - 37`, so
@@ -2557,12 +2581,21 @@ mod tests {
             body, target,
             "the straddling frame must start exactly at the window edge minus 37"
         );
-        // The straddling record (subject or a plain control), then several records fully on disk.
-        if use_subject {
-            w.append_with_subject(&rec(seq, b"x"), b"orders.eu.1")
-                .unwrap();
-        } else {
-            w.append(&rec(seq, b"x")).unwrap();
+        // The straddling record (subject, stream tag, or a plain control), then several records fully
+        // on disk. The stored field is the SAME 11-byte length for the subject and stream-tag arms, so
+        // both frames start at exactly `target` and straddle the window identically.
+        match field {
+            StraddleField::Plain => {
+                w.append(&rec(seq, b"x")).unwrap();
+            }
+            StraddleField::Subject => {
+                w.append_with_subject(&rec(seq, b"x"), b"orders.eu.1")
+                    .unwrap();
+            }
+            StraddleField::StreamTag => {
+                w.append_with_stream_tag(&rec(seq, b"x"), b"orders.eu.1")
+                    .unwrap();
+            }
         }
         seq += 1;
         for _ in 0..5 {
@@ -2582,20 +2615,60 @@ mod tests {
         // and the walk mis-read the valid frame as a torn tail — silently dropping it AND every
         // record after it. Assert full recovery for the subject case; the plain control at the
         // identical position proves the guard is the subject case, not the positioning.
-        for use_subject in [false, true] {
-            let (file, written) = build_window_straddling_segment(use_subject);
+        for field in [StraddleField::Plain, StraddleField::Subject] {
+            let (file, written) = build_window_straddling_segment(field);
             let scan = SegmentReader::open(Arc::clone(&file))
                 .unwrap()
                 .scan_recovery()
                 .unwrap();
             assert_eq!(
-                scan.record_count, written,
-                "streaming recovery dropped records (use_subject={use_subject}): a window-straddling \
-                 HAS_SUBJECT frame must never be mis-read as a torn tail"
+                scan.record_count,
+                written,
+                "streaming recovery dropped records (field={}): a window-straddling HAS_SUBJECT frame \
+                 must never be mis-read as a torn tail",
+                field.label()
             );
             assert!(
                 scan.clean,
-                "the segment recovered clean (use_subject={use_subject})"
+                "the segment recovered clean (field={})",
+                field.label()
+            );
+            assert_eq!(
+                scan.last_seq,
+                Seq::new(written - 1),
+                "the last seq is recovered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_tag_frame_straddling_the_recovery_window_recovers_without_data_loss() {
+        // #597 (the #594-A lesson applied to the shared-WAL demux key): a HAS_STREAM_TAG frame carries
+        // the SAME `u16` length prefix after the record header as a HAS_SUBJECT frame and reaches the
+        // recovery walk through the SAME `has_post_header_prefix_field` gate. #597 shipped the guard
+        // that buffers those prefix bytes before `decoded_len`, so the fix is covered by construction —
+        // but the SUBJECT case had a direct regression test and the STREAM-TAG case did not. This is
+        // the missing direct analogue: a HAS_STREAM_TAG frame straddling the window at
+        // header..header+prefix bytes must RECOVER WITHOUT LOSS, never mis-read as a torn tail that
+        // would silently drop it and every record after it. The plain control at the identical position
+        // proves the guard is the stream-tag case, not the positioning.
+        for field in [StraddleField::Plain, StraddleField::StreamTag] {
+            let (file, written) = build_window_straddling_segment(field);
+            let scan = SegmentReader::open(Arc::clone(&file))
+                .unwrap()
+                .scan_recovery()
+                .unwrap();
+            assert_eq!(
+                scan.record_count,
+                written,
+                "streaming recovery dropped records (field={}): a window-straddling HAS_STREAM_TAG \
+                 frame must never be mis-read as a torn tail",
+                field.label()
+            );
+            assert!(
+                scan.clean,
+                "the segment recovered clean (field={})",
+                field.label()
             );
             assert_eq!(
                 scan.last_seq,

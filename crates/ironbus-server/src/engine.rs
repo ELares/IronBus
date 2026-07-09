@@ -7173,14 +7173,34 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// head from [`Engine::log`], or a NAMED stream's head from its own log in the [`StreamSet`]
     /// (`Offset::ZERO` for an unknown named stream). Lets a test assert a produce to a named stream
     /// advanced ONLY that stream's head, not the default's (cross-stream data isolation).
-    #[must_use]
-    pub fn stream_head(&self, stream: &str) -> Offset {
+    ///
+    /// A named stream the hot-set LRU EVICTED (#565) has its log CLOSED, so a plain `self.streams.get`
+    /// would return `None` and report head `0` — WRONGLY, since the stream still EXISTS and its records
+    /// are durable on disk (the #565/#588 `StreamInfo` review finding). Unlike
+    /// [`stream_exists`](Self::stream_exists) — which answers a pure existence question with no on-disk
+    /// data and so never reopens — the head LIVES on disk in the stream's segments, so it can only be
+    /// read by reopening the log. This takes `&mut self` and REOPENS an evicted-but-known stream through
+    /// the established [`ensure_named_stream_resident`](Self::ensure_named_stream_resident) path (which
+    /// recovers the durable head from disk and re-admits the stream to the hot set, evicting the LRU
+    /// victim to stay within `max_open_streams`), so the reported head is the true durable head, not 0.
+    /// A genuinely-unknown stream is NOT reopened (nothing to recover) and reports `Offset::ZERO`,
+    /// folding with `stream_exists == false`. A reopen I/O fault degrades to `Offset::ZERO` rather than
+    /// surfacing — a metadata read never costs correctness, and the caller already treats 0 as "no head".
+    pub fn stream_head(&mut self, stream: &str) -> Offset {
         if stream.is_empty() {
             return self.log.flushed_offset();
         }
         let Ok(id) = StreamId::named(stream) else {
             return Offset::ZERO;
         };
+        // Reopen an evicted-but-KNOWN named stream so its durable head is read from disk rather than
+        // folded to 0; a never-declared stream is left untouched (its `get` below stays `None` -> ZERO).
+        if !self.streams.is_open(&id)
+            && self.known_named_streams.contains(&id)
+            && self.ensure_named_stream_resident(&id).is_err()
+        {
+            return Offset::ZERO;
+        }
         self.streams
             .get(&id)
             .map_or(Offset::ZERO, Log::flushed_offset)
@@ -17813,6 +17833,66 @@ mod tests {
     }
 
     #[test]
+    fn stream_head_reports_the_durable_head_of_an_evicted_named_stream() {
+        // #565 follow-up (the #588 `StreamInfo` review): `stream_head` for a named stream the hot-set
+        // LRU EVICTED must report its TRUE durable head, not 0. Before the fix `stream_head` was `&self`
+        // and could not reopen the closed log, so `streams.get` returned `None` and the head folded to
+        // 0 — a StreamInfo query on an evicted-but-existing stream wrongly saw it as empty. The fix
+        // reopens the evicted-but-known stream to read its durable head from disk.
+        let mut cfg = config(64, 5);
+        cfg.max_open_streams = 1; // room for exactly ONE named stream resident at a time
+        let mut e = open(cfg);
+
+        // Three records to A; its head is 3 while resident (the unchanged resident path).
+        for _ in 0..3 {
+            produce_named(&mut e, "A", &[0xab; 16]);
+        }
+        assert_eq!(
+            e.stream_head("A"),
+            Offset::new(3),
+            "a resident stream reports its head directly"
+        );
+
+        // Opening B evicts A (max_open_streams = 1): A is now known-but-not-resident.
+        produce_named(&mut e, "B", &[0xcd; 16]);
+        assert!(
+            !e.is_named_stream_resident("A"),
+            "A was evicted by the hot-set LRU when B opened"
+        );
+
+        // The bug: an evicted A reported head 0. The fix reopens A from disk and reports its real head.
+        assert_eq!(
+            e.stream_head("A"),
+            Offset::new(3),
+            "an evicted-but-known stream reports its real durable head, not 0"
+        );
+
+        // A genuinely-unknown stream is NOT reopened and still reports 0 (folds with exists == false).
+        assert_eq!(
+            e.stream_head("never-declared"),
+            Offset::ZERO,
+            "an unknown stream reports head 0 (nothing to reopen)"
+        );
+        assert!(
+            !e.is_named_stream_resident("never-declared"),
+            "querying an unknown stream's head never materializes it"
+        );
+
+        // The resident-stream path is unchanged: B's head (evicted by the reopen of A above) reopens and
+        // reports its own durable head, not the default's or A's.
+        assert_eq!(
+            e.stream_head("B"),
+            Offset::new(1),
+            "each stream reports its OWN durable head across evict/reopen"
+        );
+        assert_eq!(
+            e.stream_head(""),
+            Offset::ZERO,
+            "the default stream was never produced to (cross-stream isolation)"
+        );
+    }
+
+    #[test]
     fn named_stream_reap_leaves_its_dlq_intact() {
         // #566 composes with #1110: reaping a named stream's MAIN-log segments never deletes its
         // per-stream DLQ (dead-letters live in the separate `dlq/` subtree, not the reapable `*.seg`
@@ -18568,6 +18648,145 @@ mod tests {
             e.busy_keys_in_stream("orders", "g"),
             0,
             "the dead-lettered key is freed for its next record"
+        );
+    }
+
+    #[test]
+    fn a_named_stream_per_key_order_survives_a_mid_stream_join_that_moves_the_owner() {
+        // #1111 fast-follow: the NAMED-stream twin of
+        // `per_key_order_survives_a_mid_stream_join_that_moves_the_owner`. The #1111 review flagged that
+        // this guarantee was proven at the router-unit + DEFAULT-integration layers but not on the named
+        // path. Per-key order must survive a mid-stream member join that MOVES a key's owner on the
+        // per-stream router (keyed by (stream, group)): the in-flight record drains before the NEW owner
+        // gets the next one, so an old in-flight record and a newly routed one never interleave.
+        let mut e = open(config(20, 5));
+        e.declare_stream("orders").unwrap();
+        e.set_key_ordering_in_stream("orders", "g", KeyOrdering::KeyShared)
+            .unwrap();
+        let m1 = MemberId::new(1);
+        let m2 = MemberId::new(2);
+        // Find a key that, in the {m1, m2} set, is owned by m2 (exclusively, never m1), so the join
+        // below provably MOVES it from m1 (sole owner when alone) to m2. MemberId is stable across
+        // leave/rejoin, so the rendezvous owner is the same m2 after it rejoins.
+        e.join_member_in_stream("orders", "g", m1);
+        e.join_member_in_stream("orders", "g", m2);
+        let key = key_owned_by_stream(&e, "orders", "g", m2, m1);
+        e.leave_member_in_stream("orders", "g", m2);
+        assert!(
+            matches!(
+                e.route_decision_in_stream("orders", "g", m1, &key, Offset::ZERO),
+                Some(RouteDecision::Deliver)
+            ),
+            "with m1 alone it owns every key, including this one"
+        );
+        let o0 = produce_keyed_stream(&mut e, "orders", &key, b"0");
+        let o1 = produce_keyed_stream(&mut e, "orders", &key, b"1");
+        // m1 takes o0 while it is the sole owner.
+        let d0 = message(e.poll_in_stream_member("orders", "g", m1, 0).unwrap());
+        assert_eq!(d0.offset, o0);
+        // m2 joins mid-stream: the key's owner MOVES to m2.
+        e.join_member_in_stream("orders", "g", m2);
+        // o1 is not deliverable to ANYONE while o0 is in flight (the drain guard across the remap).
+        for m in [m1, m2] {
+            match e.poll_in_stream_member("orders", "g", m, 0).unwrap() {
+                Poll::Idle => {}
+                Poll::Message(d) => assert_ne!(d.offset, o1, "o1 waits for o0"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // Ack o0: the key frees and o1 delivers to the NEW owner m2 (not the old owner m1), in order.
+        assert_eq!(e.ack_in_stream("orders", "g", &d0.token), AckResult::Acked);
+        assert_eq!(
+            e.route_decision_in_stream("orders", "g", m2, &key, o1),
+            Some(RouteDecision::Deliver),
+            "the key moved to m2, so m2 is now its owner"
+        );
+        assert_eq!(
+            e.route_decision_in_stream("orders", "g", m1, &key, o1),
+            Some(RouteDecision::NotOwner),
+            "m1 no longer owns the moved key"
+        );
+        let d1 = message(e.poll_in_stream_member("orders", "g", m2, 0).unwrap());
+        assert_eq!(
+            d1.offset, o1,
+            "o1 delivers after o0 to the new owner, preserving per-key order across the remap on a \
+             named stream"
+        );
+    }
+
+    #[test]
+    fn a_named_stream_busy_key_is_not_redelivered_to_a_new_owner_until_it_drains() {
+        // #1111 fast-follow: the NAMED-stream twin of
+        // `a_busy_key_is_not_redelivered_to_a_new_owner_until_it_drains`. A key with an in-flight record
+        // is not delivered to a NEW owner (after the prior owner LEAVES) until the prior record drains
+        // or its lease expires — the drain-or-expire guard across a rebalance, on the per-stream router.
+        let mut e = open(config(20, 5));
+        e.declare_stream("orders").unwrap();
+        e.set_key_ordering_in_stream("orders", "g", KeyOrdering::KeyShared)
+            .unwrap();
+        let m1 = MemberId::new(1);
+        let m2 = MemberId::new(2);
+        let m3 = MemberId::new(3);
+        let m4 = MemberId::new(4);
+        for m in [m1, m2, m3, m4] {
+            e.join_member_in_stream("orders", "g", m);
+        }
+        // A key owned by m2 (only one member wins rendezvous for a free key, so owning m2 makes it
+        // not-owned by any survivor) whose owner CHANGES when m2 leaves.
+        let key = key_owned_by_stream(&e, "orders", "g", m2, m1);
+        // Two records on this key.
+        let o0 = produce_keyed_stream(&mut e, "orders", &key, b"first");
+        let o1 = produce_keyed_stream(&mut e, "orders", &key, b"second");
+        // m2 takes the first record; the key is now busy at o0.
+        let d0 = message(e.poll_in_stream_member("orders", "g", m2, 0).unwrap());
+        assert_eq!(d0.offset, o0);
+        assert_eq!(e.busy_keys_in_stream("orders", "g"), 1);
+        // m2 leaves: the key's owner changes.
+        assert!(e.leave_member_in_stream("orders", "g", m2));
+        let new_owner = [m1, m3, m4]
+            .into_iter()
+            .find(|&m| {
+                matches!(
+                    e.route_decision_in_stream("orders", "g", m, &key, o1),
+                    Some(RouteDecision::KeyBusy | RouteDecision::Deliver)
+                )
+            })
+            .expect("a new owner among the survivors");
+        // The NEW owner cannot take o1 while o0 is in flight: the key is busy.
+        assert_eq!(
+            e.route_decision_in_stream("orders", "g", new_owner, &key, o1),
+            Some(RouteDecision::KeyBusy),
+            "the next record waits for the in-flight one to drain"
+        );
+        // No survivor can poll o1 yet.
+        for m in [m1, m3, m4] {
+            match e.poll_in_stream_member("orders", "g", m, 0).unwrap() {
+                Poll::Idle => {}
+                Poll::Message(d) => {
+                    assert_ne!(d.offset, o1, "o1 must not deliver while o0 is busy");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // o0's lease expires (advance past the visibility window): it is now reclaimable, but per-key
+        // order still requires o0 to be redelivered BEFORE o1. The new owner gets o0 first.
+        let d0b = message(
+            e.poll_in_stream_member("orders", "g", new_owner, 40)
+                .unwrap(),
+        );
+        assert_eq!(
+            d0b.offset, o0,
+            "the expired in-flight record redelivers first"
+        );
+        assert_eq!(e.ack_in_stream("orders", "g", &d0b.token), AckResult::Acked);
+        // Now o1 is deliverable to the new owner.
+        let d1 = message(
+            e.poll_in_stream_member("orders", "g", new_owner, 40)
+                .unwrap(),
+        );
+        assert_eq!(
+            d1.offset, o1,
+            "the next record delivers only after the prior drains, on a named stream"
         );
     }
 
