@@ -400,8 +400,11 @@ fn recv_sliced(
     loop {
         match rx.recv_timeout(WAIT_ACTOR_ALIVE_POLL) {
             Ok(outcome) => return Ok(outcome),
-            // A real disconnect (a non-recycled reply channel, e.g. the direct/test path) is still
-            // `ActorGone`, exactly as before.
+            // UNREACHABLE for a POOLED produce reply channel: its co-located `tx` (#475) keeps the
+            // channel open, so a `recv_timeout` here never observes a disconnect — actor departure is
+            // detected on the Timeout arm via the `actor_alive` flag (#949), NOT via channel closure.
+            // The arm is retained to exhaustively handle the `Result` (and to still surface `ActorGone`
+            // for any hypothetical non-co-located reply channel), never as the liveness mechanism.
             Err(RecvTimeoutError::Disconnected) => return Err(ActorGone),
             Err(RecvTimeoutError::Timeout) => {
                 // The actor is still running: the outcome is merely not ready yet (a slow covering
@@ -479,9 +482,15 @@ impl ProduceSubmission {
     /// up empty parks nothing and returns immediately, where `wait` would block).
     ///
     /// # Errors
-    /// Returns [`ActorGone`] only if the actor dropped its cloned `tx` UN-sent (it exited before
-    /// replying), which disconnects the channel — exactly the condition `wait` maps to `ActorGone`. An
-    /// empty (not-yet-ready) channel is NOT an error; it is [`TryTake::NotReady`].
+    /// Returns [`ActorGone`] only if the reply channel is genuinely disconnected — which, for a POOLED
+    /// produce reply channel, CANNOT happen: its co-located `tx` (#475) keeps the channel open, so a
+    /// gone actor shows here as [`TryTake::NotReady`] (an empty channel), NOT `ActorGone`. This
+    /// non-blocking poll therefore does NOT itself detect actor departure; the caller's BLOCKING backstop
+    /// does — a not-ready front is re-parked and later block-awaited via [`wait`](ProduceSubmission::wait),
+    /// which consults the `actor_alive` flag (#949) and returns `ActorGone` instead of wedging. (The
+    /// `Disconnected` arm is retained for exhaustiveness and to surface `ActorGone` for any hypothetical
+    /// non-co-located channel.) An empty (not-yet-ready) channel is NOT an error; it is
+    /// [`TryTake::NotReady`].
     ///
     /// [`wait`]: ProduceSubmission::wait
     pub fn try_take(self) -> Result<TryTake, ActorGone> {
@@ -499,16 +508,20 @@ impl ProduceSubmission {
                     Ok(TryTake::Ready(outcome))
                 }
                 // Not yet released: return the submission INTACT (channel un-drained) to re-park. The
-                // co-located `tx` guarantees the channel cannot be disconnected here (the #802
-                // invariant), so `Empty` truly means "the actor has not committed this batch yet".
+                // co-located `tx` (#475) keeps the channel open, so `Empty` means EITHER the actor has
+                // not committed this batch yet OR it exited un-replied (#949) — a non-blocking poll cannot
+                // tell them apart. Either way the front is re-parked; a gone actor is surfaced by the
+                // caller's later BLOCKING `wait` (which consults `actor_alive`), never wedged here.
                 Err(TryRecvError::Empty) => Ok(TryTake::NotReady(ProduceSubmission::Pending {
                     channel,
                     pool,
                     spin,
                     actor_alive,
                 })),
-                // The actor exited before replying (it dropped its cloned `tx` un-sent): map it exactly
-                // like `wait`'s recv error so the session ends the connection cleanly.
+                // UNREACHABLE for a pooled channel (its co-located `tx`, #475, keeps the channel open, so
+                // a gone actor shows as `Empty`/`NotReady` above, not `Disconnected`). Retained to
+                // exhaustively handle the `Result` and to map any hypothetical genuine disconnect to
+                // `ActorGone`, exactly like `wait`'s recv error, so the session ends cleanly.
                 Err(TryRecvError::Disconnected) => Err(ActorGone),
             },
         }
@@ -4291,6 +4304,31 @@ mod tests {
         assert!(
             matches!(submission.wait(), Err(ActorGone)),
             "a spin-tier pending produce whose actor exited must return ActorGone, not wedge"
+        );
+    }
+
+    #[test]
+    fn try_take_polls_notready_not_actorgone_on_a_pooled_channel_whose_actor_is_gone() {
+        // #805: `try_take` is a NON-BLOCKING poll. For a POOLED reply channel the co-located `tx` (#475)
+        // keeps the channel OPEN even after the actor exited un-replied, so `try_recv` sees `Empty`, not
+        // `Disconnected` — `try_take` returns `NotReady`, NEVER a spurious `ActorGone`. Actor departure
+        // on the produce path is not detected by this poll; it is surfaced by the caller's BLOCKING
+        // `wait` backstop (which consults `actor_alive`, #949). This pins the corrected contract so the
+        // recv-side `Disconnected`-arm comment can never silently drift back to claiming that this poll
+        // detects a gone actor via channel closure (it cannot — the closure never happens here).
+        let pool: ReplyPool = Arc::new(Mutex::new(Vec::new()));
+        let channel = pool_take(&pool);
+        let actor_alive = Arc::new(AtomicBool::new(false)); // the actor is already gone
+        let submission = ProduceSubmission::Pending {
+            channel,
+            pool: Arc::clone(&pool),
+            spin: false,
+            actor_alive,
+        };
+        assert!(
+            matches!(submission.try_take(), Ok(TryTake::NotReady(_))),
+            "a pooled produce whose actor exited un-replied polls NotReady (the co-located tx keeps the \
+             channel open), never a spurious ActorGone — the blocking wait backstop detects departure"
         );
     }
 
