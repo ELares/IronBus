@@ -13,8 +13,10 @@ name: Rolling release
 # the binary via `IRONBUS_BUILD_VERSION` (read by `option_env!` in the `version` verb, forwarded
 # into the cross container by Cross.toml).
 #
-# The version is `YYYY.MMDD.N` (UTC date + per-day build number); the first push of a day is `.1`,
-# the next `.2`, the next day resets. The release is a NORMAL release (not a prerelease, not a
+# The version is `YYMM.1DD.1{Build}` (e.g. 2026-07-08 build 3 -> `2607.108.13`): UTC 2-digit
+# year+month, then `1`+day, then `1`+per-day build number. The `1` prefixes keep every component
+# leading-zero-free, so the string is VALID SEMVER and monotonically increasing over time while still
+# reading as a calendar version. The first push of a day is `.11`, the next `.12`, the next day resets. The release is a NORMAL release (not a prerelease, not a
 # draft), so GitHub's `releases/latest` points at the newest rolling build and the installer's
 # default-latest works. Skip a build by putting `[skip release]` in the head commit message.
 on:
@@ -47,27 +49,31 @@ jobs:
       version: ${{ steps.compute.outputs.version }}
     steps:
       - id: compute
-        name: compute YYYY.MMDD.N
+        name: compute YYMM.1DD.1{Build}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # The UTC calendar date with leading-zero month/day, e.g. 2026.0609. This is a deliberate
-          # CalVer string used only as a tag + a printed version, never semver-parsed, so the
-          # leading zeros are fine.
-          DATE="$(date -u +%Y.%m%d)"
-          # N is the per-day build number: the MAX of the existing same-day build numbers plus
-          # one, NOT count + one. Counting is gap-fragile: a deleted tag, or an operator-created
-          # tag that jumped ahead, would make count+1 collide with an existing tag and
-          # `gh release create` would fail, shipping nothing. max+1 is robust against gaps. The
-          # next day, with no prior "$DATE." releases, max is 0 so the first build is 1, so each
-          # day resets. `startswith` + `split(".")` avoids escaping the date's own dots in a regex.
-          maxn="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
-            --jq "[.[].tagName | select(startswith(\"${DATE}.\")) | split(\".\")[-1] | tonumber] | max // 0")"
-          build=$((maxn + 1))
-          VERSION="${DATE}.${build}"
-          echo "computed rolling version: $VERSION (highest existing $DATE.* build: $maxn)"
+          # CalVer `YYMM.1DD.1{Build}` (e.g. 2026-07-08 build 3 -> 2607.108.13). The `1` prefixes on the
+          # day and the build keep every component leading-zero-free, so this string is VALID SEMVER and
+          # monotonically increasing over time (major=year+month, minor=day, patch=build), while still
+          # reading as a calendar version. Used as the release tag + the stamped/printed version.
+          YYMM="$(date -u +%y%m)"      # 2-digit year + 2-digit month, e.g. 2607
+          DAY="$(date -u +%d)"         # zero-padded day-of-month, e.g. 08
+          PREFIX="${YYMM}.1${DAY}"     # `1`+DD -> the per-day namespace, e.g. 2607.108 (leading-zero-free)
+          # Build number: the MAX of the existing same-day builds plus one, NOT count + one. Counting is
+          # gap-fragile: a deleted tag, or an operator-created tag that jumped ahead, would make count+1
+          # collide with an existing tag and `gh release create` would fail, shipping nothing. max+1 is
+          # robust against gaps. Each same-day tag's patch is `1{Build}`, so `ltrimstr("1")` strips the
+          # leading `1` to recover the build number (11->1, 115->15). No prior "$PREFIX." tag => max 0 =>
+          # first build 1 => patch `11`, so each day resets. Old `YYYY.MMDD.N` and `v*` tags don't match
+          # the `$PREFIX.` startswith, so they're ignored.
+          maxbuild="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
+            --jq "[.[].tagName | select(startswith(\"${PREFIX}.\")) | split(\".\")[-1] | ltrimstr(\"1\") | tonumber] | max // 0")"
+          build=$((maxbuild + 1))
+          VERSION="${PREFIX}.1${build}"  # `1`+build, e.g. 2607.108.115
+          echo "computed rolling version: $VERSION (highest existing $PREFIX.* build: $maxbuild)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   build:

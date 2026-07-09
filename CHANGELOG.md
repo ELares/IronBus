@@ -9,6 +9,9 @@ negotiated wire envelope are the stability anchors called out per entry.
 
 ## [Unreleased]
 
+### Changed
+- Rolling-release calendar version format changed from `YYYY.MMDD.N` to `YYMM.1DD.1{Build}` (e.g. `2607.108.13` for 2026-07-08 build 3). The `1` prefixes on the day and build keep every component leading-zero-free, so the version is now valid SemVer and monotonically increasing, while still reading as a calendar version. Only the rolling (continuous) channel is affected; the formal `v*` semver channel and the internal crate version are unchanged.
+
 ## [v0.1.0]
 
 _Release date set at tag time by the maintainer (prepared 2026-07-07)._

@@ -144,7 +144,7 @@ Prefer to grab the binary yourself? Download the static `musl` binary for your C
 | armv7 / Raspberry Pi (32-bit) | `ironbus-linux-armv7` |
 | x86_64 / amd64 | `ironbus-linux-amd64` |
 
-Every push to main publishes a fresh `YYYY.MMDD.N` build (calendar-versioned, the three static binaries plus a consolidated `SHA256SUMS` and a Sigstore provenance attestation), so `releases/latest` and the installer always resolve to the newest build. See [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) for every channel.
+Every push to main publishes a fresh `YYMM.1DD.1{Build}` build (calendar-versioned, the three static binaries plus a consolidated `SHA256SUMS` and a Sigstore provenance attestation), so `releases/latest` and the installer always resolve to the newest build. See [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) for every channel.
 
 **Prefer a container?** Every build also publishes a multi-arch (amd64 / arm64 / armv7) distroless image to `ghcr.io/elares/ironbus`, so you can pull and run without installing anything (mind the loopback / security note above):
 
