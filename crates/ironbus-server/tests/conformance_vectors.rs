@@ -635,6 +635,7 @@ fn build_config(setup: &Setup) -> EngineConfig {
     };
     EngineConfig {
         consume_longpoll_ms: 0,
+        storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
         log: LogConfig {
             max_segment_bytes: setup.max_segment_bytes,
             max_total_bytes: setup.max_total_bytes,

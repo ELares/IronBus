@@ -18,8 +18,9 @@
 
 use crate::format::{
     header_offsets as off, FORMAT_VERSION, MAX_RECORD_BYTES_CEILING, RECORD_HEADER_CRC_RANGE,
-    RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX,
-    RECORD_TRAILER_LEN, RECORD_XXH3_LEN, XXH3_PAYLOAD_THRESHOLD,
+    RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_STREAM_TAG_CRC_LEN, RECORD_STREAM_TAG_LEN_PREFIX,
+    RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX, RECORD_TRAILER_LEN, RECORD_XXH3_LEN,
+    XXH3_PAYLOAD_THRESHOLD,
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{RecordFlags, Seq};
@@ -76,6 +77,12 @@ impl BodyChecksums {
     }
 }
 
+/// The full result of [`decode_inner`]: the CRC-validated [`RecordView`], the stored subject slice
+/// (empty when the record carries none, #594), the stored stream-tag slice (empty when none, #597 —
+/// mutually exclusive with the subject), and the consumed byte count. Aliased so the four-tuple does
+/// not trip the `type_complexity` lint at the shared decoder's signature.
+type DecodedFrame<'a> = (RecordView<'a>, &'a [u8], &'a [u8], usize);
+
 /// A borrowed view of a record, used both as the input to [`encode`] and the
 /// output of [`decode`]. It owns no memory; slices borrow the caller's buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +135,12 @@ pub enum DecodeError {
     /// subject field carries its own CRC (over `subject_len` + subject bytes), independent
     /// of the body CRC, so a corrupted stored subject is caught even though the body is intact.
     BadSubjectCrc,
+    /// The stored stream tag's CRC32C did not match: the optional stream-tag field of a
+    /// [`RecordFlags::HAS_STREAM_TAG`] record is corrupt (#597). Distinct from the body and subject
+    /// checksums so a caller can tell the tag field caught it. The tag is the shared-WAL demux key, so
+    /// its own CRC (over `stream_tag_len` + tag bytes) makes a corrupted tag a fail-closed reject
+    /// rather than a silent cross-stream mis-delivery.
+    BadStreamTagCrc,
     /// The encoded length fields are internally inconsistent.
     BadLength,
     /// The encoded total length exceeds the format ceiling of 1 GiB.
@@ -155,6 +168,7 @@ impl core::fmt::Display for DecodeError {
             DecodeError::BadBodyCrc => write!(f, "record body CRC mismatch"),
             DecodeError::BadXxh3 => write!(f, "record body xxh3-64 mismatch"),
             DecodeError::BadSubjectCrc => write!(f, "record stored-subject CRC mismatch"),
+            DecodeError::BadStreamTagCrc => write!(f, "record stored-stream-tag CRC mismatch"),
             DecodeError::BadLength => write!(f, "record frame has inconsistent length fields"),
             DecodeError::TooLarge => write!(f, "record frame exceeds the maximum size"),
         }
@@ -171,7 +185,44 @@ impl std::error::Error for DecodeError {}
 /// Returns [`EncodeError::TooLarge`] if the total framed size would exceed the
 /// 1 GiB format ceiling.
 pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeError> {
-    encode_impl(rec, b"", None, out)
+    encode_impl(rec, b"", b"", None, out)
+}
+
+/// Encodes `rec` like [`encode`] but ALSO stores `stream_tag` as the optional length-prefixed
+/// stream-tag field (#597): a `stream_tag_len: u16`, the tag bytes, then a CRC32C over the two,
+/// placed immediately after the header and before the body (the SAME fixed slot the subject uses),
+/// with the [`RecordFlags::HAS_STREAM_TAG`] header bit set. The tag names the stream this record
+/// belongs to when many streams share ONE WAL (the shared-WAL fallback), so a shared, interleaved log
+/// stays per-stream-addressable on read and recovery. An EMPTY `stream_tag` is byte-for-byte
+/// [`encode`] (the bit stays clear and no field is written). The tag is MUTUALLY EXCLUSIVE with a
+/// stored subject: this entry point stores no subject, so the two never coexist in one frame. The tag
+/// bytes are stored verbatim (the caller supplies a validated stream name); the body CRC32C/xxh3
+/// machinery and its threshold are UNCHANGED — they still cover only `key ++ headers ++ payload`.
+///
+/// # Errors
+/// [`EncodeError::TooLarge`] if the total framed size would exceed the 1 GiB ceiling, or the tag
+/// length would not fit the `u16` prefix.
+pub fn encode_with_stream_tag(
+    rec: &RecordView<'_>,
+    stream_tag: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<usize, EncodeError> {
+    encode_impl(rec, b"", stream_tag, None, out)
+}
+
+/// The stream-tag-storing twin of [`encode_precomputed`] (#597/#830): stores `stream_tag` as the
+/// optional stream-tag field while trusting the caller-supplied body `checksums`. The tag has its OWN
+/// CRC (computed here, over the tiny tag field), independent of the offloaded body checksums.
+///
+/// # Errors
+/// Same as [`encode_with_stream_tag`].
+pub fn encode_precomputed_with_stream_tag(
+    rec: &RecordView<'_>,
+    stream_tag: &[u8],
+    checksums: BodyChecksums,
+    out: &mut Vec<u8>,
+) -> Result<usize, EncodeError> {
+    encode_impl(rec, b"", stream_tag, Some(checksums), out)
 }
 
 /// Encodes `rec` like [`encode`] but ALSO stores `subject` as the optional length-prefixed subject
@@ -190,7 +241,7 @@ pub fn encode_with_subject(
     subject: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<usize, EncodeError> {
-    encode_impl(rec, subject, None, out)
+    encode_impl(rec, subject, b"", None, out)
 }
 
 /// The subject-storing twin of [`encode_precomputed`] (#594/#830): stores `subject` as the optional
@@ -206,7 +257,7 @@ pub fn encode_precomputed_with_subject(
     checksums: BodyChecksums,
     out: &mut Vec<u8>,
 ) -> Result<usize, EncodeError> {
-    encode_impl(rec, subject, Some(checksums), out)
+    encode_impl(rec, subject, b"", Some(checksums), out)
 }
 
 /// Encodes `rec` like [`encode`], but TRUSTS the caller-supplied `checksums` for the body instead of
@@ -230,7 +281,7 @@ pub fn encode_precomputed(
     checksums: BodyChecksums,
     out: &mut Vec<u8>,
 ) -> Result<usize, EncodeError> {
-    encode_impl(rec, b"", Some(checksums), out)
+    encode_impl(rec, b"", b"", Some(checksums), out)
 }
 
 /// The shared framing core behind [`encode`] and [`encode_precomputed`] (and their subject-storing
@@ -238,16 +289,38 @@ pub fn encode_precomputed(
 /// when `None`, they are computed here over the body bytes just laid down, exactly as before. A
 /// non-empty `subject` is stored as the optional length-prefixed subject field between the header and
 /// the body (#594), with its own CRC; an empty `subject` reproduces the pre-subject frame byte for
-/// byte. Either way the emitted frame layout is deterministic.
+/// byte. A non-empty `stream_tag` (#597) is stored likewise in the mutually-exclusive tag slot. Either
+/// way the emitted frame layout is deterministic.
+#[allow(clippy::too_many_lines)]
 fn encode_impl(
     rec: &RecordView<'_>,
     subject: &[u8],
+    stream_tag: &[u8],
     precomputed: Option<BodyChecksums>,
     out: &mut Vec<u8>,
 ) -> Result<usize, EncodeError> {
+    // The stream tag (#597) and the subject (#594) share the fixed post-header slot and are mutually
+    // exclusive by construction: the public entry points pass at most one non-empty. Assert the
+    // contract so a future caller cannot smuggle a both-set frame past `decode` (which rejects it).
+    debug_assert!(
+        subject.is_empty() || stream_tag.is_empty(),
+        "a record cannot carry both a subject and a stream tag (#594/#597 mutual exclusion)"
+    );
     let key_len = u32::try_from(rec.key.len()).map_err(|_| EncodeError::TooLarge)?;
     let hdr_len = u32::try_from(rec.headers.len()).map_err(|_| EncodeError::TooLarge)?;
     let payload_len = u32::try_from(rec.payload.len()).map_err(|_| EncodeError::TooLarge)?;
+
+    // HAS_STREAM_TAG is derived from a non-empty tag (like HAS_KEY from the key); an empty tag writes
+    // no field and leaves the bit clear. The tag field OPENS the fixed post-header slot (before the
+    // subject slot, which is empty whenever a tag is present). The `u16` length prefix makes an
+    // oversized tag a typed reject, never a panic.
+    let has_stream_tag = !stream_tag.is_empty();
+    let stream_tag_len = u16::try_from(stream_tag.len()).map_err(|_| EncodeError::TooLarge)?;
+    let stream_tag_field = if has_stream_tag {
+        RECORD_STREAM_TAG_LEN_PREFIX + stream_tag.len() + RECORD_STREAM_TAG_CRC_LEN
+    } else {
+        0
+    };
 
     // HAS_SUBJECT is derived from a non-empty subject (like HAS_KEY from the key); an empty subject
     // writes no field and leaves the bit clear, so a plain publish is byte-identical to before. The
@@ -263,12 +336,17 @@ fn encode_impl(
     let body_len = rec.key.len() + rec.headers.len() + rec.payload.len();
     // The xxh3-64 field is added for a stored body at or above the threshold. `body_len`
     // is the stored size (the bytes actually written: key + headers + payload), so the
-    // checksum protects exactly what lands on disk. See `XXH3_PAYLOAD_THRESHOLD`. The subject
-    // field is NOT part of the body: it is counted in `total_len` but excluded from the body
-    // length and the xxh3 threshold, so the body-checksum machinery is unchanged by the subject.
+    // checksum protects exactly what lands on disk. See `XXH3_PAYLOAD_THRESHOLD`. The subject and
+    // stream-tag fields are NOT part of the body: they are counted in `total_len` but excluded from
+    // the body length and the xxh3 threshold, so the body-checksum machinery is unchanged by them.
     let has_xxh3 = body_len >= XXH3_PAYLOAD_THRESHOLD as usize;
     let xxh3_field = if has_xxh3 { RECORD_XXH3_LEN } else { 0 };
-    let total = RECORD_HEADER_LEN + subject_field + body_len + xxh3_field + RECORD_TRAILER_LEN;
+    let total = RECORD_HEADER_LEN
+        + stream_tag_field
+        + subject_field
+        + body_len
+        + xxh3_field
+        + RECORD_TRAILER_LEN;
     let total_u32 = u32::try_from(total).map_err(|_| EncodeError::TooLarge)?;
     if total_u32 > MAX_RECORD_BYTES_CEILING {
         return Err(EncodeError::TooLarge);
@@ -293,6 +371,12 @@ fn encode_impl(
     } else {
         RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_SUBJECT.bits())
     };
+    // HAS_STREAM_TAG is likewise derived, from the tag presence (decode enforces the agreement).
+    flags = if has_stream_tag {
+        flags.with(RecordFlags::HAS_STREAM_TAG)
+    } else {
+        RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_STREAM_TAG.bits())
+    };
 
     // Header bytes [0, 32), then the header CRC at [32, 36).
     let mut header = [0u8; RECORD_HEADER_LEN];
@@ -309,6 +393,17 @@ fn encode_impl(
 
     out.reserve(total);
     out.extend_from_slice(&header);
+    // The optional stream-tag field (#597) OPENS the fixed post-header slot: `stream_tag_len` (u16),
+    // the tag bytes, then a CRC32C over both. It is mutually exclusive with the subject, so when it is
+    // present the subject field below is absent and the tag prefix sits exactly at `RECORD_HEADER_LEN`
+    // — the offset `decoded_len` reads. Its own CRC makes a corrupted demux key a fail-closed reject.
+    if has_stream_tag {
+        let tag_field_start = out.len();
+        out.extend_from_slice(&stream_tag_len.to_le_bytes());
+        out.extend_from_slice(stream_tag);
+        let tag_crc = crc32c::crc32c(&out[tag_field_start..]);
+        out.extend_from_slice(&tag_crc.to_le_bytes());
+    }
     // The optional subject field (#594): `subject_len` (u16), the subject bytes, then a CRC32C over
     // both. It sits at the fixed post-header offset so `decoded_len` can read `subject_len` from the
     // header plus this prefix alone. `subject_crc` covers the length prefix and the subject bytes, so
@@ -376,6 +471,12 @@ fn encode_impl(
 /// subject CRC in [`decode`]; a corrupted prefix here yields a total that then fails `decode`
 /// (fail-closed: recovery ends the valid prefix at that frame).
 ///
+/// A [`RecordFlags::HAS_STREAM_TAG`] record (#597) is sized identically: the tag field opens the SAME
+/// fixed post-header slot (it is mutually exclusive with the subject), so this also needs
+/// `RECORD_HEADER_LEN + RECORD_STREAM_TAG_LEN_PREFIX` bytes to read `stream_tag_len`. A frame that
+/// sets BOTH the subject and stream-tag bits is malformed and rejected here with
+/// [`DecodeError::BadLength`], exactly as [`decode`] rejects it.
+///
 /// # Errors
 /// Returns [`DecodeError::Truncated`] if `header` is shorter than a record header (or than the
 /// header plus the subject-length prefix for a subject record), and the corrupt variants
@@ -397,6 +498,25 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
         return Err(DecodeError::BadHeaderCrc);
     }
     let flags = RecordFlags::from_bits(header[off::FLAGS]);
+    // The stream tag (#597) and subject (#594) share the fixed post-header slot and are mutually
+    // exclusive; a frame that sets both bits is malformed. Reject it here so the header-only length
+    // walk fail-closes on a contradictory frame exactly as `decode` does (never sizing an ambiguous
+    // slot). This also keeps the sizing below reading a single `u16` at `RECORD_HEADER_LEN`.
+    if flags.contains(RecordFlags::HAS_STREAM_TAG) && flags.contains(RecordFlags::HAS_SUBJECT) {
+        return Err(DecodeError::BadLength);
+    }
+    // The optional stream-tag field (#597) is counted in `total_len` and sized by the `stream_tag_len`
+    // prefix that follows the header, at the fixed post-header offset. When present, the subject is
+    // absent (mutual exclusion), so this reads the `u16` at `RECORD_HEADER_LEN` just like the subject.
+    let stream_tag_field: u64 = if flags.contains(RecordFlags::HAS_STREAM_TAG) {
+        if header.len() < RECORD_HEADER_LEN + RECORD_STREAM_TAG_LEN_PREFIX {
+            return Err(DecodeError::Truncated);
+        }
+        let tag_len = u64::from(read_u16(header, RECORD_HEADER_LEN));
+        RECORD_STREAM_TAG_LEN_PREFIX as u64 + tag_len + RECORD_STREAM_TAG_CRC_LEN as u64
+    } else {
+        0
+    };
     // The optional subject field (#594) is counted in `total_len` and sized by the `subject_len`
     // prefix that follows the header. The flags byte is inside the CRC-protected range, so
     // HAS_SUBJECT is trusted here; the prefix is at the fixed post-header offset so this needs
@@ -423,6 +543,7 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
         + u64::from(read_u32(header, off::HDR_LEN))
         + u64::from(read_u32(header, off::PAYLOAD_LEN))
         + RECORD_HEADER_LEN as u64
+        + stream_tag_field
         + subject_field
         + xxh3_field
         + RECORD_TRAILER_LEN as u64;
@@ -446,7 +567,7 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
 /// [`DecodeError::Truncated`] means more bytes may complete the frame; the other
 /// variants mean the frame is corrupt and must be skipped by recovery.
 pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
-    let (view, _subject, total) = decode_inner(input)?;
+    let (view, _subject, _tag, total) = decode_inner(input)?;
     Ok((view, total))
 }
 
@@ -459,13 +580,31 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
 /// # Errors
 /// Same as [`decode`], plus [`DecodeError::BadSubjectCrc`] if the stored subject's own CRC fails.
 pub fn decode_with_subject(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
-    decode_inner(input)
+    let (view, subject, _tag, total) = decode_inner(input)?;
+    Ok((view, subject, total))
 }
 
-/// The shared decoder behind [`decode`] and [`decode_with_subject`]. Validates the whole frame
-/// (header CRC, subject CRC if present, body CRC, xxh3 if present) and returns the view, the stored
-/// subject slice (empty when the record carries none), and the consumed byte count.
-fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
+/// Decodes one record frame like [`decode`] and ADDITIONALLY returns the stored STREAM TAG (#597): the
+/// tag bytes for a [`RecordFlags::HAS_STREAM_TAG`] record, or an EMPTY slice for a record without a
+/// stored tag. The shared-WAL demux path uses this to recover each record's stream identity on read
+/// and recovery; plain [`decode`] validates and skips the tag field but does not return it, so every
+/// existing caller is unchanged. The returned tag borrows `input` (zero-copy).
+///
+/// # Errors
+/// Same as [`decode`], plus [`DecodeError::BadStreamTagCrc`] if the stored tag's own CRC fails.
+pub fn decode_with_stream_tag(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
+    let (view, _subject, tag, total) = decode_inner(input)?;
+    Ok((view, tag, total))
+}
+
+/// The shared decoder behind [`decode`], [`decode_with_subject`], and [`decode_with_stream_tag`].
+/// Validates the whole frame (header CRC, stream-tag CRC if present, subject CRC if present, body CRC,
+/// xxh3 if present) and returns the view, the stored subject slice (empty when the record carries
+/// none), the stored stream-tag slice (empty when the record carries none), and the consumed byte
+/// count. The stream tag and subject are mutually exclusive, so at most one of the two returned slices
+/// is non-empty.
+#[allow(clippy::too_many_lines)]
+fn decode_inner(input: &[u8]) -> Result<DecodedFrame<'_>, DecodeError> {
     if input.len() < RECORD_HEADER_LEN {
         return Err(DecodeError::Truncated);
     }
@@ -485,17 +624,48 @@ fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeEr
     }
 
     // The flags byte is inside the CRC-protected header range, so by here it is trusted:
-    // HAS_XXH3 sizes the optional xxh3 field and HAS_SUBJECT the optional subject field.
+    // HAS_XXH3 sizes the optional xxh3 field, HAS_STREAM_TAG the optional stream-tag field, and
+    // HAS_SUBJECT the optional subject field.
     let flags = RecordFlags::from_bits(input[off::FLAGS]);
+    let has_stream_tag = flags.contains(RecordFlags::HAS_STREAM_TAG);
     let has_subject = flags.contains(RecordFlags::HAS_SUBJECT);
-    // The subject-length prefix sits at the fixed post-header offset. Read it BEFORE sizing the
-    // frame; the prefix itself is protected by the subject CRC (verified below), so a corrupted
-    // prefix surfaces as a bad total (Truncated / BadLength) or a subject-CRC mismatch — fail-closed.
-    let subject_len = if has_subject {
-        if input.len() < RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX {
+    // The stream tag (#597) and subject (#594) share the fixed post-header slot and are mutually
+    // exclusive; a frame that sets both bits is malformed. Reject it before sizing the slot so an
+    // ambiguous frame is fail-closed (recovery ends the valid prefix at it), never mis-framed.
+    if has_stream_tag && has_subject {
+        return Err(DecodeError::BadLength);
+    }
+    // The stream-tag length prefix (#597) OPENS the fixed post-header slot. Read it BEFORE sizing the
+    // frame; the prefix is protected by the tag CRC (verified below), so a corrupted prefix surfaces
+    // as a bad total (Truncated / BadLength) or a tag-CRC mismatch — fail-closed.
+    let stream_tag_len = if has_stream_tag {
+        if input.len() < RECORD_HEADER_LEN + RECORD_STREAM_TAG_LEN_PREFIX {
             return Err(DecodeError::Truncated);
         }
         read_u16(input, RECORD_HEADER_LEN) as usize
+    } else {
+        0
+    };
+    // A HAS_STREAM_TAG record with a zero-length tag is malformed (the bit is derived from a
+    // NON-empty tag on encode), caught here rather than admitting a contradictory frame.
+    if has_stream_tag && stream_tag_len == 0 {
+        return Err(DecodeError::BadLength);
+    }
+    let stream_tag_field: usize = if has_stream_tag {
+        RECORD_STREAM_TAG_LEN_PREFIX + stream_tag_len + RECORD_STREAM_TAG_CRC_LEN
+    } else {
+        0
+    };
+    // The subject-length prefix sits at the post-header offset AFTER the (mutually exclusive) tag
+    // slot, so at `RECORD_HEADER_LEN` whenever a subject is present (the tag slot is then empty). Read
+    // it BEFORE sizing the frame; it is protected by the subject CRC (verified below), so a corrupted
+    // prefix surfaces as a bad total (Truncated / BadLength) or a subject-CRC mismatch — fail-closed.
+    let subject_off = RECORD_HEADER_LEN + stream_tag_field;
+    let subject_len = if has_subject {
+        if input.len() < subject_off + RECORD_SUBJECT_LEN_PREFIX {
+            return Err(DecodeError::Truncated);
+        }
+        read_u16(input, subject_off) as usize
     } else {
         0
     };
@@ -519,13 +689,14 @@ fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeEr
     let hdr_len_u32 = read_u32(input, off::HDR_LEN);
     let payload_len_u32 = read_u32(input, off::PAYLOAD_LEN);
     // Sum the attacker-controlled u32 lengths in u64 so the total cannot overflow usize on a
-    // 32-bit target before it is bounded by the ceiling. The optional subject and xxh3 fields are
-    // counted in `total_len`, so include them here too. The `usize as u64` widening of the small
-    // fixed field sizes never truncates.
+    // 32-bit target before it is bounded by the ceiling. The optional stream-tag, subject, and xxh3
+    // fields are counted in `total_len`, so include them here too. The `usize as u64` widening of the
+    // small fixed field sizes never truncates.
     let total64 = u64::from(key_len_u32)
         + u64::from(hdr_len_u32)
         + u64::from(payload_len_u32)
         + RECORD_HEADER_LEN as u64
+        + stream_tag_field as u64
         + subject_field as u64
         + xxh3_field as u64
         + RECORD_TRAILER_LEN as u64;
@@ -539,7 +710,12 @@ fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeEr
     }
     let key_len = usize::try_from(key_len_u32).map_err(|_| DecodeError::TooLarge)?;
     let hdr_len = usize::try_from(hdr_len_u32).map_err(|_| DecodeError::TooLarge)?;
-    let body_len = total - RECORD_HEADER_LEN - subject_field - RECORD_TRAILER_LEN - xxh3_field;
+    let body_len = total
+        - RECORD_HEADER_LEN
+        - stream_tag_field
+        - subject_field
+        - RECORD_TRAILER_LEN
+        - xxh3_field;
 
     // HAS_KEY is a derived, frozen bit: it must agree with the key length. A frame
     // where they disagree was written by a buggy or hostile writer.
@@ -552,10 +728,28 @@ fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeEr
         return Err(DecodeError::BadLength);
     }
 
-    // The optional subject field precedes the body (#594): validate its own CRC over the length
-    // prefix and subject bytes, so a corrupted stored subject is caught independently of the body.
+    // The optional stream-tag field opens the post-header slot (#597): validate its own CRC over the
+    // length prefix and tag bytes, so a corrupted demux key is a fail-closed reject, never a silent
+    // cross-stream mis-delivery.
+    let stream_tag: &[u8] = if has_stream_tag {
+        let field = &input[RECORD_HEADER_LEN..RECORD_HEADER_LEN + stream_tag_field];
+        let tag =
+            &field[RECORD_STREAM_TAG_LEN_PREFIX..RECORD_STREAM_TAG_LEN_PREFIX + stream_tag_len];
+        let stored_tag_crc = read_u32(field, RECORD_STREAM_TAG_LEN_PREFIX + stream_tag_len);
+        if crc32c::crc32c(&field[..RECORD_STREAM_TAG_LEN_PREFIX + stream_tag_len]) != stored_tag_crc
+        {
+            return Err(DecodeError::BadStreamTagCrc);
+        }
+        tag
+    } else {
+        &[]
+    };
+
+    // The optional subject field precedes the body (#594), after the (empty) tag slot: validate its
+    // own CRC over the length prefix and subject bytes, so a corrupted stored subject is caught
+    // independently of the body.
     let subject: &[u8] = if has_subject {
-        let field = &input[RECORD_HEADER_LEN..RECORD_HEADER_LEN + subject_field];
+        let field = &input[subject_off..subject_off + subject_field];
         let subject = &field[RECORD_SUBJECT_LEN_PREFIX..RECORD_SUBJECT_LEN_PREFIX + subject_len];
         let stored_subject_crc = read_u32(field, RECORD_SUBJECT_LEN_PREFIX + subject_len);
         if crc32c::crc32c(&field[..RECORD_SUBJECT_LEN_PREFIX + subject_len]) != stored_subject_crc {
@@ -566,7 +760,7 @@ fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeEr
         &[]
     };
 
-    let body_start = RECORD_HEADER_LEN + subject_field;
+    let body_start = RECORD_HEADER_LEN + stream_tag_field + subject_field;
     let body = &input[body_start..body_start + body_len];
     let xxh3_bytes = &input[body_start + body_len..body_start + body_len + xxh3_field];
     let trailer = &input[total - RECORD_TRAILER_LEN..total];
@@ -595,7 +789,7 @@ fn decode_inner(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeEr
         headers: &body[key_len..key_len + hdr_len],
         payload: &body[key_len + hdr_len..],
     };
-    Ok((view, subject, total))
+    Ok((view, subject, stream_tag, total))
 }
 
 #[cfg(test)]
@@ -1111,6 +1305,144 @@ mod tests {
         assert_eq!(baseline, offloaded);
         let (_view, subject, _) = decode_with_subject(&offloaded).unwrap();
         assert_eq!(subject, b"s.u.b");
+    }
+
+    // ---- #597 stream-tag field (the shared-WAL demux key) ----
+
+    fn tag_rec(payload: &[u8]) -> RecordView<'_> {
+        RecordView {
+            seq: Seq::new(6),
+            timestamp_ms: 77,
+            flags: RecordFlags::EMPTY,
+            key: b"k",
+            headers: b"h",
+            payload,
+        }
+    }
+
+    #[test]
+    fn stream_tag_round_trips_and_sets_the_flag() {
+        // A stored stream tag is recovered verbatim, the HAS_STREAM_TAG bit is set, and the body
+        // fields are untouched. `decoded_len` (given the header + tag prefix) agrees with the
+        // consumed length, and a plain 36-byte header is not enough to size a tagged frame.
+        let rec = tag_rec(b"hello");
+        let mut buf = Vec::new();
+        let n = encode_with_stream_tag(&rec, b"orders", &mut buf).unwrap();
+        assert_eq!(n, buf.len());
+        let (view, tag, consumed) = decode_with_stream_tag(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(tag, b"orders");
+        assert!(view.flags.contains(RecordFlags::HAS_STREAM_TAG));
+        assert!(!view.flags.contains(RecordFlags::HAS_SUBJECT));
+        assert_eq!(view.key, b"k");
+        assert_eq!(view.headers, b"h");
+        assert_eq!(view.payload, b"hello");
+        let prefix = &buf[..RECORD_HEADER_LEN + RECORD_STREAM_TAG_LEN_PREFIX];
+        assert_eq!(decoded_len(prefix).unwrap(), consumed);
+        assert_eq!(
+            decoded_len(&buf[..RECORD_HEADER_LEN]),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn empty_stream_tag_is_byte_identical_and_has_no_field() {
+        // Encoding with an empty tag reproduces `encode` byte-for-byte (the bit stays clear), and a
+        // plain record decodes to an empty tag with the flag clear.
+        let rec = tag_rec(b"payload");
+        let mut with = Vec::new();
+        encode_with_stream_tag(&rec, b"", &mut with).unwrap();
+        let mut plain = Vec::new();
+        encode(&rec, &mut plain).unwrap();
+        assert_eq!(with, plain, "empty tag == plain encode");
+        let (view, tag, _) = decode_with_stream_tag(&plain).unwrap();
+        assert!(tag.is_empty());
+        assert!(!view.flags.contains(RecordFlags::HAS_STREAM_TAG));
+    }
+
+    #[test]
+    fn base_decode_skips_the_stream_tag_field() {
+        // The plain `decode` (every non-demux reader) parses a tagged frame correctly, exposing the
+        // body fields, without returning the tag; `decode_with_subject` returns an EMPTY subject for a
+        // tagged record (the two fields are mutually exclusive).
+        let rec = tag_rec(b"body-bytes");
+        let mut buf = Vec::new();
+        encode_with_stream_tag(&rec, b"metrics", &mut buf).unwrap();
+        let (view, consumed) = decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(view.payload, b"body-bytes");
+        assert_eq!(view.key, b"k");
+        assert!(view.flags.contains(RecordFlags::HAS_STREAM_TAG));
+        let (_v, subject, _) = decode_with_subject(&buf).unwrap();
+        assert!(subject.is_empty(), "a tagged record carries no subject");
+    }
+
+    #[test]
+    fn stream_tag_crc_corruption_is_caught() {
+        // Flipping a tag byte fails the tag's own CRC (distinct from the body CRC), so a corrupted
+        // demux key is a fail-closed reject, never a silent cross-stream mis-delivery.
+        let rec = tag_rec(b"body");
+        let mut buf = Vec::new();
+        encode_with_stream_tag(&rec, b"stream-a", &mut buf).unwrap();
+        buf[RECORD_HEADER_LEN + RECORD_STREAM_TAG_LEN_PREFIX] ^= 0x01;
+        assert_eq!(decode(&buf), Err(DecodeError::BadStreamTagCrc));
+        assert_eq!(
+            decode_with_stream_tag(&buf),
+            Err(DecodeError::BadStreamTagCrc)
+        );
+    }
+
+    #[test]
+    fn stream_tag_with_xxh3_body_round_trips() {
+        // A tagged record whose body is at/over the xxh3 threshold carries BOTH the tag field and the
+        // xxh3 field; both are recovered and the frame decodes cleanly.
+        let payload = vec![0x5Eu8; XXH3_PAYLOAD_THRESHOLD as usize];
+        let rec = tag_rec(&payload);
+        let mut buf = Vec::new();
+        let n = encode_with_stream_tag(&rec, b"big-stream", &mut buf).unwrap();
+        assert_eq!(n, buf.len());
+        let (view, tag, consumed) = decode_with_stream_tag(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(tag, b"big-stream");
+        assert!(view.flags.contains(RecordFlags::HAS_STREAM_TAG));
+        assert!(view.flags.contains(RecordFlags::HAS_XXH3));
+        assert_eq!(view.payload, &payload[..]);
+        assert_eq!(
+            decoded_len(&buf[..RECORD_HEADER_LEN + RECORD_STREAM_TAG_LEN_PREFIX]).unwrap(),
+            consumed
+        );
+    }
+
+    #[test]
+    fn both_tag_and_subject_bits_is_rejected_as_malformed() {
+        // The tag and subject share the fixed post-header slot and are mutually exclusive. Craft a
+        // frame that (illegally) sets BOTH bits with a valid header CRC: decode and decoded_len both
+        // reject it as BadLength rather than mis-framing an ambiguous slot.
+        let mut h = build_header(
+            0,
+            0,
+            0,
+            RecordFlags::HAS_STREAM_TAG.bits() | RecordFlags::HAS_SUBJECT.bits(),
+        );
+        // Append a plausible 2-byte prefix so the length walk has bytes to read past the header.
+        h.extend_from_slice(&3u16.to_le_bytes());
+        assert_eq!(decoded_len(&h), Err(DecodeError::BadLength));
+        assert_eq!(decode(&h), Err(DecodeError::BadLength));
+    }
+
+    #[test]
+    fn encode_precomputed_with_stream_tag_is_byte_identical() {
+        // The off-actor checksum path with a tag produces a frame byte-identical to the compute-here
+        // path, and it decodes cleanly with the tag recovered.
+        let rec = tag_rec(b"payload");
+        let mut baseline = Vec::new();
+        encode_with_stream_tag(&rec, b"s-t-r", &mut baseline).unwrap();
+        let checks = BodyChecksums::compute(rec.key, rec.headers, rec.payload);
+        let mut offloaded = Vec::new();
+        encode_precomputed_with_stream_tag(&rec, b"s-t-r", checks, &mut offloaded).unwrap();
+        assert_eq!(baseline, offloaded);
+        let (_view, tag, _) = decode_with_stream_tag(&offloaded).unwrap();
+        assert_eq!(tag, b"s-t-r");
     }
 }
 

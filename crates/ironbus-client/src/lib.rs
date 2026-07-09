@@ -4230,6 +4230,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -4295,6 +4296,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -4388,6 +4390,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -8070,6 +8073,7 @@ toYtkjmdU2eQ2pK/3gM=
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -8394,6 +8398,7 @@ toYtkjmdU2eQ2pK/3gM=
     fn cluster_test_engine_config() -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),

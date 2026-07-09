@@ -9945,6 +9945,7 @@ fn open_engine_with<F: Filesystem + Clone>(
         fs,
         SystemClock::new(),
         EngineConfig {
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             // Both caps are honored: `new` validates and sets the segment cap, the builder
             // layers on the durable-log total byte cap (the drop-new shed; `0` = unlimited).
             log: LogConfig::new(config.max_segment_bytes)
@@ -15564,6 +15565,7 @@ mod tests {
             StdFs::new(dir.clone()),
             Arc::clone(&clock),
             EngineConfig {
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
@@ -16519,6 +16521,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
@@ -16608,6 +16611,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
@@ -20922,6 +20926,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
@@ -21010,6 +21015,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),

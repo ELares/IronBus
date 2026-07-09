@@ -67,6 +67,7 @@ fn engine_config() -> EngineConfig {
 fn engine_config_with_credit(consumer_credit: u32, max_in_flight: u32) -> EngineConfig {
     EngineConfig {
         consume_longpoll_ms: 0,
+        storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
         log: LogConfig::default(),
         lease: LeaseConfig::default(),
         // `unwrap` is fine in this bench/test-only path (not a lib hot path): the literal args are

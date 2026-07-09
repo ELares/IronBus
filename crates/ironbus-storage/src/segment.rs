@@ -12,14 +12,32 @@ use crate::loss::{CapViolation, ReasonCode};
 use bytes::{Bytes, BytesMut};
 use ironbus_core::codec::{self, BodyChecksums, DecodeError, RecordView};
 use ironbus_core::format::{
-    COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX,
-    RECORD_TRAILER_LEN, RECORD_XXH3_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
-    XXH3_PAYLOAD_THRESHOLD,
+    COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_STREAM_TAG_LEN_PREFIX, RECORD_SUBJECT_CRC_LEN,
+    RECORD_SUBJECT_LEN_PREFIX, RECORD_TRAILER_LEN, RECORD_XXH3_LEN, SEGMENT_FOOTER_LEN,
+    SEGMENT_HEADER_LEN, XXH3_PAYLOAD_THRESHOLD,
 };
 use ironbus_core::segment::{CompactionMeta, SegmentError, SegmentFooter, SegmentHeader};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
 use std::io;
 use std::sync::Arc;
+
+// The subject (#594) and stream-tag (#597) fields both open with a `u16` length prefix of the same
+// width at the fixed post-header offset (they are mutually exclusive). The recovery walks below
+// buffer `RECORD_SUBJECT_LEN_PREFIX` extra bytes for EITHER; this pins that the two widths agree so
+// that single buffer size stays correct for a tagged frame as well as a subject frame.
+const _: () = assert!(RECORD_SUBJECT_LEN_PREFIX == RECORD_STREAM_TAG_LEN_PREFIX);
+
+/// Whether a record's `flags` byte marks a length-prefixed optional field at the FIXED post-header
+/// offset — a stored subject (#594) OR a stored stream tag (#597), mutually exclusive, both opening
+/// with a `u16` length prefix at [`RECORD_HEADER_LEN`]. The streaming/sparse crash-recovery walks
+/// buffer that extra prefix before [`codec::decoded_len`] so a frame carrying EITHER field is sized
+/// from its header; without it a window-straddling tagged/subject frame is mis-read as a torn tail,
+/// silently dropping it and every record after it (the #594 PR #1107 finding, now also #597).
+#[inline]
+fn has_post_header_prefix_field(flags_byte: u8) -> bool {
+    let flags = RecordFlags::from_bits(flags_byte);
+    flags.contains(RecordFlags::HAS_SUBJECT) || flags.contains(RecordFlags::HAS_STREAM_TAG)
+}
 
 /// An error from the segment storage layer.
 #[derive(Debug)]
@@ -743,7 +761,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     /// overflow, [`StorageError::Record`] if the record is too large to frame, or an
     /// IO error from the write.
     pub fn append(&mut self, record: &RecordView<'_>) -> Result<Offset, StorageError> {
-        self.append_encoded(record, b"", None)
+        self.append_encoded(record, b"", b"", None)
     }
 
     /// Appends one record ALSO storing `subject` as the optional subject field (#594). Identical to
@@ -757,7 +775,36 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         record: &RecordView<'_>,
         subject: &[u8],
     ) -> Result<Offset, StorageError> {
-        self.append_encoded(record, subject, None)
+        self.append_encoded(record, subject, b"", None)
+    }
+
+    /// Appends one record ALSO storing `stream_tag` as the optional stream-tag field (#597, the
+    /// shared-WAL demux key). Identical to [`SegmentWriter::append`] except the frame carries the
+    /// stored tag (with its own CRC); an EMPTY `stream_tag` is byte-for-byte [`SegmentWriter::append`].
+    /// Mutually exclusive with a stored subject.
+    ///
+    /// # Errors
+    /// Same as [`SegmentWriter::append`].
+    pub fn append_with_stream_tag(
+        &mut self,
+        record: &RecordView<'_>,
+        stream_tag: &[u8],
+    ) -> Result<Offset, StorageError> {
+        self.append_encoded(record, b"", stream_tag, None)
+    }
+
+    /// The precomputed-body-checksum twin of [`SegmentWriter::append_with_stream_tag`] (#597/#830):
+    /// stores `stream_tag` while trusting the caller-supplied body `checksums`.
+    ///
+    /// # Errors
+    /// Same as [`SegmentWriter::append`].
+    pub fn append_precomputed_with_stream_tag(
+        &mut self,
+        record: &RecordView<'_>,
+        stream_tag: &[u8],
+        checksums: BodyChecksums,
+    ) -> Result<Offset, StorageError> {
+        self.append_encoded(record, b"", stream_tag, Some(checksums))
     }
 
     /// The precomputed-body-checksum twin of [`SegmentWriter::append_with_subject`] (#594/#830):
@@ -771,7 +818,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         subject: &[u8],
         checksums: BodyChecksums,
     ) -> Result<Offset, StorageError> {
-        self.append_encoded(record, subject, Some(checksums))
+        self.append_encoded(record, subject, b"", Some(checksums))
     }
 
     /// Appends one record whose body checksums were PRE-COMPUTED off the single-writer actor on the
@@ -790,17 +837,20 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         record: &RecordView<'_>,
         checksums: BodyChecksums,
     ) -> Result<Offset, StorageError> {
-        self.append_encoded(record, b"", Some(checksums))
+        self.append_encoded(record, b"", b"", Some(checksums))
     }
 
     /// The shared body behind [`SegmentWriter::append`] and [`SegmentWriter::append_precomputed`]:
     /// frames `record` into the pending buffer, trusting `precomputed` body checksums when `Some`
     /// (#830) or computing them in the codec when `None`. The on-disk bytes and all writer bookkeeping
-    /// are identical either way.
+    /// are identical either way. At most one of `subject` (#594) and `stream_tag` (#597) is non-empty
+    /// — they share the fixed post-header slot and are mutually exclusive (the codec rejects a frame
+    /// carrying both); a caller passing both non-empty is a bug the codec's debug assert catches.
     fn append_encoded(
         &mut self,
         record: &RecordView<'_>,
         subject: &[u8],
+        stream_tag: &[u8],
         precomputed: Option<BodyChecksums>,
     ) -> Result<Offset, StorageError> {
         if self.record_count == u32::MAX {
@@ -818,20 +868,35 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         // intermediate copy. The bytes reach the file at the next flush point; on encode failure
         // the buffer is truncated back so a rejected record leaves no partial frame behind.
         let before = self.pending.len();
-        // A non-empty subject routes to the subject-storing codec path (#594), which lays down the
-        // optional subject field; an empty subject is byte-for-byte the historical frame.
-        let encoded = match (precomputed, subject.is_empty()) {
-            (Some(checksums), true) => {
-                codec::encode_precomputed(record, checksums, &mut self.pending)
+        // A non-empty subject routes to the subject-storing codec path (#594) and a non-empty
+        // stream_tag to the tag-storing path (#597), each laying down its optional post-header field;
+        // an empty pair is byte-for-byte the historical frame. Subject and tag are mutually exclusive
+        // (the encode helpers debug-assert it), so the tag branch is taken only when there is no
+        // subject.
+        let encoded = if stream_tag.is_empty() {
+            match (precomputed, subject.is_empty()) {
+                (Some(checksums), true) => {
+                    codec::encode_precomputed(record, checksums, &mut self.pending)
+                }
+                (None, true) => codec::encode(record, &mut self.pending),
+                (Some(checksums), false) => codec::encode_precomputed_with_subject(
+                    record,
+                    subject,
+                    checksums,
+                    &mut self.pending,
+                ),
+                (None, false) => codec::encode_with_subject(record, subject, &mut self.pending),
             }
-            (None, true) => codec::encode(record, &mut self.pending),
-            (Some(checksums), false) => codec::encode_precomputed_with_subject(
-                record,
-                subject,
-                checksums,
-                &mut self.pending,
-            ),
-            (None, false) => codec::encode_with_subject(record, subject, &mut self.pending),
+        } else {
+            match precomputed {
+                Some(checksums) => codec::encode_precomputed_with_stream_tag(
+                    record,
+                    stream_tag,
+                    checksums,
+                    &mut self.pending,
+                ),
+                None => codec::encode_with_stream_tag(record, stream_tag, &mut self.pending),
+            }
         };
         if encoded.is_err() {
             self.pending.truncate(before);
@@ -1595,13 +1660,12 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             // frame and full-CRC-validate it, exactly as the streaming recovery scan does.
             scratch.resize(RECORD_HEADER_LEN, 0);
             self.file.read_exact_at(&mut scratch, pos)?;
-            // A HAS_SUBJECT record (#594) carries a subject-length prefix immediately after the
-            // header, and the header-only length walk needs those extra bytes to size the frame.
-            // Read them into `scratch` before `decoded_len` when the flag is set and the region is
-            // long enough; a shorter region is a torn tail, which `decoded_len` then reports as
-            // Truncated (clean=false) below, exactly like any incomplete frame.
-            if RecordFlags::from_bits(scratch[ironbus_core::format::header_offsets::FLAGS])
-                .contains(RecordFlags::HAS_SUBJECT)
+            // A HAS_SUBJECT (#594) or HAS_STREAM_TAG (#597) record carries a `u16` length prefix
+            // immediately after the header, and the header-only length walk needs those extra bytes
+            // to size the frame. Read them into `scratch` before `decoded_len` when either flag is set
+            // and the region is long enough; a shorter region is a torn tail, which `decoded_len` then
+            // reports as Truncated (clean=false) below, exactly like any incomplete frame.
+            if has_post_header_prefix_field(scratch[ironbus_core::format::header_offsets::FLAGS])
                 && remaining >= (RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX) as u64
             {
                 scratch.resize(RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX, 0);
@@ -2277,17 +2341,16 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             )?;
             let mut rel =
                 usize::try_from(pos - win_start).map_err(|_| StorageError::SegmentFull)?;
-            // A HAS_SUBJECT record (#594) carries a subject-length prefix immediately after the
-            // header, and the header-only length walk needs those extra bytes to size the frame.
-            // `fill_window(need=36)` may leave EXACTLY 36-37 bytes buffered at a window edge (it
-            // returns early once `have >= need`), so ensure 38 bytes are windowed before
-            // `decoded_len` when the flag is set and the region is long enough — mirroring
+            // A HAS_SUBJECT (#594) or HAS_STREAM_TAG (#597) record carries a `u16` length prefix
+            // immediately after the header, and the header-only length walk needs those extra bytes to
+            // size the frame. `fill_window(need=36)` may leave EXACTLY 36-37 bytes buffered at a window
+            // edge (it returns early once `have >= need`), so ensure 38 bytes are windowed before
+            // `decoded_len` when either flag is set and the region is long enough — mirroring
             // `walk_sparse_positions`. A shorter region is a torn tail, which `decoded_len` then
             // reports as `Truncated` below (ended as a corrupt/torn header), exactly like any
             // incomplete frame. The flags byte is untrusted here, but `decoded_len`'s header-CRC
             // check is the real gate; peeking it only decides how many bytes to buffer.
-            if RecordFlags::from_bits(win[rel + ironbus_core::format::header_offsets::FLAGS])
-                .contains(RecordFlags::HAS_SUBJECT)
+            if has_post_header_prefix_field(win[rel + ironbus_core::format::header_offsets::FLAGS])
                 && remaining >= (RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX) as u64
             {
                 self.fill_window(

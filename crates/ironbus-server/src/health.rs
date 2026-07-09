@@ -2698,6 +2698,7 @@ mod tests {
     fn test_eng_cfg() -> EngineConfig {
         EngineConfig {
             consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             compression: ironbus_core::compress::Codec::None,
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
@@ -3138,6 +3139,7 @@ mod tests {
             Arc::clone(&clock),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -4019,6 +4021,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(max_total_bytes),
                 lease: LeaseConfig::default(),
@@ -4169,6 +4172,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -4252,6 +4256,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -4532,6 +4537,7 @@ mod tests {
                 SystemClock::new(),
                 EngineConfig {
                     consume_longpoll_ms: 0,
+                    storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                     compression: ironbus_core::compress::Codec::None,
                     log: LogConfig::default(),
                     lease: LeaseConfig::default(),
@@ -4593,6 +4599,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_daily_physical_write_budget_bytes(probe),
                 lease: LeaseConfig::default(),
@@ -4753,6 +4760,7 @@ mod tests {
             Arc::clone(&clock),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 // Tiny visibility/cap so a redelivery is reclaimable a few ns later.
@@ -4897,6 +4905,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
@@ -5120,6 +5129,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
@@ -6193,6 +6203,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(1_000_000),
                 lease: LeaseConfig {
@@ -6409,6 +6420,7 @@ mod tests {
             Arc::clone(&clock),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
@@ -6635,6 +6647,7 @@ mod tests {
             ManualClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -6950,6 +6963,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(1_000_000),
                 lease: LeaseConfig {

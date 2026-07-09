@@ -123,14 +123,30 @@ impl RecordFlags {
     /// whether the subject field is present. Additive: a record without it is byte-for-byte the
     /// pre-subject layout.
     pub const HAS_SUBJECT: RecordFlags = RecordFlags(0b0000_1000);
+    /// The record carries a stored STREAM TAG (#597, V2-M2-I13): an optional length-prefixed field
+    /// placed immediately after the header (at the SAME fixed offset the subject field uses) and
+    /// before the body, with its own CRC32C. It names the stream a record belongs to when many
+    /// streams share ONE WAL (the shared-WAL fallback for high stream counts): the tag is the demux
+    /// key that keeps a shared, interleaved log per-stream-addressable on read and recovery. The
+    /// codec derives the bit from a non-empty tag (like `HAS_KEY` from the key). It is MUTUALLY
+    /// EXCLUSIVE with `HAS_SUBJECT` (both occupy the fixed post-header slot; a shared-WAL record
+    /// carries a tag, a subject-published record carries a subject, never both — the codec rejects a
+    /// frame that sets both). Additive: a record without it is byte-for-byte the pre-tag layout, so a
+    /// per-stream-log deployment (the default) never sets it and its bytes are unchanged.
+    pub const HAS_STREAM_TAG: RecordFlags = RecordFlags(0b0001_0000);
 
     /// An empty flag set.
     pub const EMPTY: RecordFlags = RecordFlags(0);
 
     /// The union of every flag this version understands. A writer must never emit
     /// a bit outside this mask.
-    pub const KNOWN: RecordFlags =
-        RecordFlags(Self::COMPRESSED.0 | Self::HAS_KEY.0 | Self::HAS_XXH3.0 | Self::HAS_SUBJECT.0);
+    pub const KNOWN: RecordFlags = RecordFlags(
+        Self::COMPRESSED.0
+            | Self::HAS_KEY.0
+            | Self::HAS_XXH3.0
+            | Self::HAS_SUBJECT.0
+            | Self::HAS_STREAM_TAG.0,
+    );
 
     /// Builds a flag set from its raw byte.
     #[must_use]
@@ -205,12 +221,19 @@ mod tests {
 
     #[test]
     fn flags_unknown_bits_detected_and_preserved() {
-        assert_eq!(RecordFlags::KNOWN.bits(), 0b1111);
-        // The xxh3 and subject presence bits are recognized flags, not unknown bits.
+        assert_eq!(RecordFlags::KNOWN.bits(), 0b1_1111);
+        // The xxh3, subject, and stream-tag presence bits are recognized flags, not unknown bits.
         assert!(RecordFlags::KNOWN.contains(RecordFlags::HAS_XXH3));
         assert!(RecordFlags::KNOWN.contains(RecordFlags::HAS_SUBJECT));
+        assert!(RecordFlags::KNOWN.contains(RecordFlags::HAS_STREAM_TAG));
         assert_eq!(RecordFlags::HAS_XXH3.unknown_bits(), RecordFlags::EMPTY);
         assert_eq!(RecordFlags::HAS_SUBJECT.unknown_bits(), RecordFlags::EMPTY);
+        assert_eq!(
+            RecordFlags::HAS_STREAM_TAG.unknown_bits(),
+            RecordFlags::EMPTY
+        );
+        // The stream-tag bit is bit 4, distinct from the subject bit (bit 3).
+        assert_eq!(RecordFlags::HAS_STREAM_TAG.bits(), 0b0001_0000);
         // A known-only set has no unknown bits.
         assert_eq!(RecordFlags::KNOWN.unknown_bits(), RecordFlags::EMPTY);
         // An unknown high bit is both preserved and reported.

@@ -263,6 +263,11 @@ enum AppendSource<'a> {
         /// byte-for-byte unchanged and only the by-subject produce threads a non-empty value; it
         /// routes to the subject-storing codec path in `write_source`.
         subject: &'a [u8],
+        /// The stored STREAM TAG for this record (#597, the shared-WAL demux key), or EMPTY for a
+        /// per-stream-log / default produce. Carried like `subject` so every existing produce path is
+        /// byte-for-byte unchanged and only the shared-WAL append threads a non-empty value; it routes
+        /// to the tag-storing codec path in `write_source`. Mutually exclusive with `subject`.
+        stream_tag: &'a [u8],
     },
     /// Copy an already-sealed, already-validated frame verbatim (via
     /// [`SegmentWriter::append_verbatim`]), skipping the redundant re-encode + re-checksum. `frame`
@@ -2674,6 +2679,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 record,
                 precomputed: None,
                 subject: b"",
+                stream_tag: b"",
             },
             true,
         )
@@ -2697,6 +2703,33 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 record,
                 precomputed: None,
                 subject,
+                stream_tag: b"",
+            },
+            true,
+        )
+    }
+
+    /// Appends one record ALSO storing `stream_tag` as the optional stream-tag field (#597), the
+    /// shared-WAL demux key that names the stream this record belongs to in a SHARED, interleaved
+    /// commit log. Otherwise identical to [`Log::append`] (same cap/budget/roll prologue, id
+    /// reservation, seek-index and write-amplification accounting). An EMPTY `stream_tag` is
+    /// byte-for-byte [`Log::append`]; a non-empty tag is stored with its own CRC inside the CRC'd
+    /// record frame, immediately after the header. Mutually exclusive with a stored subject. The
+    /// caller supplies a validated stream name as the tag ([`crate::shared_wal::SharedWal`]).
+    ///
+    /// # Errors
+    /// Same as [`Log::append`].
+    pub fn append_with_stream_tag(
+        &mut self,
+        record: &Append<'_>,
+        stream_tag: &[u8],
+    ) -> Result<Offset, StorageError> {
+        self.append_inner(
+            AppendSource::Encode {
+                record,
+                precomputed: None,
+                subject: b"",
+                stream_tag,
             },
             true,
         )
@@ -2717,6 +2750,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 record,
                 precomputed: Some(checksums),
                 subject,
+                stream_tag: b"",
             },
             true,
         )
@@ -2743,6 +2777,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 record,
                 precomputed: Some(checksums),
                 subject: b"",
+                stream_tag: b"",
             },
             true,
         )
@@ -2790,6 +2825,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 record,
                 precomputed: None,
                 subject: b"",
+                stream_tag: b"",
             },
             false,
         )
@@ -2847,6 +2883,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 record,
                 precomputed,
                 subject,
+                stream_tag,
             } => {
                 let view = RecordView {
                     seq,
@@ -2860,15 +2897,24 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 let pos_before = writer.write_pos();
                 // Offload the body checksum onto the producing connection thread when it precomputed
                 // it (#830); otherwise the codec computes it here as before. A non-empty subject
-                // (#594) routes to the subject-storing writer path, which lays down the optional
-                // subject field; an empty subject is byte-for-byte the historical frame.
-                let offset = match (precomputed, subject.is_empty()) {
-                    (Some(checksums), true) => writer.append_precomputed(&view, checksums)?,
-                    (None, true) => writer.append(&view)?,
-                    (Some(checksums), false) => {
-                        writer.append_precomputed_with_subject(&view, subject, checksums)?
+                // (#594) routes to the subject-storing writer path and a non-empty stream tag (#597)
+                // to the tag-storing path (the two are mutually exclusive); an empty pair is
+                // byte-for-byte the historical frame.
+                let offset = if stream_tag.is_empty() {
+                    match (precomputed, subject.is_empty()) {
+                        (Some(checksums), true) => writer.append_precomputed(&view, checksums)?,
+                        (None, true) => writer.append(&view)?,
+                        (Some(checksums), false) => {
+                            writer.append_precomputed_with_subject(&view, subject, checksums)?
+                        }
+                        (None, false) => writer.append_with_subject(&view, subject)?,
                     }
-                    (None, false) => writer.append_with_subject(&view, subject)?,
+                } else {
+                    match precomputed {
+                        Some(checksums) => writer
+                            .append_precomputed_with_stream_tag(&view, stream_tag, checksums)?,
+                        None => writer.append_with_stream_tag(&view, stream_tag)?,
+                    }
                 };
                 (offset, pos_before)
             }
