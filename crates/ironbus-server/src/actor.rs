@@ -3337,6 +3337,7 @@ mod tests {
             max_groups: DEFAULT_MAX_GROUPS,
             // Named-stream cap OFF (#863, `0` = unlimited): preserves the historical unbounded behavior.
             max_streams: 0,
+            max_open_streams: 0,
             max_metric_streams: crate::engine::DEFAULT_MAX_METRIC_STREAMS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: 0,

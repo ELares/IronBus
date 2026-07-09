@@ -281,6 +281,17 @@ pub struct StreamSet<F: Filesystem, C: Clock> {
     /// budget, daily write budget). Per-stream config overrides are a future concern (per-stream
     /// retention is M2-I5); here one config governs all streams, matching the single-log broker.
     config: LogConfig,
+    /// The access-ordered list of OPEN NAMED streams for the `max_open_streams` hot-set LRU (M2-I4,
+    /// #565): the FRONT is the least-recently-used named stream (the next eviction victim) and the
+    /// BACK is the most-recently-used. The DEFAULT stream `""` is NEVER a member (it is the root log
+    /// and is never evicted). Kept in lockstep with the named entries of `streams`: [`StreamSet::open`]
+    /// seeds it from the recovered named streams, [`StreamSet::declare`] pushes a newly-opened stream
+    /// to the MRU end, [`StreamSet::touch`] promotes an accessed stream to the MRU end, and
+    /// [`StreamSet::close`] removes an evicted stream. So `lru.len() == self.len() - 1` (the open named
+    /// count) always. The engine reads [`StreamSet::lru_victim`] to pick the stream to evict when
+    /// opening one more would exceed the cap; the CAP itself is engine policy (an `EngineConfig` knob),
+    /// so a bare `StreamSet` (cap unset) simply never evicts and this list is pure bookkeeping.
+    lru: Vec<StreamId>,
 }
 
 impl<F: Filesystem, C: Clock> std::fmt::Debug for StreamSet<F, C> {
@@ -380,16 +391,36 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
             }
         }
 
+        // Seed the hot-set LRU (#565) from the recovered NAMED streams in deterministic (BTreeMap key)
+        // order — the default stream `""` is excluded (it is never evicted). A freshly recovered stream
+        // has no runtime access history, so key order is the arbitrary-but-reproducible initial LRU
+        // order; the engine's boot-time evict-to-cap (if the recovered named count exceeds the cap)
+        // therefore evicts the lowest-keyed streams first, deterministically.
+        let lru: Vec<StreamId> = streams
+            .keys()
+            .filter(|id| !id.is_default())
+            .cloned()
+            .collect();
+
         Ok((
             StreamSet {
                 streams,
                 clock,
                 config,
+                lru,
             },
             recoveries,
         ))
     }
+}
 
+// `declare` (open-or-reopen a single named stream's log) needs only the CLOCK to be `Clone` (it clones
+// the clock seam into the new `Log`) — NOT the filesystem, since [`Filesystem::subdir`] borrows `&self`
+// and [`Log::open`] takes an owned subdir handle. Splitting it out of the `F: Clone` block above is what
+// lets the ENGINE'S CONSUME/ACK paths (which are generic over an `F` that need not be `Clone`) REOPEN a
+// stream the hot-set LRU evicted (#565): a lazy reopen is exactly a `declare`, so it must be reachable
+// without the `F: Clone` bound that only [`StreamSet::open`]'s parallel cold-open needs.
+impl<F: Filesystem, C: Clock + Clone> StreamSet<F, C> {
     /// Declares (creating its `streams/<hex(name)>/` directory + a fresh [`Log`] on first use, or
     /// returning the already-open one) the NAMED stream `id`, so it can be appended to and read. The
     /// default stream is always already open (it is the root log), so declaring it is a no-op that
@@ -398,7 +429,13 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
     /// On first declaration of a named stream this materializes `streams/` (and `streams/<hex>/`) on
     /// disk via [`Filesystem::subdir`] and opens a fresh independent [`Log`] there. Re-declaring an
     /// open stream is idempotent: it does not reopen or disturb the existing log. Returns whether the
-    /// stream was NEWLY created (`true`) versus already open (`false`).
+    /// stream was NEWLY OPENED (`true`) versus already open (`false`).
+    ///
+    /// This is ALSO the hot-set LRU REOPEN path (#565): a stream the LRU evicted (its log closed, its
+    /// on-disk `streams/<hex>/` subtree intact) is reopened here by exactly the same [`Log::open`] that
+    /// a first declaration runs, which recovers its durable records from disk — so a reopen is
+    /// behaviorally a per-stream restart. A newly-opened stream is pushed to the MRU end of the hot-set
+    /// LRU (it is the most-recently-touched stream by definition).
     ///
     /// # Errors
     /// Propagates a [`StorageError`] from creating the subdir or opening the stream's log.
@@ -416,6 +453,10 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
             .map_err(StorageError::Io)?;
         let log = Log::open(this_stream_dir, self.clock.clone(), self.config)?;
         self.streams.insert(id.clone(), log);
+        // A newly-opened (or reopened) named stream is the most-recently-used by definition: push it to
+        // the MRU end of the hot-set LRU so it is the LAST to be evicted (#565). `declare` returns early
+        // above when the stream is already open, so this never double-inserts an id.
+        self.lru.push(id.clone());
         Ok(true)
     }
 
@@ -720,6 +761,74 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
     #[must_use]
     pub fn is_open(&self, id: &StreamId) -> bool {
         self.streams.contains_key(id)
+    }
+
+    // ======================= M2-I4 (#565): the max_open_streams hot-set LRU =======================
+    //
+    // These methods maintain the OPEN-set access order and close/evict a stream's log on demand. The
+    // CAP is engine policy (`EngineConfig::max_open_streams`), and eviction's flush-of-durable-state
+    // (the per-stream cursor #681, the DLQ #1110, the attempt counts) lives in the engine (it owns that
+    // state). The `StreamSet` owns only the MECHANISM here: the LRU order, the victim pick, and the
+    // log close (fd + segment-buffer release). A reopen is a `declare` (above), which recovers the
+    // stream from disk — so an evict/reopen cycle is behaviorally a per-stream restart.
+
+    /// Promotes OPEN named stream `id` to the MOST-recently-used end of the hot-set LRU (#565), so it
+    /// is the LAST to be evicted. Called on every access (produce / consume / ack) of a named stream.
+    /// A no-op for the default stream (never in the LRU) or an id that is not currently open (nothing
+    /// to promote — a reopen re-adds it at the MRU end via [`StreamSet::declare`]). O(open named
+    /// streams), which is bounded by the cap.
+    pub fn touch(&mut self, id: &StreamId) {
+        if id.is_default() || !self.streams.contains_key(id) {
+            return;
+        }
+        if let Some(pos) = self.lru.iter().position(|x| x == id) {
+            // Already tracked: move it from wherever it is to the MRU (back) end. `remove` is O(n) but
+            // n is bounded by the open cap, and this keeps the vector a true recency order.
+            let existing = self.lru.remove(pos);
+            self.lru.push(existing);
+        } else {
+            // Open but somehow untracked (defensive — every open goes through `declare`, which tracks
+            // it): record it at the MRU end so the invariant `lru == open named set` self-heals.
+            self.lru.push(id.clone());
+        }
+    }
+
+    /// The LEAST-recently-used OPEN named stream — the next eviction victim — or `None` when no named
+    /// stream is open (#565). The default stream is never a candidate (it is not in the LRU). The
+    /// engine calls this when opening one more stream would exceed `max_open_streams`, evicts the
+    /// returned victim (flushing its durable state and closing its log), and repeats until under cap.
+    #[must_use]
+    pub fn lru_victim(&self) -> Option<StreamId> {
+        self.lru.first().cloned()
+    }
+
+    /// The number of OPEN NAMED streams, EXCLUDING the always-present default stream (#565): the
+    /// quantity the `max_open_streams` cap bounds. Equal to `self.len() - 1` (the default is always
+    /// open) and to `self.lru.len()` (the LRU tracks exactly the open named streams).
+    #[must_use]
+    pub fn open_named_count(&self) -> usize {
+        self.streams.len().saturating_sub(1)
+    }
+
+    /// CLOSES (evicts from the open set) NAMED stream `id`: drops its [`Log`] — releasing the file
+    /// descriptor and the in-memory segment/pending buffers — and removes it from the hot-set LRU
+    /// (#565). Its ON-DISK `streams/<hex>/` subtree is left fully intact, so a later [`StreamSet::declare`]
+    /// REOPENS and recovers it from disk exactly like a per-stream restart. Returns whether a stream
+    /// was actually closed (`false` if `id` was not open).
+    ///
+    /// The caller MUST have already made the stream's records durable ([`StreamSet::sync_stream`]) and
+    /// checkpointed any engine-side per-stream state (cursor / DLQ / attempts) BEFORE calling this —
+    /// dropping the `Log` discards its unflushed `pending` buffer, so an un-synced tail would be lost.
+    /// The default stream is NEVER closable (it is the root log): a request to close it is a no-op
+    /// `false`, so the default stream can never be evicted.
+    pub fn close(&mut self, id: &StreamId) -> bool {
+        if id.is_default() {
+            return false;
+        }
+        if let Some(pos) = self.lru.iter().position(|x| x == id) {
+            self.lru.remove(pos);
+        }
+        self.streams.remove(id).is_some()
     }
 }
 
@@ -1522,6 +1631,93 @@ mod tests {
             let read_b = set_b.read_range(id, Offset::ZERO, 1000, None).unwrap();
             assert_eq!(read.len(), read_b.len());
             assert_eq!(&*read[i].payload, &*read_b[i].payload);
+        }
+    }
+
+    // ======================= M2-I4 (#565): the max_open_streams hot-set LRU =======================
+
+    /// `declare` tracks each newly-opened named stream at the MRU end and the default stream is NEVER
+    /// in the LRU, so `lru_victim` returns the first-declared named stream and `open_named_count`
+    /// excludes the default.
+    #[test]
+    fn declare_tracks_the_open_set_and_default_is_never_a_victim() {
+        let fs = InMemoryFs::new();
+        let (mut set, _) = open(&fs);
+        // No named stream open yet: nothing to evict, and the default is not counted.
+        assert_eq!(set.open_named_count(), 0);
+        assert_eq!(set.lru_victim(), None);
+
+        let a = StreamId::named("a").unwrap();
+        let b = StreamId::named("b").unwrap();
+        let c = StreamId::named("c").unwrap();
+        for id in [&a, &b, &c] {
+            set.declare(id).unwrap();
+        }
+        assert_eq!(set.open_named_count(), 3);
+        // Declared a, b, c in order -> a is the LRU (first-declared), the eviction victim.
+        assert_eq!(set.lru_victim(), Some(a.clone()));
+    }
+
+    /// `touch` promotes an accessed stream to the MRU end, so a recently-touched stream is NOT the next
+    /// victim — the LRU reorders on access.
+    #[test]
+    fn touch_reorders_the_lru_so_a_hot_stream_is_not_evicted_next() {
+        let fs = InMemoryFs::new();
+        let (mut set, _) = open(&fs);
+        let a = StreamId::named("a").unwrap();
+        let b = StreamId::named("b").unwrap();
+        let c = StreamId::named("c").unwrap();
+        for id in [&a, &b, &c] {
+            set.declare(id).unwrap();
+        }
+        // Order is [a, b, c]; a is LRU. Touch a -> order becomes [b, c, a], so b is now the victim.
+        assert_eq!(set.lru_victim(), Some(a.clone()));
+        set.touch(&a);
+        assert_eq!(set.lru_victim(), Some(b.clone()));
+        // Touch b -> [c, a, b], c is the victim.
+        set.touch(&b);
+        assert_eq!(set.lru_victim(), Some(c.clone()));
+        // Touching the default stream is a no-op (it is never in the LRU).
+        set.touch(&StreamId::default_stream());
+        assert_eq!(set.lru_victim(), Some(c.clone()));
+    }
+
+    /// `close` releases a named stream's log + LRU slot but leaves its on-disk subtree intact, so a
+    /// later `declare` REOPENS it recovering its durable records — an evict/reopen cycle is a per-stream
+    /// restart, losing no committed data. The default stream is never closable.
+    #[test]
+    fn close_then_reopen_recovers_the_streams_durable_records() {
+        let fs = InMemoryFs::new();
+        let a = StreamId::named("a").unwrap();
+        {
+            let (mut set, _) = open(&fs);
+            set.declare(&a).unwrap();
+            set.append_to(&a, &rec(b"a0")).unwrap();
+            set.append_to(&a, &rec(b"a1")).unwrap();
+            set.sync_all().unwrap();
+
+            // Close (evict) a: it leaves the open set + LRU, but its bytes stay on disk.
+            assert!(set.close(&a));
+            assert!(!set.is_open(&a));
+            assert_eq!(set.open_named_count(), 0);
+            assert_eq!(set.lru_victim(), None);
+            // The default stream is never closable.
+            assert!(!set.close(&StreamId::default_stream()));
+            assert!(set.is_open(&StreamId::default_stream()));
+
+            // Reopen a via declare: `Log::open` recovers its two durable records from disk.
+            assert!(set.declare(&a).unwrap());
+            assert!(set.is_open(&a));
+            let read = set.read_range(&a, Offset::ZERO, 100, None).unwrap();
+            assert_eq!(
+                read.len(),
+                2,
+                "the reopened stream recovered its durable records"
+            );
+            assert_eq!(&*read[0].payload, b"a0");
+            assert_eq!(&*read[1].payload, b"a1");
+            // Reopen re-tracked it at the MRU end (it is the only named stream, so it is the victim).
+            assert_eq!(set.lru_victim(), Some(a.clone()));
         }
     }
 }
