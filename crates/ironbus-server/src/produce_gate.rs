@@ -40,14 +40,24 @@
 //!    it GROWS on an append (inside `commit_batch`) and SHRINKS only on a reap (also inside
 //!    `commit_batch`, or on a config-reload reap — both on the actor).
 //!
-//! 2. **A stale snapshot under drop-new can only be too LOW, never falsely too high.** The actor
-//!    refreshes this gate's bytes value right AFTER every `commit_batch` (the one place bytes change).
-//!    Between that refresh and the actor next processing a produce, NOTHING lowers the real bytes (a
-//!    reap only runs during a `commit_batch`, which is when/after the pre-checked produce is itself
-//!    processed). So if the snapshot reads "at/over cap," the real value is still at/over cap when the
-//!    actor checks it — the fast-reject matches the authoritative outcome. A snapshot that lags LOW
-//!    (e.g. a not-yet-published recent append) merely makes the gate fall through to the actor, which
-//!    is always safe.
+//! 2. **A stale snapshot under drop-new is a valid LOWER bound ONLY when no reap can lower the byte
+//!    total across a commit.** The actor refreshes this gate right AFTER every `commit_batch`. While
+//!    only appends move the total it GROWS between refreshes, so the last-published value is a lower
+//!    bound on the real bytes and "snapshot at/over cap" implies the actor is still at/over cap — an
+//!    EXACT fast-reject. BUT a consumer-safe retention / compaction reap (drop-new's size/age/count
+//!    trim, #337) ALSO runs INSIDE `commit_batch`, and it LOWERS `durable_record_bytes`. Across a
+//!    commit that reaps, the total is NON-MONOTONE, so the last-published value can be transiently
+//!    STALE-HIGH (over cap) after the in-commit reap has already brought the real bytes UNDER cap, for
+//!    the window between that reap and the post-commit refresh (#804). A racing connection thread
+//!    reading the stale-high value would FALSE-reject a produce the post-reap actor would accept —
+//!    exactly the forbidden false reject. The gate closes this window by DISENGAGING whenever a reap is
+//!    possible: the actor passes `reap_possible` (any retention bound set, or compaction enabled) to
+//!    [`ProduceCapGate::publish_drop_new_reap_aware`], which publishes the under-cap sentinel instead of
+//!    the byte total, so no snapshot is ever compared while it could be stale-high. When no reap is
+//!    possible (the common case: no retention / compaction configured) the total only grows between
+//!    refreshes, the snapshot is an exact lower bound, and the full #476 fast-reject stays engaged. A
+//!    snapshot that merely lags LOW (a not-yet-published recent append, or the reap-aware disengage)
+//!    only makes the gate fall through to the authoritative actor, which is always safe.
 //!
 //! 3. **Drop-oldest never fast-rejects.** Under [`DiskFullPolicy::DropOldest`](crate::engine) an
 //!    over-cap produce is ACCEPTED after a force-reap, so an over-cap snapshot does NOT imply a shed.
@@ -155,6 +165,33 @@ impl ProduceCapGate {
     /// [`ProduceCapGate::publish`].
     pub fn disengage(&self) {
         self.publish(0);
+    }
+
+    /// Publishes the gate's next drop-new snapshot, DISENGAGING instead when a retention / compaction
+    /// reap can lower the durable byte total across the upcoming commit (#804). `reap_possible` is the
+    /// actor's answer to "can a consumer-safe reap run in a `commit_batch` under the current config"
+    /// (any retention bound set — size/age/count — or compaction enabled).
+    ///
+    /// The connection-thread fast-reject compares the LAST-published byte total, which is a valid lower
+    /// bound on the real bytes ONLY while the total is MONOTONE between refreshes. That holds when only
+    /// appends move it (bytes grow), but a reap running INSIDE `commit_batch` LOWERS the total, so for
+    /// the window between the in-commit reap and the post-commit refresh the last-published value can be
+    /// transiently STALE-HIGH — over cap while the real bytes are already under it. Fast-rejecting
+    /// against that stale-high value is a FALSE reject (the post-reap actor would accept the produce),
+    /// which the module forbids. So whenever a reap is possible this publishes the `0` sentinel
+    /// ([`ProduceCapGate::disengage`]) rather than the byte total: the gate falls through to the
+    /// authoritative actor (an over-cap produce is still shed there — never lost, just not fast-pathed),
+    /// which is always safe. When NO reap is possible the total only grows between refreshes, so the
+    /// snapshot is an exact lower bound and this publishes the real byte total, keeping the full #476
+    /// fast-reject engaged (no regression to the #465 fix in the common, no-retention configuration).
+    pub fn publish_drop_new_reap_aware(&self, durable_record_bytes: u64, reap_possible: bool) {
+        if reap_possible {
+            // A reap can lower the byte total mid-commit, so the published snapshot could be stale-high
+            // during the reap window: disengage rather than risk a false reject (#804).
+            self.disengage();
+        } else {
+            self.publish_drop_new(durable_record_bytes);
+        }
     }
 
     /// The connection-thread fast-reject decision: returns `true` ONLY when the gate is SURE the
@@ -320,6 +357,59 @@ mod tests {
         assert!(
             !gate.would_shed(),
             "drop-oldest accepts over-cap; the gate must disengage (no false reject)"
+        );
+    }
+
+    #[test]
+    fn a_reap_possible_drop_new_publish_disengages_to_avoid_a_stale_high_false_reject() {
+        // #804: under drop-new WITH a retention / compaction reap possible, the durable byte total is
+        // NON-MONOTONE across a commit — an in-commit reap lowers it below the cap AFTER the gate's
+        // last snapshot was taken, so the snapshot is transiently STALE-HIGH (over cap) while the real
+        // bytes are already under it. Fast-rejecting against that stale-high value is the FALSE reject
+        // the module forbids (the post-reap actor would accept the produce).
+        let cap = 1_000;
+        let gate = ProduceCapGate::new(cap);
+
+        // THE BUG, reproduced: the plain drop-new publish stores the over-cap total, so a connection
+        // thread racing the in-commit reap fast-rejects — a false reject once the reap lands under cap.
+        gate.publish_drop_new(cap + 500);
+        assert!(
+            gate.would_shed(),
+            "the plain publish leaves the gate engaged on the stale-high total (the #804 window)"
+        );
+
+        // THE FIX: with a reap possible, the reap-aware publish disengages instead of storing the
+        // over-cap total, so no connection thread fast-rejects during the reap window.
+        gate.publish_drop_new_reap_aware(cap + 500, true);
+        assert!(
+            !gate.would_shed(),
+            "reap-aware publish disengages under a possible reap (no stale-high false reject, #804)"
+        );
+
+        // And once the reap has landed and the actor republishes the now-under-cap total, the gate is
+        // (still) open — the produce the racing thread would have been falsely rejected is admissible.
+        gate.publish_drop_new_reap_aware(cap - 100, true);
+        assert!(
+            !gate.would_shed(),
+            "the post-reap under-cap total is admissible"
+        );
+    }
+
+    #[test]
+    fn a_reap_impossible_drop_new_publish_keeps_the_fast_reject_engaged() {
+        // The common case (no retention / compaction configured): the byte total only GROWS between
+        // refreshes, so the snapshot is an exact lower bound and the #476 fast-reject stays fully
+        // engaged — `reap_possible = false` publishes the real total, engaging at/over cap exactly like
+        // `publish_drop_new`. This pins that the #804 fix does NOT regress the #465 fast-reject when no
+        // reap can move the byte total.
+        let cap = 1_000;
+        let gate = ProduceCapGate::new(cap);
+        gate.publish_drop_new_reap_aware(cap - 1, false);
+        assert!(!gate.would_shed(), "under cap: fall through");
+        gate.publish_drop_new_reap_aware(cap + 500, false);
+        assert!(
+            gate.would_shed(),
+            "over cap with no reap possible: the fast-reject stays engaged (no #476 regression)"
         );
     }
 

@@ -1757,9 +1757,15 @@ where
     // Seed the gate to the engine's CURRENT durable bytes and policy, so a broker recovered ALREADY
     // over its cap (a restart on a full log) fast-rejects from the very first produce rather than
     // waiting for the first commit to publish a reading. Publish-only (no reconcile): nothing has run
-    // yet, so there are no fast-rejects to fold, and `&engine` is still borrowed before the move.
+    // yet, so there are no fast-rejects to fold, and `&engine` is still borrowed before the move. The
+    // drop-new seed is REAP-AWARE (#804), exactly like the running refresh: a broker configured with
+    // retention / compaction starts DISENGAGED (the byte total is non-monotone across a commit), so it
+    // never false-rejects against a stale-high seed before the first reap.
     match engine.disk_full_policy() {
-        DiskFullPolicy::DropNew => cap_gate.publish_drop_new(engine.durable_record_bytes()),
+        DiskFullPolicy::DropNew => {
+            cap_gate
+                .publish_drop_new_reap_aware(engine.durable_record_bytes(), reap_possible(&engine));
+        }
         _ => cap_gate.disengage(),
     }
     let actor_gate = Arc::clone(&cap_gate);
@@ -1868,14 +1874,42 @@ where
     //    a Level-1 rejection. Two separate exact deltas, each reconciled to its own counter.
     engine.record_fast_reject_sheds(gate.take_unreconciled_fast_rejects());
     engine.record_fire_and_forget_sheds(gate.take_unreconciled_l0_sheds());
-    // 2. Publish the gate's next snapshot from the now-current byte total and overflow policy.
+    // 2. Publish the gate's next snapshot from the now-current byte total and overflow policy. Under
+    //    drop-new the publish is REAP-AWARE (#804): if a consumer-safe retention / compaction reap can
+    //    lower the byte total inside a `commit_batch`, the total is non-monotone across a commit, so the
+    //    last-published snapshot could be transiently STALE-HIGH after an in-commit reap — the gate
+    //    disengages rather than let a connection thread false-reject a produce the post-reap actor would
+    //    accept. With no reap possible (the common case) the total only grows between refreshes, so the
+    //    snapshot is exact and the full #476 fast-reject stays engaged.
     match engine.disk_full_policy() {
-        DiskFullPolicy::DropNew => gate.publish_drop_new(engine.durable_record_bytes()),
+        DiskFullPolicy::DropNew => {
+            gate.publish_drop_new_reap_aware(engine.durable_record_bytes(), reap_possible(engine));
+        }
         // Drop-oldest accepts over-cap produces (force-reap then append), so the gate must not fire.
         // `#[non_exhaustive]` enum: any future non-drop-new policy also disengages, which is the
         // conservative default (fall through to the authoritative actor path).
         _ => gate.disengage(),
     }
+}
+
+/// Whether a consumer-safe retention OR compaction reap can lower `durable_record_bytes` inside a
+/// `commit_batch` under the engine's CURRENT (live-reloadable) config (#804). Any retention bound set
+/// (size / age / count) or compaction enabled makes the byte total NON-MONOTONE across a commit, so the
+/// connection-thread fast-reject's last-published snapshot can be transiently stale-high after an
+/// in-commit reap — and the gate must DISENGAGE rather than risk a false reject. `false` (the common
+/// case: no retention / compaction) means the total only grows between refreshes, so the snapshot is an
+/// exact lower bound and the full #476 fast-reject stays engaged. Read from the engine's cheap
+/// (`Copy`-field) config snapshot, once per batch, amortized with the covering fsync — never per message.
+fn reap_possible<F, C>(engine: &Engine<F, C>) -> bool
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    let cfg = engine.config_snapshot();
+    cfg.max_retained_bytes != 0
+        || cfg.max_age_ms != 0
+        || cfg.max_messages != 0
+        || engine.compaction_config().enabled
 }
 
 /// The pipelined sync tier's spawn-time rig (#1040): the dedicated flusher thread plus its two
