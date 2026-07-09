@@ -7173,14 +7173,34 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// head from [`Engine::log`], or a NAMED stream's head from its own log in the [`StreamSet`]
     /// (`Offset::ZERO` for an unknown named stream). Lets a test assert a produce to a named stream
     /// advanced ONLY that stream's head, not the default's (cross-stream data isolation).
-    #[must_use]
-    pub fn stream_head(&self, stream: &str) -> Offset {
+    ///
+    /// A named stream the hot-set LRU EVICTED (#565) has its log CLOSED, so a plain `self.streams.get`
+    /// would return `None` and report head `0` — WRONGLY, since the stream still EXISTS and its records
+    /// are durable on disk (the #565/#588 `StreamInfo` review finding). Unlike
+    /// [`stream_exists`](Self::stream_exists) — which answers a pure existence question with no on-disk
+    /// data and so never reopens — the head LIVES on disk in the stream's segments, so it can only be
+    /// read by reopening the log. This takes `&mut self` and REOPENS an evicted-but-known stream through
+    /// the established [`ensure_named_stream_resident`](Self::ensure_named_stream_resident) path (which
+    /// recovers the durable head from disk and re-admits the stream to the hot set, evicting the LRU
+    /// victim to stay within `max_open_streams`), so the reported head is the true durable head, not 0.
+    /// A genuinely-unknown stream is NOT reopened (nothing to recover) and reports `Offset::ZERO`,
+    /// folding with `stream_exists == false`. A reopen I/O fault degrades to `Offset::ZERO` rather than
+    /// surfacing — a metadata read never costs correctness, and the caller already treats 0 as "no head".
+    pub fn stream_head(&mut self, stream: &str) -> Offset {
         if stream.is_empty() {
             return self.log.flushed_offset();
         }
         let Ok(id) = StreamId::named(stream) else {
             return Offset::ZERO;
         };
+        // Reopen an evicted-but-KNOWN named stream so its durable head is read from disk rather than
+        // folded to 0; a never-declared stream is left untouched (its `get` below stays `None` -> ZERO).
+        if !self.streams.is_open(&id)
+            && self.known_named_streams.contains(&id)
+            && self.ensure_named_stream_resident(&id).is_err()
+        {
+            return Offset::ZERO;
+        }
         self.streams
             .get(&id)
             .map_or(Offset::ZERO, Log::flushed_offset)
@@ -17809,6 +17829,66 @@ mod tests {
             e.counters().truncations,
             0,
             "a caught-up consumer is never truncated across evict/reopen"
+        );
+    }
+
+    #[test]
+    fn stream_head_reports_the_durable_head_of_an_evicted_named_stream() {
+        // #565 follow-up (the #588 `StreamInfo` review): `stream_head` for a named stream the hot-set
+        // LRU EVICTED must report its TRUE durable head, not 0. Before the fix `stream_head` was `&self`
+        // and could not reopen the closed log, so `streams.get` returned `None` and the head folded to
+        // 0 — a StreamInfo query on an evicted-but-existing stream wrongly saw it as empty. The fix
+        // reopens the evicted-but-known stream to read its durable head from disk.
+        let mut cfg = config(64, 5);
+        cfg.max_open_streams = 1; // room for exactly ONE named stream resident at a time
+        let mut e = open(cfg);
+
+        // Three records to A; its head is 3 while resident (the unchanged resident path).
+        for _ in 0..3 {
+            produce_named(&mut e, "A", &[0xab; 16]);
+        }
+        assert_eq!(
+            e.stream_head("A"),
+            Offset::new(3),
+            "a resident stream reports its head directly"
+        );
+
+        // Opening B evicts A (max_open_streams = 1): A is now known-but-not-resident.
+        produce_named(&mut e, "B", &[0xcd; 16]);
+        assert!(
+            !e.is_named_stream_resident("A"),
+            "A was evicted by the hot-set LRU when B opened"
+        );
+
+        // The bug: an evicted A reported head 0. The fix reopens A from disk and reports its real head.
+        assert_eq!(
+            e.stream_head("A"),
+            Offset::new(3),
+            "an evicted-but-known stream reports its real durable head, not 0"
+        );
+
+        // A genuinely-unknown stream is NOT reopened and still reports 0 (folds with exists == false).
+        assert_eq!(
+            e.stream_head("never-declared"),
+            Offset::ZERO,
+            "an unknown stream reports head 0 (nothing to reopen)"
+        );
+        assert!(
+            !e.is_named_stream_resident("never-declared"),
+            "querying an unknown stream's head never materializes it"
+        );
+
+        // The resident-stream path is unchanged: B's head (evicted by the reopen of A above) reopens and
+        // reports its own durable head, not the default's or A's.
+        assert_eq!(
+            e.stream_head("B"),
+            Offset::new(1),
+            "each stream reports its OWN durable head across evict/reopen"
+        );
+        assert_eq!(
+            e.stream_head(""),
+            Offset::ZERO,
+            "the default stream was never produced to (cross-stream isolation)"
         );
     }
 
