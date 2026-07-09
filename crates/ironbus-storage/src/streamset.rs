@@ -1372,8 +1372,14 @@ mod tests {
         set.append_to(&a, &rec(b"a0")).unwrap();
 
         // Pre-tick: appended but NOT durable — each durable head trails its next-append head.
-        assert!(set.get(&def).unwrap().synced_offset() != set.get(&def).unwrap().next_offset());
-        assert!(set.get(&a).unwrap().synced_offset() != set.get(&a).unwrap().next_offset());
+        assert_ne!(
+            set.get(&def).unwrap().synced_offset(),
+            set.get(&def).unwrap().next_offset()
+        );
+        assert_ne!(
+            set.get(&a).unwrap().synced_offset(),
+            set.get(&a).unwrap().next_offset()
+        );
 
         let outcome = set.commit_tick();
 
@@ -1491,8 +1497,9 @@ mod tests {
             "the victim is frozen read-only"
         );
         // Its acks stayed PARKED: durable head still trails the append head (nothing acked-as-durable).
-        assert!(
-            set.get(&victim).unwrap().synced_offset() != set.get(&victim).unwrap().next_offset()
+        assert_ne!(
+            set.get(&victim).unwrap().synced_offset(),
+            set.get(&victim).unwrap().next_offset()
         );
 
         // Tick 2: the sibling is healthy and commits fine; the frozen victim is simply skipped (a
