@@ -761,6 +761,7 @@ fn build_vectors() -> Vec<Vector> {
     encode_stream_declare(
         &StreamDeclareBody {
             stream_id: b"orders",
+            partition_count: 1,
         },
         &mut body,
     )
@@ -832,6 +833,7 @@ fn build_vectors() -> Vec<Vector> {
         &SubToBody {
             stream_id: b"orders",
             group: b"pickers",
+            partition: None,
         },
         &mut body,
     )

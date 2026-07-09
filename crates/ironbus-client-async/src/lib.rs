@@ -1326,6 +1326,7 @@ impl AsyncClient {
         encode_stream_declare(
             &StreamDeclareBody {
                 stream_id: stream.as_bytes(),
+                partition_count: 1,
             },
             &mut body,
         )
@@ -1434,6 +1435,7 @@ impl AsyncClient {
             &SubToBody {
                 stream_id: stream.as_bytes(),
                 group: group.as_bytes(),
+                partition: None,
             },
             &mut body,
         )
