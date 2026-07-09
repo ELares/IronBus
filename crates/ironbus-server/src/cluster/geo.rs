@@ -1448,10 +1448,20 @@ pub fn pull_loop<S, A>(
         }
         match link.recv() {
             Ok(Some(GeoFrame::Response(resp))) => {
-                let empty = resp.record_count == 0;
+                // Classify "caught up" with the SAME predicate the applier uses (#806): a response is a
+                // clean no-op ONLY when it carries zero records AND zero bytes (`apply_pull_response`'s
+                // guard). A MALFORMED response — `record_count == 0` but NON-EMPTY `frame_bytes` —
+                // is NOT caught-up: classifying on the count ALONE would short-circuit `apply`, pin the
+                // cursor, and re-poll the same offset FOREVER (a silent, permanent no-progress stall).
+                // Flowing it into `apply` instead walks the bytes and surfaces a typed error
+                // (`RecordCountMismatch` / `NonContiguous` / `CorruptFrame`), so the link is dropped
+                // fail-closed and the caller reconnects — consistent with the surrounding fail-closed
+                // discipline (a malformed origin frame is surfaced, never silently swallowed).
+                let empty = resp.record_count == 0 && resp.frame_bytes.is_empty();
                 if !empty {
-                    // Apply the CRC-revalidated bytes. A corrupt / non-contiguous frame fails closed; the
-                    // cursor did not move past it, so drop this link and re-pull from the cursor.
+                    // Apply the CRC-revalidated bytes. A corrupt / non-contiguous / count-mismatched
+                    // frame fails closed; the cursor did not move past it, so drop this link and re-pull
+                    // from the cursor.
                     if let Err(e) = apply(&resp) {
                         tracing::debug!(origin = origin_key, error = %e, "geo: apply failed; will resume from cursor");
                         return;
@@ -2950,5 +2960,90 @@ mod live_geo_tests {
 
         shutdown.store(true, Ordering::Release);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn a_count_zero_non_empty_response_is_not_treated_as_caught_up_and_does_not_stall() {
+        // #806: a MALFORMED response — `record_count == 0` but NON-EMPTY `frame_bytes` — must NOT be
+        // classified as "caught up" (which would short-circuit `apply`, pin the cursor, and re-poll the
+        // same offset forever, a silent no-progress stall). The loop must flow it into `apply`; the
+        // applier surfaces a typed error (`RecordCountMismatch`), and the loop drops the link
+        // fail-closed so the caller reconnects.
+        //
+        // MUTATION CHECK: revert the classifier to `resp.record_count == 0` and `apply` is NEVER called
+        // (the loop sleeps `GEO_POLL` and re-polls the pinned cursor), so `apply_calls` stays 0 and the
+        // assert below fails.
+
+        // A one-shot replay stream: hands back the framed response, then EOF; writes (the pull requests)
+        // are sunk. `Read + Write` so it drives `GeoLink` like a real transport, with no origin process.
+        struct ReplayStream {
+            to_read: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for ReplayStream {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.to_read.read(buf)
+            }
+        }
+        impl std::io::Write for ReplayStream {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // A malformed response: one VALID CRC frame, but a claimed `record_count` of 0.
+        let mut frame = Vec::new();
+        ironbus_core::codec::encode(
+            &ironbus_core::codec::RecordView {
+                seq: ironbus_core::types::Seq::new(0),
+                timestamp_ms: 1,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"x",
+            },
+            &mut frame,
+        )
+        .unwrap();
+        let resp = MirrorPullResponse {
+            origin_high_watermark: 1,
+            first_offset: 0,
+            record_count: 0, // MALFORMED: zero count, non-empty bytes
+            frame_bytes: Bytes::from(frame),
+        };
+        // Wire-frame the response once, then EOF, so the loop reads it and drops the link on the error.
+        let wire = encode_geo_frame(&resp.encode()).unwrap();
+
+        let mut link = GeoLink::new(ReplayStream {
+            to_read: std::io::Cursor::new(wire),
+        });
+        let shutdown = AtomicBool::new(false);
+        let apply_calls = std::cell::Cell::new(0u32);
+        pull_loop(
+            &mut link,
+            "origin-key",
+            "",
+            &shutdown,
+            || 0u64, // cursor pinned at 0
+            |r: &MirrorPullResponse| -> Result<ApplyOutcome, GeoError> {
+                apply_calls.set(apply_calls.get() + 1);
+                // The applier's real verdict on (count == 0, non-empty bytes) is a RecordCountMismatch;
+                // returning it drops the link exactly as the real applier would.
+                assert_eq!(r.record_count, 0);
+                assert!(!r.frame_bytes.is_empty());
+                Err(GeoError::RecordCountMismatch {
+                    claimed: 0,
+                    actual: 1,
+                })
+            },
+        );
+        assert_eq!(
+            apply_calls.get(),
+            1,
+            "the malformed count==0/non-empty response must flow into apply (dropping the link), not be \
+             silently classified as caught-up and re-polled forever"
+        );
     }
 }

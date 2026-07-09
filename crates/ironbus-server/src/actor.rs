@@ -400,8 +400,11 @@ fn recv_sliced(
     loop {
         match rx.recv_timeout(WAIT_ACTOR_ALIVE_POLL) {
             Ok(outcome) => return Ok(outcome),
-            // A real disconnect (a non-recycled reply channel, e.g. the direct/test path) is still
-            // `ActorGone`, exactly as before.
+            // UNREACHABLE for a POOLED produce reply channel: its co-located `tx` (#475) keeps the
+            // channel open, so a `recv_timeout` here never observes a disconnect — actor departure is
+            // detected on the Timeout arm via the `actor_alive` flag (#949), NOT via channel closure.
+            // The arm is retained to exhaustively handle the `Result` (and to still surface `ActorGone`
+            // for any hypothetical non-co-located reply channel), never as the liveness mechanism.
             Err(RecvTimeoutError::Disconnected) => return Err(ActorGone),
             Err(RecvTimeoutError::Timeout) => {
                 // The actor is still running: the outcome is merely not ready yet (a slow covering
@@ -479,9 +482,15 @@ impl ProduceSubmission {
     /// up empty parks nothing and returns immediately, where `wait` would block).
     ///
     /// # Errors
-    /// Returns [`ActorGone`] only if the actor dropped its cloned `tx` UN-sent (it exited before
-    /// replying), which disconnects the channel — exactly the condition `wait` maps to `ActorGone`. An
-    /// empty (not-yet-ready) channel is NOT an error; it is [`TryTake::NotReady`].
+    /// Returns [`ActorGone`] only if the reply channel is genuinely disconnected — which, for a POOLED
+    /// produce reply channel, CANNOT happen: its co-located `tx` (#475) keeps the channel open, so a
+    /// gone actor shows here as [`TryTake::NotReady`] (an empty channel), NOT `ActorGone`. This
+    /// non-blocking poll therefore does NOT itself detect actor departure; the caller's BLOCKING backstop
+    /// does — a not-ready front is re-parked and later block-awaited via [`wait`](ProduceSubmission::wait),
+    /// which consults the `actor_alive` flag (#949) and returns `ActorGone` instead of wedging. (The
+    /// `Disconnected` arm is retained for exhaustiveness and to surface `ActorGone` for any hypothetical
+    /// non-co-located channel.) An empty (not-yet-ready) channel is NOT an error; it is
+    /// [`TryTake::NotReady`].
     ///
     /// [`wait`]: ProduceSubmission::wait
     pub fn try_take(self) -> Result<TryTake, ActorGone> {
@@ -499,16 +508,20 @@ impl ProduceSubmission {
                     Ok(TryTake::Ready(outcome))
                 }
                 // Not yet released: return the submission INTACT (channel un-drained) to re-park. The
-                // co-located `tx` guarantees the channel cannot be disconnected here (the #802
-                // invariant), so `Empty` truly means "the actor has not committed this batch yet".
+                // co-located `tx` (#475) keeps the channel open, so `Empty` means EITHER the actor has
+                // not committed this batch yet OR it exited un-replied (#949) — a non-blocking poll cannot
+                // tell them apart. Either way the front is re-parked; a gone actor is surfaced by the
+                // caller's later BLOCKING `wait` (which consults `actor_alive`), never wedged here.
                 Err(TryRecvError::Empty) => Ok(TryTake::NotReady(ProduceSubmission::Pending {
                     channel,
                     pool,
                     spin,
                     actor_alive,
                 })),
-                // The actor exited before replying (it dropped its cloned `tx` un-sent): map it exactly
-                // like `wait`'s recv error so the session ends the connection cleanly.
+                // UNREACHABLE for a pooled channel (its co-located `tx`, #475, keeps the channel open, so
+                // a gone actor shows as `Empty`/`NotReady` above, not `Disconnected`). Retained to
+                // exhaustively handle the `Result` and to map any hypothetical genuine disconnect to
+                // `ActorGone`, exactly like `wait`'s recv error, so the session ends cleanly.
                 Err(TryRecvError::Disconnected) => Err(ActorGone),
             },
         }
@@ -1757,9 +1770,15 @@ where
     // Seed the gate to the engine's CURRENT durable bytes and policy, so a broker recovered ALREADY
     // over its cap (a restart on a full log) fast-rejects from the very first produce rather than
     // waiting for the first commit to publish a reading. Publish-only (no reconcile): nothing has run
-    // yet, so there are no fast-rejects to fold, and `&engine` is still borrowed before the move.
+    // yet, so there are no fast-rejects to fold, and `&engine` is still borrowed before the move. The
+    // drop-new seed is REAP-AWARE (#804), exactly like the running refresh: a broker configured with
+    // retention / compaction starts DISENGAGED (the byte total is non-monotone across a commit), so it
+    // never false-rejects against a stale-high seed before the first reap.
     match engine.disk_full_policy() {
-        DiskFullPolicy::DropNew => cap_gate.publish_drop_new(engine.durable_record_bytes()),
+        DiskFullPolicy::DropNew => {
+            cap_gate
+                .publish_drop_new_reap_aware(engine.durable_record_bytes(), reap_possible(&engine));
+        }
         _ => cap_gate.disengage(),
     }
     let actor_gate = Arc::clone(&cap_gate);
@@ -1868,14 +1887,42 @@ where
     //    a Level-1 rejection. Two separate exact deltas, each reconciled to its own counter.
     engine.record_fast_reject_sheds(gate.take_unreconciled_fast_rejects());
     engine.record_fire_and_forget_sheds(gate.take_unreconciled_l0_sheds());
-    // 2. Publish the gate's next snapshot from the now-current byte total and overflow policy.
+    // 2. Publish the gate's next snapshot from the now-current byte total and overflow policy. Under
+    //    drop-new the publish is REAP-AWARE (#804): if a consumer-safe retention / compaction reap can
+    //    lower the byte total inside a `commit_batch`, the total is non-monotone across a commit, so the
+    //    last-published snapshot could be transiently STALE-HIGH after an in-commit reap — the gate
+    //    disengages rather than let a connection thread false-reject a produce the post-reap actor would
+    //    accept. With no reap possible (the common case) the total only grows between refreshes, so the
+    //    snapshot is exact and the full #476 fast-reject stays engaged.
     match engine.disk_full_policy() {
-        DiskFullPolicy::DropNew => gate.publish_drop_new(engine.durable_record_bytes()),
+        DiskFullPolicy::DropNew => {
+            gate.publish_drop_new_reap_aware(engine.durable_record_bytes(), reap_possible(engine));
+        }
         // Drop-oldest accepts over-cap produces (force-reap then append), so the gate must not fire.
         // `#[non_exhaustive]` enum: any future non-drop-new policy also disengages, which is the
         // conservative default (fall through to the authoritative actor path).
         _ => gate.disengage(),
     }
+}
+
+/// Whether a consumer-safe retention OR compaction reap can lower `durable_record_bytes` inside a
+/// `commit_batch` under the engine's CURRENT (live-reloadable) config (#804). Any retention bound set
+/// (size / age / count) or compaction enabled makes the byte total NON-MONOTONE across a commit, so the
+/// connection-thread fast-reject's last-published snapshot can be transiently stale-high after an
+/// in-commit reap — and the gate must DISENGAGE rather than risk a false reject. `false` (the common
+/// case: no retention / compaction) means the total only grows between refreshes, so the snapshot is an
+/// exact lower bound and the full #476 fast-reject stays engaged. Read from the engine's cheap
+/// (`Copy`-field) config snapshot, once per batch, amortized with the covering fsync — never per message.
+fn reap_possible<F, C>(engine: &Engine<F, C>) -> bool
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    let cfg = engine.config_snapshot();
+    cfg.max_retained_bytes != 0
+        || cfg.max_age_ms != 0
+        || cfg.max_messages != 0
+        || engine.compaction_config().enabled
 }
 
 /// The pipelined sync tier's spawn-time rig (#1040): the dedicated flusher thread plus its two
@@ -4257,6 +4304,31 @@ mod tests {
         assert!(
             matches!(submission.wait(), Err(ActorGone)),
             "a spin-tier pending produce whose actor exited must return ActorGone, not wedge"
+        );
+    }
+
+    #[test]
+    fn try_take_polls_notready_not_actorgone_on_a_pooled_channel_whose_actor_is_gone() {
+        // #805: `try_take` is a NON-BLOCKING poll. For a POOLED reply channel the co-located `tx` (#475)
+        // keeps the channel OPEN even after the actor exited un-replied, so `try_recv` sees `Empty`, not
+        // `Disconnected` — `try_take` returns `NotReady`, NEVER a spurious `ActorGone`. Actor departure
+        // on the produce path is not detected by this poll; it is surfaced by the caller's BLOCKING
+        // `wait` backstop (which consults `actor_alive`, #949). This pins the corrected contract so the
+        // recv-side `Disconnected`-arm comment can never silently drift back to claiming that this poll
+        // detects a gone actor via channel closure (it cannot — the closure never happens here).
+        let pool: ReplyPool = Arc::new(Mutex::new(Vec::new()));
+        let channel = pool_take(&pool);
+        let actor_alive = Arc::new(AtomicBool::new(false)); // the actor is already gone
+        let submission = ProduceSubmission::Pending {
+            channel,
+            pool: Arc::clone(&pool),
+            spin: false,
+            actor_alive,
+        };
+        assert!(
+            matches!(submission.try_take(), Ok(TryTake::NotReady(_))),
+            "a pooled produce whose actor exited un-replied polls NotReady (the co-located tx keeps the \
+             channel open), never a spurious ActorGone — the blocking wait backstop detects departure"
         );
     }
 
