@@ -208,6 +208,29 @@ impl LeaseTable {
             .collect()
     }
 
+    /// The FULL durable attempt state: the live leases' delivery counts unioned with the CARRIED
+    /// (recovered-but-not-yet-re-claimed) attempt counts (#358/#565), as `(offset, attempt)` pairs in
+    /// ascending-offset order. Unlike [`attempt_counts`](Self::attempt_counts) — which snapshots the
+    /// live leases ONLY — this ALSO includes `carried`, so a snapshot written while a poison count is
+    /// still carried (a stream RECOVERED from its `attempts.ckpt` but NOT yet re-polled, so the count
+    /// sits in `carried` with `leases` empty) does not silently drop that count to zero.
+    ///
+    /// This is the snapshot the hot-set-LRU EVICTION path persists (#565): an evict must never LOWER a
+    /// group's durable attempt count, or a poison could reset its delivery count and escape its
+    /// `MaxDeliver` cap. A carried entry and a live lease for the SAME offset are disjoint in practice
+    /// (the first re-claim moves an offset out of `carried` into `leases`); if both ever held a count
+    /// the MAXIMUM is kept, so the persisted count can only rise, never regress. Bounded by
+    /// `max_in_flight` like both inputs.
+    #[must_use]
+    pub fn all_attempt_counts(&self) -> Vec<(u64, u32)> {
+        let mut merged: BTreeMap<u64, u32> = self.carried.clone();
+        for (&off, lease) in &self.leases {
+            let slot = merged.entry(off).or_insert(0);
+            *slot = (*slot).max(lease.deliveries);
+        }
+        merged.into_iter().collect()
+    }
+
     /// The number of messages currently tracked as in-flight (granted but not yet acked,
     /// whether or not their visibility has expired).
     #[must_use]
@@ -866,6 +889,39 @@ mod tests {
             counts,
             vec![(2, 2)],
             "an acked offset clears its durable count"
+        );
+    }
+
+    #[test]
+    fn all_attempt_counts_unions_live_leases_with_carried_and_never_drops_a_carried_count() {
+        // #565: the eviction-safe snapshot must include CARRIED (recovered-but-not-yet-re-claimed)
+        // counts, not just live leases — else evicting a recovered-not-repolled poison would persist an
+        // EMPTY snapshot and reset its delivery count, letting it escape MaxDeliver.
+        let mut t = LeaseTable::new(cfg());
+        // Two poison counts recovered from disk into `carried`, with NO live lease yet.
+        t.resume_attempts([(off(0).get(), 4), (off(5).get(), 2)]);
+        // The live-leases-only snapshot is EMPTY here — persisting IT would clobber the durable counts.
+        assert!(
+            t.attempt_counts().is_empty(),
+            "no live lease yet — the clobber-risk state the eviction path must not persist blindly"
+        );
+        // The union snapshot preserves BOTH carried counts.
+        let mut all = t.all_attempt_counts();
+        all.sort_unstable();
+        assert_eq!(all, vec![(0, 4), (5, 2)]);
+        // Claim offset 0: it moves from `carried` to a live lease at deliveries = 4 + 1 = 5 (and its
+        // carried entry is consumed). Offset 5 stays carried.
+        match t.claim(off(0), 0) {
+            Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 5),
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        // The union now reflects the live lease (offset 0 -> 5) AND the still-carried offset 5 -> 2.
+        let mut all = t.all_attempt_counts();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            vec![(0, 5), (5, 2)],
+            "leases ∪ carried: a claimed offset's live count and an un-claimed offset's carried count"
         );
     }
 

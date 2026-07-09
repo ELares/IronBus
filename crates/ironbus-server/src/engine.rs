@@ -4497,7 +4497,49 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             Some(g) => g.leases.attempt_counts(),
             None => return Ok(()),
         };
-        let payload = attempts_snapshot_payload(&pairs);
+        self.write_named_group_attempt_pairs(id, group, &pairs)
+    }
+
+    /// The EVICTION-safe attempt-count writer (#565): persists the FULL attempt state — live leases
+    /// UNION carried (recovered-but-not-yet-re-claimed) counts, via [`LeaseTable::all_attempt_counts`]
+    /// — rather than the live leases ONLY. This is what [`evict_named_stream`](Self::evict_named_stream)
+    /// uses so evicting a stream whose poison counts are still CARRIED (recovered from disk but not yet
+    /// re-polled, so `leases` is empty) does NOT overwrite `attempts-<hex>.ckpt` with an empty snapshot
+    /// — which would reset the poison's delivery count to zero and let it escape its `MaxDeliver` cap.
+    /// The periodic checkpoint keeps [`write_named_group_attempts`](Self::write_named_group_attempts)
+    /// (live leases only), gated on cursor-advance / in-flight so it never fires in the
+    /// recovered-not-repolled state. A no-op for an absent stream/group.
+    ///
+    /// # Errors
+    /// Propagates a storage error from opening or writing the checkpoint file.
+    fn write_named_group_attempts_full(
+        &mut self,
+        id: &StreamId,
+        group: &str,
+    ) -> Result<(), EngineError> {
+        let pairs = match self.named_streams.get(id).and_then(|s| s.groups.get(group)) {
+            Some(g) => g.leases.all_attempt_counts(),
+            None => return Ok(()),
+        };
+        self.write_named_group_attempt_pairs(id, group, &pairs)
+    }
+
+    /// Durably writes `pairs` as NAMED stream `id`'s work-group `group` attempt snapshot to
+    /// `streams/<hex(name)>/attempts-<hex(group)>.ckpt` — the shared file-write behind
+    /// [`write_named_group_attempts`](Self::write_named_group_attempts) (live leases, periodic) and
+    /// [`write_named_group_attempts_full`](Self::write_named_group_attempts_full) (leases ∪ carried,
+    /// eviction). Reopened per write so the crash-safe two-slot sequence continues. A no-op if the
+    /// stream's log is not open.
+    ///
+    /// # Errors
+    /// Propagates a storage error from opening or writing the checkpoint file.
+    fn write_named_group_attempt_pairs(
+        &mut self,
+        id: &StreamId,
+        group: &str,
+        pairs: &[(u64, u32)],
+    ) -> Result<(), EngineError> {
+        let payload = attempts_snapshot_payload(pairs);
         let name = group_attempts_name(group);
         let file = {
             let Some(log) = self.streams.get(id) else {
@@ -6489,10 +6531,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// Evicts one NAMED stream from the OPEN set (#565): the flush-before-close eviction step. In order:
     ///   1. SYNC the stream's log so every appended record is durable on disk (dropping the `Log`
     ///      discards its unflushed `pending` buffer, so an un-synced tail would be lost);
-    ///   2. persist EVERY group's committed cursor (#681) AND in-flight attempt counts (#358) at the
-    ///      current watermark, UNCONDITIONALLY (like the idle-group eviction #277), BEFORE dropping the
-    ///      in-memory consumer state — else the committed position / poison-cap would be lost and reopen
-    ///      would redeliver / re-poison;
+    ///   2. persist EVERY group's committed cursor (#681) AND FULL attempt counts (#358) at the current
+    ///      watermark, unconditionally, BEFORE dropping the in-memory consumer state — else the
+    ///      committed position / poison-cap would be lost and reopen would redeliver / re-poison. The
+    ///      cursor write is unconditional so the LATEST committed position is durable even if no interval
+    ///      checkpoint fired since the last ack. The attempts write uses
+    ///      [`write_named_group_attempts_full`](Self::write_named_group_attempts_full) (live leases UNION
+    ///      CARRIED counts), NOT the live-leases-only periodic writer: a stream RECOVERED from disk but
+    ///      not yet re-polled holds its poison counts in `carried` with `leases` EMPTY, so the
+    ///      live-leases-only snapshot would be empty and OVERWRITE the durable `attempts.ckpt` to zero —
+    ///      resetting the poison's delivery count and letting it escape its `MaxDeliver` cap. The union
+    ///      guarantees the persisted count NEVER drops below what is already on disk. (This is unlike the
+    ///      idle-group eviction #277, which writes only the cursor and only for caught-up, lease-free
+    ///      groups.)
     ///   3. DROP the in-memory consumer state and the DLQ sink handle (the DLQ's records are already
     ///      durable — `append_poison` fsyncs in-band — and its per-group idempotency set rebuilds
     ///      lazily from those records on the next reopen, so a poison is never double-dead-lettered);
@@ -6512,9 +6563,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
         // 1) Flush-before-close: make the log's appended records durable BEFORE the fd is dropped.
         self.streams.sync_stream(id).map_err(EngineError::Storage)?;
-        // 2) Persist each group's committed cursor + attempt counts at the current watermark, before the
-        //    in-memory state is dropped. Unconditional (not the interval gate) so the LATEST committed
-        //    position is durable even if no interval checkpoint fired since the last ack.
+        // 2) Persist each group's committed cursor + FULL attempt counts at the current watermark, before
+        //    the in-memory state is dropped. The cursor write is unconditional so the LATEST committed
+        //    position is durable even if no interval checkpoint fired since the last ack; the attempts
+        //    write persists leases UNION carried (`write_named_group_attempts_full`) so a
+        //    recovered-not-yet-repolled poison's durable count is never clobbered to zero (its count sits
+        //    in `carried` with `leases` empty — the live-leases-only writer would erase it).
         let groups: Vec<String> = self
             .named_streams
             .get(id)
@@ -6527,7 +6581,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 .and_then(|s| s.groups.get(group))
                 .map_or(0, |g| g.cursor.committed().get());
             self.write_named_group_checkpoint(id, group, committed)?;
-            self.write_named_group_attempts(id, group)?;
+            self.write_named_group_attempts_full(id, group)?;
         }
         // 3) Drop the in-memory consumer state + DLQ handle (both are reconstructable from disk).
         self.named_streams.remove(id);
@@ -20884,6 +20938,123 @@ mod tests {
         assert_eq!(
             entries[0].attempt, 4,
             "the poison attempt is MaxDeliver + 1 = 4, counted across the restart"
+        );
+    }
+
+    /// #565 REGRESSION: an evicted poison whose durable attempt count sits in `carried`
+    /// (RECOVERED-but-not-yet-re-polled) must NOT have that count clobbered to zero by the eviction.
+    /// The eviction persists leases UNION carried, so on reopen the poison resumes at its true attempt
+    /// number and dead-letters at exactly `MaxDeliver` TOTAL. Exercises the BOOT-evict path (restart with
+    /// `max_open_streams` below the on-disk stream count). Before the fix, `evict_named_stream` wrote the
+    /// live-leases-only snapshot — EMPTY for a recovered-not-repolled stream — overwriting
+    /// `attempts.ckpt` to zero, so the poison reset to attempt 1 and escaped its `MaxDeliver` cap.
+    #[test]
+    fn an_evicted_poison_resumes_its_attempt_count_and_dead_letters_at_max_deliver_not_reset() {
+        use ironbus_storage::dlq::{read_dead_letter_entries, DLQ_SUBDIR};
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        // max_deliver = 5: the 6th claim poisons. Deliver the poison on stream `a` THREE times pre-crash
+        // (attempts 1..3), leaving it IN FLIGHT (cursor NOT past it), and durably checkpoint its attempt
+        // count. Create a sibling `b` on disk so a restart with open cap 1 must evict one of the two.
+        {
+            let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+            e.produce_in_stream(
+                "a",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"poison",
+                },
+            )
+            .unwrap();
+            e.produce_in_stream("b", &append_at(b"b0")).unwrap();
+            for attempt in 1..=3u32 {
+                let d = message(e.poll_in_stream("a", "g", e.now_monotonic()).unwrap());
+                assert_eq!(d.deliveries, attempt);
+                clock.advance_monotonic_nanos(40);
+            }
+            // Clean-shutdown flush: durable attempts-<g>.ckpt for `a` now carries {offset 0 -> 3}.
+            e.checkpoint_in_stream("a", "g").unwrap();
+            drop(e);
+        }
+
+        // RESTART with the open cap at 1: boot recovery opens BOTH a and b (loading a's count 3 into
+        // `carried`, `leases` EMPTY), then boot eviction evicts the LRU (`a`, the lowest-keyed) BEFORE it
+        // is ever re-polled — the exact recovered-not-repolled state the clobber bug corrupts.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            probe.clone(),
+            std::sync::Arc::clone(&clock2),
+            EngineConfig {
+                max_open_streams: 1,
+                ..config(10, 5)
+            },
+        )
+        .unwrap();
+        assert!(
+            !e.is_named_stream_resident("a"),
+            "a was evicted at boot in the recovered-not-repolled state"
+        );
+        assert_eq!(e.named_stream_count(), 1);
+
+        // REOPEN a by polling it: it recovers the PRESERVED count (3) from disk, so the first redelivery
+        // is attempt 4 (3 + 1), NOT 1. Poll until it dead-letters, counting the DELIVERIES: exactly
+        // MaxDeliver - 3 = 2 more (attempts 4, 5), then the 6th claim dead-letters. The BUG would reset to
+        // 0 and deliver 5 more times (attempts 1..5) — failing the first-redelivery assertion below.
+        let mut post_reopen_deliveries = 0u32;
+        let deliveries_before_dead_letter = loop {
+            match e.poll_in_stream("a", "g", e.now_monotonic()).unwrap() {
+                Poll::Message(d) => {
+                    post_reopen_deliveries += 1;
+                    if post_reopen_deliveries == 1 {
+                        assert_eq!(
+                            d.deliveries, 4,
+                            "resumed at attempt 4 (3 carried + 1), NOT reset to 1 by the eviction"
+                        );
+                    }
+                    clock2.advance_monotonic_nanos(40);
+                }
+                Poll::Parked { offset, .. } => {
+                    assert_eq!(offset, Offset::ZERO);
+                    break post_reopen_deliveries;
+                }
+                other => panic!("unexpected poll {other:?}"),
+            }
+        };
+        assert_eq!(
+            deliveries_before_dead_letter, 2,
+            "the poison was delivered exactly MaxDeliver - 3 = 2 more times before dead-lettering — \
+             the durable count survived the evict/reopen (a reset would redeliver it 5 more times)"
+        );
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "reaches the DLQ after MaxDeliver TOTAL, exactly once"
+        );
+        assert_eq!(
+            e.committed_offset_in_stream("a", "g"),
+            Offset::new(1),
+            "committed past the poison"
+        );
+        drop(e);
+
+        // The single DLQ entry records attempt 6 (MaxDeliver + 1) — TOTAL across the evict/reopen.
+        let stream_fs = probe
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("a"))
+            .unwrap();
+        let entries = read_dead_letter_entries(&stream_fs, DLQ_SUBDIR).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].attempt, 6,
+            "the poison attempt is MaxDeliver + 1 = 6, counted across the evict/reopen — not reset"
         );
     }
 
