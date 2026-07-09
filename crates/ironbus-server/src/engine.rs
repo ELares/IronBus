@@ -8191,17 +8191,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ///
     /// With NO group at all — a produce-only stream no consumer ever bound — the floor is that
     /// stream's durable head, so every sealed record is reapable once a bound trips (matching the
-    /// default's "no touched group ⇒ floor is the head"). Returns `0` (a safe over-protecting
-    /// under-estimate that reaps nothing) if the stream is not resident; the reaper only ever runs on
-    /// a resident stream, so that branch is a guard, never the live path.
+    /// default's "no touched group ⇒ floor is the head"). This covers BOTH the in-memory produce-only
+    /// stream (a `named_streams` entry with an empty `groups` map) AND a produce-only stream RECOVERED
+    /// at boot / on reopen, which has NO `named_streams` entry at all (`recover_one_named_stream`
+    /// returns an empty `NamedStream` that is dropped, so the map stays absent) — both must floor at
+    /// the head, NOT at 0. Flooring the recovered case at 0 was the subtle bug: it would silently
+    /// disable retention for a producer-only stream after a restart, protecting everything forever.
+    /// The head read returns `0` only when the stream is not resident (the reaper's `get_mut` is then
+    /// also `None`, so it is a harmless guard, never the live path).
     fn min_committed_offset_named(&self, id: &StreamId) -> u64 {
-        let Some(ns) = self.named_streams.get(id) else {
-            return 0;
-        };
         let head = self
             .streams
             .get(id)
             .map_or(0, |log| log.flushed_offset().get());
+        let Some(ns) = self.named_streams.get(id) else {
+            return head;
+        };
         let live = ns
             .groups
             .values()
@@ -17126,6 +17131,52 @@ mod tests {
             e.dlq_records(),
             1,
             "the DLQ record is intact — reaping the main log never touched the dlq/ subtree"
+        );
+    }
+
+    #[test]
+    fn a_produce_only_named_stream_reaps_after_a_restart() {
+        // #566 regression: a producer-only named stream (no consumer, no groups) recovered at boot has
+        // NO `named_streams` entry, so its retention floor must be its durable HEAD (everything
+        // reapable), NOT 0. Flooring the recovered no-entry case at 0 would silently disable retention
+        // for the stream forever after a restart — this pins that post-restart produces keep reaping.
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "logs", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("logs"))
+            .unwrap()
+            .durable_record_bytes();
+
+        let fs = InMemoryFs::new();
+        let reopen_fs = fs.clone();
+        let mut e = Engine::open(fs, ManualClock::new(), config_with_retention(4 * one)).unwrap();
+        for _ in 0..8 {
+            produce_named(&mut e, "logs", &[0xab; 16]);
+        }
+        drop(e);
+
+        // RESTART: reopen from the same fs. The produce-only "logs" recovers resident with NO
+        // named_streams entry (an empty recovered NamedStream is dropped, so the map stays absent).
+        let mut e = Engine::open(
+            reopen_fs,
+            ManualClock::new(),
+            config_with_retention(4 * one),
+        )
+        .unwrap();
+        assert!(
+            e.is_named_stream_resident("logs"),
+            "the produce-only stream recovered resident"
+        );
+        let earliest_after_restart = e.streams.get(&sid("logs")).unwrap().earliest_offset().get();
+        // Produce past the bound: retention must reap (floor = head, not 0), advancing earliest.
+        for _ in 0..24 {
+            produce_named(&mut e, "logs", &[0xab; 16]);
+        }
+        let earliest_after_churn = e.streams.get(&sid("logs")).unwrap().earliest_offset().get();
+        assert!(
+            earliest_after_churn > earliest_after_restart,
+            "a produce-only stream keeps reaping after restart (floor = head, not 0): {earliest_after_churn} > {earliest_after_restart}"
         );
     }
 
