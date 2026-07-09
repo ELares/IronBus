@@ -69,6 +69,14 @@ pub const LAYOUT_VERSION: u32 = 1;
 /// M2-I2 materializes it.
 pub const STREAMS_SUBDIR: &str = "streams";
 
+/// The reserved data-dir subtree for PARTITIONED streams (M2-I11b, #693): each partitioned stream is
+/// a [`crate::partitioned::PartitionedStream`] rooted at `pstreams/<hex(name)>/`, whose `P` sub-logs
+/// live under `pstreams/<hex(name)>/p-<08x(i)>/`. It is a SEPARATE subtree from [`STREAMS_SUBDIR`] so
+/// the single-log [`crate::streamset::StreamSet`] (which scans only `streams/`) never mistakes a
+/// partitioned stream's root for a plain named-stream log. NOT created until a stream declares `P > 1`,
+/// so a deployment that never partitions never materializes `pstreams/` (its disk image is unchanged).
+pub const PARTITIONED_STREAMS_SUBDIR: &str = "pstreams";
+
 /// The on-disk file name of the layout marker. It deliberately does NOT match the `seg-<hex>.log`
 /// or `cursor*.ckpt` naming, so segment enumeration ([`crate::naming::segment_ids`]) and cursor
 /// discovery skip it as a foreign file.

@@ -406,6 +406,15 @@ pub struct Session {
     /// engine job by value across the actor channel is a refcount bump, not an allocation, exactly like
     /// `subscription`.
     stream: GroupName,
+    /// The PARTITION this connection's consume path is addressed to (#693, M2-I11b), or `None` to
+    /// consume the bound stream as a whole (the ONLY behavior for a single-partition or default stream,
+    /// byte-for-byte the pre-#693 path). A `SubTo` carrying an additive partition selector sets this to
+    /// `Some(i)` (validated: the stream must be partitioned and `i < P`); a plain `Sub`/`Unsub`/subject
+    /// subscribe, or a whole-stream `SubTo`, resets it to `None`. When `Some`, the Flow poll loop and the
+    /// Ack path route through the engine's `poll_partition` / `ack_partition` (partition `i`'s OWN sub-log
+    /// on its OWN durable per-partition cursor); when `None` they use the unchanged
+    /// `poll_in_stream_member` / `ack_in_stream`, or the default-stream path when `stream` is empty.
+    partition: Option<u32>,
     /// Whether this connection has EVER published a Level-2 (server+client-ack) produce (#497): set
     /// when an L2 publish is registered for confirmation, and NEVER cleared. It is the gate that keeps
     /// the per-pass `ProduceConfirm` drain off the actor for a connection that never opted into Level 2
@@ -1290,6 +1299,8 @@ impl Session {
         // A repeated Connect re-negotiates idempotently: reset the active named stream to the default
         // so a re-handshake never leaves a stale named-stream binding from a prior negotiation.
         self.stream = GroupName::default();
+        // #693: resetting to the default stream clears any partition binding (whole-stream consume).
+        self.partition = None;
         // The server caps, read LOCALLY off the handle (NO actor round-trip), so the handshake never
         // touches the actor's checkpoint/fsync path and a stalled produce on one connection cannot
         // head-of-line-block this Connect (invariant 4, #177). The caps are static engine config.
@@ -1716,6 +1727,13 @@ impl Session {
         // phase, the #676 scope), so a named-stream consumer that sends one of those gets a fence rather
         // than a cross-stream effect. The default stream (`self.stream` empty) is byte-for-byte unchanged.
         let stream = self.stream.clone();
+        // #693: a PARTITION-addressed consumer routes its ACK to that partition's OWN durable cursor via
+        // `ack_partition` (plain ack-or-fence, mirroring the named-stream ack path). Checked before the
+        // whole-stream branch; `stream` is non-empty whenever a partition is bound.
+        if let Some(partition) = self.partition {
+            return self
+                .handle_ack_in_partition(engine, stream, partition, group, ack, &token, out);
+        }
         if !stream.is_empty() {
             return self.handle_ack_in_stream(engine, stream, group, ack, &token, out);
         }
@@ -1837,6 +1855,50 @@ impl Session {
             // Nack/Term/Progress are not on the per-stream consume path this phase (#676 scope): fence
             // them (status 0) rather than acting on the default stream's lease table. The lease expires
             // and redelivers on schedule, so at-least-once for the named stream is preserved.
+            AckOp::Nack | AckOp::Term | AckOp::Progress => {
+                self.leased.remove(&ack.offset);
+                reply(out, FrameType::AckStatus, &[0]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles the ACK of a partition-addressed delivery (#693), the per-partition twin of
+    /// [`Session::handle_ack_in_stream`]: routes an `Ack` to partition `partition`'s OWN durable cursor
+    /// via [`Engine::ack_partition`] (which also durably checkpoints it), connection-scoped exactly like
+    /// every other ack (the lease-ownership check ran in [`Session::handle_ack`] before this is reached).
+    /// Nack/Term/Progress are not on the partition consume path this phase (mirroring the named-stream
+    /// scope): they reply FENCED (status 0), so the lease expires and redelivers on schedule.
+    // One more argument than `handle_ack_in_stream` (the partition index): the ack must name the exact
+    // (stream, partition, group) it commits, so the extra parameter is inherent, not incidental.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_ack_in_partition<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        stream: GroupName,
+        partition: u32,
+        group: GroupName,
+        ack: ironbus_proto::message::AckBody,
+        token: &LeaseToken,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        match ack.op {
+            AckOp::Ack => {
+                let token = *token;
+                let status = match engine
+                    .with(move |e| e.ack_partition(&stream, partition, &group, &token))?
+                {
+                    AckResult::Acked => 1u8,
+                    AckResult::Fenced => 0u8,
+                };
+                self.leased.remove(&ack.offset);
+                reply(out, FrameType::AckStatus, &[status]);
+                Ok(())
+            }
             AckOp::Nack | AckOp::Term | AckOp::Progress => {
                 self.leased.remove(&ack.offset);
                 reply(out, FrameType::AckStatus, &[0]);
@@ -2239,8 +2301,16 @@ impl Session {
                 let group = self.subscription.clone();
                 let member = self.member_id;
                 let stream = self.stream.clone();
+                // #693: a PARTITION-addressed consumer (`SubTo` carried a partition selector) drains ONE
+                // partition's sub-log via `poll_partition` (plain competing, its OWN durable per-partition
+                // cursor); `stream` is guaranteed non-empty here (SubTo validated it). A whole-stream or
+                // default-stream consumer takes the unchanged member-aware paths below.
+                let partition = self.partition;
                 let poll = engine.with(move |e| {
-                    if stream.is_empty() {
+                    if let Some(partition) = partition {
+                        let now = e.now_monotonic();
+                        e.poll_partition(&stream, partition, &group, now)
+                    } else if stream.is_empty() {
                         e.poll_now_in_member(&group, member)
                     } else {
                         let now = e.now_monotonic();
@@ -3339,6 +3409,8 @@ impl Session {
         // client never sends `SubTo`, so `self.stream` is already default for it; this only matters for
         // a streams-capable client switching from a named stream back to a plain default subscribe.)
         self.stream = GroupName::default();
+        // #693: resetting to the default stream clears any partition binding (whole-stream consume).
+        self.partition = None;
         self.leased.clear();
         // If the new group is configured key_shared (#64), put it into that mode and join as a
         // member so this connection's keys route to it. A failure to enable the mode (an invalid
@@ -3429,10 +3501,15 @@ impl Session {
             return Ok(());
         }
         let stream = stream.to_string();
-        match engine.with(move |e| e.declare_stream(&stream))? {
+        // #693: the additive `partition_count` decides the backing. `P <= 1` delegates to the plain
+        // single-log declare BYTE-FOR-BYTE; `P > 1` opts the stream into a `PartitionedStream` of `P`
+        // key-routed sub-logs. Both reply a body-less `Ok` (idempotent); a conflict (a different `P`, or
+        // a name already a single named stream) fails closed with the engine's typed reason.
+        let partition_count = decoded.partition_count;
+        match engine.with(move |e| e.declare_partitioned_stream(&stream, partition_count))? {
             // Idempotent: a first declare (`true`) and a re-declare (`false`) both reply a body-less Ok.
             Ok(_) => reply(out, FrameType::Ok, &[]),
-            // A malformed/over-long NAMED name fails closed with the engine's typed reason.
+            // A malformed/over-long NAMED name (or a partition conflict) fails closed with the reason.
             Err(e) => reply_err_coded(out, e.code().as_str(), &e.to_string()),
         }
         Ok(())
@@ -4020,6 +4097,38 @@ impl Session {
             );
             return Ok(());
         }
+        // #693: an additive partition selector addresses ONE partition of a PARTITIONED stream. Validate
+        // it (the stream must be partitioned AND the partition in range) and bind the connection's
+        // consume/ack to that partition — a plain competing subscribe on the partition's OWN sub-log +
+        // its OWN durable per-partition cursor. A selector on a non-partitioned stream, or an
+        // out-of-range partition, is a typed reject (never a silent whole-stream subscribe). Per-partition
+        // key_shared / Tier-S are deferred, so this is the plain competing bind; a whole-stream `SubTo`
+        // (`partition = None`) falls through to the historical named-stream path below unchanged.
+        if let Some(partition) = decoded.partition {
+            let stream_q = stream.to_string();
+            let in_range = engine.with(move |e| {
+                e.partition_count_of(&stream_q)
+                    .is_some_and(|pc| partition < pc.get())
+            })?;
+            if !in_range {
+                reply_err(
+                    out,
+                    &format!("partition {partition} is not addressable on stream {stream:?}"),
+                );
+                return Ok(());
+            }
+            // Abandon any prior key_shared membership + default-stream registration + leases, exactly as
+            // the whole-stream rebind below, then bind the partition.
+            self.leave_current_key_shared(engine)?;
+            self.stream = GroupName::from(stream);
+            self.subscription = GroupName::from(group);
+            self.partition = Some(partition);
+            self.registered_subscription = false;
+            self.joined_key_shared = false;
+            self.leased.clear();
+            reply(out, FrameType::Ok, &[]);
+            return Ok(());
+        }
         // Leave any prior key_shared membership (of the OLD stream+group) BEFORE rebinding, so its keys
         // re-route to the remaining members (#64 follow-up). This reads `self.stream`/`self.subscription`,
         // so it must run before they are reassigned below; a no-op for a connection that had not joined.
@@ -4029,6 +4138,8 @@ impl Session {
         // work-group is created lazily on the first named poll under the per-stream group cap (#676).
         self.stream = GroupName::from(stream);
         self.subscription = GroupName::from(group);
+        // A whole-stream SubTo consumes the stream as a whole (#693): clear any prior partition binding.
+        self.partition = None;
         // A named-stream consume does not register in the default-stream broadcast subscriber set (#676),
         // so leave any such default-stream registration behind (a no-op for a connection that never had
         // one) rather than stranding it. The key_shared membership below is per-(stream, group).
@@ -4367,6 +4478,8 @@ impl Session {
             // Bind this connection's consume path to the resolved stream (`""` = default) + the group.
             self.stream = GroupName::from(resolved_stream.as_str());
             self.subscription = GroupName::from(group);
+            // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
+            self.partition = None;
             self.registered_subscription = false;
             self.joined_key_shared = false;
             self.leased.clear();
@@ -4405,6 +4518,8 @@ impl Session {
         // as a `SubTo` binds an explicit stream id (the resolved stream is already declared by its bind).
         self.stream = GroupName::from(stream.name());
         self.subscription = GroupName::from(group);
+        // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
+        self.partition = None;
         self.registered_subscription = false;
         self.joined_key_shared = false;
         self.leased.clear();
@@ -4439,6 +4554,8 @@ impl Session {
         // eviction structures (#676 named consume is plain competing only), so the leave/evict calls
         // above are no-ops for it; only this local binding needs resetting.
         self.stream = GroupName::default();
+        // #693: resetting to the default stream clears any partition binding (whole-stream consume).
+        self.partition = None;
         self.leased.clear();
         if !leaving.is_empty() {
             engine.with(move |e| {
@@ -12765,6 +12882,142 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn partition_wire_declare_produce_and_addressed_consume_end_to_end() {
+        // #693 THE wire end-to-end: a `StreamDeclare` carrying the additive `partition_count = 2` backs
+        // "orders" with a `PartitionedStream`; keyed produce routes each key to `xxh3_64(key) % 2`; a
+        // `SubTo` carrying the additive partition selector `Some(1)` binds partition 1, and a `Flow`
+        // delivers ONLY partition-1 records (never partition 0's), which ack to partition 1's own cursor.
+        let (e, mut s, mut out) = connect_streams();
+        let pc = ironbus_core::partition::PartitionCount::new(2).unwrap();
+
+        // Declare P=2 over the wire.
+        let mut declare = Vec::new();
+        ironbus_proto::message::encode_stream_declare(
+            &ironbus_proto::message::StreamDeclareBody {
+                stream_id: b"orders",
+                partition_count: 2,
+            },
+            &mut declare,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::StreamDeclare, &declare), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "partitioned declare is acked"
+        );
+        out.clear();
+        assert_eq!(e.engine_mut().partition_count_of("orders"), Some(pc));
+
+        // Two records keyed to partition 1, plus one keyed to partition 0 (to prove isolation).
+        let key1 = (0..10_000u32)
+            .map(|n| format!("k{n}").into_bytes())
+            .find(|k| ironbus_core::partition::partition_for_key(k, pc).get() == 1)
+            .expect("a key routing to partition 1");
+        let key0 = (0..10_000u32)
+            .map(|n| format!("z{n}").into_bytes())
+            .find(|k| ironbus_core::partition::partition_for_key(k, pc).get() == 0)
+            .expect("a key routing to partition 0");
+        for p in [&b"first"[..], b"second"] {
+            e.engine_mut()
+                .produce_in_stream(
+                    "orders",
+                    &Append {
+                        timestamp_ms: 0,
+                        flags: RecordFlags::EMPTY,
+                        key: &key1,
+                        headers: b"",
+                        payload: p,
+                    },
+                )
+                .unwrap();
+        }
+        e.engine_mut()
+            .produce_in_stream(
+                "orders",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: &key0,
+                    headers: b"",
+                    payload: b"other",
+                },
+            )
+            .unwrap();
+
+        // SubTo partition 1 over the wire (additive selector).
+        let mut sub = Vec::new();
+        ironbus_proto::message::encode_sub_to(
+            &ironbus_proto::message::SubToBody {
+                stream_id: b"orders",
+                group: b"w",
+                partition: Some(1),
+            },
+            &mut sub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubTo, &sub), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "partition-addressed SubTo is acked"
+        );
+        out.clear();
+
+        // Flow: partition 1 delivers ONLY its own two records, never partition 0's "other".
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "the partition-1 consumer sees only partition-1 records over the wire"
+        );
+
+        // Ack every delivered record; each routes to partition 1's OWN durable cursor (status 1).
+        for (ty, body) in decode_all(&out) {
+            if ty != FrameType::Deliver {
+                continue;
+            }
+            let d = decode_deliver(&body).unwrap();
+            let mut ack = Vec::new();
+            encode_ack(
+                &AckBody {
+                    offset: d.offset,
+                    generation: d.generation,
+                    op: AckOp::Ack,
+                    delay_ms: 0,
+                },
+                &mut ack,
+            );
+            let mut aout = Vec::new();
+            s.process(&e, &frame(FrameType::Ack, &ack), &mut aout)
+                .unwrap();
+            let (aty, abody) = one_response(&aout);
+            assert_eq!(aty, FrameType::AckStatus);
+            assert_eq!(abody, vec![1u8], "the partition ack committed");
+        }
+        out.clear();
+
+        // Nothing more to deliver on partition 1 (all acked); its cursor advanced independently.
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            delivered_payloads(&out).is_empty(),
+            "no more partition-1 records after ack"
+        );
+        assert_eq!(
+            e.engine_mut()
+                .committed_offset_in_partition("orders", 1, "w")
+                .get(),
+            2,
+            "partition 1's cursor committed both its records"
+        );
+    }
+
+    #[test]
     fn bind_publish_and_subscribe_by_subject_end_to_end_over_the_wire() {
         // THE wire end-to-end: BindSubject "order.>" -> "orders"; PubSubject "order.us.created"
         // resolves single-home and lands in "orders" (a PubAck comes back); then a SubSubject on a
@@ -14438,6 +14691,7 @@ mod tests {
             &ironbus_proto::message::SubToBody {
                 stream_id: stream,
                 group,
+                partition: None,
             },
             &mut body,
         )

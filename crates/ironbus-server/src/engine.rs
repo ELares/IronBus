@@ -35,6 +35,7 @@ use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
 use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
+use ironbus_core::partition::{PartitionCount, PartitionIndex};
 use ironbus_core::producer_seq::{
     decode_seq_snapshot, encode_seq_snapshot, ProducerSeqRegistry, SeqConfig, SeqDecision,
 };
@@ -48,9 +49,13 @@ use ironbus_storage::checkpoint::{
 };
 use ironbus_storage::dlq::{DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
+use ironbus_storage::layout::PARTITIONED_STREAMS_SUBDIR;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds, SyncTicket};
 use ironbus_storage::loss::LossReport;
-use ironbus_storage::naming::MAX_STREAM_NAME_LEN;
+use ironbus_storage::naming::{
+    parse_partition_subdir_name, parse_stream_subdir_name, stream_subdir_name, MAX_STREAM_NAME_LEN,
+};
+use ironbus_storage::partitioned::PartitionedStream;
 use ironbus_storage::segment::{OwnedRecord, RawByteRun, StorageError};
 use ironbus_storage::streamset::{CommitOutcome, StreamError, StreamId, StreamSet};
 use ironbus_storage::txn::{TxnStore, TxnStoreError};
@@ -2510,6 +2515,81 @@ fn recover_one_named_stream<F: Filesystem, C: Clock>(
     Ok(ns)
 }
 
+/// The recovered partitioned-stream state (#693): the reopened [`PartitionedStream`]s keyed by
+/// [`StreamId`], paired with each partition's resumed per-group consumer state keyed by
+/// `(stream, partition index)`. Named so the two-map tuple does not trip the `type_complexity` lint.
+type PartitionedRecovery<F, C> = (
+    BTreeMap<StreamId, PartitionedStream<F, C>>,
+    BTreeMap<(StreamId, u32), NamedStream>,
+);
+
+/// Reopens every PARTITIONED stream (#693) under `pstreams/<hex(name)>/`, and resumes each partition's
+/// per-group consumer cursor from its own sub-log subdir — the partitioned twin of
+/// [`recover_named_stream_groups`]. For each `pstreams/` child whose name is a canonical hex-encoded
+/// stream name, the partition count `P` is DERIVED from the number of materialized `p-<08x>/` subdirs
+/// (the source of truth #591 lays down), and the [`PartitionedStream`] is reopened with that `P` so its
+/// `P` sub-logs each recover independently over their own durable bytes. Each partition's cursor is
+/// resumed via [`recover_one_named_stream`] on that partition's [`Log`], so a partition-addressed
+/// consumer resumes at its committed offset after a restart instead of redelivering the partition.
+///
+/// A foreign/non-canonical child directory is skipped; a data dir with no `pstreams/` subtree returns
+/// two empty maps and never materializes it (the non-partitioned image is unchanged).
+///
+/// # Errors
+/// Propagates a storage error from enumerating `pstreams/`, opening/recovering a partition's log, or
+/// reading a partition's checkpoint files.
+fn recover_partitioned_streams<F, C>(
+    root_log: &Log<F, C>,
+    lease: LeaseConfig,
+    opened_at: u64,
+) -> Result<PartitionedRecovery<F, C>, EngineError>
+where
+    F: Filesystem + Clone,
+    C: Clock + Clone,
+{
+    let mut partitioned = BTreeMap::new();
+    let mut consumers = BTreeMap::new();
+    let root = root_log.filesystem();
+    if !root.subdir_exists(PARTITIONED_STREAMS_SUBDIR)? {
+        return Ok((partitioned, consumers));
+    }
+    let pfs = root.subdir(PARTITIONED_STREAMS_SUBDIR)?;
+    let config = root_log.config();
+    for dir in pfs.list_subdirs()? {
+        let Some(name) = parse_stream_subdir_name(&dir) else {
+            continue;
+        };
+        let Ok(id) = StreamId::named(&name) else {
+            continue;
+        };
+        let stream_root = pfs.subdir(&dir)?;
+        // P = the count of canonical `p-<08x>/` partition subdirs #591 materialized under this stream.
+        let count = stream_root
+            .list_subdirs()?
+            .iter()
+            .filter(|d| parse_partition_subdir_name(d).is_some())
+            .count();
+        let Some(pc) = u32::try_from(count).ok().and_then(PartitionCount::new) else {
+            continue;
+        };
+        let (ps, _recoveries) =
+            PartitionedStream::open(&stream_root, root_log.clock_clone(), config, pc)
+                .map_err(EngineError::Storage)?;
+        // Resume each partition's per-group consumer cursor from its own sub-log subdir.
+        for i in 0..pc.get() {
+            let idx = PartitionIndex::new(i);
+            if let Some(plog) = ps.partition(idx) {
+                let ns = recover_one_named_stream(plog, lease, opened_at)?;
+                if !ns.groups.is_empty() || !ns.group_last_checkpointed.is_empty() {
+                    consumers.insert((id.clone(), i), ns);
+                }
+            }
+        }
+        partitioned.insert(id, ps);
+    }
+    Ok((partitioned, consumers))
+}
+
 /// Reconstructs a group's carried attempt counts from a recovered `attempts.ckpt` payload, clamped
 /// to the durable log head `flushed` and the resumed committed watermark `committed`: a carried
 /// count is only meaningful for an offset that still exists (`< flushed`) and has NOT been committed
@@ -3037,6 +3117,24 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// before the first poison redelivers after a crash. Empty for a deployment that never
     /// dead-letters a named stream, so the default and no-poison paths cost nothing.
     named_dlq: BTreeMap<StreamId, DlqSink<F, C>>,
+    /// The per-PARTITIONED-stream storage (#693, V2-M2-I11b): each entry is a
+    /// [`PartitionedStream`] of `P > 1` independent, key-routed sub-logs rooted under
+    /// `pstreams/<hex(name)>/` (the `PartitionedStream` #591 primitive, threaded through the engine).
+    /// Keyed by [`StreamId`] so a partitioned stream is ISOLATED from the single-log named streams in
+    /// [`Engine::streams`] — the two are DISJOINT namespaces (a name is either a single stream or a
+    /// partitioned one, never both). A produce to one of these routes by the record's key to
+    /// `xxh3_64(key) % P` and commits with the stream's OWN [`PartitionedStream::commit_tick`]
+    /// group-commit barrier; a partition-addressed consume drains ONE partition's sub-log. EMPTY for a
+    /// deployment that never declares `P > 1`, so the default + named-stream paths are byte-for-byte
+    /// unchanged and `pstreams/` is never materialized.
+    partitioned: BTreeMap<StreamId, PartitionedStream<F, C>>,
+    /// The per-PARTITION consumer state (#693), keyed by `(stream, partition index)`: each entry is a
+    /// [`NamedStream`]'s work-group machinery (its competing `groups` + durable per-group cursor #681),
+    /// re-instantiated PER PARTITION so a consumer addressing partition `i` drains it on its OWN
+    /// independent, durably-checkpointed cursor — the per-partition twin of [`Engine::named_streams`].
+    /// A partition's cursor lives in ITS sub-log's `pstreams/<hex(name)>/p-<08x(i)>/cursor-<hex>.ckpt`,
+    /// so it recovers beside its own records. EMPTY until a partitioned stream is consumed.
+    partition_consumers: BTreeMap<(StreamId, u32), NamedStream>,
     /// The durable TRANSACTIONAL HALF-MESSAGE store (V2-M8, #640): the `txn/` sub-log that buffers
     /// prepared (half) messages INVISIBLE to consumers and their commit/rollback op-markers, plus the
     /// in-memory lifecycle table it rebuilds at open. Opened LAZILY on the first `TxnPrepare` (so a
@@ -3448,6 +3546,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             }
         }
 
+        // Recover each PARTITIONED stream (#693) from its `pstreams/<hex(name)>/` subtree: reopen its
+        // `P` sub-logs (with `P` derived from the materialized `p-<08x>/` partition subdir count) as a
+        // `PartitionedStream`, and resume each partition's per-group consumer cursor from THAT
+        // partition's own subdir — the per-partition twin of `recover_named_stream_groups` above. A
+        // deployment that never declared `P > 1` has no `pstreams/` subtree, so this is a no-op and the
+        // on-disk image is byte-for-byte unchanged.
+        let (partitioned, partition_consumers) =
+            recover_partitioned_streams(&log, config.lease, opened_at)?;
+
         // The TRANSACTIONAL HALF-MESSAGE store's log (V2-M8, #640) shares the main log's segment
         // sizing but is NEVER byte-capped: a prepared half message is an undelivered durable payload
         // and a resolution op-marker is the durable record of the commit/rollback, so neither may be
@@ -3562,6 +3669,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The per-named-stream dead-letter sinks (#681 follow-up), eagerly opened above for every
             // recovered stream whose `dlq/` subdir already exists; the rest open lazily on first poison.
             named_dlq,
+            // The per-partitioned-stream storage + per-partition consumer state (#693), recovered above
+            // from `pstreams/`. Empty for a deployment that never declared `P > 1`.
+            partitioned,
+            partition_consumers,
             // The transactional half-message store (V2-M8, #640): opened above iff the `txn/` subdir
             // already exists, else `None` until the first `TxnPrepare` lazily creates it. A
             // non-transactional broker keeps this `None`, so the produce/consume hot path is unchanged.
@@ -4409,6 +4520,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         for (id, group) in stream_groups {
             self.checkpoint_named_group(&id, &group)?;
         }
+        // Flush every PARTITION's per-group consumer cursor (#693), the per-partition twin of the
+        // named-stream loop above: a clean shutdown persists each partition-addressed consumer's
+        // committed position (to `pstreams/<hex(name)>/p-<08x(i)>/cursor-<hex(group)>.ckpt`) so a restart
+        // resumes it instead of redelivering the partition. Snapshot the `(stream, partition, group)`
+        // triples first so the `&mut self` checkpoint calls do not borrow `partition_consumers` across
+        // the loop. A no-op for a deployment that never consumed a partitioned stream.
+        let mut partition_groups: Vec<(StreamId, u32, String)> = Vec::new();
+        for ((id, partition), ns) in &self.partition_consumers {
+            for group in ns.groups.keys() {
+                partition_groups.push((id.clone(), *partition, group.clone()));
+            }
+        }
+        for (id, partition, group) in partition_groups {
+            self.checkpoint_partition_group(&id, PartitionIndex::new(partition), &group)?;
+        }
         // Flush the idempotent-producer SEQUENCE high-waters (V2-M8) on the clean-shutdown barrier too,
         // AFTER the cursors are flushed (so the durable head the high-waters clamp against is advanced)
         // and BEFORE the observability-only counters. CORRECTNESS state: a restart after a clean stop
@@ -4863,6 +4989,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             });
         }
         let id = StreamId::named(stream)?;
+        // #693: a PARTITIONED stream (declared with `P > 1`) routes the produce BY KEY to its partition
+        // sub-log (`xxh3_64(key) % P`, #591), NOT to a single named-stream log. This runs BEFORE the
+        // single-stream path below so a partitioned name never materializes a plain `streams/<hex>/`
+        // log. A no-op for the common case (no partitioned streams declared): one map lookup.
+        if self.partitioned.contains_key(&id) {
+            return self
+                .produce_partitioned(&id, message)
+                .map(|(_, offset)| offset);
+        }
         // #863: cap the DISTINCT-stream count before materializing a NEW stream (inode/dir bound).
         self.check_stream_cap(&id)?;
         // Declare-on-first-produce THROUGH the hot-set LRU (#565): open (or lazily REOPEN + per-stream
@@ -4910,6 +5045,572 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // unchanged.
         self.reap_named_for_retention(&id)?;
         Ok(offset)
+    }
+
+    // ===================================================================================
+    // PARTITIONED-STREAM WIRING (#693, V2-M2-I11b): thread the `PartitionedStream` (#591) storage
+    // primitive through the engine. A stream declared with `P > 1` is backed by a `PartitionedStream`
+    // of `P` independent, key-routed sub-logs under `pstreams/<hex(name)>/`. A produce ROUTES BY KEY to
+    // `xxh3_64(key) % P` (#591's stable hash), so every record sharing a key lands in — and keeps its
+    // order within — one partition; a keyless produce spreads by the stream's round-robin selector. A
+    // partition-addressed consume drains ONE partition's sub-log on its OWN competing work-group + its
+    // OWN durable per-partition cursor (#681, checkpointed under the partition subdir), so `P`
+    // partitions consume `P`-way in parallel with fully isolated cursors.
+    //
+    // SCOPE (this PR = the CORE wiring): declare-P, produce-route-by-key (+ the stream's own
+    // `PartitionedStream::commit_tick` group-commit barrier + froze->WriterFrozen), per-partition
+    // retention, and partition-addressed competing consume with a durable per-partition cursor. The
+    // ASSIGNMENT is SIMPLE/STATIC — a consumer names ONE explicit partition. DEFERRED follow-ups (never
+    // removed from a single-log named stream): cooperative rebalance / dynamic partition->consumer
+    // assignment, a per-partition DLQ (#1110-style; a poison is committed-past + `Poll::Parked` here),
+    // per-partition subject filters / key-shared routing / Tier-S streaming, and per-partition metric
+    // labels. `P == 1` is NEVER a `PartitionedStream`: it is today's single-log named stream, byte-for-
+    // byte on the wire AND on disk.
+    // ===================================================================================
+
+    /// Declares a stream with `partition_count` partitions (#693): the engine-side of the additive
+    /// `partition_count` field on the `StreamDeclare` wire verb. A `partition_count <= 1` is a plain
+    /// single-partition named stream and delegates to [`Engine::declare_stream`] BYTE-FOR-BYTE (no
+    /// `PartitionedStream`, no `pstreams/` subtree). A `partition_count > 1` opens (or idempotently
+    /// re-ensures) a [`PartitionedStream`] of `P` independent sub-logs under `pstreams/<hex(name)>/`.
+    ///
+    /// Idempotent: re-declaring an existing partitioned stream with the SAME `P` is `Ok(false)`; a
+    /// FIRST declare is `Ok(true)`. Repartitioning (a different `P`) is NOT supported (it would reshuffle
+    /// every key, #591's honest modulo-hash caveat) and a name that already exists as a SINGLE named
+    /// stream cannot be re-declared partitioned — both are rejected fail-closed.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for the empty/default name (it is never partitioned), a
+    /// malformed named name, a name already resident as a single named stream, or a re-declare with a
+    /// DIFFERENT partition count; [`EngineError::TooManyStreams`] if opening one more would exceed the
+    /// distinct-stream cap; else a storage error from opening the partitioned stream's sub-logs.
+    pub fn declare_partitioned_stream(
+        &mut self,
+        stream: &str,
+        partition_count: u32,
+    ) -> Result<bool, EngineError>
+    where
+        F: Clone,
+    {
+        // P <= 1 is today's single-log named stream, byte-for-byte (no PartitionedStream at all).
+        if partition_count <= 1 {
+            return self.declare_stream(stream);
+        }
+        // The default stream is the root log and is never partitioned.
+        if stream.is_empty() {
+            return Err(EngineError::InvalidStreamName {
+                name: String::new(),
+            });
+        }
+        let id = StreamId::named(stream)?;
+        let pc =
+            PartitionCount::new(partition_count).ok_or_else(|| EngineError::InvalidStreamName {
+                name: stream.to_string(),
+            })?;
+        // Idempotent re-declare: SAME P -> Ok(false); DIFFERENT P -> fail-closed (no live repartition).
+        if let Some(existing) = self.partitioned.get(&id) {
+            if existing.count() == pc {
+                return Ok(false);
+            }
+            return Err(EngineError::InvalidStreamName {
+                name: stream.to_string(),
+            });
+        }
+        // A name already resident as a SINGLE named stream cannot also be a partitioned stream (the two
+        // are disjoint namespaces): reject rather than silently shadow.
+        if self.known_named_streams.contains(&id) {
+            return Err(EngineError::InvalidStreamName {
+                name: stream.to_string(),
+            });
+        }
+        // Distinct-stream cap (#863): count partitioned streams alongside named ones (inode/fd bound).
+        if self.max_streams != 0
+            && self.known_named_streams.len() + self.partitioned.len() >= self.max_streams
+        {
+            return Err(EngineError::TooManyStreams {
+                max: self.max_streams,
+            });
+        }
+        let root = self.partitioned_stream_root(&id)?;
+        let (ps, _recoveries) =
+            PartitionedStream::open(&root, self.log.clock_clone(), self.log.config(), pc)
+                .map_err(EngineError::Storage)?;
+        self.partitioned.insert(id, ps);
+        Ok(true)
+    }
+
+    /// The partition count `P` of the partitioned stream `stream` (#693), or `None` if `stream` is not
+    /// a partitioned stream (the default stream, a single named stream, an unknown/malformed name). The
+    /// query the wire/session layer uses to decide whether a produce/consume must route through the
+    /// partition path.
+    #[must_use]
+    pub fn partition_count_of(&self, stream: &str) -> Option<PartitionCount> {
+        let id = StreamId::named(stream).ok()?;
+        self.partitioned.get(&id).map(PartitionedStream::count)
+    }
+
+    /// Resolves the `pstreams/<hex(name)>/` root filesystem for a partitioned stream `id`, creating the
+    /// `pstreams/` subtree + the stream's subdir on first use. The [`PartitionedStream`] then roots its
+    /// `p-<08x(i)>/` sub-logs under this handle.
+    fn partitioned_stream_root(&self, id: &StreamId) -> Result<F, EngineError>
+    where
+        F: Clone,
+    {
+        let pfs = self.log.filesystem().subdir(PARTITIONED_STREAMS_SUBDIR)?;
+        let root = pfs.subdir(&stream_subdir_name(id.name()))?;
+        Ok(root)
+    }
+
+    /// Produces `message` to the partitioned stream `id` (#693), ROUTING it by key to `xxh3_64(key) % P`
+    /// (a keyless record spreads round-robin, #591), appending to that ONE partition's sub-log and
+    /// committing it with the stream's OWN [`PartitionedStream::commit_tick`] group-commit barrier.
+    /// Returns the partition it landed in and the [`Offset`] within that partition.
+    ///
+    /// The durability contract is per PARTITION: the record is acked only after its partition's covering
+    /// `fdatasync`; a partition whose barrier FROZE surfaces a fatal [`StorageError::WriterFrozen`]
+    /// instead of acking a non-durable record (I2, ack-implies-durable). Per-partition retention runs
+    /// after the durable commit, exactly as the named-stream produce reaps after its commit.
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownStream`] if `id` is not a partitioned stream, a storage error from the
+    /// append, or [`StorageError::WriterFrozen`] if the chosen partition's commit barrier froze.
+    fn produce_partitioned(
+        &mut self,
+        id: &StreamId,
+        message: &Append<'_>,
+    ) -> Result<(PartitionIndex, Offset), EngineError> {
+        // Route + append to the key's partition (short mutable borrow of the storage map).
+        let (idx, offset) = {
+            let ps = self
+                .partitioned
+                .get_mut(id)
+                .ok_or_else(|| EngineError::UnknownStream {
+                    name: id.name().to_string(),
+                })?;
+            ps.append(message).map_err(EngineError::Storage)?
+        };
+        // Per-stream PRODUCE throughput (#571), keyed by the stream name (bounded/overflow-folded).
+        self.registry.record_stream_produced(id.name().as_bytes());
+        // ONE cross-partition group-commit tick (#591): K dirtied partitions => K fdatasync barriers,
+        // amortized over the batch; a clean partition costs nothing. A partition whose covering
+        // fdatasync FAILED is FROZEN (its durable head did not advance) -> surface WriterFrozen rather
+        // than ack a non-durable record (I2), exactly as the named-stream produce path does on a froze.
+        let froze = {
+            let ps = self
+                .partitioned
+                .get_mut(id)
+                .expect("partitioned stream present after append");
+            ps.commit_tick().froze.contains(&idx)
+        };
+        if froze {
+            return Err(EngineError::Storage(StorageError::WriterFrozen));
+        }
+        // Per-PARTITION retention + compaction (#566, per partition): reclaim disk on the chosen
+        // partition's own sub-log, floored at that partition's min-committed offset so a slow consumer's
+        // records are never reaped. A no-op unless retention/compaction is configured.
+        self.reap_partition_for_retention(id, idx)?;
+        Ok((idx, offset))
+    }
+
+    /// Per-partition retention + compaction (#693), the per-partition twin of
+    /// [`Engine::reap_named_for_retention`]: reaps fully-consumed old sealed segments of partition
+    /// `idx`'s sub-log past the retention bound (floored at that partition's own min-committed offset)
+    /// and runs one off-hot-path compaction pass, reusing the same [`Log::reap`] / [`Log::maybe_compact`]
+    /// machinery per partition. A no-op unless retention or compaction is configured.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the partition's reap or compaction pass.
+    fn reap_partition_for_retention(
+        &mut self,
+        id: &StreamId,
+        idx: PartitionIndex,
+    ) -> Result<(), EngineError> {
+        if self.retention != RetentionBounds::default() {
+            let protect_below = self.min_committed_offset_partition(id, idx);
+            let bounds = self.retention;
+            if let Some(log) = self
+                .partitioned
+                .get_mut(id)
+                .and_then(|ps| ps.partition_mut(idx))
+            {
+                let outcome = log
+                    .reap(bounds, protect_below)
+                    .map_err(EngineError::Storage)?;
+                self.counters.segments_reaped = self
+                    .counters
+                    .segments_reaped
+                    .saturating_add(outcome.segments_reaped);
+            }
+        }
+        if self.compaction.enabled {
+            let compaction = self.compaction;
+            if let Some(log) = self
+                .partitioned
+                .get_mut(id)
+                .and_then(|ps| ps.partition_mut(idx))
+            {
+                let _ = log
+                    .maybe_compact(&compaction)
+                    .map_err(EngineError::Storage)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The min committed offset across partition `(id, idx)`'s consumer groups (#693), the retention
+    /// PROTECT floor for that partition: no group's unconsumed records are reaped. Falls back to the
+    /// partition's durable head when it has no consumer groups yet (nothing consumes it, so retention is
+    /// free to reap up to the head). The per-partition twin of [`Engine::min_committed_offset_named`].
+    fn min_committed_offset_partition(&self, id: &StreamId, idx: PartitionIndex) -> u64 {
+        let head = self
+            .partitioned
+            .get(id)
+            .and_then(|ps| ps.partition(idx))
+            .map_or(0, |log| log.flushed_offset().get());
+        let Some(ns) = self.partition_consumers.get(&(id.clone(), idx.get())) else {
+            return head;
+        };
+        let live = ns
+            .groups
+            .values()
+            .filter(|g| g.touched)
+            .map(|g| g.cursor.committed().get());
+        let ghosts = ns
+            .group_last_checkpointed
+            .iter()
+            .filter(|(name, _)| !ns.groups.contains_key(name.as_str()))
+            .map(|(_, &committed)| committed);
+        live.chain(ghosts).min().unwrap_or(head)
+    }
+
+    /// Polls PARTITION `partition` of the partitioned stream `stream` in competing work-group `group`
+    /// (#693): delivers the next in-order record off THAT partition's OWN sub-log, on its OWN durable
+    /// cursor + lease table, isolated from every other partition (so `P` consumers drain `P` partitions
+    /// in parallel). The SIMPLE/STATIC assignment — one consumer names one explicit partition.
+    ///
+    /// The delivery loop is the plain-competing claim/lease/disposition core the default stream uses,
+    /// scoped to one partition; a poison over `max_deliver` is committed-past and surfaced as
+    /// [`Poll::Parked`] (a per-partition DLQ is a deferred follow-up). A below-earliest cursor (a
+    /// partition reaped past it) resets up and surfaces [`Poll::Truncated`] once, exactly as the default
+    /// path.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed name, [`EngineError::UnknownStream`] for a
+    /// stream that is not partitioned or a `partition` out of range, [`EngineError::InvalidGroupName`] /
+    /// [`EngineError::TooManyGroups`] from the group gate, else a storage error from the read.
+    pub fn poll_partition(
+        &mut self,
+        stream: &str,
+        partition: u32,
+        group: &str,
+        now: u64,
+    ) -> Result<Poll, EngineError> {
+        let id = StreamId::named(stream)?;
+        let idx = PartitionIndex::new(partition);
+        // Resolve the partition's durable head, rejecting an unknown stream or out-of-range partition.
+        let flushed = match self.partitioned.get(&id) {
+            Some(ps) if partition < ps.count().get() => ps
+                .partition(idx)
+                .map_or(0, |log| log.flushed_offset().get()),
+            _ => {
+                return Err(EngineError::UnknownStream {
+                    name: stream.to_string(),
+                })
+            }
+        };
+        validate_group_name(group)?;
+        // Ensure the partition's work-group exists, under the per-partition group cap.
+        let lease_config = self.lease_config;
+        let max_groups = self.max_groups;
+        let ns = self
+            .partition_consumers
+            .entry((id.clone(), partition))
+            .or_insert_with(NamedStream::new);
+        if !ns.groups.contains_key(group) {
+            if max_groups != 0 && ns.groups.len() >= max_groups {
+                return Err(EngineError::TooManyGroups { max: max_groups });
+            }
+            ns.groups
+                .insert(group.to_string(), WorkGroup::new(lease_config, now));
+        }
+        self.deliver_from_partition(&id, idx, group, now, flushed)
+    }
+
+    /// The plain-competing claim/deliver loop for ONE partition (#693), factored out of
+    /// [`Engine::poll_partition`]. The work-group `group` of partition `(id, idx)` is already present
+    /// and `flushed` is the partition's durable head. Re-instantiates the SAME competing primitives the
+    /// default stream uses — the [`AckCursor`], the [`LeaseTable`] claim/ack, the 0/1/2-ack disposition
+    /// — scoped to this partition's sub-log, so per-partition order + a durable per-partition cursor
+    /// hold with no cross-partition contention.
+    // One cohesive competing scan (below-earliest trim, claim, compaction-hole, disposition) scoped to
+    // one partition — splitting it would scatter the single in-flight-window walk, exactly as the
+    // default stream's `poll_in_timed` keeps its scan whole.
+    #[allow(clippy::too_many_lines)]
+    fn deliver_from_partition(
+        &mut self,
+        id: &StreamId,
+        idx: PartitionIndex,
+        group: &str,
+        now: u64,
+        flushed: u64,
+    ) -> Result<Poll, EngineError> {
+        let key = (id.clone(), idx.get());
+        // The oldest record still retained in this partition (rises above 0 only after a retention reap).
+        let earliest = self
+            .partitioned
+            .get(id)
+            .and_then(|ps| ps.partition(idx))
+            .map_or(0, |log| log.earliest_offset().get());
+        let lease_config = self.lease_config;
+        // Stamp the group active and read its committed cursor in a short scoped borrow.
+        let committed = match self
+            .partition_consumers
+            .get_mut(&key)
+            .and_then(|ns| ns.groups.get_mut(group))
+        {
+            None => return Ok(Poll::Idle),
+            Some(g) => {
+                g.last_activity = now;
+                g.touched = true;
+                g.cursor.committed().get()
+            }
+        };
+        // BELOW-EARLIEST truncation (the per-partition twin of the default `poll_in` #84 path): if this
+        // group's cursor fell below the oldest retained record (a retention reap ran past it), reset UP
+        // to `earliest` and surface the truncation ONCE, so a consumer never silently skips records.
+        if committed < earliest {
+            if let Some(g) = self
+                .partition_consumers
+                .get_mut(&key)
+                .and_then(|ns| ns.groups.get_mut(group))
+            {
+                g.cursor = AckCursor::resume(Offset::new(earliest));
+                g.leases = LeaseTable::new(lease_config);
+            }
+            let skipped = earliest - committed;
+            self.counters.truncations = self.counters.truncations.saturating_add(1);
+            self.counters.truncated_records =
+                self.counters.truncated_records.saturating_add(skipped);
+            self.counters.last_skip_offset = self.counters.last_skip_offset.max(earliest);
+            return Ok(Poll::Truncated {
+                earliest_retained: Offset::new(earliest),
+                skipped,
+            });
+        }
+        // The delivery window: at most `max_in_flight` offsets above the committed cursor, never past
+        // the partition's durable end.
+        let window_end = committed
+            .saturating_add(u64::from(self.max_in_flight))
+            .min(flushed);
+        let mut offset = committed;
+        while offset < window_end {
+            let off = Offset::new(offset);
+            // Resolve the group and try to claim `off` (scoped borrow of `partition_consumers`).
+            let claim = match self
+                .partition_consumers
+                .get_mut(&key)
+                .and_then(|ns| ns.groups.get_mut(group))
+            {
+                None => return Ok(Poll::Idle),
+                Some(g) => {
+                    if g.cursor.is_acked(off) {
+                        offset += 1;
+                        continue;
+                    }
+                    g.leases.claim(off, now)
+                }
+            };
+            match claim {
+                Claim::InFlight => {
+                    offset += 1;
+                }
+                Claim::Exhausted => return Err(EngineError::GenerationExhausted),
+                Claim::Granted { token, deliveries } => {
+                    // Read the record off this partition's sub-log (immutable `partitioned` borrow,
+                    // DISJOINT from the `partition_consumers` field borrowed above).
+                    let record = match self.partitioned.get(id).and_then(|ps| ps.partition(idx)) {
+                        Some(log) => log.read_from(off, 1).map_err(EngineError::Storage)?,
+                        None => return Ok(Poll::Idle),
+                    };
+                    let Some(record) = record.into_iter().next() else {
+                        return Err(EngineError::MissingRecord { offset });
+                    };
+                    // A compacted hole (a later record superseded `off`): ack the group cursor past the
+                    // whole absent run and surface `Poll::Compacted`. A dense partition never takes this.
+                    if record.offset != off {
+                        if let Some(g) = self
+                            .partition_consumers
+                            .get_mut(&key)
+                            .and_then(|ns| ns.groups.get_mut(group))
+                        {
+                            g.leases.ack(&token);
+                            let mut hole = offset;
+                            while hole < record.offset.get() {
+                                g.cursor.ack(Offset::new(hole));
+                                hole += 1;
+                            }
+                        }
+                        return Ok(Poll::Compacted {
+                            from: off,
+                            to: record.offset,
+                        });
+                    }
+                    match self.delivery.disposition(deliveries) {
+                        Disposition::Deliver => {
+                            self.counters.delivered = self.counters.delivered.saturating_add(1);
+                            if deliveries > 1 {
+                                self.counters.redelivered =
+                                    self.counters.redelivered.saturating_add(1);
+                            }
+                            self.registry.record_stream_delivered(id.name().as_bytes());
+                            return Ok(Poll::Message(Delivery {
+                                offset: off,
+                                token,
+                                deliveries,
+                                record,
+                            }));
+                        }
+                        Disposition::DeadLetter => {
+                            // A per-partition DLQ is a deferred follow-up: commit the poison PAST (so it
+                            // never redelivers forever) and surface `Poll::Parked`, the same shape the
+                            // default stream's dead-letter returns. The lease is released here.
+                            if let Some(g) = self
+                                .partition_consumers
+                                .get_mut(&key)
+                                .and_then(|ns| ns.groups.get_mut(group))
+                            {
+                                g.leases.ack(&token);
+                                g.cursor.ack(off);
+                            }
+                            return Ok(Poll::Parked {
+                                offset: off,
+                                record,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Poll::Idle)
+    }
+
+    /// Acks a partition-addressed delivery (#693): commits partition `(stream, partition)`'s work-group
+    /// `group` cursor past `token.offset` and DURABLY checkpoints the partition's cursor, so the commit
+    /// survives a restart (the per-partition twin of [`Engine::ack_in_stream`]). A stale token (already
+    /// acked or redelivered) is a [`AckResult::Fenced`] no-op, exactly as the default ack.
+    ///
+    /// The checkpoint write is best-effort per ack (a failure loses only a lagging optimization — the
+    /// same at-least-once contract the default cursor's lagging checkpoint has); the clean-shutdown
+    /// flush ([`Engine::checkpoint_all_groups`]) is the guaranteed barrier.
+    #[must_use]
+    pub fn ack_partition(
+        &mut self,
+        stream: &str,
+        partition: u32,
+        group: &str,
+        token: &LeaseToken,
+    ) -> AckResult {
+        let Ok(id) = StreamId::named(stream) else {
+            return AckResult::Fenced;
+        };
+        let key = (id.clone(), partition);
+        let now = self.log.now_monotonic();
+        let acked = {
+            let Some(g) = self
+                .partition_consumers
+                .get_mut(&key)
+                .and_then(|ns| ns.groups.get_mut(group))
+            else {
+                return AckResult::Fenced;
+            };
+            g.last_activity = now;
+            g.touched = true;
+            match g.leases.ack(token) {
+                AckOutcome::Acked => {
+                    g.cursor.ack(token.offset);
+                    self.counters.acks = self.counters.acks.saturating_add(1);
+                    self.registry.record_group_consumed(group.as_bytes());
+                    true
+                }
+                AckOutcome::Fenced => false,
+            }
+        };
+        if acked {
+            // Durably checkpoint this partition's cursor so the commit survives a restart (#681-style,
+            // per partition). Best-effort: a write failure only loses a lagging optimization.
+            let _ = self.checkpoint_partition_group(&id, PartitionIndex::new(partition), group);
+            AckResult::Acked
+        } else {
+            AckResult::Fenced
+        }
+    }
+
+    /// The current committed offset of partition `(stream, partition)`'s work-group `group` (#693): the
+    /// exclusive next-to-deliver position on that partition's OWN cursor. `0` for an unknown
+    /// stream/partition/group. The per-partition twin of [`Engine::committed_offset_in_stream`], used by
+    /// tests and observability to read a partition's independent progress.
+    #[must_use]
+    pub fn committed_offset_in_partition(
+        &self,
+        stream: &str,
+        partition: u32,
+        group: &str,
+    ) -> Offset {
+        let Ok(id) = StreamId::named(stream) else {
+            return Offset::ZERO;
+        };
+        self.partition_consumers
+            .get(&(id, partition))
+            .and_then(|ns| ns.groups.get(group))
+            .map_or(Offset::ZERO, |g| g.cursor.committed())
+    }
+
+    /// Durably writes partition `(id, idx)`'s work-group cursor snapshot to
+    /// `pstreams/<hex(name)>/p-<08x(idx)>/cursor-<hex(group)>.ckpt` (#693), the per-partition twin of
+    /// [`Engine::write_named_group_checkpoint`]: the checkpoint lives in the PARTITION's own subdir
+    /// (resolved via that partition's sub-log filesystem), so a partition-addressed consumer's cursor is
+    /// co-located with — and recovers beside — its own records. Same `AckCursor` snapshot payload and
+    /// dual-slot [`Checkpoint`] as every other cursor; only the location differs. A no-op for an absent
+    /// stream/partition/group.
+    ///
+    /// # Errors
+    /// Propagates a storage error from opening or writing the checkpoint file.
+    fn checkpoint_partition_group(
+        &mut self,
+        id: &StreamId,
+        idx: PartitionIndex,
+        group: &str,
+    ) -> Result<(), EngineError> {
+        let key = (id.clone(), idx.get());
+        let (payload, committed) = match self
+            .partition_consumers
+            .get(&key)
+            .and_then(|s| s.groups.get(group))
+        {
+            Some(g) => (snapshot_payload(&g.cursor), g.cursor.committed().get()),
+            None => return Ok(()),
+        };
+        let name = group_checkpoint_name(group);
+        let file = {
+            let Some(log) = self.partitioned.get(id).and_then(|ps| ps.partition(idx)) else {
+                return Ok(());
+            };
+            let fs = log.filesystem();
+            if fs.exists(&name)? {
+                fs.open(&name)?
+            } else {
+                let f = fs.create_new(&name)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            }
+        };
+        let (mut cp, _) = Checkpoint::open(file)?;
+        cp.write(&payload)?;
+        if let Some(s) = self.partition_consumers.get_mut(&key) {
+            s.group_last_checkpointed
+                .insert(group.to_string(), committed);
+        }
+        Ok(())
     }
 
     // ===================================================================================
@@ -5699,7 +6400,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Ok(id) = StreamId::named(stream) else {
             return false;
         };
-        self.known_named_streams.contains(&id)
+        // A stream EXISTS if it is a known single named stream OR a declared PARTITIONED stream (#693):
+        // the two are disjoint namespaces, but both are client-reachable and both must report existence
+        // (e.g. a `SubTo` / `StreamInfo` on a partitioned stream).
+        self.known_named_streams.contains(&id) || self.partitioned.contains_key(&id)
     }
 
     /// Whether the named stream `stream`'s log is currently OPEN (fd-resident) rather than evicted by
@@ -23304,6 +24008,257 @@ mod tests {
         assert!(
             drain_visible_generic(&mut e).is_empty(),
             "the orphan was discarded, never delivered"
+        );
+    }
+
+    // ================================================================================
+    // PARTITIONED-STREAM WIRING (#693): declare-P, produce-route-by-key, partition-addressed consume
+    // with a durable per-partition cursor, P=1 identity, and per-partition contract independence.
+    // ================================================================================
+
+    /// An `Append` carrying a key, for the partition-routing tests.
+    fn part_keyed<'a>(key: &'a [u8], payload: &'a [u8]) -> Append<'a> {
+        Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key,
+            headers: b"",
+            payload,
+        }
+    }
+
+    /// A key that routes to `target` over `pc` partitions (the same stable `xxh3_64 % P` the engine
+    /// uses), found by a bounded search — so a test can fill a SPECIFIC partition deterministically.
+    fn key_for_partition(target: u32, pc: PartitionCount) -> Vec<u8> {
+        for n in 0..1_000_000u32 {
+            let k = format!("key-{n}").into_bytes();
+            if ironbus_core::partition::partition_for_key(&k, pc).get() == target {
+                return k;
+            }
+        }
+        panic!("no key routes to partition {target}");
+    }
+
+    /// Drains partition `partition` of `stream` in group `group`, acking each delivery, returning the
+    /// payloads in delivery order.
+    fn drain_partition(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        partition: u32,
+        group: &str,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let now = e.now_monotonic();
+            match e.poll_partition(stream, partition, group, now).unwrap() {
+                Poll::Message(d) => {
+                    out.push(d.record.payload.to_vec());
+                    assert_eq!(
+                        e.ack_partition(stream, partition, group, &d.token),
+                        AckResult::Acked
+                    );
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll on partition {partition}: {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// #693 (1): declaring `P > 1` backs the stream with a `PartitionedStream`, and a keyed produce
+    /// routes to `xxh3_64(key) % P`, STABLY — every record for a key lands in its one home partition,
+    /// in order, and no sibling partition holds it; a different key routes to its own stable home.
+    #[test]
+    fn keyed_produce_routes_to_a_stable_partition() {
+        let mut e = open(config(64, 5));
+        assert!(e.declare_partitioned_stream("orders", 4).unwrap());
+        assert_eq!(e.partition_count_of("orders").unwrap().get(), 4);
+        let pc = PartitionCount::new(4).unwrap();
+
+        let key = b"order-42";
+        let home = ironbus_core::partition::partition_for_key(key, pc).get();
+        for n in 0..5u8 {
+            e.produce_in_stream("orders", &part_keyed(key, &[n]))
+                .unwrap();
+        }
+        // Every sibling partition is empty of the key's records; the home partition holds all 5 in order.
+        for p in 0..4 {
+            if p != home {
+                assert!(
+                    drain_partition(&mut e, "orders", p, "w").is_empty(),
+                    "partition {p} holds none of the key's records"
+                );
+            }
+        }
+        assert_eq!(
+            drain_partition(&mut e, "orders", home, "w"),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4]],
+            "the key's records land in its home partition, in order"
+        );
+        // Stability: the SAME key still routes home on a later produce.
+        e.produce_in_stream("orders", &part_keyed(key, b"z"))
+            .unwrap();
+        assert_eq!(
+            drain_partition(&mut e, "orders", home, "w"),
+            vec![b"z".to_vec()],
+            "the same key is stable across produces"
+        );
+
+        // A DIFFERENT key routes to its OWN stable home partition.
+        let key2 = b"customer-7";
+        let home2 = ironbus_core::partition::partition_for_key(key2, pc).get();
+        e.produce_in_stream("orders", &part_keyed(key2, b"a"))
+            .unwrap();
+        e.produce_in_stream("orders", &part_keyed(key2, b"b"))
+            .unwrap();
+        assert_eq!(
+            drain_partition(&mut e, "orders", home2, "w"),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+    }
+
+    /// #693 (2): a partition-addressed consumer sees ONLY that partition's records, in order, on its
+    /// OWN durable cursor — which SURVIVES a restart (resumes past the committed offset, redelivering
+    /// nothing it acked).
+    #[test]
+    fn partition_addressed_consume_has_a_durable_cursor_across_restart() {
+        let fs = InMemoryFs::new();
+        let pc = PartitionCount::new(4).unwrap();
+        let k2 = key_for_partition(2, pc);
+        let k0 = key_for_partition(0, pc);
+
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+            e.declare_partitioned_stream("orders", 4).unwrap();
+            for n in 0..3u8 {
+                e.produce_in_stream("orders", &part_keyed(&k2, &[b'A', n]))
+                    .unwrap();
+            }
+            for n in 0..2u8 {
+                e.produce_in_stream("orders", &part_keyed(&k0, &[b'B', n]))
+                    .unwrap();
+            }
+            // The partition-2 consumer sees ONLY partition-2 records, in order.
+            let now = e.now_monotonic();
+            let d0 = message(e.poll_partition("orders", 2, "w", now).unwrap());
+            assert_eq!(&*d0.record.payload, b"A\x00");
+            assert_eq!(
+                e.ack_partition("orders", 2, "w", &d0.token),
+                AckResult::Acked
+            );
+            let now = e.now_monotonic();
+            let d1 = message(e.poll_partition("orders", 2, "w", now).unwrap());
+            assert_eq!(&*d1.record.payload, b"A\x01");
+            assert_eq!(
+                e.ack_partition("orders", 2, "w", &d1.token),
+                AckResult::Acked
+            );
+            assert_eq!(e.committed_offset_in_partition("orders", 2, "w").get(), 2);
+            // Durably flush the partition cursors for a clean shutdown.
+            e.checkpoint_all_groups().unwrap();
+        }
+
+        // Reopen over the SAME storage: the partitioned stream + the partition-2 cursor recover.
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+            assert_eq!(
+                e.partition_count_of("orders").unwrap().get(),
+                4,
+                "the partitioned stream recovered with its declared P"
+            );
+            assert_eq!(
+                e.committed_offset_in_partition("orders", 2, "w").get(),
+                2,
+                "the partition-2 cursor resumed at its durable committed offset"
+            );
+            let now = e.now_monotonic();
+            let d = message(e.poll_partition("orders", 2, "w", now).unwrap());
+            assert_eq!(
+                &*d.record.payload, b"A\x02",
+                "resumes past the durable cursor — no redelivery of acked records"
+            );
+            assert_eq!(
+                e.ack_partition("orders", 2, "w", &d.token),
+                AckResult::Acked
+            );
+            let now = e.now_monotonic();
+            assert!(matches!(
+                e.poll_partition("orders", 2, "w", now).unwrap(),
+                Poll::Idle
+            ));
+        }
+    }
+
+    /// #693 (3): declaring `P = 1` is NOT a partitioned stream — it is today's single-log named stream,
+    /// byte-for-byte: no `PartitionedStream`, no `pstreams/` subtree, and produce/consume route through
+    /// the unchanged named-stream path.
+    #[test]
+    fn single_partition_declare_is_the_unchanged_named_stream() {
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+        assert!(e.declare_partitioned_stream("s", 1).unwrap());
+        assert!(
+            e.partition_count_of("s").is_none(),
+            "P=1 is not a partitioned stream"
+        );
+        assert!(e.stream_exists("s"));
+        // Produce + consume route through the NORMAL named-stream path (not the partition path).
+        e.produce_in_stream("s", &part_keyed(b"k", b"v")).unwrap();
+        let now = e.now_monotonic();
+        let d = message(e.poll_in_stream("s", "w", now).unwrap());
+        assert_eq!(&*d.record.payload, b"v");
+        assert_eq!(e.ack_in_stream("s", "w", &d.token), AckResult::Acked);
+        // No `pstreams/` subtree is ever materialized for a single-partition stream.
+        assert!(
+            !fs.subdir_exists(PARTITIONED_STREAMS_SUBDIR).unwrap(),
+            "P=1 never creates the pstreams/ subtree"
+        );
+        // A re-declare at P=1 is idempotent (already existed).
+        assert!(!e.declare_partitioned_stream("s", 1).unwrap());
+    }
+
+    /// #693 (4): each partition carries the durable contract INDEPENDENTLY — committing one partition's
+    /// cursor never touches a sibling's, each partition delivers its own records, and per-partition
+    /// retention reaps one partition's own old sealed segments.
+    #[test]
+    fn each_partition_carries_the_contract_independently() {
+        let mut e = open(config(64, 5));
+        e.declare_partitioned_stream("orders", 4).unwrap();
+        let pc = PartitionCount::new(4).unwrap();
+        let ka = key_for_partition(1, pc);
+        let kb = key_for_partition(3, pc);
+        for n in 0..3u8 {
+            e.produce_in_stream("orders", &part_keyed(&ka, &[n]))
+                .unwrap();
+        }
+        for n in 0..3u8 {
+            e.produce_in_stream("orders", &part_keyed(&kb, &[n]))
+                .unwrap();
+        }
+        // Consume + commit ONLY partition 1.
+        assert_eq!(drain_partition(&mut e, "orders", 1, "w").len(), 3);
+        assert_eq!(e.committed_offset_in_partition("orders", 1, "w").get(), 3);
+        // Partition 3's cursor is UNTOUCHED (independent) and still delivers all its records.
+        assert_eq!(
+            e.committed_offset_in_partition("orders", 3, "w").get(),
+            0,
+            "committing partition 1 never advanced partition 3's cursor"
+        );
+        assert_eq!(drain_partition(&mut e, "orders", 3, "w").len(), 3);
+
+        // Per-partition RETENTION: a produce-only partition (floor = head) reaps its OWN old sealed
+        // segments once it trips the shared byte bound, independently of its siblings.
+        let mut r = open(config_with_retention(320));
+        r.declare_partitioned_stream("orders", 2).unwrap();
+        let k0 = key_for_partition(0, PartitionCount::new(2).unwrap());
+        for n in 0..40u16 {
+            let payload = [u8::try_from(n & 0xff).unwrap(); 16];
+            r.produce_in_stream("orders", &part_keyed(&k0, &payload))
+                .unwrap();
+        }
+        assert!(
+            r.counters().segments_reaped >= 1,
+            "per-partition retention reaped at least one old sealed segment"
         );
     }
 }

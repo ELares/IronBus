@@ -2377,28 +2377,47 @@ fn read_stream_id<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], BodyError> {
 ///
 /// Layout (version+length framed, forward-compatible): `body_version: u8`
 /// ([`STREAM_WIRE_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block), then the
-/// v1 block: `stream_id: u16-len + bytes`. Bytes past `field_len` (a future version's appended fields)
-/// are TOLERATED and ignored.
+/// v1 block: `stream_id: u16-len + bytes`, then — ONLY when it exceeds the default single partition —
+/// an ADDITIVE `partition_count: u32 LE` (#693, V2-M2-I11b). Bytes past `field_len` (a future
+/// version's appended fields) are TOLERATED and ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamDeclareBody<'a> {
     /// The name of the stream to create-or-ensure (validated server-side by `StreamId::named`).
     pub stream_id: &'a [u8],
+    /// The number of partitions `P` (`>= 1`) to back this stream with (#693): `1` (the DEFAULT) is
+    /// today's single-log stream — byte-for-byte on the wire AND on disk — and `P > 1` opts the stream
+    /// into `P` independent, key-routed sub-logs (`ironbus_storage::partitioned::PartitionedStream`).
+    /// It is an ADDITIVE wire field emitted ONLY when `> 1`, so an old client (or any single-partition
+    /// declare) is byte-for-byte the historical `StreamDeclare` body and a partitioned stream is opt-in.
+    pub partition_count: u32,
 }
 
-/// Encodes a `StreamDeclare` body onto the end of `out` (#588).
+/// Encodes a `StreamDeclare` body onto the end of `out` (#588, #693).
+///
+/// The `partition_count` is appended INSIDE the field-length block AFTER the stream id, and ONLY when
+/// it exceeds `1` (the default single partition), so a single-partition declare is byte-for-byte the
+/// pre-#693 body. It must remain the LAST additive field of the v1 block: a future field appends after
+/// it and, when set alongside a single-partition declare, must still emit `partition_count = 1` to keep
+/// the positional order the decoder reads.
 ///
 /// # Errors
-/// Returns [`BodyError::FieldTooLarge`] if the stream id exceeds the `u16` wire limit.
+/// Returns [`BodyError::FieldTooLarge`] if the stream id (or the framed block) exceeds the `u16` wire
+/// limit.
 pub fn encode_stream_declare(
     req: &StreamDeclareBody<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), BodyError> {
     let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
-    let field_len = u16::try_from(2 + req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let extra = usize::from(req.partition_count > 1) * 4;
+    let field_len =
+        u16::try_from(2 + req.stream_id.len() + extra).map_err(|_| BodyError::FieldTooLarge)?;
     out.push(STREAM_WIRE_BODY_VERSION);
     out.extend_from_slice(&field_len.to_le_bytes());
     out.extend_from_slice(&id_len.to_le_bytes());
     out.extend_from_slice(req.stream_id);
+    if req.partition_count > 1 {
+        out.extend_from_slice(&req.partition_count.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -2423,7 +2442,15 @@ pub fn decode_stream_declare(body: &[u8]) -> Result<StreamDeclareBody<'_>, BodyE
     let block = r.take(field_len)?;
     let mut fr = Reader::new(block);
     let stream_id = read_stream_id(&mut fr)?;
-    Ok(StreamDeclareBody { stream_id })
+    // The partition count is an ADDITIVE field appended after the stream id (#693): a partition-aware
+    // client emits a `> 1` count, while an old client (or any single-partition declare) omits it and it
+    // folds to the default `1`. A missing/short remainder, or an out-of-range `0`, folds to `1` (never
+    // an error), so the field stays forward-compatible and a partitioned stream is strictly opt-in.
+    let partition_count = fr.u32().ok().filter(|&p| p >= 1).unwrap_or(1);
+    Ok(StreamDeclareBody {
+        stream_id,
+        partition_count,
+    })
 }
 
 /// A client's query for a named stream (the `StreamInfo` REQUEST body, tag 29, #588): it carries the
@@ -2590,26 +2617,36 @@ pub fn decode_pub_to(body: &[u8]) -> Result<PubToBody<'_>, BodyError> {
 /// the default group.
 ///
 /// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
-/// `stream_id: u16-len + bytes`, `group: u16-len + bytes`. Both fields ride INSIDE the declared block
-/// (each `u16`-length-prefixed), so a future version appends after them. Trailing block bytes are
-/// tolerated.
+/// `stream_id: u16-len + bytes`, `group: u16-len + bytes`, then — ONLY when the consumer addresses a
+/// specific partition — an ADDITIVE `partition: u32 LE` (#693, V2-M2-I11b). All fields ride INSIDE the
+/// declared block, so a future version appends after them. Trailing block bytes are tolerated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubToBody<'a> {
     /// The target stream name (empty selects the default stream).
     pub stream_id: &'a [u8],
     /// The work-group name (empty selects the default group), validated server-side.
     pub group: &'a [u8],
+    /// The partition of a PARTITIONED stream this consumer addresses (#693), or `None` to subscribe to
+    /// the stream as a whole (the ONLY behavior for a single-partition stream, byte-for-byte the
+    /// historical `SubTo`). `Some(i)` binds the connection's subsequent Flow/Ack to partition `i`'s
+    /// OWN sub-log + its own per-partition durable cursor — the SIMPLE/STATIC assignment (one consumer,
+    /// one explicit partition). Emitted ONLY when `Some`, so an old client's `SubTo` is unchanged.
+    pub partition: Option<u32>,
 }
 
-/// Encodes a `SubTo` body onto the end of `out` (#588): the version byte, the field-block length, then
-/// the stream id and group, each `u16`-length-prefixed.
+/// Encodes a `SubTo` body onto the end of `out` (#588, #693): the version byte, the field-block length,
+/// then the stream id and group (each `u16`-length-prefixed), and — ONLY when `partition` is `Some` —
+/// the addressed partition as a `u32 LE` appended to the block. A `None` partition emits nothing extra,
+/// so a whole-stream `SubTo` is byte-for-byte the pre-#693 body. The partition must remain the LAST
+/// additive field of the block (a future field appends after it).
 ///
 /// # Errors
 /// Returns [`BodyError::FieldTooLarge`] if the stream id or group exceeds the `u16` wire limit.
 pub fn encode_sub_to(req: &SubToBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
     let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
     let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
-    let field_len = u16::try_from(2 + req.stream_id.len() + 2 + req.group.len())
+    let extra = usize::from(req.partition.is_some()) * 4;
+    let field_len = u16::try_from(2 + req.stream_id.len() + 2 + req.group.len() + extra)
         .map_err(|_| BodyError::FieldTooLarge)?;
     out.push(STREAM_WIRE_BODY_VERSION);
     out.extend_from_slice(&field_len.to_le_bytes());
@@ -2617,6 +2654,9 @@ pub fn encode_sub_to(req: &SubToBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyE
     out.extend_from_slice(req.stream_id);
     out.extend_from_slice(&group_len.to_le_bytes());
     out.extend_from_slice(req.group);
+    if let Some(partition) = req.partition {
+        out.extend_from_slice(&partition.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -2639,7 +2679,15 @@ pub fn decode_sub_to(body: &[u8]) -> Result<SubToBody<'_>, BodyError> {
     let mut fr = Reader::new(block);
     let stream_id = read_stream_id(&mut fr)?;
     let group = fr.var()?;
-    Ok(SubToBody { stream_id, group })
+    // The addressed partition is an ADDITIVE field appended after the group (#693): a partition-aware
+    // consumer emits a `u32`, an old client omits it (folding to `None` = whole-stream subscribe). A
+    // missing/short remainder folds to `None`, never an error, so the field stays forward-compatible.
+    let partition = fr.u32().ok();
+    Ok(SubToBody {
+        stream_id,
+        group,
+        partition,
+    })
 }
 
 // ===================================================================================
@@ -4491,7 +4539,11 @@ mod tests {
 
             // SubTo: stream_id + group (both u16-len framed inside the block).
             let mut buf = Vec::new();
-            encode_sub_to(&SubToBody { stream_id: &stream_id, group: &group }, &mut buf).unwrap();
+            encode_sub_to(
+                &SubToBody { stream_id: &stream_id, group: &group, partition: None },
+                &mut buf,
+            )
+            .unwrap();
             let v = decode_sub_to(&buf).unwrap();
             prop_assert_eq!(v.stream_id, stream_id.as_slice());
             prop_assert_eq!(v.group, group.as_slice());
@@ -5653,12 +5705,24 @@ mod tests {
         // round-tripping exactly. The default-stream empty id round-trips too.
         for id in [b"orders".as_slice(), b"", b"a/b.c-1"] {
             let mut buf = Vec::new();
-            encode_stream_declare(&StreamDeclareBody { stream_id: id }, &mut buf).unwrap();
+            encode_stream_declare(
+                &StreamDeclareBody {
+                    stream_id: id,
+                    partition_count: 1,
+                },
+                &mut buf,
+            )
+            .unwrap();
             assert_eq!(
                 buf[0], STREAM_WIRE_BODY_VERSION,
                 "leads with the body version"
             );
             assert_eq!(decode_stream_declare(&buf).unwrap().stream_id, id);
+            assert_eq!(
+                decode_stream_declare(&buf).unwrap().partition_count,
+                1,
+                "a single-partition declare defaults to P=1"
+            );
 
             let mut ibuf = Vec::new();
             encode_stream_info(&StreamInfoBody { stream_id: id }, &mut ibuf).unwrap();
@@ -6067,10 +6131,12 @@ mod tests {
         fn any_sub_to_round_trips(
             stream_id in prop::collection::vec(any::<u8>(), 0..=MAX_STREAM_ID_LEN),
             group in prop::collection::vec(any::<u8>(), 0..256),
+            partition in prop::option::of(any::<u32>()),
         ) {
             let msg = SubToBody {
                 stream_id: &stream_id,
                 group: &group,
+                partition,
             };
             let mut buf = Vec::new();
             encode_sub_to(&msg, &mut buf).unwrap();
@@ -6160,6 +6226,7 @@ mod tests {
             &SubToBody {
                 stream_id: &at_stream_cap,
                 group: b"g",
+                partition: None,
             },
             &mut buf,
         )
@@ -6209,6 +6276,7 @@ mod tests {
                 &SubToBody {
                     stream_id: id,
                     group,
+                    partition: None,
                 },
                 &mut buf,
             )
@@ -6216,7 +6284,101 @@ mod tests {
             let decoded = decode_sub_to(&buf).unwrap();
             assert_eq!(decoded.stream_id, id);
             assert_eq!(decoded.group, group);
+            assert_eq!(
+                decoded.partition, None,
+                "whole-stream SubTo has no partition"
+            );
         }
+    }
+
+    #[test]
+    fn stream_declare_carries_an_additive_partition_count() {
+        // #693: a partition-aware StreamDeclare carries P > 1 as an ADDITIVE field, while a P = 1
+        // declare is byte-for-byte the historical single-partition body (the field is omitted). An old
+        // decoder tolerates the extra bytes (a v1 reader ignores the trailing block); a new decoder
+        // reads P back exactly. The P = 1 encoding is IDENTICAL to a declare that names no count.
+        let mut with_p = Vec::new();
+        encode_stream_declare(
+            &StreamDeclareBody {
+                stream_id: b"orders",
+                partition_count: 4,
+            },
+            &mut with_p,
+        )
+        .unwrap();
+        let d = decode_stream_declare(&with_p).unwrap();
+        assert_eq!(d.stream_id, b"orders");
+        assert_eq!(d.partition_count, 4);
+
+        let mut single = Vec::new();
+        encode_stream_declare(
+            &StreamDeclareBody {
+                stream_id: b"orders",
+                partition_count: 1,
+            },
+            &mut single,
+        )
+        .unwrap();
+        // P = 1 is byte-for-byte the pre-#693 body (no partition_count appended).
+        let mut legacy = vec![STREAM_WIRE_BODY_VERSION];
+        let field_len = u16::try_from(2 + "orders".len()).unwrap();
+        legacy.extend_from_slice(&field_len.to_le_bytes());
+        legacy.extend_from_slice(&u16::try_from("orders".len()).unwrap().to_le_bytes());
+        legacy.extend_from_slice(b"orders");
+        assert_eq!(
+            single, legacy,
+            "P=1 is byte-for-byte the historical declare"
+        );
+        // And an OLD-client body (no partition_count) decodes to the default P = 1.
+        assert_eq!(decode_stream_declare(&legacy).unwrap().partition_count, 1);
+        // A declared P of 0 (never emitted by the encoder) folds to 1, never an error.
+        let mut zero = vec![STREAM_WIRE_BODY_VERSION];
+        let zfl = u16::try_from(2 + "o".len() + 4).unwrap();
+        zero.extend_from_slice(&zfl.to_le_bytes());
+        zero.extend_from_slice(&1u16.to_le_bytes());
+        zero.extend_from_slice(b"o");
+        zero.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode_stream_declare(&zero).unwrap().partition_count, 1);
+    }
+
+    #[test]
+    fn sub_to_carries_an_additive_partition_selector() {
+        // #693: a partition-addressed SubTo carries the target partition as an ADDITIVE field; a
+        // whole-stream SubTo omits it (byte-for-byte the historical body) and decodes to None.
+        let mut addressed = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: b"orders",
+                group: b"w",
+                partition: Some(2),
+            },
+            &mut addressed,
+        )
+        .unwrap();
+        let d = decode_sub_to(&addressed).unwrap();
+        assert_eq!(d.stream_id, b"orders");
+        assert_eq!(d.group, b"w");
+        assert_eq!(d.partition, Some(2));
+
+        let mut whole = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: b"orders",
+                group: b"w",
+                partition: None,
+            },
+            &mut whole,
+        )
+        .unwrap();
+        let mut legacy = vec![STREAM_WIRE_BODY_VERSION];
+        let field_len = u16::try_from(2 + "orders".len() + 2 + "w".len()).unwrap();
+        legacy.extend_from_slice(&field_len.to_le_bytes());
+        legacy.extend_from_slice(&u16::try_from("orders".len()).unwrap().to_le_bytes());
+        legacy.extend_from_slice(b"orders");
+        legacy.extend_from_slice(&u16::try_from("w".len()).unwrap().to_le_bytes());
+        legacy.extend_from_slice(b"w");
+        assert_eq!(whole, legacy, "None is byte-for-byte the historical SubTo");
+        assert_eq!(decode_sub_to(&legacy).unwrap().partition, None);
     }
 
     #[test]
