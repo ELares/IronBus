@@ -3760,7 +3760,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ) -> Result<(), EngineError> {
         self.retention = retention;
         self.disk_full_policy = disk_full_policy;
-        self.reap_for_retention()
+        self.reap_for_retention()?;
+        // #566: a reload that TIGHTENS retention reclaims from RESIDENT named streams at once too, not
+        // just the default stream — the shared policy applies per stream. Each evicted stream reaps on
+        // its next reopen (`ensure_named_stream_open`), so a non-resident stream is not force-opened
+        // here (which would fight the #565 hot-set budget). `stream_ids` returns only OPEN streams,
+        // default-first; the default `""` slot is inert (served by `self.log`) so it is skipped.
+        let resident: Vec<StreamId> = self
+            .streams
+            .stream_ids()
+            .into_iter()
+            .filter(|id| !id.is_default())
+            .collect();
+        for id in resident {
+            self.reap_named_for_retention(&id)?;
+        }
+        Ok(())
     }
 
     /// Seeds the metric registry from the recovered durable state (#97), so the per-consumer lag
@@ -4885,6 +4900,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if outcome.froze.contains(&id) {
             return Err(EngineError::Storage(StorageError::WriterFrozen));
         }
+        // Per-stream RETENTION + COMPACTION (#566): now that this record is durable and acked, reclaim
+        // disk on THIS stream's own log by reaping fully-consumed old sealed segments past its
+        // retention bound (floored at its own min-committed offset) and running one off-hot-path
+        // compaction pass — reusing the default stream's `Log::reap` / `Log::maybe_compact` machinery,
+        // per stream. Runs AFTER the durable commit (a reap error never undoes the record), exactly as
+        // the default stream's `reap_for_retention` runs after `commit_batch`. A no-op unless retention
+        // or compaction is configured, so an unconfigured broker's named produce is byte-for-byte
+        // unchanged.
+        self.reap_named_for_retention(&id)?;
         Ok(offset)
     }
 
@@ -5891,6 +5915,39 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 key_shared,
             } => (committed, filter, key_shared),
         };
+        // BELOW-EARLIEST TRUNCATION (#566, the per-stream twin of the default `poll_in` #82/#84 path):
+        // if per-stream retention reaped past this group's committed cursor — or a NEW group joined a
+        // stream whose prefix was already reaped, so it starts at 0 below a raised `earliest` — its
+        // records were reclaimed out from under it. Reset the cursor UP to `earliest` (dropping the
+        // now-meaningless leases that referenced reaped offsets) and surface the truncation ONCE, so a
+        // named consumer never SILENTLY skips records and never reads a reaped offset. After the reset
+        // `committed == earliest`, so a subsequent poll is no longer below earliest and never
+        // re-truncates the same gap. A stashed match (drained above) sits at/above committed, so it is
+        // never lost to this reset — exactly the `poll_in` ordering. (No `sync_consumer_lag`: the
+        // default-stream lag registry is not keyed by named-stream groups, matching the filtered-run
+        // and DLQ named paths.)
+        let earliest = self
+            .streams
+            .get(id)
+            .map_or(0, |log| log.earliest_offset().get());
+        if committed < earliest {
+            let skipped = earliest - committed;
+            let lease_config = self.lease_config;
+            if let Some(g) = self.named_group_mut(id, group) {
+                g.cursor = AckCursor::resume(Offset::new(earliest));
+                g.leases = LeaseTable::new(lease_config);
+            }
+            // Count the skip the moment it is surfaced (#96): one truncation event spanning `skipped`
+            // records, never silent — the same counters the default below-earliest path bumps.
+            self.counters.truncations = self.counters.truncations.saturating_add(1);
+            self.counters.truncated_records =
+                self.counters.truncated_records.saturating_add(skipped);
+            self.counters.last_skip_offset = self.counters.last_skip_offset.max(earliest);
+            return Ok(Poll::Truncated {
+                earliest_retained: Offset::new(earliest),
+                skipped,
+            });
+        }
         // The group's subject pattern, PARSED once (the clone above is a short pattern string, once per
         // poll). `None` (unfiltered) leaves the scan byte-for-byte the historical named path.
         // `filtered_from` accumulates the START of the current run of skipped (non-matching) offsets,
@@ -5937,6 +5994,27 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 let Some(record) = record.into_iter().next() else {
                     return Err(EngineError::MissingRecord { offset });
                 };
+                // COMPACTION HOLE (#337/#566): the read returned a record ABOVE `off`, so `off` was
+                // compacted away (a later record for its key superseded it) and the whole run
+                // `[off, record.offset)` is absent. Ack the group cursor past it (no lease was claimed
+                // in the key_shared peek-first path) and surface `Poll::Compacted` — the interior,
+                // sparse-offset twin of the below-earliest trim above. A compacted hole is member-
+                // agnostic (those offsets are gone for every member), so advancing the shared cursor is
+                // correct, exactly like the member-agnostic filter arm below. A dense (non-compacted)
+                // named log never takes this branch.
+                if record.offset != off {
+                    if let Some(g) = self.named_group_mut(id, group) {
+                        let mut hole = offset;
+                        while hole < record.offset.get() {
+                            g.cursor.ack(Offset::new(hole));
+                            hole += 1;
+                        }
+                    }
+                    return Ok(Poll::Compacted {
+                        from: off,
+                        to: record.offset,
+                    });
+                }
                 // 3. FILTER (#594-B) composes FIRST: a non-matching record is committed PAST for the
                 //    whole group (its subject never matches for any member) and the scan CONTINUES to
                 //    this member's next candidate. Silent (no `Poll::Filtered`): a key_shared member
@@ -6050,6 +6128,27 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             let Some(record) = record.into_iter().next() else {
                 return Err(EngineError::MissingRecord { offset });
             };
+            // COMPACTION HOLE (#337/#566): the read returned a record ABOVE the leased `off`, so `off`
+            // was compacted away and the whole run `[off, record.offset)` is absent. Release the lease
+            // just claimed at `off`, ack the group cursor across the entire hole (nothing to deliver
+            // there), and surface `Poll::Compacted` — byte-for-byte the default `poll_in` sparse-offset
+            // handling, mapped by the session to `GapMarker(reason=COMPACTED)`. A dense (non-compacted)
+            // named log always matches `record.offset == off`, so this branch is never taken and the
+            // hot path is unchanged.
+            if record.offset != off {
+                if let Some(g) = self.named_group_mut(id, group) {
+                    g.leases.ack(&token);
+                    let mut hole = offset;
+                    while hole < record.offset.get() {
+                        g.cursor.ack(Offset::new(hole));
+                        hole += 1;
+                    }
+                }
+                return Ok(Poll::Compacted {
+                    from: off,
+                    to: record.offset,
+                });
+            }
             // PER-SUBJECT FILTER (#594-B): a filtered group delivers ONLY records whose stored subject
             // matches. A non-match (or a subject-less record, D2) is committed past WITHOUT delivery
             // (release the lease, advance the DURABLE cursor, #681) and its skip accumulated; a MATCH
@@ -6465,6 +6564,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.named_streams.insert(id.clone(), ns);
         self.known_named_streams.insert(id.clone());
         self.streams.touch(id);
+        // #566 composes with the #565 hot-set LRU: a KNOWN stream reopened after eviction may hold
+        // segments that AGED OUT (or that a consumer caught up past via `ack_in_stream`, which does not
+        // reap) while the stream was closed with no produce to drive a reap. Run ONE retention pass now
+        // that its durable groups are recovered — so the protect floor is exact — reclaiming those
+        // segments on the stream's next access. This is the "retention applied on reopen" half of the
+        // evicted-stream policy: combined with the reap at eviction and after every produce, an evicted
+        // stream's on-disk segments are always reaped (no disk leak) WITHOUT corrupting its durable
+        // cursor / attempts / DLQ (the reap only unlinks whole segments below the min-committed floor;
+        // those live in separate files). A brand-new stream (`!known`) has no segments to reap.
+        if known {
+            self.reap_named_for_retention(id)?;
+        }
         Ok(!known)
     }
 
@@ -6563,6 +6674,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
         // 1) Flush-before-close: make the log's appended records durable BEFORE the fd is dropped.
         self.streams.sync_stream(id).map_err(EngineError::Storage)?;
+        // 1.5) #566: reap this stream down to its retention bound BEFORE evicting it, so a stream that
+        //      goes cold does not sit on disk holding fully-consumed segments past its policy. The
+        //      protect floor is this stream's own min-committed offset across its STILL-RESIDENT groups
+        //      (computed inside `reap_named_for_retention` before the in-memory state is dropped in
+        //      step 3), so the reap never deletes a segment any group still needs. The cursors persisted
+        //      in step 2 are all at or above the new `earliest` (the floor bounds the reap), so a reopen
+        //      resumes at a valid offset; the DLQ (a separate `dlq/` subtree) is untouched. A no-op when
+        //      retention/compaction is off, so an unconfigured broker's eviction is byte-for-byte the
+        //      #565 path. It runs AFTER the sync above so the reap acts on the fully-durable log.
+        self.reap_named_for_retention(id)?;
         // 2) Persist each group's committed cursor + FULL attempt counts at the current watermark, before
         //    the in-memory state is dropped. The cursor write is unconditional so the LATEST committed
         //    position is durable even if no interval checkpoint fired since the last ack; the attempts
@@ -7961,6 +8082,65 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(())
     }
 
+    /// The per-NAMED-stream twin of [`Engine::reap_for_retention`] (#566): reclaims disk on stream
+    /// `id`'s OWN log by reaping fully-consumed old sealed segments once it trips any enabled
+    /// retention bound (size / age / count), then — if compaction is enabled — running ONE
+    /// off-hot-path key-compaction pass. It REUSES the SAME [`Log::reap`] + [`Log::maybe_compact`]
+    /// machinery the default stream uses, floored at THIS stream's own consumer protect offset
+    /// ([`Engine::min_committed_offset_named`]) so a reap NEVER deletes a segment any of this stream's
+    /// groups still needs. The SHARED engine retention policy (`self.retention` / `self.compaction`,
+    /// live-reloadable via [`Engine::apply_reloadable_config`]) is applied PER STREAM, so once
+    /// streams are independent logs a high-churn stream ages out aggressively while an archival
+    /// stream retains, on the same node (#566, the first-principles per-log-property framing).
+    ///
+    /// The `compact_and_delete` ORDER is identical to the default (#337): the cheap WHOLE-SEGMENT
+    /// reaper runs FIRST (never compact a segment about to be reaped), THEN one rate-limited
+    /// compaction pass. A no-op when retention AND compaction are both off (the default), so an
+    /// unconfigured broker's named-stream produce is byte-for-byte unchanged. A no-op too when the
+    /// stream is not resident (its log is not open); the caller only reaps a resident stream.
+    ///
+    /// This does NOT touch the stream's durable per-group cursor / attempts / DLQ: `Log::reap` only
+    /// unlinks whole SEALED segments strictly below the min-committed floor, and those files live in
+    /// separate paths (`cursor-<hex>.ckpt`, `attempts-<hex>.ckpt`, `dlq/`) — so retention composes
+    /// with the #681 durable cursor and the #1110 named DLQ without corrupting either.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the reap or the compaction pass, exactly as
+    /// [`Engine::reap_for_retention`]. It is called only AFTER a produce already succeeded and was
+    /// counted (or from the evict / reopen seams), so a reap error never undoes a durable record.
+    fn reap_named_for_retention(&mut self, id: &StreamId) -> Result<(), EngineError> {
+        // The WHOLE-SEGMENT reaper FIRST (#337 order), floored at this stream's min committed offset
+        // so a live/slow group's unconsumed records are never reaped (the consumer-safety guarantee,
+        // per stream). `bounds` is copied out before the `&mut self.streams` borrow so the immutable
+        // `self.retention` read does not overlap the mutable log borrow.
+        if self.retention != RetentionBounds::default() {
+            let protect_below = self.min_committed_offset_named(id);
+            let bounds = self.retention;
+            if let Some(log) = self.streams.get_mut(id) {
+                let outcome = log
+                    .reap(bounds, protect_below)
+                    .map_err(EngineError::Storage)?;
+                self.counters.segments_reaped = self
+                    .counters
+                    .segments_reaped
+                    .saturating_add(outcome.segments_reaped);
+            }
+        }
+        // The OPT-IN, OFF-HOT-PATH compaction pass (#337), a no-op unless an operator enabled it. It
+        // only ever reads SEALED segments and writes a NEW v2 segment (never the active one), so it
+        // does not race the per-stream append path. `compaction` is copied out for the same disjoint-
+        // borrow reason as `bounds` above.
+        if self.compaction.enabled {
+            let compaction = self.compaction;
+            if let Some(log) = self.streams.get_mut(id) {
+                let _ = log
+                    .maybe_compact(&compaction)
+                    .map_err(EngineError::Storage)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The retention protect floor: the minimum committed offset across every work-group that
     /// has ever seen a consumer interaction or durable consumer state (`touched`, #424). A
     /// touched group sitting at offset 0 keeps the floor at 0 (reaping nothing), exactly the
@@ -7997,6 +8177,42 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         live.chain(ghosts)
             .min()
             .unwrap_or_else(|| self.flushed_offset().get())
+    }
+
+    /// The per-NAMED-stream retention protect floor (#566): the minimum committed offset across every
+    /// TOUCHED work-group of stream `id`, the per-stream twin of [`Engine::min_committed_offset`]. A
+    /// live touched group sitting at offset 0 keeps the floor at 0 (reaping nothing) — exactly the
+    /// consumer-safe pin the default stream applies to a real slow consumer. Every named group is
+    /// touched by construction (a lazily-created group is a consumer op; a durable-resumed group
+    /// carried state), so unlike the default there is no untouched structural group to skip; the
+    /// `touched` filter is kept for parity and is a no-op here. A GHOST `group_last_checkpointed`
+    /// entry whose group is NOT currently live ALSO pins (an idle-checkpointed group's durable
+    /// position), so retention never deletes data a checkpointed-but-not-live group still needs.
+    ///
+    /// With NO group at all — a produce-only stream no consumer ever bound — the floor is that
+    /// stream's durable head, so every sealed record is reapable once a bound trips (matching the
+    /// default's "no touched group ⇒ floor is the head"). Returns `0` (a safe over-protecting
+    /// under-estimate that reaps nothing) if the stream is not resident; the reaper only ever runs on
+    /// a resident stream, so that branch is a guard, never the live path.
+    fn min_committed_offset_named(&self, id: &StreamId) -> u64 {
+        let Some(ns) = self.named_streams.get(id) else {
+            return 0;
+        };
+        let head = self
+            .streams
+            .get(id)
+            .map_or(0, |log| log.flushed_offset().get());
+        let live = ns
+            .groups
+            .values()
+            .filter(|g| g.touched)
+            .map(|g| g.cursor.committed().get());
+        let ghosts = ns
+            .group_last_checkpointed
+            .iter()
+            .filter(|(name, _)| !ns.groups.contains_key(name.as_str()))
+            .map(|(_, &committed)| committed);
+        live.chain(ghosts).min().unwrap_or(head)
     }
 
     /// Evicts (reclaims the in-memory state of) every NAMED work-group that has been IDLE past the
@@ -16485,6 +16701,432 @@ mod tests {
             payload,
         })
         .unwrap()
+    }
+
+    // ============================ #566: per-stream retention + compaction ============================
+
+    /// The [`StreamId`] for a named-stream test, so a test can read a stream's OWN log
+    /// (`earliest_offset` / `durable_record_bytes` / `flushed_offset`) through the `StreamSet`.
+    fn sid(name: &str) -> StreamId {
+        StreamId::named(name).unwrap()
+    }
+
+    /// Produces a KEYED record to the NAMED stream `stream`, for the per-stream compaction test.
+    fn produce_keyed_named(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Offset {
+        e.produce_in_stream(
+            stream,
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key,
+                headers: b"",
+                payload,
+            },
+        )
+        .unwrap()
+    }
+
+    /// `config_with_retention`, plus a `max_open_streams` hot-set LRU cap, for the #566-composes-#565
+    /// evicted-stream reap test.
+    fn config_named_retention_lru(max_retained_bytes: u64, max_open: usize) -> EngineConfig {
+        let mut cfg = config_with_retention(max_retained_bytes);
+        cfg.max_open_streams = max_open;
+        cfg
+    }
+
+    #[test]
+    fn named_stream_retention_reaps_its_own_old_segments_as_the_log_grows() {
+        // #566: a NAMED stream reaps its OWN old sealed segments once it trips the shared retention
+        // bound — proving retention is a per-log property once streams are independent logs. A
+        // produce-only stream (no consumer) has its floor at the durable head, so every fully-below-
+        // head segment over the byte bound is reapable.
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "orders", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("orders"))
+            .unwrap()
+            .durable_record_bytes();
+
+        let mut e = open(config_with_retention(4 * one));
+        for _ in 0..30 {
+            produce_named(&mut e, "orders", &[0xab; 16]);
+        }
+        let log = e.streams.get(&sid("orders")).unwrap();
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "the named stream reaped at least one old segment"
+        );
+        assert!(
+            log.durable_record_bytes() < 30 * one,
+            "the named stream's durable bytes dropped well below the produced volume: {} < {}",
+            log.durable_record_bytes(),
+            30 * one
+        );
+        assert!(
+            log.earliest_offset().get() > 0,
+            "the named stream's earliest_retained advanced past 0"
+        );
+        assert_eq!(
+            log.flushed_offset(),
+            Offset::new(30),
+            "the head is unchanged (a reap deletes only a below-earliest prefix)"
+        );
+    }
+
+    #[test]
+    fn named_stream_retention_is_independent_and_default_stream_reap_is_unchanged() {
+        // #566: two streams age out on their OWN logs. A high-churn NAMED stream reaps while the
+        // DEFAULT stream, with a slow group pinning offset 0, reaps NOTHING — the default stream's
+        // consumer-safe retention is byte-for-byte the pre-#566 behavior, and per-stream isolation
+        // holds (reaping X never touches Y).
+        let mut probe = open(config_with_retention(0));
+        produce(&mut probe, &[0xab; 16]);
+        let one = probe.durable_record_bytes();
+
+        let mut e = open(config_with_retention(4 * one));
+        // A slow DEFAULT-stream group leases offset 0 and never acks: it pins the default floor at 0.
+        produce(&mut e, &[0xab; 16]);
+        assert!(matches!(e.poll_in("slow", 0).unwrap(), Poll::Message(_)));
+        // Churn the NAMED stream well past the bound (produce-only ⇒ its floor is its head).
+        for _ in 0..30 {
+            produce_named(&mut e, "orders", &[0xab; 16]);
+        }
+        // The named stream reaped; the default stream did NOT (its slow group pins offset 0).
+        assert!(
+            e.streams
+                .get(&sid("orders"))
+                .unwrap()
+                .earliest_offset()
+                .get()
+                > 0,
+            "the churny named stream reaped its prefix"
+        );
+        assert_eq!(
+            e.earliest_retained_offset(),
+            Offset::ZERO,
+            "the default stream's slow group still pins offset 0 (default reap unchanged)"
+        );
+        assert!(
+            matches!(e.poll_now_in("slow"), Ok(Poll::Idle | Poll::Message(_))),
+            "the default stream's offset 0 is still readable (never reaped)"
+        );
+    }
+
+    #[test]
+    fn a_named_consumer_below_the_reaped_point_is_truncated_then_resumes() {
+        // #566 data-integrity: a group whose committed cursor is below the oldest retained offset (here
+        // a NEW group joining a stream whose prefix was already reaped) gets EXACTLY ONE truncation
+        // resetting it to earliest, then delivers from there — never a silent skip, never a reaped-
+        // offset read. Byte-for-byte the default stream's #82/#84 below-earliest path.
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "orders", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("orders"))
+            .unwrap()
+            .durable_record_bytes();
+
+        let mut e = open(config_with_retention(4 * one));
+        for _ in 0..30 {
+            produce_named(&mut e, "orders", &[0xab; 16]);
+        }
+        let earliest = e.streams.get(&sid("orders")).unwrap().earliest_offset();
+        assert!(earliest.get() > 0, "the stream's prefix was reaped");
+        assert_eq!(e.counters().truncations, 0, "no truncation surfaced yet");
+
+        // A NEW group starts at 0, below the raised earliest: its first poll is a truncation up to it.
+        match e.poll_in_stream("orders", "g", 100).unwrap() {
+            Poll::Truncated {
+                earliest_retained,
+                skipped,
+            } => {
+                assert_eq!(earliest_retained, earliest, "reset to earliest retained");
+                assert_eq!(skipped, earliest.get(), "skipped the whole reaped span");
+            }
+            other => panic!("expected a truncation, got {other:?}"),
+        }
+        assert_eq!(
+            e.committed_offset_in_stream("orders", "g"),
+            earliest,
+            "the cursor was reset UP to earliest"
+        );
+        assert_eq!(e.counters().truncations, 1, "one truncation event counted");
+        assert_eq!(
+            e.counters().truncated_records,
+            earliest.get(),
+            "the record counter equals the skipped span"
+        );
+
+        // The next poll delivers from earliest (no silent skip, no reaped-offset read), never re-truncates.
+        match e.poll_in_stream("orders", "g", 100).unwrap() {
+            Poll::Message(d) => {
+                assert_eq!(d.offset, earliest, "resumes at the oldest retained record");
+                assert_eq!(e.ack_in_stream("orders", "g", &d.token), AckResult::Acked);
+            }
+            other => panic!("expected a delivery after the reset, got {other:?}"),
+        }
+        assert_eq!(
+            e.counters().truncations,
+            1,
+            "the same gap is not re-counted on a later poll"
+        );
+    }
+
+    #[test]
+    fn a_slow_named_group_prevents_reaping_the_segments_it_still_needs() {
+        // #566 data-integrity (the protect floor, per stream): a slow group stuck near offset 0 pins
+        // this stream's floor low, so NO segment below its cursor is reaped even far over the bound —
+        // un-consumed data a slow consumer still needs is never deleted (no premature reap).
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "orders", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("orders"))
+            .unwrap()
+            .durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        produce_named(&mut e, "orders", &[0xab; 16]);
+        // The slow group leases offset 0 but never acks: its committed stays 0, pinning the floor.
+        assert!(matches!(
+            e.poll_in_stream("orders", "slow", 0).unwrap(),
+            Poll::Message(_)
+        ));
+        assert_eq!(e.committed_offset_in_stream("orders", "slow"), Offset::ZERO);
+        for _ in 0..30 {
+            produce_named(&mut e, "orders", &[0xab; 16]);
+        }
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "the slow group pins the protect floor at 0, so nothing is reaped"
+        );
+        assert_eq!(
+            e.streams.get(&sid("orders")).unwrap().earliest_offset(),
+            Offset::ZERO,
+            "offset 0 (still needed by the slow group) was never reaped"
+        );
+    }
+
+    #[test]
+    fn named_stream_key_compaction_emits_compacted_on_the_hole() {
+        // #566: per-stream KEY-COMPACTION reusing the default's `Log::maybe_compact`. A named consumer
+        // sees ONLY the survivors (latest per key), at their ORIGINAL offsets, and the compacted holes
+        // surface as `Poll::Compacted { from, to }` (mapped by the session to GapMarker COMPACTED) —
+        // never a wrong-offset delivery or a MissingRecord error.
+        let mut e = open(small_segment_config());
+        e.set_compaction_config(ironbus_storage::compaction::CompactionConfig::enabled());
+        let mut last_alpha = Offset::ZERO;
+        let mut last_beta = Offset::ZERO;
+        for v in 0..6u8 {
+            last_alpha = produce_keyed_named(&mut e, "orders", b"alpha", &[v; 12]);
+            last_beta = produce_keyed_named(&mut e, "orders", b"beta", &[v + 100; 12]);
+        }
+        let last = produce_keyed_named(&mut e, "orders", b"gamma", b"only");
+
+        let mut delivered: Vec<u64> = Vec::new();
+        let mut compacted_spans: Vec<(u64, u64)> = Vec::new();
+        loop {
+            match e.poll_in_stream("orders", "g", 0).unwrap() {
+                Poll::Message(d) => {
+                    delivered.push(d.offset.get());
+                    assert_eq!(e.ack_in_stream("orders", "g", &d.token), AckResult::Acked);
+                }
+                Poll::Compacted { from, to } => {
+                    assert!(from.get() < to.get(), "a compacted span is non-empty");
+                    compacted_spans.push((from.get(), to.get()));
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome on the named stream: {other:?}"),
+            }
+        }
+        assert!(
+            !compacted_spans.is_empty(),
+            "the named drain crossed at least one compacted hole"
+        );
+        for w in compacted_spans.windows(2) {
+            assert!(
+                w[0].1 <= w[1].0,
+                "compacted spans are ascending and disjoint"
+            );
+        }
+        assert!(
+            delivered.contains(&last_alpha.get()),
+            "latest alpha survived"
+        );
+        assert!(delivered.contains(&last_beta.get()), "latest beta survived");
+        assert!(
+            delivered.contains(&last.get()),
+            "the one-shot gamma survived"
+        );
+        let mut sorted = delivered.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            delivered, sorted,
+            "delivered in ascending order, holes skipped"
+        );
+    }
+
+    #[test]
+    fn an_evicted_named_stream_is_reaped_without_corrupting_its_cursor() {
+        // #566 composes with #565: a stream evicted by the hot-set LRU is reaped (no disk leak) at the
+        // eviction boundary and again on reopen, and its DURABLE cursor resumes EXACTLY where it left
+        // off across reap+evict+reopen — no corruption, no redelivery, no spurious truncation.
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "A", &[0xab; 16]);
+        let one = probe.streams.get(&sid("A")).unwrap().durable_record_bytes();
+
+        let mut e = open(config_named_retention_lru(4 * one, 1));
+        // Produce to A, keeping group "g" caught up to the head (acking as it goes), so the floor is
+        // the head and A reaps its consumed prefix.
+        let mut now = 0u64;
+        for _ in 0..24 {
+            produce_named(&mut e, "A", &[0xab; 16]);
+            loop {
+                match e.poll_in_stream("A", "g", now).unwrap() {
+                    Poll::Message(d) => {
+                        assert_eq!(e.ack_in_stream("A", "g", &d.token), AckResult::Acked);
+                    }
+                    Poll::Idle => break,
+                    other => panic!("unexpected while draining A: {other:?}"),
+                }
+                now += 1;
+            }
+        }
+        assert!(
+            e.streams.get(&sid("A")).unwrap().earliest_offset().get() > 0,
+            "A's old segments were reaped (no disk leak) while resident"
+        );
+        let committed_a = e.committed_offset_in_stream("A", "g");
+        assert_eq!(committed_a, Offset::new(24), "g caught up to A's head");
+
+        // Force A's eviction: opening B exceeds max_open_streams = 1, evicting A (sync + reap + persist
+        // its cursor + close).
+        produce_named(&mut e, "B", &[0xcd; 16]);
+        assert!(
+            !e.is_named_stream_resident("A"),
+            "A was evicted by the hot-set LRU"
+        );
+
+        // Reopen A by polling g: the durable cursor must resume intact — nothing to redeliver (g was
+        // caught up), and no truncation (a caught-up consumer is never truncated).
+        match e.poll_in_stream("A", "g", now).unwrap() {
+            Poll::Idle => {}
+            other => panic!("a caught-up g must redeliver nothing on reopen, got {other:?}"),
+        }
+        assert!(e.is_named_stream_resident("A"), "A reopened on access");
+        assert_eq!(
+            e.committed_offset_in_stream("A", "g"),
+            committed_a,
+            "the cursor survived reap+evict+reopen intact (no corruption)"
+        );
+        let log = e.streams.get(&sid("A")).unwrap();
+        assert!(
+            log.earliest_offset().get() > 0,
+            "A is still reaped on disk after reopen (no disk leak reintroduced)"
+        );
+        assert_eq!(
+            log.flushed_offset(),
+            Offset::new(24),
+            "A's head is intact (a reap deletes only a prefix)"
+        );
+        assert_eq!(
+            e.counters().truncations,
+            0,
+            "a caught-up consumer is never truncated across evict/reopen"
+        );
+    }
+
+    #[test]
+    fn named_stream_reap_leaves_its_dlq_intact() {
+        // #566 composes with #1110: reaping a named stream's MAIN-log segments never deletes its
+        // per-stream DLQ (dead-letters live in the separate `dlq/` subtree, not the reapable `*.seg`
+        // files), so a poison's forensic copy survives even aggressive retention that reaps past the
+        // poison's original offset.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "orders", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("orders"))
+            .unwrap()
+            .durable_record_bytes();
+        // max_deliver = 1 so a redelivery dead-letters; a tight byte bound so old segments reap.
+        let cfg = EngineConfig {
+            delivery: DeliveryConfig::new(1, false, vec![]).unwrap(),
+            ..config_with_retention(4 * one)
+        };
+        let mut e = open_with_clock(cfg, std::sync::Arc::clone(&clock));
+
+        // Poison offset 0 on stream "orders" group "g": first delivery, expire the lease, re-poll →
+        // dead-lettered (attempt 2 > max_deliver 1), a forensic copy in the stream's OWN dlq/.
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 1,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"poison",
+            },
+        )
+        .unwrap();
+        let d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        assert_eq!(d.offset, Offset::ZERO);
+        clock.advance_monotonic_nanos(40);
+        assert!(
+            matches!(
+                e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap(),
+                Poll::Parked { .. }
+            ),
+            "the poison was dead-lettered to the stream's own DLQ"
+        );
+        assert_eq!(e.dlq_records(), 1, "one record in the named stream's DLQ");
+
+        // Now churn the stream far past the retention bound, keeping g caught up, so retention reaps old
+        // segments INCLUDING the region around the poison's original offset.
+        for _ in 0..30 {
+            e.produce_in_stream(
+                "orders",
+                &Append {
+                    timestamp_ms: 1,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: &[0xab; 16],
+                },
+            )
+            .unwrap();
+            loop {
+                match e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap() {
+                    Poll::Message(d) => {
+                        assert_eq!(e.ack_in_stream("orders", "g", &d.token), AckResult::Acked);
+                    }
+                    Poll::Idle => break,
+                    other => panic!("unexpected while draining orders: {other:?}"),
+                }
+            }
+        }
+        assert!(
+            e.streams
+                .get(&sid("orders"))
+                .unwrap()
+                .earliest_offset()
+                .get()
+                > 1,
+            "retention reaped past the poison's original offset in the MAIN log"
+        );
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "the DLQ record is intact — reaping the main log never touched the dlq/ subtree"
+        );
     }
 
     /// Finds two distinct keys that route to two DIFFERENT members under the given membership, so a
