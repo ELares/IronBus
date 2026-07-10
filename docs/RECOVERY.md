@@ -577,13 +577,19 @@ prefix is consistent), proving the repair left a log the broker accepts unchange
 
 When the BROKER itself recovers at startup (`Engine::open`), it counts the recovery
 as an EVENT (#575) — the flagship metric NATS has no analogue for. Each is bumped
-once per open from the durable loss report and is monotonic across a `kill -9`:
+once per open from the durable loss reports of EVERY recovery path that open ran
+(#1130: the root log, each named per-stream recovery, the shared WAL's recovery,
+and every partition sub-log recovery) and is monotonic across a `kill -9`:
 
 - `ironbus_recovery_runs_total{outcome="clean|torn_tail_truncated|quarantined|data_loss"}`
-  — one increment per recovery run, in its outcome bucket. The
-  `fraction-of-opens-that-needed-a-repair` signal.
+  — one increment per recovery run, in the bucket of the WORST loss observed
+  across all the paths. The `fraction-of-opens-that-needed-a-repair` signal.
+  `data_loss` fires for quarantine-UNCAPTURED loss — today, the shared WAL's
+  undecodable-tag records (counted on the `ironbus_shared_wal_undecodable_records`
+  last-open gauge).
 - `ironbus_torn_tail_repairs_total` — torn/unsynced tails truncated to the longest
-  valid prefix (power-loss repairs, NOT data loss).
+  valid prefix (power-loss repairs, NOT data loss), across every log the open
+  recovers.
 - `ironbus_corruption_repairs_total{artifact="segment|cursor|dlq"}` — corruption
   spans quarantined-and-dropped, by artifact. **This is the metric NATS structurally
   lacks**: a non-zero `{artifact="segment"}` is the alertable "real bytes were lost

@@ -726,6 +726,7 @@ where
             in_flight: g.in_flight(),
             healthy: g.is_healthy(),
             recovered_truncated: g.recovered_truncated_bytes(),
+            shared_wal_undecodable: g.shared_wal_undecodable_records(),
             quarantined: g.quarantined_bytes(),
             recovery_loss: loss.bytes_skipped,
             recovery_loss_records: loss.records_lost,
@@ -929,6 +930,10 @@ struct MetricsSnapshot {
     in_flight: usize,
     healthy: bool,
     recovered_truncated: u64,
+    /// Durable shared-WAL records whose stored stream tag was absent/invalid at the last open's
+    /// demux scan (#1130): quarantine-uncaptured cross-stream loss, delivered to no stream. A
+    /// per-open snapshot like `recovered_truncated`; always `0` in the default per-stream mode.
+    shared_wal_undecodable: u64,
     /// The persisted on-disk footprint of the forensic quarantine store (#134, #315): the
     /// corrupt-byte copies prior recoveries left, surviving restart.
     quarantined: u64,
@@ -1009,6 +1014,7 @@ fn broker_core_lines(
     in_flight: usize,
     healthy: bool,
     recovered_truncated: u64,
+    shared_wal_undecodable: u64,
     quarantined: u64,
     last_dead_lettered: i64,
     dlq_records: u64,
@@ -1034,6 +1040,9 @@ fn broker_core_lines(
          # HELP ironbus_recovery_truncated_bytes Bytes dropped from a torn or unsynced tail at the last recovery (startup).\n\
          # TYPE ironbus_recovery_truncated_bytes gauge\n\
          ironbus_recovery_truncated_bytes {recovered_truncated}\n\
+         # HELP ironbus_shared_wal_undecodable_records Durable shared-WAL records whose stored stream tag was absent or invalid at the last open's demux scan: each is delivered to NO stream (never mis-delivered) — real, quarantine-uncaptured cross-stream loss, which classifies that open as a data_loss recovery run. Always 0 in the default per-stream mode.\n\
+         # TYPE ironbus_shared_wal_undecodable_records gauge\n\
+         ironbus_shared_wal_undecodable_records {shared_wal_undecodable}\n\
          # HELP ironbus_quarantine_bytes Persisted on-disk bytes of the forensic quarantine store (capped, copy-not-move); the corrupt-byte copies prior recoveries left, surviving restart.\n\
          # TYPE ironbus_quarantine_bytes gauge\n\
          ironbus_quarantine_bytes {quarantined}\n\
@@ -1120,6 +1129,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         in_flight,
         healthy,
         recovered_truncated,
+        shared_wal_undecodable,
         quarantined,
         recovery_loss,
         recovery_loss_records,
@@ -1145,6 +1155,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         in_flight,
         healthy,
         recovered_truncated,
+        shared_wal_undecodable,
         quarantined,
         last_dead_lettered,
         dlq_records,
@@ -3587,6 +3598,16 @@ mod tests {
         assert!(m.contains("\nironbus_in_flight 0\n"), "{m}");
         assert!(m.contains("\nironbus_writer_healthy 1\n"), "{m}");
         assert!(m.contains("\nironbus_recovery_truncated_bytes 0\n"), "{m}");
+        // The shared-WAL undecodable-tag gauge (#1130) exists and reports the honest zero on a
+        // default-mode (per-stream) broker.
+        assert!(
+            m.contains("# TYPE ironbus_shared_wal_undecodable_records gauge"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_shared_wal_undecodable_records 0\n"),
+            "{m}"
+        );
         // The per-reason recovery-loss series is present, one line per reason, zero on a clean
         // start (no recovery loss).
         assert!(
@@ -5661,6 +5682,12 @@ mod tests {
         ("ironbus_writer_healthy", "gauge"),
         ("ironbus_last_dead_lettered_offset", "gauge"),
         ("ironbus_recovery_truncated_bytes", "gauge"),
+        // The shared-WAL undecodable-tag record count (#1130): a per-open snapshot GAUGE (the
+        // record stays on disk, so a cumulative counter would re-count it every open), the
+        // cross-stream twin of `ironbus_recovery_truncated_bytes`. Real, quarantine-uncaptured
+        // loss; a non-zero value also classifies that open's `ironbus_recovery_runs_total` bucket
+        // as `data_loss`.
+        ("ironbus_shared_wal_undecodable_records", "gauge"),
         ("ironbus_quarantine_bytes", "gauge"),
         ("ironbus_consumer_overflow_saturated", "gauge"),
         // Edge gauges (#118): write-amp ratio, RAM headroom, the throughput-collapse saturation

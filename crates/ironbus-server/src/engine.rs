@@ -55,10 +55,10 @@ use ironbus_storage::loss::LossReport;
 use ironbus_storage::naming::{
     parse_partition_subdir_name, parse_stream_subdir_name, stream_subdir_name, MAX_STREAM_NAME_LEN,
 };
-use ironbus_storage::partitioned::PartitionedStream;
+use ironbus_storage::partitioned::{PartitionRecovery, PartitionedStream};
 use ironbus_storage::segment::{OwnedRecord, RawByteRun, StorageError};
-use ironbus_storage::shared_wal::{SharedWal, StorageMode};
-use ironbus_storage::streamset::{CommitOutcome, StreamError, StreamId, StreamSet};
+use ironbus_storage::shared_wal::{SharedWal, SharedWalRecovery, StorageMode};
+use ironbus_storage::streamset::{CommitOutcome, StreamError, StreamId, StreamRecovery, StreamSet};
 use ironbus_storage::txn::{TxnStore, TxnStoreError};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1317,10 +1317,12 @@ pub struct Counters {
 
 /// The recovery-event counter family (#575): the FLAGSHIP corruption-recovery metrics NATS has no
 /// analogue for. Each is raised once per [`Engine::open`] recovery run from the just-recovered durable
-/// [`LossReport`], so they are monotonic non-decreasing and replay-reconstructable across a hard crash
-/// (the same durability the recovery-loss family already has). Rendered by `health.rs` as
-/// `ironbus_recovery_runs_total{outcome}`, `ironbus_torn_tail_repairs_total`, and
-/// `ironbus_corruption_repairs_total{artifact}` in the frozen METRICS.md taxonomy.
+/// [`LossReport`]s of EVERY recovery path that open ran (#1130: the root log, each named per-stream
+/// recovery, the shared WAL, and every partition sub-log), so they are monotonic non-decreasing and
+/// replay-reconstructable across a hard crash (the same durability the recovery-loss family already
+/// has). Rendered by `health.rs` as `ironbus_recovery_runs_total{outcome}`,
+/// `ironbus_torn_tail_repairs_total`, and `ironbus_corruption_repairs_total{artifact}` in the frozen
+/// METRICS.md taxonomy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryCounters {
     /// Recovery RUNS by outcome, indexed in [`RecoveryOutcome::ALL`] order: one increment per open,
@@ -1349,9 +1351,12 @@ pub enum RecoveryOutcome {
     TornTailTruncated,
     /// At least one corruption span was quarantined-and-dropped (real data loss, copied to forensics).
     Quarantined,
-    /// Recovery completed but the loss report carried data loss without a successful quarantine
-    /// capture (e.g. the quarantine store was over its cap): the reported-but-uncaptured data-loss
-    /// outcome. Reserved alongside `Quarantined` so the outcome taxonomy is frozen up front.
+    /// Recovery completed but the open observed real data loss without a successful quarantine
+    /// capture: the reported-but-uncaptured data-loss outcome, the worst bucket. Fired today when
+    /// the shared WAL's demux scan finds undecodable-tag records (#1130): durable records whose
+    /// stream tag was absent/invalid, delivered to NO stream, with nothing quarantined (the record
+    /// stays on disk). Also reserved for a future capture failure (e.g. the quarantine store over
+    /// its cap).
     DataLoss,
 }
 
@@ -2643,11 +2648,15 @@ where
 }
 
 /// The recovered partitioned-stream state (#693): the reopened [`PartitionedStream`]s keyed by
-/// [`StreamId`], paired with each partition's resumed per-group consumer state keyed by
-/// `(stream, partition index)`. Named so the two-map tuple does not trip the `type_complexity` lint.
+/// [`StreamId`], each partition's resumed per-group consumer state keyed by
+/// `(stream, partition index)`, plus every partition sub-log's INDEPENDENT recovery summary across
+/// all partitioned streams (#575/#1130 — previously discarded, which left a partition's torn-tail /
+/// corruption loss invisible to the recovery-event counters). Named so the tuple does not trip the
+/// `type_complexity` lint.
 type PartitionedRecovery<F, C> = (
     BTreeMap<StreamId, PartitionedStream<F, C>>,
     BTreeMap<(StreamId, u32), NamedStream>,
+    Vec<PartitionRecovery>,
 );
 
 /// Reopens every PARTITIONED stream (#693) under `pstreams/<hex(name)>/`, and resumes each partition's
@@ -2660,7 +2669,8 @@ type PartitionedRecovery<F, C> = (
 /// consumer resumes at its committed offset after a restart instead of redelivering the partition.
 ///
 /// A foreign/non-canonical child directory is skipped; a data dir with no `pstreams/` subtree returns
-/// two empty maps and never materializes it (the non-partitioned image is unchanged).
+/// two empty maps (and no recovery summaries) and never materializes it (the non-partitioned image is
+/// unchanged).
 ///
 /// # Errors
 /// Propagates a storage error from enumerating `pstreams/`, opening/recovering a partition's log, or
@@ -2676,9 +2686,10 @@ where
 {
     let mut partitioned = BTreeMap::new();
     let mut consumers = BTreeMap::new();
+    let mut recoveries = Vec::new();
     let root = root_log.filesystem();
     if !root.subdir_exists(PARTITIONED_STREAMS_SUBDIR)? {
-        return Ok((partitioned, consumers));
+        return Ok((partitioned, consumers, recoveries));
     }
     let pfs = root.subdir(PARTITIONED_STREAMS_SUBDIR)?;
     let config = root_log.config();
@@ -2699,9 +2710,13 @@ where
         let Some(pc) = u32::try_from(count).ok().and_then(PartitionCount::new) else {
             continue;
         };
-        let (ps, _recoveries) =
+        // The per-partition recovery summaries are COLLECTED (not discarded, #575/#1130) so `open`
+        // can fold every partition sub-log's torn-tail / corruption loss events into the
+        // recovery-event counters — a partition's crash damage must be as visible as the root log's.
+        let (ps, partition_recoveries) =
             PartitionedStream::open(&stream_root, root_log.clock_clone(), config, pc)
                 .map_err(EngineError::Storage)?;
+        recoveries.extend(partition_recoveries);
         // Resume each partition's per-group consumer cursor from its own sub-log subdir.
         for i in 0..pc.get() {
             let idx = PartitionIndex::new(i);
@@ -2714,7 +2729,7 @@ where
         }
         partitioned.insert(id, ps);
     }
-    Ok((partitioned, consumers))
+    Ok((partitioned, consumers, recoveries))
 }
 
 /// Reconstructs a group's carried attempt counts from a recovered `attempts.ckpt` payload, clamped
@@ -3235,6 +3250,14 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// their own `cursor-<hex>.ckpt` files.
     group_last_checkpointed: BTreeMap<String, u64>,
     counters: Counters,
+    /// The count of durable SHARED-WAL records whose stored stream tag was absent or invalid at the
+    /// LAST open's demux scan (#1130): deep corruption (or a foreign writer) that passed the frame
+    /// CRCs, so the record is delivered to NO stream — real, quarantine-uncaptured cross-stream
+    /// loss. A per-open SNAPSHOT (like [`Engine::recovered_truncated_bytes`]), NOT a durable
+    /// counter: the record stays on disk, so a cumulative counter would re-count it every open.
+    /// Always `0` in the default per-stream mode. Exposed as the
+    /// `ironbus_shared_wal_undecodable_records` gauge.
+    shared_wal_undecodable_records: u64,
     /// The fsync (durability barrier) latency distribution observed on produce.
     fsync: LatencyHistogram,
     /// The bounded, allocation-free metric registry (#97): the fixed-bucket fsync-duration and
@@ -3496,15 +3519,28 @@ type RecoveredProducerSeq<File> = (Option<ProducerSeqCheckpoint<File>>, Option<V
 type RecoveredAttempts<File> = (AttemptsCheckpoint<File>, Option<Vec<u8>>);
 
 /// The result of [`Engine::open_log_and_streams`] (#676): the DEFAULT stream's root [`Log`] paired
-/// with the per-NAMED-stream [`StreamSet`] substrate. Named so the two-element tuple does not trip
+/// with the per-NAMED-stream [`StreamSet`] substrate, plus each opened stream's INDEPENDENT
+/// recovery summary (#575/#1130 — previously discarded, which left a named stream's torn-tail /
+/// corruption loss invisible to the recovery-event counters). Named so the tuple does not trip
 /// the `type_complexity` lint and reads as one value at the call site.
-type LogAndStreams<F, C> = (Log<F, C>, StreamSet<F, C>);
+type LogAndStreams<F, C> = (
+    Log<F, C>,
+    StreamSet<F, C>,
+    BTreeMap<StreamId, StreamRecovery>,
+);
 
 /// The result of [`Engine::open_log_and_shared_wal`] (#597 wiring): the root [`Log`], the
 /// DEFAULT-ONLY [`StreamSet`] (its inert `""` slot; no named per-stream log exists in shared mode),
-/// and the ONE recovered [`SharedWal`]. Named so the three-element tuple does not trip
-/// `type_complexity` and reads as one value at the call site.
-type LogStreamsAndWal<F, C> = (Log<F, C>, StreamSet<F, C>, SharedWal<F, C>);
+/// the ONE recovered [`SharedWal`], and its recovery summary (#575/#1130 — previously discarded,
+/// which left a torn SHARED tail's cross-stream loss and the undecodable-tag record count invisible
+/// to the metrics surface). Named so the tuple does not trip `type_complexity` and reads as one
+/// value at the call site.
+type LogStreamsAndWal<F, C> = (
+    Log<F, C>,
+    StreamSet<F, C>,
+    SharedWal<F, C>,
+    SharedWalRecovery,
+);
 
 /// The result of [`recover_shared_stream_groups`] (#597 wiring): each known named stream's resumed
 /// consumer state, plus the KNOWN set itself (wal-scanned streams ∪ `streams/<hex>/` metadata dirs).
@@ -3600,13 +3636,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // mode the StreamSet then re-opens the already-clean root for its inert `""` slot and
         // recovers the named streams; in SHARED-WAL mode the ONE shared commit log recovers
         // (rebuilding its per-stream demux index) and the StreamSet holds ONLY the inert `""` slot.
-        let (log, streams, mut shared_wal) = if config.storage_mode == StorageMode::SharedWal {
-            let (log, streams, wal) = Self::open_log_and_shared_wal(fs, clock, config.log)?;
-            (log, streams, Some(wal))
-        } else {
-            let (log, streams) = Self::open_log_and_streams(fs, clock, config.log)?;
-            (log, streams, None)
-        };
+        // The per-path recovery summaries (#575/#1130) ride alongside: the named per-stream
+        // summaries in the default mode (empty in shared mode, where no named per-stream log
+        // exists), the shared WAL's single summary in shared mode. Both feed the recovery-event
+        // counter accumulation below, so NO recovery path's loss is invisible to the metrics.
+        let (log, streams, mut shared_wal, stream_recoveries, shared_recovery) =
+            if config.storage_mode == StorageMode::SharedWal {
+                let (log, streams, wal, recovery) =
+                    Self::open_log_and_shared_wal(fs, clock, config.log)?;
+                (log, streams, Some(wal), BTreeMap::new(), Some(recovery))
+            } else {
+                let (log, streams, recoveries) = Self::open_log_and_streams(fs, clock, config.log)?;
+                (log, streams, None, recoveries, None)
+            };
 
         // Open (creating if absent) the cursor checkpoint through the log's filesystem.
         let checkpoint_file = {
@@ -3632,7 +3674,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // counters from the last snapshot (or all-zeros if it is missing or torn) AND reconciling the
         // recovery-loss family with the durable log / loss report (#307). Factored out to keep `open`
         // readable; the never-block-recovery contract and the checkpoint-plus-replay max live there.
-        let (counters_checkpoint, counters) = Self::open_counters_checkpoint(&log)?;
+        let (counters_checkpoint, mut counters) = Self::open_counters_checkpoint(&log)?;
 
         // Recover the durable idempotent-producer SEQUENCE high-waters (V2-M8). If the
         // `producer-seq.ckpt` file exists, open its dual-slot handle and decode the last fully-durable
@@ -3805,8 +3847,45 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // partition's own subdir — the per-partition twin of `recover_named_stream_groups` above. A
         // deployment that never declared `P > 1` has no `pstreams/` subtree, so this is a no-op and the
         // on-disk image is byte-for-byte unchanged.
-        let (partitioned, partition_consumers) =
+        let (partitioned, partition_consumers, partition_recoveries) =
             recover_partitioned_streams(&log, config.lease, opened_at)?;
+
+        // Recovery-EVENT counters (#575), folded in ONCE per open across EVERY recovery path
+        // (#1130): the root log, each NAMED per-stream recovery, the SHARED WAL's single recovery
+        // (shared mode), and every PARTITION sub-log recovery. One `runs_by_outcome` bump per open
+        // (classified by the WORST loss observed across all paths), plus each path's per-event
+        // torn-tail / corruption repair counts. Like the root-only accumulation this replaces, it
+        // never double-counts across restarts: each loss report reflects only THIS recovery (a
+        // repaired tail re-opens clean next time). The inert `""` StreamSet slot re-opens the
+        // already-recovered root and so always carries an empty report; it is skipped explicitly so
+        // the root log is counted exactly once. The undecodable-tag record count is deliberately
+        // NOT added to the (durable, cross-restart) repair counters — an undecodable record stays
+        // on disk and would be re-counted every open — it classifies the run's outcome
+        // (`data_loss`: real, quarantine-uncaptured loss) and is exposed as the last-open gauge
+        // `ironbus_shared_wal_undecodable_records` instead.
+        let shared_wal_undecodable_records = shared_recovery
+            .as_ref()
+            .map_or(0, |r| r.undecodable_tag_records);
+        {
+            let mut recovery_losses: Vec<&LossReport> =
+                Vec::with_capacity(2 + stream_recoveries.len() + partition_recoveries.len());
+            recovery_losses.push(log.loss_report());
+            recovery_losses.extend(
+                stream_recoveries
+                    .iter()
+                    .filter(|(id, _)| !id.is_default())
+                    .map(|(_, r)| &r.loss_report),
+            );
+            if let Some(recovery) = shared_recovery.as_ref() {
+                recovery_losses.push(&recovery.loss_report);
+            }
+            recovery_losses.extend(partition_recoveries.iter().map(|r| &r.loss_report));
+            Self::accumulate_recovery_events(
+                &mut counters.recovery,
+                &recovery_losses,
+                shared_wal_undecodable_records,
+            );
+        }
 
         // The TRANSACTIONAL HALF-MESSAGE store's log (V2-M8, #640) shares the main log's segment
         // sizing but is NEVER byte-capped: a prepared half message is an undelivered durable payload
@@ -3923,6 +4002,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             last_attempts_checkpointed: default_committed,
             // Seeded from the durable counters snapshot (#98), all-zeros if it was missing or torn.
             counters,
+            // The shared demux scan's undecodable-tag record count (#1130), a per-open snapshot;
+            // `0` in the default per-stream mode (no shared WAL) and on a clean shared open.
+            shared_wal_undecodable_records,
             fsync: LatencyHistogram::default(),
             // The bounded metric registry (#97), from the clock seam; its head and per-consumer
             // floors are seeded from the recovered state after construction.
@@ -4081,9 +4163,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     {
         let fs_for_streams = fs.clone();
         let log = Log::open(fs, clock.clone(), config)?;
-        let (streams, _stream_recoveries) =
+        // The per-stream recovery summaries are RETURNED (not discarded, #575/#1130) so `open` can
+        // fold every named stream's torn-tail / corruption loss events into the recovery-event
+        // counters — a named stream's crash damage must be as visible as the root log's.
+        let (streams, stream_recoveries) =
             StreamSet::open(&fs_for_streams, clock, config).map_err(EngineError::Storage)?;
-        Ok((log, streams))
+        Ok((log, streams, stream_recoveries))
     }
 
     /// The SHARED-WAL-mode twin of [`Engine::open_log_and_streams`] (#597 wiring): opens the root
@@ -4107,10 +4192,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let fs_for_wal = fs.clone();
         let fs_for_streams = fs.clone();
         let log = Log::open(fs, clock.clone(), config)?;
-        let (wal, _recovery) = SharedWal::open(&fs_for_wal, clock.clone(), config)?;
+        // The shared WAL's recovery summary is RETURNED (not discarded, #575/#1130) so `open` can
+        // fold the shared commit log's loss report into the recovery-event counters and surface the
+        // undecodable-tag record count: a torn SHARED tail is CROSS-STREAM loss and must be at
+        // least as visible as the root log's.
+        let (wal, recovery) = SharedWal::open(&fs_for_wal, clock.clone(), config)?;
         let streams = StreamSet::open_default_only(&fs_for_streams, clock, config)
             .map_err(EngineError::Storage)?;
-        Ok((log, streams, wal))
+        Ok((log, streams, wal, recovery))
     }
 
     /// The MODE-vs-LAYOUT fail-closed gate (#597 wiring), run by [`Engine::open`] BEFORE any
@@ -4420,39 +4509,60 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             log.loss_report(),
             log.flushed_offset().get(),
         );
-        // Recovery-EVENT counters (#575): record THIS open as one recovery run, classified by its loss
-        // report, and add this run's per-event repair counts. Unlike the recovery-LOSS `max`
-        // reconciliation above, these are additive per-open EVENT counts, which is correct and never
-        // double-counts: `loss_report()` reflects only THIS recovery (a torn tail or corruption span
-        // this open dropped), and a clean re-open after a prior recovery already truncated/quarantined
-        // the damage carries an EMPTY report, so it adds a clean-outcome run and zero repairs.
-        Self::accumulate_recovery_events(&mut counters.recovery, log.loss_report());
+        // The recovery-EVENT counters (#575) are NOT accumulated here: `Engine::open` folds them in
+        // ONCE after EVERY recovery path has run (root log, named per-stream recoveries, the shared
+        // WAL, partitioned sub-logs — #1130), so the one-run-per-open classification can see the
+        // whole open, not just the root log.
         Ok((counters_checkpoint, counters))
     }
 
     /// Records ONE recovery run in the recovery-EVENT counter family (#575), the marquee
     /// corruption-recovery metrics NATS has no analogue for. It is called once per [`Engine::open`]
-    /// with the just-recovered durable [`LossReport`]:
+    /// with the just-recovered durable [`LossReport`]s of EVERY recovery path that open ran
+    /// (#1130): the root log, each NAMED per-stream recovery, the SHARED WAL's single recovery
+    /// (shared mode), and every PARTITION sub-log recovery — plus the shared demux scan's
+    /// undecodable-tag record count. It:
     ///
-    /// - bumps exactly ONE `runs_by_outcome` bucket: `Clean` for an empty report, else
-    ///   `TornTailTruncated` when the only loss was a torn tail (no data loss), else `Quarantined`
-    ///   when a data-loss corruption span was dropped (the corruption was copied to the quarantine
-    ///   store before truncation, per the recovery contract);
-    /// - adds the count of `TornTail` loss events to `torn_tail_repairs`;
-    /// - adds each data-loss (corruption) event to the matching `corruption_repairs_by_artifact`
-    ///   bucket. A corruption skip in the main log is the `Segment` artifact; recovery does not
-    ///   today produce cursor or DLQ corruption loss events (a torn cursor reverts via its dual-slot
-    ///   checkpoint, never producing a loss event), so those buckets stay zero here, reserved for the
-    ///   frozen taxonomy and incremented by the offline `repair` path when it acts on those artifacts.
+    /// - bumps exactly ONE `runs_by_outcome` bucket, classified by the WORST loss observed across
+    ///   all the reports: `Clean` when every report is empty (and no undecodable-tag record was
+    ///   seen), else `TornTailTruncated` when the only loss was torn tails (no data loss), else
+    ///   `Quarantined` when a data-loss corruption span was dropped (the corruption was copied to
+    ///   the quarantine store before truncation, per the recovery contract), else `DataLoss` when
+    ///   the open observed real loss with NO quarantine capture — today the shared WAL's
+    ///   undecodable-tag records, durable records whose stream tag was absent/invalid and which are
+    ///   therefore delivered to no stream (they remain on disk; nothing is quarantined);
+    /// - adds the count of `TornTail` loss events across all reports to `torn_tail_repairs`;
+    /// - adds each data-loss (corruption) event across all reports to the matching
+    ///   `corruption_repairs_by_artifact` bucket. A corruption skip in any log (root, named stream,
+    ///   shared WAL, partition sub-log) is the `Segment` artifact; recovery does not today produce
+    ///   cursor or DLQ corruption loss events (a torn cursor reverts via its dual-slot checkpoint,
+    ///   never producing a loss event), so those buckets stay zero here, reserved for the frozen
+    ///   taxonomy and incremented by the offline `repair` path when it acts on those artifacts.
     ///
-    /// It is a pure, saturating accumulation over the in-memory report (no IO, never fails recovery),
-    /// and adding only THIS open's events keeps the counters monotonic non-decreasing across restarts
-    /// without double-counting (the report is per-recovery; a clean re-open adds nothing).
-    fn accumulate_recovery_events(recovery: &mut RecoveryCounters, loss: &LossReport) {
-        let data_loss = loss.data_loss_bytes() > 0;
-        let outcome = if loss.is_empty() {
+    /// The undecodable-tag record count deliberately does NOT add to `corruption_repairs_by_artifact`:
+    /// nothing is repaired (the record stays on disk, excluded from every stream), and — unlike a
+    /// per-recovery loss report, which empties once the damage is truncated — the demux scan would
+    /// re-count it on EVERY open, breaking the family's no-double-count discipline. It classifies the
+    /// run's outcome and rides the last-open gauge `ironbus_shared_wal_undecodable_records` instead.
+    ///
+    /// It is a pure, saturating accumulation over the in-memory reports (no IO, never fails
+    /// recovery), and adding only THIS open's events keeps the counters monotonic non-decreasing
+    /// across restarts without double-counting (each report is per-recovery; a clean re-open adds
+    /// nothing).
+    fn accumulate_recovery_events(
+        recovery: &mut RecoveryCounters,
+        losses: &[&LossReport],
+        undecodable_tag_records: u64,
+    ) {
+        let clean = losses.iter().all(|l| l.is_empty()) && undecodable_tag_records == 0;
+        let quarantined = losses.iter().any(|l| l.data_loss_bytes() > 0);
+        let outcome = if clean {
             RecoveryOutcome::Clean
-        } else if data_loss {
+        } else if undecodable_tag_records > 0 {
+            // Real loss with NO quarantine capture (the record stays on disk, delivered to no
+            // stream): the reported-but-uncaptured bucket, the worst outcome.
+            RecoveryOutcome::DataLoss
+        } else if quarantined {
             RecoveryOutcome::Quarantined
         } else {
             RecoveryOutcome::TornTailTruncated
@@ -4460,11 +4570,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let bucket = &mut recovery.runs_by_outcome[outcome.index()];
         *bucket = bucket.saturating_add(1);
 
-        for event in &loss.events {
+        for event in losses.iter().flat_map(|l| &l.events) {
             if event.reason_code.is_data_loss() {
-                // A corruption skip in the main log: the `Segment` artifact. (Recovery does not
-                // emit cursor/DLQ loss events today; those buckets are driven by the offline
-                // `repair` path, reserved here so the taxonomy is frozen up front.)
+                // A corruption skip in a log (root, named stream, shared WAL, or partition
+                // sub-log): the `Segment` artifact. (Recovery does not emit cursor/DLQ loss events
+                // today; those buckets are driven by the offline `repair` path, reserved here so
+                // the taxonomy is frozen up front.)
                 let idx = RecoveryArtifact::Segment.index();
                 recovery.corruption_repairs_by_artifact[idx] =
                     recovery.corruption_repairs_by_artifact[idx].saturating_add(1);
@@ -12510,6 +12621,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.log.recovered_truncated_bytes()
     }
 
+    /// The count of durable SHARED-WAL records whose stored stream tag was absent or invalid at the
+    /// LAST open's demux scan (#1130): each is delivered to NO stream (never mis-delivered), which
+    /// is real, quarantine-uncaptured cross-stream loss — the open that observes one classifies as
+    /// a `data_loss` recovery run. A per-open snapshot like
+    /// [`Engine::recovered_truncated_bytes`]; always `0` in the default per-stream mode. Exposed as
+    /// the `ironbus_shared_wal_undecodable_records` gauge.
+    #[must_use]
+    pub fn shared_wal_undecodable_records(&self) -> u64 {
+        self.shared_wal_undecodable_records
+    }
+
     /// The structured loss report from recovery (#120): the byte spans dropped to reach the
     /// last intact record, with their reasons. Empty for a fresh log or a clean recovery. The
     /// metrics endpoint reads it for the per-reason recovery-loss series.
@@ -16154,12 +16276,18 @@ mod tests {
     #[test]
     fn recovery_event_counters_classify_and_count_each_outcome() {
         // The recovery-EVENT family (#575) records one run per accumulation, in the right outcome
-        // bucket, and adds the per-event torn-tail / corruption repair counts. Driven directly over
-        // the helper so each outcome is pinned deterministically.
+        // bucket, and adds the per-event torn-tail / corruption repair counts across EVERY loss
+        // report of the open (#1130). Driven directly over the helper so each outcome is pinned
+        // deterministically.
         let mut r = RecoveryCounters::default();
 
-        // 1) A CLEAN report: one clean run, no repairs.
-        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(&mut r, &LossReport::new());
+        // 1) A CLEAN open (only empty reports, no undecodable-tag records): one clean run, no
+        //    repairs.
+        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(
+            &mut r,
+            &[&LossReport::new(), &LossReport::new()],
+            0,
+        );
         assert_eq!(r.runs_by_outcome[RecoveryOutcome::Clean.index()], 1);
         assert_eq!(r.torn_tail_repairs, 0);
         assert_eq!(
@@ -16167,11 +16295,16 @@ mod tests {
             0
         );
 
-        // 2) A TORN-TAIL-only report: one torn_tail_truncated run, one torn-tail repair, NO
-        //    corruption (a torn tail is not data loss).
+        // 2) A TORN-TAIL-only open (the torn report riding NEXT TO a clean sibling, the named-stream
+        //    shape): one torn_tail_truncated run, one torn-tail repair, NO corruption (a torn tail
+        //    is not data loss).
         let mut torn = LossReport::new();
         torn.push(LossEvent::span(0, 16, 64, 1, ReasonCode::TornTail));
-        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(&mut r, &torn);
+        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(
+            &mut r,
+            &[&LossReport::new(), &torn],
+            0,
+        );
         assert_eq!(
             r.runs_by_outcome[RecoveryOutcome::TornTailTruncated.index()],
             1
@@ -16183,7 +16316,9 @@ mod tests {
             "a torn tail is never counted as a corruption repair"
         );
 
-        // 3) A CORRUPTION report (data loss): one quarantined run, one segment corruption repair.
+        // 3) A CORRUPTION open (data loss): one quarantined run, one segment corruption repair.
+        //    The quarantined outcome WINS over a sibling report's torn tail (worst-of), while both
+        //    reports' per-event repairs are counted.
         let mut corrupt = LossReport::new();
         corrupt.push(LossEvent::span(
             1,
@@ -16192,18 +16327,38 @@ mod tests {
             1,
             ReasonCode::CorruptRecordBody,
         ));
-        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(&mut r, &corrupt);
+        let mut sibling_torn = LossReport::new();
+        sibling_torn.push(LossEvent::span(2, 8, 32, 1, ReasonCode::TornTail));
+        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(
+            &mut r,
+            &[&corrupt, &sibling_torn],
+            0,
+        );
         assert_eq!(r.runs_by_outcome[RecoveryOutcome::Quarantined.index()], 1);
         assert_eq!(
             r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
             1
         );
-        // The torn-tail count is unchanged by a pure-corruption run.
-        assert_eq!(r.torn_tail_repairs, 1);
+        // The sibling report's torn tail was counted as a repair (cross-path accumulation, #1130)
+        // even though the run classified quarantined.
+        assert_eq!(r.torn_tail_repairs, 2);
 
-        // The counters are monotonic across the three accumulations (one run each = three runs).
+        // 4) An UNDECODABLE-TAG open (#1130, shared mode): real, quarantine-UNCAPTURED loss — the
+        //    data_loss bucket, the worst outcome, winning even over a quarantined sibling. The
+        //    undecodable count does NOT add to the durable repair counters (the record stays on
+        //    disk and would be re-counted every open); it rides the last-open gauge instead.
+        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(&mut r, &[&corrupt], 3);
+        assert_eq!(r.runs_by_outcome[RecoveryOutcome::DataLoss.index()], 1);
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            2,
+            "the corrupt sibling's span still counts; the 3 undecodable records do NOT"
+        );
+        assert_eq!(r.torn_tail_repairs, 2);
+
+        // The counters are monotonic across the four accumulations (one run each = four runs).
         let total_runs: u64 = r.runs_by_outcome.iter().sum();
-        assert_eq!(total_runs, 3, "exactly one run recorded per accumulation");
+        assert_eq!(total_runs, 4, "exactly one run recorded per accumulation");
 
         // The hand-written `index()` stays in lockstep with `ALL` (the array order the renderer and
         // the durable snapshot both depend on).
@@ -16238,6 +16393,175 @@ mod tests {
         assert!(
             r.torn_tail_repairs >= 1,
             "the torn tail was counted as a torn-tail repair, got {}",
+            r.torn_tail_repairs
+        );
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            0,
+            "a torn tail is never a corruption repair"
+        );
+    }
+
+    #[test]
+    fn recovery_event_counters_fire_on_a_named_stream_torn_tail_reopen() {
+        // #1130: a NAMED stream's torn tail must be as visible as the root log's. A hard crash
+        // tears the named stream's OWN segment (the root log stays clean), and the reopen still
+        // records one torn_tail_truncated run + at least one torn-tail repair — the per-stream
+        // recovery summaries are no longer discarded on the open path.
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        for i in 0..4u8 {
+            produce_named(&mut e, "orders", &[0xcd, i]);
+        }
+        drop(e);
+        // Tear the NAMED stream's segment tail (streams/<hex("orders")>/seg-0); the root log has no
+        // records and recovers clean.
+        let stream_fs = fs
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("orders"))
+            .unwrap();
+        tear_segment_tail(&stream_fs, 3);
+
+        let reopened = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        let r = reopened.counters().recovery;
+        assert_eq!(
+            r.runs_by_outcome[RecoveryOutcome::TornTailTruncated.index()],
+            1,
+            "the named stream's torn tail classified the (single) reopen run"
+        );
+        assert!(
+            r.torn_tail_repairs >= 1,
+            "the named stream's torn tail was counted as a torn-tail repair, got {}",
+            r.torn_tail_repairs
+        );
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            0,
+            "a torn tail is never a corruption repair"
+        );
+    }
+
+    #[test]
+    fn recovery_event_counters_fire_on_a_shared_wal_torn_tail_reopen() {
+        // #1130: a torn SHARED-WAL tail is CROSS-STREAM loss and must reach the metrics surface.
+        // A hard crash tears the ONE shared commit log's tail (the root log stays clean), and the
+        // reopen records one torn_tail_truncated run + at least one torn-tail repair — the
+        // SharedWalRecovery is no longer discarded on the open path.
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), shared_config(10, 5)).unwrap();
+        for i in 0..4u8 {
+            produce_named(&mut e, "orders", &[0xab, i]);
+        }
+        drop(e);
+        let wal_fs = fs.subdir(SHARED_WAL_SUBDIR).unwrap();
+        tear_segment_tail(&wal_fs, 3);
+
+        let reopened = Engine::open(fs, ManualClock::new(), shared_config(10, 5)).unwrap();
+        let r = reopened.counters().recovery;
+        assert_eq!(
+            r.runs_by_outcome[RecoveryOutcome::TornTailTruncated.index()],
+            1,
+            "the shared WAL's torn tail classified the (single) reopen run"
+        );
+        assert!(
+            r.torn_tail_repairs >= 1,
+            "the shared torn tail was counted as a torn-tail repair, got {}",
+            r.torn_tail_repairs
+        );
+        assert_eq!(
+            reopened.shared_wal_undecodable_records(),
+            0,
+            "a torn tail is not an undecodable-tag record"
+        );
+    }
+
+    #[test]
+    fn shared_wal_undecodable_tag_records_classify_a_data_loss_run_and_ride_the_gauge() {
+        // #1130: a durable shared-WAL record whose stream tag is absent/invalid (a foreign writer,
+        // or deep corruption that passed the frame CRCs) is delivered to NO stream — real,
+        // quarantine-UNCAPTURED cross-stream loss. The reopen that observes it classifies as a
+        // data_loss run and surfaces the count on the engine's last-open snapshot (the
+        // `ironbus_shared_wal_undecodable_records` gauge), while the durable repair counters are
+        // NOT bumped (the record stays on disk; a cumulative count would re-count it every open).
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), shared_config(10, 5)).unwrap();
+            produce_named(&mut e, "orders", b"tagged");
+        }
+        // Append an UNTAGGED record directly to the shared commit log, bypassing the engine's
+        // tagging append — exactly the frame shape a foreign writer would leave.
+        {
+            let wal_fs = fs.subdir(SHARED_WAL_SUBDIR).unwrap();
+            let mut raw = Log::open(wal_fs, ManualClock::new(), LogConfig::default()).unwrap();
+            raw.append(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"untagged",
+            })
+            .unwrap();
+            raw.sync().unwrap();
+        }
+
+        let reopened = Engine::open(fs, ManualClock::new(), shared_config(10, 5)).unwrap();
+        assert_eq!(
+            reopened.shared_wal_undecodable_records(),
+            1,
+            "the demux scan surfaced the untagged durable record"
+        );
+        let r = reopened.counters().recovery;
+        assert_eq!(
+            r.runs_by_outcome[RecoveryOutcome::DataLoss.index()],
+            1,
+            "an undecodable-tag record is quarantine-uncaptured loss: the data_loss bucket"
+        );
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            0,
+            "an undecodable record is not a repair; it rides the gauge, not the durable counters"
+        );
+        assert_eq!(r.torn_tail_repairs, 0, "no tail was torn in this recipe");
+    }
+
+    #[test]
+    fn recovery_event_counters_fire_on_a_partition_sub_log_torn_tail_reopen() {
+        // #1130: a PARTITION sub-log's torn tail must be as visible as the root log's. A hard
+        // crash tears one partition's own segment (root + sibling partitions stay clean), and the
+        // reopen records one torn_tail_truncated run + at least one torn-tail repair — the
+        // per-partition recovery summaries are no longer discarded on the open path.
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+        assert!(e.declare_partitioned_stream("orders", 2).unwrap());
+        let key = b"order-42";
+        let home =
+            ironbus_core::partition::partition_for_key(key, PartitionCount::new(2).unwrap()).get();
+        for n in 0..4u8 {
+            e.produce_in_stream("orders", &part_keyed(key, &[n]))
+                .unwrap();
+        }
+        drop(e);
+        // Tear the HOME partition's sub-log tail (pstreams/<hex("orders")>/p-<08x(home)>/seg-0).
+        let pfs = fs
+            .subdir(PARTITIONED_STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("orders"))
+            .unwrap()
+            .subdir(&ironbus_storage::naming::partition_subdir_name(home))
+            .unwrap();
+        tear_segment_tail(&pfs, 3);
+
+        let reopened = Engine::open(fs, ManualClock::new(), config(64, 5)).unwrap();
+        let r = reopened.counters().recovery;
+        assert_eq!(
+            r.runs_by_outcome[RecoveryOutcome::TornTailTruncated.index()],
+            1,
+            "the partition sub-log's torn tail classified the (single) reopen run"
+        );
+        assert!(
+            r.torn_tail_repairs >= 1,
+            "the partition's torn tail was counted as a torn-tail repair, got {}",
             r.torn_tail_repairs
         );
         assert_eq!(

@@ -110,7 +110,7 @@ snapshot already dominates the replay increments nothing).
 | `ironbus_egress_shed_total` | The **AIMD** egress limiter throttled a Flow batch below what the consumer wanted because it was falling behind (a would-block at the egress grant with a near-full in-flight set, or a nack), so the effective per-consumer egress credit was multiplicatively decreased (#69, #402). | **Egress backpressure**: a consumer falling behind has its effective egress credit halved (within the negotiated #292 cap) rather than the broker piling on, then it recovers additively as the consumer acks promptly. Zero unless the AIMD is enabled (`--egress-limit` non-zero). |
 | `ironbus_wal_fsync_headroom_shed_total` | A NEW `produce` is shed by the **fsync-headroom** admission credit (#378): the un-fsynced (buffered-but-not-durable) backlog was at the configured `--wal-fsync-headroom-bytes` and a group-commit drain could not free it (only reachable under a relaxed durability level that defers the fsync). | **Un-fsynced backlog bound** (a memory / loss-window guard): the broker refuses the *new* write to keep the un-fsynced frontier within the headroom. Decided BEFORE the append, so it NEVER drops an already-accepted record (I2 holds). Under the default `sync` level the headroom THROTTLES (drain-then-admit) instead of shedding, so this stays `0` there; a rising value is a relaxed-level broker capping its loss window. |
 | `ironbus_ack_ahead_shed_total` | A client ack was accepted on the wire but NOT recorded in the group cursor because recording it would have fragmented the run-length **acked-ahead set** past the configured range cap (`max_acked_ahead_runs`, #543 -- Pulsar's `individuallyDeletedMessages` design with its unbounded-R hazard fixed). The offset stays unacked in the cursor and simply **redelivers** later. | **Bounded cursor memory, dup-not-loss**: the committed watermark is NEVER forced past an unacked gap (that would be silent loss); the shed ack is a bounded at-least-once DUPLICATE instead. A rising value means a pathologically fragmented out-of-order ack pattern (e.g. acking every 2nd offset under a pinned gap); zero for a healthy consumer. |
-| `ironbus_torn_tail_repairs_total` | A torn/unsynced tail is truncated to the longest valid prefix at recovery (#575). One increment per `TornTail` loss event a recovery run dropped. | **Power-loss repair, NOT data loss**: the common brownout case, the tail bytes were never fully written. The unlabeled half of the recovery-EVENT family; the marquee NATS-can't recovery signal (NATS's truncate-and-drop recovery is silent). |
+| `ironbus_torn_tail_repairs_total` | A torn/unsynced tail is truncated to the longest valid prefix at recovery (#575). One increment per `TornTail` loss event a recovery run dropped, across **every log the open recovers** (#1130): the root log, each named per-stream log, the shared WAL, and every partition sub-log. | **Power-loss repair, NOT data loss**: the common brownout case, the tail bytes were never fully written. The unlabeled half of the recovery-EVENT family; the marquee NATS-can't recovery signal (NATS's truncate-and-drop recovery is silent). |
 
 ### Recovery-event counters (the marquee NATS-can't series)
 
@@ -120,18 +120,22 @@ operator can **alert on recovery actually firing**. They are the flagship
 at all** — its truncate-and-drop recovery is silent and unbounded (#7549/#7556), so
 its only signal is a missing message an operator discovers downstream. Each
 counter is bumped **once per `Engine::open` recovery run**, derived from the
-durable loss report, so they are monotonic `_total` counters that survive a `kill
--9` (the durable loss report re-derives them on the next open without
-double-counting: the report reflects only this recovery, so a clean re-open adds a
-`clean` run and zero repairs).
+durable loss reports of **every recovery path that open ran** (#1130: the root
+log, each named per-stream recovery, the shared WAL's recovery, and every
+partition sub-log recovery — one aggregate family, not a per-stream label, to
+keep the cardinality fixed), so they are monotonic `_total` counters that survive
+a `kill -9` (the durable loss reports re-derive them on the next open without
+double-counting: each report reflects only this recovery, so a clean re-open adds
+a `clean` run and zero repairs). The run's `outcome` bucket is the **worst** loss
+observed across all the paths.
 
 | Counter | Event that increments it | Resilience meaning |
 |---------|--------------------------|--------------------|
 | `ironbus_recovery_runs_total{outcome="clean"}` | A recovery run completed with **no loss event** (the clean-shutdown / no-corruption case). | Baseline: how often the broker opened cleanly. The denominator for a "fraction of opens that needed a repair" alert. |
 | `ironbus_recovery_runs_total{outcome="torn_tail_truncated"}` | A recovery run's only loss was a **torn/unsynced tail** truncated to the longest valid prefix (no data loss). | **Power-loss repair**: the common brownout case. A non-zero rate is expected on an edge fleet, never alarming. |
 | `ironbus_recovery_runs_total{outcome="quarantined"}` | A recovery run dropped at least one **data-loss corruption span**, copied to the `quarantine/` forensic store before truncation. | **Corruption recovered, bounded + reported**: the I3-capped, quarantine-preserving recovery NATS cannot do. The alert signal that real bytes were lost (and forensically preserved). |
-| `ironbus_recovery_runs_total{outcome="data_loss"}` | Reserved: a data-loss recovery whose quarantine capture did not succeed (e.g. the quarantine store was over its cap). | Reserved bucket so the `outcome` taxonomy is frozen up front; the loss is still bounded + reported via the loss report. |
-| `ironbus_corruption_repairs_total{artifact="segment"}` | A **corruption span in the main log** was quarantined-and-dropped at recovery (or by the offline `ironbus repair`). | **Segment corruption repaired**: the headline corruption signal. NATS has **no** corruption-repair metric. |
+| `ironbus_recovery_runs_total{outcome="data_loss"}` | A recovery observed real data loss with **no quarantine capture** — today, the shared WAL's demux scan found **undecodable-tag records** (#1130): durable records whose stream tag was absent/invalid, delivered to NO stream, with nothing quarantined (the record stays on disk; see `ironbus_shared_wal_undecodable_records`). Also fires for a future capture failure (e.g. the quarantine store over its cap). | **Uncaptured loss, the worst bucket**: the alert signal that loss happened AND forensics were not preserved. The loss is still bounded + reported (the gauge carries the count). |
+| `ironbus_corruption_repairs_total{artifact="segment"}` | A **corruption span in a log** — the root log, a named per-stream log, the shared WAL, or a partition sub-log (#1130) — was quarantined-and-dropped at recovery (or by the offline `ironbus repair`). | **Segment corruption repaired**: the headline corruption signal. NATS has **no** corruption-repair metric. |
 | `ironbus_corruption_repairs_total{artifact="cursor"}` | A **consumer cursor** corruption was repaired (reserved: a torn cursor reverts via its dual-slot checkpoint, so recovery does not emit one today; driven by the offline `ironbus repair` cursor path). | Reserved + offline-`repair`-driven, frozen up front. |
 | `ironbus_corruption_repairs_total{artifact="dlq"}` | A **DLQ** corruption was repaired (reserved, same shape as `cursor`). | Reserved + offline-`repair`-driven, frozen up front. |
 
@@ -162,7 +166,25 @@ ironbus_recovery_data_loss_bytes              bytes of REAL data loss at the las
 ironbus_recovery_loss_bytes{reason=...}       bytes dropped at the last recovery, by reason
 ironbus_recovery_loss_records{reason=...}     records dropped at the last recovery, by reason
 ironbus_quarantine_bytes                      persisted on-disk bytes of the forensic quarantine store (surviving restart)
+ironbus_shared_wal_undecodable_records        durable shared-WAL records with an absent/invalid stream tag at the last open (#1130)
 ```
+
+**Byte-granularity scope (honest):** the `ironbus_recovery_truncated_bytes` /
+`ironbus_recovery_loss_*` gauges report the **root log's** recovery loss (the
+report the offline `ironbus verify` equality is pinned against). A named
+stream's, the shared WAL's, or a partition sub-log's recovery loss reaches the
+metrics surface through the **recovery-EVENT counters** above (#1130: every
+recovery path's loss events count toward the runs/torn-tail/corruption family),
+with per-path byte totals in the recovery log lines and the durable loss reports.
+
+`ironbus_shared_wal_undecodable_records` (#1130) is the shared WAL's cross-stream
+twin of `ironbus_recovery_truncated_bytes`: durable records whose stored stream
+tag was **absent or invalid** at the last open's demux scan (deep corruption that
+passed the frame CRCs, or a foreign writer). Each is delivered to **no** stream
+(never mis-delivered) — real, quarantine-uncaptured loss, which classifies that
+open's `ironbus_recovery_runs_total` bucket as `data_loss`. It is a last-open
+**gauge**, not a `_total`: the record stays on disk, so a cumulative counter
+would re-count it on every open. Always `0` in the default per-stream mode.
 
 `ironbus_recovery_data_loss_bytes` (#59) is the headline **bytes lost** figure: the loss report's
 total with `TornTail` **excluded**, because a torn or unsynced tail is bytes that were never fully
