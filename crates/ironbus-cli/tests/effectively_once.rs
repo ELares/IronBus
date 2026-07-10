@@ -26,6 +26,11 @@
 //! the normal `cargo test` suite (`cargo test -p ironbus-cli --test effectively_once`), so the
 //! survival differentiator is demonstrated on every CI run, not asserted.
 //!
+//! Scenario 5 is the CONSUMER-side twin (#547): the durable per-message DELIVERY COUNT — a
+//! poison message nacked mid-retry across a kill -9 resumes its count and dead-letters after
+//! exactly `MaxDeliver` observed deliveries TOTAL, where NATS's volatile redelivery count (and
+//! `MaxDeliver=-1` default) redelivers it forever. See `docs/DURABILITY.md` for the contract.
+//!
 //! Methodology note (mirrors the NATS leg): the "long offline gap" is measured against a
 //! deliberately SHORTENED window — `--dedup-window-ms 3000` here, `duplicates: 5s` on the NATS
 //! stream — and the gap sleeps PAST it. Waiting out the real 2-minute defaults would measure
@@ -601,5 +606,135 @@ fn unclean_kill_before_any_checkpoint_degrades_unflushed_highwaters_to_at_least_
         publish_plain(&mut client, b"fresh-after-degrade"),
         6,
         "every un-checkpointed retry re-appended: the honest bound is checkpoint lag"
+    );
+}
+
+// =================================================================================================
+// SCENARIO 5 (the CONSUMER-side twin of scenario 4, #547): MaxDeliver -> DLQ fires ACROSS a
+// kill -9 mid-retry — the durable per-message DELIVERY COUNT survival that scenario 4's
+// producer-side measurement left unasserted.
+//
+// IronBus measured behavior: a poison message nacked K times before an UNCLEAN kill (SIGKILL, no
+// drain) resumes its delivery count at the durable floor after the restart, so it dead-letters
+// after EXACTLY MaxDeliver observed deliveries TOTAL across the crash — never 2 x MaxDeliver, and
+// never the NATS failure mode (redelivery count volatile, default MaxDeliver=-1: a poison
+// redelivers FOREVER across restarts). The count is made durable by the #547 redelivery-driven
+// attempts flush on the per-pass checkpoint seam (a poison retry loop never advances the cursor,
+// so the interval checkpoint alone would never persist it) plus the clean-disconnect flush; the
+// honest lag bound — an attempt-1-only kill loses at most that single first attempt, and a
+// disabled trigger degrades to interval/disconnect cadence — is measured at the engine level
+// (`engine::tests::an_unclean_kill_before_any_redelivery_costs_at_most_one_extra_delivery` and
+// `a_threshold_of_zero_disables_the_trigger_and_the_dlq_fires_late_but_fires`: LATE by exactly
+// the lag, but it FIRES).
+// =================================================================================================
+#[test]
+fn max_deliver_dead_letters_after_a_kill_minus_nine_mid_retry_never_redelivers_forever() {
+    const MAX_DELIVER: u32 = 5;
+    let scratch = Scratch::new("poison");
+    let dir = scratch.join("data");
+    let dir = dir.to_str().expect("utf8 data dir");
+
+    let (broker, addr, _h) = start_broker(dir, &["--max-deliver", "5"]);
+    let mut client = Client::connect(&addr).expect("connect the producer");
+    assert_eq!(publish_plain(&mut client, b"poison-rec"), 0);
+    drop(client);
+
+    // Deliver + NACK the poison twice (attempts 1 and 2). Each `sub --nack` run takes one
+    // window-bounded batch and disconnects; the explicit 1 ms delay overrides the escalating
+    // backoff schedule so the next run redelivers immediately.
+    let mut observed_deliveries = 0u32;
+    for attempt in 1..=2u32 {
+        let (out, _e, code) = run(&[
+            "sub",
+            "--addr",
+            &addr,
+            "--max",
+            "1",
+            "--nack",
+            "--delay-ms",
+            "1",
+        ]);
+        assert_eq!(code, 0, "nack run {attempt}: {out}");
+        let got = payloads(&out);
+        assert_eq!(got, vec!["poison-rec".to_string()], "attempt {attempt}");
+        observed_deliveries += 1;
+    }
+    // Let the broker's actor drain the per-pass attempts flush + the close-path checkpoint the
+    // second run scheduled (both are broker-side and complete in microseconds; this sleep only
+    // de-flakes a pathologically loaded CI runner) — then KILL -9 MID-RETRY: the poison is
+    // nacked, its retry pending, its delivery count 2. No drain, no shutdown flush.
+    std::thread::sleep(Duration::from_millis(500));
+    drop(broker);
+
+    // RESTART over the same dir: the delivery count must RESUME (NATS restarts it at zero).
+    let (broker2, addr2, health2) = start_broker(dir, &["--max-deliver", "5"]);
+    for run_idx in 3..=MAX_DELIVER {
+        let (out, _e, code) = run(&[
+            "sub",
+            "--addr",
+            &addr2,
+            "--max",
+            "1",
+            "--nack",
+            "--delay-ms",
+            "1",
+        ]);
+        assert_eq!(code, 0, "post-restart nack run {run_idx}: {out}");
+        let got = payloads(&out);
+        assert_eq!(
+            got,
+            vec!["poison-rec".to_string()],
+            "post-restart delivery {run_idx} still under the resumed MaxDeliver budget"
+        );
+        observed_deliveries += 1;
+    }
+    assert_eq!(
+        observed_deliveries, MAX_DELIVER,
+        "exactly MaxDeliver observed deliveries TOTAL across the kill -9"
+    );
+
+    // The NEXT fetch dead-letters the poison instead of delivering it: the count resumed at the
+    // durable floor, so this is attempt MaxDeliver + 1 ACROSS the crash — the assertion NATS
+    // cannot make (its redelivery count is volatile and its default MaxDeliver is unlimited).
+    let (out, _e, code) = run(&[
+        "sub",
+        "--addr",
+        &addr2,
+        "--max",
+        "1",
+        "--nack",
+        "--delay-ms",
+        "1",
+    ]);
+    assert_eq!(code, 0, "the dead-lettering fetch: {out}");
+    assert!(
+        payloads(&out).is_empty(),
+        "the poison is PARKED, not redelivered a 6th time: {out}"
+    );
+    let metrics = http_get(&health2, "/metrics");
+    assert_eq!(
+        metric_value(&metrics, "ironbus_dead_lettered_total"),
+        Some(1),
+        "MaxDeliver -> DLQ fired exactly once, across the kill -9"
+    );
+    assert_eq!(
+        metric_value(&metrics, "ironbus_delivered_total"),
+        Some(u64::from(MAX_DELIVER - 2)),
+        "this broker run delivered only the RESUMED budget (3), not a fresh MaxDeliver"
+    );
+
+    // The durable ground truth, offline: stop the broker and stream the DLQ sink itself. The one
+    // entry records attempt 6 (MaxDeliver + 1) — the count was TOTAL across the restart.
+    drop(broker2);
+    let (out, _e, code) = run(&["dump", "--data-dir", dir, "--dlq"]);
+    assert_eq!(code, 0, "offline dlq dump: {out}");
+    let dlq_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("source_offset="))
+        .collect();
+    assert_eq!(dlq_lines.len(), 1, "exactly one dead-letter record: {out}");
+    assert!(
+        dlq_lines[0].contains("source_offset=0") && dlq_lines[0].contains("attempt=6"),
+        "the poison dead-lettered as attempt MaxDeliver + 1, counted across the kill -9: {out}"
     );
 }

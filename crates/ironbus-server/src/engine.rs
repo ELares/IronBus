@@ -4510,8 +4510,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
         // Persist the durable per-message attempt counts (#358) when the cursor advanced OR there
         // are in-flight leases: a redelivery escalates an attempt count WITHOUT moving the cursor,
-        // so a poison record being retried must still record its rising count. Writing an empty
-        // snapshot when nothing is in flight clears any stale carried counts from the last crash.
+        // so a poison record being retried must still record its rising count. The snapshot is the
+        // live ∪ carried union (#565/#547), so a flush in a partially re-claimed recovery state
+        // never regresses a still-carried count; acked or committed-past offsets leave both
+        // inputs, so a clean ack still clears its durable count on the next write.
         if committed > self.last_attempts_checkpointed || has_in_flight {
             self.checkpoint_default_attempts()?;
             self.last_attempts_checkpointed = committed;
@@ -4531,11 +4533,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .map_or_else(Vec::new, |g| snapshot_payload(&g.cursor))
     }
 
-    /// Durably writes the default group's in-flight attempt-count snapshot to `attempts.ckpt`
-    /// (#358), via the same CRC'd dual-slot checkpoint the cursor uses. The payload is the live
-    /// lease table's `(offset, attempt)` pairs, capped to a slot; an empty payload (nothing in
-    /// flight) is a valid snapshot that clears any stale carried counts. The handle is long-lived,
-    /// so this continues the crash-safe two-slot sequence without reopening.
+    /// Durably writes the default group's attempt-count snapshot to `attempts.ckpt` (#358), via
+    /// the same CRC'd dual-slot checkpoint the cursor uses. The payload is the FULL attempt state
+    /// — live leases UNION the CARRIED (recovered-but-not-yet-re-claimed) counts, via
+    /// [`LeaseTable::all_attempt_counts`] (#565/#547) — capped to a slot. The union is what keeps
+    /// a PARTIALLY re-claimed recovery honest: after a restart with several poisons carried, the
+    /// first poll re-claims only the lowest one, so a live-leases-only snapshot written then (the
+    /// disconnect flush fires on `has_in_flight`) would silently CLOBBER the still-carried
+    /// siblings' durable counts back to zero — the same regression class the #565 eviction fix
+    /// closed. An offset acked or committed-past leaves BOTH inputs, so a clean ack still clears
+    /// its durable count; an empty union (nothing in flight, nothing carried) is a valid snapshot
+    /// that clears stale counts. The handle is long-lived, so this continues the crash-safe
+    /// two-slot sequence without reopening. Notes the flush on the lease table, resetting the
+    /// redelivery-dirtiness counter behind the #547 delivery-driven trigger.
     ///
     /// # Errors
     /// Propagates a storage error from writing the checkpoint.
@@ -4543,21 +4553,28 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let pairs = self
             .groups
             .get(DEFAULT_GROUP)
-            .map_or_else(Vec::new, |g| g.leases.attempt_counts());
+            .map_or_else(Vec::new, |g| g.leases.all_attempt_counts());
         let payload = attempts_snapshot_payload(&pairs);
         self.attempts_checkpoint.write(&payload)?;
+        if let Some(g) = self.groups.get_mut(DEFAULT_GROUP) {
+            g.leases.note_attempts_flushed();
+        }
         Ok(())
     }
 
-    /// Durably writes a NAMED group's in-flight attempt-count snapshot to its `attempts-<hex>.ckpt`
-    /// (#358), the companion to [`Engine::write_group_checkpoint`]. The file is reopened per write so
-    /// the crash-safe two-slot sequence continues correctly, exactly as the named cursor checkpoint.
+    /// Durably writes a NAMED group's attempt-count snapshot to its `attempts-<hex>.ckpt` (#358),
+    /// the companion to [`Engine::write_group_checkpoint`]. Like
+    /// [`Engine::checkpoint_default_attempts`] it persists the FULL attempt state (live leases
+    /// UNION carried, [`LeaseTable::all_attempt_counts`], #565/#547) so a snapshot written while
+    /// some recovered counts are still carried never regresses them. The file is reopened per
+    /// write so the crash-safe two-slot sequence continues correctly, exactly as the named cursor
+    /// checkpoint. Notes the flush on the lease table (#547).
     ///
     /// # Errors
     /// Propagates a storage error from opening or writing the checkpoint file.
     fn write_group_attempts(&mut self, group: &str) -> Result<(), EngineError> {
         let pairs = match self.groups.get(group) {
-            Some(g) => g.leases.attempt_counts(),
+            Some(g) => g.leases.all_attempt_counts(),
             None => return Ok(()),
         };
         let payload = attempts_snapshot_payload(&pairs);
@@ -4574,6 +4591,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let (mut cp, _) = AttemptsCheckpoint::open(file)?;
         cp.write(&payload)?;
+        if let Some(g) = self.groups.get_mut(group) {
+            g.leases.note_attempts_flushed();
+        }
         Ok(())
     }
 
@@ -4659,10 +4679,33 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(())
     }
 
+    /// Whether a group's durable attempt snapshot is DUE under the redelivery-driven trigger
+    /// (#547): the configured threshold ([`DeliveryConfig::attempts_flush_redeliveries`],
+    /// default 1) is enabled AND at least that many REDELIVERY grants have accumulated since
+    /// the group's counts were last durable. The cursor-interval checkpoint is gated on cursor
+    /// ADVANCE, which
+    /// a head-of-line poison under retry never produces — so without this trigger a poison's
+    /// rising attempt count could stay un-persisted for arbitrarily many redeliveries and every
+    /// unclean restart would replay them (the NATS volatile-redelivery-count failure mode this
+    /// engine exists to beat). Checked on the same per-pass seam as the interval checkpoint, so
+    /// the flush amortizes over a pass (one snapshot write per pass that granted redeliveries,
+    /// never one per delivery); first deliveries (attempt 1) never trip it.
+    fn attempts_flush_due(&self, leases: &LeaseTable) -> bool {
+        let threshold = self.delivery.attempts_flush_redeliveries();
+        threshold != 0 && leases.redeliveries_since_flush() >= threshold
+    }
+
     /// Checkpoints the committed cursor if it has advanced at least `checkpoint_interval`
     /// offsets since the last checkpoint, returning whether a checkpoint was written. This
     /// bounds how many messages a crash redelivers to roughly `checkpoint_interval` while
     /// keeping the checkpoint write rate far below one per ack (edge flash endurance).
+    ///
+    /// Independently of cursor advance, it also flushes JUST the durable attempt snapshot when
+    /// the redelivery-driven trigger is due ([`Engine::attempts_flush_due`], #547), so a poison
+    /// message's rising delivery count becomes durable on a cadence bounded in REDELIVERIES —
+    /// `MaxDeliver -> DLQ` then holds across an unclean restart even though a retry loop never
+    /// advances the cursor. That flush is one targeted `attempts.ckpt` write (no cursor, no
+    /// counters, no producer-seq piggyback), and returns `true` like any other written checkpoint.
     ///
     /// # Errors
     /// Propagates a storage error from writing the checkpoint.
@@ -4693,6 +4736,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // a later crash, never correctness, so it must NOT fail the cursor checkpoint that just
             // succeeded. The counters are an observability aid, not durable correctness state.
             let _ = self.checkpoint_counters();
+            Ok(true)
+        } else if self
+            .groups
+            .get(DEFAULT_GROUP)
+            .is_some_and(|g| self.attempts_flush_due(&g.leases))
+        {
+            // The redelivery-driven attempts flush (#547): the cursor did not advance (a poison
+            // retry loop never advances it), but enough redelivery grants accumulated that the
+            // durable attempt counts must catch up, or an unclean restart would replay them and
+            // `MaxDeliver` would fire late — unboundedly late across repeated crashes. One
+            // targeted `attempts.ckpt` write; the flush note inside resets the trigger.
+            self.checkpoint_default_attempts()?;
+            self.last_attempts_checkpointed = committed;
             Ok(true)
         } else {
             Ok(false)
@@ -4759,8 +4815,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
 
     /// Like [`Engine::maybe_checkpoint`] but for a named work-group (#60): checkpoints it if its
     /// committed cursor advanced at least `checkpoint_interval` since its last checkpoint, so a
-    /// crash redelivers a bounded tail per group. The default group delegates to
-    /// [`Engine::maybe_checkpoint`].
+    /// crash redelivers a bounded tail per group. Also flushes just the group's attempt snapshot
+    /// when the redelivery-driven trigger is due (#547), exactly as the default group does. The
+    /// default group delegates to [`Engine::maybe_checkpoint`].
     ///
     /// # Errors
     /// Propagates a storage error from writing the checkpoint.
@@ -4772,6 +4829,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Ok(false);
         };
         let committed = g.cursor.committed().get();
+        let attempts_due = self.attempts_flush_due(&g.leases);
         let last = self
             .group_last_checkpointed
             .get(group)
@@ -4780,6 +4838,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if committed.saturating_sub(last) >= self.checkpoint_interval.max(1) {
             self.write_group_checkpoint(group, committed)?;
             // Persist the named group's attempt counts on the same interval cadence (#358).
+            self.write_group_attempts(group)?;
+            Ok(true)
+        } else if attempts_due {
+            // The redelivery-driven attempts flush (#547): see `maybe_checkpoint`.
             self.write_group_attempts(group)?;
             Ok(true)
         } else {
@@ -4941,8 +5003,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// The file lives in the STREAM's OWN subdirectory (resolved via that stream's log filesystem), so
     /// a named-stream consumer's poison-cap state is co-located with — and recovers beside — its own
     /// log and cursor, the `dlq/` subdir pattern generalized. Same [`AttemptsCheckpoint`] snapshot as
-    /// the default stream: no parallel format, only a different location. Reopened per write so the
-    /// crash-safe two-slot sequence continues correctly. A no-op for an absent stream/group.
+    /// the default stream: no parallel format, only a different location. Like every attempt-snapshot
+    /// writer it persists the FULL attempt state (live leases UNION carried,
+    /// [`LeaseTable::all_attempt_counts`], #565/#547), so a write in ANY recovery state — including
+    /// the eviction of a recovered-but-never-re-polled stream, the original #565 clobber, and the
+    /// partially re-claimed state the periodic/disconnect writers can hit — never lowers a durable
+    /// count. Reopened per write so the crash-safe two-slot sequence continues correctly. Notes the
+    /// flush on the lease table (#547). A no-op for an absent stream/group.
     ///
     /// # Errors
     /// Propagates a storage error from opening or writing the checkpoint file.
@@ -4952,42 +5019,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         group: &str,
     ) -> Result<(), EngineError> {
         let pairs = match self.named_streams.get(id).and_then(|s| s.groups.get(group)) {
-            Some(g) => g.leases.attempt_counts(),
-            None => return Ok(()),
-        };
-        self.write_named_group_attempt_pairs(id, group, &pairs)
-    }
-
-    /// The EVICTION-safe attempt-count writer (#565): persists the FULL attempt state — live leases
-    /// UNION carried (recovered-but-not-yet-re-claimed) counts, via [`LeaseTable::all_attempt_counts`]
-    /// — rather than the live leases ONLY. This is what [`evict_named_stream`](Self::evict_named_stream)
-    /// uses so evicting a stream whose poison counts are still CARRIED (recovered from disk but not yet
-    /// re-polled, so `leases` is empty) does NOT overwrite `attempts-<hex>.ckpt` with an empty snapshot
-    /// — which would reset the poison's delivery count to zero and let it escape its `MaxDeliver` cap.
-    /// The periodic checkpoint keeps [`write_named_group_attempts`](Self::write_named_group_attempts)
-    /// (live leases only), gated on cursor-advance / in-flight so it never fires in the
-    /// recovered-not-repolled state. A no-op for an absent stream/group.
-    ///
-    /// # Errors
-    /// Propagates a storage error from opening or writing the checkpoint file.
-    fn write_named_group_attempts_full(
-        &mut self,
-        id: &StreamId,
-        group: &str,
-    ) -> Result<(), EngineError> {
-        let pairs = match self.named_streams.get(id).and_then(|s| s.groups.get(group)) {
             Some(g) => g.leases.all_attempt_counts(),
             None => return Ok(()),
         };
-        self.write_named_group_attempt_pairs(id, group, &pairs)
+        self.write_named_group_attempt_pairs(id, group, &pairs)?;
+        if let Some(g) = self
+            .named_streams
+            .get_mut(id)
+            .and_then(|s| s.groups.get_mut(group))
+        {
+            g.leases.note_attempts_flushed();
+        }
+        Ok(())
     }
 
     /// Durably writes `pairs` as NAMED stream `id`'s work-group `group` attempt snapshot to
     /// `streams/<hex(name)>/attempts-<hex(group)>.ckpt` — the shared file-write behind
-    /// [`write_named_group_attempts`](Self::write_named_group_attempts) (live leases, periodic) and
-    /// [`write_named_group_attempts_full`](Self::write_named_group_attempts_full) (leases ∪ carried,
-    /// eviction). Reopened per write so the crash-safe two-slot sequence continues. A no-op if the
-    /// stream's log is not open.
+    /// [`write_named_group_attempts`](Self::write_named_group_attempts) (leases ∪ carried, every
+    /// cadence: periodic, disconnect, eviction, and the #547 redelivery-driven trigger). Reopened
+    /// per write so the crash-safe two-slot sequence continues. A no-op if the stream's log is not
+    /// open.
     ///
     /// # Errors
     /// Propagates a storage error from opening or writing the checkpoint file.
@@ -5057,7 +5108,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// Like [`Engine::maybe_checkpoint_group`] but for a NAMED stream's work-group (#681): checkpoints
     /// it only if its committed cursor advanced at least `checkpoint_interval` since its last
     /// checkpoint, so a hot named-stream consumer writes its cursor on a bounded cadence rather than
-    /// per ack. A no-op for an absent stream/group.
+    /// per ack. Also flushes just the group's attempt snapshot when the redelivery-driven trigger is
+    /// due (#547), exactly as the default stream does. A no-op for an absent stream/group.
     ///
     /// # Errors
     /// Propagates a storage error from writing the checkpoint.
@@ -5070,6 +5122,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Ok(false);
         };
         let committed = g.cursor.committed().get();
+        let attempts_due = self.attempts_flush_due(&g.leases);
         let last = self
             .named_streams
             .get(id)
@@ -5080,6 +5133,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.write_named_group_checkpoint(id, group, committed)?;
             // Persist the named-stream group's attempt counts on the same interval cadence (#681 DLQ
             // follow-up), exactly as `maybe_checkpoint_group` does for the default stream (#358).
+            self.write_named_group_attempts(id, group)?;
+            Ok(true)
+        } else if attempts_due {
+            // The redelivery-driven attempts flush (#547): see `maybe_checkpoint`.
             self.write_named_group_attempts(id, group)?;
             Ok(true)
         } else {
@@ -7984,15 +8041,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ///      watermark, unconditionally, BEFORE dropping the in-memory consumer state — else the
     ///      committed position / poison-cap would be lost and reopen would redeliver / re-poison. The
     ///      cursor write is unconditional so the LATEST committed position is durable even if no interval
-    ///      checkpoint fired since the last ack. The attempts write uses
-    ///      [`write_named_group_attempts_full`](Self::write_named_group_attempts_full) (live leases UNION
-    ///      CARRIED counts), NOT the live-leases-only periodic writer: a stream RECOVERED from disk but
-    ///      not yet re-polled holds its poison counts in `carried` with `leases` EMPTY, so the
-    ///      live-leases-only snapshot would be empty and OVERWRITE the durable `attempts.ckpt` to zero —
-    ///      resetting the poison's delivery count and letting it escape its `MaxDeliver` cap. The union
-    ///      guarantees the persisted count NEVER drops below what is already on disk. (This is unlike the
-    ///      idle-group eviction #277, which writes only the cursor and only for caught-up, lease-free
-    ///      groups.)
+    ///      checkpoint fired since the last ack. The attempts write is
+    ///      [`write_named_group_attempts`](Self::write_named_group_attempts), which persists live
+    ///      leases UNION CARRIED counts (post-#547 EVERY attempt writer does): a stream RECOVERED from
+    ///      disk but not yet re-polled holds its poison counts in `carried` with `leases` EMPTY, so a
+    ///      live-leases-only snapshot would be empty and would OVERWRITE the durable `attempts.ckpt`
+    ///      to zero — resetting the poison's delivery count and letting it escape its `MaxDeliver`
+    ///      cap. The union guarantees the persisted count NEVER drops below what is already on disk.
+    ///      (This is unlike the idle-group eviction #277, which writes only the cursor and only for
+    ///      caught-up, lease-free groups.)
     ///   3. DROP the in-memory consumer state and the DLQ sink handle (the DLQ's records are already
     ///      durable — `append_poison` fsyncs in-band — and its per-group idempotency set rebuilds
     ///      lazily from those records on the next reopen, so a poison is never double-dead-lettered);
@@ -8025,9 +8082,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // 2) Persist each group's committed cursor + FULL attempt counts at the current watermark, before
         //    the in-memory state is dropped. The cursor write is unconditional so the LATEST committed
         //    position is durable even if no interval checkpoint fired since the last ack; the attempts
-        //    write persists leases UNION carried (`write_named_group_attempts_full`) so a
+        //    write persists leases UNION carried (`write_named_group_attempts`, the union writer) so a
         //    recovered-not-yet-repolled poison's durable count is never clobbered to zero (its count sits
-        //    in `carried` with `leases` empty — the live-leases-only writer would erase it).
+        //    in `carried` with `leases` empty — a live-leases-only snapshot would erase it).
         let groups: Vec<String> = self
             .named_streams
             .get(id)
@@ -8040,7 +8097,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 .and_then(|s| s.groups.get(group))
                 .map_or(0, |g| g.cursor.committed().get());
             self.write_named_group_checkpoint(id, group, committed)?;
-            self.write_named_group_attempts_full(id, group)?;
+            self.write_named_group_attempts(id, group)?;
         }
         // 3) Drop the in-memory consumer state + DLQ handle (both are reconstructable from disk).
         self.named_streams.remove(id);
@@ -18301,6 +18358,450 @@ mod tests {
         assert_eq!(
             d.deliveries, 5,
             "the attempt count resumed; a reset-to-1 regression would fail here"
+        );
+    }
+
+    #[test]
+    fn a_redelivery_schedules_a_durable_attempts_flush_with_no_cursor_advance_or_clean_flush() {
+        // THE #547 TEETH, default stream: a poison retry loop never advances the cursor and never
+        // disconnects cleanly, so pre-#547 NOTHING persisted its rising attempt count — an unclean
+        // kill replayed every retry and repeated crashes redelivered the poison forever (the NATS
+        // volatile-redelivery-count failure mode). The redelivery-driven trigger makes the count
+        // durable on the ordinary per-pass `maybe_checkpoint` seam, with NO explicit
+        // `checkpoint_cursor` (no clean disconnect, no shutdown) anywhere in this test.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        // FIRST delivery (attempt 1, the hot path): the per-pass checkpoint stays a no-op — no
+        // cursor advance, no redelivery, so no attempts write is scheduled (no per-delivery fsync).
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.deliveries, 1);
+        assert!(
+            !e.maybe_checkpoint().unwrap(),
+            "a first delivery alone schedules nothing"
+        );
+        // REDELIVERY (attempt 2): the per-pass checkpoint now writes JUST the attempt snapshot,
+        // even though the cursor has not moved a single offset (pre-#547 this returned false and
+        // the count stayed volatile).
+        clock.advance_monotonic_nanos(40);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.deliveries, 2);
+        assert!(
+            e.maybe_checkpoint().unwrap(),
+            "the redelivery scheduled the attempts flush on the ordinary per-pass seam"
+        );
+        assert_eq!(e.committed_offset(), Offset::ZERO, "the cursor never moved");
+        // UNCLEAN KILL: no checkpoint_cursor, no checkpoint_all_groups — drop the engine dead.
+        drop(e);
+
+        // RESTART: the count resumes at the durable floor (2), so the next delivery is attempt 3,
+        // and the poison dead-letters after EXACTLY MaxDeliver observed deliveries TOTAL across
+        // the crash — 2 before + 3 after = 5, never 2 + 5.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        let mut post_restart = 0u32;
+        loop {
+            match e.poll_now().unwrap() {
+                Poll::Message(d) => {
+                    post_restart += 1;
+                    if post_restart == 1 {
+                        assert_eq!(d.deliveries, 3, "resumed at the durable floor + 1");
+                    }
+                    clock2.advance_monotonic_nanos(40);
+                }
+                Poll::Parked { offset, .. } => {
+                    assert_eq!(offset, Offset::ZERO);
+                    break;
+                }
+                other => panic!("unexpected poll {other:?}"),
+            }
+        }
+        assert_eq!(
+            post_restart, 3,
+            "exactly MaxDeliver - 2 = 3 more deliveries: 5 TOTAL observed across the kill -9"
+        );
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "MaxDeliver -> DLQ fired across the crash"
+        );
+        let entries = read_dlq_entries(&probe).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].attempt, 6,
+            "the poisoning claim is attempt MaxDeliver + 1, counted ACROSS the unclean restart"
+        );
+    }
+
+    #[test]
+    fn first_deliveries_alone_never_schedule_an_attempts_flush() {
+        // The no-per-delivery-fsync evidence (#547): a healthy pass — every message on its FIRST
+        // attempt, nothing acked — leaves the per-pass checkpoint a complete no-op. Only a
+        // REDELIVERY (attempt >= 2, the poison-relevant event) can schedule the attempts write.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        for p in [&b"a"[..], b"b", b"c"] {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: p,
+            })
+            .unwrap();
+        }
+        for _ in 0..3 {
+            let d = message(e.poll_now().unwrap());
+            assert_eq!(d.deliveries, 1, "all first deliveries");
+        }
+        assert!(
+            !e.maybe_checkpoint().unwrap(),
+            "three first deliveries schedule no checkpoint write at all"
+        );
+    }
+
+    #[test]
+    fn the_attempts_flush_threshold_amortizes_over_n_redeliveries() {
+        // The tunable amortization (#547): threshold 3 means the per-pass seam writes the attempt
+        // snapshot only once every 3 ACCUMULATED redelivery grants — the documented trade of a
+        // longer (but still delivery-bounded) durable lag for fewer flash writes.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let mut c = config(10, 100);
+        c.delivery = DeliveryConfig::new(100, false, vec![])
+            .unwrap()
+            .with_attempts_flush_redeliveries(3);
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), c).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"p",
+        })
+        .unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.deliveries, 1);
+        for expected_attempt in 2..=4u32 {
+            clock.advance_monotonic_nanos(40);
+            let d = message(e.poll_now().unwrap());
+            assert_eq!(d.deliveries, expected_attempt);
+            let flushed = e.maybe_checkpoint().unwrap();
+            if expected_attempt < 4 {
+                assert!(!flushed, "below the threshold: no write yet");
+            } else {
+                assert!(flushed, "the 3rd accumulated redelivery flushes");
+            }
+        }
+        // The flush reset the accumulation: the next redelivery is 1-of-3 again.
+        clock.advance_monotonic_nanos(40);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.deliveries, 5);
+        assert!(
+            !e.maybe_checkpoint().unwrap(),
+            "the counter reset on flush; one redelivery is below the threshold again"
+        );
+    }
+
+    #[test]
+    fn a_threshold_of_zero_disables_the_trigger_and_the_dlq_fires_late_but_fires() {
+        // The opt-out (#547) doubles as the honest-bound proof: with the delivery-driven trigger
+        // OFF, an unclean kill loses every un-checkpointed attempt (the legacy lag), the count
+        // resumes LOWER, and MaxDeliver -> DLQ fires LATE by exactly the lost deliveries — but it
+        // FIRES. The lag is bounded by the deliveries since the last durability point, never
+        // infinite within a run.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut c = config(10, 5);
+        c.delivery = DeliveryConfig::new(5, false, vec![])
+            .unwrap()
+            .with_attempts_flush_redeliveries(0);
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), c).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        deliver_n_times(&mut e, &clock, 2);
+        assert!(
+            !e.maybe_checkpoint().unwrap(),
+            "trigger disabled: the redelivery schedules nothing (the pre-#547 behavior)"
+        );
+        drop(e); // unclean kill; the 2 observed deliveries were never persisted
+
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut c2 = config(10, 5);
+        c2.delivery = DeliveryConfig::new(5, false, vec![])
+            .unwrap()
+            .with_attempts_flush_redeliveries(0);
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock2), c2).unwrap();
+        let mut post_restart = 0u32;
+        loop {
+            match e.poll_now().unwrap() {
+                Poll::Message(d) => {
+                    post_restart += 1;
+                    if post_restart == 1 {
+                        assert_eq!(
+                            d.deliveries, 1,
+                            "the un-persisted count was lost: resumes low"
+                        );
+                    }
+                    clock2.advance_monotonic_nanos(40);
+                }
+                Poll::Parked { .. } => break,
+                other => panic!("unexpected poll {other:?}"),
+            }
+        }
+        assert_eq!(
+            post_restart, 5,
+            "LATE by exactly the 2 lost deliveries (7 observed total, not 5) — but it FIRED"
+        );
+        assert_eq!(e.dlq_records(), 1, "the DLQ still fires: late, never never");
+    }
+
+    #[test]
+    fn an_unclean_kill_before_any_redelivery_costs_at_most_one_extra_delivery() {
+        // The honest first-attempt lag under the DEFAULT trigger (#547): a FIRST delivery
+        // (attempt 1) deliberately never schedules a flush (that would be a per-delivery fsync on
+        // the hot path), so a kill -9 landing before ANY redelivery loses exactly that one
+        // attempt. The poison then dead-letters after MaxDeliver + 1 observed deliveries — the
+        // documented worst case for a single crash, and every redelivery AFTER the restart is
+        // durable-before-hand-out again.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.deliveries, 1, "one observed delivery, never persisted");
+        drop(e); // kill -9 before any redelivery, tick, or clean flush
+
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        let mut post_restart = 0u32;
+        loop {
+            match e.poll_now().unwrap() {
+                Poll::Message(d) => {
+                    post_restart += 1;
+                    if post_restart == 1 {
+                        assert_eq!(d.deliveries, 1, "the first attempt was the only loss");
+                    }
+                    clock2.advance_monotonic_nanos(40);
+                }
+                Poll::Parked { .. } => break,
+                other => panic!("unexpected poll {other:?}"),
+            }
+        }
+        assert_eq!(
+            post_restart, 5,
+            "MaxDeliver + 1 = 6 observed deliveries total: late by exactly the one lost attempt"
+        );
+        assert_eq!(e.dlq_records(), 1);
+    }
+
+    #[test]
+    fn a_partial_reclaim_flush_never_regresses_a_still_carried_sibling_count() {
+        // The #565 clobber class on the PERIODIC/DISCONNECT path (#547): after a restart with TWO
+        // poisons carried, the first poll re-claims only the LOWER one (consuming its carried
+        // entry into a live lease) while the higher one is STILL carried. A live-leases-only
+        // snapshot written in that state — the disconnect flush fires on `has_in_flight` — would
+        // silently erase the higher poison's durable count; a second crash would then regress it
+        // to zero and let it outlive its MaxDeliver cap. The union writer keeps both.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        for p in [&b"p0"[..], b"p1"] {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: p,
+            })
+            .unwrap();
+        }
+        // Deliver BOTH twice (attempts 1 and 2 each), persist {0: 2, 1: 2}, and crash.
+        for expected_attempt in 1..=2u32 {
+            for expected_offset in 0..=1u64 {
+                let d = message(e.poll_now().unwrap());
+                assert_eq!(d.offset, Offset::new(expected_offset));
+                assert_eq!(d.deliveries, expected_attempt);
+            }
+            clock.advance_monotonic_nanos(40);
+        }
+        e.checkpoint_cursor().unwrap();
+        drop(e);
+
+        // RESTART 1: re-claim ONLY offset 0 (offset 1 stays carried), then hit the disconnect
+        // flush in exactly that partially re-claimed state, then crash again.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, Offset::ZERO);
+        assert_eq!(d.deliveries, 3, "offset 0 resumed at 2 + 1");
+        e.checkpoint_cursor().unwrap(); // the disconnect flush: live {0: 3} UNION carried {1: 2}
+        drop(e);
+
+        // RESTART 2: offset 1's count MUST have survived the intermediate flush. A live-only
+        // snapshot would have erased it and this delivery would report attempt 1.
+        let clock3 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock3), config(10, 5)).unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, Offset::ZERO);
+        assert_eq!(d.deliveries, 4, "offset 0 resumed at 3 + 1");
+        // Offset 0 is now in flight, so the next poll grants offset 1 without any clock advance.
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, Offset::new(1));
+        assert_eq!(
+            d.deliveries, 3,
+            "offset 1 resumed at 2 + 1: the partial-reclaim flush did NOT regress its count"
+        );
+    }
+
+    #[test]
+    fn a_named_group_redelivery_schedules_its_attempts_flush() {
+        // The named-GROUP leg of #547 (default stream, `cursor-<hex>`/`attempts-<hex>` files): the
+        // per-pass `maybe_checkpoint_group` flushes the group's attempt snapshot on the redelivery
+        // trigger with no cursor advance and no clean flush, and the count survives an unclean kill.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        let d = message(e.poll_now_in("workers").unwrap());
+        assert_eq!(d.deliveries, 1);
+        assert!(
+            !e.maybe_checkpoint_group("workers").unwrap(),
+            "a first delivery schedules nothing for a named group either"
+        );
+        clock.advance_monotonic_nanos(40);
+        let d = message(e.poll_now_in("workers").unwrap());
+        assert_eq!(d.deliveries, 2);
+        assert!(
+            e.maybe_checkpoint_group("workers").unwrap(),
+            "the redelivery scheduled the named group's attempts flush"
+        );
+        drop(e); // unclean kill
+
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        let d = message(e.poll_now_in("workers").unwrap());
+        assert_eq!(
+            d.deliveries, 3,
+            "the named group's count resumed across the unclean kill"
+        );
+    }
+
+    #[test]
+    fn a_named_stream_redelivery_schedules_its_attempts_flush_and_the_dlq_fires_across_a_kill() {
+        use ironbus_storage::dlq::{read_dead_letter_entries, DLQ_SUBDIR};
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        // The named-STREAM leg of #547 (`streams/<hex>/attempts-<hex>.ckpt`): same contract as the
+        // default stream — the redelivery trigger persists the count on the per-pass seam, the
+        // count survives an unclean kill, and the poison dead-letters after EXACTLY MaxDeliver
+        // observed deliveries total, into the stream's OWN dlq/.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"poison",
+            },
+        )
+        .unwrap();
+        let d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        assert_eq!(d.deliveries, 1);
+        assert!(
+            !e.maybe_checkpoint_in_stream("orders", "g").unwrap(),
+            "a first delivery schedules nothing for a named stream either"
+        );
+        clock.advance_monotonic_nanos(40);
+        let d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        assert_eq!(d.deliveries, 2);
+        assert!(
+            e.maybe_checkpoint_in_stream("orders", "g").unwrap(),
+            "the redelivery scheduled the named stream's attempts flush"
+        );
+        drop(e); // unclean kill: no checkpoint_in_stream, no shutdown flush
+
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        let mut post_restart = 0u32;
+        loop {
+            match e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap() {
+                Poll::Message(d) => {
+                    post_restart += 1;
+                    if post_restart == 1 {
+                        assert_eq!(d.deliveries, 3, "resumed at the durable floor + 1");
+                    }
+                    clock2.advance_monotonic_nanos(40);
+                }
+                Poll::Parked { offset, .. } => {
+                    assert_eq!(offset, Offset::ZERO);
+                    break;
+                }
+                other => panic!("unexpected poll {other:?}"),
+            }
+        }
+        assert_eq!(
+            post_restart, 3,
+            "exactly MaxDeliver - 2 = 3 more deliveries: 5 TOTAL observed across the kill -9"
+        );
+        drop(e);
+        let stream_fs = probe
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("orders"))
+            .unwrap();
+        let entries = read_dead_letter_entries(&stream_fs, DLQ_SUBDIR).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the stream's own DLQ fired across the crash"
+        );
+        assert_eq!(
+            entries[0].attempt, 6,
+            "attempt MaxDeliver + 1, counted across the unclean restart"
         );
     }
 
