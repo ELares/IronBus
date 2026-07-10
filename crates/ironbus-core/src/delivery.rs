@@ -63,11 +63,22 @@ pub struct DeliveryConfig {
     max_deliver: u32,
     allow_unlimited: bool,
     backoff_nanos: Vec<u64>,
+    attempts_flush_redeliveries: u32,
 }
 
 impl DeliveryConfig {
     /// The default cap on delivery attempts before a message is dead-lettered.
     pub const DEFAULT_MAX_DELIVER: u32 = 5;
+
+    /// The default redelivery-driven attempt-count flush threshold (#547): once at least this
+    /// many REDELIVERY grants (attempts >= 2, the poison-relevant events) have accumulated in a
+    /// group since its attempt counts were last durable, the server's per-pass checkpoint seam
+    /// writes the attempt snapshot even though the cursor has not advanced. `1` (the default)
+    /// makes every pass that granted a redelivery end with one amortized snapshot write, so the
+    /// durable count lags the true count by AT MOST the redeliveries of a single in-progress
+    /// pass — bounded in deliveries, never in wall-clock or cursor distance. First deliveries
+    /// (attempt 1, the hot path) never trip it, so a healthy workload pays nothing.
+    pub const DEFAULT_ATTEMPTS_FLUSH_REDELIVERIES: u32 = 1;
 
     /// Builds a delivery config.
     ///
@@ -95,7 +106,30 @@ impl DeliveryConfig {
             max_deliver,
             allow_unlimited,
             backoff_nanos,
+            attempts_flush_redeliveries: Self::DEFAULT_ATTEMPTS_FLUSH_REDELIVERIES,
         })
+    }
+
+    /// Overrides the redelivery-driven attempt-count flush threshold (#547), returning the
+    /// config for chaining. `0` DISABLES the delivery-driven trigger entirely (the attempt
+    /// counts then persist only on the legacy cadence: cursor-interval, clean disconnect,
+    /// graceful shutdown, and eviction — the pre-#547 behavior, whose un-persisted lag is
+    /// unbounded in redeliveries). A larger value amortizes further: the durable count may lag
+    /// the true count by up to `n - 1` FULLY-ACCUMULATED redeliveries plus the current pass's
+    /// grants, and `MaxDeliver -> DLQ` fires correspondingly later (never never) after a crash.
+    /// The default ([`Self::DEFAULT_ATTEMPTS_FLUSH_REDELIVERIES`], 1) is the tight, safe bound.
+    #[must_use]
+    pub fn with_attempts_flush_redeliveries(mut self, n: u32) -> DeliveryConfig {
+        self.attempts_flush_redeliveries = n;
+        self
+    }
+
+    /// The redelivery-driven attempt-count flush threshold (#547): flush the durable attempt
+    /// snapshot once this many redelivery grants have accumulated since the last flush; `0`
+    /// means the delivery-driven trigger is disabled.
+    #[must_use]
+    pub fn attempts_flush_redeliveries(&self) -> u32 {
+        self.attempts_flush_redeliveries
     }
 
     /// The configured delivery cap (`0` means unlimited).
@@ -238,6 +272,30 @@ mod tests {
         // An explicit delay wins, even zero (retry immediately).
         assert_eq!(c.effective_nack_delay(2, Some(7)), 7);
         assert_eq!(c.effective_nack_delay(2, Some(0)), 0);
+    }
+
+    #[test]
+    fn the_attempts_flush_threshold_defaults_to_one_and_is_overridable() {
+        // The safe default (#547): every accumulated redelivery makes the attempt snapshot due.
+        let c = config(5, vec![]);
+        assert_eq!(
+            c.attempts_flush_redeliveries(),
+            DeliveryConfig::DEFAULT_ATTEMPTS_FLUSH_REDELIVERIES
+        );
+        assert_eq!(c.attempts_flush_redeliveries(), 1);
+        // Amortize (a nack-storm-heavy deployment) or disable (0, the legacy cadence) explicitly.
+        assert_eq!(
+            config(5, vec![])
+                .with_attempts_flush_redeliveries(8)
+                .attempts_flush_redeliveries(),
+            8
+        );
+        assert_eq!(
+            config(5, vec![])
+                .with_attempts_flush_redeliveries(0)
+                .attempts_flush_redeliveries(),
+            0
+        );
     }
 
     #[test]

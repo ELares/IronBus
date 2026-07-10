@@ -159,9 +159,21 @@ pub struct LeaseTable {
     /// so the live lease owns the count from then on. Empty in steady state (every entry is consumed
     /// by the first redelivery), and bounded by the same `max_in_flight` window that bounds
     /// `leases`, so it never grows unbounded. Acked / committed-past offsets never redeliver (the
-    /// cursor gates them), so a stale carried entry is simply never consumed; the snapshot is
-    /// rebuilt from the live leases each checkpoint, so such an entry never persists.
+    /// cursor gates them), so a stale carried entry is simply never consumed; an acked or
+    /// committed-past offset leaves both `leases` and `carried` (see [`LeaseTable::ack`] /
+    /// [`LeaseTable::release_below`]), so it ages out of the durable snapshot too.
     carried: BTreeMap<u64, u32>,
+    /// REDELIVERY grants (a [`LeaseTable::claim`] granted at attempt >= 2, including a carried
+    /// resume) since the last durable attempt-count flush (#547). This is the delivery-driven
+    /// dirtiness signal behind the durable `MaxDeliver` contract: the interval checkpoint is gated
+    /// on CURSOR advance, which a head-of-line poison never produces, so without this counter a
+    /// poison's rising attempt count could stay un-persisted for arbitrarily many redeliveries and
+    /// an unclean restart would replay them all. The server checks it on its per-pass checkpoint
+    /// seam and flushes the attempt snapshot once the configured threshold is reached, then calls
+    /// [`LeaseTable::note_attempts_flushed`] — so the durable lag is bounded in REDELIVERIES, not
+    /// wall-clock or cursor distance, and first deliveries (attempt 1, the hot path) never pay a
+    /// flush. Saturating; never decremented except by the flush note.
+    redeliveries_since_flush: u32,
 }
 
 impl LeaseTable {
@@ -173,7 +185,25 @@ impl LeaseTable {
             leases: BTreeMap::new(),
             next_generation: 0,
             carried: BTreeMap::new(),
+            redeliveries_since_flush: 0,
         }
+    }
+
+    /// The number of REDELIVERY grants (claims granted at attempt >= 2, including a carried
+    /// resume across a restart) since the last [`note_attempts_flushed`](Self::note_attempts_flushed)
+    /// (#547). The server's checkpoint seam compares this against its configured threshold to
+    /// decide whether the durable attempt snapshot is due, independent of cursor advance.
+    #[must_use]
+    pub fn redeliveries_since_flush(&self) -> u32 {
+        self.redeliveries_since_flush
+    }
+
+    /// Marks the durable attempt snapshot as freshly written (#547), resetting the
+    /// redelivery-dirtiness counter. Called by every attempt-snapshot writer (interval,
+    /// disconnect, shutdown, eviction, and the redelivery-driven trigger), so the counter always
+    /// measures redeliveries SINCE the counts were last durable.
+    pub fn note_attempts_flushed(&mut self) {
+        self.redeliveries_since_flush = 0;
     }
 
     /// Seeds the durable per-message attempt counts CARRIED from a prior run (#358), so the next
@@ -280,6 +310,11 @@ impl LeaseTable {
             lease.attempt_start = now;
             lease.deadline = deadline;
             lease.deliveries = lease.deliveries.saturating_add(1);
+            // A redelivery grant escalated a durable-relevant count (#547): mark the attempt
+            // snapshot dirty so the server's delivery-driven flush trigger can bound the
+            // un-persisted lag in redeliveries (a poison retry loop never advances the cursor,
+            // so the interval checkpoint alone would never fire).
+            self.redeliveries_since_flush = self.redeliveries_since_flush.saturating_add(1);
             lease.deliveries
         } else {
             // First claim of this offset in THIS table. If a durable attempt count was carried
@@ -292,6 +327,13 @@ impl LeaseTable {
                 .carried
                 .remove(&off)
                 .map_or(1, |prior| prior.saturating_add(1));
+            if resumed >= 2 {
+                // A carried resume IS a redelivery (the message had been delivered before the
+                // restart), so it marks the snapshot dirty exactly like the in-table redelivery
+                // branch above: the resumed count must become durable again promptly, or a second
+                // crash could regress it to the pre-restart floor (#547).
+                self.redeliveries_since_flush = self.redeliveries_since_flush.saturating_add(1);
+            }
             self.leases.insert(
                 off,
                 Lease {
@@ -528,6 +570,53 @@ mod tests {
         // Redeliver by re-claiming after expiry, so tok0 is now stale.
         let _ = t.claim(off(0), 1000);
         assert_eq!(t.nack(&tok0, 1000, 0), NackOutcome::Fenced);
+    }
+
+    #[test]
+    fn redeliveries_since_flush_counts_regrants_and_carried_resumes_not_first_deliveries() {
+        // First deliveries (attempt 1) are the hot path and must NEVER mark the attempt
+        // snapshot dirty (#547): no per-delivery flush pressure.
+        let mut t = LeaseTable::new(cfg());
+        assert_eq!(t.redeliveries_since_flush(), 0);
+        t.claim(off(0), 0);
+        t.claim(off(1), 0);
+        assert_eq!(
+            t.redeliveries_since_flush(),
+            0,
+            "attempt-1 grants are not redeliveries"
+        );
+        // An expired lease's re-claim IS a redelivery (attempt 2): counts once per grant.
+        t.claim(off(0), 40);
+        assert_eq!(t.redeliveries_since_flush(), 1);
+        t.claim(off(0), 80);
+        assert_eq!(t.redeliveries_since_flush(), 2);
+        // The flush note resets the dirtiness; subsequent redeliveries count from zero again.
+        t.note_attempts_flushed();
+        assert_eq!(t.redeliveries_since_flush(), 0);
+        t.claim(off(1), 40);
+        assert_eq!(t.redeliveries_since_flush(), 1);
+    }
+
+    #[test]
+    fn a_carried_resume_is_a_redelivery_for_the_flush_trigger() {
+        // A post-restart first claim that RESUMES a carried count is a redelivery (the message
+        // was delivered before the crash), so it must mark the snapshot dirty: without this, a
+        // resumed poison's count would only re-persist on a cursor advance it never causes, and
+        // a second crash would regress it to the pre-restart floor (#547).
+        let mut t = LeaseTable::new(cfg());
+        t.resume_attempts(vec![(0, 3)]);
+        match t.claim(off(0), 0) {
+            Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 4, "resumed 3 + 1"),
+            other => panic!("expected a grant, got {other:?}"),
+        }
+        assert_eq!(
+            t.redeliveries_since_flush(),
+            1,
+            "the carried resume marks the snapshot dirty"
+        );
+        // A genuinely fresh first claim alongside it still does not count.
+        t.claim(off(1), 0);
+        assert_eq!(t.redeliveries_since_flush(), 1);
     }
 
     #[test]

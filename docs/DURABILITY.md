@@ -330,6 +330,55 @@ explicitly NOT a number this document or any host-side test invents.
 
 ---
 
+## 6. The durable per-message delivery count (#547): MaxDeliver -> DLQ across crashes
+
+Poison-message containment is durable state, not a best-effort in-memory
+counter. NATS's redelivery count is volatile (lost on every server restart) and
+its default `MaxDeliver=-1` is unlimited, so a poison message there can
+redeliver forever across restarts. IronBus persists each in-flight message's
+delivery count (`attempts.ckpt` / `attempts-<hex>.ckpt` /
+`streams/<hex>/attempts-<hex>.ckpt`, #358/#60/#681) and RESUMES it on open, so
+`MaxDeliver -> DLQ` (default 5, unlimited only by explicit opt-in) fires even
+across crashes. The honest contract, exactly:
+
+- **What survives a clean restart (SIGTERM drain or clean disconnect):** every
+  group's attempt counts as of the final flush — the drain checkpoints every
+  group, and a clean disconnect flushes a group with anything in flight. No lag.
+- **What survives kill -9:** every count as of the last completed
+  attempt-snapshot write. Writers fire on the cursor-interval tick, the
+  clean-disconnect flush, the graceful-shutdown drain, hot-set eviction, AND —
+  because a poison retry loop never advances the cursor, so none of those are
+  guaranteed to fire — the #547 REDELIVERY-DRIVEN trigger: any engine pass that
+  granted at least `attempts_flush_redeliveries` redeliveries (attempt >= 2;
+  default threshold 1, `0` disables, a larger value amortizes further) ends with
+  one snapshot write, amortized over the pass. The durable lag is therefore
+  bounded in DELIVERIES, not wall-clock or cursor distance: at most the current
+  pass's redelivery grants, plus a message's very first attempt (attempt 1
+  deliberately never schedules a flush — that would be a per-delivery fsync on
+  the hot path).
+- **The guarantee:** a poison message NEVER redelivers unboundedly across
+  restarts. The recovered count never regresses below the durable floor (every
+  snapshot writer persists live leases UNION carried counts, the #565 rule, so a
+  flush in any partially-recovered state can only raise a count), and the count
+  resumes and reaches `MaxDeliver`; the worst case is lag-extra observed
+  deliveries — `MaxDeliver + 1` total for a kill -9 that lands before the first
+  redelivery ever becomes durable, more only under a raised amortization
+  threshold or a disabled trigger (then bounded by the legacy interval /
+  disconnect cadence within each run). Late by the lag, but it always fires.
+
+Proven by: `engine::tests::a_redelivery_schedules_a_durable_attempts_flush_*`
+(the trigger, no cursor advance, exactly `MaxDeliver` total across the kill),
+`an_unclean_kill_before_any_redelivery_costs_at_most_one_extra_delivery` and
+`a_threshold_of_zero_disables_the_trigger_and_the_dlq_fires_late_but_fires`
+(the lag bounds), `a_partial_reclaim_flush_never_regresses_a_still_carried_sibling_count`
+(the never-regress rule), the named-group / named-stream legs, and the
+end-to-end `effectively_once.rs` scenario 5
+(`max_deliver_dead_letters_after_a_kill_minus_nine_mid_retry_never_redelivers_forever`),
+which drives the real binary through nack, kill -9, restart, and the offline
+DLQ dump.
+
+---
+
 ## Summary: what is true today
 
 - IronBus DEFAULTS to ONE durability level, `sync`: ack-implies-durable (I2). The
@@ -351,6 +400,11 @@ explicitly NOT a number this document or any host-side test invents.
 - The across-levels throughput / latency / bytes-at-risk curve on ARM SD/eMMC is
   a DEVICE residual: it now has the relaxed levels but still needs the reference
   hardware, it is not faked host-side, and it feeds #19.
+- Per-message DELIVERY COUNTS are durable (#547, section 6): the count resumes
+  across kill -9 (lag bounded in deliveries, never wall-clock; it never
+  regresses below the durable floor), so `MaxDeliver -> DLQ` always fires — at
+  worst lag-late — where NATS's volatile count plus `MaxDeliver=-1` default
+  redelivers a poison forever.
 
 ## Cross-references
 
