@@ -13,7 +13,10 @@ Related material: the earlier t4g.small round is
 [benchmarks/t4g-single-node-vs-nats-2026-06-22.md](benchmarks/t4g-single-node-vs-nats-2026-06-22.md),
 the matched-durability corpus method lives in [benchmarks/README.md](benchmarks/README.md), the
 on-device history is [PERF_LEDGER.md](PERF_LEDGER.md), and the Redpanda studies are linked from
-the [README benchmarks section](../README.md#benchmarks).
+the [README benchmarks section](../README.md#benchmarks). The corruption-recovery head-to-head
+([#644](https://github.com/ELares/IronBus/issues/644): the same four on-disk corruption classes
+injected into both brokers' file stores, behavior measured on both sides) is
+[benchmarks/corruption-recovery.md](benchmarks/corruption-recovery.md).
 
 ## Headlines
 
