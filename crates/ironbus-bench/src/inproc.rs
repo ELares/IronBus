@@ -77,6 +77,7 @@ fn engine_config_with_credit(consumer_credit: u32, max_in_flight: u32) -> Engine
         consumer_credit,
         consumer_credit_bytes: 0,
         checkpoint_interval: 1,
+        max_acked_ahead_runs: 1024,
         max_retained_bytes: 0,
         max_age_ms: 0,
         max_messages: 0,

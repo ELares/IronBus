@@ -651,6 +651,7 @@ fn build_config(setup: &Setup) -> EngineConfig {
         consumer_credit: 64,
         consumer_credit_bytes: 0,
         checkpoint_interval: 1024,
+        max_acked_ahead_runs: 1024,
         max_retained_bytes: 0,
         max_age_ms: 0,
         max_messages: 0,
