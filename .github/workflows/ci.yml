@@ -325,6 +325,26 @@ jobs:
       - name: assert the durable scoreboard rows are fairness-linted and agree with PERF_LEDGER.md
         run: sh scripts/ci/durable-scoreboard-check.sh
 
+  write-amp-rss-drift:
+    name: write-amp + RSS fairness + drift gate (#645)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The #645 write-amplification + RSS-per-message gate, same pattern as the #646 scoreboard
+      # gate above: the head-to-head vs NATS has a machine-readable form
+      # (docs/benchmarks/write-amp-rss-rows.jsonl) and a human-readable form
+      # (docs/benchmarks/write-amp-rss.md). This gate asserts the rows parse, every head-to-head
+      # pair compares the SAME metric at the SAME workload with exactly one IronBus side (a churn
+      # write_bytes figure can never be scored against a retained du figure), every unpaired
+      # context row carries its asymmetry note, the two load-bearing pairs exist, and the doc's
+      # stated numbers/headline ratio agree with the rows. Deterministic, offline, history-free;
+      # needs only jq. The live comparative run deliberately does NOT happen in CI (the #114
+      # flaky-percent-gate consideration); re-runs are manual via
+      # docs/benchmarks/write_amp_rss.sh on a quiet Linux box.
+      - name: assert the write-amp/RSS rows are fairness-linted and agree with write-amp-rss.md
+        run: sh scripts/ci/write-amp-rss-check.sh
+
   cross-build:
     name: musl build (${{ matrix.target }})
     runs-on: ubuntu-latest
