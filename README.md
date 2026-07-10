@@ -80,7 +80,7 @@ zero-config default the cluster degrades to, not the ceiling:
 
 ## Benchmarks
 
-Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted, on the substrate that actually decides a durable broker: **real network-attached durable storage**, where a `fdatasync` ack means the bytes survived power loss. IronBus is benchmarked head-to-head against **Redpanda v26.1.12** on real AWS **t4g / EBS** hardware, cross-checked in a matched Linux VM. Everything below is **3-run medians** with each broker pinned to a matched, labeled durability tier; full methodology, per-broker configs, and harnesses live under **[docs/benchmarks/](docs/benchmarks/)**.
+Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, not asserted, on the substrate that actually decides a durable broker: **real network-attached durable storage**, where a `fdatasync` ack means the bytes survived power loss. IronBus is benchmarked head-to-head against **Redpanda v26.1.12** on real AWS **t4g / EBS** hardware, cross-checked in a matched Linux VM — and against **NATS** (core and JetStream) on the same instance class ([below](#measured-against-nats)). Everything in the Redpanda studies is **3-run medians** with each broker pinned to a matched, labeled durability tier; full methodology, per-broker configs, and harnesses live under **[docs/benchmarks/](docs/benchmarks/)**.
 
 ### Matched-conditions: IronBus vs Redpanda, both inside one Linux VM
 
@@ -115,6 +115,17 @@ The single-connection medians on that substrate, with `--io-mode auto` (3-run me
 | | 1 KiB | **1,045 / 3,172** | 2,000 / 301,000 | IronBus **1.9× / ~95×** |
 
 On this real durable substrate IronBus **wins or ties every row**; the single non-win is P2/128 B single-connection, at par (within the study's ~8 % cell spread). Redpanda's L1 p50 is throttled-tool-quantized to whole milliseconds, but its ~300 ms p99 tail is real. Full medians and the harness are in **[§7 of the study doc](docs/benchmarks/REDPANDA_MATCHED_2026_07.md)**.
+
+### Measured against NATS
+
+The NATS head-to-head ([#606](https://github.com/ELares/IronBus/issues/606), [#1100](https://github.com/ELares/IronBus/issues/1100)) ran both brokers on one **AWS t4g.large** (2 vCPU Graviton2), single-host loopback, 256 B payloads — `ironbus` 2607.109.15 / 2607.110.11 vs `nats-server` 2.14.3. The headlines, wins and losses both:
+
+- **Filtered consumers: ~1x penalty vs JetStream's measured ~7x.** A subject-filtered IronBus consumer drains at ~1x its unfiltered rate (coalesced gap markers, exact gap accounting on every run), where JetStream's filtered consumer measured 13.5–14.8k msg/s against 105k unfiltered — a ~7x re-scan penalty. On a sparse 1-in-100 subject, the IronBus filtered consumer traverses the same window ~21x sooner; durable/fsynced filtered stays at ~1.3x per-delivered cost.
+- **Flat subject routing.** Going from 1 to 10,000 subjects costs IronBus **-10.9%** publish throughput; NATS core measured ~35% degradation on the same climb.
+- **Consume: acked beats their unacked.** IronBus streaming consume at **716–735k msg/s, acked over a replayable log**, vs NATS core's **unacked** delivery at 667–681k. Durable consume: **333k msg/s = 3.4x JetStream** (file storage, explicit acks). Push delivery (`serve --consume-longpoll-ms`) is **2.1x better at p50** than pull-poll (175–198 µs vs 372–383 µs round-trip at 2,000 msg/s).
+- **Where NATS wins, stated plainly:** NATS core's fire-and-forget (unacked) ingest is ~6.7x higher than IronBus's acked ingest, and JetStream's async ingest is ~1.7x higher — though JetStream's publish ack is not fsynced and IronBus's is, a strictly stronger guarantee. Different guarantees; the loss rows are reported, not hidden.
+
+Single-host loopback on a burstable instance: p50/p99-grade numbers, directional at the tails. **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** has every table, every caveat, and the reproduction commands (`ironbus bench --subjects/--filter`, `nats bench` on the other side).
 
 ### Performance targets
 
@@ -291,7 +302,7 @@ ironbus cumulative-ack --group audit --up-to 5000
 
 ### Tier-S streaming consume (consumer-managed offsets)
 
-The Kafka-style high-throughput consume tier: zero-copy `DeliverBatch` delivery over a resident sparse byte index, with consumer-managed offsets and cumulative commits — the 1.65 M msg/s row in the [benchmarks](#benchmarks) (4.2x NATS). The lease-rich work-queue tier (Tier-W) stays the default for per-message semantics.
+The Kafka-style high-throughput consume tier: zero-copy `DeliverBatch` delivery over a resident sparse byte index, with consumer-managed offsets and cumulative commits — measured at **716–735k msg/s acked** on AWS t4g.large, ahead of NATS core's unacked delivery on the same host, and **333k msg/s durable = 3.4x JetStream** (see [Measured against NATS](#measured-against-nats) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md)). The lease-rich work-queue tier (Tier-W) stays the default for per-message semantics.
 
 ```sh
 ironbus bench --count 100000 --mode subscribe --consume-tier streaming
