@@ -10,8 +10,8 @@
 //! [`crate::bench`] and are unit-tested on every target.
 
 use crate::bench::{
-    fill_payload, percentiles_us, AckMode, BenchConfig, BenchReport, Bound, ConsumeTier, Mode,
-    BENCH_NAMESPACE_PREFIX, ROUND_TRIP_TOKEN_LEN,
+    bench_subject_name, fill_payload, percentiles_us, AckMode, BenchConfig, BenchReport, Bound,
+    ConsumeTier, Mode, BENCH_NAMESPACE_PREFIX, ROUND_TRIP_TOKEN_LEN,
 };
 use crate::{
     materialized_config_line, open_disk_engine, open_memory_engine, CliError, DurabilityLevelArg,
@@ -19,7 +19,8 @@ use crate::{
 };
 use ironbus_client::{Client, ClientConfig, ClientError, StreamConsumerConfig};
 use ironbus_core::clock::Clock; // the monotonic seam the serve loop's liveness beacon (#95) reads
-use ironbus_proto::message::{ConsumeTier as ProtoConsumeTier, PubBody};
+use ironbus_core::subject::{Subject, SubjectPattern};
+use ironbus_proto::message::{gap_reason, ConsumeTier as ProtoConsumeTier, PubBody};
 use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
 use ironbus_server::server::serve;
 use ironbus_storage::fs::{EphemeralFs, Filesystem, StdFs};
@@ -391,6 +392,56 @@ fn connect_streaming(addr: &str) -> Result<Client, CliError> {
             "bench: connecting streaming client to broker at {addr}: {e}"
         ))
     })
+}
+
+/// Connects a STREAM-ADDRESSING client to `addr` (#1126): advertises `understands_streams` in the
+/// `Connect` handshake so this connection may `BindSubject` / `PubSubject` over the wire — the
+/// producer side of the multi-subject modes. If the server does not confirm the capability the
+/// subject verbs return a typed server error the caller surfaces, so the bench cannot silently
+/// fall back to the subject-less path.
+fn connect_subjects(addr: &str) -> Result<Client, CliError> {
+    let client_cfg = ClientConfig {
+        understands_streams: true,
+        ..ClientConfig::default()
+    };
+    Client::connect_with(addr, &client_cfg).map_err(|e| {
+        CliError::Unreachable(format!(
+            "bench: connecting subject-addressing client to broker at {addr}: {e}"
+        ))
+    })
+}
+
+/// Connects the FILTERED consumer (#594, #1126): advertises stream addressing (the `SubSubject`
+/// verb rides it), the subject-filter capability (`filter_mode = 1` is fail-closed rejected
+/// without it), and gap-marker support (so each skipped run arrives as a typed [`ironbus_client::Gap`]
+/// with reason FILTERED, which the drain counts — the filter's wire-visible overhead).
+fn connect_filtered(addr: &str) -> Result<Client, CliError> {
+    let client_cfg = ClientConfig {
+        understands_streams: true,
+        request_subject_filter: true,
+        request_gap_marker: true,
+        ..ClientConfig::default()
+    };
+    Client::connect_with(addr, &client_cfg).map_err(|e| {
+        CliError::Unreachable(format!(
+            "bench: connecting filtered consumer to broker at {addr}: {e}"
+        ))
+    })
+}
+
+/// Live-binds the `n` synthetic bench subjects (`bench.s0`..`bench.s{n-1}`) to the DEFAULT stream
+/// over the wire (`BindSubject`, #1126) and returns their names in slot order. Binding every
+/// subject to ONE stream is deliberate: the records interleave in a single log, which is exactly
+/// the stream a filtered consumer must be measured against (filtered vs unfiltered on the SAME
+/// data). Idempotent server-side, so a re-run against a live broker is a benign success.
+fn bind_bench_subjects(client: &mut Client, addr: &str, n: u32) -> Result<Vec<String>, CliError> {
+    let subjects: Vec<String> = (0..n).map(bench_subject_name).collect();
+    for subject in &subjects {
+        client
+            .bind_subject("", subject)
+            .map_err(|e| classify(addr, "binding a bench subject on", &e))?;
+    }
+    Ok(subjects)
 }
 
 /// Whether the run should stop given how many ops are done and when it started.
@@ -822,6 +873,9 @@ fn multi_publish_attribution(cfg: &BenchConfig) -> SampleAttribution {
 /// independent connections concurrently — the multi-connection load the pipelined sync tier needs
 /// to fill its overlap window, which the design spec proved a single connection cannot.
 fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
+    if let Some(n) = cfg.subjects {
+        return run_publish_subjects(cfg, addr, n);
+    }
     if cfg.producers > 1 {
         return run_publish_multi(cfg, addr);
     }
@@ -838,6 +892,94 @@ fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
         elapsed,
         publish_attribution(cfg),
     ))
+}
+
+/// The MULTI-SUBJECT publish mode (#1126, unblocks #606): live-bind the `n` synthetic subjects to
+/// the default stream (`BindSubject` over the wire), then distribute the bound/rate-paced records
+/// across them ROUND-ROBIN via the awaited `PubSubject` — every record resolves its literal subject
+/// through the broker's routing trie, so the per-produce samples are honest produce-to-ack RTTs
+/// that INCLUDE the routing hot-path cost (#606's flat-per-record-cost claim under measurement).
+/// The parse guards refuse the pipelined shapes with `--subjects`, so this is always the plain
+/// awaited path and [`publish_attribution`] returns the plain-path honesty flags. Reports the
+/// per-subject tallies alongside the aggregate.
+fn run_publish_subjects(cfg: &BenchConfig, addr: &str, n: u32) -> Result<BenchReport, CliError> {
+    let mut client = connect_subjects(addr)?;
+    let subjects = bind_bench_subjects(&mut client, addr, n)?;
+    let slots = subjects.len() as u64;
+    let mut payload = vec![0u8; cfg.payload_bytes];
+    let mut produced: u64 = 0;
+    let mut samples: Vec<u64> = Vec::new();
+    let mut per_subject: Vec<u64> = vec![0; subjects.len()];
+    // The measurement window matches the plain publish leg: from after the connect + binds (the
+    // binds are setup, not the measured load) to after the last send.
+    let started = Instant::now();
+    while !should_stop(&cfg.bound, produced, started) {
+        let slot = usize::try_from(produced % slots).unwrap_or(0);
+        fill_payload(
+            &mut payload,
+            cfg.payload_shape,
+            produced,
+            ROUND_TRIP_TOKEN_LEN,
+        );
+        stamp_seq(&mut payload, produced);
+        samples.push(produce_one_subject(
+            &mut client,
+            addr,
+            &subjects[slot],
+            &mut payload,
+            started,
+        )?);
+        per_subject[slot] += 1;
+        produced += 1;
+        pace(cfg.target_rate_hz, produced, started);
+    }
+    let elapsed = started.elapsed();
+    let mut report = finish_report(
+        cfg,
+        produced,
+        produced,
+        &[],
+        &samples,
+        elapsed,
+        publish_attribution(cfg),
+    );
+    report.per_subject = subjects.into_iter().zip(per_subject).collect();
+    Ok(report)
+}
+
+/// Produces one message BY SUBJECT (#1126): the `PubSubject` twin of [`produce_one`], stamping the
+/// send-time token at the real send instant and returning the produce-CALL latency in nanoseconds.
+/// A `PubSubject` ack is the same fsynced-durable `PubAck` a plain produce returns (I2), so the
+/// sample is an honest awaited RTT — including the routing-trie resolve — and, on the per-ack
+/// durable disk path, an honest per-op fsync cost. A capacity shed is tolerated exactly like
+/// [`produce_one`] (the overload workload).
+fn produce_one_subject(
+    client: &mut Client,
+    addr: &str,
+    subject: &str,
+    payload: &mut [u8],
+    started: Instant,
+) -> Result<u64, CliError> {
+    stamp_send_time(payload, started);
+    let call_start = Instant::now();
+    let result = client.publish_subject(
+        subject,
+        &PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload,
+        },
+    );
+    let latency_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    match result {
+        Ok(_) => Ok(latency_ns),
+        Err(e) if is_shed(&e) => Ok(latency_ns),
+        Err(e) => Err(classify(addr, "subject-publishing to", &e)),
+    }
 }
 
 /// The per-producer payload-entropy stride (#1040): leg `i` seeds its payload fills from sequence
@@ -970,12 +1112,59 @@ fn run_subscribe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError>
         Bound::Duration(_) => SUBSCRIBE_DURATION_PRELOAD,
     };
     let started = Instant::now();
+    // Preload the queue: SUBJECT-ADDRESSED interleaved round-robin when `--subjects` is set
+    // (#1126, the multi-subject stream a `--filter` acts on), else the historical plain pipelined
+    // window. `expected` is what the DRAIN should deliver: the filter-matched subset under
+    // `--filter`, else the whole preload.
+    let expected = if let Some(n) = cfg.subjects {
+        preload_subjects(cfg, addr, preload, n)?
+    } else {
+        preload_plain(cfg, addr, preload)?;
+        preload
+    };
+
+    // The measured drain phase: time it from here so the throughput reflects fetch/ack, not the
+    // preload. The preload fsync cost is not the SUBSCRIBE metric (drain throughput is), so the
+    // fsync histogram is empty for this mode.
+    let drain_start = Instant::now();
+    // TIER selector (#554): Tier-W is the per-message-lease work queue; Tier-S is the streaming
+    // consumer-managed-offset path (the durable single-consumer streaming-consume head-to-head).
+    let (recorded, latencies, gaps) = match cfg.consume_tier {
+        ConsumeTier::Work => drain(cfg, addr, expected, started)?,
+        ConsumeTier::Streaming => {
+            let (recorded, latencies) = drain_streaming(cfg, addr, expected, started)?;
+            (recorded, latencies, GapTally::default())
+        }
+    };
+    let mut report = finish_report(
+        cfg,
+        preload,
+        recorded,
+        &latencies,
+        &[],
+        drain_start.elapsed(),
+        SampleAttribution {
+            fsync_measured: false,
+            acks_awaited: false,
+        },
+    );
+    // The filtered drain's skip accounting (#594, #1126): reported only when the run was filtered,
+    // so an unfiltered report keeps its historical null fields.
+    if cfg.filter.is_some() {
+        report.gap_markers = Some(gaps.markers);
+        report.gap_offsets_skipped = Some(gaps.offsets);
+    }
+    Ok(report)
+}
+
+/// The historical PLAIN subscribe preload: a pipelined produce window (group-committed), not a
+/// serial per-message produce — SUBSCRIBE measures the DRAIN rate, so the preload's write speed is
+/// irrelevant to the metric, and a serial fdatasync-per-message preload is otherwise fsync-bound
+/// (~SD speed), making a large preload take minutes for no measurement value. Each message still
+/// carries its `seq` stamp. Chunked so the in-flight window stays bounded. Extracted verbatim from
+/// `run_subscribe` for the #1126 preload dispatch; the bytes on the wire are unchanged.
+fn preload_plain(cfg: &BenchConfig, addr: &str, preload: u64) -> Result<(), CliError> {
     let mut producer = connect(addr)?;
-    // Pre-load via a PIPELINED produce window (group-committed), not a serial per-message produce:
-    // SUBSCRIBE measures the DRAIN rate, so the preload's write speed is irrelevant to the metric,
-    // and a serial fdatasync-per-message preload is otherwise fsync-bound (~SD speed), making a
-    // large preload take minutes for no measurement value. Each message still carries its `seq`
-    // stamp. Chunked so the in-flight window stays bounded.
     let mut seq: u64 = 0;
     while seq < preload {
         let n = (preload - seq).min(PRELOAD_CHUNK);
@@ -1003,30 +1192,77 @@ fn run_subscribe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError>
             .map_err(|e| classify(addr, "preloading the subscribe queue on", &e))?;
         seq += n;
     }
-    drop(producer);
+    Ok(())
+}
 
-    // The measured drain phase: time it from here so the throughput reflects fetch/ack, not the
-    // preload. The preload fsync cost is not the SUBSCRIBE metric (drain throughput is), so the
-    // fsync histogram is empty for this mode.
-    let drain_start = Instant::now();
-    // TIER selector (#554): Tier-W is the per-message-lease work queue; Tier-S is the streaming
-    // consumer-managed-offset path (the durable single-consumer streaming-consume head-to-head).
-    let (recorded, latencies) = match cfg.consume_tier {
-        ConsumeTier::Work => drain(cfg, addr, preload, started)?,
-        ConsumeTier::Streaming => drain_streaming(cfg, addr, preload, started)?,
+/// The SUBJECT-ADDRESSED subscribe preload (#1126): live-binds the `n` bench subjects to the
+/// default stream and publishes the `preload` records ROUND-ROBIN across them via the awaited
+/// `PubSubject`, so the drain consumes an INTERLEAVED multi-subject stream — the shape a
+/// `--filter` measurement needs. Per-record awaited (no pipelined subject-publish client path
+/// exists); the preload is setup, not the drain metric, so its write speed shapes no reported
+/// number. Returns the drain's EXPECTED delivery count: the records whose subject the configured
+/// `--filter` matches (computed through the REAL #567 pattern matcher, the same primitive the
+/// broker's filter applies, so the expectation can never drift from the broker's semantics), or
+/// every non-shed record when unfiltered.
+fn preload_subjects(cfg: &BenchConfig, addr: &str, preload: u64, n: u32) -> Result<u64, CliError> {
+    let mut producer = connect_subjects(addr)?;
+    let subjects = bind_bench_subjects(&mut producer, addr, n)?;
+    // Whether each subject slot matches the drain's filter, precomputed once per slot.
+    let slot_matches: Vec<bool> = match &cfg.filter {
+        Some(pattern) => {
+            // The pattern was already validated at parse time; a failure here means the two
+            // validators drifted, which is an internal fault worth naming, not a usage error.
+            let parsed = SubjectPattern::parse(pattern).map_err(|e| {
+                CliError::Internal(format!(
+                    "bench: the parse-time-validated `--filter` pattern was rejected by the \
+                     matcher: {e}"
+                ))
+            })?;
+            subjects
+                .iter()
+                .map(|s| Subject::parse_literal(s).is_ok_and(|subject| parsed.matches(&subject)))
+                .collect()
+        }
+        None => vec![true; subjects.len()],
     };
-    Ok(finish_report(
-        cfg,
-        preload,
-        recorded,
-        &latencies,
-        &[],
-        drain_start.elapsed(),
-        SampleAttribution {
-            fsync_measured: false,
-            acks_awaited: false,
-        },
-    ))
+    let slots = subjects.len() as u64;
+    let mut expected: u64 = 0;
+    let mut payload = vec![0u8; cfg.payload_bytes];
+    for seq in 0..preload {
+        let slot = usize::try_from(seq % slots).unwrap_or(0);
+        fill_payload(&mut payload, cfg.payload_shape, seq, ROUND_TRIP_TOKEN_LEN);
+        stamp_seq(&mut payload, seq);
+        let result = producer.publish_subject(
+            &subjects[slot],
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: &payload,
+            },
+        );
+        match result {
+            // Only a record that actually landed can be expected off the drain; a shed one never
+            // arrives (the overload workload the plain preload tolerates the same way).
+            Ok(_) => {
+                if slot_matches[slot] {
+                    expected += 1;
+                }
+            }
+            Err(e) if is_shed(&e) => {}
+            Err(e) => {
+                return Err(classify(
+                    addr,
+                    "subject-preloading the subscribe queue on",
+                    &e,
+                ))
+            }
+        }
+    }
+    Ok(expected)
 }
 
 /// ROUND-TRIP mode: a producer thread appends on the bound/rate while this thread fetches + acks and
@@ -1163,11 +1399,25 @@ fn drain(
     addr: &str,
     expected: u64,
     produce_started: Instant,
-) -> Result<(u64, Vec<u64>), CliError> {
-    let mut consumer = connect(addr)?;
-    subscribe_group(&mut consumer, addr, &cfg.group)?;
+) -> Result<(u64, Vec<u64>, GapTally), CliError> {
+    // FILTERED consume (#594, #1126): under `--filter` the subscription is established with the
+    // pattern as the work-group's filter (`SubSubject` filter_mode = 1 on a connection that
+    // advertised the subject-filter + gap-marker capabilities), so the broker delivers ONLY
+    // matching records and reports each skipped run as one coalesced FILTERED gap marker, which
+    // this drain counts. Unfiltered keeps the historical group subscribe, byte-for-byte.
+    let mut consumer = if let Some(pattern) = &cfg.filter {
+        let mut c = connect_filtered(addr)?;
+        c.subscribe_subject_filtered(pattern, &cfg.group)
+            .map_err(|e| classify(addr, "filter-subscribing to", &e))?;
+        c
+    } else {
+        let mut c = connect(addr)?;
+        subscribe_group(&mut c, addr, &cfg.group)?;
+        c
+    };
     let mut latencies: Vec<u64> = Vec::new();
     let mut recorded: u64 = 0;
+    let mut gaps = GapTally::default();
     let mut empty_streak: u32 = 0;
     // Reused across iterations so the batched-ack path does not reallocate the ack vector per batch.
     let mut acks: Vec<(u64, u64)> = Vec::with_capacity(cfg.fetch_batch as usize);
@@ -1179,6 +1429,15 @@ fn drain(
         // with whatever is ready (a single drain pass), exactly the closed-loop drain shape.
         let fetched = fetch_batch_pull(&mut consumer, addr, cfg.fetch_batch)?;
         let now = Instant::now();
+        // Tally the filter's wire-visible skips (#594): one coalesced FILTERED marker per skipped
+        // run, spanning `[from, to)` offsets. Other gap reasons (trim/compaction) are not the
+        // filter's doing and are left out of the filter accounting.
+        for g in &fetched.gaps {
+            if g.reason == gap_reason::FILTERED {
+                gaps.markers += 1;
+                gaps.offsets += g.to.saturating_sub(g.from);
+            }
+        }
         acks.clear();
         for m in &fetched.messages {
             if let Some(sent) = read_round_trip_time(&m.payload, produce_started) {
@@ -1225,12 +1484,24 @@ fn drain(
         // `expected` records means the broker shed the rest under its byte cap (memory mode, or a
         // disk drop policy) -- report it rather than hang waiting for records that will never come.
         eprintln!(
-            "note: drained {recorded} of {expected} preloaded records; the broker shed \
+            "note: drained {recorded} of {expected} expected records; the broker shed \
              {} under its cap (the consume rate is over the {recorded} that survived)",
             expected - recorded
         );
     }
-    Ok((recorded, latencies))
+    Ok((recorded, latencies, gaps))
+}
+
+/// The FILTERED-consume skip tally (#594, #1126): how many coalesced `GapMarker(reason = FILTERED)`
+/// frames the drain received and how many offsets they skipped in total, so the report carries the
+/// filter's exact wire-visible overhead next to the delivered count. Zero/zero for an unfiltered
+/// drain (no FILTERED marker is ever sent without a filter).
+#[derive(Clone, Copy, Debug, Default)]
+struct GapTally {
+    /// Coalesced FILTERED gap markers received (one per skipped run).
+    markers: u64,
+    /// Total offsets those markers skipped (the sum of each marker's `to - from` span).
+    offsets: u64,
 }
 
 /// Drains the preloaded prefix via the TIER-S STREAMING consumer (#554): the batched-fetch +

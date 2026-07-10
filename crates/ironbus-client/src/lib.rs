@@ -443,6 +443,18 @@ pub struct ClientConfig {
     /// delivery. The decoded `Message` payload is IDENTICAL either way; this only governs whether the
     /// bytes travel compressed on the wire.
     pub understands_compressed_delivery: bool,
+    /// Whether this client ADVERTISES that it understands the per-subject FILTERED consume mode
+    /// (#594): when `true`, the `Connect` sets the subject-filter capability bit
+    /// (`ironbus_proto::message::CONNECT_FLAG2_WANTS_SUBJECT_FILTER`, the second bit of the appended
+    /// `flags2` byte), so the server may honor a [`Client::subscribe_subject_filtered`] (a
+    /// `SubSubject` with `filter_mode = 1`) that binds a wildcard subject PATTERN as the
+    /// work-group's filter, delivering ONLY matching records with one coalesced
+    /// `GapMarker(reason = FILTERED)` per skipped run (advertise
+    /// [`ClientConfig::request_gap_marker`] too to receive those markers as typed [`Gap`]s instead
+    /// of nothing). When `false` (the default, backward-compatible) the client does not advertise it
+    /// and a filtered subscribe is FAIL-CLOSED rejected by the server with a typed error — an old
+    /// client (or one that opted out) can never be silently placed in filtered mode.
+    pub request_subject_filter: bool,
     /// The connection-scoped authentication credential this client presents in its `Connect`
     /// handshake (#631, #884), or `None` (the default) for an unauthenticated connection. When
     /// `Some(cred)`, `connect_with` appends the auth section the broker verifies (via
@@ -514,6 +526,12 @@ impl Default for ClientConfig {
             // passthrough. A caller wrapping a legacy consumer that cannot decode the descriptor sets it
             // `false` to force the broker to decompress before delivery (the silent-corruption guard).
             understands_compressed_delivery: true,
+            // Off by default: an unconfigured client does not advertise the subject-filter mode, so
+            // its `Connect` flags2 byte is byte-for-byte the pre-#594 layout and a filtered
+            // subscribe is fail-closed rejected by the server. A caller that wants the filtered
+            // consume path opts in by setting this (typically alongside `understands_streams` and
+            // `request_gap_marker`).
+            request_subject_filter: false,
             // None by default: an unconfigured client presents NO credential, so `connect_with`
             // appends no auth section and the `Connect` body is byte-for-byte the pre-#631 layout — an
             // unauthenticated connect to a no-auth broker is unchanged (#884). A caller opts into auth
@@ -1350,7 +1368,11 @@ impl Client {
                 // client verbatim; a caller wrapping a legacy consumer sets it `false` to force the
                 // broker to decompress before delivery.
                 understands_compressed_delivery: config.understands_compressed_delivery,
-                wants_subject_filter: false,
+                // The subject-filter capability bit (#594, the second `flags2` bit). Off by default,
+                // so the body is byte-for-byte the pre-#594 `Connect` and a filtered subscribe is
+                // fail-closed rejected; a caller opts in via the config to use
+                // `subscribe_subject_filtered`.
+                wants_subject_filter: config.request_subject_filter,
             },
             &mut connect_body,
         );
@@ -3434,14 +3456,52 @@ impl Client {
     /// negotiated, an unbound/ambiguous/malformed/wildcard subject), [`ClientError::Body`] on an
     /// over-large field, or a frame/connection error.
     pub fn subscribe_subject(&mut self, subject: &str, group: &str) -> Result<(), ClientError> {
+        self.subscribe_subject_with_mode(subject, group, 0)
+    }
+
+    /// Subscribes this connection's consume path with a per-subject FILTER (#594): a `SubSubject`
+    /// with `filter_mode = 1`, binding the wildcard-capable subject `pattern` (the #567 grammar:
+    /// dot-separated tokens; `*` matches exactly one token, `>` matches one-or-more trailing tokens)
+    /// as the work-`group`'s filter on the covering stream. Subsequent [`Client::fetch`] /
+    /// [`Client::ack`] then deliver ONLY the records whose stored subject matches the pattern; each
+    /// skipped run of non-matching offsets is committed past by the broker and reported as ONE
+    /// coalesced `GapMarker` with reason FILTERED (`ironbus_proto::message::gap_reason::FILTERED`),
+    /// surfaced in [`Fetch::gaps`] when this connection also negotiated gap-marker support
+    /// ([`ClientConfig::request_gap_marker`]). The filter is a per-GROUP property (shared by every
+    /// consumer in the group, so the durable cursor stays coherent).
+    ///
+    /// Requires the stream-addressing capability ([`ClientConfig::understands_streams`]) AND the
+    /// subject-filter capability ([`ClientConfig::request_subject_filter`]): a filtered subscribe
+    /// without either is FAIL-CLOSED rejected by the server with a typed error, so an old client is
+    /// never silently placed in filtered mode.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the subscription (a capability not
+    /// negotiated, or a malformed pattern), [`ClientError::Body`] on an over-large field, or a
+    /// frame/connection error.
+    pub fn subscribe_subject_filtered(
+        &mut self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<(), ClientError> {
+        self.subscribe_subject_with_mode(pattern, group, 1)
+    }
+
+    /// The shared `SubSubject` sender behind [`Client::subscribe_subject`] (`filter_mode = 0`, the
+    /// single-home literal subscribe) and [`Client::subscribe_subject_filtered`] (`filter_mode = 1`,
+    /// the #594 per-subject filtered bind), so the two paths can never drift on the wire shape.
+    fn subscribe_subject_with_mode(
+        &mut self,
+        subject: &str,
+        group: &str,
+        filter_mode: u8,
+    ) -> Result<(), ClientError> {
         let mut body = Vec::new();
         encode_sub_subject(
             &SubSubjectBody {
                 subject: subject.as_bytes(),
                 group: group.as_bytes(),
-                // The sync client subscribes single-home for now (#594); filtered consume is a
-                // client follow-up, so it never advertises the capability or sends filter_mode = 1.
-                filter_mode: 0,
+                filter_mode,
             },
             &mut body,
         )
@@ -7863,6 +7923,102 @@ toYtkjmdU2eQ2pK/3gM=
             other => panic!("expected a typed server reject, got {other:?}"),
         }
 
+        drop(c);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// A `ClientConfig` advertising the streams, subject-filter, AND gap-marker capabilities (#594):
+    /// what a filtered consumer connects with, so it may use `subscribe_subject_filtered` and
+    /// receive the `GapMarker(reason = FILTERED)` skips as typed [`Gap`]s.
+    fn config_for_filtered_consume() -> ClientConfig {
+        ClientConfig {
+            understands_streams: true,
+            request_subject_filter: true,
+            request_gap_marker: true,
+            ..ClientConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_filtered_subject_subscribe_delivers_only_matches_with_filtered_gaps_end_to_end() {
+        // TEETH (#594 client half, #1126): over the REAL wire server, a filter-capable client binds
+        // a broad pattern to the DEFAULT stream, publishes an INTERLEAVED multi-subject stream, then
+        // `subscribe_subject_filtered` delivers ONLY the matching records, with the skipped runs
+        // surfaced as typed Gaps carrying reason FILTERED. This FAILS if the config flag stops
+        // setting the capability bit or the method stops sending filter_mode = 1 (the server then
+        // fail-closed rejects, or delivers everything).
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect_with(addr, &config_for_filtered_consume()).unwrap();
+        assert!(c.streams_enabled());
+        assert!(c.gap_marker_enabled());
+
+        // Bind a broad pattern to the DEFAULT stream ("") so several subjects interleave in one log.
+        c.bind_subject("", "msg.>").unwrap();
+        let body = |p: &'static [u8]| PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        };
+        // Offsets 0..5: MATCH, non, MATCH, non, MATCH under the filter `msg.orders.*`.
+        for (subject, payload) in [
+            ("msg.orders.a", b"A" as &'static [u8]), // 0 MATCH
+            ("msg.audit.x", b"X"),                   // 1 skip
+            ("msg.orders.b", b"B"),                  // 2 MATCH
+            ("msg.audit.y", b"Y"),                   // 3 skip
+            ("msg.orders.c", b"C"),                  // 4 MATCH
+        ] {
+            c.publish_subject(subject, &body(payload)).unwrap();
+        }
+
+        // FILTERED subscribe: the pattern becomes the work-group's filter (filter_mode = 1).
+        c.subscribe_subject_filtered("msg.orders.*", "workers")
+            .unwrap();
+        let fetched = c.fetch(10).unwrap();
+        let got: Vec<Vec<u8>> = fetched.messages.iter().map(|m| m.payload.clone()).collect();
+        assert_eq!(
+            got,
+            vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            "only records whose subject matches the filter are delivered"
+        );
+        // The two skipped offsets (1 and 3) each arrive as ONE coalesced typed Gap with reason
+        // FILTERED — a reported, bounded skip, never silent loss.
+        assert_eq!(fetched.gaps.len(), 2, "gaps: {:?}", fetched.gaps);
+        for g in &fetched.gaps {
+            assert_eq!(
+                g.reason,
+                ironbus_proto::message::gap_reason::FILTERED,
+                "each skip marker carries reason FILTERED: {g:?}"
+            );
+        }
+        for m in &fetched.messages {
+            assert!(c.ack(m.offset, m.generation).unwrap());
+        }
+
+        drop(c);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_filtered_subscribe_without_the_capability_is_fail_closed_rejected() {
+        // A streams-capable client that did NOT opt into `request_subject_filter` is REFUSED a
+        // filtered subscribe with a typed server error (never silently placed in filtered mode, and
+        // never silently served unfiltered).
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect_with(addr, &config_understanding_streams()).unwrap();
+        c.bind_subject("", "msg.>").unwrap();
+        let err = c
+            .subscribe_subject_filtered("msg.orders.*", "workers")
+            .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Server(e) if e.to_string().contains("wants_subject_filter")),
+            "expected the fail-closed capability reject, got {err:?}"
+        );
         drop(c);
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
