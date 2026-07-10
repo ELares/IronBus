@@ -16,7 +16,10 @@ on-device history is [PERF_LEDGER.md](PERF_LEDGER.md), and the Redpanda studies 
 the [README benchmarks section](../README.md#benchmarks). The corruption-recovery head-to-head
 ([#644](https://github.com/ELares/IronBus/issues/644): the same four on-disk corruption classes
 injected into both brokers' file stores, behavior measured on both sides) is
-[benchmarks/corruption-recovery.md](benchmarks/corruption-recovery.md).
+[benchmarks/corruption-recovery.md](benchmarks/corruption-recovery.md), and the
+write-amplification + RSS-per-message head-to-head
+([#645](https://github.com/ELares/IronBus/issues/645)) is
+[benchmarks/write-amp-rss.md](benchmarks/write-amp-rss.md).
 
 ## Headlines
 
