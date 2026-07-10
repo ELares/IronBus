@@ -74,6 +74,9 @@ pub enum ServerErrorCode {
     InvalidSubject,
     /// `ERR_BIND_REJECTED`: a bind would exceed the routing trie's fork bound.
     BindRejected,
+    /// `ERR_BINDING_TABLE_FULL`: a bind would make the binding table's durable snapshot exceed its
+    /// checkpoint slot (#1106); the previous table stays installed.
+    BindingTableFull,
     /// `ERR_NO_STREAM_FOR_SUBJECT`: a subject-addressed publish resolved to no bound stream.
     NoStreamForSubject,
     /// `ERR_AMBIGUOUS_SUBJECT`: a subject-addressed publish resolved to two-or-more bound streams.
@@ -114,6 +117,7 @@ impl ServerErrorCode {
             "ERR_MIRROR_READ_ONLY" => Self::MirrorReadOnly,
             "ERR_INVALID_SUBJECT" => Self::InvalidSubject,
             "ERR_BIND_REJECTED" => Self::BindRejected,
+            "ERR_BINDING_TABLE_FULL" => Self::BindingTableFull,
             "ERR_NO_STREAM_FOR_SUBJECT" => Self::NoStreamForSubject,
             "ERR_AMBIGUOUS_SUBJECT" => Self::AmbiguousSubject,
             "ERR_GENERATION_EXHAUSTED" => Self::GenerationExhausted,
@@ -147,6 +151,7 @@ impl ServerErrorCode {
             Self::MirrorReadOnly => "ERR_MIRROR_READ_ONLY",
             Self::InvalidSubject => "ERR_INVALID_SUBJECT",
             Self::BindRejected => "ERR_BIND_REJECTED",
+            Self::BindingTableFull => "ERR_BINDING_TABLE_FULL",
             Self::NoStreamForSubject => "ERR_NO_STREAM_FOR_SUBJECT",
             Self::AmbiguousSubject => "ERR_AMBIGUOUS_SUBJECT",
             Self::GenerationExhausted => "ERR_GENERATION_EXHAUSTED",
@@ -288,6 +293,7 @@ mod tests {
             ServerErrorCode::MirrorReadOnly,
             ServerErrorCode::InvalidSubject,
             ServerErrorCode::BindRejected,
+            ServerErrorCode::BindingTableFull,
             ServerErrorCode::NoStreamForSubject,
             ServerErrorCode::AmbiguousSubject,
             ServerErrorCode::GenerationExhausted,

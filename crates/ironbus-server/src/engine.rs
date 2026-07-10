@@ -44,8 +44,8 @@ use ironbus_core::sublist::{Sublist, SublistBuilder, SublistError, SublistSnapsh
 use ironbus_core::ttl::{decode_ttl_headers, is_expired, Ttl};
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::checkpoint::{
-    AttemptsCheckpoint, Checkpoint, CountersCheckpoint, ProducerSeqCheckpoint, ATTEMPTS_PAYLOAD,
-    MAX_PAYLOAD, PRODUCER_SEQ_PAYLOAD,
+    AttemptsCheckpoint, BindingsCheckpoint, Checkpoint, CountersCheckpoint, ProducerSeqCheckpoint,
+    ATTEMPTS_PAYLOAD, BINDINGS_PAYLOAD, MAX_PAYLOAD, PRODUCER_SEQ_PAYLOAD,
 };
 use ironbus_storage::dlq::{DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
@@ -798,6 +798,16 @@ pub enum EngineError {
     /// [`SublistError`] reason. (An individually-valid pattern can still trip this as a property of the
     /// accepted SET; the bind is rejected and the previous binding table is left installed unchanged.)
     BindRejected(SublistError),
+    /// A `BindSubject` would make the binding table's durable snapshot exceed its checkpoint slot
+    /// (#1106): the bind is refused fail-closed BEFORE anything is written — never a truncated
+    /// snapshot, never an in-memory table a restart could not recover. The previous binding table
+    /// stays installed and durable. The bound is a property of the accepted SET's encoded size (its
+    /// patterns + stream names), the durable twin of the #568 fork bound above and the #863 stream
+    /// cap; it is far beyond any sane routing table (~thousands of typical bindings).
+    BindingTableFull {
+        /// The snapshot slot's byte cap the resulting table would exceed.
+        max_bytes: usize,
+    },
     /// A subject-addressed publish resolved to ZERO bound streams (#585, the single-home FAIL-CLOSED
     /// reject): the publish is REFUSED, NOT silently dropped — the explicit beat over NATS, which would
     /// discard a publish to a subject with no matching interest while still acking success. The producer
@@ -893,6 +903,11 @@ impl core::fmt::Display for EngineError {
             ),
             EngineError::InvalidSubject(e) => write!(f, "invalid subject: {e}"),
             EngineError::BindRejected(e) => write!(f, "bind rejected: {e}"),
+            EngineError::BindingTableFull { max_bytes } => write!(
+                f,
+                "bind rejected: the resulting binding table's durable snapshot would exceed its \
+                 {max_bytes}-byte checkpoint slot (the previous table stays installed)"
+            ),
             EngineError::NoStreamForSubject { subject } => write!(
                 f,
                 "no stream is bound for subject {subject:?} (bind a subject pattern to a stream first)"
@@ -2930,25 +2945,33 @@ impl WorkGroup {
 /// compiles to. The registry (`entries`) is the source of truth a rebuild reads; the `snapshot` is the
 /// immutable, generation-stamped trie a publish resolves against wait-free.
 ///
-/// # Bind = rebuild + swap (invalidates every connection's resolve cache)
+/// # Bind = stage + durable checkpoint + swap (invalidates every connection's resolve cache)
 ///
-/// A [`BindingTable::bind`] appends a `pattern -> stream` entry, rebuilds a fresh immutable trie from
-/// the whole registry, and [`SublistSnapshot::store`]s it — which bumps the snapshot's monotonic
-/// generation. Each connection's [`ResolveCache`](ironbus_core::resolve_cache::ResolveCache) compares
-/// that generation on its next resolve and drops its stale cached answer (one O(1) compare, no global
-/// flush — the beat over NATS's per-change global Sublist-cache flush). The rebuild is the rare,
-/// amortized cost a bind pays; every resolve against the installed trie is wait-free.
+/// A bind [`stage`](BindingTable::stage)s a `pattern -> stream` entry (tentative registry insert +
+/// a fresh immutable trie rebuilt from the whole registry), the engine then fsyncs the FULL table to
+/// the durable `bindings.ckpt` (#1106), and only after the snapshot is durable does
+/// [`commit`](BindingTable::commit) [`SublistSnapshot::store`] the trie — which bumps the snapshot's
+/// monotonic generation. Each connection's
+/// [`ResolveCache`](ironbus_core::resolve_cache::ResolveCache) compares that generation on its next
+/// resolve and drops its stale cached answer (one O(1) compare, no global flush — the beat over
+/// NATS's per-change global Sublist-cache flush). The rebuild is the rare, amortized cost a bind
+/// pays; every resolve against the installed trie is wait-free.
 ///
 /// # Fail-closed at ingest
 ///
-/// `bind` validates the pattern through the #567 grammar BEFORE registering it, and the trie rebuild is
-/// itself fail-closed on the fork bound (#568): a binding SET whose worst-case wildcard fork frontier
-/// would exceed the cap is REFUSED and the PREVIOUS table is left installed unchanged, so a bad bind
-/// never corrupts routing and never silently truncates a match.
+/// A bind validates the pattern through the #567 grammar BEFORE registering it, and the trie rebuild
+/// is itself fail-closed on the fork bound (#568): a binding SET whose worst-case wildcard fork
+/// frontier would exceed the cap is REFUSED and the PREVIOUS table is left installed unchanged, so a
+/// bad bind never corrupts routing and never silently truncates a match. The durable snapshot rides
+/// the same discipline: a table whose snapshot would exceed the checkpoint slot
+/// ([`BINDINGS_PAYLOAD`]) or whose checkpoint write fails is [`unstage`](BindingTable::unstage)d,
+/// so the installed trie, the registry, and the durable snapshot can never diverge.
 struct BindingTable {
     /// The authoritative `(pattern, stream)` registry, the source of truth a rebuild reads. An owned
     /// pattern string + its target stream; the same pattern may appear for two DISTINCT streams (which
-    /// makes any subject they both cover ambiguous under single-home). In-memory only this phase.
+    /// makes any subject they both cover ambiguous under single-home). DURABLE since #1106: the full
+    /// registry is snapshotted to `bindings.ckpt` (fsynced) before every bind acks, and recovered at
+    /// [`Engine::open`], so subject routing survives a restart without any client re-binding.
     entries: Vec<(String, StreamId)>,
     /// The compiled, wait-free routing trie: a publish resolves a literal subject against this
     /// snapshot (directly or through a per-connection resolve cache) with no lock and no walk on a
@@ -2979,17 +3002,43 @@ impl BindingTable {
         b.build(0)
     }
 
-    /// Registers `pattern -> stream` and atomically swaps in the rebuilt trie, returning the new
-    /// generation. Validates the pattern through the #567 grammar first (fail-closed). If the rebuilt
-    /// SET would exceed the #568 fork bound, the registry is rolled back and the PREVIOUS trie stays
-    /// installed (a bad bind never corrupts routing). Idempotent: re-binding the SAME `(pattern, stream)`
-    /// pair is a no-op success (it does not duplicate the entry), so a client may re-declare its bindings
-    /// safely.
+    /// Rebuilds a table from the durable snapshot's decoded `entries` at [`Engine::open`] (#1106),
+    /// building + installing the trie ONCE for the whole recovered registry (the generation restarts
+    /// at 1; per-connection resolve caches are per-process, so they rebuild naturally). Every stored
+    /// pattern re-validates through the #567 grammar inside `build`, and the #568 fork bound is
+    /// re-enforced — a persisted set only ever passed BOTH at bind time, so an error here means the
+    /// snapshot did not come from a healthy broker and the caller fails the open closed.
+    ///
+    /// # Errors
+    /// [`SublistError::InvalidPattern`] / [`SublistError::ForkLimitExceeded`] as for a live bind.
+    fn from_entries(entries: Vec<(String, StreamId)>) -> Result<BindingTable, SublistError> {
+        let table = BindingTable {
+            entries,
+            snapshot: SublistSnapshot::empty(),
+        };
+        let trie = table.build()?;
+        table.snapshot.store(trie);
+        Ok(table)
+    }
+
+    /// STAGES `pattern -> stream` (#1106): validates the pattern, dup-checks, tentatively registers
+    /// the entry, and rebuilds the trie WITHOUT installing it. `Ok(None)` is the idempotent no-op —
+    /// the identical pair is already bound (and already in the durable snapshot), so there is nothing
+    /// to persist and nothing to swap. `Ok(Some(trie))` means the entry is now in the registry and
+    /// `trie` is the rebuilt table, NOT yet visible to any resolve: the caller MUST either
+    /// [`commit`](Self::commit) it (after the durable checkpoint write succeeds) or
+    /// [`unstage`](Self::unstage) it (on any persistence failure), so the installed trie, the
+    /// registry, and the durable snapshot can never diverge. On a fork-bound rejection the registry
+    /// is rolled back HERE and the previous trie stays installed (a bad bind never corrupts routing).
     ///
     /// # Errors
     /// [`SublistError::InvalidPattern`] for a malformed pattern, or [`SublistError::ForkLimitExceeded`]
     /// if the resulting binding set would exceed the fork bound.
-    fn bind(&mut self, pattern: &str, stream: StreamId) -> Result<u64, SublistError> {
+    fn stage(
+        &mut self,
+        pattern: &str,
+        stream: StreamId,
+    ) -> Result<Option<Sublist<StreamId>>, SublistError> {
         // Validate the pattern at the boundary (fail-closed) before it can enter the registry.
         SubjectPattern::parse(pattern).map_err(SublistError::InvalidPattern)?;
         // Idempotent: an identical (pattern, stream) pair is already bound -> no rebuild, no duplicate.
@@ -2998,13 +3047,13 @@ impl BindingTable {
             .iter()
             .any(|(p, s)| p == pattern && *s == stream)
         {
-            return Ok(self.snapshot.generation());
+            return Ok(None);
         }
         // Tentatively register, then rebuild. On a fork-bound rejection, ROLL BACK the registry so the
         // installed trie and the registry stay consistent (the previous table remains the truth).
         self.entries.push((pattern.to_owned(), stream));
         match self.build() {
-            Ok(trie) => Ok(self.snapshot.store(trie)),
+            Ok(trie) => Ok(Some(trie)),
             Err(e) => {
                 self.entries.pop();
                 Err(e)
@@ -3012,10 +3061,117 @@ impl BindingTable {
         }
     }
 
+    /// Rolls back the entry a [`stage`](Self::stage) tentatively registered because its durable
+    /// persistence failed (#1106): the registry reverts to exactly the installed (and durable) table,
+    /// so a failed bind leaves NO trace — not in memory, not on disk — and the previous trie stays
+    /// the truth every resolve sees.
+    fn unstage(&mut self) {
+        self.entries.pop();
+    }
+
+    /// Atomically swaps the staged `trie` in, returning the new generation (#1106). Called ONLY after
+    /// the staged table's snapshot is durably on disk (fsynced), so the ack a client receives — and
+    /// every resolve against the new trie — can never name a binding a restart would forget. The
+    /// generation bump is what invalidates every connection's resolve cache (#569).
+    fn commit(&mut self, trie: Sublist<StreamId>) -> u64 {
+        self.snapshot.store(trie)
+    }
+
+    /// Encodes the FULL registry as the durable snapshot payload (#1106): the version byte, a `u32`
+    /// entry count, then per entry a `u32`-length-prefixed pattern and a `u32`-length-prefixed stream
+    /// name (`""` = the default stream). `u32` prefixes deliberately over-provision so NO length can
+    /// ever truncate silently; the total size is bounded by the [`BINDINGS_PAYLOAD`] cap check the
+    /// engine performs BEFORE writing (a snapshot over the cap is a typed fail-closed reject, so the
+    /// count below always fits `u32` by construction).
+    fn snapshot_payload(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            1 + 4
+                + self
+                    .entries
+                    .iter()
+                    .map(|(p, s)| 8 + p.len() + s.name().len())
+                    .sum::<usize>(),
+        );
+        out.push(BINDINGS_SNAPSHOT_VERSION);
+        // The cap check bounds a WRITTEN snapshot to ~12k entries; `u32::MAX` is unreachable for any
+        // table that can exist in memory, so the saturation below is a formality, never a truncation
+        // that could be persisted (an over-cap payload is rejected before the write).
+        let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for (pattern, stream) in &self.entries {
+            let plen = u32::try_from(pattern.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&plen.to_le_bytes());
+            out.extend_from_slice(pattern.as_bytes());
+            let slen = u32::try_from(stream.name().len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&slen.to_le_bytes());
+            out.extend_from_slice(stream.name().as_bytes());
+        }
+        out
+    }
+
     /// The number of registered bindings (for tests/metrics).
     fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Splits a `u32`-length-prefixed field off `bytes` (#1106): the field bytes plus the remainder, or
+/// `None` if the prefix or the field itself runs past the end (a truncated or corrupt snapshot —
+/// the caller fails closed). Bounds-checked; never panics, never over-reads.
+fn take_len_prefixed(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let (len_bytes, rest) = bytes.split_at(4);
+    let len = usize::try_from(u32::from_le_bytes(len_bytes.try_into().ok()?)).ok()?;
+    if rest.len() < len {
+        return None;
+    }
+    Some(rest.split_at(len))
+}
+
+/// Decodes a durable binding-table snapshot (#1106) back into its `(pattern, stream)` entries, or
+/// `None` for ANY malformation: an unknown version byte (a future layout this broker must not
+/// mis-decode), a truncated field, non-UTF-8 bytes, an invalid stream name, or trailing garbage.
+/// The binding table is LOAD-BEARING routing state — an acked bind silently dropped would re-open
+/// the exact NoStream-after-restart gap #1106 closes — so the caller ([`Engine::open`]) FAILS THE
+/// OPEN CLOSED on `None` rather than starting with a silently emptied routing table. (A TORN slot
+/// never reaches here: the dual-slot CRC discipline already discarded it, falling back to the prior
+/// durable snapshot — and a torn slot can only be a write that never acked.) Pattern grammar and the
+/// fork bound are re-validated by the subsequent [`BindingTable::from_entries`] rebuild.
+fn decode_bindings_snapshot(bytes: &[u8]) -> Option<Vec<(String, StreamId)>> {
+    let (&version, after_version) = bytes.split_first()?;
+    if version != BINDINGS_SNAPSHOT_VERSION {
+        return None;
+    }
+    if after_version.len() < 4 {
+        return None;
+    }
+    let (count_bytes, mut rest) = after_version.split_at(4);
+    let count = u32::from_le_bytes(count_bytes.try_into().ok()?);
+    // Grow by parsing, never by pre-reserving the claimed count: a corrupt-but-CRC-valid count can
+    // claim billions, but every real entry consumes at least 8 bytes of the (slot-capped) payload,
+    // so the allocation stays bounded by the bytes that actually exist.
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let (pattern_bytes, r) = take_len_prefixed(rest)?;
+        let (stream_bytes, r) = take_len_prefixed(r)?;
+        rest = r;
+        let pattern = core::str::from_utf8(pattern_bytes).ok()?.to_owned();
+        let stream = core::str::from_utf8(stream_bytes).ok()?;
+        // `""` is the default stream (bindable, #585); a named stream re-validates its name rule so a
+        // corrupt name can never reach the filesystem layer.
+        let id = if stream.is_empty() {
+            StreamId::default_stream()
+        } else {
+            StreamId::named(stream).ok()?
+        };
+        entries.push((pattern, id));
+    }
+    if !rest.is_empty() {
+        return None; // trailing garbage: not a snapshot this broker wrote — fail closed
+    }
+    Some(entries)
 }
 
 /// Whether every literal subject matched by `filter` is ALSO matched by `binding` (#594-B): the
@@ -3412,6 +3568,19 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// that fit), so it never grows unbounded. `None` until the first sequenced produce, so a broker
     /// no producer sequences against never creates the file (the disk image is unchanged).
     producer_seq_checkpoint: Option<ProducerSeqCheckpoint<F::File>>,
+    /// The durable subject->stream BINDING TABLE checkpoint (#1106): a CRC'd dual-slot
+    /// `bindings.ckpt` at the data-dir ROOT (broker-global routing state, so the SAME artifact in
+    /// both storage modes) holding the FULL `(pattern -> stream)` registry. UNLIKE the cadence-driven
+    /// checkpoints it is rewritten + fsynced ON EVERY BINDING MUTATION, BEFORE the `BindSubject`
+    /// ack and BEFORE the rebuilt trie is swapped in — bindings mutate rarely (admin-scoped, no
+    /// unbind verb yet), so the full-table write costs nothing at bind frequency and buys the
+    /// ack-implies-durable guarantee: a client whose bind was acked finds the binding routing after
+    /// any restart. On [`Engine::open`] the snapshot rebuilds [`Self::bindings`]; it is LOAD-BEARING
+    /// (a CRC-valid-but-undecodable snapshot fails the open closed, see `open`), while a TORN slot —
+    /// only ever a write that never acked — falls back to the prior durable table via the dual-slot
+    /// discipline. `None` until the first bind, so a broker that never binds a subject never creates
+    /// the file (the disk image is unchanged).
+    bindings_checkpoint: Option<BindingsCheckpoint<F::File>>,
     /// The DURABILITY LEVEL (#341, #379): the default [`DurabilityLevel::Sync`] acks only after the
     /// covering fsync (I2 holds, zero acked loss). The relaxed levels ack before the covering fsync
     /// for a documented loss window. Read on every `commit_batch` to decide whether to issue the
@@ -3507,10 +3676,28 @@ const ATTEMPTS_CHECKPOINT: &str = "attempts.ckpt";
 /// creates it, so the disk image of a non-idempotent workload is unchanged.
 const PRODUCER_SEQ_CHECKPOINT: &str = "producer-seq.ckpt";
 
+/// The file name of the durable subject->stream BINDING TABLE checkpoint (#1106). It never collides
+/// with the other root checkpoints (`bindings.` vs `cursor.`/`counters.`/`attempts.`/
+/// `producer-seq.`). Like the producer-seq checkpoint it is opened LAZILY: a broker that never binds
+/// a subject never creates it, so the disk image of a deployment that never uses subject routing is
+/// byte-for-byte unchanged. It lives at the data-dir ROOT in BOTH storage modes (per-stream and
+/// shared-WAL): the binding table is broker-global routing state, not per-stream state.
+const BINDINGS_CHECKPOINT: &str = "bindings.ckpt";
+
+/// The version byte that leads every durable binding-table snapshot (#1106), so a future layout can
+/// be told apart fail-closed: a v1 broker REFUSES to open a snapshot with an unknown version rather
+/// than mis-decoding it (the binding table is load-bearing routing state).
+const BINDINGS_SNAPSHOT_VERSION: u8 = 1;
+
 /// The result of opening the durable idempotent-producer SEQUENCE checkpoint (V2-M8): the dual-slot
 /// handle (only `Some` if the file already existed at open) plus the recovered snapshot bytes (decoded
 /// and clamped by the caller), or `None` if the file was absent or its slots were torn.
 type RecoveredProducerSeq<File> = (Option<ProducerSeqCheckpoint<File>>, Option<Vec<u8>>);
+
+/// The result of opening the durable subject->stream BINDING TABLE checkpoint (#1106): the dual-slot
+/// handle (only `Some` if the file already existed at open — it is created lazily on the first bind)
+/// plus the recovered snapshot bytes, or `None` if the file was absent or both slots were torn.
+type RecoveredBindings<File> = (Option<BindingsCheckpoint<File>>, Option<Vec<u8>>);
 
 /// The result of opening the durable attempt-count checkpoint (#358): the long-lived dual-slot
 /// handle plus the recovered snapshot bytes (decoded and clamped by the caller), or `None` if the
@@ -3932,6 +4119,44 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 .filter(|id| !id.is_default())
                 .collect(),
         };
+        // Recover the durable subject->stream BINDING TABLE (#1106) — deliberately AFTER every
+        // stream substrate above (per-stream logs, shared WAL, partitioned streams) has recovered,
+        // so routing state never precedes the streams it routes to. The snapshot is LOAD-BEARING
+        // routing config: a CRC-valid-but-undecodable payload fails the open CLOSED (mirroring the
+        // shared-WAL reap checkpoint) rather than silently emptying the table — an acked bind
+        // silently dropped would re-open the exact NoStream-after-restart gap #1106 closes. A TORN
+        // slot (only ever a write that never acked) already fell back to the prior durable snapshot
+        // inside the dual-slot open; an absent file recovers the empty table (nothing was ever
+        // bound). Recovery does NOT re-declare the bound streams: a recovered binding whose target
+        // stream no longer exists on disk is KEPT (dangling), matching the live semantics — a
+        // binding is routing config that may outlive its stream, and a later subject publish
+        // re-materializes the target via declare-on-first-produce. Not declaring also keeps a
+        // binding to a PARTITIONED stream (#693/#1119) recovery-clean: no shadow `streams/<hex>/`
+        // subtree is created, and the produce path's partitioned-first routing resolves it exactly
+        // as before the restart.
+        let (bindings_checkpoint, recovered_bindings) = Self::open_bindings_checkpoint(&log)?;
+        let bindings = match recovered_bindings {
+            Some(payload) => {
+                let entries = decode_bindings_snapshot(&payload).ok_or_else(|| {
+                    StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "the subject-binding checkpoint (bindings.ckpt) is undecodable; refusing \
+                         to open rather than silently drop acked subject bindings (fail-closed)",
+                    ))
+                })?;
+                BindingTable::from_entries(entries).map_err(|e| {
+                    StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "the subject-binding checkpoint (bindings.ckpt) holds a table this \
+                             broker cannot rebuild ({e}); refusing to open rather than silently \
+                             drop acked subject bindings (fail-closed)"
+                        ),
+                    ))
+                })?
+            }
+            None => BindingTable::new(),
+        };
         let mut engine = Engine {
             log,
             // The per-named-stream LOG substrate (#676), opened above; recovered named streams (if
@@ -3947,12 +4172,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // consume lazily creates its entry; a deployment that never names a stream keeps this
             // empty, so the default path is byte-for-byte today.
             named_streams,
-            // The subject->stream binding table (#585): EMPTY at open (no subject is bound until a
-            // client `BindSubject`s one). Bindings are in-memory only this phase — a stream's subject
-            // bindings do NOT survive a restart (only its LOG recovers, via the StreamSet); durable
-            // binding persistence is a flagged follow-up. A deployment that never binds keeps this empty,
-            // so the default + explicit-stream-id paths are byte-for-byte unaffected.
-            bindings: BindingTable::new(),
+            // The subject->stream binding table (#585), DURABLE since #1106: recovered above from
+            // `bindings.ckpt` (rebuilt + trie-installed in one pass), so subject routing survives a
+            // restart WITHOUT any client re-binding — a `PubSubject` that resolved before the
+            // restart resolves identically after it. Empty when the file is absent (nothing was ever
+            // bound); a deployment that never binds keeps this empty and never creates the file, so
+            // the default + explicit-stream-id paths are byte-for-byte unaffected.
+            bindings,
             groups,
             group_last_checkpointed,
             lease_config: config.lease,
@@ -4065,6 +4291,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // already existed at open (recovered above), else `None` until the FIRST sequenced produce
             // creates it. A broker no producer sequences against never creates the file.
             producer_seq_checkpoint,
+            // The durable binding-table checkpoint handle (#1106), opened above iff `bindings.ckpt`
+            // already exists; else `None` until the first bind lazily creates it.
+            bindings_checkpoint,
             // The durability level (#341, #379): default `sync` is the historical durable broker
             // (ack only after the covering fsync, I2). The interval window is held in nanoseconds on
             // the monotonic clock seam; the time-window anchor is seeded to the open instant so a
@@ -4457,6 +4686,54 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.producer_seq
                 .restore(&producer_id, epoch, last_seq, last_offset, now);
         }
+    }
+
+    /// Opens the durable subject->stream BINDING TABLE checkpoint (#1106) at [`Engine::open`] and
+    /// recovers the last durable snapshot. Only opened if the file EXISTS (it is created lazily on
+    /// the first bind by [`Engine::ensure_bindings_checkpoint`], so a broker that never binds a
+    /// subject never creates it and its disk image is unchanged). A TORN slot is surfaced as the
+    /// prior durable slot (or `None` if no slot ever completed) by the dual-slot fallback — safe,
+    /// because a torn write is by construction a bind that never acked; the DECODE of the recovered
+    /// bytes is the caller's, which fails the open closed on an undecodable (CRC-valid) payload.
+    ///
+    /// # Errors
+    /// Propagates a genuine IO error from opening or reading the bindings checkpoint file.
+    fn open_bindings_checkpoint(
+        log: &Log<F, C>,
+    ) -> Result<RecoveredBindings<F::File>, EngineError> {
+        let fs = log.filesystem();
+        if !fs.exists(BINDINGS_CHECKPOINT)? {
+            return Ok((None, None));
+        }
+        let file = fs.open(BINDINGS_CHECKPOINT)?;
+        let (checkpoint, recovered) = BindingsCheckpoint::open(file)?;
+        Ok((Some(checkpoint), recovered))
+    }
+
+    /// Opens (creating + directory-fsyncing if absent) the durable binding-table checkpoint (#1106)
+    /// on the FIRST bind, mirroring [`Engine::ensure_producer_seq_checkpoint`]: lazy creation keeps
+    /// the disk image of a deployment that never binds a subject byte-for-byte unchanged. A no-op
+    /// once the handle exists.
+    ///
+    /// # Errors
+    /// Propagates a genuine IO error from creating or opening the checkpoint file.
+    fn ensure_bindings_checkpoint(&mut self) -> Result<(), EngineError> {
+        if self.bindings_checkpoint.is_some() {
+            return Ok(());
+        }
+        let file = {
+            let fs = self.log.filesystem();
+            if fs.exists(BINDINGS_CHECKPOINT)? {
+                fs.open(BINDINGS_CHECKPOINT)?
+            } else {
+                let f = fs.create_new(BINDINGS_CHECKPOINT)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            }
+        };
+        let (checkpoint, _) = BindingsCheckpoint::open(file)?;
+        self.bindings_checkpoint = Some(checkpoint);
+        Ok(())
     }
 
     /// Opens (creating if absent) the durable resilience-counters checkpoint (#98) and recovers the
@@ -8305,18 +8582,25 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     // ===================================================================================
 
     /// BINDS the subject `pattern` to the stream named `stream` (#585): registers `pattern -> stream` in
-    /// the routing trie and atomically swaps the rebuilt, generation-advanced trie in (invalidating every
-    /// connection's resolve cache). The named stream is `declare`d on bind (materializing its independent
+    /// the routing trie, DURABLY persists the full binding table (#1106, fsynced to `bindings.ckpt`
+    /// BEFORE this returns — so before any ack and before the new trie is visible), and atomically
+    /// swaps the rebuilt, generation-advanced trie in (invalidating every connection's resolve
+    /// cache). A client whose bind was acked therefore finds the binding routing after ANY restart —
+    /// no re-bind required. The named stream is `declare`d on bind (materializing its independent
     /// log + recovery) so a subsequent subject-addressed publish has a destination log; the DEFAULT
     /// stream (the EMPTY name) is always present and is `declare`-free. The `pattern` is a #567 PATTERN
     /// (wildcards `*`/`>` allowed). Idempotent: re-binding the same `(pattern, stream)` pair is a no-op
-    /// success. Returns the new routing generation.
+    /// success (no rewrite — the pair is already in the durable snapshot). Returns the new routing
+    /// generation. On ANY persistence failure the staged entry is rolled back and the PREVIOUS table
+    /// stays installed and durable, so an errored bind leaves no trace in memory or on disk.
     ///
     /// # Errors
     /// [`EngineError::InvalidSubject`] for a malformed pattern, [`EngineError::InvalidStreamName`] for a
     /// malformed named stream, [`EngineError::BindRejected`] if the resulting binding SET would exceed
-    /// the trie's #568 fork bound (the previous table stays installed), or [`EngineError::Storage`] from
-    /// declaring the stream's log.
+    /// the trie's #568 fork bound (the previous table stays installed),
+    /// [`EngineError::BindingTableFull`] if the resulting table's durable snapshot would exceed the
+    /// checkpoint slot (#1106, fail-closed — the previous table stays installed), or
+    /// [`EngineError::Storage`] from declaring the stream's log or writing the checkpoint.
     pub fn bind_subject(&mut self, stream: &str, pattern: &str) -> Result<u64, EngineError>
     where
         F: Clone,
@@ -8337,8 +8621,44 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.ensure_named_stream_open(&id)?;
             id
         };
-        // Register + rebuild + swap (advances the generation; rolls back on a fork-bound rejection).
-        Ok(self.bindings.bind(pattern, id)?)
+        // STAGE: validate + dup-check + tentative registry insert + fail-closed trie rebuild. The
+        // rebuilt trie is NOT yet visible; a fork-bound rejection rolled the registry back inside.
+        let Some(trie) = self.bindings.stage(pattern, id)? else {
+            // Idempotent re-bind of an identical pair: already installed AND already durable.
+            return Ok(self.bindings.snapshot.generation());
+        };
+        // PERSIST BEFORE SWAP, SWAP BEFORE ACK (#1106): the full staged table is snapshotted and
+        // fsynced first, so by the time the caller (the session) acks, the binding is durable — and
+        // by the time any resolve can route through the new trie, a restart is guaranteed to recover
+        // it. Any failure here unstages the entry: the installed trie, the registry, and the durable
+        // snapshot never diverge, and the client's error means "nothing changed".
+        let payload = self.bindings.snapshot_payload();
+        if payload.len() > BINDINGS_PAYLOAD {
+            // Fail-closed slot bound (the #863 pattern): the table that WOULD result no longer fits
+            // one durable snapshot slot, so the bind is refused BEFORE anything is written — never a
+            // truncated snapshot, never an unpersistable in-memory table.
+            self.bindings.unstage();
+            return Err(EngineError::BindingTableFull {
+                max_bytes: BINDINGS_PAYLOAD,
+            });
+        }
+        let persisted = self.ensure_bindings_checkpoint().and_then(|()| {
+            match self.bindings_checkpoint.as_mut() {
+                Some(cp) => Ok(cp.write(&payload)?),
+                // Unreachable: `ensure_bindings_checkpoint` just installed the handle; treated as a
+                // storage fault rather than a panic so a bind can never take the broker down.
+                None => Err(EngineError::Storage(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the bindings checkpoint handle vanished after ensure",
+                )))),
+            }
+        });
+        if let Err(e) = persisted {
+            self.bindings.unstage();
+            return Err(e);
+        }
+        // COMMIT: the snapshot is durable; install the trie and advance the generation (#569).
+        Ok(self.bindings.commit(trie))
     }
 
     /// Resolves the literal `subject` to a single bound stream under the FAIL-CLOSED single-home default
@@ -25287,6 +25607,332 @@ mod tests {
         assert_eq!(e2.stream_head(""), Offset::new(1));
         let d = message(e2.poll_in_stream("", DEFAULT_GROUP, 0).unwrap());
         assert_eq!(d.record.payload.as_ref(), b"d0");
+    }
+
+    // ===================================================================================
+    // DURABLE BINDING TABLE (#1106): bindings survive a restart (fsync-before-ack), torn/undecodable
+    // checkpoint postures, the fail-closed slot bound, dangling-stream recovery, and both storage
+    // modes.
+    // ===================================================================================
+
+    #[test]
+    fn a_subject_binding_survives_a_restart_and_routes_without_a_rebind() {
+        // THE #1106 core contract, per-stream mode: a broker restart must NOT empty subject routing.
+        // Bind two patterns (one to a named stream, one to the default), restart, and publish BY
+        // SUBJECT with NO re-bind: both routes resolve exactly as before the restart. Before #1106
+        // the second publish was a NoStreamForSubject reject until every client re-bound.
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.bind_subject("orders", "order.>").unwrap();
+            e.bind_subject("", "metric.>").unwrap();
+            assert_eq!(
+                produce_subject(&mut e, "order.us.created", b"o0").unwrap(),
+                Offset::new(0)
+            );
+        }
+        // Restart over the SAME filesystem: routing recovers WITHOUT any client re-binding.
+        let mut e2 = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e2.binding_count(), 2, "both bindings survived the restart");
+        assert_eq!(
+            e2.resolve_subject("order.us.created").unwrap().name(),
+            "orders"
+        );
+        assert_eq!(
+            produce_subject(&mut e2, "order.eu.created", b"o1").unwrap(),
+            Offset::new(1),
+            "a post-restart PubSubject routes to the recovered stream at the NEXT offset"
+        );
+        assert_eq!(
+            produce_subject(&mut e2, "metric.cpu", b"m0").unwrap(),
+            Offset::new(0),
+            "a binding to the DEFAULT stream also survives"
+        );
+        // The pre- and post-restart records are BOTH in the bound stream, in order.
+        let d0 = message(e2.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d0.record.payload.as_ref(), b"o0");
+        assert_eq!(e2.ack_in_stream("orders", "g", &d0.token), AckResult::Acked);
+        let d1 = message(e2.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d1.record.payload.as_ref(), b"o1");
+        // An idempotent re-declare of a RECOVERED binding is still a no-op (no duplicate, no
+        // generation churn): the recovered table and a re-binding client agree.
+        let g = e2.binding_generation();
+        assert_eq!(e2.bind_subject("orders", "order.>").unwrap(), g);
+        assert_eq!(e2.binding_count(), 2);
+    }
+
+    #[test]
+    fn shared_mode_a_subject_binding_survives_a_restart_and_routes_without_a_rebind() {
+        // The #1106 core contract in SHARED-WAL mode (#597): the binding table is broker-global
+        // state at the data-dir root, so the SAME bindings.ckpt recovers when every named stream's
+        // records live in the one tagged commit log.
+        let fs = InMemoryFs::new();
+        {
+            let mut e =
+                Engine::open(fs.clone(), ManualClock::new(), shared_config(100, 5)).unwrap();
+            e.bind_subject("orders", "order.>").unwrap();
+            produce_subject(&mut e, "order.us.created", b"o0").unwrap();
+        }
+        let mut e2 = Engine::open(fs, ManualClock::new(), shared_config(100, 5)).unwrap();
+        assert_eq!(
+            e2.binding_count(),
+            1,
+            "the binding survived the shared-mode restart"
+        );
+        produce_subject(&mut e2, "order.eu.created", b"o1").unwrap();
+        // Both records demux off the shared WAL under the bound stream, in per-stream order.
+        let d0 = message(e2.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d0.record.payload.as_ref(), b"o0");
+        assert_eq!(e2.ack_in_stream("orders", "g", &d0.token), AckResult::Acked);
+        let d1 = message(e2.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d1.record.payload.as_ref(), b"o1");
+    }
+
+    #[test]
+    fn a_bind_acked_then_power_loss_still_recovers_the_binding() {
+        // FSYNC-BEFORE-ACK (#1106): `bind_subject` returning Ok IS the ack the session relays, and
+        // the checkpoint write (fsync) happens strictly before that return — so a power cut
+        // IMMEDIATELY after the ack must still recover the binding. `simulate_power_loss` reverts
+        // every unsynced byte and directory entry, so this fails if any part of the binding's
+        // durability (file creation, dir fsync, slot write) were deferred past the ack.
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        {
+            let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+            e.bind_subject("orders", "order.>").unwrap(); // acked here
+            probe.simulate_power_loss(); // crash immediately after the ack
+        }
+        let mut e2 = Engine::open(probe, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e2.binding_count(),
+            1,
+            "an acked bind survives a power cut immediately after the ack"
+        );
+        // The recovered binding ROUTES: even if the crash reverted parts of the declared stream's
+        // materialization, the publish re-materializes it (declare-on-first-produce), the documented
+        // dangling-binding semantics.
+        assert_eq!(
+            produce_subject(&mut e2, "order.us.created", b"o0").unwrap(),
+            Offset::new(0)
+        );
+    }
+
+    #[test]
+    fn a_torn_bindings_checkpoint_slot_falls_back_to_the_prior_durable_table() {
+        // The dual-slot posture (#1106): a TORN newest slot (a write that by construction never
+        // acked — the ack only follows a completed fsync) is discarded by its CRC and recovery
+        // regresses to the PRIOR durable table, never to a torn or invented one. Two binds land in
+        // ALTERNATE slots (seq 1 -> slot 1, seq 2 -> slot 0); corrupting the newest (slot 0) must
+        // recover exactly the first table.
+        use ironbus_storage::io::RandomAccessFile;
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.bind_subject("orders", "order.>").unwrap(); // seq 1 -> slot 1
+            e.bind_subject("audit", "audit.>").unwrap(); // seq 2 -> slot 0
+        }
+        // Corrupt a CRC-covered payload byte in slot 0 (the newest write): the slot layout is
+        // [seq: 8][len: 2][payload: BINDINGS_PAYLOAD][crc: 4], so byte 10 is the payload's first.
+        let f = fs.open(BINDINGS_CHECKPOINT).unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact_at(&mut b, 10).unwrap();
+        f.write_all_at(&[b[0] ^ 0xff], 10).unwrap();
+        f.sync_all().unwrap();
+        let mut e2 = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e2.binding_count(),
+            1,
+            "recovery regressed to the prior durable table (one binding), never a torn one"
+        );
+        assert_eq!(
+            e2.resolve_subject("order.us.created").unwrap().name(),
+            "orders"
+        );
+        assert!(
+            matches!(
+                produce_subject(&mut e2, "audit.login", b"x"),
+                Err(EngineError::NoStreamForSubject { .. })
+            ),
+            "the torn (never-acked) second bind is gone, fail-closed"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_bindings_checkpoint_fails_the_open_closed() {
+        // LOAD-BEARING posture (#1106): a CRC-VALID slot whose payload this broker cannot decode
+        // (here: an unknown snapshot version) is NOT a torn write — it is a snapshot from a broker
+        // this build does not understand. Opening with a silently EMPTIED routing table would
+        // re-create the exact acked-bind-vanishes gap #1106 closes, so the open REFUSES instead
+        // (mirroring the shared-WAL reap checkpoint's fail-closed decode).
+        let fs = InMemoryFs::new();
+        {
+            // A first open/close materializes a valid data dir.
+            let _e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        }
+        {
+            // Write a CRC-valid slot with an unknown version byte through the REAL checkpoint codec.
+            let file = fs.create_new(BINDINGS_CHECKPOINT).unwrap();
+            fs.sync_dir().unwrap();
+            let (mut cp, _) = BindingsCheckpoint::open(file).unwrap();
+            cp.write(&[BINDINGS_SNAPSHOT_VERSION + 1, 0, 0, 0, 0])
+                .unwrap();
+        }
+        let err = Engine::open(fs, ManualClock::new(), config(10, 5)).err();
+        assert!(
+            matches!(err, Some(EngineError::Storage(_))),
+            "an undecodable (CRC-valid) bindings snapshot refuses the open, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_recovered_binding_to_a_missing_stream_keeps_routing_and_rematerializes_on_publish() {
+        // THE DANGLING-BINDING DECISION (#1106, documented): recovery does NOT require (or declare)
+        // the bound stream — a binding is routing config that may outlive its stream, exactly as a
+        // live table's binding does. It KEEPS routing after the restart, and the first subject
+        // publish re-materializes the stream via declare-on-first-produce. Craft a durable snapshot
+        // naming a stream that has NO on-disk state at all.
+        let fs = InMemoryFs::new();
+        {
+            let _e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        }
+        {
+            let file = fs.create_new(BINDINGS_CHECKPOINT).unwrap();
+            fs.sync_dir().unwrap();
+            let (mut cp, _) = BindingsCheckpoint::open(file).unwrap();
+            // version 1, count 1, pattern "ghost.>", stream "ghost" (never declared on this disk).
+            let mut payload = vec![BINDINGS_SNAPSHOT_VERSION];
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(&7u32.to_le_bytes());
+            payload.extend_from_slice(b"ghost.>");
+            payload.extend_from_slice(&5u32.to_le_bytes());
+            payload.extend_from_slice(b"ghost");
+            cp.write(&payload).unwrap();
+        }
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.binding_count(),
+            1,
+            "the dangling binding is KEPT, not dropped"
+        );
+        assert_eq!(
+            e.named_stream_count(),
+            0,
+            "recovery does not materialize the missing stream (no declare at open)"
+        );
+        assert_eq!(e.resolve_subject("ghost.us").unwrap().name(), "ghost");
+        // The first publish re-materializes the stream (declare-on-first-produce) and lands.
+        assert_eq!(
+            produce_subject(&mut e, "ghost.us", b"g0").unwrap(),
+            Offset::new(0)
+        );
+        assert_eq!(e.named_stream_count(), 1);
+        let d = message(e.poll_in_stream("ghost", "g", 0).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"g0");
+    }
+
+    #[test]
+    fn a_bind_over_the_snapshot_slot_cap_is_a_typed_fail_closed_reject() {
+        // The durable slot bound (#1106, the #863 pattern): a bind whose RESULTING table's snapshot
+        // would exceed the checkpoint slot is refused with the typed `BindingTableFull` BEFORE
+        // anything is written — the previous table stays installed, durable, and recoverable. Two
+        // ~40 KiB single-token patterns: the first fits the 60 KiB slot, the second would not.
+        let fs = InMemoryFs::new();
+        let big_a = "a".repeat(40 * 1024);
+        let big_b = "b".repeat(40 * 1024);
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.bind_subject("orders", &big_a).unwrap();
+            let g = e.binding_generation();
+            let rejected = e.bind_subject("audit", &big_b);
+            assert!(
+                matches!(
+                    rejected,
+                    Err(EngineError::BindingTableFull { max_bytes }) if max_bytes == BINDINGS_PAYLOAD
+                ),
+                "over-cap bind is the typed fail-closed reject, got: {rejected:?}"
+            );
+            assert_eq!(e.binding_count(), 1, "the staged entry was rolled back");
+            assert_eq!(
+                e.binding_generation(),
+                g,
+                "a rejected bind never advances the generation (no cache invalidation churn)"
+            );
+        }
+        // The PREVIOUS table is what a restart recovers: exactly the one accepted binding.
+        let e2 = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e2.binding_count(), 1);
+        assert_eq!(e2.resolve_subject(&big_a).unwrap().name(), "orders");
+    }
+
+    #[test]
+    fn a_binding_to_a_partitioned_stream_survives_restart_and_routes_by_key_post_restart() {
+        // The #1119 partition-namespace interaction: a binding to a PARTITIONED stream (#693) must
+        // keep routing after a restart. The produce path routes partitioned-FIRST, so the recovered
+        // binding's resolve lands each keyed record in its stable `xxh3_64(key) % P` home partition —
+        // and recovery itself declares nothing (no shadow subtree is ADDED by binding recovery).
+        let fs = InMemoryFs::new();
+        let pc = PartitionCount::new(4).unwrap();
+        let k2 = key_for_partition(2, pc);
+        let subject_pub = |e: &mut Engine<InMemoryFs, ManualClock>, key: &[u8], payload: &[u8]| {
+            e.produce_by_subject(
+                "order.us.created",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key,
+                    headers: b"",
+                    payload,
+                },
+            )
+            .unwrap();
+        };
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+            assert!(e.declare_partitioned_stream("orders", 4).unwrap());
+            e.bind_subject("orders", "order.>").unwrap();
+            subject_pub(&mut e, &k2, b"pre-restart");
+        }
+        let mut e2 = Engine::open(fs, ManualClock::new(), config(64, 5)).unwrap();
+        assert_eq!(
+            e2.binding_count(),
+            1,
+            "the partitioned-stream binding survived"
+        );
+        assert_eq!(
+            e2.resolve_subject("order.us.created").unwrap().name(),
+            "orders"
+        );
+        // A post-restart subject publish still routes BY KEY into the partitioned stream.
+        subject_pub(&mut e2, &k2, b"post-restart");
+        assert_eq!(
+            drain_partition(&mut e2, "orders", 2, "w"),
+            vec![b"pre-restart".to_vec(), b"post-restart".to_vec()],
+            "both records live in the key's stable home partition, in order, across the restart"
+        );
+    }
+
+    #[test]
+    fn a_broker_that_never_binds_never_creates_the_bindings_checkpoint() {
+        // LAZY CREATION (#1106): the artifact appears only on the first bind, so a deployment that
+        // never uses subject routing keeps a byte-for-byte unchanged disk image (the conformance
+        // byte-identity posture every optional subsystem follows: dlq/, txn/, producer-seq.ckpt).
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            produce(&mut e, b"no-subjects-here");
+        }
+        assert!(
+            !fs.exists(BINDINGS_CHECKPOINT).unwrap(),
+            "no bind, no bindings.ckpt"
+        );
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            e.bind_subject("orders", "order.>").unwrap();
+        }
+        assert!(
+            fs.exists(BINDINGS_CHECKPOINT).unwrap(),
+            "the first bind creates the checkpoint"
+        );
     }
 
     // ===================================================================================

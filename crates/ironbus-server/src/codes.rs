@@ -134,6 +134,11 @@ impl ErrorCode {
     /// fork bound (#585/#568). Maps [`EngineError::BindRejected`].
     pub const ERR_BIND_REJECTED: ErrorCode = ErrorCode("ERR_BIND_REJECTED");
 
+    /// A `BindSubject` was refused because the resulting binding table's durable snapshot would
+    /// exceed its checkpoint slot (#1106) — the fail-closed durable-size twin of the fork bound; the
+    /// previous table stays installed and durable. Maps [`EngineError::BindingTableFull`].
+    pub const ERR_BINDING_TABLE_FULL: ErrorCode = ErrorCode("ERR_BINDING_TABLE_FULL");
+
     /// A subject-addressed publish resolved to NO bound stream — the fail-closed reject, NOT a silent
     /// drop (#585). Maps [`EngineError::NoStreamForSubject`].
     pub const ERR_NO_STREAM_FOR_SUBJECT: ErrorCode = ErrorCode("ERR_NO_STREAM_FOR_SUBJECT");
@@ -213,6 +218,7 @@ impl ErrorCode {
             EngineError::UnknownStream { .. } => Self::ERR_UNKNOWN_STREAM,
             EngineError::InvalidSubject(_) => Self::ERR_INVALID_SUBJECT,
             EngineError::BindRejected(_) => Self::ERR_BIND_REJECTED,
+            EngineError::BindingTableFull { .. } => Self::ERR_BINDING_TABLE_FULL,
             EngineError::NoStreamForSubject { .. } => Self::ERR_NO_STREAM_FOR_SUBJECT,
             EngineError::AmbiguousSubject { .. } => Self::ERR_AMBIGUOUS_SUBJECT,
             EngineError::GenerationExhausted => Self::ERR_GENERATION_EXHAUSTED,
@@ -270,6 +276,7 @@ mod tests {
             ErrorCode::ERR_MIRROR_READ_ONLY,
             ErrorCode::ERR_INVALID_SUBJECT,
             ErrorCode::ERR_BIND_REJECTED,
+            ErrorCode::ERR_BINDING_TABLE_FULL,
             ErrorCode::ERR_NO_STREAM_FOR_SUBJECT,
             ErrorCode::ERR_AMBIGUOUS_SUBJECT,
             ErrorCode::ERR_GENERATION_EXHAUSTED,
@@ -388,6 +395,12 @@ mod tests {
                     limit: 1024,
                 }),
                 ErrorCode::ERR_BIND_REJECTED,
+            ),
+            (
+                EngineError::BindingTableFull {
+                    max_bytes: 60 * 1024,
+                },
+                ErrorCode::ERR_BINDING_TABLE_FULL,
             ),
             (
                 EngineError::NoStreamForSubject {
