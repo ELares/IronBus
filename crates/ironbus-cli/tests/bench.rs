@@ -484,6 +484,176 @@ fn a_zero_duration_is_rejected() {
 }
 
 #[test]
+fn multi_subject_publish_distributes_across_live_bound_subjects() {
+    // #1126 HARNESS SELF-TEST (publish side): a `--subjects 3` publish against the isolated (but
+    // REAL, wire-served) broker live-binds bench.s0..bench.s2 (`BindSubject`), distributes the 60
+    // records round-robin via `PubSubject`, and reports the per-subject tallies plus the
+    // aggregate. The path is the plain awaited subject publish, so the ack RTT percentiles (which
+    // now INCLUDE the routing-trie resolve, the #606 measurement) and the disk fsync cost are
+    // honestly claimed.
+    let tmp = PrivateTmp::new();
+    let out = run_bench_in(
+        &tmp,
+        &[
+            "--count",
+            "60",
+            "--mode",
+            "publish",
+            "--subjects",
+            "3",
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bench --subjects should exit 0; stderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(stdout.contains("\"subjects\":3"), "json: {stdout}");
+    assert!(stdout.contains("\"produced\":60"), "json: {stdout}");
+    // The round-robin split is exact: 60 records across 3 subjects, in slot order.
+    assert!(
+        stdout.contains(
+            "\"per_subject\":[{\"subject\":\"bench.s0\",\"produced\":20},\
+             {\"subject\":\"bench.s1\",\"produced\":20},\
+             {\"subject\":\"bench.s2\",\"produced\":20}]"
+        ),
+        "json: {stdout}"
+    );
+    // Awaited per-record path: the ack percentiles are measured, and on disk so is the fsync cost.
+    assert!(
+        json_number(&stdout, "ack_p50_us").is_some(),
+        "subject publish awaits every record, so ack RTTs are honest: {stdout}"
+    );
+    assert!(stdout.contains("\"fsync_measured\":true"), "json: {stdout}");
+    assert_eq!(tmp.count_bench_dirs(), 0, "synthetic dir cleaned up");
+}
+
+#[test]
+fn filtered_consume_delivers_only_the_matching_subset_with_gap_markers() {
+    // #1126 HARNESS SELF-TEST (the #594 filtered-consume side): preload an INTERLEAVED 3-subject
+    // stream (round-robin bench.s0/s1/s2, offsets 0..60), then drain it through a FILTERED
+    // subscription (`--filter bench.s1`: SubSubject filter_mode=1 + the capability bit). The drain
+    // must deliver ONLY the 20 matching records, and the 40 non-matching offsets must arrive as
+    // coalesced FILTERED gap markers — the wire-visible skip accounting the #606
+    // filtered-vs-unfiltered ratio is computed from. This FAILS if the filter silently delivers
+    // everything (recorded would be 60) or the markers are not surfaced/counted.
+    let tmp = PrivateTmp::new();
+    let out = run_bench_in(
+        &tmp,
+        &[
+            "--count",
+            "60",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.s1",
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "filtered bench should exit 0; stderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(stdout.contains("\"filter\":\"bench.s1\""), "json: {stdout}");
+    // Exactly the matching third is delivered.
+    let recorded = json_number(&stdout, "recorded").expect("recorded present");
+    assert!(
+        (recorded - 20.0).abs() < f64::EPSILON,
+        "the filtered drain must record EXACTLY the 20 bench.s1 records, got {recorded}: {stdout}"
+    );
+    // The 40 skipped offsets arrive as coalesced FILTERED markers: one per skipped run (the
+    // leading run before the first match, one between each pair of matches, and possibly a
+    // trailing run after the last match, depending on when the head is reached).
+    let markers = json_number(&stdout, "gap_markers").expect("gap_markers present");
+    assert!(
+        (19.0..=21.0).contains(&markers),
+        "expected one coalesced marker per skipped run (~20), got {markers}: {stdout}"
+    );
+    let skipped = json_number(&stdout, "gap_offsets_skipped").expect("gap_offsets_skipped");
+    assert!(
+        (39.0..=40.0).contains(&skipped),
+        "the markers must account the ~40 non-matching offsets, got {skipped}: {stdout}"
+    );
+    assert_eq!(tmp.count_bench_dirs(), 0, "synthetic dir cleaned up");
+}
+
+#[test]
+fn unfiltered_consume_on_the_same_multi_subject_stream_gets_everything() {
+    // The #1126 control leg: the SAME interleaved 3-subject preload drained UNFILTERED delivers
+    // every record (recorded == 60) and reports NO filter accounting (null fields) — the
+    // denominator of the #606 filtered-vs-unfiltered ratio, over the same wire and data shape.
+    let tmp = PrivateTmp::new();
+    let out = run_bench_in(
+        &tmp,
+        &[
+            "--count",
+            "60",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "unfiltered multi-subject bench should exit 0; stderr: {stderr}\nstdout: {stdout}"
+    );
+    let recorded = json_number(&stdout, "recorded").expect("recorded present");
+    assert!(
+        (recorded - 60.0).abs() < f64::EPSILON,
+        "the unfiltered drain must record ALL 60 records, got {recorded}: {stdout}"
+    );
+    assert!(stdout.contains("\"filter\":null"), "json: {stdout}");
+    assert!(stdout.contains("\"gap_markers\":null"), "json: {stdout}");
+    assert_eq!(tmp.count_bench_dirs(), 0, "synthetic dir cleaned up");
+}
+
+#[test]
+fn subject_and_filter_guards_hold_at_the_binary() {
+    // The #1126 parse guards, proven at the real binary (exit 1, never a spawned broker): a
+    // filter without the multi-subject preload, and --subjects with a pipelined publish shape.
+    let out = run_bench(&[
+        "--count",
+        "10",
+        "--mode",
+        "subscribe",
+        "--filter",
+        "bench.s1",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--filter without --subjects must be exit 1 (usage)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--subjects"), "stderr: {stderr}");
+    let out = run_bench(&[
+        "--count",
+        "10",
+        "--mode",
+        "publish",
+        "--subjects",
+        "3",
+        "--pubwindow",
+        "2",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--subjects with a pipelined shape must be exit 1 (usage)"
+    );
+}
+
+#[test]
 fn human_output_describes_the_isolated_target() {
     // Without --json the human view names the isolated synthetic broker and the synthetic group.
     let out = run_bench(&["--count", "50"]);

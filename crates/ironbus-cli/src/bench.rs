@@ -331,6 +331,28 @@ pub struct BenchConfig {
     /// durable single-consumer streaming-consume path benched head-to-head with a NATS `JetStream`
     /// pull consumer). SUBSCRIBE-only, exactly like [`Self::consume_ack`].
     pub consume_tier: ConsumeTier,
+    /// MULTI-SUBJECT addressing (#1126, unblocks #606): `Some(n)` binds the `n` synthetic subjects
+    /// `bench.s0`..`bench.s{n-1}` to the DEFAULT stream over the live wire (`BindSubject`) and
+    /// drives the load SUBJECT-ADDRESSED — publish distributes records across the subjects
+    /// round-robin via `PubSubject` (the awaited per-publish path, so every sample is an honest
+    /// produce-to-ack RTT that includes the routing-trie resolve, the #606 flat-per-record-cost
+    /// claim under measurement), and the subscribe preload interleaves the same way so a
+    /// [`Self::filter`] has a multi-subject stream to filter. `None` (the default) is the
+    /// historical subject-less path, byte-for-byte unchanged. Publish/subscribe only, and
+    /// mutually exclusive with the pipelined publish shapes (`--pubwindow > 1`, `--stream`,
+    /// `--autopipe`, `--faf`) and `--producers > 1`: no pipelined `PubSubject` client path exists,
+    /// so accepting those flags would silently change what they mean.
+    pub subjects: Option<u32>,
+    /// SUBJECT-FILTERED consume (#594 over the wire, #1126): `Some(pattern)` establishes the
+    /// SUBSCRIBE drain's subscription FILTERED (`SubSubject` with `filter_mode = 1` plus the
+    /// subject-filter capability bit), so the broker delivers ONLY the records whose subject
+    /// matches the #567 pattern and reports each skipped run as one coalesced
+    /// `GapMarker(reason = FILTERED)` — the direct head-to-head against `JetStream`'s measured
+    /// filtered-consumer re-scan penalty. Requires `--mode subscribe`, [`Self::subjects`] (the
+    /// preload must interleave subjects for the filter to act on), and the Tier-W work queue
+    /// (the filtered path is the work-queue consume path). `None` (the default) drains
+    /// unfiltered, byte-for-byte the historical subscribe.
+    pub filter: Option<String>,
     /// Emit the versioned JSON object instead of (well, in addition to a suppressed) human view.
     pub json: bool,
 }
@@ -414,6 +436,19 @@ pub struct BenchReport {
     /// Whether the fsync cost was measured through the real per-ack durable path. `false` in the
     /// `--no-fsync` dry run, so a consumer never mistakes a dry-run number for an honest one.
     pub fsync_measured: bool,
+    /// Per-subject produced tallies for a `--subjects` publish (#1126): one `(subject, produced)`
+    /// entry per bound subject, in slot order, so a recorded run self-describes how the round-robin
+    /// distributed. Empty for every subject-less run (and for the subscribe modes, whose
+    /// distribution is the preload's, not a measured result).
+    pub per_subject: Vec<(String, u64)>,
+    /// The number of coalesced `GapMarker(reason = FILTERED)` frames the `--filter` drain received
+    /// (#594): each marks ONE skipped run of non-matching offsets, so this counts the filter's
+    /// wire-visible overhead events. `None` for every unfiltered run.
+    pub gap_markers: Option<u64>,
+    /// The total offsets those FILTERED gap markers skipped (the sum of each marker's `to - from`
+    /// span): with the recorded (delivered) count this gives the exact filtered/total split the
+    /// #606 filtered-vs-unfiltered ratio needs. `None` for every unfiltered run.
+    pub gap_offsets_skipped: Option<u64>,
 }
 
 /// Parses the raw `bench` argument list into a validated [`BenchConfig`], or a usage error. This is
@@ -450,6 +485,8 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut io_mode = ironbus_storage::substrate::IoMode::Buffered;
     let mut per_message_ack = false;
     let mut consume_tier = ConsumeTier::Work;
+    let mut subjects: Option<u32> = None;
+    let mut filter: Option<String> = None;
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
@@ -620,6 +657,39 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
                         "`--consume-tier` must be `work` or `streaming`, got `{raw}`"
                     ))
                 })?;
+            }
+            // MULTI-SUBJECT addressing (#1126): bind N synthetic subjects to the default stream
+            // over the live wire and drive the load subject-addressed. 0 is meaningless (nothing
+            // would ever be addressable), so it is a usage error naming the bound.
+            "--subjects" => {
+                let raw = take(args, &mut i, "--subjects")?;
+                let parsed: u32 = raw.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "`--subjects` must be a positive integer, got `{raw}`"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(CliError::Usage(
+                        "`--subjects` must be at least 1 (omit the flag for the subject-less \
+                         default path)"
+                            .into(),
+                    ));
+                }
+                subjects = Some(parsed);
+            }
+            // SUBJECT-FILTERED consume (#594, #1126): the SUBSCRIBE drain subscribes with the
+            // pattern as the work-group's filter (filter_mode = 1). Validated against the REAL
+            // #567 grammar here so a malformed pattern fails fast as a usage error instead of a
+            // mid-run server reject.
+            "--filter" => {
+                let raw = take(args, &mut i, "--filter")?;
+                if let Err(e) = ironbus_core::subject::SubjectPattern::parse(&raw) {
+                    return Err(CliError::Usage(format!(
+                        "`--filter` must be a valid subject pattern (dot-separated tokens; `*` \
+                         matches one token, `>` matches trailing tokens): {e}"
+                    )));
+                }
+                filter = Some(raw);
             }
             "--json" => {
                 json = true;
@@ -840,6 +910,66 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         ));
     }
 
+    // MULTI-SUBJECT guards (#1126). Subject addressing shapes the publish loop and the subscribe
+    // preload; round-trip's fixed producer/consumer pair is a separate path the flag says nothing
+    // about, so it is refused there (a no-op flag is a footgun, the `--per-message-ack` precedent).
+    if subjects.is_some() && mode == Mode::RoundTrip {
+        return Err(CliError::Usage(
+            "`--subjects` drives the subject-addressed publish/preload paths and requires \
+             `--mode publish` or `--mode subscribe`: round-trip is the fixed \
+             one-producer/one-consumer default-stream pair, so the flag would mean nothing there."
+                .into(),
+        ));
+    }
+    // The subject-addressed publish is the PLAIN AWAITED `PubSubject` loop (no pipelined
+    // subject-publish client path exists), so the pipelined publish shapes cannot combine with it:
+    // accepting them would silently change what those flags mean. Each names the clash.
+    if subjects.is_some() && (pub_window > 1 || stream || auto_pipeline || fire_and_forget) {
+        return Err(CliError::Usage(
+            "`--subjects` drives the plain awaited subject-addressed publish (`PubSubject`, one \
+             awaited ack per record — the honest per-record routing-cost measurement); the \
+             pipelined shapes (`--pubwindow > 1`, `--stream`, `--autopipe`, `--fire-and-forget`) \
+             have no subject-addressed client path, so they cannot combine with it. Drop one side."
+                .into(),
+        ));
+    }
+    if subjects.is_some() && producers > 1 {
+        return Err(CliError::Usage(
+            "`--subjects` cannot combine with `--producers > 1` yet: the multi-producer driver \
+             runs the subject-less publish legs. Drop one of the two flags."
+                .into(),
+        ));
+    }
+
+    // SUBJECT-FILTER guards (#1126). The filter shapes ONLY the subscribe drain's subscription
+    // (the #594 filtered work-queue consume path), so every other placement is refused explicitly.
+    if filter.is_some() && mode != Mode::Subscribe {
+        return Err(CliError::Usage(
+            "`--filter` establishes the `--mode subscribe` drain's subscription FILTERED (the \
+             #594 per-subject consume path): publish never consumes and round-trip uses a \
+             separate concurrent consumer, so the flag would mean nothing there. Pass \
+             `--mode subscribe`, or drop `--filter`."
+                .into(),
+        ));
+    }
+    if filter.is_some() && subjects.is_none() {
+        return Err(CliError::Usage(
+            "`--filter` needs `--subjects <n>`: the filtered drain measures delivery against an \
+             INTERLEAVED multi-subject stream, and only a subject-addressed preload gives the \
+             records subjects for the filter to act on (a plain preload's records carry no \
+             subject and would ALL be skipped)."
+                .into(),
+        ));
+    }
+    if filter.is_some() && consume_tier == ConsumeTier::Streaming {
+        return Err(CliError::Usage(
+            "`--filter` drives the Tier-W work-queue filtered consume path (#594) and has no \
+             meaning for `--consume-tier streaming` (the streaming cursor consumes the stream \
+             unfiltered). Drop one of the two flags."
+                .into(),
+        ));
+    }
+
     Ok(BenchConfig {
         mode,
         bound,
@@ -859,8 +989,19 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         io_mode,
         consume_ack,
         consume_tier,
+        subjects,
+        filter,
         json,
     })
+}
+
+/// The synthetic subject the multi-subject modes bind and address for slot `i` (#1126):
+/// `bench.s{i}` under the bench-owned `bench.` prefix, so a live run's bindings are recognizable
+/// as bench-created, exactly as the `ironbus-bench-` group/dir prefix marks the bench namespace.
+/// Shared by the publish loop, the subscribe preload, and the tests, so the name can never drift.
+#[must_use]
+pub fn bench_subject_name(i: u32) -> String {
+    format!("bench.s{i}")
 }
 
 /// Runs a parsed `bench` invocation: executes the load (the platform seam) and renders the report
@@ -911,6 +1052,7 @@ fn execute(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
     fill_payload(&mut probe, cfg.payload_shape, 0, ROUND_TRIP_TOKEN_LEN);
     let _ = nanos_to_us(0);
     let _ = cleanup_failed_error("", "");
+    let _ = bench_subject_name(0);
     Err(CliError::Internal(
         "ironbus bench requires a Unix host in v1: the isolated broker uses the Unix-only on-disk \
          storage path"
@@ -948,6 +1090,7 @@ pub fn write_human<W: Write + ?Sized>(
         }
     )?;
     writeln!(out, "group:          {}", cfg.group)?;
+    write_subject_config_lines(cfg, out)?;
     // The multi-producer fleet (#1040): named only above the single-connection default, so the
     // historical `--producers 1` view is byte-identical.
     if cfg.mode == Mode::Publish && cfg.producers > 1 {
@@ -991,9 +1134,15 @@ pub fn write_human<W: Write + ?Sized>(
         )?;
     }
     writeln!(out, "produced:       {} messages", report.produced)?;
+    // The per-subject round-robin tallies (#1126): one line per bound subject, publish mode only
+    // (the subscribe preload's distribution is setup, not a measured result).
+    for (subject, produced) in &report.per_subject {
+        writeln!(out, "  {subject}:     {produced} messages")?;
+    }
     if cfg.mode.measures_latency() {
         writeln!(out, "recorded:       {} messages", report.recorded)?;
     }
+    write_gap_marker_line(report, out)?;
     writeln!(
         out,
         "throughput:     {:.0} msg/s, {:.2} MB/s",
@@ -1016,6 +1165,49 @@ pub fn write_human<W: Write + ?Sized>(
         write_latency_line(out, "ack max", report.ack_max_us)?;
     }
     write_fsync_cost_line(cfg, report, out)?;
+    Ok(())
+}
+
+/// Writes the `subjects:` and `filter:` config lines (#1126), each named only when its flag is on,
+/// so the historical subject-less human view stays byte-identical. Split from [`write_human`] to
+/// keep that function under the line-count lint the way [`write_fsync_cost_line`] is.
+fn write_subject_config_lines<W: Write + ?Sized>(
+    cfg: &BenchConfig,
+    out: &mut W,
+) -> Result<(), CliError> {
+    // MULTI-SUBJECT addressing (#1126).
+    if let Some(n) = cfg.subjects {
+        writeln!(
+            out,
+            "subjects:       {n} (live-bound {}..{}, distributed round-robin via PubSubject)",
+            bench_subject_name(0),
+            bench_subject_name(n.saturating_sub(1))
+        )?;
+    }
+    // SUBJECT-FILTERED consume (#594, #1126).
+    if let Some(pattern) = &cfg.filter {
+        writeln!(
+            out,
+            "filter:         {pattern} (filtered subscription: only matching records are \
+             delivered; skips arrive as coalesced FILTERED gap markers)"
+        )?;
+    }
+    Ok(())
+}
+
+/// Writes the filtered drain's wire-visible skip accounting (#594, #1126), printed only when the
+/// run was filtered (both tallies present), so the unfiltered view is byte-identical.
+fn write_gap_marker_line<W: Write + ?Sized>(
+    report: &BenchReport,
+    out: &mut W,
+) -> Result<(), CliError> {
+    if let (Some(markers), Some(skipped)) = (report.gap_markers, report.gap_offsets_skipped) {
+        writeln!(
+            out,
+            "gap markers:    {markers} coalesced FILTERED markers ({skipped} offsets skipped \
+             past by the filter)"
+        )?;
+    }
     Ok(())
 }
 
@@ -1129,12 +1321,13 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"producers\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"consume_tier\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"producers\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"consume_tier\":\"{}\",\"subjects\":{},\"filter\":{},\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
          \"ack_p50_us\":{},\"ack_p99_us\":{},\"ack_p999_us\":{},\"ack_max_us\":{},\
-         \"fsync_cost_us\":{},\"fsync_measured\":{}}}}}",
+         \"fsync_cost_us\":{},\"fsync_measured\":{},\
+         \"per_subject\":{},\"gap_markers\":{},\"gap_offsets_skipped\":{}}}}}",
         BENCH_JSON_SCHEMA_VERSION,
         cfg.mode.as_str(),
         cfg.is_isolated(),
@@ -1153,6 +1346,8 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.storage.as_str(),
         cfg.consume_ack.as_str(),
         cfg.consume_tier.as_str(),
+        opt_u32_json(cfg.subjects),
+        opt_string_json(cfg.filter.as_deref()),
         report.produced,
         report.recorded,
         f64_json(report.elapsed_secs),
@@ -1169,8 +1364,50 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         opt_f64_json(report.ack_max_us),
         opt_f64_json(report.fsync_cost_us),
         report.fsync_measured,
+        per_subject_json(&report.per_subject),
+        opt_u64_json(report.gap_markers),
+        opt_u64_json(report.gap_offsets_skipped),
     );
     s
+}
+
+/// Serializes the per-subject produced tallies (#1126) as a JSON array of
+/// `{"subject":...,"produced":...}` objects in slot order, or `null` for a subject-less run (the
+/// additive null-not-omitted shape every optional bench field uses).
+fn per_subject_json(per_subject: &[(String, u64)]) -> String {
+    use std::fmt::Write as _;
+    if per_subject.is_empty() {
+        return "null".to_string();
+    }
+    let mut s = String::from("[");
+    for (i, (subject, produced)) in per_subject.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        // A write into a String is infallible, so the result is intentionally discarded.
+        let _ = write!(
+            s,
+            "{{\"subject\":\"{}\",\"produced\":{produced}}}",
+            escape_json(subject)
+        );
+    }
+    s.push(']');
+    s
+}
+
+/// Serializes an optional `u32` as a JSON number or `null`.
+fn opt_u32_json(v: Option<u32>) -> String {
+    v.map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
+/// Serializes an optional `u64` as a JSON number or `null`.
+fn opt_u64_json(v: Option<u64>) -> String {
+    v.map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
+/// Serializes an optional string as a JSON string literal or `null`.
+fn opt_string_json(v: Option<&str>) -> String {
+    v.map_or_else(|| "null".to_string(), |s| format!("\"{}\"", escape_json(s)))
 }
 
 /// The `bound` sub-object fields (exactly one of duration/count is present, the other null).
@@ -1495,6 +1732,7 @@ mod tests {
             ack_max_us: Some(2100.0),
             fsync_cost_us: Some(900.0),
             fsync_measured: true,
+            ..BenchReport::default()
         };
         let json = bench_json(&cfg, &report);
         // Versioned.
@@ -2307,6 +2545,248 @@ mod tests {
             p[16..],
             GOLDEN_LCG_SEQ7_48,
             "random fill drifted from the twin"
+        );
+    }
+
+    #[test]
+    fn subjects_and_filter_parse_and_default_off() {
+        // #1126: both flags default OFF, so an unflagged run is byte-for-byte the historical
+        // subject-less path.
+        let cfg = parse(&["--count", "10"]).unwrap();
+        assert_eq!(cfg.subjects, None);
+        assert_eq!(cfg.filter, None);
+        // Publish accepts --subjects; subscribe accepts --subjects + --filter.
+        let cfg = parse(&["--count", "10", "--mode", "publish", "--subjects", "4"]).unwrap();
+        assert_eq!(cfg.subjects, Some(4));
+        let cfg = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.s1",
+        ])
+        .unwrap();
+        assert_eq!(cfg.subjects, Some(3));
+        assert_eq!(cfg.filter.as_deref(), Some("bench.s1"));
+        // Wildcard patterns pass the real #567 grammar.
+        let cfg = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.*",
+        ])
+        .unwrap();
+        assert_eq!(cfg.filter.as_deref(), Some("bench.*"));
+    }
+
+    #[test]
+    fn the_bench_subject_names_are_pinned() {
+        // The synthetic subject names are a wire-visible contract (a live run's bindings must be
+        // recognizable as bench-owned, and an operator re-running the #606 scenarios pastes these
+        // into --filter), so the shape is pinned.
+        assert_eq!(bench_subject_name(0), "bench.s0");
+        assert_eq!(bench_subject_name(7), "bench.s7");
+    }
+
+    #[test]
+    fn subjects_guards_refuse_round_trip_pipelined_shapes_and_multi_producer() {
+        // #1126 guards: --subjects is the plain awaited PubSubject path, so every placement it
+        // cannot honestly shape is a usage error naming the clash (a no-op or silently-changed
+        // flag is a footgun, the --per-message-ack precedent). This FAILS if any guard is dropped.
+        let err = parse(&["--count", "10", "--subjects", "3"]).unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "round-trip is refused");
+        for extra in [
+            &["--pubwindow", "2"][..],
+            &["--stream", "--pubwindow", "8"][..],
+            &["--autopipe"][..],
+            &["--faf"][..],
+            &["--producers", "2"][..],
+        ] {
+            let mut args = vec!["--count", "10", "--mode", "publish", "--subjects", "3"];
+            args.extend_from_slice(extra);
+            let err = parse(&args).unwrap_err();
+            assert!(
+                matches!(err, CliError::Usage(_)),
+                "--subjects with {extra:?} must be refused"
+            );
+        }
+        // Zero subjects is meaningless.
+        assert!(parse(&["--count", "10", "--mode", "publish", "--subjects", "0"]).is_err());
+    }
+
+    #[test]
+    fn filter_guards_refuse_wrong_mode_missing_subjects_streaming_tier_and_bad_patterns() {
+        // --filter shapes only the Tier-W subscribe drain against a multi-subject stream; every
+        // other placement is refused explicitly (#1126). This FAILS if any guard is dropped.
+        let err = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "publish",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.s1",
+        ])
+        .unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "publish is refused");
+        let err = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "subscribe",
+            "--filter",
+            "bench.s1",
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--subjects"),
+            "a filter without a multi-subject preload is refused: {err}"
+        );
+        let err = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.s1",
+            "--consume-tier",
+            "streaming",
+        ])
+        .unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "Tier-S is refused");
+        // A malformed pattern fails fast at parse time through the REAL #567 grammar (a partial
+        // wildcard is an illegal-char rejection), never as a mid-run server reject.
+        let err = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.s*x",
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, CliError::Usage(_)),
+            "a malformed pattern is a parse-time usage error"
+        );
+    }
+
+    #[test]
+    fn subject_and_filter_fields_land_in_the_json_and_null_when_off() {
+        // The ADDITIVE #1126 JSON fields: always present, null when the feature is off (the ack-
+        // percentile precedent), so a downstream consumer can gate on them without schema sniffing.
+        let cfg = parse(&["--count", "10", "--mode", "publish"]).unwrap();
+        let json = bench_json(&cfg, &BenchReport::default());
+        for field in [
+            "\"subjects\":null",
+            "\"filter\":null",
+            "\"per_subject\":null",
+            "\"gap_markers\":null",
+            "\"gap_offsets_skipped\":null",
+        ] {
+            assert!(json.contains(field), "missing {field} in json: {json}");
+        }
+        // ON: the config echoes both flags and the results carry the tallies.
+        let cfg = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.s1",
+        ])
+        .unwrap();
+        let report = BenchReport {
+            produced: 9,
+            recorded: 3,
+            elapsed_secs: 1.0,
+            gap_markers: Some(3),
+            gap_offsets_skipped: Some(6),
+            ..BenchReport::default()
+        };
+        let json = bench_json(&cfg, &report);
+        assert!(json.contains("\"subjects\":3"), "json: {json}");
+        assert!(json.contains("\"filter\":\"bench.s1\""), "json: {json}");
+        assert!(json.contains("\"gap_markers\":3"), "json: {json}");
+        assert!(json.contains("\"gap_offsets_skipped\":6"), "json: {json}");
+        // A publish run's per-subject tallies serialize in slot order.
+        let cfg = parse(&["--count", "9", "--mode", "publish", "--subjects", "3"]).unwrap();
+        let report = BenchReport {
+            produced: 9,
+            elapsed_secs: 1.0,
+            per_subject: vec![
+                ("bench.s0".to_string(), 3),
+                ("bench.s1".to_string(), 3),
+                ("bench.s2".to_string(), 3),
+            ],
+            ..BenchReport::default()
+        };
+        let json = bench_json(&cfg, &report);
+        assert!(
+            json.contains(
+                "\"per_subject\":[{\"subject\":\"bench.s0\",\"produced\":3},\
+                 {\"subject\":\"bench.s1\",\"produced\":3},\
+                 {\"subject\":\"bench.s2\",\"produced\":3}]"
+            ),
+            "json: {json}"
+        );
+    }
+
+    #[test]
+    fn human_view_prints_subject_and_filter_lines_only_when_on() {
+        // OFF: the historical human view is byte-identical (no subjects/filter/gap lines at all).
+        let cfg = parse(&["--count", "10", "--mode", "subscribe"]).unwrap();
+        let mut human = Vec::new();
+        write_human(&cfg, &BenchReport::default(), &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(!human.contains("subjects:"), "human: {human}");
+        assert!(!human.contains("filter:"), "human: {human}");
+        assert!(!human.contains("gap markers:"), "human: {human}");
+        // ON: each line names its feature.
+        let cfg = parse(&[
+            "--count",
+            "10",
+            "--mode",
+            "subscribe",
+            "--subjects",
+            "3",
+            "--filter",
+            "bench.s1",
+        ])
+        .unwrap();
+        let report = BenchReport {
+            produced: 9,
+            recorded: 3,
+            elapsed_secs: 1.0,
+            gap_markers: Some(3),
+            gap_offsets_skipped: Some(6),
+            ..BenchReport::default()
+        };
+        let mut human = Vec::new();
+        write_human(&cfg, &report, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(
+            human.contains("subjects:       3 (live-bound bench.s0..bench.s2"),
+            "human: {human}"
+        );
+        assert!(human.contains("filter:         bench.s1"), "human: {human}");
+        assert!(
+            human.contains("gap markers:    3 coalesced FILTERED markers (6 offsets skipped"),
+            "human: {human}"
         );
     }
 }

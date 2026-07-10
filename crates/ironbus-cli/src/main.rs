@@ -962,6 +962,7 @@ USAGE:
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
                   [--fetch-batch <n>] [--group <name>] [--no-fsync] [--pubwindow <n>] [--stream] [--json]
                   [--producers <n>] [--storage <disk|memory>] [--per-message-ack]
+                  [--subjects <n>] [--filter <pattern>]
                   [--addr <host:port> --i-understand-this-is-live]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
     ironbus rollback --dest <path>
@@ -1243,6 +1244,20 @@ Notes:
     sample is one self-contained awaited produce RTT); the per-op fsync cost is not attributed
     above 1 (concurrent connections share covering group-commit fsyncs). The JSON gains an
     additive producers field.
+    --subjects <n> (#1126, publish/subscribe) drives the load SUBJECT-ADDRESSED: it live-binds
+    the n synthetic subjects bench.s0..bench.s{n-1} to the default stream over the wire
+    (BindSubject) and distributes records across them round-robin via the awaited PubSubject,
+    so every sample is an honest produce-to-ack RTT that includes the routing-trie resolve.
+    Publish reports per-subject tallies plus the aggregate (additive subjects/per_subject JSON
+    fields); subscribe interleaves its preload the same way. Mutually exclusive with the
+    pipelined publish shapes (--pubwindow > 1, --stream, --autopipe, --faf) and --producers > 1
+    (no pipelined subject-publish client path exists).
+    --filter <pattern> (#594, subscribe + --subjects, Tier-W only) establishes the drain's
+    subscription FILTERED (SubSubject filter_mode=1 + the subject-filter capability): the broker
+    delivers ONLY the records whose subject matches the pattern and reports each skipped run as
+    ONE coalesced FILTERED gap marker, which the drain counts (additive filter/gap_markers/
+    gap_offsets_skipped JSON fields) — the filtered-vs-unfiltered delivery ratio measured over
+    the real wire, the head-to-head against JetStream's filtered-consumer re-scan penalty.
     <secs> or --count <n> is REQUIRED (no unbounded default), and --no-fsync is a dry run that
     runs the spawned isolated broker at INTERVAL durability (bounded-loss page-cache acks, the
     honest relaxed tier a real serve --durability-level interval runs, #1027) and batches its
