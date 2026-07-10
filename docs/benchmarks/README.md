@@ -8,6 +8,11 @@ the rig was built for -- the rig (schema + fairness lints + Little's-Law) shippe
 in [`crates/ironbus-bench`](../../crates/ironbus-bench) long before the live peer
 runs existed; this corpus is those runs.
 
+> The 2026-07 single-host head-to-head vs NATS on t4g.large — filtered consumers (~1x vs
+> JetStream's ~7x re-scan penalty), flat subject routing, streaming/durable consume, push
+> delivery — is consolidated in [`docs/BENCHMARKS.md`](../BENCHMARKS.md). The earlier
+> t4g.small round is [`t4g-single-node-vs-nats-2026-06-22.md`](t4g-single-node-vs-nats-2026-06-22.md).
+
 ## The honesty contract
 
 A comparison is honest only if both sides run the **same workload** under the
