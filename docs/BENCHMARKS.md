@@ -167,3 +167,8 @@ publish sweep for the Sublist-degradation row. Full run notes, per-row provenanc
 recorded intermediate numbers are in
 [#606](https://github.com/ELares/IronBus/issues/606) and
 [#1100](https://github.com/ELares/IronBus/issues/1100).
+
+The matched-durability produce + consume legs have a scripted re-run rig,
+[scripts/bench/nats-scoreboard.sh](../scripts/bench/nats-scoreboard.sh) (#646); the scoreboard
+itself, its machine-readable rows, and its CI fairness/drift gate live in
+[PERF_LEDGER.md](PERF_LEDGER.md).

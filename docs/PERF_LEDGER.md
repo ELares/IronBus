@@ -410,3 +410,91 @@ small/moderate prefill. The prefix-bounded caveat the prior ledger carried is RE
 The multi-consumer aggregate criterion (≥1.5x at M≥4) and the Tier-W-batched-≥10x-baseline
 criterion from #554 are separate legs not measured in this single-consumer round; they are the
 natural next consume frontier now that the single-consumer streaming-consume win is unconditional.
+
+---
+
+# Durable produce + consume scoreboard vs NATS JetStream AND Core at matched durability (#646, V2-M12)
+
+First principles, stated before any number: "beats NATS" is only credible at EQUAL durability. A
+leg is scored as a head-to-head win or loss ONLY when both sides give the same guarantee on the
+same box under the same workload; every leg where the guarantees differ is context, carries its
+asymmetry explicitly, and is never paired. The matched-durability legs are the load-bearing
+comparison and a CI gate (below). The produce scoreboard (rounds 1-5 above, the Pi rig) and the
+#554 consume scoreboard pinned single axes; this section is the consolidated durable
+produce + consume matrix from the 2026-07 t4g round
+([#606](https://github.com/ELares/IronBus/issues/606) rounds 1+2,
+[#1100](https://github.com/ELares/IronBus/issues/1100)) — the same measurements published in
+[BENCHMARKS.md](BENCHMARKS.md).
+
+## The rig
+
+AWS t4g.large (2 vCPU Graviton2), Ubuntu 24.04 arm64, single-host loopback, 256 B payloads;
+`ironbus` release 2607.109.15 (round 1) / 2607.110.11 (round 2) vs `nats-server` 2.14.3 driven by
+natscli 0.4.0; one warmed named group per broker, fresh broker per scenario; two runs per round-2
+configuration. Raw artifacts retained privately by the maintainer (not committed). The
+machine-readable form of this scoreboard is
+[benchmarks/durable-scoreboard-rows.jsonl](benchmarks/durable-scoreboard-rows.jsonl). Ranges are
+recorded as measured; where a single number is needed the CONSERVATIVE endpoint is used (IronBus
+low end vs peer high end), so every stated ratio is a floor, not a flatter.
+
+## Matched-durability legs (the load-bearing head-to-head)
+
+| leg | the matched guarantee (both sides) | IronBus | NATS | score |
+| --- | --- | --- | --- | --- |
+| Durable consume | file/disk-backed stream, explicit acks / committed cursor: a crash redelivers only the uncommitted span | **333k msg/s** (disk, streaming consumer) | JetStream 97-98k msg/s (file storage, explicit acks) | **IronBus 3.4x** |
+| Non-durable delivery | live delivery of every message; NATS Core has no persistence, so this is its matching tier | **716-735k msg/s** (memory mode, ACKED, replayable log) | Core 667-681k msg/s (unacked) | **IronBus wins while acking every message** |
+
+The durable consume leg is THE scoreboard row: both sides at the strongest common consume
+guarantee, IronBus leading 3.4x (333k over the 98k conservative endpoint). The non-durable
+delivery leg is matched at NATS Core's own tier, and IronBus still leads while doing strictly
+more work per message (an ack, plus a replayable log).
+
+## Guarantee-asymmetric legs (context: never paired, scored honestly)
+
+The publish-side legs CANNOT be scored head-to-head, and this is exactly what the CI gate refuses
+to pair:
+
+| leg | IronBus | NATS | the asymmetry (why this is NOT a matched pair) |
+| --- | --- | --- | --- |
+| Sync publish (one awaited ack per publish) | 844/s, ack fsync-backed (1.03 ms) | JetStream sync publish 6.3-6.4k/s, ack in 154 us, NOT fsynced | An acked IronBus record has survived a power cut; an acked JetStream record has not necessarily. The ~7.5x NATS rate buys a strictly weaker ack. |
+| Windowed / async durable publish | 54.6k/s (group commit; every ack still fsync-backed) | JetStream async 90-91k/s (acks not fsynced) | NATS wins ~1.7x on the UNMATCHED comparison — recorded as the honest loss it is, with the guarantee gap stated. Held to IronBus's actual guarantee (sync-always), the produce scoreboard above measured JetStream at the fsync floor (~203/s-class on the Pi rig). |
+| Raw ingest | 251-254k/s, every message acked (memory mode) | Core 1.64-1.75M/s fire-and-forget | ~6.7x for NATS at a different guarantee entirely: a fire-and-forget socket write with no ack, no retention, no delivery. |
+
+Round-2 context on the same rig, recorded in the [BENCHMARKS.md](BENCHMARKS.md) tables:
+subject-filtered consume costs IronBus ~1x vs JetStream's measured ~7x re-scan penalty, and
+1 -> 10,000-subject publish costs IronBus -10.9% vs NATS Core's ~35% degradation.
+
+## Caveats (part of the result)
+
+- Single host, loopback: no real network, no cross-AZ, no packet loss.
+- t4g.large is BURSTABLE: read every number as p50/p99-grade and directional at the tails
+  (intermittent ~100 ms host stalls were observed and documented in #1100); a dedicated or metal
+  box is needed for publishable p999 claims.
+- 256 B payloads only; per-byte costs shift the picture at larger sizes (see
+  [benchmarks/README.md](benchmarks/README.md)).
+- The sync-publish rates (844/s vs 6.3-6.4k) are the awaited-publish rates behind the recorded
+  1.03 ms vs 154 us acks (#606 round-1 raw runs); they are round-trip-bound numbers, coherent
+  with those ack latencies (1/1.03 ms is a ~970/s ceiling, 1/154 us a ~6.5k/s ceiling).
+
+## The CI gate (#646)
+
+The gate holds the PRINCIPLE, not a benchmark run: a live NATS-vs-IronBus comparison on a shared
+CI runner is exactly the flaky percent gate the #114 design notes warn trains people to ignore
+gates. Three layers, all deterministic:
+
+1. **Matched-durability fairness + drift gate (per-PR, new with this section):**
+   [benchmarks/durable-scoreboard-rows.jsonl](benchmarks/durable-scoreboard-rows.jsonl) is the
+   machine-readable scoreboard, and `scripts/ci/durable-scoreboard-check.sh` (wired into ci.yml)
+   fails the PR if a head-to-head pair ever carries mismatched durability labels, if an
+   asymmetric row loses its asymmetry note, if the load-bearing durable-consume pair is dropped,
+   or if the numbers here and in the rows drift apart. Offline, history-free, jq-only — the same
+   discipline as the #554 consume-corpus fairness gate and the #359 SLO drift gate.
+2. **Absolute regression protection (existing):** IronBus's own durable produce/consume rates are
+   gated by the #114 rolling-median regression gate against the release-archived baseline, fed by
+   the #111 macro-bench device residual. That is where "our durable legs must not regress"
+   lives; this scoreboard adds the comparative fairness layer on top of it.
+3. **The comparative re-run is MANUAL by design:**
+   [../scripts/bench/nats-scoreboard.sh](../scripts/bench/nats-scoreboard.sh) reproduces every
+   leg above (both brokers, the recorded flags, natscli-0.4.0-verified) on a quiet box. Run it
+   after any change that could move a scoreboard row, then update the rows and this section
+   together — the drift gate makes updating one without the other fail.

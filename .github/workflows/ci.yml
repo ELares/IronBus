@@ -305,6 +305,26 @@ jobs:
       - name: assert the SLO JSON parses, is unratified, and agrees with docs/SLO.md
         run: sh scripts/ci/slo-table-check.sh
 
+  durable-scoreboard-drift:
+    name: durable scoreboard fairness + drift gate (#646)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The #646 matched-durability scoreboard gate: the durable produce+consume scoreboard vs
+      # NATS (the "#646" section of docs/PERF_LEDGER.md) has a machine-readable form
+      # (docs/benchmarks/durable-scoreboard-rows.jsonl). This gate asserts the rows parse, every
+      # head-to-head pair carries IDENTICAL durability labels (an fsync-backed ack can never be
+      # scored against a page-cache ack), every unpaired row carries its guarantee-asymmetry note,
+      # the load-bearing durable-consume pair exists, and the ledger's stated numbers/ratio agree
+      # with the rows. Deterministic, offline, history-free; needs only jq (pre-installed on
+      # ubuntu-latest). The live NATS comparison deliberately does NOT run per-PR (a comparative
+      # benchmark on a shared runner is a flaky percent gate, the #114 failure consideration);
+      # re-runs are manual via scripts/bench/nats-scoreboard.sh on a quiet box, and the drift
+      # checks here force the rows and the ledger prose to move together afterwards.
+      - name: assert the durable scoreboard rows are fairness-linted and agree with PERF_LEDGER.md
+        run: sh scripts/ci/durable-scoreboard-check.sh
+
   cross-build:
     name: musl build (${{ matrix.target }})
     runs-on: ubuntu-latest
