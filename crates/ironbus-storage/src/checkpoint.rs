@@ -83,6 +83,22 @@ pub const METADATA_SNAPSHOT_PAYLOAD: usize = 60 * 1024;
 /// current floor (retention stalls, bounded and documented — never a torn or truncated snapshot).
 pub const SHARED_WAL_REAP_PAYLOAD: usize = 60 * 1024;
 
+/// The per-slot payload cap for the durable subject->stream BINDING TABLE checkpoint (#1106): the
+/// full `(pattern -> stream)` registry, rewritten and fsynced on EVERY binding mutation BEFORE the
+/// `BindSubject` ack, so an acked bind always survives a restart. Bindings mutate rarely (a bind is
+/// an admin-scoped routing declaration, and no unbind verb exists yet, so the table only grows), so
+/// the full-table rewrite costs nothing at bind frequency and buys the simplest possible recovery:
+/// decode one snapshot, rebuild the trie once. Each entry is `2 + pattern + 2 + stream name (<= 64)`
+/// bytes; this 60 KiB cap (under the slot's `u16` length field, like the other large checkpoints)
+/// holds ~800 worst-case short-pattern entries and thousands of typical ones. Unlike the tolerant
+/// cursor checkpoints, this payload is LOAD-BEARING for routing correctness (an acked bind silently
+/// dropped would re-open the exact NoStream-after-restart gap #1106 closes), so a
+/// CRC-valid-but-undecodable snapshot fails the open closed (see `ironbus-server`'s engine open);
+/// the dual-slot discipline still means a TORN (never-acked) write reverts to the prior durable
+/// table. A bind whose resulting snapshot would exceed the cap is REFUSED fail-closed with a typed
+/// error and the previous table stays installed — never a torn or truncated snapshot.
+pub const BINDINGS_PAYLOAD: usize = 60 * 1024;
+
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
 const CRC_LEN: usize = 4;
@@ -186,6 +202,16 @@ pub type MetadataSnapshotCheckpoint<F> = SlotCheckpoint<F, METADATA_SNAPSHOT_PAY
 /// per-stream positions exact across a crash anywhere in a global reap; see
 /// [`crate::shared_wal::SharedWal`].
 pub type SharedWalReapCheckpoint<F> = SlotCheckpoint<F, SHARED_WAL_REAP_PAYLOAD>;
+
+/// The crash-safe checkpoint for the durable subject->stream BINDING TABLE (#1106): a
+/// [`BINDINGS_PAYLOAD`]-per-slot [`SlotCheckpoint`]. It reuses the identical dual-slot CRC
+/// discipline as the other checkpoints — a torn (never-acked) write reverts to the prior durable
+/// table — but, like the shared-WAL reap checkpoint and UNLIKE the tolerant cursor family, its
+/// payload is LOAD-BEARING routing state: the write-then-ack discipline (the snapshot is fsynced
+/// BEFORE the `BindSubject` ack) is what guarantees an acked bind still routes after a restart, so
+/// a CRC-valid-but-undecodable snapshot fails the engine open closed rather than silently emptying
+/// the routing table.
+pub type BindingsCheckpoint<F> = SlotCheckpoint<F, BINDINGS_PAYLOAD>;
 
 impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CAP> {
     /// Bytes per slot for this cap: sequence, payload length, payload, CRC.

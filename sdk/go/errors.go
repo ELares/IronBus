@@ -30,6 +30,7 @@ const (
 	ErrCodeMirrorReadOnly          = "ERR_MIRROR_READ_ONLY"
 	ErrCodeInvalidSubject          = "ERR_INVALID_SUBJECT"
 	ErrCodeBindRejected            = "ERR_BIND_REJECTED"
+	ErrCodeBindingTableFull        = "ERR_BINDING_TABLE_FULL"
 	ErrCodeNoStreamForSubject      = "ERR_NO_STREAM_FOR_SUBJECT"
 	ErrCodeAmbiguousSubject        = "ERR_AMBIGUOUS_SUBJECT"
 	ErrCodeGenerationExhausted     = "ERR_GENERATION_EXHAUSTED"

@@ -422,6 +422,40 @@ before #358 simply has no attempts file, which decodes as "no carried counts" (e
 message resumes at attempt 1, the historical behavior); a torn snapshot degrades the same way
 and never blocks open.
 
+### Binding-table snapshot (the checkpoint payload, #1106)
+
+Source: `crates/ironbus-server/src/engine.rs` (`BindingTable::snapshot_payload` /
+`decode_bindings_snapshot`); slot machinery `crates/ironbus-storage/src/checkpoint.rs`
+(`BindingsCheckpoint`, `BINDINGS_PAYLOAD` = 60 KiB per slot). This is the payload stored in
+`bindings.ckpt` at the DATA-DIR ROOT (broker-global routing state — the same artifact in both the
+per-stream and shared-WAL storage modes): the FULL subject->stream binding registry (#585), so
+subject routing survives a restart without any client re-binding.
+
+| field       | type  | width    | notes |
+|-------------|-------|----------|-------|
+| `version`   | u8    | 1        | binding snapshot version = 1; an UNKNOWN version refuses the open (fail-closed), never a mis-decode |
+| `count`     | u32   | 4        | number of entries that follow |
+| `entries[]` | pairs | variable | `count` entries, each `pattern_len: u32` + pattern bytes (a #567 pattern) + `stream_len: u32` + stream-name bytes (`""` = the default stream) |
+
+Durability discipline (the #1106 contract): the checkpoint is REWRITTEN AND FSYNCED ON EVERY
+BINDING MUTATION, strictly BEFORE the `BindSubject` ack and before the rebuilt routing trie is
+swapped in — so an acked bind is always recoverable, and a torn slot can only ever be a bind that
+never acked (the dual-slot CRC discipline then regresses to the prior durable table). Bindings
+mutate rarely (admin-scoped; no unbind verb exists yet, so the table only grows), which is why the
+full-table rewrite is the right cost model — no cadence, no replay. The file is created LAZILY on
+the first bind, so a broker that never binds a subject has a byte-for-byte unchanged disk image. A
+bind whose RESULTING table would not fit the 60 KiB slot is refused fail-closed with the typed
+`ERR_BINDING_TABLE_FULL` (the previous table stays installed and durable). UNLIKE the tolerant
+cursor family, this payload is LOAD-BEARING routing state: a CRC-VALID slot that fails to decode
+(unknown version, truncated field, invalid pattern or stream name, trailing garbage) REFUSES the
+open (the shared-WAL `reap.ckpt` posture) rather than starting with a silently emptied routing
+table. Recovery rebuilds the trie AFTER every stream substrate has recovered and deliberately
+declares NOTHING: a recovered binding whose target stream has no on-disk state is KEPT (a binding
+is routing config that may outlive its stream), and the first subject publish re-materializes the
+stream via declare-on-first-produce — identical to the live table's semantics. A pre-#1106 broker
+ignores the file entirely (bindings simply start empty, the historical behavior), so the artifact
+is ADDITIVE and downgrade-safe.
+
 ---
 
 ## On-disk DLQ model
@@ -552,7 +586,7 @@ numbers, planes, and purposes:
 | 31  | `SubTo` | client to server | stream-addressed subscribe (stream id + group) (#588) |
 | 32  | `FetchRecords` | peer only | ISR follower fetch request (`from_offset` + caps); encoder/decoder in `ironbus-server` `cluster::replication` |
 | 33  | `FetchResponse` | peer only | the leader's records + high-watermark reply to `FetchRecords` |
-| 34  | `BindSubject` | client to server | bind a `*`/`>` subject pattern to a named stream; `admin`-scoped under auth (#585) |
+| 34  | `BindSubject` | client to server | bind a `*`/`>` subject pattern to a named stream; `admin`-scoped under auth (#585); DURABLE since #1106 — the full binding table is fsynced to `bindings.ckpt` BEFORE the `Ok` ack, so an acked bind survives any restart with no re-bind |
 | 35  | `PubSubject` | client to server | publish by literal subject; fail-closed single-home resolution (#585) |
 | 36  | `SubSubject` | client to server | subscribe by literal subject (#585) |
 | 37  | `AckReplicated` | peer only | quorum-`fdatasync` replication ack (releases the withheld cluster `PubAck`) (#719) |
