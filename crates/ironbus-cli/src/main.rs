@@ -498,7 +498,10 @@ impl StorageModeArg {
         }
     }
 
-    /// The engine-side [`ironbus_storage::shared_wal::StorageMode`] this flag selects.
+    /// The engine-side [`ironbus_storage::shared_wal::StorageMode`] this flag selects. Unix-gated
+    /// like its only caller (`open_engine_with`, the broker's engine-open path): on non-Unix the
+    /// serve path does not build, so this mapping would be dead code there.
+    #[cfg(unix)]
     fn to_engine(self) -> ironbus_storage::shared_wal::StorageMode {
         match self {
             StorageModeArg::PerStream => ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
