@@ -49,7 +49,7 @@ use ironbus_storage::checkpoint::{
 };
 use ironbus_storage::dlq::{DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
-use ironbus_storage::layout::PARTITIONED_STREAMS_SUBDIR;
+use ironbus_storage::layout::{PARTITIONED_STREAMS_SUBDIR, SHARED_WAL_SUBDIR, STREAMS_SUBDIR};
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds, SyncTicket};
 use ironbus_storage::loss::LossReport;
 use ironbus_storage::naming::{
@@ -57,6 +57,7 @@ use ironbus_storage::naming::{
 };
 use ironbus_storage::partitioned::PartitionedStream;
 use ironbus_storage::segment::{OwnedRecord, RawByteRun, StorageError};
+use ironbus_storage::shared_wal::{SharedWal, StorageMode};
 use ironbus_storage::streamset::{CommitOutcome, StreamError, StreamId, StreamSet};
 use ironbus_storage::txn::{TxnStore, TxnStoreError};
 use std::collections::BTreeMap;
@@ -2486,8 +2487,28 @@ fn recover_one_named_stream<F: Filesystem, C: Clock>(
     lease: LeaseConfig,
     opened_at: u64,
 ) -> Result<NamedStream, EngineError> {
-    let flushed = log.flushed_offset().get();
-    let fs = log.filesystem();
+    recover_stream_groups_at(
+        log.filesystem(),
+        log.flushed_offset().get(),
+        lease,
+        opened_at,
+    )
+}
+
+/// The filesystem-rooted CORE of [`recover_one_named_stream`], factored out for the shared-WAL mode
+/// (#597 wiring): resumes one stream's durable per-group consumer state (committed cursor #681 +
+/// in-flight attempt counts #358) from the checkpoint files in `fs` — the stream's own
+/// `streams/<hex(name)>/` subdir — clamped to that stream's durable head `flushed`. In the default
+/// mode `fs`/`flushed` come from the stream's own [`Log`]; in shared mode `fs` is the stream's
+/// METADATA subdir (same directory, same files, same formats — no per-stream log exists) and
+/// `flushed` is its durable stream-relative position length in the [`SharedWal`]. Keeping ONE body
+/// is what guarantees the two modes can never drift on cursor-resume semantics.
+fn recover_stream_groups_at<F: Filesystem>(
+    fs: &F,
+    flushed: u64,
+    lease: LeaseConfig,
+    opened_at: u64,
+) -> Result<NamedStream, EngineError> {
     let mut ns = NamedStream::new();
     // Discover every durable group of THIS stream from BOTH its cursor file AND its attempts file
     // (the #681 DLQ follow-up brings the default stream's #358 union to the named path): a group
@@ -2529,6 +2550,60 @@ fn recover_one_named_stream<F: Filesystem, C: Clock>(
         ns.groups.insert(group, g);
     }
     Ok(ns)
+}
+
+/// The SHARED-WAL-mode twin of [`recover_named_stream_groups`] (#597 wiring): discovers every KNOWN
+/// named stream (the union of the wal's demux-scanned streams and the `streams/<hex(name)>/`
+/// consumer-METADATA subdirs — a declared-but-never-produced or fully-reaped stream leaves only the
+/// dir), DECLARES each into the wal (idempotent; re-registers the index slot so it is appendable and
+/// readable), and resumes each stream's per-group cursors + attempts from its metadata subdir via
+/// the SAME [`recover_stream_groups_at`] core the default mode uses — clamped to that stream's
+/// durable POSITION length in the shared WAL. A stream with no consumer checkpoints recovers an
+/// empty [`NamedStream`] and stays absent from the map (lazy-on-first-consume), exactly as the
+/// default mode. Creating a wal-only stream's metadata dir here is deliberate: it is the durable
+/// existence marker (and the future home of its checkpoints/DLQ).
+///
+/// # Errors
+/// Propagates a storage error from the dir scans, the wal declare, or a checkpoint read.
+fn recover_shared_stream_groups<F, C>(
+    root: &F,
+    wal: &mut SharedWal<F, C>,
+    lease: LeaseConfig,
+    opened_at: u64,
+) -> Result<SharedRecovery, EngineError>
+where
+    F: Filesystem,
+    C: Clock,
+{
+    let mut known: std::collections::BTreeSet<StreamId> = wal.stream_ids().into_iter().collect();
+    if root.subdir_exists(STREAMS_SUBDIR)? {
+        let sfs = root.subdir(STREAMS_SUBDIR)?;
+        for dir in sfs.list_subdirs()? {
+            let Some(name) = parse_stream_subdir_name(&dir) else {
+                continue; // a foreign dir is skipped, exactly as StreamSet::open skips it
+            };
+            let Ok(id) = StreamId::named(&name) else {
+                continue;
+            };
+            known.insert(id);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for id in &known {
+        // Idempotent for a wal-scanned stream; registers a fresh index slot for a metadata-only one
+        // (declared-but-never-produced across the restart). The default stream can never be in
+        // `known` (both sources validate named ids), so `declare` cannot reject here.
+        wal.declare(id)?;
+        let flushed = wal.stream_durable_len(id);
+        let meta = root
+            .subdir(STREAMS_SUBDIR)?
+            .subdir(&stream_subdir_name(id.name()))?;
+        let ns = recover_stream_groups_at(&meta, flushed, lease, opened_at)?;
+        if !ns.groups.is_empty() {
+            out.insert(id.clone(), ns);
+        }
+    }
+    Ok((out, known))
 }
 
 /// The recovered partitioned-stream state (#693): the reopened [`PartitionedStream`]s keyed by
@@ -2985,6 +3060,23 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// never dirties the `""` slot, the default stream's single-log group-commit on [`Engine::log`] is
     /// byte-identical.
     streams: StreamSet<F, C>,
+    /// The SHARED-WAL storage substrate (#597, wiring phase): `Some` iff the engine was opened with
+    /// [`StorageMode::SharedWal`], in which case EVERY named stream's records live interleaved and
+    /// stream-tagged in this ONE commit log (under `shared-wal/`) instead of per-stream logs, and
+    /// `streams` above holds ONLY its inert `""` slot ([`StreamSet::open_default_only`] — so every
+    /// untouched per-stream code path answers "not open" for a named stream and the shared branches
+    /// below are the only live named routing). The consumer-visible per-stream OFFSET space in
+    /// shared mode is the stream-relative POSITION (dense per stream, stable across restart and the
+    /// global reap via the demux-floor checkpoint), so the whole [`WorkGroup`] cursor/lease/ack/DLQ
+    /// machinery composes unchanged. Per-stream consumer METADATA (cursor + attempts checkpoints
+    /// #681, the per-stream `dlq/` sink #1110) still lives under `streams/<hex(name)>/` — the SAME
+    /// files, the SAME formats, only the stream's LOG is shared — so recovery reuses the exact #681
+    /// machinery. `None` (the default) keeps the per-stream mode byte-for-byte untouched.
+    ///
+    /// Mode-vs-layout is FAIL-CLOSED both ways at [`Engine::open`]: shared mode refuses a data dir
+    /// holding per-stream segments (or a `pstreams/` subtree), and the default mode refuses a data
+    /// dir holding a `shared-wal/` subtree — never a silent misread of the other mode's records.
+    shared_wal: Option<SharedWal<F, C>>,
     /// The per-NAMED-stream CONSUMER state (#676), keyed by [`StreamId`]: each entry mirrors the
     /// default stream's work-group machinery (its `groups` map of [`WorkGroup`]s) for one named
     /// stream, so the same group name in two streams is two independent cursors (cross-stream
@@ -3364,6 +3456,61 @@ type RecoveredAttempts<File> = (AttemptsCheckpoint<File>, Option<Vec<u8>>);
 /// the `type_complexity` lint and reads as one value at the call site.
 type LogAndStreams<F, C> = (Log<F, C>, StreamSet<F, C>);
 
+/// The result of [`Engine::open_log_and_shared_wal`] (#597 wiring): the root [`Log`], the
+/// DEFAULT-ONLY [`StreamSet`] (its inert `""` slot; no named per-stream log exists in shared mode),
+/// and the ONE recovered [`SharedWal`]. Named so the three-element tuple does not trip
+/// `type_complexity` and reads as one value at the call site.
+type LogStreamsAndWal<F, C> = (Log<F, C>, StreamSet<F, C>, SharedWal<F, C>);
+
+/// The result of [`recover_shared_stream_groups`] (#597 wiring): each known named stream's resumed
+/// consumer state, plus the KNOWN set itself (wal-scanned streams ∪ `streams/<hex>/` metadata dirs).
+type SharedRecovery = (
+    BTreeMap<StreamId, NamedStream>,
+    std::collections::BTreeSet<StreamId>,
+);
+
+/// Opens (creating + dir-syncing if absent) a named checkpoint file on `fs` — the shared body of
+/// the per-stream cursor/attempts checkpoint writers, one derivation for both storage modes.
+fn open_or_create_checkpoint_file<Fs: Filesystem>(
+    fs: &Fs,
+    name: &str,
+) -> Result<Fs::File, EngineError> {
+    if fs.exists(name)? {
+        Ok(fs.open(name)?)
+    } else {
+        let f = fs.create_new(name)?;
+        fs.sync_dir()?; // the new file's directory entry must be durable
+        Ok(f)
+    }
+}
+
+/// A typed MODE-vs-LAYOUT mismatch refusal (#597): surfaced through the Storage error channel
+/// (`InvalidData`, matching the shared WAL's own fail-closed refusals) rather than minting a wire
+/// error code for an open-time-only rejection.
+fn storage_mode_mismatch(message: String) -> EngineError {
+    EngineError::Storage(StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    )))
+}
+
+/// A typed shared-WAL-mode UNSUPPORTED-feature refusal (#597 wiring): the fail-closed reject for a
+/// feature whose contract cannot hold in shared mode (a stored per-record subject and per-subject
+/// filtering — the subject and the stream tag are mutually exclusive frame fields; the Tier-S
+/// raw/contiguous streaming fetch — the shared log's frames are interleaved; a partitioned declare).
+/// Surfaced through the Storage error channel (`Unsupported`) exactly as the pre-wiring `open`
+/// reject was — an honest typed refusal, never a silent degrade.
+fn shared_mode_unsupported(what: &str) -> EngineError {
+    EngineError::Storage(StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "{what} is not supported in the shared-WAL storage mode (#597): it does not compose \
+             with a shared, interleaved commit log; use the default per-stream-logs mode for this \
+             feature"
+        ),
+    )))
+}
+
 /// Materializes the engine's write-path compression configuration (#430, ADR-0003): the
 /// configured codec over the frozen defaults (the 64-byte raw-store threshold, `dict_id` 0, no
 /// dictionary, the default zstd level). Kept out of [`Engine::open`] so the open path stays
@@ -3396,25 +3543,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if config.max_in_flight == 0 {
             return Err(EngineError::ZeroMaxInFlight);
         }
-        // The shared-WAL storage fallback (#597) is implemented + tested at the storage layer
-        // (ironbus_storage::shared_wal::SharedWal) but its engine wiring is the deferred follow-up.
-        // Fail closed on the opt-in rather than silently running the per-stream default, so the mode
-        // switch is honest (never a silent no-op). Surfaced via the existing Storage error channel to
-        // avoid minting a wire error code for an open-time-only rejection. The DEFAULT (per-stream
-        // logs) proceeds untouched.
-        if config.storage_mode == ironbus_storage::shared_wal::StorageMode::SharedWal {
-            return Err(EngineError::Storage(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "shared-WAL storage mode (#597) is implemented at the storage layer \
-                 (ironbus_storage::shared_wal::SharedWal) but its engine produce/consume/recovery \
-                 wiring is the deferred follow-up; use the default per-stream-logs storage mode",
-            ))));
-        }
-        // Open the DEFAULT stream's root log AND the per-named-stream StreamSet substrate (#676). The
-        // root log is opened FIRST so it owns the authoritative recovery (truncating + reporting any
-        // torn tail, byte for byte as before); the StreamSet then re-opens the already-clean root for
-        // its inert `""` slot and recovers the named streams. See [`Engine::open_log_and_streams`].
-        let (log, streams) = Self::open_log_and_streams(fs, clock, config.log)?;
+        // MODE-vs-LAYOUT fail-closed check (#597 wiring): opening a data directory under the WRONG
+        // storage mode is a typed refusal BEFORE any recovery runs, never a silent misread of the
+        // other mode's records (a per-stream open of a shared-WAL dir would read every named stream
+        // as empty; a shared open of a per-stream dir would shadow the per-stream segments). The
+        // default-mode probe is one non-creating `subdir_exists`, so an existing per-stream
+        // deployment's open is behaviorally and on-disk byte-for-byte unchanged.
+        Self::check_storage_mode_layout(&fs, config.storage_mode)?;
+        // Open the DEFAULT stream's root log AND the named-stream substrate for the selected mode
+        // (#676/#597). The root log is opened FIRST in BOTH modes so it owns the authoritative
+        // recovery (truncating + reporting any torn tail, byte for byte as before). In the default
+        // mode the StreamSet then re-opens the already-clean root for its inert `""` slot and
+        // recovers the named streams; in SHARED-WAL mode the ONE shared commit log recovers
+        // (rebuilding its per-stream demux index) and the StreamSet holds ONLY the inert `""` slot.
+        let (log, streams, mut shared_wal) = if config.storage_mode == StorageMode::SharedWal {
+            let (log, streams, wal) = Self::open_log_and_shared_wal(fs, clock, config.log)?;
+            (log, streams, Some(wal))
+        } else {
+            let (log, streams) = Self::open_log_and_streams(fs, clock, config.log)?;
+            (log, streams, None)
+        };
 
         // Open (creating if absent) the cursor checkpoint through the log's filesystem.
         let checkpoint_file = {
@@ -3505,10 +3653,25 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // `streams/<hex(name)>/cursor-<hex(group)>.ckpt` (#681), the per-stream twin of
         // `recover_named_groups` above: a named-stream consumer resumes at its committed offset after
         // a restart instead of redelivering the whole log. Each stream's cursors are clamped to THAT
-        // stream's own durable head (read from its recovered log in `streams`). A stream that was only
-        // ever produced-to (never consumed) has no cursor file and stays absent from `named_streams`,
-        // so the lazy-on-first-consume path is unchanged for it.
-        let named_streams = recover_named_stream_groups(&streams, config.lease, opened_at)?;
+        // stream's own durable head — its recovered log in `streams` in the default mode, or its
+        // durable stream-relative POSITION length in the shared WAL (#597): the SAME checkpoint
+        // files, the SAME formats, only the head's source differs. A stream that was only ever
+        // produced-to (never consumed) has no cursor file and stays absent from `named_streams`, so
+        // the lazy-on-first-consume path is unchanged for it. Shared mode also returns the KNOWN
+        // set (wal-scanned streams ∪ `streams/<hex>/` metadata dirs) and declares every known
+        // stream into the wal, so a declared-but-never-produced or fully-reaped stream still exists
+        // after a restart.
+        let (named_streams, shared_known) = match shared_wal.as_mut() {
+            Some(wal) => {
+                let (map, known) =
+                    recover_shared_stream_groups(log.filesystem(), wal, config.lease, opened_at)?;
+                (map, Some(known))
+            }
+            None => (
+                recover_named_stream_groups(&streams, config.lease, opened_at)?,
+                None,
+            ),
+        };
 
         // The DLQ sink's log shares the main log's segment sizing but is NEVER byte-capped: a
         // poison record is the durable evidence of a dropped message and must not itself be shed.
@@ -3554,25 +3717,41 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // metric and the idempotency set are correct. A stream that never dead-lettered has no `dlq/`
         // subdir and stays unopened (lazy), so a no-poison deployment never materializes one.
         let mut named_dlq: BTreeMap<StreamId, DlqSink<F, C>> = BTreeMap::new();
-        for id in streams.stream_ids() {
-            if id.is_default() {
-                continue;
+        if let Some(known) = &shared_known {
+            // SHARED-WAL mode (#597): a named stream's DLQ sink still lives in its OWN
+            // `streams/<hex(name)>/dlq/` metadata subdir (the #1110 layout, unchanged) even though
+            // its LOG is shared — resolve it there instead of via a per-stream log.
+            for id in known {
+                let meta = log
+                    .filesystem()
+                    .subdir(STREAMS_SUBDIR)?
+                    .subdir(&stream_subdir_name(id.name()))?;
+                if meta.subdir_exists(DLQ_SUBDIR).unwrap_or(false) {
+                    let sink = DlqSink::open_at(&meta, DLQ_SUBDIR, log.clock_clone(), dlq_config)?;
+                    named_dlq.insert(id.clone(), sink);
+                }
             }
-            let Some(stream_log) = streams.get(&id) else {
-                continue;
-            };
-            if stream_log
-                .filesystem()
-                .subdir_exists(DLQ_SUBDIR)
-                .unwrap_or(false)
-            {
-                let sink = DlqSink::open_at(
-                    stream_log.filesystem(),
-                    DLQ_SUBDIR,
-                    stream_log.clock_clone(),
-                    dlq_config,
-                )?;
-                named_dlq.insert(id, sink);
+        } else {
+            for id in streams.stream_ids() {
+                if id.is_default() {
+                    continue;
+                }
+                let Some(stream_log) = streams.get(&id) else {
+                    continue;
+                };
+                if stream_log
+                    .filesystem()
+                    .subdir_exists(DLQ_SUBDIR)
+                    .unwrap_or(false)
+                {
+                    let sink = DlqSink::open_at(
+                        stream_log.filesystem(),
+                        DLQ_SUBDIR,
+                        stream_log.clock_clone(),
+                        dlq_config,
+                    )?;
+                    named_dlq.insert(id, sink);
+                }
             }
         }
 
@@ -3620,16 +3799,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // existence cap (`max_streams`) and the reopen-vs-reject decision are correct BEFORE any client
         // touches a stream. This survives a hot-set LRU eviction (which drops the open `Log`), so an
         // evicted-then-consumed stream is recognized as KNOWN (reopened), never UNKNOWN (rejected).
-        let known_named_streams: std::collections::BTreeSet<StreamId> = streams
-            .stream_ids()
-            .into_iter()
-            .filter(|id| !id.is_default())
-            .collect();
+        let known_named_streams: std::collections::BTreeSet<StreamId> = match shared_known {
+            // Shared mode (#597): existence is the wal-scanned ∪ metadata-dir union recovered above
+            // (a shared stream has no per-stream log for `stream_ids` to report).
+            Some(known) => known,
+            None => streams
+                .stream_ids()
+                .into_iter()
+                .filter(|id| !id.is_default())
+                .collect(),
+        };
         let mut engine = Engine {
             log,
             // The per-named-stream LOG substrate (#676), opened above; recovered named streams (if
             // any) are already in it. The default stream is served by `log`, never this set's `""`.
             streams,
+            // The shared-WAL substrate (#597): `Some` iff `storage_mode == SharedWal`, recovered
+            // above (index rebuilt from the tagged shared log + the demux-floor checkpoint).
+            shared_wal,
             // The per-named-stream CONSUMER state (#676, #681): RESUMED at open from each stream's
             // durable per-group cursor checkpoints (`recover_named_stream_groups` above), so a
             // named-stream consumer resumes at its committed offset after a restart. A stream that was
@@ -3847,6 +4034,98 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok((log, streams))
     }
 
+    /// The SHARED-WAL-mode twin of [`Engine::open_log_and_streams`] (#597 wiring): opens the root
+    /// [`Log`] FIRST (the authoritative recovery + #670 marker check, byte-for-byte the default
+    /// mode's order), then the ONE shared commit log under `shared-wal/` ([`SharedWal::open`], which
+    /// recovers it and rebuilds the per-stream demux index from the tagged records + the demux-floor
+    /// checkpoint), then a DEFAULT-ONLY [`StreamSet`] (its inert `""` slot re-open) — NO per-stream
+    /// named log is ever opened or materialized in shared mode, which is the density point.
+    ///
+    /// # Errors
+    /// Propagates a storage error from any of the three opens (including the shared WAL's
+    /// fail-closed refusals: an undecodable demux-floor checkpoint, or a physical log ahead of it).
+    fn open_log_and_shared_wal(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<LogStreamsAndWal<F, C>, EngineError>
+    where
+        F: Clone,
+    {
+        let fs_for_wal = fs.clone();
+        let fs_for_streams = fs.clone();
+        let log = Log::open(fs, clock.clone(), config)?;
+        let (wal, _recovery) = SharedWal::open(&fs_for_wal, clock.clone(), config)?;
+        let streams = StreamSet::open_default_only(&fs_for_streams, clock, config)
+            .map_err(EngineError::Storage)?;
+        Ok((log, streams, wal))
+    }
+
+    /// The MODE-vs-LAYOUT fail-closed gate (#597 wiring), run by [`Engine::open`] BEFORE any
+    /// recovery: a data directory laid out by the OTHER storage mode is a typed refusal, never a
+    /// silent misread.
+    ///
+    /// - Default (per-stream) mode refuses a dir holding a `shared-wal/` subtree: the named streams'
+    ///   records live in the shared commit log, so a per-stream open would read every named stream
+    ///   as EMPTY (and a later shared-mode open would then find freshly-minted per-stream segments —
+    ///   a split-brain image). One non-creating `subdir_exists` probe, so an existing per-stream
+    ///   deployment is unchanged.
+    /// - Shared mode refuses a dir whose `streams/<hex>/` subdirs hold per-stream log SEGMENTS
+    ///   (`seg-*`): those records are unreachable through the shared WAL, so opening shared would
+    ///   silently shadow them. (In shared mode `streams/<hex>/` legitimately holds ONLY consumer
+    ///   metadata — cursor/attempts checkpoints and `dlq/` — which is exactly what the probe
+    ///   permits.) It also refuses a dir with a `pstreams/` subtree: partitioned streams (#693) are
+    ///   per-stream-log storage and are not supported in shared mode (their declare path is likewise
+    ///   rejected), so their records must never be half-served.
+    ///
+    /// The default stream's ROOT log is served identically in both modes and is never a mismatch.
+    ///
+    /// # Errors
+    /// The typed `InvalidData` mismatch refusal, or an IO error from the probes.
+    fn check_storage_mode_layout(fs: &F, mode: StorageMode) -> Result<(), EngineError> {
+        match mode {
+            StorageMode::PerStreamLogs => {
+                if fs.subdir_exists(SHARED_WAL_SUBDIR)? {
+                    return Err(storage_mode_mismatch(
+                        "this data directory holds a shared-WAL commit log (shared-wal/) but the \
+                         engine was opened in the default per-stream-logs storage mode; a \
+                         per-stream open would silently read every named stream as empty — reopen \
+                         with the shared-wal storage mode"
+                            .to_string(),
+                    ));
+                }
+            }
+            StorageMode::SharedWal => {
+                if fs.subdir_exists(PARTITIONED_STREAMS_SUBDIR)? {
+                    return Err(storage_mode_mismatch(
+                        "this data directory holds partitioned streams (pstreams/), which are \
+                         per-stream-log storage; the shared-WAL storage mode does not support \
+                         partitioned streams — reopen with the default per-stream-logs mode"
+                            .to_string(),
+                    ));
+                }
+                if fs.subdir_exists(STREAMS_SUBDIR)? {
+                    let sfs = fs.subdir(STREAMS_SUBDIR)?;
+                    for dir in sfs.list_subdirs()? {
+                        if parse_stream_subdir_name(&dir).is_none() {
+                            continue; // a foreign dir is skipped, exactly as StreamSet::open skips it
+                        }
+                        let sub = sfs.subdir(&dir)?;
+                        if sub.list()?.iter().any(|f| f.starts_with("seg-")) {
+                            return Err(storage_mode_mismatch(format!(
+                                "streams/{dir} holds per-stream log segments but the engine was \
+                                 opened in the shared-WAL storage mode; a shared open would \
+                                 silently shadow those records — reopen with the default \
+                                 per-stream-logs mode"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_compaction_config(&mut self, config: ironbus_storage::compaction::CompactionConfig) {
         self.compaction = config;
     }
@@ -3902,6 +4181,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.retention = retention;
         self.disk_full_policy = disk_full_policy;
         self.reap_for_retention()?;
+        // SHARED-WAL mode (#597): the named streams share ONE log, so a tightened reload runs ONE
+        // immediate GLOBAL reap (floored at the min committed across every stream's groups) instead
+        // of the per-stream loop below (which is inert in shared mode: no per-stream log is open).
+        if self.shared_wal.is_some() {
+            self.shared_reap_for_retention()?;
+            return Ok(());
+        }
         // #566: a reload that TIGHTENS retention reclaims from RESIDENT named streams at once too, not
         // just the default stream — the shared policy applies per stream. Each evicted stream reaps on
         // its next reopen (`ensure_named_stream_open`), so a non-resident stream is not force-opened
@@ -4626,18 +4912,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let name = group_checkpoint_name(group);
         // Resolve the file on THIS stream's own subdir filesystem (disjoint field from
         // `named_streams`), creating + dir-syncing it on first use exactly as the default path does.
-        let file = {
+        // In SHARED-WAL mode (#597) that subdir is the stream's consumer-METADATA dir — the SAME
+        // path and format, resolved without a per-stream log.
+        let file = if self.shared_wal.is_some() {
+            if !self.known_named_streams.contains(id) {
+                return Ok(());
+            }
+            let fs = self.named_stream_meta_fs(id)?;
+            open_or_create_checkpoint_file(&fs, &name)?
+        } else {
             let Some(log) = self.streams.get(id) else {
                 return Ok(());
             };
-            let fs = log.filesystem();
-            if fs.exists(&name)? {
-                fs.open(&name)?
-            } else {
-                let f = fs.create_new(&name)?;
-                fs.sync_dir()?; // the new file's directory entry must be durable
-                f
-            }
+            open_or_create_checkpoint_file(log.filesystem(), &name)?
         };
         let (mut cp, _) = Checkpoint::open(file)?;
         cp.write(&payload)?;
@@ -4712,18 +4999,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ) -> Result<(), EngineError> {
         let payload = attempts_snapshot_payload(pairs);
         let name = group_attempts_name(group);
-        let file = {
+        // The same mode-aware file resolution as `write_named_group_checkpoint`: the stream's own
+        // log filesystem, or its SHARED-WAL consumer-METADATA subdir (#597) — same path, same format.
+        let file = if self.shared_wal.is_some() {
+            if !self.known_named_streams.contains(id) {
+                return Ok(());
+            }
+            let fs = self.named_stream_meta_fs(id)?;
+            open_or_create_checkpoint_file(&fs, &name)?
+        } else {
             let Some(log) = self.streams.get(id) else {
                 return Ok(());
             };
-            let fs = log.filesystem();
-            if fs.exists(&name)? {
-                fs.open(&name)?
-            } else {
-                let f = fs.create_new(&name)?;
-                fs.sync_dir()?; // the new file's directory entry must be durable
-                f
-            }
+            open_or_create_checkpoint_file(log.filesystem(), &name)?
         };
         let (mut cp, _) = AttemptsCheckpoint::open(file)?;
         cp.write(&payload)?;
@@ -5028,6 +5316,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 .produce_partitioned(&id, message)
                 .map(|(_, offset)| offset);
         }
+        // SHARED-WAL mode (#597): route the named append into the ONE tagged commit log. Runs after
+        // the mirror/partitioned guards above (partitioned streams cannot exist in shared mode, so
+        // that map lookup is a no-op) and carries the same cap/declare/registry/retention steps.
+        if self.shared_wal.is_some() {
+            return self.produce_in_shared_stream(&id, message, subject);
+        }
         // #863: cap the DISTINCT-stream count before materializing a NEW stream (inode/dir bound).
         self.check_stream_cap(&id)?;
         // Declare-on-first-produce THROUGH the hot-set LRU (#565): open (or lazily REOPEN + per-stream
@@ -5075,6 +5369,162 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // unchanged.
         self.reap_named_for_retention(&id)?;
         Ok(offset)
+    }
+
+    /// The SHARED-WAL-mode named produce (#597 wiring): appends `message` for stream `id` into the
+    /// ONE shared commit log, framed with `id`'s name as its stored stream tag (the demux key), and
+    /// acks only after the covering `fdatasync` on that one log (I2 holds; the barrier covers EVERY
+    /// stream's pending appends — the density win extends to commits). The returned [`Offset`] is
+    /// the record's STREAM-RELATIVE position: dense and monotonic per stream, exactly the offset
+    /// space a per-stream log gives a producer, and the space the shared consume/ack paths and the
+    /// durable per-group cursor (#681) operate in.
+    ///
+    /// A NON-EMPTY `subject` is fail-closed rejected: the stored subject and the stream tag are
+    /// MUTUALLY EXCLUSIVE record fields (#1122's frame contract — both occupy the fixed post-header
+    /// slot), so a shared-mode record physically cannot carry a subject; accepting the publish and
+    /// silently dropping its subject would break the #594 filtered-consume contract downstream.
+    ///
+    /// After the durable commit this runs the GLOBAL retention reap (the shared-mode reduced
+    /// contract, [`Engine::shared_reap_for_retention`]) exactly where the per-stream produce runs
+    /// its per-stream reap. Disk-full in shared mode is the ONE log's own byte cap: an over-cap
+    /// append surfaces the shared log's `AtCapacity` (there is no per-stream sub-log to shed from,
+    /// and drop-oldest force-reaping is not wired for the shared log — the reduced #1116 contract).
+    ///
+    /// # Errors
+    /// The unsupported-subject reject above, [`EngineError::TooManyStreams`] from the distinct-
+    /// stream cap, or a storage error from the tagged append, the covering sync (a failed barrier
+    /// freezes the shared log's writer: nothing is acked, exactly the default stream's `commit_batch`
+    /// contract), or the reap.
+    fn produce_in_shared_stream(
+        &mut self,
+        id: &StreamId,
+        message: &Append<'_>,
+        subject: &[u8],
+    ) -> Result<Offset, EngineError> {
+        if !subject.is_empty() {
+            return Err(shared_mode_unsupported(
+                "a stored per-record subject (#594, publish-by-subject with subject storage)",
+            ));
+        }
+        // #863: cap the DISTINCT-stream count before materializing a NEW stream, then declare it
+        // (an index slot + its metadata dir — no fd, no per-stream log; the density point).
+        self.check_stream_cap(id)?;
+        self.ensure_named_stream_open(id)?;
+        let position = {
+            let Some(wal) = self.shared_wal.as_mut() else {
+                // Unreachable: the caller routed here because `shared_wal` is `Some`.
+                return Err(shared_mode_unsupported(
+                    "a shared produce without a shared WAL",
+                ));
+            };
+            wal.append_to(id, message).map_err(EngineError::Storage)?
+        };
+        // Per-stream PRODUCE throughput (#571), keyed by the stream name exactly as the per-stream
+        // mode counts it (bounded + overflow-folded).
+        self.registry.record_stream_produced(id.name().as_bytes());
+        // ONE covering fdatasync on the ONE shared log, BEFORE the ack (I2, ack-implies-durable). A
+        // failed barrier freezes the shared log's writer and surfaces here — the record is NOT acked
+        // and every subsequent shared append is refused (`WriterFrozen`), the same fail-closed
+        // discipline as the default stream's `commit_batch` and the named `commit_tick` froze check.
+        {
+            let Some(wal) = self.shared_wal.as_mut() else {
+                return Err(shared_mode_unsupported(
+                    "a shared produce without a shared WAL",
+                ));
+            };
+            wal.sync().map_err(EngineError::Storage)?;
+        }
+        // The GLOBAL reap (shared-mode retention, #566's reduced contract): floored at the min
+        // committed across ALL streams' groups, run AFTER the durable commit exactly as the
+        // per-stream produce reaps after its commit tick. A no-op unless retention is configured.
+        self.shared_reap_for_retention()?;
+        Ok(Offset::new(position))
+    }
+
+    /// The GLOBAL retention reap of the shared WAL (#597 wiring, the documented REDUCED #566
+    /// contract): ONE reap over the ONE commit log, floored at [`Engine::shared_reap_floor`] — the
+    /// minimum committed record (mapped to its shared-log offset) across EVERY stream's consumer
+    /// groups — so no stream's un-consumed record is ever reclaimed, and one slow stream pins the
+    /// whole shared log (the honest tradeoff vs. per-stream reaps). Key compaction (#337) is NOT
+    /// wired for the shared log (its demux index is position-ordered and compaction would punch
+    /// interior holes in it), so `maybe_compact` is deliberately absent here. A no-op when retention
+    /// is off, so an unconfigured shared-mode broker reaps nothing.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the reap (including its demux-floor checkpoint write).
+    fn shared_reap_for_retention(&mut self) -> Result<(), EngineError> {
+        if self.retention == RetentionBounds::default() {
+            return Ok(());
+        }
+        let floor = self.shared_reap_floor();
+        let bounds = self.retention;
+        let Some(wal) = self.shared_wal.as_mut() else {
+            return Ok(());
+        };
+        let outcome = wal
+            .reap(bounds, Offset::new(floor))
+            .map_err(EngineError::Storage)?;
+        self.counters.segments_reaped = self
+            .counters
+            .segments_reaped
+            .saturating_add(outcome.segments_reaped);
+        Ok(())
+    }
+
+    /// The shared-mode retention PROTECT floor (#597 wiring): the minimum, across EVERY declared
+    /// stream, of the SHARED-log offset of that stream's first record still needed by any of its
+    /// consumer groups. Per stream it mirrors [`Engine::min_committed_offset_named`] exactly — the
+    /// min committed POSITION over its touched live groups and its ghost `group_last_checkpointed`
+    /// entries (#432), defaulting to the stream's durable head when it has no consumer at all (a
+    /// produce-only stream is reapable to its head) — then maps that position to a shared-log offset
+    /// via [`SharedWal::first_offset_at_or_after`] (a fully-consumed or empty stream contributes no
+    /// pin). With NO stream pinning anything, the floor is the shared log's durable head: everything
+    /// committed everywhere, so every sealed record is reapable once a bound trips.
+    fn shared_reap_floor(&self) -> u64 {
+        let Some(wal) = self.shared_wal.as_ref() else {
+            return 0;
+        };
+        let mut floor: Option<u64> = None;
+        for id in wal.stream_ids() {
+            let head = wal.stream_durable_len(&id);
+            let min_pos = match self.named_streams.get(&id) {
+                None => head,
+                Some(ns) => {
+                    let live = ns
+                        .groups
+                        .values()
+                        .filter(|g| g.touched)
+                        .map(|g| g.cursor.committed().get());
+                    let ghosts = ns
+                        .group_last_checkpointed
+                        .iter()
+                        .filter(|(name, _)| !ns.groups.contains_key(name.as_str()))
+                        .map(|(_, &committed)| committed);
+                    live.chain(ghosts).min().unwrap_or(head)
+                }
+            };
+            if let Some(shared) = wal.first_offset_at_or_after(&id, min_pos) {
+                floor = Some(floor.map_or(shared.get(), |f| f.min(shared.get())));
+            }
+        }
+        floor.unwrap_or_else(|| wal.synced_offset().get())
+    }
+
+    /// Resolves a NAMED stream's consumer-METADATA filesystem in SHARED-WAL mode (#597 wiring): the
+    /// `streams/<hex(name)>/` subdir that holds its durable cursor + attempts checkpoints (#681) and
+    /// its `dlq/` sink (#1110) — the SAME location, files, and formats as the per-stream mode, only
+    /// without a per-stream log beside them. Creates the dir on first use (it doubles as the
+    /// stream's durable existence marker).
+    ///
+    /// # Errors
+    /// Propagates an IO error from resolving/creating the subdirs.
+    fn named_stream_meta_fs(&self, id: &StreamId) -> Result<F, EngineError> {
+        let fs = self
+            .log
+            .filesystem()
+            .subdir(STREAMS_SUBDIR)?
+            .subdir(&stream_subdir_name(id.name()))?;
+        Ok(fs)
     }
 
     // ===================================================================================
@@ -5125,6 +5575,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // P <= 1 is today's single-log named stream, byte-for-byte (no PartitionedStream at all).
         if partition_count <= 1 {
             return self.declare_stream(stream);
+        }
+        // SHARED-WAL mode (#597): partitioned streams are per-stream-log storage (P sub-logs under
+        // pstreams/) and do not compose with the one shared commit log — fail-closed typed reject,
+        // matching the open-time pstreams/ layout refusal, never a half-supported hybrid.
+        if self.shared_wal.is_some() {
+            return Err(shared_mode_unsupported(
+                "a partitioned stream declare (#693, P > 1)",
+            ));
         }
         // The default stream is the root log and is never partitioned.
         if stream.is_empty() {
@@ -6450,6 +6908,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Ok(id) = StreamId::named(stream) else {
             return false;
         };
+        // SHARED-WAL mode (#597): a known stream is ALWAYS "resident" — it is an index slot in the
+        // one shared log, never an fd the hot-set LRU could have closed.
+        if self.shared_wal.is_some() {
+            return self.known_named_streams.contains(&id);
+        }
         self.streams.is_open(&id)
     }
 
@@ -6532,10 +6995,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 name: stream.to_string(),
             });
         }
-        let Some(flushed) = self.streams.get(&id).map(|log| log.flushed_offset().get()) else {
-            return Err(EngineError::UnknownStream {
-                name: stream.to_string(),
-            });
+        // The stream's durable head in ITS consumer-visible offset space: the per-stream log's
+        // flushed offset, or — in SHARED-WAL mode (#597) — its durable stream-relative POSITION
+        // length in the one shared log (the same dense per-stream shape, so the window math below
+        // is identical).
+        let flushed = if let Some(wal) = self.shared_wal.as_ref() {
+            wal.stream_durable_len(&id)
+        } else {
+            match self.streams.get(&id).map(|log| log.flushed_offset().get()) {
+                Some(flushed) => flushed,
+                None => {
+                    return Err(EngineError::UnknownStream {
+                        name: stream.to_string(),
+                    })
+                }
+            }
         };
         validate_group_name(group)?;
         let lease_config = self.lease_config;
@@ -6660,10 +7134,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // never lost to this reset — exactly the `poll_in` ordering. (No `sync_consumer_lag`: the
         // default-stream lag registry is not keyed by named-stream groups, matching the filtered-run
         // and DLQ named paths.)
-        let earliest = self
-            .streams
-            .get(id)
-            .map_or(0, |log| log.earliest_offset().get());
+        let earliest = if let Some(wal) = self.shared_wal.as_ref() {
+            // SHARED-WAL mode (#597): the stream's earliest retained POSITION (its reap base) — the
+            // global reap's per-stream face, feeding the identical truncation contract below.
+            wal.stream_earliest(id)
+        } else {
+            self.streams
+                .get(id)
+                .map_or(0, |log| log.earliest_offset().get())
+        };
         if committed < earliest {
             let skipped = earliest - committed;
             let lease_config = self.lease_config;
@@ -6720,12 +7199,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     offset += 1;
                     continue;
                 }
-                // 2. Read the record to learn its subject + key (immutable `&self.streams` borrow).
-                let record = match self.streams.get(id) {
-                    Some(log) => log.read_from(off, 1).map_err(EngineError::Storage)?,
-                    None => return Ok(Poll::Idle),
+                // 2. Read the record to learn its subject + key (immutable storage borrow): the
+                //    stream's own log, or the SHARED-WAL demux read at this position (#597 —
+                //    tag-verified, offset already remapped to the position, so the arms below are
+                //    mode-agnostic).
+                let record = if let Some(wal) = self.shared_wal.as_ref() {
+                    wal.read_at(id, offset).map_err(EngineError::Storage)?
+                } else {
+                    match self.streams.get(id) {
+                        Some(log) => log
+                            .read_from(off, 1)
+                            .map_err(EngineError::Storage)?
+                            .into_iter()
+                            .next(),
+                        None => return Ok(Poll::Idle),
+                    }
                 };
-                let Some(record) = record.into_iter().next() else {
+                let Some(record) = record else {
                     return Err(EngineError::MissingRecord { offset });
                 };
                 // COMPACTION HOLE (#337/#566): the read returned a record ABOVE `off`, so `off` was
@@ -6853,13 +7343,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 Some(Claim::Exhausted) => return Err(EngineError::GenerationExhausted),
                 Some(Claim::Granted { token, deliveries }) => (token, deliveries),
             };
-            // Read the leased record off THIS stream's log (immutable `&self.streams` borrow, now that
-            // the group borrow above has ended).
-            let record = match self.streams.get(id) {
-                Some(log) => log.read_from(off, 1).map_err(EngineError::Storage)?,
-                None => return Ok(Poll::Idle),
+            // Read the leased record off THIS stream's storage, now that the group borrow above has
+            // ended: its own log, or the SHARED-WAL demux read at this position (#597 — the stored
+            // tag is re-verified and the offset remapped to the position, so everything below is
+            // mode-agnostic; a shared read never returns a sparse offset, positions are dense).
+            let record = if let Some(wal) = self.shared_wal.as_ref() {
+                wal.read_at(id, offset).map_err(EngineError::Storage)?
+            } else {
+                match self.streams.get(id) {
+                    Some(log) => log
+                        .read_from(off, 1)
+                        .map_err(EngineError::Storage)?
+                        .into_iter()
+                        .next(),
+                    None => return Ok(Poll::Idle),
+                }
             };
-            let Some(record) = record.into_iter().next() else {
+            let Some(record) = record else {
                 return Err(EngineError::MissingRecord { offset });
             };
             // COMPACTION HOLE (#337/#566): the read returned a record ABOVE the leased `off`, so `off`
@@ -7000,16 +7500,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// poll path read a record off this stream's log immediately before capturing the poison).
     fn named_dlq_sink(&mut self, id: &StreamId) -> Result<&mut DlqSink<F, C>, EngineError> {
         if !self.named_dlq.contains_key(id) {
-            let Some(log) = self.streams.get(id) else {
-                // Unreachable: the poll captured the poison from a record just read off this log.
-                return Err(EngineError::MissingRecord { offset: 0 });
+            // The sink roots at the stream's own `streams/<hex(name)>/dlq/` in BOTH modes (#1110):
+            // via its log's filesystem in the default mode, or via its consumer-METADATA subdir in
+            // SHARED-WAL mode (#597) — the same on-disk location and format either way.
+            let sink = if self.shared_wal.is_some() {
+                let meta = self.named_stream_meta_fs(id)?;
+                DlqSink::open_at(&meta, DLQ_SUBDIR, self.log.clock_clone(), self.dlq_config)?
+            } else {
+                let Some(log) = self.streams.get(id) else {
+                    // Unreachable: the poll captured the poison from a record just read off this log.
+                    return Err(EngineError::MissingRecord { offset: 0 });
+                };
+                DlqSink::open_at(
+                    log.filesystem(),
+                    DLQ_SUBDIR,
+                    log.clock_clone(),
+                    self.dlq_config,
+                )?
             };
-            let sink = DlqSink::open_at(
-                log.filesystem(),
-                DLQ_SUBDIR,
-                log.clock_clone(),
-                self.dlq_config,
-            )?;
             self.named_dlq.insert(id.clone(), sink);
         }
         // Just-inserted above when absent, so this is always Some.
@@ -7123,7 +7631,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if self.streams.is_open(&id) {
             self.streams.touch(&id);
         }
-        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        // SHARED-WAL mode (#597): there is no per-stream log to source the clock from (and no LRU
+        // to keep hot) — read the seam off the root log; it is the same engine clock.
+        let now = if self.shared_wal.is_some() {
+            self.log.now_monotonic()
+        } else {
+            self.streams.get(&id).map_or(0, Log::now_monotonic)
+        };
         let Some(named) = self.named_streams.get_mut(&id) else {
             return AckResult::Fenced;
         };
@@ -7193,6 +7707,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Ok(id) = StreamId::named(stream) else {
             return Offset::ZERO;
         };
+        // SHARED-WAL mode (#597): the head is the stream's durable POSITION length, read straight
+        // off the resident demux index (no fd, so no reopen dance; an unknown stream reads 0,
+        // folding with `stream_exists == false` exactly as the default mode's `None` does).
+        if let Some(wal) = self.shared_wal.as_ref() {
+            return Offset::new(wal.stream_durable_len(&id));
+        }
         // Reopen an evicted-but-KNOWN named stream so its durable head is read from disk rather than
         // folded to 0; a never-declared stream is left untouched (its `get` below stays `None` -> ZERO).
         if !self.streams.is_open(&id)
@@ -7215,6 +7735,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// deployment visits exactly one entry, so the common path stays a single atomic head read.
     pub fn for_each_poll_frontier<G: FnMut(&str, u64)>(&self, mut f: G) {
         f("", self.log.flushed_offset().get());
+        // SHARED-WAL mode (#597): each stream's frontier is its durable POSITION length in the one
+        // shared log (advanced by the covering sync each shared produce issues), in the wal's
+        // deterministic id order — the same shape the per-stream frontier walk reports.
+        if let Some(wal) = self.shared_wal.as_ref() {
+            for id in wal.stream_ids() {
+                f(id.name(), wal.stream_durable_len(&id));
+            }
+            return;
+        }
         self.streams.for_each_named_frontier(f);
     }
 
@@ -7223,6 +7752,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// subtract it to report the named count an operator cares about.)
     #[must_use]
     pub fn named_stream_count(&self) -> usize {
+        // SHARED-WAL mode (#597): the declared-stream count in the one shared log (there is no
+        // per-stream OPEN set; every declared stream is equally resident).
+        if let Some(wal) = self.shared_wal.as_ref() {
+            return wal.stream_count();
+        }
         // The StreamSet's `len()` includes its inert default `""` slot; the named count is the rest.
         self.streams.len().saturating_sub(1)
     }
@@ -7289,6 +7823,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             !id.is_default(),
             "the default stream is never routed through the LRU"
         );
+        // SHARED-WAL mode (#597): a named stream is an index slot + a metadata dir, never an fd, so
+        // the hot-set LRU does not apply and "open" reduces to "declared".
+        if self.shared_wal.is_some() {
+            return self.ensure_shared_stream_declared(id);
+        }
         if self.streams.is_open(id) {
             // Already resident: just refresh its recency so an actively-used stream is not the next
             // eviction victim (the LRU-reorders-on-access property).
@@ -7333,6 +7872,47 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(!known)
     }
 
+    /// The SHARED-WAL-mode body of [`Engine::ensure_named_stream_open`] (#597 wiring): ensures `id`
+    /// is DECLARED in the shared WAL (an index slot — no fd, no per-stream log, which is the whole
+    /// density point) and that its `streams/<hex(name)>/` metadata dir exists (the durable existence
+    /// marker and the home of its cursor/attempts checkpoints + `dlq/`). Returns whether this was
+    /// the stream's FIRST-ever declaration. Unlike the per-stream body there is NO eviction and NO
+    /// reopen-recovery: a shared stream is never closed (nothing per-stream holds an fd), so its
+    /// in-memory consumer state persists for the engine's life — the `max_open_streams` hot-set LRU
+    /// is documented as inert in shared mode (the `max_streams` EXISTENCE cap still applies via the
+    /// caller's `check_stream_cap`). The consumer state is created lazily and NEVER clobbered
+    /// (`or_insert`), so a repeat produce cannot reset live cursors.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the wal declare or the metadata-dir creation.
+    fn ensure_shared_stream_declared(&mut self, id: &StreamId) -> Result<bool, EngineError> {
+        let known = self.known_named_streams.contains(id);
+        {
+            let Some(wal) = self.shared_wal.as_mut() else {
+                // Unreachable: the caller routed here because `shared_wal` is `Some`.
+                return Err(shared_mode_unsupported(
+                    "a shared declare without a shared WAL",
+                ));
+            };
+            wal.declare(id)?;
+        }
+        if !known {
+            // Materialize + durably record the stream's metadata dir (its existence marker): sync
+            // the parent dirs so the entry survives a power loss, mirroring how a per-stream
+            // declare's `Log::open` dir-syncs its new subtree.
+            let root = self.log.filesystem();
+            let sfs = root.subdir(STREAMS_SUBDIR)?;
+            let _meta = sfs.subdir(&stream_subdir_name(id.name()))?;
+            sfs.sync_dir()?;
+            root.sync_dir()?;
+            self.known_named_streams.insert(id.clone());
+        }
+        self.named_streams
+            .entry(id.clone())
+            .or_insert_with(NamedStream::new);
+        Ok(!known)
+    }
+
     /// Ensures a KNOWN named stream `id` is RESIDENT for a CONSUME/ACK access (#565): reopening +
     /// re-recovering it from disk if the LRU evicted it, and marking it most-recently-used. Returns
     /// `Ok(true)` if the stream is now open, or `Ok(false)` if it was NEVER declared — the consume path
@@ -7359,7 +7939,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// # Errors
     /// Propagates a storage error from flushing an evicted stream's durable state or closing its log.
     fn evict_to_open_cap(&mut self) -> Result<(), EngineError> {
-        if self.max_open_streams == 0 {
+        // SHARED-WAL mode (#597): there are no per-stream fds to bound — ONE log serves every
+        // stream — so the hot-set LRU is inert (documented; `max_streams` still bounds existence).
+        if self.shared_wal.is_some() || self.max_open_streams == 0 {
             return Ok(());
         }
         // At/over the cap means adding one more would exceed it: evict down to `cap - 1` so the imminent
@@ -7381,7 +7963,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// # Errors
     /// Propagates a storage error from flushing an evicted stream's durable state or closing its log.
     fn evict_open_streams_down_to_cap(&mut self) -> Result<(), EngineError> {
-        if self.max_open_streams == 0 {
+        // SHARED-WAL mode (#597): no per-stream fds exist, so the boot-time cap enforcement is
+        // inert exactly like the runtime LRU (`evict_to_open_cap`).
+        if self.shared_wal.is_some() || self.max_open_streams == 0 {
             return Ok(());
         }
         while self.streams.open_named_count() > self.max_open_streams {
@@ -10613,6 +11197,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return self.set_streaming_in(group, streaming);
         }
         let id = StreamId::named(stream)?;
+        // SHARED-WAL mode (#597): the Tier-S streaming tier is fail-closed rejected for a NAMED
+        // stream — its raw/contiguous fetch serves on-disk frame runs verbatim, and a shared log's
+        // frames are INTERLEAVED across streams (and tagged), so a contiguous per-stream run does
+        // not exist to serve. The per-record Tier-W poll path (leases + durable cursor) is the
+        // shared-mode consume contract. A typed reject, never a wedged streaming group.
+        if self.shared_wal.is_some() {
+            return Err(shared_mode_unsupported(
+                "the Tier-S streaming consume mode on a named stream (#544)",
+            ));
+        }
         // The stream must be resident (its log open) before a streaming group can bind to it — a Tier-S
         // mark on an unknown stream is a typed reject, never a silent bind to a stream that does not exist
         // (matching the named filter / key-shared setters).
@@ -10742,6 +11336,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             SubjectPattern::parse(p).map_err(EngineError::InvalidSubject)?;
         }
         let id = StreamId::named(stream)?;
+        // SHARED-WAL mode (#597): a per-subject FILTER on a named stream is fail-closed rejected —
+        // a shared-mode record physically CANNOT carry a stored subject (the subject and the stream
+        // tag are mutually exclusive fields in the fixed post-header frame slot, #1122), so every
+        // record would be non-matching and a filtered group would silently consume nothing while
+        // committing past everything. A typed reject keeps the #594 contract honest. (Clearing a
+        // filter — `None` — is equally rejected: no filter can exist to clear.)
+        if self.shared_wal.is_some() {
+            return Err(shared_mode_unsupported(
+                "a per-subject filtered subscription on a named stream (#594)",
+            ));
+        }
         // The stream must be resident (its log open) before a filtered group can bind to it — a filter
         // on an unknown stream is a typed reject, never a silent bind to a stream that does not exist.
         if self.streams.get(&id).is_none() {
@@ -10812,13 +11417,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return self.set_key_ordering_in(group, ordering);
         }
         let id = StreamId::named(stream)?;
-        if self.streams.get(&id).is_none() {
+        // Mode-aware existence: a shared-mode stream (#597) has no per-stream log, but `key_shared`
+        // COMPOSES in shared mode (routing needs only the record's key, which the demux read
+        // carries), so the gate is the known-stream set there; the default mode keeps its
+        // log-resident gate byte-for-byte.
+        let resident = if self.shared_wal.is_some() {
+            self.known_named_streams.contains(&id)
+        } else {
+            self.streams.get(&id).is_some()
+        };
+        if !resident {
             return Err(EngineError::UnknownStream {
                 name: stream.to_string(),
             });
         }
         validate_group_name(group)?;
-        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        let now = if self.shared_wal.is_some() {
+            self.log.now_monotonic()
+        } else {
+            self.streams.get(&id).map_or(0, Log::now_monotonic)
+        };
         let lease_config = self.lease_config;
         let max_groups = self.max_groups;
         let named = self
@@ -11270,7 +11888,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return self.stream_fetch_raw_in(group, member, start_offset, max_records, max_bytes);
         }
         let id = StreamId::named(stream)?;
-        if self.streams.get(&id).is_none() {
+        // Mode-aware existence (#597): a shared-mode stream exists without a per-stream log. The
+        // wrong-mode guard below then rejects it — Tier-S cannot be enabled in shared mode
+        // (`set_streaming_in_stream` fail-closes), so a shared raw fetch is always a typed reject.
+        let resident = if self.shared_wal.is_some() {
+            self.known_named_streams.contains(&id)
+        } else {
+            self.streams.get(&id).is_some()
+        };
+        if !resident {
             return Err(EngineError::UnknownStream {
                 name: stream.to_string(),
             });
@@ -11432,6 +12058,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Err(EngineError::UnknownStream {
                 name: stream.to_string(),
             });
+        }
+        // SHARED-WAL mode (#597): a named streaming group cannot exist (Tier-S is fail-closed
+        // rejected at `set_streaming_in_stream`), so a shared streaming commit is always the same
+        // wrong-mode reject — surfaced BEFORE the per-stream-log window read below, which has no
+        // shared equivalent to consult.
+        if self.shared_wal.is_some() {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
         }
         // Read THIS stream's durable window + monotonic clock in one scoped borrow, copying the values
         // out so the borrow of `self.streams` ends before the group cursor mutation below.
@@ -12710,27 +13343,407 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn open_rejects_shared_wal_storage_mode_until_engine_wiring_lands() {
-        // #597: selecting the shared-WAL storage fallback fails closed at open with a typed
-        // Unsupported error (the honest opt-in — never a silent run of the per-stream default), because
-        // the storage PRIMITIVE (ironbus_storage::shared_wal::SharedWal) is implemented + tested but its
-        // engine produce/consume/recovery wiring is the deferred follow-up.
-        let cfg = EngineConfig {
+    // ---- SHARED-WAL storage mode (#597, wiring phase) -------------------------------------------
+    //
+    // These tests exercise the shared-WAL mode END TO END through the ENGINE's named-stream entry
+    // points (produce_in_stream / poll_in_stream / ack_in_stream / restart / DLQ / global reap /
+    // fail-closed rejects), the wiring that closes #597. The storage primitive's own invariants
+    // (tag demux, position exactness, the demux-floor checkpoint) are pinned in
+    // `ironbus_storage::shared_wal`; here the assertions are about the CONSUMER CONTRACT composing
+    // unchanged over the shared substrate.
+
+    /// The shared test config: the same `config(..)` with the shared-WAL storage mode selected.
+    fn shared_config(max_in_flight: u32, max_deliver: u32) -> EngineConfig {
+        EngineConfig {
             storage_mode: ironbus_storage::shared_wal::StorageMode::SharedWal,
-            ..config(10, 5)
-        };
-        match Engine::open(InMemoryFs::new(), ManualClock::new(), cfg) {
-            Err(EngineError::Storage(StorageError::Io(e))) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
-            }
-            // `_` (not a bound var) avoids formatting the Ok(Engine), which is not `Debug`.
-            _ => {
-                panic!("expected shared-WAL mode to be rejected at open with an Unsupported error")
+            ..config(max_in_flight, max_deliver)
+        }
+    }
+
+    /// Polls stream `stream` in `group` and expects a delivered message.
+    fn shared_message(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        group: &str,
+        now: u64,
+    ) -> Delivery {
+        message(e.poll_in_stream(stream, group, now).unwrap())
+    }
+
+    #[test]
+    fn shared_mode_n_streams_produce_consume_ack_isolated_through_one_wal() {
+        // #597 wiring: N streams interleave through the ONE shared commit log; each stream's
+        // consumer sees ONLY its own records, in order, on dense per-stream offsets; acks commit
+        // per-stream cursors independently; and the DEFAULT stream (the root log) is untouched.
+        let mut e = open(shared_config(100, 5));
+        // Interleaved producers across three streams (+ the default stream).
+        for i in 0..4u8 {
+            assert_eq!(
+                produce_named(&mut e, "alpha", &[b'a', i]),
+                Offset::new(u64::from(i)),
+                "per-stream offsets are dense positions"
+            );
+            produce_named(&mut e, "beta", &[b'b', i]);
+            if i % 2 == 0 {
+                produce_named(&mut e, "gamma", &[b'g', i]);
             }
         }
-        // The DEFAULT (per-stream logs) opens fine — the mode switch is the only difference.
-        assert!(Engine::open(InMemoryFs::new(), ManualClock::new(), config(10, 5)).is_ok());
+        produce(&mut e, b"default-untouched");
+        assert_eq!(e.stream_head("alpha"), Offset::new(4));
+        assert_eq!(e.stream_head("beta"), Offset::new(4));
+        assert_eq!(e.stream_head("gamma"), Offset::new(2));
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(1),
+            "root log: 1 default record"
+        );
+        assert_eq!(e.named_stream_count(), 3);
+        // Each stream's consumer drains EXACTLY its own records, in order (invariant a).
+        let mut now = 0u64;
+        for i in 0..4u8 {
+            let d = shared_message(&mut e, "alpha", "g", now);
+            assert_eq!(d.offset, Offset::new(u64::from(i)));
+            assert_eq!(d.record.payload.as_ref(), &[b'a', i]);
+            assert_eq!(e.ack_in_stream("alpha", "g", &d.token), AckResult::Acked);
+            now += 1;
+        }
+        for i in 0..2u8 {
+            let d = shared_message(&mut e, "gamma", "g", now);
+            assert_eq!(d.record.payload.as_ref(), &[b'g', 2 * i]);
+            assert_eq!(e.ack_in_stream("gamma", "g", &d.token), AckResult::Acked);
+            now += 1;
+        }
+        // The SAME group name in two streams is two independent cursors (per-stream isolation).
+        assert_eq!(e.committed_offset_in_stream("alpha", "g"), Offset::new(4));
+        assert_eq!(e.committed_offset_in_stream("beta", "g"), Offset::ZERO);
+        assert_eq!(e.committed_offset_in_stream("gamma", "g"), Offset::new(2));
+        // Drained streams are Idle; beta still has its records.
+        assert!(matches!(
+            e.poll_in_stream("alpha", "g", now).unwrap(),
+            Poll::Idle
+        ));
+        let d = shared_message(&mut e, "beta", "g", now);
+        assert_eq!(d.record.payload.as_ref(), b"b\x00");
+        // The default stream consumes byte-for-byte through its own path.
+        let dd = message(e.poll(now).unwrap());
+        assert_eq!(dd.record.payload.as_ref(), b"default-untouched");
+        // An unknown stream stays a typed reject (a consume never mints a stream).
+        assert!(matches!(
+            e.poll_in_stream("ghost", "g", now),
+            Err(EngineError::UnknownStream { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_mode_per_stream_durable_cursor_survives_restart() {
+        // The #681 durable-cursor restart contract, in shared mode: acked records never redeliver
+        // across a restart, un-acked ones do — per stream, from the SAME `streams/<hex>/cursor-*`
+        // checkpoints the per-stream mode writes.
+        let fs = InMemoryFs::new();
+        {
+            let mut e =
+                Engine::open(fs.clone(), ManualClock::new(), shared_config(100, 5)).unwrap();
+            for i in 0..3u8 {
+                produce_named_on(&mut e, "orders", &[b'o', i]);
+                produce_named_on(&mut e, "audit", &[b'x', i]);
+            }
+            // orders/g consumes + acks 2 of 3; audit is never consumed.
+            for _ in 0..2 {
+                let d = message(e.poll_in_stream("orders", "g", 0).unwrap());
+                assert_eq!(e.ack_in_stream("orders", "g", &d.token), AckResult::Acked);
+            }
+            // The graceful-shutdown flush persists the named cursors (#681).
+            e.checkpoint_all_groups().unwrap();
+        }
+        let mut e = Engine::open(fs, ManualClock::new(), shared_config(100, 5)).unwrap();
+        // The resumed cursor: exactly the un-acked suffix redelivers, nothing acked does (b).
+        assert_eq!(e.committed_offset_in_stream("orders", "g"), Offset::new(2));
+        let d = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d.offset, Offset::new(2));
+        assert_eq!(d.record.payload.as_ref(), &[b'o', 2]);
+        // The never-consumed stream redelivers from 0 — and its records are intact.
+        let d = message(e.poll_in_stream("audit", "g2", 0).unwrap());
+        assert_eq!(d.offset, Offset::ZERO);
+        assert_eq!(d.record.payload.as_ref(), &[b'x', 0]);
+        // Existence survived too: heads are exact after the restart.
+        assert_eq!(e.stream_head("orders"), Offset::new(3));
+        assert_eq!(e.stream_head("audit"), Offset::new(3));
+    }
+
+    /// Produces `payload` to NAMED stream `stream` on an engine over any `InMemoryFs` handle.
+    fn produce_named_on(e: &mut Engine<InMemoryFs, ManualClock>, stream: &str, payload: &[u8]) {
+        e.produce_in_stream(
+            stream,
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shared_mode_per_stream_dlq_parks_a_poison_in_its_own_sink() {
+        // The per-stream DLQ (#1110) composes in shared mode: a poison past max_deliver parks into
+        // ITS stream's own `streams/<hex>/dlq/` sink, the cursor commits past it, and the sibling
+        // stream is untouched.
+        let mut e = open(shared_config(10, 2)); // max_deliver = 2
+        produce_named(&mut e, "poisoned", b"bad");
+        produce_named(&mut e, "healthy", b"good");
+        let mut now = 0u64;
+        for _ in 0..2 {
+            let _ = message(e.poll_in_stream("poisoned", "g", now).unwrap());
+            now += 40; // expire the lease, never ack
+        }
+        match e.poll_in_stream("poisoned", "g", now).unwrap() {
+            Poll::Parked { offset, record } => {
+                assert_eq!(offset, Offset::ZERO);
+                assert_eq!(record.payload.as_ref(), b"bad");
+            }
+            other => panic!("expected the poison to park, got {other:?}"),
+        }
+        assert_eq!(
+            e.committed_offset_in_stream("poisoned", "g"),
+            Offset::new(1),
+            "the cursor committed past the parked poison"
+        );
+        assert_eq!(e.counters().dead_lettered, 1);
+        // The sibling stream delivers normally (its sink, cursor, and records are isolated).
+        let d = shared_message(&mut e, "healthy", "g", now);
+        assert_eq!(d.record.payload.as_ref(), b"good");
+    }
+
+    #[test]
+    fn shared_mode_global_reap_floors_at_the_slowest_stream_then_reclaims() {
+        // The GLOBAL reap (the documented reduced #566 contract): a tripped retention bound reaps
+        // NOTHING while a slow stream's consumer still needs the head of the shared log, and
+        // reclaims once every stream's groups have committed past it — through the ENGINE's produce
+        // path (the reap runs after each durable shared produce).
+        let mut cfg = shared_config(100, 5);
+        cfg.log = LogConfig::new(256).unwrap(); // tiny segments so the shared log rolls
+        cfg.max_messages = 4; // count-bound retention
+        let mut e = open(cfg);
+        // The slow stream's ONE record lands first (shared offset 0) and its consumer TOUCHES the
+        // group at position 0 (an untouched stream would floor at its head and protect nothing).
+        produce_named(&mut e, "slow", b"slow0");
+        let d = shared_message(&mut e, "slow", "g", 0);
+        assert_eq!(d.record.payload.as_ref(), b"slow0"); // leased, NOT acked: committed stays 0
+                                                         // A fast stream floods the shared log; every produce runs the global reap with the bound
+                                                         // tripped, but the floor (slow/g at position 0 -> shared offset 0) protects everything.
+        for i in 0..40u8 {
+            produce_named(&mut e, "fast", &[b'f', i]);
+        }
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "the slow stream's floor pins the whole shared log"
+        );
+        // The slow record is still deliverable after its lease expired (nothing was reaped).
+        let d = shared_message(&mut e, "slow", "g", 100);
+        assert_eq!(d.record.payload.as_ref(), b"slow0");
+        assert_eq!(e.ack_in_stream("slow", "g", &d.token), AckResult::Acked);
+        // Drain + ack the fast stream so its own group no longer pins the floor either.
+        let mut now = 200u64;
+        loop {
+            match e.poll_in_stream("fast", "g", now).unwrap() {
+                Poll::Message(d) => {
+                    assert_eq!(e.ack_in_stream("fast", "g", &d.token), AckResult::Acked);
+                }
+                _ => break,
+            }
+            now += 1;
+        }
+        // The floor is now the durable head: the next produce's reap physically reclaims.
+        produce_named(&mut e, "fast", b"tail");
+        assert!(
+            e.counters().segments_reaped > 0,
+            "with every group committed, the tripped bound reclaims the shared prefix"
+        );
+        // The reaped prefix surfaces as the one-time per-stream TRUNCATION signal for a NEW group
+        // that starts below the stream's earliest surviving position — never a silent skip.
+        match e.poll_in_stream("fast", "late", now).unwrap() {
+            Poll::Truncated { .. } | Poll::Message(_) => {}
+            other => panic!("expected Truncated or a surviving message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_mode_survives_a_restart_after_a_reap_with_exact_positions() {
+        // Cursor exactness ACROSS a reap + restart (invariant b + c composed): the demux-floor
+        // checkpoint keeps stream positions stable, so a committed cursor resumes exactly and the
+        // un-acked suffix redelivers at its original offsets.
+        let fs = InMemoryFs::new();
+        let mut cfg = shared_config(100, 5);
+        cfg.log = LogConfig::new(256).unwrap();
+        cfg.max_messages = 4;
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), cfg).unwrap();
+            // Create (touch) the consumer group FIRST: an untouched, consumer-less stream floors the
+            // global reap at its head, so the burst below would otherwise be legitimately reaped
+            // before the consumer ever arrived (the same no-consumer retention contract as the
+            // per-stream mode). The group at committed 0 pins the floor at record 0.
+            produce_named_on(&mut e, "s", &[b's', 0]);
+            let d0 = message(e.poll_in_stream("s", "g", 0).unwrap());
+            for i in 1..30u8 {
+                produce_named_on(&mut e, "s", &[b's', i]);
+            }
+            assert_eq!(
+                e.counters().segments_reaped,
+                0,
+                "the group's floor at 0 protects the whole burst"
+            );
+            // Consume + ack all but the last two (d0 first — its lease is still live at now=0).
+            assert_eq!(e.ack_in_stream("s", "g", &d0.token), AckResult::Acked);
+            for _ in 1..28 {
+                let d = message(e.poll_in_stream("s", "g", 0).unwrap());
+                assert_eq!(e.ack_in_stream("s", "g", &d.token), AckResult::Acked);
+            }
+            produce_named_on(&mut e, "s", &[b's', 30]); // triggers the global reap past the floor
+            assert!(e.counters().segments_reaped > 0, "the reap ran");
+            e.checkpoint_all_groups().unwrap();
+        }
+        let cfg2 = EngineConfig {
+            log: LogConfig::new(256).unwrap(),
+            max_messages: 4,
+            ..shared_config(100, 5)
+        };
+        let mut e = Engine::open(fs, ManualClock::new(), cfg2).unwrap();
+        assert_eq!(e.committed_offset_in_stream("s", "g"), Offset::new(28));
+        // Exactly the un-acked suffix redelivers, at its ORIGINAL positions (no shift, no dup).
+        let d = message(e.poll_in_stream("s", "g", 0).unwrap());
+        assert_eq!(d.offset, Offset::new(28));
+        assert_eq!(d.record.payload.as_ref(), &[b's', 28]);
+        assert_eq!(e.stream_head("s"), Offset::new(31));
+    }
+
+    #[test]
+    fn shared_mode_fail_closed_rejects_subjects_filters_tier_s_and_partitions() {
+        // The features whose contracts cannot hold over a shared, interleaved log are TYPED
+        // fail-closed rejects (never a silent degrade): a stored per-record subject (mutually
+        // exclusive with the stream tag), a per-subject filtered subscription (no stored subject to
+        // match), the Tier-S streaming tier (no contiguous per-stream frame runs), and a
+        // partitioned declare (per-stream-log storage).
+        let mut e = open(shared_config(10, 5));
+        produce_named(&mut e, "s", b"r0");
+        let unsupported = |r: Result<(), EngineError>| match r {
+            Err(EngineError::Storage(StorageError::Io(err))) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+            }
+            other => panic!("expected a typed Unsupported reject, got {other:?}"),
+        };
+        unsupported(
+            e.produce_in_stream_with_subject(
+                "s",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"x",
+                },
+                b"orders.created",
+            )
+            .map(|_| ()),
+        );
+        unsupported(e.set_subject_filter_in_stream("s", "g", Some("orders.*")));
+        unsupported(e.set_streaming_in_stream("s", "g", true));
+        unsupported(e.declare_partitioned_stream("parts", 4).map(|_| ()));
+        // The default stream's subject path is NOT shared-mode routed and keeps working.
+        e.produce_with_subject(
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"y",
+            },
+            b"orders.created",
+        )
+        .unwrap();
+        // An EMPTY subject is the plain named produce (no reject).
+        produce_named(&mut e, "s", b"r1");
+    }
+
+    #[test]
+    fn storage_mode_mismatch_fails_closed_in_both_directions() {
+        // Opening a data dir under the WRONG storage mode is a typed refusal, never a silent
+        // misread (invariant: mode-mismatch-on-open MUST fail closed).
+        let mismatch = |r: Result<Engine<InMemoryFs, ManualClock>, EngineError>| match r {
+            Err(EngineError::Storage(StorageError::Io(err))) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            Err(other) => panic!("expected a typed InvalidData mismatch, got {other:?}"),
+            Ok(_) => panic!("expected a typed InvalidData mismatch, got Ok"),
+        };
+        // Per-stream data dir -> shared-mode open: refused (the per-stream segments would be
+        // silently shadowed).
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            produce_named_on(&mut e, "orders", b"r0");
+        }
+        mismatch(Engine::open(
+            fs.clone(),
+            ManualClock::new(),
+            shared_config(10, 5),
+        ));
+        // ... and the SAME dir keeps opening fine in its own mode.
+        assert!(Engine::open(fs, ManualClock::new(), config(10, 5)).is_ok());
+        // Shared data dir -> default-mode open: refused (every named stream would read as empty).
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), shared_config(10, 5)).unwrap();
+            produce_named_on(&mut e, "orders", b"r0");
+        }
+        mismatch(Engine::open(fs.clone(), ManualClock::new(), config(10, 5)));
+        assert!(Engine::open(fs, ManualClock::new(), shared_config(10, 5)).is_ok());
+        // A pstreams/ subtree -> shared-mode open: refused (partitioned streams are per-stream-log
+        // storage).
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            assert!(e.declare_partitioned_stream("parts", 2).unwrap());
+        }
+        mismatch(Engine::open(fs, ManualClock::new(), shared_config(10, 5)));
+    }
+
+    #[test]
+    fn shared_mode_hot_set_lru_is_inert_and_existence_cap_still_binds() {
+        // #565 in shared mode: `max_open_streams` does not apply (ONE log serves every stream, no
+        // per-stream fds), so far more streams than the cap stay simultaneously consumable; the
+        // `max_streams` EXISTENCE cap (#863) still binds.
+        let mut cfg = shared_config(10, 5);
+        cfg.max_open_streams = 1;
+        cfg.max_streams = 5;
+        let mut e = open(cfg);
+        for i in 0..5u8 {
+            let name = format!("s{i}");
+            produce_named(&mut e, &name, &[i]);
+        }
+        for i in 0..5u8 {
+            let name = format!("s{i}");
+            assert!(e.is_named_stream_resident(&name), "{name} stays resident");
+            let d = message(e.poll_in_stream(&name, "g", 0).unwrap());
+            assert_eq!(d.record.payload.as_ref(), &[i]);
+        }
+        assert_eq!(e.named_stream_count(), 5);
+        // The distinct-stream EXISTENCE cap still refuses a sixth stream.
+        assert!(matches!(
+            e.produce_in_stream(
+                "s5",
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"x",
+                },
+            ),
+            Err(EngineError::TooManyStreams { .. })
+        ));
     }
 
     #[test]

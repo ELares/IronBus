@@ -58,36 +58,53 @@
 //!   whichever streams had records in the torn region (bounded/reported over the shared bytes),
 //!   whereas per-stream logs contain a torn segment's blast radius to one stream. This is the I2
 //!   tradeoff the issue names explicitly.
-//! - **Retention (#566) is a GLOBAL commit-log reap, not per-stream.** The interleaved records cannot
-//!   be reaped for one stream independently; RocketMQ reaps the whole CommitLog by time/size and trims
-//!   the derived indexes. Wiring that reap is a documented follow-up (see the PR); this core keeps the
-//!   shared log append-only.
+//! - **Retention (#566) is a GLOBAL commit-log reap, not per-stream** ([`SharedWal::reap`]). The
+//!   interleaved records cannot be reaped for one stream independently; RocketMQ reaps the whole
+//!   CommitLog by time/size and trims the derived indexes. The reap is FLOORED by the caller at the
+//!   minimum committed offset across EVERY stream's consumer groups (mapped to a shared-log offset),
+//!   so one slow stream pins the whole shared log — the documented reduced contract.
 //! - **Subjects (#594) are not stored in shared mode** (the stored subject and the stream tag share
 //!   the fixed post-header frame slot and are mutually exclusive). Per-subject filtering within a
-//!   shared-WAL stream is a documented follow-up.
+//!   shared-WAL stream is therefore fail-closed rejected by the engine (a typed error, never a
+//!   silently empty filtered read).
 //! - **The DLQ (#1110) still composes per stream**: the dead-letter sink is a SEPARATE per-stream log
 //!   keyed by [`StreamId`], orthogonal to whether the SOURCE is a per-stream log or the shared WAL, so
 //!   a poisoned record's forensic copy still lands in its stream's DLQ unchanged.
 //!
-//! ## Scope boundary (what this module is NOT)
+//! ## Per-stream POSITIONS survive the global reap (the demux-floor checkpoint)
 //!
-//! This is the shared-WAL STORAGE PRIMITIVE only: tagged interleaved append, per-stream demux read,
-//! and index-rebuilding recovery over ONE commit log. Wiring it into the engine's
-//! `produce_in_stream`/`poll_in_stream`/`ack_in_stream` and recovery paths in place of the per-stream
-//! [`StreamSet`] — plus the global-reap retention and per-subject filtering above — is the deferred
-//! follow-up surfaced in the PR (like #693's deferred cooperative rebalance). The default per-stream
-//! mode is byte-for-byte untouched.
+//! A consumer's durable cursor (#681) is a STREAM-RELATIVE position, so positions must be STABLE
+//! across restarts even after a reap deleted the tagged records that defined them. The shared WAL
+//! makes them stable with a tiny crash-safe checkpoint (`shared-wal/reap.ckpt`, dual-slot CRC'd):
+//! before ANY segment is unlinked, the reap durably records the new LOGICAL EARLIEST shared offset
+//! `E` plus, per stream, the count of its records below `E` (that stream's position BASE). The
+//! write-then-unlink order is the safety argument: a crash anywhere leaves the physical log AT OR
+//! BEHIND the checkpointed `E`, and every record below `E` was already committed by every group (the
+//! reap floor), so recovery scans the log from `E`, numbers each stream's survivors from its
+//! checkpointed base, and every position is exactly what it was — no loss, no duplication, no
+//! renumbering. A physical earliest AHEAD of the checkpoint is impossible under this discipline and
+//! is refused fail-closed (foreign interference, never a silent mis-numbering).
+//!
+//! ## Scope boundary
+//!
+//! This module is the shared-WAL STORAGE substrate: tagged interleaved append, per-stream demux
+//! read over stable stream-relative positions, index-rebuilding recovery, and the checkpointed
+//! global reap. The ENGINE wiring (produce/poll/ack routing, per-stream durable cursors and DLQ
+//! sinks under `streams/<hex(name)>/`, the reap floor across every stream's groups) lives in
+//! `ironbus-server`'s engine (#597 wiring phase). The default per-stream mode is byte-for-byte
+//! untouched.
 
+use crate::checkpoint::SharedWalReapCheckpoint;
 use crate::fs::Filesystem;
 use crate::layout::SHARED_WAL_SUBDIR;
-use crate::log::{Append, Log, LogConfig};
+use crate::log::{Append, Log, LogConfig, ReapOutcome, RetentionBounds};
 use crate::loss::LossReport;
 use crate::segment::{OwnedRecord, StorageError};
 use crate::streamset::{StreamError, StreamId};
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::codec;
-use ironbus_core::types::Offset;
+use ironbus_core::types::{Offset, RecordFlags};
 use std::collections::BTreeMap;
 
 /// How a broker stores its NAMED streams — the storage-mode selector (#597), a tunable an operator
@@ -147,11 +164,52 @@ pub struct SharedWal<F: Filesystem, C: Clock> {
     /// The single shared commit log holding every stream's records, interleaved and tagged. ONE
     /// segment set + fd(s) for ALL streams — the density win.
     log: Log<F, C>,
-    /// The DERIVED per-stream index: for each stream, the ordered shared-log offsets of its records,
-    /// in stream order (ascending, since shared-log offsets are monotonic and a stream's records are
-    /// appended in order). Rebuilt from the log on [`SharedWal::open`], append-maintained on write. A
-    /// `BTreeMap` keeps iteration deterministic and the per-stream lookup O(log streams).
-    index: BTreeMap<StreamId, Vec<Offset>>,
+    /// The DERIVED per-stream index: for each stream, its position BASE (the count of its records
+    /// the checkpointed global reap has retired, see the module docs) plus the ordered shared-log
+    /// offsets of its SURVIVING records (ascending, since shared-log offsets are monotonic and a
+    /// stream's records are appended in order). Stream-relative position `base + i` maps to
+    /// `offsets[i]`. Rebuilt from the log + the reap checkpoint on [`SharedWal::open`],
+    /// append-maintained on write, trimmed by [`SharedWal::reap`]. A `BTreeMap` keeps iteration
+    /// deterministic and the per-stream lookup O(log streams).
+    index: BTreeMap<StreamId, StreamSlot>,
+    /// The `shared-wal/` subdirectory handle, held so the reap checkpoint file can be created and
+    /// reopened beside the shared log's segments.
+    shared_fs: F,
+    /// The LOGICAL earliest shared-log offset: every record below it has been retired from the
+    /// per-stream indexes by a checkpointed reap (its bytes may briefly outlive it on disk in the
+    /// crash window between the checkpoint fsync and the segment unlink — such survivors are
+    /// invisible, all below the reap floor, and reclaimed by the next physical reap). Always at or
+    /// ahead of the PHYSICAL [`Log::earliest_offset`]; recovery fails closed on the reverse.
+    logical_earliest: u64,
+    /// The demux-floor checkpoint handle (`reap.ckpt`, dual-slot CRC'd), `Some` once a reap has
+    /// advanced the floor (or the file existed at open). A shared WAL that is never reaped never
+    /// creates the file, so an unreaped data dir's image is unchanged from #1122.
+    reap_checkpoint: Option<SharedWalReapCheckpoint<F::File>>,
+}
+
+/// One stream's slot in the derived index: its position BASE (records retired by the checkpointed
+/// global reap) plus the shared-log offsets of its surviving records, in stream order.
+#[derive(Default)]
+struct StreamSlot {
+    /// The count of this stream's records the global reap has retired: its first SURVIVING record
+    /// is stream-relative position `base`. `0` until a reap retires one of its records.
+    base: u64,
+    /// The shared-log offsets of the surviving records, ascending; `offsets[i]` is stream-relative
+    /// position `base + i`.
+    offsets: Vec<Offset>,
+}
+
+impl StreamSlot {
+    /// The next append's stream-relative position: `base + len` (total positions ever assigned).
+    fn next_position(&self) -> u64 {
+        self.base + self.offsets.len() as u64
+    }
+
+    /// The number of surviving offsets strictly below the shared-log offset `bound` — the
+    /// partition point the reap trim and the durable-head gate share.
+    fn surviving_below(&self, bound: u64) -> usize {
+        self.offsets.partition_point(|o| o.get() < bound)
+    }
 }
 
 impl<F: Filesystem, C: Clock> std::fmt::Debug for SharedWal<F, C> {
@@ -169,71 +227,151 @@ impl<F: Filesystem, C: Clock> std::fmt::Debug for SharedWal<F, C> {
 /// buffer rather than one syscall per record or one buffer for the whole log.
 const RECOVERY_SCAN_CHUNK: usize = 1024;
 
-impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
+/// The file name of the shared WAL's crash-safe REAP (demux-floor) checkpoint, under
+/// [`SHARED_WAL_SUBDIR`] beside the shared log's segments. See the module docs: written and fsynced
+/// BEFORE any segment is unlinked, so per-stream positions survive a crash anywhere in a reap.
+const REAP_CHECKPOINT: &str = "reap.ckpt";
+
+/// The reap-checkpoint snapshot format version (the payload's first byte).
+const REAP_SNAPSHOT_VERSION: u8 = 1;
+
+impl<F: Filesystem, C: Clock> SharedWal<F, C> {
     /// Opens (recovering, or creating fresh) the shared WAL rooted at `fs`: opens the ONE shared commit
-    /// log under [`SHARED_WAL_SUBDIR`] with the standard longest-valid-prefix recovery, then REBUILDS
-    /// the per-stream index by scanning that log once and demultiplexing each record's stored tag.
+    /// log under [`SHARED_WAL_SUBDIR`] with the standard longest-valid-prefix recovery, recovers the
+    /// reap (demux-floor) checkpoint if one exists, then REBUILDS the per-stream index by scanning the
+    /// log from the checkpointed logical earliest and demultiplexing each record's stored tag, numbering
+    /// each stream's survivors from its checkpointed position base.
     ///
     /// The returned [`SharedWalRecovery`] carries the shared log's bounded/reported loss and the
     /// per-stream record counts the scan reconstructed. A torn tail is truncated fail-closed (its loss
     /// reported); every surviving durable record is placed under its stream's index by its tag, so each
-    /// stream's committed sequence is reconstructed exactly (invariant 2).
+    /// stream's committed sequence — and every stream-relative POSITION — is reconstructed exactly
+    /// (invariant 2), reap or no reap.
     ///
     /// # Errors
     /// Propagates a [`StorageError`] from creating the `shared-wal/` subdir, opening/recovering the
-    /// shared log, or reading it during the demux scan.
+    /// shared log, or reading it during the demux scan. Fails CLOSED (`InvalidData`) when the reap
+    /// checkpoint is present but undecodable, or when the physical log starts AHEAD of the
+    /// checkpointed logical earliest — either would silently mis-number per-stream positions, which
+    /// this mode must never do.
     pub fn open(
         fs: &F,
         clock: C,
         config: LogConfig,
     ) -> Result<OpenedSharedWal<F, C>, StorageError> {
+        let log_fs = fs.subdir(SHARED_WAL_SUBDIR).map_err(StorageError::Io)?;
         let shared_fs = fs.subdir(SHARED_WAL_SUBDIR).map_err(StorageError::Io)?;
-        let log = Log::open(shared_fs, clock, config)?;
+        let log = Log::open(log_fs, clock, config)?;
+        // Recover the demux-floor checkpoint (see the module docs). Its payload is LOAD-BEARING for
+        // position exactness, so unlike the tolerant cursor checkpoints a valid-slot-but-undecodable
+        // payload is a fail-closed refusal, never a silent bases-of-zero fallback (which would
+        // renumber every reaped stream's positions). A missing file (or one with no completed write)
+        // means no reap ever completed its checkpoint — and therefore, by the write-then-unlink
+        // discipline, no reap ever unlinked a segment — which the physical-earliest check pins.
+        let (reap_checkpoint, recovered) = if shared_fs.exists(REAP_CHECKPOINT)? {
+            let (cp, payload) = SharedWalReapCheckpoint::open(shared_fs.open(REAP_CHECKPOINT)?)?;
+            (Some(cp), payload)
+        } else {
+            (None, None)
+        };
+        let (logical_earliest, bases) = match recovered {
+            Some(payload) => decode_reap_snapshot(&payload).ok_or_else(|| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the shared-WAL reap checkpoint is undecodable; refusing to open rather than \
+                     mis-number per-stream positions (fail-closed)",
+                ))
+            })?,
+            None => (0, BTreeMap::new()),
+        };
+        let physical_earliest = log.earliest_offset().get();
+        if physical_earliest > logical_earliest {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the shared commit log starts at offset {physical_earliest} but the reap \
+                     checkpoint records logical earliest {logical_earliest}: segments were removed \
+                     without the checkpointed write-then-unlink discipline, so per-stream positions \
+                     cannot be reconstructed exactly; refusing to open (fail-closed)"
+                ),
+            )));
+        }
         let mut wal = SharedWal {
             log,
             index: BTreeMap::new(),
+            shared_fs,
+            logical_earliest,
+            reap_checkpoint,
         };
-        let undecodable = wal.rebuild_index()?;
+        let undecodable = wal.rebuild_index(&bases)?;
         let recovery = SharedWalRecovery {
             recovered_truncated_bytes: wal.log.recovered_truncated_bytes(),
             loss_report: wal.log.loss_report().clone(),
             stream_record_counts: wal
                 .index
                 .iter()
-                .map(|(id, offs)| (id.clone(), offs.len()))
+                .map(|(id, slot)| (id.clone(), slot.offsets.len()))
                 .collect(),
             undecodable_tag_records: undecodable,
         };
         Ok((wal, recovery))
     }
 
-    /// Scans the shared commit log from offset 0 to its durable head, demultiplexing each record's
-    /// stored tag into the per-stream index. Returns the count of records whose tag was absent or not a
-    /// valid stream name (undecodable — placed under no stream). The scan reads at most
-    /// [`RECOVERY_SCAN_CHUNK`] raw frames per positioned read, so peak memory is one chunk, not the
-    /// whole log. Only the DURABLE prefix (below the flushed head) is scanned, which is exactly the
-    /// longest valid prefix the shared log's own recovery already established.
-    fn rebuild_index(&mut self) -> Result<u64, StorageError> {
+    /// Scans the shared commit log from the LOGICAL earliest offset to its durable head,
+    /// demultiplexing each record's stored tag into the per-stream index and numbering each stream's
+    /// survivors from its checkpointed base in `bases`. Returns the count of records whose tag was
+    /// absent or not a valid stream name (undecodable — placed under no stream). The scan reads at
+    /// most [`RECOVERY_SCAN_CHUNK`] raw frames per positioned read, so peak memory is one chunk, not
+    /// the whole log. Only the DURABLE prefix (below the flushed head) is scanned, which is exactly
+    /// the longest valid prefix the shared log's own recovery already established.
+    ///
+    /// A stream present in `bases` but with NO surviving record still gets a slot (its base alone):
+    /// its position space must continue where it left off, so a fully-reaped stream's next append is
+    /// `base`, never a renumbered `0`.
+    fn rebuild_index(&mut self, bases: &BTreeMap<String, u64>) -> Result<u64, StorageError> {
         self.index.clear();
+        for (name, &base) in bases {
+            // A checkpointed name that no longer parses as a stream name is corrupt state the CRC
+            // did not catch conceptually — refuse rather than drop a stream's position base.
+            let id = StreamId::named(name).map_err(|_| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "the shared-WAL reap checkpoint names an invalid stream {name:?}; \
+                         refusing to open (fail-closed)"
+                    ),
+                ))
+            })?;
+            self.index.insert(
+                id,
+                StreamSlot {
+                    base,
+                    offsets: Vec::new(),
+                },
+            );
+        }
         let mut undecodable = 0u64;
         let flushed = self.log.flushed_offset().get();
-        let mut cursor = 0u64;
+        let mut cursor = self.logical_earliest;
         while cursor < flushed {
-            let (run, next) =
+            let (run, _next) =
                 self.log
                     .read_range_raw(Offset::new(cursor), RECOVERY_SCAN_CHUNK, None)?;
             if run.record_count == 0 {
-                // No contiguous raw run at `cursor` (e.g. a compacted region routed to the materialize
-                // path). The shared WAL is append-only in this core (retention is a deferred global
-                // reap), so this is not expected; advance to the suggested tail if it makes progress,
-                // else stop — fail-safe, never an infinite loop.
-                match next {
-                    Some(n) if n.get() > cursor => {
-                        cursor = n.get();
-                        continue;
-                    }
-                    _ => break,
-                }
+                // The durable range `[logical_earliest, flushed)` of the shared commit log is
+                // contiguous BY CONSTRUCTION: the only prefix remover is the checkpointed reap
+                // (whole leading segments) and compaction is never wired onto the shared log. A
+                // hole here would mean the index under-counts a stream's records — a silent
+                // position shift — so it is a fail-closed error, never a skipped span (#1123 item 3,
+                // the `record_count == 0` hardening).
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "the shared commit log has no readable run at offset {cursor} inside its \
+                         durable range (flushed {flushed}); the per-stream index cannot be rebuilt \
+                         exactly, refusing to open (fail-closed)"
+                    ),
+                )));
             }
             let bytes: &[u8] = &run.bytes;
             let base = run.first_offset.get();
@@ -251,6 +389,7 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
                     self.index
                         .entry(id)
                         .or_default()
+                        .offsets
                         .push(Offset::new(base + i));
                 } else {
                     undecodable += 1;
@@ -280,7 +419,7 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
         if self.index.contains_key(id) {
             Ok(false)
         } else {
-            self.index.insert(id.clone(), Vec::new());
+            self.index.insert(id.clone(), StreamSlot::default());
             Ok(true)
         }
     }
@@ -311,7 +450,7 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
         let offset = self
             .log
             .append_with_stream_tag(record, id.name().as_bytes())?;
-        // `id` was confirmed present above and `declare`/`close` (the only index mutators) do not run
+        // `id` was confirmed present above and `declare`/`reap` (the only index mutators) do not run
         // during this call, so the entry is still present; map the impossible `None` to a typed error
         // rather than an unwrap, so this method carries no panic path.
         let entry = self.index.get_mut(id).ok_or_else(|| {
@@ -320,17 +459,21 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
                 format!("stream {:?} vanished from the shared-WAL index", id.name()),
             ))
         })?;
-        let stream_pos = entry.len() as u64;
-        entry.push(offset);
+        let stream_pos = entry.next_position();
+        entry.offsets.push(offset);
         Ok(stream_pos)
     }
 
     /// Reads up to `max` of stream `id`'s records starting at STREAM-RELATIVE position `from_stream_pos`
-    /// (0 = the stream's first record), demultiplexed from the shared commit log via `id`'s index. Each
-    /// returned record is fully CRC-validated AND its stored tag is verified to equal `id` before it is
-    /// returned (invariant 1: a sibling stream's record can never be delivered here). A record that is
-    /// not yet durable (at or past the shared log's flushed head) is not returned; because a stream's
-    /// index offsets are ascending, the read stops at the first non-durable one.
+    /// (0 = the stream's first-ever record), demultiplexed from the shared commit log via `id`'s index.
+    /// Each returned record is fully CRC-validated AND its stored tag is verified to equal `id` before
+    /// it is returned (invariant 1: a sibling stream's record can never be delivered here), and its
+    /// `offset` field carries its STREAM-RELATIVE position (the consumer-visible per-stream offset
+    /// space). A record that is not yet durable (at or past the shared log's flushed head) is not
+    /// returned; because a stream's index offsets are ascending, the read stops at the first
+    /// non-durable one. A `from_stream_pos` below the stream's reaped earliest position starts at the
+    /// earliest surviving record instead (the caller-visible truncation signal is the ENGINE's
+    /// below-earliest check against [`SharedWal::stream_earliest`]).
     ///
     /// # Errors
     /// Returns [`StorageError::Io`] wrapping `NotFound` if `id` is not declared; [`StorageError`] from
@@ -342,27 +485,62 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
         from_stream_pos: u64,
         max: usize,
     ) -> Result<Vec<OwnedRecord>, StorageError> {
-        let offsets = self.index.get(id).ok_or_else(|| {
-            StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("stream {:?} is not declared in the shared WAL", id.name()),
-            ))
-        })?;
-        let start = usize::try_from(from_stream_pos).unwrap_or(usize::MAX);
-        let flushed = self.log.flushed_offset().get();
+        if !self.index.contains_key(id) {
+            return Err(not_declared(id));
+        }
         let mut out = Vec::new();
-        for &offset in offsets.iter().skip(start) {
-            if out.len() >= max {
-                break;
+        let mut pos = from_stream_pos.max(self.stream_earliest(id));
+        while out.len() < max {
+            match self.read_at(id, pos)? {
+                Some(record) => out.push(record),
+                None => break,
             }
-            // A stream's index offsets are ascending, so the first non-durable one ends the readable
-            // run (every later offset is also non-durable). This is the per-stream durable-head gate.
-            if offset.get() >= flushed {
-                break;
-            }
-            out.push(self.read_one_demuxed(id, offset)?);
+            pos += 1;
         }
         Ok(out)
+    }
+
+    /// Reads the ONE record of stream `id` at STREAM-RELATIVE position `pos`, or `Ok(None)` when
+    /// `pos` is at or past the stream's DURABLE head (appended-but-unsynced records are invisible,
+    /// the per-stream durable-head gate). The record's stored tag is verified to equal `id`
+    /// (invariant 1) and its `offset` field is remapped to `pos` — the stream-relative position IS
+    /// the consumer-visible offset space in shared mode, dense per stream exactly like a per-stream
+    /// log's offsets. This is the engine's per-record consume read seam (#597 wiring).
+    ///
+    /// # Errors
+    /// [`StorageError::Io`]/`NotFound` if `id` is not declared; `InvalidData` if `pos` is below the
+    /// stream's reaped earliest position (the caller checks [`SharedWal::stream_earliest`] first, so
+    /// reaching this is an internal-ordering bug surfaced fail-closed, never a silent wrong record);
+    /// else a storage error from the positioned read or the tag re-verify.
+    pub fn read_at(&self, id: &StreamId, pos: u64) -> Result<Option<OwnedRecord>, StorageError> {
+        let slot = self.index.get(id).ok_or_else(|| not_declared(id))?;
+        if pos < slot.base {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "shared-WAL read of stream {:?} at position {pos} below its reaped earliest \
+                     {} (fail-closed; the caller must surface truncation instead)",
+                    id.name(),
+                    slot.base,
+                ),
+            )));
+        }
+        let Ok(idx) = usize::try_from(pos - slot.base) else {
+            return Ok(None);
+        };
+        let Some(&offset) = slot.offsets.get(idx) else {
+            return Ok(None);
+        };
+        // The per-stream durable-head gate: never return a not-yet-durable record.
+        if offset.get() >= self.log.flushed_offset().get() {
+            return Ok(None);
+        }
+        let mut record = self.read_one_demuxed(id, offset)?;
+        // The consumer-visible offset space is the STREAM-RELATIVE position: dense per stream, the
+        // exact shape a per-stream log's offsets have, so the engine's cursor/lease machinery (#681)
+        // composes unchanged.
+        record.offset = Offset::new(pos);
+        Ok(Some(record))
     }
 
     /// Reads and demultiplexes the single record at shared-log `offset`, verifying its stored tag
@@ -391,17 +569,144 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
             )));
         }
         // The blobs are refcounted slices of the shared read buffer the view borrows (zero-copy). A
-        // shared-WAL record carries a tag, never a subject, so `subject` is empty.
+        // shared-WAL record carries a tag, never a subject, so `subject` is empty. The tag itself is
+        // carried in `stream_tag` so byte-capped read paths account the STORED frame size exactly
+        // (#1123 item 2), while the `HAS_STREAM_TAG` bit is CLEARED on the materialized record: the
+        // tag is storage-internal demux state, and a downstream re-encode of this record (the
+        // per-stream DLQ sink's forensic copy) must not claim a tag field it does not carry.
         Ok(OwnedRecord {
             offset,
             seq: view.seq,
             timestamp_ms: view.timestamp_ms,
-            flags: view.flags,
+            flags: RecordFlags::from_bits(view.flags.bits() & !RecordFlags::HAS_STREAM_TAG.bits()),
             key: run.bytes.slice_ref(view.key),
             headers: run.bytes.slice_ref(view.headers),
             payload: run.bytes.slice_ref(view.payload),
             subject: Bytes::new(),
+            stream_tag: run.bytes.slice_ref(tag),
         })
+    }
+
+    /// This stream's DURABLE head in its stream-relative POSITION space: the position one past its
+    /// last durable record (`base + surviving-durable count`), i.e. the per-stream twin of
+    /// [`Log::flushed_offset`]. `0` for an undeclared stream (the caller gates existence separately).
+    #[must_use]
+    pub fn stream_durable_len(&self, id: &StreamId) -> u64 {
+        let Some(slot) = self.index.get(id) else {
+            return 0;
+        };
+        let flushed = self.log.flushed_offset().get();
+        slot.base + slot.surviving_below(flushed) as u64
+    }
+
+    /// This stream's EARLIEST retained stream-relative position (its reap base): positions below it
+    /// were retired by the checkpointed global reap, the per-stream twin of [`Log::earliest_offset`].
+    /// `0` for an undeclared or never-reaped stream.
+    #[must_use]
+    pub fn stream_earliest(&self, id: &StreamId) -> u64 {
+        self.index.get(id).map_or(0, |slot| slot.base)
+    }
+
+    /// The SHARED-log offset of stream `id`'s first surviving record at or after stream-relative
+    /// position `pos`, or `None` when the stream has no surviving record there (fully consumed past
+    /// `pos`, or undeclared/empty). This is the position -> shared-offset mapping the engine's
+    /// global-reap FLOOR uses: a group committed to position `p` still needs every record from `p`
+    /// on, i.e. every shared offset at or above this mapping — so the min of it across all streams'
+    /// groups is exactly the offset no reap may cross (invariant: never reap un-consumed records).
+    #[must_use]
+    pub fn first_offset_at_or_after(&self, id: &StreamId, pos: u64) -> Option<Offset> {
+        let slot = self.index.get(id)?;
+        let idx = usize::try_from(pos.saturating_sub(slot.base)).unwrap_or(usize::MAX);
+        slot.offsets.get(idx).copied()
+    }
+
+    /// The GLOBAL retention reap of the ONE shared commit log (#597 wiring, the documented reduced
+    /// per-stream-retention contract): reaps whole leading sealed segments under `bounds`, floored at
+    /// `protect_below` — the SHARED-log offset below which every stream's every group has committed
+    /// (the engine computes it as the min of [`SharedWal::first_offset_at_or_after`] over all
+    /// streams' min committed positions), so no stream's un-consumed record is ever reclaimed.
+    ///
+    /// The POSITION-EXACTNESS discipline (see the module docs): when advancing is possible (a sealed
+    /// prefix ends at or below the floor and a retention bound is tripped), the reap first writes and
+    /// FSYNCS the demux-floor checkpoint — the new logical earliest plus every affected stream's
+    /// position base — and only then trims the in-memory indexes and unlinks segments. A crash
+    /// anywhere leaves the physical log at-or-behind the checkpoint, and recovery renumbers nothing.
+    /// A checkpoint snapshot that would not fit its payload cap is NOT written and the reap simply
+    /// does not advance (bounded, documented, never a torn snapshot).
+    ///
+    /// # Errors
+    /// Propagates a storage error from the checkpoint write or the underlying [`Log::reap`]. On a
+    /// checkpoint-write error nothing was trimmed or unlinked, so the WAL is unchanged.
+    pub fn reap(
+        &mut self,
+        bounds: RetentionBounds,
+        protect_below: Offset,
+    ) -> Result<ReapOutcome, StorageError> {
+        if bounds == RetentionBounds::default() {
+            return Ok(ReapOutcome::default());
+        }
+        // Advance the demux floor only when it can actually unlock a physical reap: some sealed
+        // prefix ends at or below the consumer-safe floor, beyond the current logical earliest, and
+        // a retention bound is tripped (the same trip test `Log::reap`'s loop head applies). This
+        // keeps the checkpoint fsync OFF the produce path except when a segment is actually about to
+        // be retired.
+        if let Some(end) = self.log.sealed_prefix_end_at_or_below(protect_below.get()) {
+            if end > self.logical_earliest
+                && self.log.retention_tripped(bounds)
+                && self.write_reap_checkpoint(end)?
+            {
+                // The checkpoint is durable: retiring everything below `end` from the indexes is
+                // now crash-safe (recovery scans from `end` and numbers from the bases just
+                // checkpointed, whether or not the unlink below completes).
+                for slot in self.index.values_mut() {
+                    let k = slot.surviving_below(end);
+                    slot.offsets.drain(..k);
+                    slot.base += k as u64;
+                }
+                self.logical_earliest = end;
+            }
+        }
+        self.log.reap(bounds, self.logical_earliest)
+    }
+
+    /// Writes (and fsyncs) the demux-floor checkpoint for a reap advancing the logical earliest to
+    /// `end`: `end` plus, per stream, its position base AT `end` (current base + survivors below
+    /// `end`). Returns `false` WITHOUT writing when the snapshot would exceed the payload cap (the
+    /// reap then simply does not advance — safe, bounded, documented), `true` after a durable write.
+    /// Creates (and dir-syncs) the checkpoint file on first use.
+    fn write_reap_checkpoint(&mut self, end: u64) -> Result<bool, StorageError> {
+        let bases: BTreeMap<&str, u64> = self
+            .index
+            .iter()
+            .map(|(id, slot)| (id.name(), slot.base + slot.surviving_below(end) as u64))
+            .filter(|&(_, base)| base > 0)
+            .collect();
+        let payload = encode_reap_snapshot(end, &bases);
+        if payload.len() > crate::checkpoint::SHARED_WAL_REAP_PAYLOAD {
+            return Ok(false);
+        }
+        if self.reap_checkpoint.is_none() {
+            let file = if self.shared_fs.exists(REAP_CHECKPOINT)? {
+                self.shared_fs.open(REAP_CHECKPOINT)?
+            } else {
+                let f = self.shared_fs.create_new(REAP_CHECKPOINT)?;
+                self.shared_fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            };
+            let (cp, _) = SharedWalReapCheckpoint::open(file)?;
+            self.reap_checkpoint = Some(cp);
+        }
+        // Just installed above when absent, so this is always Some; no panic path.
+        if let Some(cp) = self.reap_checkpoint.as_mut() {
+            cp.write(&payload)?;
+        }
+        Ok(true)
+    }
+
+    /// The LOGICAL earliest shared-log offset (see the struct field): for tests and observability.
+    #[must_use]
+    pub fn logical_earliest(&self) -> u64 {
+        self.logical_earliest
     }
 
     /// Makes every appended record durable (ONE `fdatasync` on the shared commit log, for ALL streams —
@@ -432,11 +737,12 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
         self.index.keys().cloned().collect()
     }
 
-    /// The number of records currently indexed for stream `id` (its stream-relative length, including
-    /// not-yet-synced appends), or `0` if `id` is not declared.
+    /// The stream's NEXT append position (`base + surviving count`, including not-yet-synced
+    /// appends) — the total positions ever assigned to `id` — or `0` if `id` is not declared.
     #[must_use]
     pub fn stream_len(&self, id: &StreamId) -> usize {
-        self.index.get(id).map_or(0, Vec::len)
+        usize::try_from(self.index.get(id).map_or(0, StreamSlot::next_position))
+            .unwrap_or(usize::MAX)
     }
 
     /// The number of on-disk segment FILES the shared commit log holds — the density quantity: ONE
@@ -474,6 +780,75 @@ impl<F: Filesystem + Clone, C: Clock + Clone> SharedWal<F, C> {
 fn tag_to_stream_id(tag: &[u8]) -> Option<StreamId> {
     let name = std::str::from_utf8(tag).ok()?;
     StreamId::named(name).ok()
+}
+
+/// The typed not-declared error every read/append boundary of the shared WAL returns for a stream
+/// that was never [`SharedWal::declare`]d — a typo'd id fails closed, never a silently-minted stream.
+fn not_declared(id: &StreamId) -> StorageError {
+    StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("stream {:?} is not declared in the shared WAL", id.name()),
+    ))
+}
+
+/// Encodes the reap (demux-floor) snapshot: `[version u8][logical earliest u64 le][count u32 le]`
+/// then per entry `[name len u16 le][name bytes][base u64 le]`, names in deterministic (`BTreeMap`)
+/// order. Only streams with a NON-ZERO base are included (a zero base is the decode-side default),
+/// keeping the snapshot proportional to the streams the reap has actually touched.
+fn encode_reap_snapshot(earliest: u64, bases: &BTreeMap<&str, u64>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13 + bases.keys().map(|n| 10 + n.len()).sum::<usize>());
+    out.push(REAP_SNAPSHOT_VERSION);
+    out.extend_from_slice(&earliest.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(bases.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for (name, base) in bases {
+        // A stream name is validated <= 64 bytes at declare, so the u16 length always fits.
+        out.extend_from_slice(&u16::try_from(name.len()).unwrap_or(u16::MAX).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&base.to_le_bytes());
+    }
+    out
+}
+
+/// A bounds-checked split (the MSRV-friendly `split_at_checked`): `Some((head, tail))` with `head`
+/// exactly `mid` bytes, or `None` when the slice is too short.
+fn take_bytes(bytes: &[u8], mid: usize) -> Option<(&[u8], &[u8])> {
+    if mid > bytes.len() {
+        None
+    } else {
+        Some(bytes.split_at(mid))
+    }
+}
+
+/// Decodes a reap (demux-floor) snapshot, or `None` for a payload this version cannot interpret
+/// EXACTLY (wrong version, short buffer, trailing garbage, non-UTF-8 name, duplicate name). `None`
+/// is a FAIL-CLOSED open (see [`SharedWal::open`]) — the snapshot is load-bearing for per-stream
+/// position exactness, so a partially-understood one must never be silently half-applied.
+fn decode_reap_snapshot(bytes: &[u8]) -> Option<(u64, BTreeMap<String, u64>)> {
+    let (&version, rest) = bytes.split_first()?;
+    if version != REAP_SNAPSHOT_VERSION {
+        return None;
+    }
+    let (earliest_bytes, rest) = take_bytes(rest, 8)?;
+    let earliest = u64::from_le_bytes(earliest_bytes.try_into().ok()?);
+    let (count_bytes, mut rest) = take_bytes(rest, 4)?;
+    let count = u32::from_le_bytes(count_bytes.try_into().ok()?);
+    let mut bases = BTreeMap::new();
+    for _ in 0..count {
+        let (len_bytes, r) = take_bytes(rest, 2)?;
+        let name_len = usize::from(u16::from_le_bytes(len_bytes.try_into().ok()?));
+        let (name_bytes, r) = take_bytes(r, name_len)?;
+        let (base_bytes, r) = take_bytes(r, 8)?;
+        let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+        let base = u64::from_le_bytes(base_bytes.try_into().ok()?);
+        if bases.insert(name, base).is_some() {
+            return None; // a duplicate name means a corrupt snapshot
+        }
+        rest = r;
+    }
+    if !rest.is_empty() {
+        return None; // trailing bytes mean a corrupt snapshot
+    }
+    Some((earliest, bases))
 }
 
 #[cfg(test)]
@@ -791,6 +1166,195 @@ mod tests {
         let ghost = named("ghost");
         assert!(wal.append_to(&ghost, &rec(b"x")).is_err());
         assert!(wal.read_stream(&ghost, 0, 1).is_err());
+    }
+
+    /// The GLOBAL reap respects the consumer-safe floor: with a SLOW stream's first record still
+    /// un-consumed (the floor maps to its shared offset), a tripped retention bound reaps NOTHING
+    /// below it — the slow stream's data survives — and once the floor advances past it, the sealed
+    /// prefix is physically reclaimed (segment count drops, logical earliest advances).
+    #[test]
+    fn global_reap_floors_at_the_slow_streams_offset_then_reclaims() {
+        let fs = InMemoryFs::new();
+        // Tiny segments so appends roll quickly and a sealed prefix exists to reap.
+        let config = LogConfig::new(256).unwrap();
+        let (mut wal, _) = SharedWal::open(&fs, ManualClock::new(), config).unwrap();
+        let fast = named("fast");
+        let slow = named("slow");
+        wal.declare(&fast).unwrap();
+        wal.declare(&slow).unwrap();
+        // slow0 lands FIRST (shared offset 0), then a burst of fast records rolls segments.
+        wal.append_to(&slow, &rec(b"slow0")).unwrap();
+        for i in 0..40u8 {
+            wal.append_to(&fast, &rec(format!("fast{i:02}").as_bytes()))
+                .unwrap();
+        }
+        wal.sync().unwrap();
+        assert!(wal.segment_count() > 2, "the burst rolled segments");
+        let before = wal.segment_count();
+        let bounds = RetentionBounds {
+            max_messages: 5,
+            ..RetentionBounds::default()
+        };
+        // The slow stream's consumer sits at position 0: the floor is slow0's shared offset (0), so
+        // NOTHING is reapable even though the count bound is tripped.
+        let floor = wal.first_offset_at_or_after(&slow, 0).unwrap();
+        assert_eq!(floor.get(), 0, "slow0 is the first shared record");
+        let outcome = wal.reap(bounds, floor).unwrap();
+        assert_eq!(outcome.segments_reaped, 0, "the floor protects everything");
+        assert_eq!(wal.segment_count(), before);
+        assert_eq!(wal.stream_earliest(&slow), 0);
+        assert_eq!(
+            wal.read_at(&slow, 0).unwrap().unwrap().payload.as_ref(),
+            b"slow0",
+            "the slow stream's un-consumed record survives"
+        );
+        // The slow consumer commits past its record: the floor advances to the durable head, and the
+        // same bound now physically reclaims the sealed prefix.
+        let head = wal.synced_offset();
+        let outcome = wal.reap(bounds, head).unwrap();
+        assert!(
+            outcome.segments_reaped > 0,
+            "the sealed prefix is reclaimed"
+        );
+        assert!(wal.segment_count() < before);
+        assert!(wal.logical_earliest() > 0);
+    }
+
+    /// Per-stream POSITIONS are exact across reap + restart (the demux-floor checkpoint): after a
+    /// global reap retires each stream's early records, a REOPEN reconstructs every surviving
+    /// record at exactly the position it was assigned at append time — no loss, no duplication, no
+    /// renumbering — and a read below the reaped earliest fails closed.
+    #[test]
+    fn positions_survive_a_reap_and_a_restart_exactly() {
+        let fs = InMemoryFs::new();
+        let config = LogConfig::new(256).unwrap();
+        let a = named("alpha");
+        let b = named("beta");
+        // Interleave appends; remember each record's (stream, position, payload).
+        let mut positions: Vec<(StreamId, u64, Vec<u8>)> = Vec::new();
+        {
+            let (mut wal, _) = SharedWal::open(&fs, ManualClock::new(), config).unwrap();
+            wal.declare(&a).unwrap();
+            wal.declare(&b).unwrap();
+            for i in 0..30u8 {
+                let (id, payload) = if i % 3 == 0 {
+                    (&b, format!("b{i:02}"))
+                } else {
+                    (&a, format!("a{i:02}"))
+                };
+                let pos = wal.append_to(id, &rec(payload.as_bytes())).unwrap();
+                positions.push((id.clone(), pos, payload.into_bytes()));
+            }
+            wal.sync().unwrap();
+            // Reap with the floor at the durable head (every group committed everything).
+            let bounds = RetentionBounds {
+                max_messages: 4,
+                ..RetentionBounds::default()
+            };
+            let outcome = wal.reap(bounds, wal.synced_offset()).unwrap();
+            assert!(outcome.segments_reaped > 0, "the reap physically reclaimed");
+            assert!(wal.stream_earliest(&a) > 0, "alpha's early records retired");
+        }
+        // REOPEN over the reaped image: every SURVIVING record reads back at its ORIGINAL position.
+        let (wal, recovery) = SharedWal::open(&fs, ManualClock::new(), config).unwrap();
+        assert_eq!(recovery.undecodable_tag_records, 0);
+        let mut surviving = 0;
+        for (id, pos, payload) in &positions {
+            if *pos < wal.stream_earliest(id) {
+                // Retired by the reap: a read below the earliest fails CLOSED, never a wrong record.
+                assert!(wal.read_at(id, *pos).is_err());
+                continue;
+            }
+            let got = wal.read_at(id, *pos).unwrap().unwrap();
+            assert_eq!(got.payload.as_ref(), payload.as_slice(), "position {pos}");
+            assert_eq!(got.offset.get(), *pos, "offset field = position");
+            surviving += 1;
+        }
+        assert!(surviving > 0, "some records survived the reap");
+        // The NEXT append continues each stream's position space, never renumbering from 0.
+        let mut wal = wal;
+        let next_a = wal.append_to(&a, &rec(b"a-next")).unwrap();
+        let expected_a = positions
+            .iter()
+            .filter(|(id, _, _)| id == &a)
+            .map(|(_, p, _)| p + 1)
+            .max()
+            .unwrap();
+        assert_eq!(next_a, expected_a, "positions continue after restart");
+    }
+
+    /// The CRASH WINDOW between the demux-floor checkpoint fsync and the segment unlink is safe
+    /// (the write-then-unlink discipline): the unlink is made to FAIL after the checkpoint is
+    /// durable, and a reopen still reconstructs every stream's positions exactly — the checkpointed
+    /// logical earliest simply runs ahead of the physical log, whose orphaned prefix is invisible.
+    #[test]
+    fn a_crash_between_checkpoint_and_unlink_keeps_positions_exact() {
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let config = LogConfig::new(256).unwrap();
+        let a = named("alpha");
+        let survivors: Vec<(u64, Vec<u8>)>;
+        {
+            let (mut wal, _) = SharedWal::open(&fs, ManualClock::new(), config).unwrap();
+            wal.declare(&a).unwrap();
+            for i in 0..30u8 {
+                wal.append_to(&a, &rec(format!("a{i:02}").as_bytes()))
+                    .unwrap();
+            }
+            wal.sync().unwrap();
+            assert!(wal.segment_count() > 2);
+            // Fail the FIRST unlink: the checkpoint (already fsynced) records the advanced floor,
+            // the physical log keeps its prefix — exactly the crash window.
+            control.fail_remove_on(1);
+            let bounds = RetentionBounds {
+                max_messages: 4,
+                ..RetentionBounds::default()
+            };
+            let err = wal.reap(bounds, wal.synced_offset());
+            assert!(err.is_err(), "the injected unlink failure surfaces");
+            assert!(
+                wal.logical_earliest() > 0,
+                "the floor advanced before the unlink"
+            );
+            survivors = (wal.stream_earliest(&a)..wal.stream_durable_len(&a))
+                .map(|p| {
+                    let r = wal.read_at(&a, p).unwrap().unwrap();
+                    (p, r.payload.to_vec())
+                })
+                .collect();
+            assert!(!survivors.is_empty());
+        }
+        // Reopen: logical earliest (checkpoint) > physical earliest (unlink failed). Recovery scans
+        // from the checkpoint and numbers from the checkpointed bases — positions exact, the
+        // orphaned physical prefix invisible.
+        let (wal, _) = SharedWal::open(&fs, ManualClock::new(), config).unwrap();
+        for (pos, payload) in &survivors {
+            let got = wal.read_at(&a, *pos).unwrap().unwrap();
+            assert_eq!(got.payload.as_ref(), payload.as_slice(), "position {pos}");
+        }
+        assert!(wal.read_at(&a, 0).is_err(), "below-earliest fails closed");
+    }
+
+    /// The demuxed record CLEARS the storage-internal `HAS_STREAM_TAG` bit and carries the stored
+    /// tag in `stream_tag`, so `encoded_len` accounts the tag field's STORED bytes exactly (#1123
+    /// item 2) while a downstream re-encode never claims a tag field it does not carry.
+    #[test]
+    fn demuxed_record_accounts_the_tag_field_and_clears_the_flag() {
+        let fs = InMemoryFs::new();
+        let (mut wal, _) = open(&fs);
+        let a = named("alpha");
+        wal.declare(&a).unwrap();
+        wal.append_to(&a, &rec(b"payload")).unwrap();
+        wal.sync().unwrap();
+        let got = wal.read_at(&a, 0).unwrap().unwrap();
+        assert!(!got.flags.contains(RecordFlags::HAS_STREAM_TAG));
+        assert_eq!(got.stream_tag.as_ref(), b"alpha");
+        // The frame on disk is exactly one record: the accounted length must equal the durable
+        // record bytes the log measured for it (the single source of truth for stored size).
+        assert_eq!(
+            got.encoded_len() as u64,
+            wal.shared_log().durable_record_bytes(),
+            "encoded_len accounts the stored tag field exactly"
+        );
     }
 
     /// The shared WAL syncs ALL streams with ONE fdatasync (the density win on commits): dirtying many

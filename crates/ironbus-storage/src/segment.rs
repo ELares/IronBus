@@ -12,9 +12,10 @@ use crate::loss::{CapViolation, ReasonCode};
 use bytes::{Bytes, BytesMut};
 use ironbus_core::codec::{self, BodyChecksums, DecodeError, RecordView};
 use ironbus_core::format::{
-    COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_STREAM_TAG_LEN_PREFIX, RECORD_SUBJECT_CRC_LEN,
-    RECORD_SUBJECT_LEN_PREFIX, RECORD_TRAILER_LEN, RECORD_XXH3_LEN, SEGMENT_FOOTER_LEN,
-    SEGMENT_HEADER_LEN, XXH3_PAYLOAD_THRESHOLD,
+    COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_STREAM_TAG_CRC_LEN,
+    RECORD_STREAM_TAG_LEN_PREFIX, RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX,
+    RECORD_TRAILER_LEN, RECORD_XXH3_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
+    XXH3_PAYLOAD_THRESHOLD,
 };
 use ironbus_core::segment::{CompactionMeta, SegmentError, SegmentFooter, SegmentHeader};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
@@ -366,6 +367,16 @@ pub struct OwnedRecord {
     /// subject-filtered consumer tests each record's subject against the group's pattern; a record
     /// with no stored subject is treated as non-matching (never swallowed by a `>` catch-all).
     pub subject: Bytes,
+    /// The stored STREAM TAG this record was framed with in a SHARED WAL (#597, the #1123
+    /// `encoded_len` follow-up), or EMPTY for every per-stream-log record (the default mode never
+    /// writes a tag). Populated ONLY by the shared-WAL demux read
+    /// ([`crate::shared_wal::SharedWal`]), which also CLEARS the `HAS_STREAM_TAG` flag bit on the
+    /// materialized record — the tag is storage-internal demux state, never a consumer-visible
+    /// field, and a downstream re-encode (the per-stream DLQ sink's forensic copy) must not claim a
+    /// tag field it does not carry. It exists here so [`OwnedRecord::encoded_len`] can account the
+    /// tag field's STORED bytes exactly on the byte-capped read paths. A refcounted slice of the
+    /// shared read buffer.
+    pub stream_tag: Bytes,
 }
 
 /// A CONTIGUOUS run of stored record frames returned WITHOUT materializing per-record
@@ -437,6 +448,9 @@ impl OwnedRecord {
             // decoded by `decode_with_subject` from `buf`), so this is one more refcount bump, no
             // copy. Empty for a record with no stored subject.
             subject: buf.slice_ref(subject),
+            // A stream tag (#597) is only ever materialized by the shared-WAL demux read, which
+            // constructs its records directly; every per-stream materializing path carries none.
+            stream_tag: Bytes::new(),
         }
     }
 
@@ -462,7 +476,18 @@ impl OwnedRecord {
         } else {
             RECORD_SUBJECT_LEN_PREFIX + self.subject.len() + RECORD_SUBJECT_CRC_LEN
         };
-        RECORD_HEADER_LEN + subject_field + body_len + xxh3_field + RECORD_TRAILER_LEN
+        // The optional STREAM-TAG field (#597, the #1123 follow-up): the shared-WAL demux read
+        // populates `stream_tag` with the stored tag it verified, so a shared-mode record's frame
+        // size accounts the tag field EXACTLY (same shape as the subject field — the const-assert
+        // above pins the two prefix widths equal, and the tag CRC width equals the subject CRC
+        // width by the frozen format). Mutually exclusive with a stored subject, so at most one of
+        // the two fields is ever counted. Empty for every per-stream-log record, adding nothing.
+        let tag_field = if self.stream_tag.is_empty() {
+            0
+        } else {
+            RECORD_STREAM_TAG_LEN_PREFIX + self.stream_tag.len() + RECORD_STREAM_TAG_CRC_LEN
+        };
+        RECORD_HEADER_LEN + subject_field + tag_field + body_len + xxh3_field + RECORD_TRAILER_LEN
     }
 }
 

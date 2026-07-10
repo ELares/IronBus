@@ -4517,6 +4517,50 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         )
     }
 
+    /// Whether the consumer-safe retention reaper ([`Log::reap`]) would consider the OLDEST sealed
+    /// segment ELIGIBLE under `bounds` right now — the SAME size / count / age trip test `reap`'s
+    /// loop head applies, WITHOUT unlinking anything. `false` when every bound is off, or when only
+    /// the active segment exists (there is never anything to reap then). This is the read-only
+    /// pre-check the shared-WAL global reap (#597) uses to decide whether paying its demux-floor
+    /// checkpoint fsync could actually unlock a physical reap; keeping it here (beside `reap`) keeps
+    /// the two trip tests one derivation, so they can never drift.
+    #[must_use]
+    pub fn retention_tripped(&self, bounds: RetentionBounds) -> bool {
+        if self.segments.len() < 2 {
+            return false;
+        }
+        let oldest = self.segments[0];
+        let over_bytes = bounds.max_bytes != 0 && self.durable_record_bytes() > bounds.max_bytes;
+        let over_count =
+            bounds.max_messages != 0 && self.durable_record_count() > bounds.max_messages;
+        let now_ms = self.clock.now_unix_millis();
+        let aged_out = bounds.max_age_ms != 0
+            && oldest.max_timestamp_ms.saturating_add(bounds.max_age_ms) < now_ms;
+        over_bytes || over_count || aged_out
+    }
+
+    /// The HIGHEST sealed-segment boundary (a covered base offset, i.e. an offset a [`Log::reap`]
+    /// could raise [`Log::earliest_offset`] to) that sits at or below `protect_below_offset`, or
+    /// `None` when no sealed prefix ends at or below it (including when only the active segment
+    /// exists). Walks the same "next segment's covered base" boundaries `reap` frees whole segments
+    /// against, so the returned offset is by construction ACHIEVABLE by a physical reap protected at
+    /// it. Read-only; used by the shared-WAL global reap (#597) to pick the exact demux-floor
+    /// checkpoint value, so the logical (indexed) earliest and the physical earliest coincide after
+    /// a completed reap.
+    #[must_use]
+    pub fn sealed_prefix_end_at_or_below(&self, protect_below_offset: u64) -> Option<u64> {
+        let mut end = None;
+        for slot in self.segments.iter().skip(1) {
+            let base = slot.covered_base_offset();
+            if base <= protect_below_offset {
+                end = Some(base);
+            } else {
+                break;
+            }
+        }
+        end
+    }
+
     /// The index in `segments` of the segment whose range holds `offset` (the slot with
     /// the largest `base_offset` not exceeding `offset`). Callers guarantee `offset` is
     /// at least the oldest base offset.

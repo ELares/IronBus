@@ -208,6 +208,7 @@ mod tests {
             headers: Bytes::new(),
             payload: Bytes::from(vec![u8::try_from(offset & 0xff).unwrap()]),
             subject: Bytes::new(),
+            stream_tag: Bytes::new(),
         }
     }
 

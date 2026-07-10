@@ -9,6 +9,9 @@ negotiated wire envelope are the stability anchors called out per entry.
 
 ## [Unreleased]
 
+### Added
+- Shared-WAL storage mode is now USABLE end to end (#597, wiring phase; the storage primitive shipped in #1122): `serve --storage-mode shared-wal` routes every NAMED stream's produce/consume/ack/recovery through ONE stream-tagged commit log under `shared-wal/` (one segment set + one covering `fdatasync` for all streams — the high-stream-count density fallback), while the durable per-group cursors (#681), attempt checkpoints (#358), per-stream DLQ sinks (#1110), and key-shared routing (#64) compose unchanged from each stream's `streams/<hex>/` metadata dir. Retention becomes ONE global reap floored at the min committed across every stream's groups, with a crash-safe demux-floor checkpoint (`shared-wal/reap.ckpt`, fsynced before any unlink) keeping per-stream offsets exact across reap + restart. Mode-mismatched data dirs are refused fail-closed BOTH ways at open; stored subjects/filtered subscriptions (#594), Tier-S streaming (#544), and partitioned streams (#693) are typed fail-closed rejects in shared mode (documented in `docs/CONTRACTS.md`). The default `per-stream` mode is byte-for-byte unchanged.
+
 ### Changed
 - Rolling-release calendar version format changed from `YYYY.MMDD.N` to `YYMM.1DD.1{Build}` (e.g. `2607.108.13` for 2026-07-08 build 3). The `1` prefixes on the day and build keep every component leading-zero-free, so the version is now valid SemVer and monotonically increasing, while still reading as a calendar version. Only the rolling (continuous) channel is affected; the formal `v*` semver channel and the internal crate version are unchanged.
 

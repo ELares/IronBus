@@ -68,6 +68,21 @@ pub const PRODUCER_SEQ_PAYLOAD: usize = 60 * 1024;
 /// retained log tail) is what makes metadata compaction crash-safe (#660 non-negotiable 3).
 pub const METADATA_SNAPSHOT_PAYLOAD: usize = 60 * 1024;
 
+/// The per-slot payload cap for the shared-WAL REAP (demux-floor) checkpoint (#597 wiring): the
+/// `(logical earliest shared offset, {stream -> reaped-record base count})` snapshot the shared-WAL
+/// global retention reap writes (and fsyncs) BEFORE any segment is unlinked, so a restart rebuilds
+/// each stream's per-stream POSITIONS exactly even though the reaped prefix's tagged records are
+/// gone. Each entry is `2 + stream name (<= 64) + 8` bytes, at most 74 bytes; this 60 KiB cap
+/// (the slot `u16` length field bounds a payload at 65535 bytes, like the other large checkpoints)
+/// holds ~830 worst-case entries and several thousand with typical short names. Unlike the tolerant
+/// checkpoints above, this payload is LOAD-BEARING for demux correctness, so an
+/// undecodable-but-CRC-valid payload fails the open closed (see `ironbus_storage::shared_wal`); the
+/// dual-slot discipline still means a TORN write reverts to the prior durable snapshot, which is
+/// always consistent because the matching unlink only ever runs AFTER its snapshot is durable. A
+/// snapshot that would exceed the cap is NOT written and the reap simply does not advance past its
+/// current floor (retention stalls, bounded and documented — never a torn or truncated snapshot).
+pub const SHARED_WAL_REAP_PAYLOAD: usize = 60 * 1024;
+
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
 const CRC_LEN: usize = 4;
@@ -164,6 +179,13 @@ pub type ProducerSeqCheckpoint<F> = SlotCheckpoint<F, PRODUCER_SEQ_PAYLOAD>;
 /// full log, or the new snapshot + the (un-truncated or truncated) log — never a gap where neither
 /// holds the committed state.
 pub type MetadataSnapshotCheckpoint<F> = SlotCheckpoint<F, METADATA_SNAPSHOT_PAYLOAD>;
+
+/// The crash-safe checkpoint for the shared-WAL REAP (demux-floor) snapshot (#597 wiring): a
+/// [`SHARED_WAL_REAP_PAYLOAD`]-per-slot [`SlotCheckpoint`]. The write-then-unlink discipline (the
+/// snapshot is fsynced BEFORE any shared-log segment is unlinked) is what keeps every stream's
+/// per-stream positions exact across a crash anywhere in a global reap; see
+/// [`crate::shared_wal::SharedWal`].
+pub type SharedWalReapCheckpoint<F> = SlotCheckpoint<F, SHARED_WAL_REAP_PAYLOAD>;
 
 impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CAP> {
     /// Bytes per slot for this cap: sequence, payload length, payload, CRC.

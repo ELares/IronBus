@@ -1520,6 +1520,7 @@ mod tests {
             headers: Bytes::copy_from_slice(headers),
             payload: Bytes::copy_from_slice(payload),
             subject: Bytes::new(),
+            stream_tag: Bytes::new(),
         }
     }
 
@@ -1737,6 +1738,7 @@ mod tests {
             headers: Bytes::from_static(b"hdr"),
             payload: Bytes::from(compressed_payload.clone()),
             subject: Bytes::new(),
+            stream_tag: Bytes::new(),
         };
         sink.append_poison("orders", &src, 6).unwrap();
 

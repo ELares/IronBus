@@ -414,6 +414,40 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
     }
 }
 
+impl<F: Filesystem, C: Clock> StreamSet<F, C> {
+    /// Opens ONLY the DEFAULT stream's slot — the inert `""` re-open of the (already-recovered) root
+    /// log — WITHOUT scanning or opening anything under `streams/` (#597, shared-WAL wiring). This is
+    /// the substrate the ENGINE uses in [`crate::shared_wal::StorageMode::SharedWal`] mode, where the
+    /// named streams live in the ONE shared commit log and the `streams/<hex(name)>/` subdirectories
+    /// hold ONLY per-stream consumer METADATA (cursor / attempts checkpoints and the per-stream
+    /// `dlq/` sink) with NO segments: opening a per-stream [`Log`] there would materialize an empty
+    /// segment file per stream (defeating the density point) AND create a second, empty-looking read
+    /// surface shadowing the shared WAL's real records. With only the `""` slot, every named-stream
+    /// query on this set answers "not open" (`get` -> `None`, `is_open` -> `false`,
+    /// `open_named_count` -> `0`), which is exactly the fail-safe answer for the engine's untouched
+    /// per-stream-mode code paths — the shared-mode branches never consult this set for a named
+    /// stream. The default stream's contract is unchanged: the engine still serves `""` from its own
+    /// root [`Log`]; this slot is the same inert re-open [`StreamSet::open`] performs.
+    ///
+    /// # Errors
+    /// Propagates a [`StorageError`] from re-opening the root log.
+    pub fn open_default_only(fs: &F, clock: C, config: LogConfig) -> Result<Self, StorageError>
+    where
+        F: Clone,
+        C: Clone,
+    {
+        let mut streams = BTreeMap::new();
+        let root = Log::open(fs.clone(), clock.clone(), config)?;
+        streams.insert(StreamId::default_stream(), root);
+        Ok(StreamSet {
+            streams,
+            clock,
+            config,
+            lru: Vec::new(),
+        })
+    }
+}
+
 // `declare` (open-or-reopen a single named stream's log) needs only the CLOCK to be `Clone` (it clones
 // the clock seam into the new `Log`) — NOT the filesystem, since [`Filesystem::subdir`] borrows `&self`
 // and [`Log::open`] takes an owned subdir handle. Splitting it out of the `F: Clone` block above is what
