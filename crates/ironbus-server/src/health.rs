@@ -1285,7 +1285,10 @@ fn backpressure_metric_lines(bp: &BackpressureSnapshot) -> String {
          ironbus_wal_fsync_headroom_shed_total {wal_headroom_shed}\n\
          # HELP ironbus_wal_fsync_headroom_bytes The configured fsync-headroom admission window in bytes (#378): the most un-fsynced buffered-but-not-durable record bytes the write frontier may run ahead of the durable frontier before a produce is throttled (a group-commit drain forced first) or shed; 0 = disabled (unbounded by this control).\n\
          # TYPE ironbus_wal_fsync_headroom_bytes gauge\n\
-         ironbus_wal_fsync_headroom_bytes {wal_fsync_headroom_bytes}\n",
+         ironbus_wal_fsync_headroom_bytes {wal_fsync_headroom_bytes}\n\
+         # HELP ironbus_ack_ahead_shed_total Client acks accepted on the wire but not recorded in the group cursor under the acked-ahead range cap (#543): recording them would have fragmented the run-length acked-ahead set past max_acked_ahead_runs, so the offset stays unacked and redelivers later (an at-least-once duplicate, never a loss; the committed watermark is never forced past an unacked gap). A rising value is a pathologically fragmented out-of-order ack pattern.\n\
+         # TYPE ironbus_ack_ahead_shed_total counter\n\
+         ironbus_ack_ahead_shed_total {ack_ahead_shed}\n",
         codel_shed = bp.codel_shed,
         codel_backstop_shed = bp.codel_backstop_shed,
         codel_interval_resets = bp.codel_interval_resets,
@@ -1297,6 +1300,7 @@ fn backpressure_metric_lines(bp: &BackpressureSnapshot) -> String {
         egress_limit = bp.egress_limit,
         wal_headroom_shed = bp.wal_headroom_shed,
         wal_fsync_headroom_bytes = bp.wal_fsync_headroom_bytes,
+        ack_ahead_shed = bp.ack_ahead_shed,
     )
 }
 
@@ -2707,6 +2711,7 @@ mod tests {
             consumer_credit: 64,
             consumer_credit_bytes: 0,
             checkpoint_interval: 1024,
+            max_acked_ahead_runs: 1024,
             max_retained_bytes: 0,
             max_age_ms: 0,
             max_messages: 0,
@@ -3148,6 +3153,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -4030,6 +4036,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -4181,6 +4188,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -4265,6 +4273,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -4546,6 +4555,7 @@ mod tests {
                     consumer_credit: 64,
                     consumer_credit_bytes: 0,
                     checkpoint_interval: 1024,
+                    max_acked_ahead_runs: 1024,
                     max_retained_bytes: 0,
                     max_age_ms: 0,
                     max_messages: 0,
@@ -4608,6 +4618,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -4773,6 +4784,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -4918,6 +4930,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes,
                 max_age_ms: 0,
                 max_messages,
@@ -5142,6 +5155,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -5506,6 +5520,12 @@ mod tests {
         // set. The companion `ironbus_wal_fsync_headroom_bytes` is a GAUGE (no `_total`), so it is
         // excluded here and pinned only in `FROZEN_METRIC_TYPES`.
         "ironbus_wal_fsync_headroom_shed_total",
+        // The acked-ahead range-cap shed counter (#543): a client ack accepted on the wire but NOT
+        // recorded in the group cursor because recording it would have fragmented the acked-ahead
+        // set past `max_acked_ahead_runs`; the offset redelivers later (a duplicate, never a
+        // loss). A deliberate resilience SHED the #16 contract guarantees is never silent, an
+        // unlabeled `_total`, so it joins this set.
+        "ironbus_ack_ahead_shed_total",
         // The torn-tail recovery-repair counter (#575): a torn/unsynced tail truncated to the longest
         // valid prefix at recovery (a power-loss repair, NOT data loss). A never-silent recovery EVENT
         // the marquee NATS-can't taxonomy guarantees is counted, an UNLABELED `_total`, so it joins
@@ -5683,6 +5703,9 @@ mod tests {
         // FROZEN_RESILIENCE_COUNTERS) and the configured-headroom GAUGE (no `_total`, pinned only
         // here, like the other backpressure gauges).
         ("ironbus_wal_fsync_headroom_shed_total", "counter"),
+        // The acked-ahead range-cap shed (#543): an unlabeled `_total` counter (also in
+        // FROZEN_RESILIENCE_COUNTERS).
+        ("ironbus_ack_ahead_shed_total", "counter"),
         ("ironbus_codel_sojourn_estimate_ms", "gauge"),
         ("ironbus_retry_ratio", "gauge"),
         ("ironbus_egress_limit", "gauge"),
@@ -6215,6 +6238,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 4096,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 2048,
                 max_age_ms: 99,
                 max_messages: 33,
@@ -6432,6 +6456,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -6656,6 +6681,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -6975,6 +7001,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 4096,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 2048,
                 max_age_ms: 99,
                 max_messages: 33,

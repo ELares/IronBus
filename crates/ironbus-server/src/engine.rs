@@ -29,7 +29,7 @@ use ironbus_core::compress::{
     compress_payload, Codec, CompressConfig, DEFAULT_MAX_DECOMPRESSED_BYTES,
 };
 use ironbus_core::confirm::{ConfirmConfig, ConfirmRegistry, ConfirmStatus, ReadyConfirm};
-use ironbus_core::cursor::AckCursor;
+use ironbus_core::cursor::{AckCursor, BoundedAck};
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
 use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
 use ironbus_core::lease::{
@@ -337,6 +337,30 @@ pub struct EngineConfig {
     /// last checkpoint, bounding how many messages a crash redelivers. A value of 0 is treated
     /// as 1 (checkpoint on every advance). A clean disconnect also flushes the cursor.
     pub checkpoint_interval: u64,
+    /// The cap R on each work-group cursor's acked-ahead RANGE count (#543): the most run-length
+    /// `[start, end)` ranges of out-of-order acks one [`AckCursor`] may hold, so a pathological
+    /// ack pattern (e.g. acking every 2nd offset under a pinned gap) is O(R)-bounded in memory,
+    /// never O(unacked-gaps) — the fix for Pulsar's unbounded `individuallyDeletedMessages`
+    /// hazard. This caps the CLIENT-driven token-ack sites ([`Engine::ack_in`],
+    /// [`Engine::ack_in_stream`], [`Engine::ack_partition`]); at the cap a FRAGMENTING ack (one
+    /// that would open a brand-new disjoint range) is accepted on the wire but NOT recorded in
+    /// the cursor — the offset stays unacked, so it simply REDELIVERS later (an at-least-once
+    /// duplicate, NEVER a loss: the committed watermark is never forced past an unacked gap) and
+    /// the shed is counted on `ironbus_ack_ahead_shed_total`. Acks that advance the watermark or
+    /// merge into an existing range are never shed, so progress can never wedge. The engine's
+    /// internal scan acks (compaction holes, TTL expiry, dead-letter commits) are near-contiguous
+    /// with the scan cursor and stay on the unbounded path (refusing THEM could livelock a poll),
+    /// bounded as ever by the delivery window below.
+    ///
+    /// DEFENSE IN DEPTH, not the only bound: every delivery path already stops its scan at
+    /// `committed + max_in_flight`, which implicitly bounds the ahead set to
+    /// `~max_in_flight / 2` ranges — but that couples cursor memory to the in-flight window, and
+    /// this cap decouples them per the tunability principle. The default
+    /// ([`DEFAULT_MAX_ACKED_AHEAD_RUNS`], 1024) therefore never fires at the default
+    /// `max_in_flight` (1024 in-flight fragments to at most ~512 ranges); it exists so a widened
+    /// window cannot silently widen cursor RAM. `0` means NO explicit cap (the window bound above
+    /// still applies), matching the `0` = off convention of the other bounds.
+    pub max_acked_ahead_runs: usize,
     /// The consumer-safe size-retention bound (refs #13, #80): after a successful produce, the
     /// engine reclaims disk by deleting whole old SEALED segments while the durable log exceeds
     /// this many RECORD bytes, but NEVER a segment any consumer still needs (it protects below
@@ -1720,6 +1744,11 @@ pub struct BackpressureSnapshot {
     /// The `ironbus_wal_fsync_headroom_bytes` gauge (#378): the configured fsync-headroom window in
     /// bytes (`0` = disabled / unbounded).
     pub wal_fsync_headroom_bytes: u64,
+    /// The `ironbus_ack_ahead_shed_total` counter (#543): client acks accepted on the wire but NOT
+    /// recorded in the group cursor because recording them would have fragmented the acked-ahead
+    /// set past `max_acked_ahead_runs`; each shed offset redelivers later (a duplicate, never a
+    /// loss). A rising value is backpressure evidence of a pathologically fragmented ack pattern.
+    pub ack_ahead_shed: u64,
 }
 
 /// A snapshot of one work-group's consumer position, for the metrics endpoint (#16): an
@@ -2076,6 +2105,13 @@ pub const DEFAULT_SYNC_MAX_DIRTY_BYTES: u64 = 16 * 1024 * 1024;
 /// of distinct consumer groups, and 1024 `AckCursor`/`LeaseTable` pairs is a modest, bounded amount
 /// of state. See [`EngineConfig::max_groups`] (where `0` = unlimited).
 pub const DEFAULT_MAX_GROUPS: usize = 1024;
+
+/// The default cap R on a work-group cursor's acked-ahead RANGE count (#543, see
+/// [`EngineConfig::max_acked_ahead_runs`]): 1024 run-length ranges is 16 KiB of cursor state per
+/// group at 16 bytes a range — bounded even across [`DEFAULT_MAX_GROUPS`] groups — while sitting
+/// far past what a healthy consumer fragments to (a pathological every-2nd-offset ack pattern
+/// needs more than 2048 distinct unacked gaps inside one in-flight window to reach it).
+pub const DEFAULT_MAX_ACKED_AHEAD_RUNS: usize = 1024;
 
 /// The default cap on the number of resident NAMED streams (#863). Like [`DEFAULT_MAX_GROUPS`] this is
 /// a generous-but-FINITE backstop (a server names few streams; the unbounded growth this bounds is the
@@ -3104,6 +3140,14 @@ pub struct Engine<F: Filesystem, C: Clock> {
     lease_config: LeaseConfig,
     delivery: DeliveryConfig,
     max_in_flight: u32,
+    /// The acked-ahead RANGE cap R per work-group cursor (#543), already resolved from the
+    /// config's `0 = no explicit cap` convention to `usize::MAX`, so the ack hot path compares
+    /// without re-branching. See [`EngineConfig::max_acked_ahead_runs`].
+    max_acked_ahead_runs: usize,
+    /// Client acks SHED under the acked-ahead range cap (#543): the fragmenting out-of-order ack
+    /// was accepted on the wire but not recorded, so its offset redelivers later (a duplicate,
+    /// never a loss). The `ironbus_ack_ahead_shed_total` counter. Saturating.
+    acked_ahead_shed: u64,
     /// The per-CONSUMER (per-connection) standing in-flight credit ceiling (refs #65, #9, #10),
     /// floored to 1 at open. The engine itself does NOT decrement it (the engine is shared by
     /// every connection and has no per-connection identity); it advertises this ceiling to each
@@ -3835,6 +3879,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             lease_config: config.lease,
             delivery: config.delivery,
             max_in_flight: config.max_in_flight,
+            // Resolve the acked-ahead range cap's `0 = no explicit cap` convention once at open
+            // (#543), so the ack hot path is a single comparison.
+            max_acked_ahead_runs: if config.max_acked_ahead_runs == 0 {
+                usize::MAX
+            } else {
+                config.max_acked_ahead_runs
+            },
+            acked_ahead_shed: 0,
             // Floor the per-consumer credit to 1 (#65): a zero ceiling would deliver nothing to any
             // connection, wedging every consumer. The hard floor of one guarantees forward progress.
             consumer_credit: config.consumer_credit.max(1),
@@ -6040,13 +6092,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     }
 
     /// Acks a partition-addressed delivery (#693): commits partition `(stream, partition)`'s work-group
-    /// `group` cursor past `token.offset` and DURABLY checkpoints the partition's cursor, so the commit
-    /// survives a restart (the per-partition twin of [`Engine::ack_in_stream`]). A stale token (already
-    /// acked or redelivered) is a [`AckResult::Fenced`] no-op, exactly as the default ack.
+    /// `group` cursor past `token.offset` (the per-partition twin of [`Engine::ack_in_stream`]). A stale
+    /// token (already acked or redelivered) is a [`AckResult::Fenced`] no-op, exactly as the default ack.
     ///
-    /// The checkpoint write is best-effort per ack (a failure loses only a lagging optimization — the
-    /// same at-least-once contract the default cursor's lagging checkpoint has); the clean-shutdown
-    /// flush ([`Engine::checkpoint_all_groups`]) is the guaranteed barrier.
+    /// The durable cursor checkpoint is INTERVAL-GATED (#545), exactly like the default stream's
+    /// [`Engine::maybe_checkpoint`] and a named stream's `maybe_checkpoint_named_group`: it writes
+    /// (and fsyncs) only after the partition cursor advanced at least `checkpoint_interval` offsets
+    /// since its last checkpoint, so a hot partition consumer's per-ack cost is O(1) in-memory (the
+    /// pre-#545 per-ack `Checkpoint::write` was a file reopen + `sync_all` per ack). The at-least-once
+    /// contract is unchanged: a crash redelivers at most ~`checkpoint_interval` already-acked messages
+    /// per partition group, and the clean-shutdown flush ([`Engine::checkpoint_all_groups`]) remains
+    /// the guaranteed barrier. The checkpoint write stays best-effort (a failure loses only a lagging
+    /// optimization).
     #[must_use]
     pub fn ack_partition(
         &mut self,
@@ -6060,34 +6117,42 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let key = (id.clone(), partition);
         let now = self.log.now_monotonic();
-        let acked = {
-            let Some(g) = self
-                .partition_consumers
-                .get_mut(&key)
-                .and_then(|ns| ns.groups.get_mut(group))
-            else {
-                return AckResult::Fenced;
-            };
-            g.last_activity = now;
-            g.touched = true;
-            match g.leases.ack(token) {
-                AckOutcome::Acked => {
-                    g.cursor.ack(token.offset);
-                    self.counters.acks = self.counters.acks.saturating_add(1);
-                    self.registry.record_group_consumed(group.as_bytes());
-                    true
-                }
-                AckOutcome::Fenced => false,
-            }
+        // Read the acked-ahead range cap (#543) before the mutable consumer-state borrows.
+        let cap = self.max_acked_ahead_runs;
+        let Some(ns) = self.partition_consumers.get_mut(&key) else {
+            return AckResult::Fenced;
         };
-        if acked {
-            // Durably checkpoint this partition's cursor so the commit survives a restart (#681-style,
-            // per partition). Best-effort: a write failure only loses a lagging optimization.
+        // The interval gate's floor (#545): this partition group's last durably-checkpointed
+        // committed offset. Read before the group borrow below.
+        let last = ns.group_last_checkpointed.get(group).copied().unwrap_or(0);
+        let Some(g) = ns.groups.get_mut(group) else {
+            return AckResult::Fenced;
+        };
+        g.last_activity = now;
+        g.touched = true;
+        let committed = match g.leases.ack(token) {
+            AckOutcome::Acked => {
+                // The acked-ahead range cap (#543), exactly as [`Engine::ack_in`]: a shed keeps
+                // the offset unacked in the cursor (its lease is already freed), so it redelivers
+                // later — a duplicate, never a loss — while the wire reply stays `Acked` and the
+                // commit bookkeeping (and any checkpoint) is skipped because nothing committed.
+                if g.cursor.ack_bounded(token.offset, cap) == BoundedAck::Shed {
+                    self.acked_ahead_shed = self.acked_ahead_shed.saturating_add(1);
+                    return AckResult::Acked;
+                }
+                self.counters.acks = self.counters.acks.saturating_add(1);
+                self.registry.record_group_consumed(group.as_bytes());
+                g.cursor.committed().get()
+            }
+            AckOutcome::Fenced => return AckResult::Fenced,
+        };
+        // Interval-gated durable checkpoint (#545): write only after `checkpoint_interval` newly
+        // committed offsets, so the ack hot path never pays a per-ack fsync. Best-effort: a write
+        // failure only loses a lagging optimization, never correctness.
+        if committed.saturating_sub(last) >= self.checkpoint_interval.max(1) {
             let _ = self.checkpoint_partition_group(&id, PartitionIndex::new(partition), group);
-            AckResult::Acked
-        } else {
-            AckResult::Fenced
         }
+        AckResult::Acked
     }
 
     /// The current committed offset of partition `(stream, partition)`'s work-group `group` (#693): the
@@ -7695,6 +7760,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         } else {
             self.streams.get(&id).map_or(0, Log::now_monotonic)
         };
+        // Read the acked-ahead range cap (#543) before the mutable stream/group borrows.
+        let cap = self.max_acked_ahead_runs;
         let Some(named) = self.named_streams.get_mut(&id) else {
             return AckResult::Fenced;
         };
@@ -7705,7 +7772,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         g.touched = true;
         match g.leases.ack(token) {
             AckOutcome::Acked => {
-                g.cursor.ack(token.offset);
+                // The acked-ahead range cap (#543), exactly as [`Engine::ack_in`]: a shed keeps
+                // the offset unacked in the cursor (its lease is already freed), so it redelivers
+                // later — a duplicate, never a loss — while the wire reply stays `Acked` and the
+                // commit bookkeeping below is skipped because nothing committed.
+                if g.cursor.ack_bounded(token.offset, cap) == BoundedAck::Shed {
+                    self.acked_ahead_shed = self.acked_ahead_shed.saturating_add(1);
+                    return AckResult::Acked;
+                }
                 // key_shared (#64 follow-up): the key this offset held is now free, so its next record
                 // may route. A no-op for a plain competing named group (no router). A nack does NOT
                 // clear it (the same offset redelivers), so the key stays busy and per-key order holds.
@@ -8936,6 +9010,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             egress_limit: self.backpressure.egress.limit(),
             wal_headroom_shed: self.backpressure.wal_headroom_shed,
             wal_fsync_headroom_bytes: self.backpressure.fsync_headroom.headroom_bytes(),
+            ack_ahead_shed: self.acked_ahead_shed,
         }
     }
 
@@ -11039,6 +11114,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // The ack marks the group active (#277), so a group being drained is never reclaimed by
         // the idle sweep mid-stream. Read the clock seam before the mutable group borrow.
         let now = self.log.now_monotonic();
+        // Read the acked-ahead range cap (#543) before the mutable group borrow.
+        let cap = self.max_acked_ahead_runs;
         // Never create a group on ack: a consumer must `poll_in` (which is capped) before
         // it can ack, so an ack on an unknown group is a fence, not a new allocation.
         let Some(g) = self.groups.get_mut(group) else {
@@ -11048,7 +11125,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         g.touched = true;
         match g.leases.ack(token) {
             AckOutcome::Acked => {
-                g.cursor.ack(token.offset);
+                // Record the ack in the cursor UNDER the acked-ahead range cap (#543). A shed
+                // (the fragmenting out-of-order ack would open a range past the cap) keeps the
+                // offset UNACKED in the cursor: its lease is already freed above, so the poll
+                // scan simply REDELIVERS it later — a duplicate, never a loss, and the committed
+                // watermark is never forced past an unacked gap. The wire reply stays `Acked`
+                // (at-least-once permits redelivery of an acked message); only the cursor
+                // bookkeeping is skipped, and the shed is counted for the operator. The key is
+                // NOT cleared (mirroring nack: the same offset redelivers, so the key stays busy
+                // and per-key order holds), and the ack/lag/confirm bookkeeping is skipped
+                // because nothing committed.
+                if g.cursor.ack_bounded(token.offset, cap) == BoundedAck::Shed {
+                    self.acked_ahead_shed = self.acked_ahead_shed.saturating_add(1);
+                    return AckResult::Acked;
+                }
                 // key_shared (#64): the key this offset held is now free, so its next record may
                 // route. A no-op for a plain competing group (no router). A nack does NOT clear
                 // it: the same offset redelivers, so the key stays busy and per-key order holds.
@@ -12713,6 +12803,7 @@ mod tests {
             consumer_credit: DEFAULT_CONSUMER_CREDIT,
             consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
             checkpoint_interval: 1024,
+            max_acked_ahead_runs: DEFAULT_MAX_ACKED_AHEAD_RUNS,
             max_retained_bytes: 0,
             max_age_ms: 0,
             max_messages: 0,
@@ -16524,6 +16615,144 @@ mod tests {
             delivered,
             vec![2],
             "only the uncheckpointed tail redelivers"
+        );
+    }
+
+    #[test]
+    fn acked_ahead_range_cap_sheds_fragmenting_acks_dup_not_loss() {
+        // #543: a pathological every-2nd-offset ack pattern (offset 0 pinned unacked) stops
+        // growing the acked-ahead range set at the configured cap R. The overflow acks are SHED
+        // (accepted on the wire, unrecorded in the cursor, counted on the metric), the committed
+        // watermark NEVER passes an unacked offset, and every shed message REDELIVERS (a
+        // duplicate) and eventually commits — never a loss.
+        let cfg = EngineConfig {
+            max_acked_ahead_runs: 4,
+            ..config(64, 5)
+        };
+        let mut e = open(cfg);
+        for i in 0..32u8 {
+            produce(&mut e, &[i]);
+        }
+        // Deliver all 32 (the in-flight window of 64 spans them) and hold every token.
+        let mut tokens = Vec::new();
+        for _ in 0..32 {
+            tokens.push(message(e.poll(0).unwrap()));
+        }
+        // Ack every SECOND offset (1, 3, 5, ..., 31): with the gap at 0 pinned, each is a
+        // fragmenting out-of-order ack that opens its own disjoint run.
+        for d in tokens.iter().filter(|d| d.offset.get() % 2 == 1) {
+            assert_eq!(
+                e.ack(&d.token),
+                AckResult::Acked,
+                "the wire reply stays Acked even when the cursor sheds"
+            );
+        }
+        // The range set stopped growing at the cap: 4 runs (offsets 1, 3, 5, 7) recorded, the
+        // other 12 fragmenting acks (9, 11, ..., 31) shed and counted.
+        let g = e.groups.get(DEFAULT_GROUP).unwrap();
+        assert_eq!(g.cursor.ahead_runs(), 4, "the run count is capped at R");
+        assert_eq!(e.backpressure_snapshot().ack_ahead_shed, 12);
+        // The at-least-once safety line: the watermark never passed the unacked gap at 0.
+        assert_eq!(e.committed_offset().get(), 0);
+        // Acking the gap advances over the RECORDED contiguous prefix only (0 merges into the
+        // 1..2 run, stopping at the genuinely unacked 2) — never over a shed or unacked offset.
+        assert_eq!(e.ack(&tokens[0].token), AckResult::Acked);
+        assert_eq!(e.committed_offset().get(), 2);
+        // Redelivery, not loss: past the visibility window every offset the cursor does not hold
+        // redelivers — including the SHED 9 — while the recorded acked-ahead 3, 5, 7 never do.
+        let mut redelivered = Vec::new();
+        loop {
+            match e.poll(40).unwrap() {
+                Poll::Message(d) => redelivered.push(d),
+                Poll::Idle => break,
+                other => panic!("unexpected poll: {other:?}"),
+            }
+        }
+        let offsets: std::collections::BTreeSet<u64> =
+            redelivered.iter().map(|d| d.offset.get()).collect();
+        assert!(offsets.contains(&9), "a shed ack redelivers (a duplicate)");
+        for recorded in [3u64, 5, 7] {
+            assert!(
+                !offsets.contains(&recorded),
+                "recorded acked-ahead offset {recorded} must not redeliver"
+            );
+        }
+        assert!(
+            offsets.iter().all(|&o| o >= 2),
+            "nothing below the committed watermark ever redelivers"
+        );
+        // Convergence: re-acking every redelivery commits the whole log — the sheds only ever
+        // deferred progress. The re-acks land in scan order (at the watermark or merging), so
+        // none of them can shed.
+        let shed_before = e.backpressure_snapshot().ack_ahead_shed;
+        for d in &redelivered {
+            assert_eq!(e.ack(&d.token), AckResult::Acked);
+        }
+        assert_eq!(
+            e.committed_offset().get(),
+            32,
+            "every message commits: dup, never loss"
+        );
+        assert_eq!(e.groups.get(DEFAULT_GROUP).unwrap().cursor.ahead_runs(), 0);
+        assert_eq!(
+            e.backpressure_snapshot().ack_ahead_shed,
+            shed_before,
+            "watermark/merge re-acks never shed"
+        );
+    }
+
+    #[test]
+    fn acked_ahead_set_survives_restart_on_the_cadence_with_no_per_ack_fsync() {
+        // #545 evidence: the ack hot path never writes the cursor durably by itself — the ONLY
+        // ack-driven cursor write is the interval-gated `maybe_checkpoint` (driven by the
+        // server's committed-progress hook), which declines below the interval — while the
+        // existing cadence's clean-shutdown flush persists BOTH the committed watermark and the
+        // acked-ahead range set, so a restart redelivers only the genuinely unacked offsets.
+        let fs = {
+            let mut e = Engine::open(InMemoryFs::new(), ManualClock::new(), config(10, 5)).unwrap();
+            for p in 0..6u8 {
+                produce(&mut e, &[p]);
+            }
+            let mut tokens = Vec::new();
+            for _ in 0..6 {
+                tokens.push(message(e.poll(0).unwrap()));
+            }
+            // Commit 0 (watermark -> 1) and ack 2, 3 ahead of the pinned gap at 1.
+            for d in &tokens {
+                if [0u64, 2, 3].contains(&d.offset.get()) {
+                    assert_eq!(e.ack(&d.token), AckResult::Acked);
+                }
+            }
+            assert_eq!(e.committed_offset().get(), 1);
+            assert!(
+                !e.maybe_checkpoint().unwrap(),
+                "below the interval the ack-driven checkpoint hook writes (and fsyncs) NOTHING"
+            );
+            // The graceful-shutdown flush is the cadence's guaranteed barrier.
+            e.checkpoint_all_groups().unwrap();
+            e.into_filesystem()
+        };
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.committed_offset().get(),
+            1,
+            "the watermark survived the restart"
+        );
+        // Only the genuine gaps (1, 4, 5) redeliver; the persisted acked-ahead 2, 3 do not.
+        let mut redelivered = std::collections::BTreeSet::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    redelivered.insert(d.offset.get());
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll: {other:?}"),
+            }
+        }
+        assert_eq!(
+            redelivered,
+            [1u64, 4, 5].into_iter().collect(),
+            "the durable acked-ahead set spares 2 and 3 from redelivery"
         );
     }
 
@@ -24486,6 +24715,7 @@ mod tests {
         // `maybe_checkpoint_in_stream` writes the cursor as it advances.
         let cfg = EngineConfig {
             checkpoint_interval: 1,
+            max_acked_ahead_runs: DEFAULT_MAX_ACKED_AHEAD_RUNS,
             ..config(10, 5)
         };
         {
@@ -25992,6 +26222,76 @@ mod tests {
                 e.poll_partition("orders", 2, "w", now).unwrap(),
                 Poll::Idle
             ));
+        }
+    }
+
+    /// #545: the partition ack path's durable cursor checkpoint is INTERVAL-GATED, not per ack.
+    /// Below the interval an ack writes (and fsyncs) nothing — a crash simply redelivers the
+    /// acked tail (a duplicate, never a loss) — while an interval of 1 makes the very first ack
+    /// durable, and the clean-shutdown flush remains the guaranteed barrier (covered by
+    /// `partition_addressed_consume_has_a_durable_cursor_across_restart` above).
+    #[test]
+    fn partition_ack_checkpoint_is_interval_gated_not_per_ack() {
+        let fs = InMemoryFs::new();
+        let pc = PartitionCount::new(2).unwrap();
+        let k0 = key_for_partition(0, pc);
+        // Leg 1: the default interval (1024) — three acks, then a CRASH (drop, no clean
+        // shutdown). Nothing durable was written on the ack path, so the cursor resumes at 0.
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+            e.declare_partitioned_stream("orders", 2).unwrap();
+            for n in 0..3u8 {
+                e.produce_in_stream("orders", &part_keyed(&k0, &[n]))
+                    .unwrap();
+            }
+            for _ in 0..3 {
+                let now = e.now_monotonic();
+                let d = message(e.poll_partition("orders", 0, "w", now).unwrap());
+                assert_eq!(
+                    e.ack_partition("orders", 0, "w", &d.token),
+                    AckResult::Acked
+                );
+            }
+            assert_eq!(e.committed_offset_in_partition("orders", 0, "w").get(), 3);
+        }
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+            assert_eq!(
+                e.committed_offset_in_partition("orders", 0, "w").get(),
+                0,
+                "below the interval the partition ack path wrote no durable cursor (no per-ack fsync)"
+            );
+            // At-least-once: the acked records REDELIVER (dup), nothing is lost or skipped.
+            let now = e.now_monotonic();
+            let d = message(e.poll_partition("orders", 0, "w", now).unwrap());
+            assert_eq!(
+                d.offset.get(),
+                0,
+                "redelivery resumes at the durable cursor"
+            );
+        }
+        // Leg 2: interval 1 — the very first ack reaches the gate and checkpoints durably, so a
+        // crash right after it resumes past the acked offset.
+        {
+            let cfg = EngineConfig {
+                checkpoint_interval: 1,
+                ..config(64, 5)
+            };
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), cfg).unwrap();
+            let now = e.now_monotonic();
+            let d = message(e.poll_partition("orders", 0, "w", now).unwrap());
+            assert_eq!(
+                e.ack_partition("orders", 0, "w", &d.token),
+                AckResult::Acked
+            );
+        }
+        {
+            let e = Engine::open(fs, ManualClock::new(), config(64, 5)).unwrap();
+            assert_eq!(
+                e.committed_offset_in_partition("orders", 0, "w").get(),
+                1,
+                "at interval 1 the first ack checkpointed the partition cursor durably"
+            );
         }
     }
 

@@ -10085,6 +10085,12 @@ fn open_engine_with<F: Filesystem + Clone>(
             // budget) with a hard floor of one message. Default 8 MiB; `0` = unlimited (off).
             consumer_credit_bytes: config.consumer_credit_bytes,
             checkpoint_interval: config.checkpoint_interval,
+            // The acked-ahead RANGE cap (#543) at the engine's safe default: bounds each
+            // work-group cursor's out-of-order-ack memory to 16 KiB (1024 ranges), decoupled
+            // from `--max-in-flight`. Deliberately not a CLI/profile knob yet (the default
+            // never fires at any shipped profile's in-flight window); a
+            // `delivery.max_acked_ahead_runs` knob is the follow-up if operators need it.
+            max_acked_ahead_runs: ironbus_server::engine::DEFAULT_MAX_ACKED_AHEAD_RUNS,
             // Consumer-safe retention (#13, #80), each `0` = disabled (off), the default. Size in
             // record bytes, age in milliseconds (against the engine clock), count in messages; the
             // bounds compose, so a segment is reaped if ANY enabled bound trips.
@@ -15693,6 +15699,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -16646,6 +16653,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -16736,6 +16744,7 @@ mod tests {
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -21052,6 +21061,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
@@ -21141,6 +21151,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
                 consumer_credit: 64,
                 consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
+                max_acked_ahead_runs: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,

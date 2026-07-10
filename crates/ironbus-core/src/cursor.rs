@@ -12,11 +12,16 @@
 //! every offset is acked, plus a sparse, run-length-encoded set of offsets acked AHEAD
 //! of the watermark. An out-of-order ack lands in that set; whenever the offset at the
 //! watermark becomes acked, the watermark jumps over the now-contiguous run. The cursor
-//! is pure and IO-free; durability of `committed` and bounding the ahead set (via the
-//! consumer's max-in-flight) are the caller's responsibility. The ahead set is also
-//! persistable: [`AckCursor::ahead_ranges`] snapshots it and [`AckCursor::resume_with_ahead`]
-//! restores it (validating the shape), so a durable consumer-state store (#60) can resume a
-//! restart that redelivers only genuinely unacked offsets, not the acked-ahead ones too.
+//! is pure and IO-free; durability of `committed` is the caller's responsibility. The
+//! ahead set is bounded two ways: the caller's delivery window (offsets past
+//! `committed + max_in_flight` are never delivered, so never acked) and, hardening that,
+//! the explicit RANGE cap of [`AckCursor::ack_bounded`] (#543), which refuses to record a
+//! FRAGMENTING ack once the run count would pass the cap — the refused offset simply reads
+//! as unacked and redelivers later (an at-least-once duplicate, never a loss). The ahead
+//! set is also persistable: [`AckCursor::ahead_ranges`] snapshots it and
+//! [`AckCursor::resume_with_ahead`] restores it (validating the shape), so a durable
+//! consumer-state store (#60) can resume a restart that redelivers only genuinely unacked
+//! offsets, not the acked-ahead ones too.
 
 use crate::types::Offset;
 
@@ -199,20 +204,64 @@ impl AckCursor {
     /// Records an ack for `offset`, advancing the committed cursor over any newly
     /// contiguous prefix. Returns `true` if this ack was new, `false` if `offset` was
     /// already acked (a duplicate, which at-least-once delivery permits and ignores).
+    /// The UNBOUNDED form of [`AckCursor::ack_bounded`]: it never sheds, so the caller
+    /// is trusting its delivery window to bound the ahead set.
     pub fn ack(&mut self, offset: Offset) -> bool {
+        matches!(self.ack_bounded(offset, usize::MAX), BoundedAck::Recorded)
+    }
+
+    /// Records an ack for `offset` like [`AckCursor::ack`], but BOUNDS the acked-ahead set at
+    /// `max_runs` run-length ranges (#543, Pulsar's `individuallyDeletedMessages` design with its
+    /// unbounded-R hazard fixed): an out-of-order ack that would CREATE a new disjoint run once
+    /// `max_runs` ranges already exist is refused as [`BoundedAck::Shed`] and the cursor is left
+    /// untouched, so the ahead set's memory is O(`max_runs`), never O(unacked-gaps).
+    ///
+    /// The shed choice is the at-least-once-SAFE one at the cap. The committed watermark can
+    /// NEVER be forced past an unacked gap (that would be silent loss); instead the fragmenting
+    /// ack is simply not remembered: the offset still reads as unacked ([`AckCursor::is_acked`]
+    /// stays `false`), so the caller's redelivery machinery delivers it again later and a future
+    /// re-ack lands normally (usually merging into a neighbor run by then). A shed is therefore a
+    /// bounded DUPLICATE, never a loss, and exactly one offset of tracking is dropped per shed
+    /// (the newest), never a whole previously-recorded range.
+    ///
+    /// Never shed, even at the cap:
+    /// - an ack AT the watermark (`offset == committed`): it ADVANCES the watermark (absorbing
+    ///   any now-contiguous run), monotonically SHRINKING the ahead set — refusing it could
+    ///   deadlock progress;
+    /// - a MERGING ack (adjacent to an existing run on either side): it never grows the run
+    ///   count (bridging two runs shrinks it), so gap-filling toward the watermark always lands.
+    ///
+    /// A `max_runs` of `0` therefore accepts ONLY in-order acks at the watermark (no
+    /// out-of-order tracking at all); a caller offering a `0 = unbounded` config convention
+    /// should map that `0` to `usize::MAX` BEFORE calling.
+    pub fn ack_bounded(&mut self, offset: Offset, max_runs: usize) -> BoundedAck {
         let offset = offset.get();
         if offset < self.committed || self.contains_ahead(offset) {
-            return false;
+            return BoundedAck::Duplicate;
         }
         // The offset space treats `u64::MAX` as exhausted (see [`Offset::checked_next`])
         // and a real deployment never reaches it. Refuse the ack rather than overflow the
         // half-open range end, which would otherwise wrap and collapse `committed` to 0.
         let Some(next) = offset.checked_add(1) else {
-            return false;
+            return BoundedAck::Duplicate;
         };
+        // Only a FRAGMENTING ack (strictly above the watermark, adjacent to no existing run) can
+        // grow the run count, so only it is ever shed. The merge probes mirror `insert` exactly:
+        // the ranges are sorted and `offset` is known absent, so the partition point is the
+        // insertion index and the two neighbors are the only possible merges. An ack at the
+        // watermark is exempt outright: `insert` + `advance` nets the run count to at most its
+        // old value (the transient run is absorbed into `committed` immediately).
+        if self.ahead.len() >= max_runs && offset != self.committed {
+            let i = self.ahead.partition_point(|&(s, _)| s <= offset);
+            let merges_left = i > 0 && self.ahead[i - 1].1 == offset;
+            let merges_right = i < self.ahead.len() && self.ahead[i].0 == next;
+            if !merges_left && !merges_right {
+                return BoundedAck::Shed;
+            }
+        }
         self.insert(offset, next);
         self.advance();
-        true
+        BoundedAck::Recorded
     }
 
     /// Commits the watermark up to the EXCLUSIVE offset `up_to` (every offset strictly below
@@ -313,6 +362,23 @@ impl AckCursor {
             }
         }
     }
+}
+
+/// The outcome of a bounded ack ([`AckCursor::ack_bounded`], #543).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedAck {
+    /// The ack was new and recorded: the watermark advanced and/or the ahead set absorbed it.
+    Recorded,
+    /// The offset was already acked (below the watermark or inside the ahead set) — or sits at
+    /// the exhausted `u64::MAX` offset-space boundary — so nothing changed. At-least-once
+    /// delivery permits and ignores a duplicate ack.
+    Duplicate,
+    /// The ack was refused under the range cap: recording it would have created a NEW
+    /// acked-ahead run past `max_runs`. The cursor is untouched — the offset still reads as
+    /// unacked, so it redelivers later (an at-least-once duplicate, never a loss) and the
+    /// committed watermark cannot have passed an unacked gap. The caller should count the shed
+    /// (it is backpressure evidence of a pathologically fragmented ack pattern).
+    Shed,
 }
 
 /// A malformed acked-ahead snapshot rejected by [`AckCursor::resume_with_ahead`].
@@ -592,6 +658,89 @@ mod tests {
         for gap in [4u64, 5, 7, 8, 9, 13, 14, 19, 21, 1_000] {
             assert!(!c.is_acked(off(gap)), "gap offset {gap} must be unacked");
         }
+    }
+
+    #[test]
+    fn fragmenting_ack_at_the_cap_is_shed_and_reads_unacked() {
+        // Cap of 2 runs. Acks at 2, 4 fragment into two disjoint runs; the third fragmenting ack
+        // (6) must be SHED: refused, unrecorded, cursor untouched.
+        let mut c = AckCursor::new();
+        assert_eq!(c.ack_bounded(off(2), 2), BoundedAck::Recorded);
+        assert_eq!(c.ack_bounded(off(4), 2), BoundedAck::Recorded);
+        assert_eq!(c.ahead_runs(), 2);
+        let before = c.clone();
+        assert_eq!(c.ack_bounded(off(6), 2), BoundedAck::Shed);
+        assert_eq!(c, before, "a shed leaves the cursor untouched");
+        assert!(
+            !c.is_acked(off(6)),
+            "the shed offset reads unacked (it will redeliver)"
+        );
+        assert_eq!(c.ahead_runs(), 2, "the run count never passes the cap");
+        // A re-ack of the shed offset lands once it MERGES (5 bridges toward it first).
+        assert_eq!(
+            c.ack_bounded(off(5), 2),
+            BoundedAck::Recorded,
+            "merge with 4..5 is never shed"
+        );
+        assert_eq!(
+            c.ack_bounded(off(6), 2),
+            BoundedAck::Recorded,
+            "now merges into 4..6"
+        );
+        assert_eq!(c.ahead_ranges(), &[(2, 3), (4, 7)]);
+    }
+
+    #[test]
+    fn watermark_and_merging_acks_are_never_shed_at_the_cap() {
+        // Saturate the cap (2 runs at 2..3 and 4..5), then prove every progress-making ack still
+        // lands: the watermark ack (0), the gap-fill merges (1, then 3 bridging both runs).
+        let mut c = AckCursor::new();
+        assert_eq!(c.ack_bounded(off(2), 2), BoundedAck::Recorded);
+        assert_eq!(c.ack_bounded(off(4), 2), BoundedAck::Recorded);
+        assert_eq!(
+            c.ack_bounded(off(0), 2),
+            BoundedAck::Recorded,
+            "watermark ack always lands"
+        );
+        assert_eq!(c.committed(), off(1));
+        assert_eq!(
+            c.ack_bounded(off(1), 2),
+            BoundedAck::Recorded,
+            "gap fill absorbs 2..3"
+        );
+        assert_eq!(c.committed(), off(3));
+        assert_eq!(
+            c.ack_bounded(off(3), 2),
+            BoundedAck::Recorded,
+            "bridges into 4..5"
+        );
+        assert_eq!(
+            c.committed(),
+            off(5),
+            "fully committed despite the saturated cap"
+        );
+        assert_eq!(c.ahead_runs(), 0);
+        // Duplicates at the cap are still duplicates, not sheds.
+        assert_eq!(c.ack_bounded(off(4), 2), BoundedAck::Duplicate);
+    }
+
+    #[test]
+    fn cap_zero_accepts_only_in_order_acks() {
+        // max_runs == 0: no out-of-order tracking at all — only the watermark ack lands. (A
+        // caller with a `0 = unbounded` config convention maps 0 to usize::MAX before calling.)
+        let mut c = AckCursor::new();
+        assert_eq!(c.ack_bounded(off(1), 0), BoundedAck::Shed);
+        assert_eq!(c.ack_bounded(off(0), 0), BoundedAck::Recorded);
+        assert_eq!(c.committed(), off(1));
+        assert_eq!(c.ahead_runs(), 0);
+    }
+
+    #[test]
+    fn bounded_ack_refuses_the_exhausted_offset_boundary() {
+        // Parity with `ack`: u64::MAX is the exhausted offset space, refused without wrap.
+        let mut c = AckCursor::resume(off(u64::MAX));
+        assert_eq!(c.ack_bounded(off(u64::MAX), 8), BoundedAck::Duplicate);
+        assert_eq!(c.committed(), off(u64::MAX));
     }
 
     #[test]
@@ -937,6 +1086,72 @@ mod tests {
                     prop_assert!(c.is_acked(off(below)), "offset {below} below committed must be acked");
                 }
             }
+        }
+
+        /// #543 criterion: under ANY ack order and any cap R >= 1, the run count never exceeds R,
+        /// the watermark stays monotonic and never passes an unacked offset, a Recorded ack reads
+        /// acked, and a Shed ack reads unacked with the cursor bit-identical (dup-not-loss). With
+        /// R = usize::MAX the bounded ack is exactly the unbounded `ack`.
+        #[test]
+        fn bounded_ack_caps_the_runs_and_never_skips_a_gap(
+            acks in prop::collection::vec(0u64..60, 0..120),
+            cap in 1usize..6,
+        ) {
+            let mut c = AckCursor::new();
+            let mut unbounded = AckCursor::new();
+            let mut last_committed = 0u64;
+            for &o in &acks {
+                let before = c.clone();
+                match c.ack_bounded(off(o), cap) {
+                    BoundedAck::Recorded => prop_assert!(c.is_acked(off(o))),
+                    BoundedAck::Duplicate => prop_assert_eq!(&c, &before),
+                    BoundedAck::Shed => {
+                        prop_assert_eq!(&c, &before, "a shed must leave the cursor untouched");
+                        prop_assert!(!c.is_acked(off(o)), "a shed offset must read unacked");
+                    }
+                }
+                prop_assert!(c.ahead_runs() <= cap, "run count {} passed the cap {cap}", c.ahead_runs());
+                prop_assert!(c.committed().get() >= last_committed, "watermark regressed");
+                last_committed = c.committed().get();
+                // The load-bearing safety line: nothing below the watermark is ever unacked.
+                for below in 0..c.committed().get() {
+                    prop_assert!(c.is_acked(off(below)), "offset {below} below committed must be acked");
+                }
+                // usize::MAX-capped bounded ack tracks the unbounded ack exactly.
+                unbounded.ack_bounded(off(o), usize::MAX);
+            }
+            let mut plain = AckCursor::new();
+            for &o in &acks {
+                plain.ack(off(o));
+            }
+            prop_assert_eq!(&unbounded, &plain, "usize::MAX cap must equal the unbounded ack");
+            // The bounded cursor never commits PAST the unbounded one (sheds only defer progress).
+            prop_assert!(c.committed().get() <= plain.committed().get());
+        }
+
+        /// A shed is a DEFERRAL, not a loss: re-acking every offset after a capped first pass
+        /// (redelivery + re-ack, which is what the engine's poll loop does) always converges to
+        /// the fully-committed cursor, because merges and watermark acks are never shed.
+        #[test]
+        fn shed_offsets_converge_after_redelivery(perm in any_permutation(1..30usize), cap in 1usize..4) {
+            let mut c = AckCursor::new();
+            let n = perm.len() as u64;
+            for &o in &perm {
+                let _ = c.ack_bounded(off(o as u64), cap);
+            }
+            // Redeliver-and-re-ack every still-unacked offset, in order (the engine's poll scan
+            // is in-order from the watermark, so in-order is the faithful model).
+            for o in 0..n {
+                if !c.is_acked(off(o)) {
+                    prop_assert_eq!(
+                        c.ack_bounded(off(o), cap),
+                        BoundedAck::Recorded,
+                        "an in-order re-ack at the watermark can never shed"
+                    );
+                }
+            }
+            prop_assert_eq!(c.committed(), off(n), "every message eventually commits");
+            prop_assert_eq!(c.ahead_runs(), 0);
         }
 
         #[test]
