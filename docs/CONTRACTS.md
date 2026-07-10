@@ -179,6 +179,49 @@ the trailing `total_len` equals the computed total, `body_crc` passes, (if prese
   fields; `decode`/`encode` reject a total over this as `TooLarge`.
 - `XXH3_PAYLOAD_THRESHOLD` = 64 KiB.
 
+### The shared-WAL storage mode (#597, opt-in): the reduced per-stream contract
+
+`--storage-mode shared-wal` (engine `StorageMode::SharedWal`) stores EVERY named stream's records
+interleaved and stream-tagged in ONE commit log under `shared-wal/` instead of per-stream logs —
+the high-stream-count density fallback (one segment set + ONE covering `fdatasync` for all
+streams). The default `per-stream` mode is byte-for-byte unchanged. What holds, what changes, and
+what is refused in shared mode:
+
+- **Consumer contract UNCHANGED.** A stream's consumer-visible offsets are its stream-relative
+  POSITIONS: dense, monotonic, and STABLE across restarts and reaps (the demux-floor checkpoint
+  below), so leases, at-least-once, the 0/1/2 ack spectrum, `MaxDeliver`, durable per-group
+  cursors (#681, the same `streams/<hex(stream)>/cursor-<hex(group)>.ckpt` files and formats),
+  per-stream attempt checkpoints (#358), the per-stream DLQ sink (#1110, the same
+  `streams/<hex(stream)>/dlq/`), and key-shared routing (#64) all compose verbatim. In shared mode
+  `streams/<hex(stream)>/` holds ONLY this consumer metadata — no segments.
+- **Isolation is SHARED, not per-stream (I2's named tradeoff).** A torn tail on the one commit log
+  truncates whichever streams had records in the torn region (bounded and reported); demux
+  integrity still holds — every read re-verifies the stored tag, so stream A's record is never
+  delivered to stream B.
+- **Retention (#566) is ONE GLOBAL reap.** The shared log is reaped as a whole, FLOORED at the
+  minimum committed record (mapped to its shared-log offset) across EVERY stream's consumer
+  groups — no stream's un-consumed record is ever reclaimed, and one slow stream pins the whole
+  shared log. Before any segment is unlinked the reap fsyncs a demux-floor checkpoint
+  (`shared-wal/reap.ckpt`, dual-slot CRC'd: the new logical earliest shared offset + each stream's
+  reaped-record position base), so a crash anywhere in the reap never renumbers a stream's
+  positions; a physical log AHEAD of the checkpoint is refused fail-closed at open. Key compaction
+  (#337) is not wired for the shared log.
+- **Disk-full (#1116) is the ONE log's byte cap.** An over-cap shared produce is the shared log's
+  own `AtCapacity` drop-new shed; drop-oldest force-reaping is not wired for the shared log.
+- **The hot-set LRU (#565) is inert.** `max_open_streams` bounds per-stream fds, and shared mode
+  has none (one log serves every stream); the `max_streams` EXISTENCE cap (#863) still applies.
+- **Fail-closed typed rejects (`Unsupported`).** Stored per-record subjects and per-subject
+  filtered subscriptions (#594 — the subject and the stream tag are mutually exclusive frame
+  fields, so a shared record cannot carry a subject), the Tier-S streaming tier on named streams
+  (#544/#541 — no contiguous per-stream frame runs exist to serve), and partitioned streams
+  (#693 — per-stream-log storage). The default stream (`""`, the root log) is served identically
+  in both modes, including its subjects/filters/Tier-S.
+- **Mode-vs-layout is fail-closed BOTH WAYS at open (`InvalidData`).** A per-stream open of a data
+  dir holding `shared-wal/` is refused (every named stream would silently read as empty); a shared
+  open of a dir whose `streams/<hex>/` hold segments — or holding `pstreams/` — is refused (those
+  records would be silently shadowed). Never a silent misread; the mode is restart-only and bound
+  to the data dir's layout.
+
 ---
 
 ## On-disk segment models

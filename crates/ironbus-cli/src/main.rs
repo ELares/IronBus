@@ -278,6 +278,13 @@ const DEFAULT_GROUP_IDLE_EVICT_MS: u64 = ironbus_server::engine::DEFAULT_GROUP_I
 /// unchanged. `drop-oldest` opts in to force-reaping the oldest sealed segment to make room.
 const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 
+/// The default STORAGE MODE for `serve` (`per-stream`, matching the engine default, #597): every
+/// named stream gets its OWN log under `streams/<hex>/` (per-stream resilience isolation, today's
+/// behavior byte-for-byte). `shared-wal` opts in to the high-stream-count density fallback where
+/// MANY named streams share ONE tagged commit log. The mode is RESTART-ONLY and layout-bound: the
+/// engine fail-closed refuses to open a data directory laid out by the other mode.
+const DEFAULT_STORAGE_MODE: &str = "per-stream";
+
 /// The default durability LEVEL for `serve` (`sync`, matching the engine default, #341, #379): an ack
 /// is emitted only after the covering `fdatasync`, so I2 holds and an acknowledged record is never
 /// lost on a power cut (ZERO acked loss). A zero-config broker stays power-loss safe; the relaxed
@@ -454,6 +461,48 @@ impl DiskFullPolicyArg {
         match self {
             DiskFullPolicyArg::DropNew => DEFAULT_DISK_FULL_POLICY,
             DiskFullPolicyArg::DropOldest => "drop-oldest",
+        }
+    }
+}
+
+/// The named-stream STORAGE MODE parsed from `serve --storage-mode` (#597). A platform-neutral,
+/// `Copy` mirror of the engine's [`ironbus_storage::shared_wal::StorageMode`], mirroring
+/// [`DiskFullPolicyArg`]'s flag-enum pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageModeArg {
+    /// Every named stream is its OWN log under `streams/<hex>/` (the default, byte-for-byte).
+    PerStream,
+    /// MANY named streams share ONE tagged commit log under `shared-wal/` (#597): the
+    /// high-stream-count density fallback, trading per-stream resilience isolation and per-stream
+    /// retention for one segment set + one fsync across all streams. Opt-in; layout-bound
+    /// (mode-mismatched data dirs are refused fail-closed at open).
+    SharedWal,
+}
+
+impl StorageModeArg {
+    /// Parses the `--storage-mode` flag value, accepting `per-stream` or `shared-wal`.
+    fn parse(value: &str) -> Option<StorageModeArg> {
+        match value {
+            "per-stream" => Some(StorageModeArg::PerStream),
+            "shared-wal" => Some(StorageModeArg::SharedWal),
+            _ => None,
+        }
+    }
+
+    /// The flag/log spelling of this mode, the inverse of [`StorageModeArg::parse`]; `PerStream`
+    /// returns [`DEFAULT_STORAGE_MODE`] so the default constant stays the single source of truth.
+    fn as_str(self) -> &'static str {
+        match self {
+            StorageModeArg::PerStream => DEFAULT_STORAGE_MODE,
+            StorageModeArg::SharedWal => "shared-wal",
+        }
+    }
+
+    /// The engine-side [`ironbus_storage::shared_wal::StorageMode`] this flag selects.
+    fn to_engine(self) -> ironbus_storage::shared_wal::StorageMode {
+        match self {
+            StorageModeArg::PerStream => ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
+            StorageModeArg::SharedWal => ironbus_storage::shared_wal::StorageMode::SharedWal,
         }
     }
 }
@@ -924,6 +973,7 @@ USAGE:
                   [--max-groups <n>] [--max-streams <n>] [--max-open-streams <n>]
                   [--group-idle-evict-ms <ms>]
                   [--disk-full-policy <drop-new|drop-oldest>]
+                  [--storage-mode <per-stream|shared-wal>]
                   [--key-shared-group <name>]... [--broadcast-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>] [--enable-admin]
     ironbus passwd --auth-config <path> --user <name> [--scopes <publish,subscribe,admin>]
@@ -1085,6 +1135,15 @@ Notes:
     is hit: drop-new sheds it (preserving older data); drop-oldest force-reaps the oldest sealed
     segment to make room then accepts it, so a slow consumer whose records are reaped gets a
     one-time truncation notice and resumes at the oldest record still present.
+    --storage-mode (default per-stream) selects how NAMED streams are stored (#597): per-stream
+    gives every named stream its own log under streams/<hex>/ (per-stream resilience isolation,
+    today's behavior byte-for-byte); shared-wal is the high-stream-count density fallback where
+    MANY named streams share ONE tagged commit log under shared-wal/ (one segment set + one fsync
+    for all streams), trading per-stream isolation, per-stream retention (retention becomes ONE
+    global reap floored at the min committed across every stream's groups), stored per-record
+    subjects/filtered subscriptions, Tier-S streaming, and partitioned streams (all typed rejects
+    in shared-wal mode). RESTART-ONLY and layout-bound: opening a data dir laid out by the other
+    mode is refused fail-closed, never silently misread.
     --key-shared-group <name> (repeatable, default none) runs the named competing group in
     key_shared ordering: a record's key routes to one live member, so same-key records keep their
     order while the group drains in parallel across keys. A group not named here stays plain
@@ -2440,6 +2499,9 @@ struct ServeFlags {
     /// schedule is never conflated with consenting to a fully ephemeral broker.
     ephemeral_loss_ack: bool,
     disk_full_policy: Option<String>,
+    /// The named-stream STORAGE MODE (#597): `--storage-mode <per-stream|shared-wal>`; `None`
+    /// falls back to the `per-stream` default. Restart-only (layout-bound), never reloadable.
+    storage_mode: Option<String>,
     visibility_ms: Option<u64>,
     enable_admin: bool,
     /// Turn ON the OTLP span export (#99, #352): the `--enable-otlp-export` bare flag. OFF by
@@ -2727,6 +2789,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--disk-full-policy" => {
                 f.disk_full_policy = Some(take_value("--disk-full-policy", args, &mut i)?);
+            }
+            "--storage-mode" => {
+                f.storage_mode = Some(take_value("--storage-mode", args, &mut i)?);
             }
             "--durability-level" => {
                 f.durability_level = Some(take_value("--durability-level", args, &mut i)?);
@@ -3160,6 +3225,24 @@ fn parse_serve_flags_with_env_and_reader(
             "`{source}` must be `drop-new` or `drop-oldest`, got `{disk_full_policy_arg}`"
         ))
     })?;
+    // The named-stream STORAGE MODE (#597) resolves like the disk-full policy: an enum string with
+    // flag > env > default (`per-stream`) precedence, parsed after resolution so a bad value names
+    // its source. Not a profile preset (the mode is a data-dir layout choice, not a tuning knob),
+    // and RESTART-ONLY: it is deliberately absent from the SIGHUP-reloadable subset, and the engine
+    // fail-closed refuses a data dir laid out by the other mode anyway.
+    let mode_from_flag = f.storage_mode.is_some();
+    let storage_mode_arg =
+        resolve_string("--storage-mode", f.storage_mode, env, DEFAULT_STORAGE_MODE);
+    let storage_mode = StorageModeArg::parse(&storage_mode_arg).ok_or_else(|| {
+        let source = if mode_from_flag {
+            "--storage-mode".to_string()
+        } else {
+            env_var_name("--storage-mode")
+        };
+        CliError::Usage(format!(
+            "`{source}` must be `per-stream` or `shared-wal`, got `{storage_mode_arg}`"
+        ))
+    })?;
     // The durability LEVEL (#341, #379) resolves like the disk-full policy: an enum string with
     // flag > env > default (`sync`) precedence, parsed after resolution so a bad value names its
     // source (the flag if explicit, else the env var). The default `sync` keeps the historical
@@ -3330,6 +3413,7 @@ fn parse_serve_flags_with_env_and_reader(
                 preset.ram_ceiling_bytes,
             )?,
             disk_full_policy,
+            storage_mode,
             visibility_ms: resolve_number(
                 "--visibility-timeout-ms",
                 f.visibility_ms,
@@ -5140,6 +5224,12 @@ struct ServeConfig {
     /// `DropOldest` force-reaps the oldest sealed segment to make room then accepts it. Honored only
     /// when `max_total_bytes` is set; with no cap, no produce is ever over-cap.
     disk_full_policy: DiskFullPolicyArg,
+    /// The named-stream STORAGE MODE (#597), wired into [`EngineConfig::storage_mode`]: `PerStream`
+    /// (the default, byte-for-byte today) gives every named stream its own log; `SharedWal` opts in
+    /// to the high-stream-count density fallback (many streams, ONE tagged commit log). RESTART-ONLY
+    /// and layout-bound: deliberately absent from the SIGHUP-reloadable subset, and the engine
+    /// fail-closed refuses a data dir laid out by the other mode.
+    storage_mode: StorageModeArg,
     visibility_ms: u64,
     /// Enable the OPT-IN read-only `/admin` introspection endpoint on the health server (#99). OFF
     /// by default: only with `--enable-admin` (and only when `--health-addr` is set) does `/admin`
@@ -5383,6 +5473,7 @@ impl ServeConfig {
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
+            storage_mode: StorageModeArg::PerStream,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
             enable_otlp_export: false,
@@ -6900,7 +6991,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          power_loss_safe={power_loss_safe} compression={compression} io_mode={io_mode} \
          flush_interval_ms={} \
          flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
-         commit_gather_us={} sync_max_dirty_bytes={}",
+         commit_gather_us={} sync_max_dirty_bytes={} storage_mode={storage_mode}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -6935,6 +7026,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.commit_gather_us,
         config.sync_max_dirty_bytes,
         data_dir = data_dir.map_or_else(|| "none".to_string(), |d| d.display().to_string()),
+        storage_mode = config.storage_mode.as_str(),
     )
 }
 
@@ -9960,7 +10052,10 @@ fn open_engine_with<F: Filesystem + Clone>(
         fs,
         SystemClock::new(),
         EngineConfig {
-            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
+            // The named-stream STORAGE MODE (#597): `--storage-mode` selects per-stream logs (the
+            // default, byte-for-byte) or the shared-WAL density fallback. Restart-only; the engine
+            // fail-closed refuses a data dir laid out by the other mode.
+            storage_mode: config.storage_mode.to_engine(),
             // Both caps are honored: `new` validates and sets the segment cap, the builder
             // layers on the durable-log total byte cap (the drop-new shed; `0` = unlimited).
             log: LogConfig::new(config.max_segment_bytes)
@@ -13676,6 +13771,7 @@ mod tests {
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
+            storage_mode: StorageModeArg::PerStream,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
             enable_otlp_export: false,
@@ -14820,6 +14916,7 @@ mod tests {
                 headers: Bytes::new(),
                 payload: Bytes::from(format!("poison-{i}").into_bytes()),
                 subject: Bytes::new(),
+                stream_tag: Bytes::new(),
             };
             sink.append_poison("orders", &src, 6).unwrap();
         }
@@ -17130,6 +17227,7 @@ mod tests {
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
+            storage_mode: StorageModeArg::PerStream,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
             enable_otlp_export: false,
