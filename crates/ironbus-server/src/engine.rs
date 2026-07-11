@@ -2943,6 +2943,33 @@ where
     Ok((partitioned, consumers, priority, recoveries))
 }
 
+/// The bit shift separating the LANE (top 8 bits) from the lane OFFSET (low 56 bits) in a composite
+/// priority delivery offset (#553). 56 bits of offset is `~7.2e16` records per lane — unreachable in
+/// practice — and 8 bits of lane covers the 256-lane `Engine::MAX_PRIORITY_LEVELS` ceiling.
+pub(crate) const PRIORITY_LANE_SHIFT: u64 = 56;
+
+/// Composes a priority stream's COMPOSITE delivery offset (#553): the `lane` in the top 8 bits, the
+/// per-lane `raw` offset in the low 56. Globally unique across a stream's lanes for one consumer, so the
+/// offset-keyed lease map and the wire ack need no lane field. See [`decompose_priority_offset`] for the
+/// inverse. A free `pub(crate)` fn (not an `Engine` method) so the session layer's lease bookkeeping can
+/// lane-scope its composite offsets with the SAME encoding.
+#[must_use]
+pub(crate) fn compose_priority_offset(lane: PartitionIndex, raw: Offset) -> u64 {
+    let mask = (1u64 << PRIORITY_LANE_SHIFT) - 1;
+    (u64::from(lane.get()) << PRIORITY_LANE_SHIFT) | (raw.get() & mask)
+}
+
+/// Decomposes a composite priority delivery offset (#553) back into `(lane, lane offset)` — the inverse
+/// of [`compose_priority_offset`]. Used by `Engine::ack_priority` to route an ack (whose offset the
+/// consumer echoed verbatim) to the right lane's cursor, and by the session's `Poll::Truncated` lease
+/// prune to lane-SCOPE the pruning so a reap in one lane never drops another lane's in-flight leases.
+#[must_use]
+pub(crate) fn decompose_priority_offset(composite: u64) -> (u32, Offset) {
+    let mask = (1u64 << PRIORITY_LANE_SHIFT) - 1;
+    let lane = u32::try_from(composite >> PRIORITY_LANE_SHIFT).unwrap_or(u32::MAX);
+    (lane, Offset::new(composite & mask))
+}
+
 /// Reconstructs a group's carried attempt counts from a recovered `attempts.ckpt` payload, clamped
 /// to the durable log head `flushed` and the resumed committed watermark `committed`: a carried
 /// count is only meaningful for an offset that still exists (`< flushed`) and has NOT been committed
@@ -7320,38 +7347,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// every representable priority maps to a lane (saturating at the top when `priority >= P`).
     const MAX_PRIORITY_LEVELS: u32 = 256;
 
-    /// The bit shift separating the LANE (top 8 bits) from the lane OFFSET (low 56 bits) in a composite
-    /// priority delivery offset (#553). 56 bits of offset is `~7.2e16` records per lane — unreachable in
-    /// practice — and 8 bits of lane covers the `256`-lane [`Engine::MAX_PRIORITY_LEVELS`] ceiling.
-    const PRIORITY_LANE_SHIFT: u64 = 56;
-
-    /// Composes a priority stream's COMPOSITE delivery offset (#553): the `lane` in the top 8 bits, the
-    /// per-lane `raw` offset in the low 56. Globally unique across a stream's lanes for one consumer, so
-    /// the offset-keyed lease map and the wire ack need no lane field. See [`Engine::ack_priority`] for
-    /// the inverse.
-    #[must_use]
-    fn compose_priority_offset(lane: PartitionIndex, raw: Offset) -> u64 {
-        let mask = (1u64 << Self::PRIORITY_LANE_SHIFT) - 1;
-        (u64::from(lane.get()) << Self::PRIORITY_LANE_SHIFT) | (raw.get() & mask)
-    }
-
-    /// Decomposes a composite priority delivery offset (#553) back into `(lane, lane offset)` — the
-    /// inverse of [`Engine::compose_priority_offset`], used by [`Engine::ack_priority`] to route an ack
-    /// (whose offset the consumer echoed verbatim) to the right lane's cursor.
-    #[must_use]
-    fn decompose_priority_offset(composite: u64) -> (u32, Offset) {
-        let mask = (1u64 << Self::PRIORITY_LANE_SHIFT) - 1;
-        let lane = u32::try_from(composite >> Self::PRIORITY_LANE_SHIFT).unwrap_or(u32::MAX);
-        (lane, Offset::new(composite & mask))
-    }
-
     /// Rewrites every offset a lane's [`Poll`] surfaces into the COMPOSITE lane-tagged offset (#553), so
     /// a priority consumer's leases, acks, and in-band advisories all carry the globally-unique offset.
     /// `Poll::Idle` never reaches here (the scan continues past an idle lane); every other variant has
     /// its `Offset` fields tagged with `lane`.
     #[must_use]
     fn compose_priority_poll(lane: PartitionIndex, poll: Poll) -> Poll {
-        let tag = |o: Offset| Offset::new(Self::compose_priority_offset(lane, o));
+        let tag = |o: Offset| Offset::new(compose_priority_offset(lane, o));
         match poll {
             Poll::Message(mut d) => {
                 d.token.offset = tag(d.token.offset);
@@ -7635,7 +7637,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if !self.is_priority_stream(stream) {
             return AckResult::Fenced;
         }
-        let (lane, raw) = Self::decompose_priority_offset(token.offset.get());
+        let (lane, raw) = decompose_priority_offset(token.offset.get());
         self.ack_partition(
             stream,
             lane,
@@ -30834,14 +30836,21 @@ mod tests {
     fn priority_composite_offset_round_trips() {
         for lane in [0u32, 1, 7, 42, 255] {
             for raw in [0u64, 1, 1000, (1u64 << 55) - 1] {
-                let composite = Engine::<InMemoryFs, ManualClock>::compose_priority_offset(
-                    PartitionIndex::new(lane),
-                    Offset::new(raw),
-                );
-                let (dl, doff) =
-                    Engine::<InMemoryFs, ManualClock>::decompose_priority_offset(composite);
+                let composite =
+                    compose_priority_offset(PartitionIndex::new(lane), Offset::new(raw));
+                let (dl, doff) = decompose_priority_offset(composite);
                 assert_eq!(dl, lane);
                 assert_eq!(doff.get(), raw);
+                // Same-lane composites are ORDER-PRESERVING on the low 56 bits — the property the
+                // session's lane-scoped `Poll::Truncated` prune relies on.
+                if raw > 0 {
+                    let lower =
+                        compose_priority_offset(PartitionIndex::new(lane), Offset::new(raw - 1));
+                    assert!(
+                        lower < composite,
+                        "within a lane, offset order is preserved"
+                    );
+                }
             }
         }
     }

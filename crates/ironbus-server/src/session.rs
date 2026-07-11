@@ -2057,6 +2057,18 @@ impl Session {
             reply_err(out, "not connected");
             return Ok(());
         }
+        // #553: a PRIORITY-bound consumer must not send a broadcast `CumulativeAck` — its `self.leased`
+        // holds COMPOSITE lane-tagged offsets, so the raw `up_to`-exclusive prune below would corrupt its
+        // cross-lane lease bookkeeping (fencing lower-lane acks). A priority consumer acks per-message
+        // (each composite offset routes to its lane); reject the frame rather than mis-prune. Cheap
+        // insurance — it is a misuse of a broadcast-group verb on a competing named-stream consumer.
+        if self.priority_bound {
+            reply_err(
+                out,
+                "cumulative-ack is not supported on a priority-stream consumer (ack per message)",
+            );
+            return Ok(());
+        }
         let Ok(ack) = decode_cumulative_ack(body) else {
             reply_err(out, "malformed cumulative-ack body");
             return Ok(());
@@ -2207,6 +2219,31 @@ impl Session {
             .values()
             .map(|l| l.bytes)
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// Drops the now-meaningless in-flight leases at or below a `Poll::Truncated` reset (#82/#84): a
+    /// force-reap moved the group's cursor UP to `earliest_retained`, so any lease this session held
+    /// below it is a reaped offset a later ack must NOT act on (it would fence, or worse act on a
+    /// recycled offset).
+    ///
+    /// For a NON-priority consumer this prunes every lease below the reset offset (raw offsets, the
+    /// historical behavior). For a PRIORITY consumer (#553) `earliest_retained` is a COMPOSITE offset
+    /// (its reaped LANE in the top 8 bits) and `self.leased` multiplexes composite offsets from ALL
+    /// lanes, so the prune is LANE-SCOPED: only leases in the SAME lane as the reaped one are dropped —
+    /// and, because same-lane composites are order-preserving on the low 56 bits, the within-lane
+    /// `>= reset` comparison is correct — while every OTHER lane's in-flight leases are RETAINED. A reap
+    /// in one lane must never fence another lane's acks (a cross-lane composite compare would drop every
+    /// lease in the lower-numbered lanes, spuriously redelivering them).
+    fn prune_leases_below_truncation(&mut self, earliest_retained: Offset) {
+        let reset = earliest_retained.get();
+        if self.priority_bound {
+            let (reaped_lane, _) = crate::engine::decompose_priority_offset(reset);
+            self.leased.retain(|&o, _| {
+                crate::engine::decompose_priority_offset(o).0 != reaped_lane || o >= reset
+            });
+        } else {
+            self.leased.retain(|&o, _| o >= reset);
+        }
     }
 
     /// Drops every `leased` entry the engine no longer holds as an ACTIVE (live and not expired)
@@ -2536,8 +2573,9 @@ impl Session {
                         earliest_retained,
                         skipped,
                     }) => {
-                        self.leased
-                            .retain(|&offset, _| offset >= earliest_retained.get());
+                        // Lane-scoped for a priority consumer (#553): a reap in one lane never fences
+                        // another lane's in-flight leases (see `prune_leases_below_truncation`).
+                        self.prune_leases_below_truncation(earliest_retained);
                         self.emit_truncation(
                             out,
                             &mut frame_body,
@@ -2825,14 +2863,13 @@ impl Session {
                         reply(out, FrameType::DeadLetter, &frame_body);
                     }
                     // A below-earliest truncation: identical handling to `handle_flow` — drop the now-meaningless
-                    // leases below the reset and emit the in-band advisory (GapMarker or Truncated per the
-                    // negotiated capability), then keep draining.
+                    // leases below the reset (lane-scoped for a priority consumer, #553) and emit the in-band
+                    // advisory (GapMarker or Truncated per the negotiated capability), then keep draining.
                     Ok(Poll::Truncated {
                         earliest_retained,
                         skipped,
                     }) => {
-                        self.leased
-                            .retain(|&offset, _| offset >= earliest_retained.get());
+                        self.prune_leases_below_truncation(earliest_retained);
                         self.emit_truncation(
                             out,
                             &mut frame_body,
@@ -14164,6 +14201,90 @@ mod tests {
         assert!(
             delivered_payloads(&out).is_empty(),
             "no more records after every lane is acked"
+        );
+    }
+
+    /// #553 (regression): the `Poll::Truncated` lease prune is LANE-SCOPED for a priority consumer. A
+    /// force-reap in ONE lane must drop only THAT lane's below-earliest in-flight leases and RETAIN
+    /// every other lane's — the composite offsets must not be compared cross-lane (which would fence a
+    /// lower-numbered lane's acks and spuriously redeliver them). The non-priority path is unchanged.
+    #[test]
+    fn priority_truncation_prune_is_lane_scoped_not_cross_lane() {
+        use crate::engine::compose_priority_offset;
+        use ironbus_core::partition::PartitionIndex;
+        let comp = |lane: u32, off: u64| {
+            compose_priority_offset(PartitionIndex::new(lane), Offset::new(off))
+        };
+
+        // A priority-bound consumer holding in-flight leases across THREE lanes.
+        let mut s = Session::new();
+        s.priority_bound = true;
+        for (lane, off) in [(0u32, 5u64), (1, 2), (1, 3), (2, 0), (2, 1)] {
+            s.leased.insert(
+                comp(lane, off),
+                Lease {
+                    generation: 1,
+                    bytes: 4,
+                },
+            );
+        }
+
+        // Lane 2 force-reaped up to offset 1 (Poll::Truncated{earliest = compose(2, 1)}): ONLY lane 2's
+        // below-earliest lease (off 0) is pruned; lanes 0 and 1 are UNTOUCHED. The cross-lane bug would
+        // have dropped every lease with a smaller composite = ALL of lanes 0 and 1 (2<<56 > any lane-0/1
+        // composite).
+        s.prune_leases_below_truncation(Offset::new(comp(2, 1)));
+        assert!(
+            s.leased.contains_key(&comp(0, 5)),
+            "lane 0 lease retained (its lane was NOT reaped)"
+        );
+        assert!(s.leased.contains_key(&comp(1, 2)), "lane 1 lease retained");
+        assert!(s.leased.contains_key(&comp(1, 3)), "lane 1 lease retained");
+        assert!(
+            !s.leased.contains_key(&comp(2, 0)),
+            "lane 2 below-earliest lease pruned"
+        );
+        assert!(
+            s.leased.contains_key(&comp(2, 1)),
+            "lane 2 at-earliest lease retained"
+        );
+        // The lane-0 lease survives with its generation intact, so its later ack PASSES the ownership
+        // gate (offset + generation match a live lease) and is NOT spuriously fenced — the concrete
+        // symptom of the fixed bug (fenced ack -> engine lease expires -> spurious duplicate).
+        assert_eq!(s.leased.get(&comp(0, 5)).map(|l| l.generation), Some(1));
+
+        // Reaping lane 1 up to offset 3 DOES prune lane 1's below-earliest lease (within-lane path
+        // works), while lane 0 STILL survives across the lane-1 reap.
+        s.prune_leases_below_truncation(Offset::new(comp(1, 3)));
+        assert!(
+            !s.leased.contains_key(&comp(1, 2)),
+            "lane 1 below-earliest lease pruned by a lane-1 reap"
+        );
+        assert!(
+            s.leased.contains_key(&comp(1, 3)),
+            "lane 1 at-earliest lease retained"
+        );
+        assert!(
+            s.leased.contains_key(&comp(0, 5)),
+            "lane 0 STILL retained across a lane-1 reap"
+        );
+
+        // The NON-priority path is unchanged: raw offsets, prune everything strictly below the reset.
+        let mut r = Session::new();
+        for off in [1u64, 4, 9] {
+            r.leased.insert(
+                off,
+                Lease {
+                    generation: 1,
+                    bytes: 4,
+                },
+            );
+        }
+        r.prune_leases_below_truncation(Offset::new(5));
+        assert!(!r.leased.contains_key(&1) && !r.leased.contains_key(&4));
+        assert!(
+            r.leased.contains_key(&9),
+            "raw offsets >= reset retained (byte-for-byte the pre-#553 behavior)"
         );
     }
 
