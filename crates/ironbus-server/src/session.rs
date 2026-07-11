@@ -1673,6 +1673,12 @@ impl Session {
             // accepted record to its level (c0/c1/c2) for the per-ack-level produce counters.
             ack_level,
         };
+        // DISTRIBUTED-TRACING PRODUCER span (#770): emitted for an ACCEPTED produce (all pre-submit
+        // rejections/redirects returned above), CONTINUING the client's trace when the produce carried
+        // a W3C `traceparent` in its headers (else a new root); a malformed/absent context is treated
+        // as absent and never rejects the produce. Head-sampled + bounded-lossy; a `None` sink (export
+        // off) is a zero-cost no-op. Emitted BEFORE `append` moves into the submit below.
+        emit_produce_span(engine.span_sink(), msg.headers);
         // LEVEL 0 (no-ack fast path, #495): submit the produce with NO reply channel and return
         // immediately — do NOT park. The producer fired and forgot, so there is no PubAck to write, no
         // reply-channel allocation, and no fsync to wait for. The connection-thread byte-cap pre-check
@@ -2334,6 +2340,11 @@ impl Session {
         let longpoll_cell = engine.commit_notify().map(|n| n.cell(&self.stream));
         let longpoll_budget = std::time::Duration::from_millis(self.consume_longpoll_ms);
         let longpoll_start = std::time::Instant::now();
+        // DISTRIBUTED-TRACING sink (#770): hoisted ONCE per flow, so a delivered record emits a
+        // CONSUMER span linking back to its producer WITHOUT a per-record sink lookup. `None` (a broker
+        // without `--enable-otlp-export`) makes every per-record emission a zero-cost no-op, so the
+        // deliver hot path is byte-for-byte unchanged by default.
+        let span_sink = engine.span_sink();
         loop {
             // FRESH per-pass generation snapshot, taken BEFORE this pass's drain (lost-wakeup safety and
             // stale-snapshot avoidance, see above).
@@ -2409,6 +2420,16 @@ impl Session {
                         // error the partial frame is rolled off `out` and the batch stops.
                         if encode_deliver_frame(&msg, out).is_err() {
                             break;
+                        }
+                        // DISTRIBUTED-TRACING CONSUMER span (#770): a delivered record opens a Consumer
+                        // span that LINKS back to the PRODUCING span read off the record's STORED
+                        // `traceparent` header (same trace id, the producing span id) — the
+                        // producer -> consumer link. Per the OTLP messaging convention a consume span
+                        // LINKS (not parents), since one flow can deliver many produced records. A
+                        // malformed/absent stored `traceparent` simply contributes no link. Head-sampled
+                        // + bounded-lossy; `None` sink is a zero-cost no-op.
+                        if let Some(sink) = &span_sink {
+                            emit_consume_span(sink, &d.record.headers);
                         }
                         // Record ownership so only this session can later act on this lease (#175), and
                         // the message's byte size so the byte budget (#275) is derived from `leased`. The
@@ -4902,6 +4923,40 @@ fn lease_bytes(record: &ironbus_storage::segment::OwnedRecord) -> u64 {
         .saturating_add(record.headers.len())
         .saturating_add(record.payload.len());
     u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// Emits a distributed-tracing PRODUCER span (#770) for an accepted produce over the produce's wire
+/// `headers`. When the headers carry a W3C `traceparent`, the span CONTINUES the client's trace
+/// (adopts the trace id, parents on the inbound span id); a malformed or absent context yields a new
+/// ROOT producer span. Head-sampled + bounded-lossy through the `sink`; a `None` sink (a broker
+/// without OTLP export) returns immediately (a zero-cost no-op), so the produce hot path is byte-for-
+/// byte unchanged by default. Takes the resolved `Option<SpanSink>` (not the engine) so it needs no
+/// generic engine bound.
+fn emit_produce_span(sink: Option<crate::obs::SpanSink>, headers: &[u8]) {
+    if let Some(sink) = sink {
+        let parent = ironbus_core::trace_context::TraceParent::from_headers(headers);
+        sink.emit(crate::obs::SpanRecord::produce(
+            crate::obs::next_span_id(),
+            crate::obs::Severity::Info,
+            parent,
+        ));
+    }
+}
+
+/// Emits a distributed-tracing CONSUMER span (#770) for a delivered record over its STORED `headers`,
+/// LINKING back to the producing span read off the record's `traceparent` (same trace id, the
+/// producing span id) — the producer -> consumer link. A malformed or absent stored context simply
+/// contributes no link (the consume span is still emitted). Head-sampled + bounded-lossy through the
+/// `sink`. Called only when a sink is present (hoisted once per flow), so the caller owns the
+/// `None` fast-path.
+fn emit_consume_span(sink: &crate::obs::SpanSink, headers: &[u8]) {
+    let producer = ironbus_core::trace_context::TraceParent::from_headers(headers);
+    let producers: Vec<ironbus_core::trace_context::TraceParent> = producer.into_iter().collect();
+    sink.emit(crate::obs::SpanRecord::consume(
+        crate::obs::next_span_id(),
+        crate::obs::Severity::Info,
+        &producers,
+    ));
 }
 
 /// Combines two byte budgets into the EFFECTIVE one, where `0` means UNLIMITED on EITHER side (#489,
@@ -9061,6 +9116,161 @@ mod tests {
         s.process(e, &frame(FrameType::Pub, &pub_body), &mut out)
             .unwrap();
         out
+    }
+
+    #[test]
+    fn distributed_tracing_links_a_produce_span_to_the_matching_consume_span_end_to_end() {
+        // The #770 END-TO-END proof: a produce carrying a W3C `traceparent` in its headers, driven
+        // THROUGH the session's produce path, emits a PRODUCER span parented to the inbound span id
+        // onto the SAME bounded queue the OTLP exporter drains; the matching deliver (Flow) emits a
+        // CONSUMER span carrying a SpanLink back to that producing span. This exercises the real
+        // emission sites (`handle_pub` + `handle_flow`), not the data model in isolation.
+        use crate::obs::{BoundedSpanQueue, SpanKindTag, SpanSink};
+        use ironbus_core::trace_context::TraceParent;
+
+        // The known W3C context the "client" stamps into the produce headers (the W3C example vector).
+        let traceparent: &[u8] =
+            b"traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let expected = TraceParent::from_headers(traceparent).expect("the sample context parses");
+
+        // An engine wired to a REAL span sink at full sampling, so emission actually lands on the queue.
+        let queue = Arc::new(BoundedSpanQueue::with_capacity(64));
+        let e = DirectEngine::new(engine()).with_span_sink(SpanSink::new(Arc::clone(&queue), 1.0));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+
+        // PRODUCE through the session carrying the traceparent in the headers.
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: traceparent,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"p",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+
+        // CONSUME (Flow): the record is delivered, emitting the Consumer span.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            !delivered_tokens(&out).is_empty(),
+            "the produced record was delivered"
+        );
+        // ROUND-TRIP (#770 acceptance 2): the traceparent read back off the DURABLE record's stored
+        // headers is byte-identical to what the client sent in.
+        let frames = decode_all(&out);
+        let deliver = frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::Deliver)
+            .expect("a Deliver frame");
+        let delivered =
+            ironbus_proto::message::decode_deliver(&deliver.1).expect("a valid Deliver body");
+        assert_eq!(
+            delivered.headers, traceparent,
+            "the traceparent round-trips byte-identically off the durable record"
+        );
+
+        // Drain the queue the exporter would drain, and inspect the emitted spans.
+        let spans = queue.drain();
+        let producer = spans
+            .iter()
+            .find(|r| r.ctx.kind == SpanKindTag::Producer)
+            .expect("a Producer span was emitted for the produce");
+        assert_eq!(
+            producer.ctx.trace_id, expected.trace_id,
+            "the produce span continues the client's trace"
+        );
+        assert_eq!(
+            producer.ctx.parent_span_id, expected.parent_id,
+            "the produce span parents on the inbound span id (not a root)"
+        );
+
+        let consumer = spans
+            .iter()
+            .find(|r| r.ctx.kind == SpanKindTag::Consumer)
+            .expect("a Consumer span was emitted for the deliver");
+        assert_eq!(
+            consumer.ctx.link_count, 1,
+            "the consume span links to exactly the producing span"
+        );
+        assert_eq!(
+            consumer.ctx.links[0].trace_id, expected.trace_id,
+            "the link is in the producer's trace"
+        );
+        assert_eq!(
+            consumer.ctx.links[0].span_id, expected.parent_id,
+            "the link targets the producing span id (producer -> consumer correlation)"
+        );
+    }
+
+    #[test]
+    fn a_malformed_produce_traceparent_is_absent_and_the_produce_still_succeeds() {
+        // A malformed `traceparent` in the produce headers is treated as ABSENT: the produce is NOT
+        // rejected (it is durably produced and delivered), and its Producer span is a ROOT (no parent),
+        // never an error. This is the defensive-parse contract on the live produce path.
+        use crate::obs::{BoundedSpanQueue, SpanKindTag, SpanSink};
+
+        let queue = Arc::new(BoundedSpanQueue::with_capacity(16));
+        let e = DirectEngine::new(engine()).with_span_sink(SpanSink::new(Arc::clone(&queue), 1.0));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"traceparent: not-a-valid-w3c-value",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"p",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        // The produce SUCCEEDS (process returns Ok, the connection stays open) despite the bad context.
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .expect("a malformed traceparent must not reject the produce");
+
+        // The record is durably produced: a Flow delivers it.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            !delivered_tokens(&out).is_empty(),
+            "the produce still committed and delivered despite the malformed traceparent"
+        );
+
+        // The Producer span is a ROOT: the malformed context was dropped (absent), not adopted.
+        let spans = queue.drain();
+        let producer = spans
+            .iter()
+            .find(|r| r.ctx.kind == SpanKindTag::Producer)
+            .expect("a Producer span was still emitted");
+        assert_eq!(
+            producer.ctx.parent_span_id, [0u8; 8],
+            "a malformed traceparent yields a root producer span (no parent)"
+        );
+        assert_eq!(
+            producer.ctx.trace_id, [0u8; 16],
+            "a malformed traceparent yields a root trace (derived from the span id)"
+        );
     }
 
     /// A mock whose produce path always reports the durable-log byte cap (drop-new) shed.

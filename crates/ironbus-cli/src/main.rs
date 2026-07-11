@@ -7252,11 +7252,40 @@ fn cmd_serve(
              feature; OTLP span export is disabled (rebuild with --features otlp to enable it)"
         )?;
     }
-    let _span_queue = ironbus_server::obs::init_tracing(&ironbus_server::obs::TracingConfig {
+    // The OTLP head-sampling ratio (#770, #99): when export is ON, produce/deliver spans are admitted
+    // at this fraction (the exporter samples at drain, and the produce/deliver EMISSION sites sample at
+    // push through the same gate). Env-TUNABLE (`IRONBUS_OTLP_SAMPLE_RATIO`, clamped to [0,1]) so an
+    // operator can dial trace volume without a rebuild; DEFAULTS to full sampling when export is on (the
+    // bounded-lossy queue sheds any excess, never blocking a produce) and to 0.0 (no distributed spans;
+    // ERROR/WARN events still record) when export is off, so a non-tracing broker pays nothing. A
+    // malformed env value falls back to the default.
+    let otlp_sample_ratio = if config.enable_otlp_export {
+        std::env::var("IRONBUS_OTLP_SAMPLE_RATIO")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map_or(1.0, |r| r.clamp(0.0, 1.0))
+    } else {
+        ironbus_server::obs::DEFAULT_SAMPLE_RATIO
+    };
+    // Held for the broker's lifetime (the drain thread also holds its own `Arc` clone): the bounded
+    // span-export queue the OTLP exporter drains AND the produce/deliver emission sites push onto.
+    let span_queue = ironbus_server::obs::init_tracing(&ironbus_server::obs::TracingConfig {
         otlp_export_enabled: config.enable_otlp_export,
         otlp_endpoint: config.otlp_endpoint.clone(),
+        sample_ratio: otlp_sample_ratio,
         ..ironbus_server::obs::TracingConfig::default()
     });
+    // The span-emission sink threaded to the engine so the produce/deliver/ack sites emit into the SAME
+    // queue (#770). `None` when export is off (a zero-cost no-op at every emission site); `Some` when on
+    // (built once here, installed on the engine handle in `run_broker` before any connection clone).
+    let span_sink: Option<ironbus_server::obs::SpanSink> = if config.enable_otlp_export {
+        Some(ironbus_server::obs::SpanSink::new(
+            std::sync::Arc::clone(&span_queue),
+            otlp_sample_ratio,
+        ))
+    } else {
+        None
+    };
 
     // SECURE-BIND guard (#95, the #107 bind invariant), FAIL-CLOSED and FIRST: resolve and classify
     // `--health-addr` before ANY broker side effect (no data dir touched, no lock taken, no listener
@@ -7472,6 +7501,7 @@ fn cmd_serve(
                 preauth_cfg,
                 audit,
                 tls_termination,
+                span_sink.clone(),
                 reload,
                 out,
             );
@@ -7525,6 +7555,7 @@ fn cmd_serve(
                 preauth_cfg,
                 audit,
                 tls_termination,
+                span_sink,
                 reload,
                 out,
             )
@@ -8908,6 +8939,10 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // (where the resolved transport flags are in scope). A live rustls TLS 1.3 config behind
     // `--features tls`, or a zero-cost plaintext terminator otherwise.
     tls_termination: ironbus_server::server::TlsTermination,
+    // The distributed-tracing span-emission sink (#770): `Some` when `--enable-otlp-export` is on,
+    // installed on the engine handle below so every connection's produce/deliver/ack sites emit into the
+    // exporter's queue. `None` on a non-tracing broker (a zero-cost no-op at every emission site).
+    span_sink: Option<ironbus_server::obs::SpanSink>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -8926,6 +8961,13 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         Some(slot) => shared.with_client_ack_slot(slot),
         None => shared,
     };
+    // Install the SHARED span-emission sink (#770) onto the base handle BEFORE any per-connection clone,
+    // so every connection's produce/deliver/ack sites reach the ONE sink over the exporter's bounded
+    // queue. `None` (export off) installs nothing, so `EngineAccess::span_sink` stays `None` and every
+    // emission site is a zero-cost no-op — the byte-for-byte default hot path.
+    if let Some(sink) = span_sink {
+        shared.set_span_sink(sink);
+    }
     // Arm the append-actor wedge watchdog (#862) BEFORE any produce can run: a durability fsync that
     // hangs longer than this bound flips `/healthz` and `/readyz` to 503 (instead of leaving liveness
     // green and hanging readyz), so an orchestrator restarts a node whose disk has stalled. `0` disables

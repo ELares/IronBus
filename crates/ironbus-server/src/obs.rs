@@ -64,19 +64,219 @@ impl Severity {
     }
 }
 
-/// One span queued for export. Carries only its severity and a small opaque id; no payload bytes and
-/// no secret material, so the export queue never widens the trust boundary the way `/admin` mutation
-/// would. The concrete exporter (`otlp::record_to_span_data`, behind the `otlp` feature) maps this
-/// onto an OTLP span.
+/// The OTLP span kind of a recorded span (#770), our own dependency-free tag so the default and
+/// `edge-min` builds carry it without linking `opentelemetry`. The `otlp` exporter maps it onto
+/// `opentelemetry::trace::SpanKind`. `Internal` is the neutral default (today's behavior); `Server`
+/// is the connection handler, `Producer` a produce, `Consumer` a deliver/ack — the messaging lifecycle
+/// the W3C-propagation half of tracing needs to speak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SpanKindTag {
+    /// A local, un-kinded span: the neutral default, the behavior before distributed tracing.
+    #[default]
+    Internal,
+    /// The connection handler / server-side request span.
+    Server,
+    /// A client-side request span (reserved; the broker rarely originates one).
+    Client,
+    /// A produce span: the message-bus PRODUCER side of the OTLP messaging convention.
+    Producer,
+    /// A deliver/ack span: the message-bus CONSUMER side of the OTLP messaging convention.
+    Consumer,
+}
+
+/// The cap on the number of producer -> consumer links a single consume span may carry (#770). A
+/// batch delivery can fan in many produced records; without a bound the link list would grow with the
+/// batch. We keep only the first [`MAX_SPAN_LINKS`] DISTINCT producer contexts and drop the rest, so a
+/// span's link surface is fixed-size and `Copy`, never an unbounded allocation on the export path.
+pub const MAX_SPAN_LINKS: usize = 8;
+
+/// One producer -> consumer span LINK (#770): the (trace-id, span-id) of a span this span links to.
+/// Dependency-free plain data (24 bytes, `Copy`); the `otlp` exporter maps it onto an
+/// `opentelemetry` `Link`. An all-zero link is the empty/unused slot in a [`SpanTraceContext`]'s fixed
+/// link array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SpanLink {
+    /// The 16-byte trace id of the linked span.
+    pub trace_id: [u8; 16],
+    /// The 8-byte span id of the linked span.
+    pub span_id: [u8; 8],
+}
+
+/// The distributed-trace linkage a span carries (#770): its kind, the trace it belongs to, its
+/// parent, and a bounded set of producer -> consumer links. ALWAYS-ON plain data (no `opentelemetry`
+/// dependency, present on the default and `edge-min` builds); the `otlp` exporter reads it to populate
+/// the exported span's `span_kind`, `parent_span_id`, and `links` instead of the old
+/// `Internal`/`INVALID`/empty defaults. The `Default` is exactly the pre-#770 behavior: an `Internal`
+/// span with a trace id derived from the span id (a new root) and no parent and no links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpanTraceContext {
+    /// The span kind (drives the exported `span_kind`).
+    pub kind: SpanKindTag,
+    /// The trace id this span belongs to. ALL-ZERO means "derive a trace id from the span id" (the
+    /// root-span behavior): a produce that continues a client's trace sets this to the client's trace
+    /// id, a root produce leaves it zero.
+    pub trace_id: [u8; 16],
+    /// The parent span id. ALL-ZERO means "no parent" (exported as `SpanId::INVALID`): a produce
+    /// continuing a client's trace sets this to the inbound `traceparent`'s span id, a root leaves it
+    /// zero.
+    pub parent_span_id: [u8; 8],
+    /// The bounded producer -> consumer links; only the first `link_count` slots are populated. A
+    /// consume span links back to the producing span(s) here.
+    pub links: [SpanLink; MAX_SPAN_LINKS],
+    /// How many of `links` are populated (`0..=MAX_SPAN_LINKS`).
+    pub link_count: usize,
+}
+
+impl Default for SpanTraceContext {
+    fn default() -> SpanTraceContext {
+        SpanTraceContext {
+            kind: SpanKindTag::Internal,
+            trace_id: [0u8; 16],
+            parent_span_id: [0u8; 8],
+            links: [SpanLink::default(); MAX_SPAN_LINKS],
+            link_count: 0,
+        }
+    }
+}
+
+impl SpanTraceContext {
+    /// The context for a plain internal event/span: the pre-#770 behavior (Internal kind, root trace
+    /// derived from the span id, no parent, no links).
+    #[must_use]
+    pub fn internal() -> SpanTraceContext {
+        SpanTraceContext::default()
+    }
+
+    /// The context for the connection-handler SERVER span: `Server` kind, otherwise a root (no inbound
+    /// context is threaded to the handler span today).
+    #[must_use]
+    pub fn server() -> SpanTraceContext {
+        SpanTraceContext {
+            kind: SpanKindTag::Server,
+            ..SpanTraceContext::default()
+        }
+    }
+
+    /// The context for a PRODUCE span (#770): `Producer` kind, and — when the produce carried an
+    /// inbound W3C `traceparent` — CONTINUING the client's trace by adopting its trace id and making
+    /// the inbound span id this span's PARENT. With no inbound context it is a new root (today's
+    /// behavior), still tagged `Producer`.
+    #[must_use]
+    pub fn producer(parent: Option<ironbus_core::trace_context::TraceParent>) -> SpanTraceContext {
+        match parent {
+            Some(tp) => SpanTraceContext {
+                kind: SpanKindTag::Producer,
+                trace_id: tp.trace_id,
+                parent_span_id: tp.parent_id,
+                ..SpanTraceContext::default()
+            },
+            None => SpanTraceContext {
+                kind: SpanKindTag::Producer,
+                ..SpanTraceContext::default()
+            },
+        }
+    }
+
+    /// The context for a DELIVER/ACK CONSUME span (#770): `Consumer` kind with a producer -> consumer
+    /// LINK back to each DISTINCT producing span read off the delivered record(s)' stored
+    /// `traceparent`. Per the OTLP messaging convention a consume span LINKS to (not parents on) the
+    /// producing span, because one deliver/fetch can batch many produced records. The links are
+    /// DEDUPED by (trace-id, span-id) and CAPPED at [`MAX_SPAN_LINKS`]: extra distinct producers are
+    /// dropped so the link surface stays bounded. The consume span itself is a root (its own trace is
+    /// derived from its span id); a malformed/absent stored `traceparent` simply contributes no link.
+    #[must_use]
+    pub fn consumer(producers: &[ironbus_core::trace_context::TraceParent]) -> SpanTraceContext {
+        let mut ctx = SpanTraceContext {
+            kind: SpanKindTag::Consumer,
+            ..SpanTraceContext::default()
+        };
+        for tp in producers {
+            if ctx.link_count >= MAX_SPAN_LINKS {
+                break;
+            }
+            let link = SpanLink {
+                trace_id: tp.trace_id,
+                span_id: tp.parent_id,
+            };
+            // Dedup: link once per distinct producer span even across a batch.
+            if ctx.links[..ctx.link_count].contains(&link) {
+                continue;
+            }
+            ctx.links[ctx.link_count] = link;
+            ctx.link_count += 1;
+        }
+        ctx
+    }
+}
+
+/// One span queued for export. Carries a small opaque id, its severity, and its distributed-trace
+/// context ([`SpanTraceContext`]) — no payload bytes and no secret material, so the export queue never
+/// widens the trust boundary the way `/admin` mutation would. The concrete exporter
+/// (`otlp::record_to_span_data`, behind the `otlp` feature) maps this onto an OTLP span, reading the
+/// context for the exported `span_kind`, parent, and links.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpanRecord {
     /// A monotonic-ish span id, opaque to this module.
     pub id: u64,
     /// The span's severity, which drives the always-record rule.
     pub severity: Severity,
+    /// The distributed-trace linkage (kind, trace/parent ids, producer -> consumer links). Defaults to
+    /// [`SpanTraceContext::internal`], the pre-#770 behavior.
+    pub ctx: SpanTraceContext,
 }
 
 impl SpanRecord {
+    /// A plain internal event/span record (the pre-#770 shape): id + severity with the neutral
+    /// [`SpanTraceContext::internal`] context. This is the constructor the resilience-event path uses.
+    #[must_use]
+    pub fn event(id: u64, severity: Severity) -> SpanRecord {
+        SpanRecord {
+            id,
+            severity,
+            ctx: SpanTraceContext::internal(),
+        }
+    }
+
+    /// A connection-handler SERVER span record (#770): `Server` kind.
+    #[must_use]
+    pub fn server(id: u64, severity: Severity) -> SpanRecord {
+        SpanRecord {
+            id,
+            severity,
+            ctx: SpanTraceContext::server(),
+        }
+    }
+
+    /// A PRODUCE span record (#770): `Producer` kind, continuing the client's trace when `parent` (the
+    /// inbound W3C `traceparent`) is present, otherwise a new root.
+    #[must_use]
+    pub fn produce(
+        id: u64,
+        severity: Severity,
+        parent: Option<ironbus_core::trace_context::TraceParent>,
+    ) -> SpanRecord {
+        SpanRecord {
+            id,
+            severity,
+            ctx: SpanTraceContext::producer(parent),
+        }
+    }
+
+    /// A DELIVER/ACK CONSUME span record (#770): `Consumer` kind with producer -> consumer links to the
+    /// delivered record(s)' stored producers (deduped and capped at [`MAX_SPAN_LINKS`]).
+    #[must_use]
+    pub fn consume(
+        id: u64,
+        severity: Severity,
+        producers: &[ironbus_core::trace_context::TraceParent],
+    ) -> SpanRecord {
+        SpanRecord {
+            id,
+            severity,
+            ctx: SpanTraceContext::consumer(producers),
+        }
+    }
+
     /// Whether this span must be recorded regardless of the sampling ratio (ERROR/WARN always are).
     #[must_use]
     pub fn force_recorded(self) -> bool {
@@ -227,6 +427,78 @@ impl BoundedSpanQueue {
     #[must_use]
     pub fn enqueued(&self) -> u64 {
         self.enqueued.load(Ordering::Relaxed)
+    }
+}
+
+/// The process-wide monotonic source of span ids (#770). Each emitted produce/deliver/ack span takes a
+/// fresh id here, which drives BOTH its exported span id and the deterministic head-sampling position
+/// ([`sampling_position`]). Starts at 1 (never the all-zero invalid id) and wraps harmlessly. Relaxed:
+/// it is a pure id generator, never a synchronization point.
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Returns a fresh, process-unique span id for an emitted span (#770). Monotonic and allocation-free,
+/// so the emission sites pay only an atomic increment. Wrapping past `u64::MAX` is harmless (the
+/// exporter forces a non-zero span id regardless).
+#[must_use]
+pub fn next_span_id() -> u64 {
+    NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The process span-EMISSION sink (#770): the handle the produce/deliver/ack hot-path sites use to
+/// offer a span for export, or `None` (via [`crate::actor::EngineAccess::span_sink`]) when tracing
+/// export is not wired, in which case emission is a compiled-in but zero-cost no-op. It pairs the
+/// SAME [`BoundedSpanQueue`] the OTLP exporter drains (#352) with the head-sampling ratio (#99), so
+/// [`SpanSink::emit`] applies the identical [`should_sample`] gate the exporter uses BEFORE the
+/// bounded-lossy push — a non-sampled span never even touches the queue, keeping the produce path
+/// bounded. This type carries NO `opentelemetry`: it is always-on plain data (an `Arc` + an `f64`),
+/// so the default and `edge-min` builds link none of the exporter; only the DRAIN is feature-gated.
+#[derive(Clone, Debug)]
+pub struct SpanSink {
+    /// The bounded-lossy queue the OTLP exporter drains. Shared (`Arc`) so the emitting connection
+    /// threads and the drain thread reference the one queue.
+    queue: std::sync::Arc<BoundedSpanQueue>,
+    /// The head-sampling ratio in `[0.0, 1.0]` applied at emission time (the same gate the exporter
+    /// applies at drain), so a non-tracing ratio (`0.0`, the default) admits only ERROR/WARN and drops
+    /// the Info-level produce/deliver spans at the cheapest point.
+    sample_ratio: f64,
+}
+
+impl SpanSink {
+    /// Builds an emission sink over `queue` (the exporter's bounded-lossy queue) at `sample_ratio`.
+    #[must_use]
+    pub fn new(queue: std::sync::Arc<BoundedSpanQueue>, sample_ratio: f64) -> SpanSink {
+        SpanSink {
+            queue,
+            sample_ratio,
+        }
+    }
+
+    /// Offers `record` for export, HEAD-SAMPLED and NON-BLOCKING (#770, #99). Applies the same
+    /// [`should_sample`] decision the exporter uses (an ERROR/WARN span is always admitted; an
+    /// Info-level produce/deliver span passes only under the ratio), then a bounded-lossy
+    /// [`BoundedSpanQueue::push`] that DROPS-and-counts when full rather than blocking the produce
+    /// path. A sampled-out span is skipped before the push, so the hot path pays only the sampling
+    /// hash when tracing is on and nothing when the sink is absent (the `None` fast-path lives at the
+    /// call site). The push outcome is intentionally not surfaced: a full-queue drop is the
+    /// bounded-lossy contract, counted on the queue, never the producing thread's concern.
+    pub fn emit(&self, record: SpanRecord) {
+        if !should_sample(record, self.sample_ratio, sampling_position(record.id)) {
+            return;
+        }
+        let _ = self.queue.push(record);
+    }
+
+    /// The sink's head-sampling ratio (for diagnostics/tests).
+    #[must_use]
+    pub fn sample_ratio(&self) -> f64 {
+        self.sample_ratio
+    }
+
+    /// A clone of the underlying bounded-lossy queue handle (for diagnostics/tests that assert what
+    /// was emitted).
+    #[must_use]
+    pub fn queue(&self) -> std::sync::Arc<BoundedSpanQueue> {
+        std::sync::Arc::clone(&self.queue)
     }
 }
 
@@ -432,13 +704,15 @@ fn install_json_log_layer() {
 /// verifiable property, not a stub.
 #[cfg(feature = "otlp")]
 pub mod otlp {
-    use super::{sampling_position, should_sample, BoundedSpanQueue, Severity, SpanRecord};
+    use super::{
+        sampling_position, should_sample, BoundedSpanQueue, Severity, SpanKindTag, SpanRecord,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use opentelemetry::trace::{
-        SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
+        Link, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
     };
     use opentelemetry::{InstrumentationScope, KeyValue};
     use opentelemetry_otlp::{SpanExporter, WithExportConfig};
@@ -500,40 +774,100 @@ pub mod otlp {
         }
     }
 
-    /// Maps one in-process [`SpanRecord`] onto an OTLP [`SpanData`] for the wire (#352). The record
-    /// carries only an opaque id and a severity (no payload, no secret material, by design, so export
-    /// never widens the trust boundary), so the mapping derives a deterministic span/trace id from the
-    /// record id and stamps the severity as the span name plus a `severity` attribute. The start and
-    /// end time are both `now` (the record is a point event, not a duration); the scope is `ironbus`.
+    /// Maps our dependency-free [`SpanKindTag`] onto the `opentelemetry` [`SpanKind`] (#770). The tag
+    /// is plain data on every build; this mapping lives only in the `otlp`-gated exporter, so the
+    /// default build never names the `opentelemetry` kind.
+    #[must_use]
+    pub fn map_span_kind(kind: SpanKindTag) -> SpanKind {
+        match kind {
+            SpanKindTag::Internal => SpanKind::Internal,
+            SpanKindTag::Server => SpanKind::Server,
+            SpanKindTag::Client => SpanKind::Client,
+            SpanKindTag::Producer => SpanKind::Producer,
+            SpanKindTag::Consumer => SpanKind::Consumer,
+        }
+    }
+
+    /// Maps one in-process [`SpanRecord`] onto an OTLP [`SpanData`] for the wire (#352, #770). The
+    /// record carries an opaque id, a severity, and its distributed-trace context (no payload, no
+    /// secret material, by design, so export never widens the trust boundary). The mapping derives a
+    /// deterministic, non-zero span id from the record id, and takes the TRACE id and PARENT from the
+    /// record's [`super::SpanTraceContext`] when set (a produce that continued a client's
+    /// `traceparent`) or derives a root trace id from the span id otherwise (today's behavior). The
+    /// span kind, the producer -> consumer LINKS, and the OTLP `messaging.*` attributes come from the
+    /// context, replacing the old `Internal`/`INVALID`/empty defaults. Start and end time are both
+    /// `now` (a point event); the scope is `ironbus`.
     #[must_use]
     pub fn record_to_span_data(record: SpanRecord, scope: &InstrumentationScope) -> SpanData {
         let now = std::time::SystemTime::now();
-        // A deterministic, non-zero trace id from the record id: the low 8 bytes are the id, the high
-        // 8 bytes a fixed mix so the trace id is never all-zero (which OTLP treats as invalid). The
-        // span id is the record id (also forced non-zero).
         let id = record.id;
-        let mut trace_bytes = [0u8; 16];
-        trace_bytes[..8].copy_from_slice(&id.wrapping_add(1).to_be_bytes());
-        trace_bytes[8..].copy_from_slice(&id.to_be_bytes());
+        let ctx = record.ctx;
+        // The span's OWN id: the record id forced non-zero (OTLP treats an all-zero id as invalid).
         let span_bytes = id.max(1).to_be_bytes();
+        // The TRACE id: the context's carried trace id when the produce continued a client's trace,
+        // else a deterministic root trace id derived from the span id (low 8 bytes = id, high 8 = a
+        // fixed mix so it is never the all-zero invalid id).
+        let trace_id = if ctx.trace_id == [0u8; 16] {
+            let mut trace_bytes = [0u8; 16];
+            trace_bytes[..8].copy_from_slice(&id.wrapping_add(1).to_be_bytes());
+            trace_bytes[8..].copy_from_slice(&id.to_be_bytes());
+            TraceId::from_bytes(trace_bytes)
+        } else {
+            TraceId::from_bytes(ctx.trace_id)
+        };
+        // The PARENT: the context's parent span id (a produce continuing a client's trace) or the
+        // invalid id for a root span (the pre-#770 behavior).
+        let parent_span_id = if ctx.parent_span_id == [0u8; 8] {
+            SpanId::INVALID
+        } else {
+            SpanId::from_bytes(ctx.parent_span_id)
+        };
         let span_context = SpanContext::new(
-            TraceId::from_bytes(trace_bytes),
+            trace_id,
             SpanId::from_bytes(span_bytes),
             TraceFlags::SAMPLED,
             false,
             TraceState::NONE,
         );
+        // Producer -> consumer LINKS from the context, each a REMOTE span context (the linked span
+        // lives on another connection/client). Bounded by `link_count` (<= MAX_SPAN_LINKS).
+        let mut links = SpanLinks::default();
+        for link in &ctx.links[..ctx.link_count] {
+            let link_ctx = SpanContext::new(
+                TraceId::from_bytes(link.trace_id),
+                SpanId::from_bytes(link.span_id),
+                TraceFlags::SAMPLED,
+                true,
+                TraceState::NONE,
+            );
+            links.links.push(Link::new(link_ctx, Vec::new(), 0));
+        }
+        // Attributes: the severity, plus the OTLP messaging-convention keys for the producer/consumer
+        // kinds (system + operation). The destination/stream name is not carried on the span record,
+        // so it is intentionally omitted (a follow-up can thread it through).
+        let mut attributes = vec![KeyValue::new("severity", severity_name(record.severity))];
+        match ctx.kind {
+            SpanKindTag::Producer => {
+                attributes.push(KeyValue::new("messaging.system", "ironbus"));
+                attributes.push(KeyValue::new("messaging.operation", "publish"));
+            }
+            SpanKindTag::Consumer => {
+                attributes.push(KeyValue::new("messaging.system", "ironbus"));
+                attributes.push(KeyValue::new("messaging.operation", "deliver"));
+            }
+            SpanKindTag::Internal | SpanKindTag::Server | SpanKindTag::Client => {}
+        }
         SpanData {
             span_context,
-            parent_span_id: SpanId::INVALID,
-            span_kind: SpanKind::Internal,
+            parent_span_id,
+            span_kind: map_span_kind(ctx.kind),
             name: severity_name(record.severity).into(),
             start_time: now,
             end_time: now,
-            attributes: vec![KeyValue::new("severity", severity_name(record.severity))],
+            attributes,
             dropped_attributes_count: 0,
             events: SpanEvents::default(),
-            links: SpanLinks::default(),
+            links,
             status: Status::Unset,
             instrumentation_scope: scope.clone(),
         }
@@ -717,10 +1051,7 @@ pub mod otlp {
         fn encode_span_frames_tag_then_big_endian_id() {
             let mut out = Vec::new();
             encode_span(
-                SpanRecord {
-                    id: 0x0102_0304_0506_0708,
-                    severity: Severity::Warn,
-                },
+                SpanRecord::event(0x0102_0304_0506_0708, Severity::Warn),
                 &mut out,
             );
             assert_eq!(out, vec![2, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -730,18 +1061,9 @@ pub mod otlp {
         fn encode_batch_respects_sampling() {
             // At ratio 0.0 only ERROR/WARN are encoded; INFO is dropped from the batch.
             let spans = [
-                SpanRecord {
-                    id: 1,
-                    severity: Severity::Error,
-                },
-                SpanRecord {
-                    id: 2,
-                    severity: Severity::Info,
-                },
-                SpanRecord {
-                    id: 3,
-                    severity: Severity::Warn,
-                },
+                SpanRecord::event(1, Severity::Error),
+                SpanRecord::event(2, Severity::Info),
+                SpanRecord::event(3, Severity::Warn),
             ];
             let bytes = encode_batch(&spans, 0.0);
             // Two 9-byte frames (the Error and the Warn), the Info excluded by sampling.
@@ -754,10 +1076,7 @@ pub mod otlp {
         fn drain_and_encode_empties_the_queue() {
             let q = Arc::new(BoundedSpanQueue::with_capacity(8));
             for id in 0..3 {
-                q.push(SpanRecord {
-                    id,
-                    severity: Severity::Error,
-                });
+                q.push(SpanRecord::event(id, Severity::Error));
             }
             let bytes = drain_and_encode(&q, 0.0);
             assert_eq!(bytes.len(), 27, "three 9-byte error frames");
@@ -778,7 +1097,7 @@ pub mod otlp {
                 Severity::Trace,
             ] {
                 // id 0 is the boundary: the mapping forces a non-zero span id even for id 0.
-                let span = record_to_span_data(SpanRecord { id: 0, severity }, &scope);
+                let span = record_to_span_data(SpanRecord::event(0, severity), &scope);
                 assert_ne!(
                     span.span_context.trace_id(),
                     TraceId::INVALID,
@@ -851,10 +1170,7 @@ pub mod otlp {
 
             let queue = Arc::new(BoundedSpanQueue::with_capacity(16));
             for id in 1..=4 {
-                queue.push(SpanRecord {
-                    id,
-                    severity: Severity::Error,
-                });
+                queue.push(SpanRecord::event(id, Severity::Error));
             }
             // One drain-and-ship: maps the four ERROR spans (always sampled at ratio 0.0) and ships
             // them to the sink. The export may surface a gRPC-level error AFTER the bytes are on the
@@ -909,6 +1225,122 @@ pub mod otlp {
             // Returns promptly (the stop flag is already set, so the loop body never runs).
             run_drain_loop(&queue, 0.0, &scope, &mut exporter, &rt);
             STOP_DRAIN.store(false, Ordering::Relaxed);
+        }
+
+        // ---- Distributed-trace export mapping (#770): the exporter reads the span context ----
+
+        use ironbus_core::trace_context::TraceParent;
+
+        fn sample_traceparent() -> TraceParent {
+            TraceParent::parse(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                .expect("the sample context parses")
+        }
+
+        fn has_attr(span: &SpanData, key: &str, value: &str) -> bool {
+            span.attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+        }
+
+        #[test]
+        fn a_produce_span_exports_with_the_inbound_parent_and_producer_kind() {
+            // Acceptance #1 (produce half): a produce carrying an inbound `traceparent` exports a
+            // PRODUCER span whose PARENT is the inbound span id (not `SpanId::INVALID`) and whose
+            // TRACE id is the client's, so it continues the client's trace. The messaging attributes
+            // are present per the OTLP messaging convention.
+            let tp = sample_traceparent();
+            let scope = InstrumentationScope::builder(SCOPE_NAME).build();
+            let span =
+                record_to_span_data(SpanRecord::produce(42, Severity::Info, Some(tp)), &scope);
+            assert_eq!(span.span_kind, SpanKind::Producer);
+            assert_eq!(
+                span.parent_span_id,
+                SpanId::from_bytes(tp.parent_id),
+                "the produce span's parent is the inbound span id, not INVALID"
+            );
+            assert_ne!(span.parent_span_id, SpanId::INVALID);
+            assert_eq!(
+                span.span_context.trace_id(),
+                TraceId::from_bytes(tp.trace_id),
+                "the produce span shares the client's trace id"
+            );
+            assert!(span.links.links.is_empty(), "a producer span has no links");
+            assert!(has_attr(&span, "messaging.system", "ironbus"));
+            assert!(has_attr(&span, "messaging.operation", "publish"));
+        }
+
+        #[test]
+        fn a_consume_span_exports_with_a_link_to_the_producing_span_and_consumer_kind() {
+            // Acceptance #1 (deliver/ack half): the matching deliver exports a CONSUMER span carrying
+            // a `SpanLink` back to the producing span — same trace id, the producing span id — read
+            // off the record's stored `traceparent`. This is the producer -> consumer link.
+            let tp = sample_traceparent();
+            let scope = InstrumentationScope::builder(SCOPE_NAME).build();
+            let span =
+                record_to_span_data(SpanRecord::consume(1000, Severity::Info, &[tp]), &scope);
+            assert_eq!(span.span_kind, SpanKind::Consumer);
+            assert_eq!(
+                span.parent_span_id,
+                SpanId::INVALID,
+                "a consume span parents on nothing"
+            );
+            assert_eq!(span.links.links.len(), 1, "one producer -> consumer link");
+            let link_ctx = &span.links.links[0].span_context;
+            assert_eq!(
+                link_ctx.span_id(),
+                SpanId::from_bytes(tp.parent_id),
+                "the link targets the producing span id"
+            );
+            assert_eq!(
+                link_ctx.trace_id(),
+                TraceId::from_bytes(tp.trace_id),
+                "the link is in the producer's trace"
+            );
+            assert!(link_ctx.is_remote(), "the linked producing span is remote");
+            assert!(has_attr(&span, "messaging.system", "ironbus"));
+            assert!(has_attr(&span, "messaging.operation", "deliver"));
+        }
+
+        #[test]
+        fn a_batch_consume_span_exports_capped_links() {
+            // A large batch exports at most MAX_SPAN_LINKS links: the export link surface is bounded.
+            let mut producers = Vec::new();
+            for i in 0..(crate::obs::MAX_SPAN_LINKS + 10) {
+                let mut trace_id = [0u8; 16];
+                trace_id[0] = 0xBB;
+                trace_id[15] = u8::try_from(i + 1).unwrap_or(0xFF);
+                let mut parent_id = [0u8; 8];
+                parent_id[7] = u8::try_from(i + 1).unwrap_or(0xFF);
+                producers.push(TraceParent {
+                    trace_id,
+                    parent_id,
+                    flags: 1,
+                });
+            }
+            let scope = InstrumentationScope::builder(SCOPE_NAME).build();
+            let span =
+                record_to_span_data(SpanRecord::consume(1, Severity::Info, &producers), &scope);
+            assert_eq!(span.links.links.len(), crate::obs::MAX_SPAN_LINKS);
+        }
+
+        #[test]
+        fn an_internal_event_span_exports_the_pre_770_shape() {
+            // Regression: a plain event/severity span exports EXACTLY as before #770 — Internal kind,
+            // an INVALID parent, no links, a non-zero derived trace id — so the resilience-event path
+            // is untouched.
+            let scope = InstrumentationScope::builder(SCOPE_NAME).build();
+            let span = record_to_span_data(SpanRecord::event(0, Severity::Error), &scope);
+            assert_eq!(span.span_kind, SpanKind::Internal);
+            assert_eq!(span.parent_span_id, SpanId::INVALID);
+            assert!(span.links.links.is_empty());
+            assert_ne!(
+                span.span_context.trace_id(),
+                TraceId::INVALID,
+                "the derived root trace id is never the invalid all-zero id"
+            );
+            assert_ne!(span.span_context.span_id(), SpanId::INVALID);
+            // No messaging attributes on an internal span.
+            assert!(!has_attr(&span, "messaging.system", "ironbus"));
         }
     }
 }
@@ -987,10 +1419,7 @@ mod tests {
         let q = BoundedSpanQueue::with_capacity(4);
         for id in 0..4 {
             assert!(
-                q.push(SpanRecord {
-                    id,
-                    severity: Severity::Info
-                }),
+                q.push(SpanRecord::event(id, Severity::Info)),
                 "the first {} pushes fit",
                 q.capacity()
             );
@@ -1000,10 +1429,7 @@ mod tests {
         // Offer 10 more under pressure: each is dropped and counted, the buffer stays bounded.
         for id in 4..14 {
             assert!(
-                !q.push(SpanRecord {
-                    id,
-                    severity: Severity::Info
-                }),
+                !q.push(SpanRecord::event(id, Severity::Info)),
                 "a push to a full queue is rejected, not blocked"
             );
         }
@@ -1025,27 +1451,15 @@ mod tests {
         // Drain takes the buffered spans and leaves the queue ready to accept again, so a working
         // exporter relieves pressure (the drop counter stays put; it is a cumulative total).
         let q = BoundedSpanQueue::with_capacity(2);
-        assert!(q.push(SpanRecord {
-            id: 1,
-            severity: Severity::Info
-        }));
-        assert!(q.push(SpanRecord {
-            id: 2,
-            severity: Severity::Info
-        }));
-        assert!(!q.push(SpanRecord {
-            id: 3,
-            severity: Severity::Info
-        }));
+        assert!(q.push(SpanRecord::event(1, Severity::Info)));
+        assert!(q.push(SpanRecord::event(2, Severity::Info)));
+        assert!(!q.push(SpanRecord::event(3, Severity::Info)));
         assert_eq!(q.dropped(), 1);
         let drained = q.drain();
         assert_eq!(drained.len(), 2, "drain takes both buffered spans");
         assert!(q.is_empty(), "the queue is empty after a drain");
         // Room again: a push now succeeds, and the cumulative drop counter is unchanged.
-        assert!(q.push(SpanRecord {
-            id: 4,
-            severity: Severity::Info
-        }));
+        assert!(q.push(SpanRecord::event(4, Severity::Info)));
         assert_eq!(
             q.dropped(),
             1,
@@ -1059,14 +1473,8 @@ mod tests {
         // config error as total loss); it is floored to one usable slot.
         let q = BoundedSpanQueue::with_capacity(0);
         assert_eq!(q.capacity(), 1);
-        assert!(q.push(SpanRecord {
-            id: 1,
-            severity: Severity::Info
-        }));
-        assert!(!q.push(SpanRecord {
-            id: 2,
-            severity: Severity::Info
-        }));
+        assert!(q.push(SpanRecord::event(1, Severity::Info)));
+        assert!(!q.push(SpanRecord::event(2, Severity::Info)));
         assert_eq!(q.dropped(), 1);
     }
 
@@ -1075,7 +1483,7 @@ mod tests {
         // The resilience rule (#16): ERROR/WARN are NEVER sampled out, so a freeze or a skip event
         // is always recorded even on the leanest 0.0-ratio edge profile.
         for severity in [Severity::Error, Severity::Warn] {
-            let rec = SpanRecord { id: 7, severity };
+            let rec = SpanRecord::event(7, severity);
             assert!(rec.force_recorded(), "{severity:?} is always recorded");
             assert!(
                 should_sample(rec, 0.0, sampling_position(7)),
@@ -1094,7 +1502,7 @@ mod tests {
         // so the default edge build pays nothing for trace export.
         for severity in [Severity::Info, Severity::Debug, Severity::Trace] {
             for id in 0..10_000u64 {
-                let rec = SpanRecord { id, severity };
+                let rec = SpanRecord::event(id, severity);
                 assert!(
                     !should_sample(rec, 0.0, sampling_position(id)),
                     "{severity:?} id {id} must be sampled out at ratio 0.0"
@@ -1108,10 +1516,7 @@ mod tests {
         // The other endpoint: at ratio 1.0 every span passes, so the sampling decision is a real
         // gate across the whole [0,1] range, not a constant.
         for id in 0..10_000u64 {
-            let rec = SpanRecord {
-                id,
-                severity: Severity::Info,
-            };
+            let rec = SpanRecord::event(id, Severity::Info);
             assert!(
                 should_sample(rec, 1.0, sampling_position(id)),
                 "id {id} must pass at ratio 1.0"
@@ -1141,10 +1546,7 @@ mod tests {
             (0..10_000u64)
                 .filter(|&id| {
                     should_sample(
-                        SpanRecord {
-                            id,
-                            severity: Severity::Info,
-                        },
+                        SpanRecord::event(id, Severity::Info),
                         ratio,
                         sampling_position(id),
                     )
@@ -1206,16 +1608,10 @@ mod tests {
         let q2 = init_tracing(&TracingConfig::default());
         // Both calls return a usable queue; with export off, pushing still drops-and-counts when
         // full, proving the queue is real independent of the exporter.
-        assert!(q1.push(SpanRecord {
-            id: 1,
-            severity: Severity::Info
-        }));
+        assert!(q1.push(SpanRecord::event(1, Severity::Info)));
         // The second queue is a distinct, usable, empty buffer (a fresh allocation per call).
         assert!(q2.is_empty(), "a fresh queue starts empty");
-        assert!(q2.push(SpanRecord {
-            id: 2,
-            severity: Severity::Info
-        }));
+        assert!(q2.push(SpanRecord::event(2, Severity::Info)));
         assert_eq!(q2.len(), 1, "the second queue accepts a push");
     }
 
@@ -1233,10 +1629,7 @@ mod tests {
         // buffer (an exporter, were one running, would have drained them). This is the observable that
         // no export work happened.
         for id in 0..8 {
-            assert!(queue.push(SpanRecord {
-                id,
-                severity: Severity::Info
-            }));
+            assert!(queue.push(SpanRecord::event(id, Severity::Info)));
         }
         assert_eq!(
             queue.len(),
@@ -1248,5 +1641,173 @@ mod tests {
             before_dropped,
             "no drop occurred below capacity and no background export touched the counter"
         );
+    }
+
+    // ---- Distributed-trace context (#770), the ALWAYS-ON plain-data half (no `otlp` feature) ----
+
+    use ironbus_core::trace_context::TraceParent;
+
+    /// A known W3C context for the distributed-tracing tests.
+    fn sample_traceparent() -> TraceParent {
+        TraceParent::parse(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .expect("the sample context parses")
+    }
+
+    #[test]
+    fn a_produce_with_a_traceparent_continues_the_client_trace() {
+        // A produce carrying an inbound `traceparent` (found in the headers blob) builds a PRODUCER
+        // span that CONTINUES the client's trace: same trace id, and the inbound span id as PARENT.
+        let headers = b"traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let parent = TraceParent::from_headers(headers);
+        let rec = SpanRecord::produce(42, Severity::Info, parent);
+        assert_eq!(rec.ctx.kind, SpanKindTag::Producer);
+        assert_eq!(
+            rec.ctx.trace_id,
+            sample_traceparent().trace_id,
+            "the produce span adopts the client's trace id"
+        );
+        assert_eq!(
+            rec.ctx.parent_span_id,
+            sample_traceparent().parent_id,
+            "the inbound span id becomes the produce span's parent"
+        );
+        assert_eq!(rec.ctx.link_count, 0, "a producer span carries no links");
+    }
+
+    #[test]
+    fn a_produce_without_a_traceparent_is_a_root_producer() {
+        // No inbound context => a NEW ROOT producer span (today's behavior), still tagged Producer.
+        let rec = SpanRecord::produce(7, Severity::Info, TraceParent::from_headers(b"no context"));
+        assert_eq!(rec.ctx.kind, SpanKindTag::Producer);
+        assert_eq!(
+            rec.ctx.trace_id, [0u8; 16],
+            "root: trace id derived from span id"
+        );
+        assert_eq!(rec.ctx.parent_span_id, [0u8; 8], "root: no parent");
+    }
+
+    #[test]
+    fn a_deliver_links_the_consume_span_back_to_the_producing_span() {
+        // The OTLP messaging convention: a deliver/ack opens a CONSUMER span that LINKS to the
+        // producing context read off the delivered record's stored `traceparent` (same trace id, the
+        // producing span id). It is a LINK, not a parent, because one deliver can batch many records.
+        let tp = sample_traceparent();
+        let rec = SpanRecord::consume(99, Severity::Info, &[tp]);
+        assert_eq!(rec.ctx.kind, SpanKindTag::Consumer);
+        assert_eq!(rec.ctx.link_count, 1);
+        assert_eq!(
+            rec.ctx.links[0].trace_id, tp.trace_id,
+            "link is in the producer's trace"
+        );
+        assert_eq!(
+            rec.ctx.links[0].span_id, tp.parent_id,
+            "link targets the producing span id"
+        );
+        assert_eq!(
+            rec.ctx.parent_span_id, [0u8; 8],
+            "a consume span parents on nothing"
+        );
+    }
+
+    #[test]
+    fn a_batch_deliver_dedups_and_caps_its_producer_links() {
+        // A batch deliver links to each DISTINCT producer, deduped, and CAPPED at MAX_SPAN_LINKS so
+        // the link surface stays bounded no matter how large the batch.
+        let mut producers = Vec::new();
+        // 3 copies of one producer (must collapse to a single link) ...
+        for _ in 0..3 {
+            producers.push(sample_traceparent());
+        }
+        // ... then MAX_SPAN_LINKS + 5 DISTINCT producers (only the cap's worth are kept).
+        for i in 0..(MAX_SPAN_LINKS + 5) {
+            let mut trace_id = [0u8; 16];
+            trace_id[0] = 0xAA;
+            trace_id[15] = u8::try_from(i + 1).unwrap_or(0xFF);
+            let mut parent_id = [0u8; 8];
+            parent_id[7] = u8::try_from(i + 1).unwrap_or(0xFF);
+            producers.push(TraceParent {
+                trace_id,
+                parent_id,
+                flags: 1,
+            });
+        }
+        let rec = SpanRecord::consume(1, Severity::Info, &producers);
+        assert_eq!(
+            rec.ctx.link_count, MAX_SPAN_LINKS,
+            "the link count is capped at MAX_SPAN_LINKS"
+        );
+        // The kept links are all distinct.
+        for i in 0..rec.ctx.link_count {
+            for j in (i + 1)..rec.ctx.link_count {
+                assert_ne!(
+                    rec.ctx.links[i], rec.ctx.links[j],
+                    "kept links are distinct"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_deliver_of_a_record_with_no_stored_traceparent_carries_no_link() {
+        // A record whose stored headers hold no (or a malformed) `traceparent` contributes no link:
+        // the consume span is a plain Consumer with an empty link set, never an error.
+        let none: Vec<TraceParent> = Vec::new();
+        let rec = SpanRecord::consume(5, Severity::Info, &none);
+        assert_eq!(rec.ctx.kind, SpanKindTag::Consumer);
+        assert_eq!(rec.ctx.link_count, 0);
+    }
+
+    #[test]
+    fn an_event_span_is_the_pre_770_internal_default() {
+        // The plain event/severity path is byte-for-byte the pre-#770 shape: Internal kind, a root
+        // trace derived from the id, no parent, no links.
+        let rec = SpanRecord::event(3, Severity::Error);
+        assert_eq!(rec.ctx.kind, SpanKindTag::Internal);
+        assert_eq!(rec.ctx, SpanTraceContext::internal());
+        assert_eq!(rec.ctx.trace_id, [0u8; 16]);
+        assert_eq!(rec.ctx.parent_span_id, [0u8; 8]);
+        assert_eq!(rec.ctx.link_count, 0);
+    }
+
+    #[test]
+    fn a_server_span_carries_the_server_kind() {
+        let rec = SpanRecord::server(1, Severity::Info);
+        assert_eq!(rec.ctx.kind, SpanKindTag::Server);
+    }
+
+    #[test]
+    fn the_span_sink_emits_under_a_full_sample_ratio() {
+        // At ratio 1.0 an Info-level produce span is enqueued onto the SAME queue the exporter drains.
+        let queue = std::sync::Arc::new(BoundedSpanQueue::with_capacity(8));
+        let sink = SpanSink::new(std::sync::Arc::clone(&queue), 1.0);
+        sink.emit(SpanRecord::produce(next_span_id(), Severity::Info, None));
+        assert_eq!(
+            queue.len(),
+            1,
+            "a full-ratio Info produce span is pushed onto the exporter's queue"
+        );
+    }
+
+    #[test]
+    fn the_span_sink_head_samples_out_info_at_zero_ratio() {
+        // At the default 0.0 ratio an Info-level produce/deliver span is dropped at the sampling gate
+        // BEFORE the push, so a non-tracing broker's produce path never even touches the queue.
+        let queue = std::sync::Arc::new(BoundedSpanQueue::with_capacity(8));
+        let sink = SpanSink::new(std::sync::Arc::clone(&queue), 0.0);
+        sink.emit(SpanRecord::produce(next_span_id(), Severity::Info, None));
+        assert_eq!(
+            queue.len(),
+            0,
+            "a 0.0-ratio Info span is sampled out, not pushed"
+        );
+        assert_eq!(queue.dropped(), 0, "a sampled-out span is not a queue drop");
+    }
+
+    #[test]
+    fn next_span_id_is_monotonic_and_never_zero() {
+        let a = next_span_id();
+        let b = next_span_id();
+        assert_ne!(a, 0, "a span id is never the all-zero invalid id");
+        assert_ne!(a, b, "successive span ids differ");
     }
 }

@@ -709,6 +709,13 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// connection (one per actor), so a `clone` keeps the SAME `Arc` (like `cap_gate`). Consulted only
     /// when `consume_longpoll_ms > 0`; the default-off path never touches it.
     commit_notify: Arc<CommitNotify>,
+    /// The distributed-tracing span-emission sink (#770): a set-once slot, EMPTY until the serve path
+    /// installs it via [`set_span_sink`](Self::set_span_sink) when `--enable-otlp-export` is on. SHARED
+    /// across every per-connection clone (an `Arc`, like `client_ack`), so the ONE sink the CLI built
+    /// from the bounded span queue reaches every connection's produce/deliver/ack emission sites.
+    /// `None`/empty on a non-tracing broker, so [`EngineAccess::span_sink`] returns `None` and emission
+    /// is a zero-cost no-op — the byte-for-byte default hot path.
+    span_sink: Arc<OnceLock<crate::obs::SpanSink>>,
 }
 
 /// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
@@ -745,6 +752,9 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // The SAME shared commit-notify seam (push delivery): one per actor, bumped by the actor
             // and waited on by every idle long-polling consumer, so the `Arc` is shared on clone.
             commit_notify: Arc::clone(&self.commit_notify),
+            // The SAME shared span-emission sink (#770): the ONE sink the serve path installed reaches
+            // every connection, so the `Arc<OnceLock>` is shared on clone (like `client_ack`).
+            span_sink: Arc::clone(&self.span_sink),
         }
     }
 }
@@ -769,6 +779,17 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     /// The bound is shared across every connection's handle clone (one watchdog per actor).
     pub fn set_actor_watchdog_bound(&self, bound_nanos: u64) {
         self.actor_watchdog.set_bound_nanos(bound_nanos);
+    }
+
+    /// Install the SHARED distributed-tracing span-emission sink (#770) on this base handle. Called
+    /// ONCE at serve start (when `--enable-otlp-export` is on), RIGHT AFTER [`spawn_actor_with_gather`]
+    /// and BEFORE any per-connection clone, so every connection's produce/deliver/ack emission sites
+    /// reach the ONE sink the CLI built from the bounded span queue. Set-once via the shared `OnceLock`
+    /// (a second call is ignored); the shed/sampling discipline lives in the sink. A serve that never
+    /// calls this leaves the slot empty, so [`EngineAccess::span_sink`] returns `None` and emission is a
+    /// zero-cost no-op.
+    pub fn set_span_sink(&self, sink: crate::obs::SpanSink) {
+        let _ = self.span_sink.set(sink);
     }
 
     /// The shared cluster produce-ack gate (#719), once the data-plane bootstrap has filled the slot;
@@ -1183,6 +1204,17 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         false
     }
 
+    /// The process span-emission sink for distributed tracing (#770), or `None` when OTLP span export
+    /// is not wired (the DEFAULT for every engine, and for a broker started without
+    /// `--enable-otlp-export`). The produce/deliver/ack sites read this to offer a head-sampled
+    /// Producer/Consumer span to the exporter's bounded-lossy queue; a `None` sink makes emission a
+    /// compiled-in but zero-cost no-op (no atomic, no push), so a non-tracing broker's hot path is
+    /// byte-for-byte unchanged. A cheap LOCAL read (a clone of an `Arc` + an `f64`), never an actor
+    /// round-trip. [`EngineHandle`] overrides it to return the sink the serve path installed.
+    fn span_sink(&self) -> Option<crate::obs::SpanSink> {
+        None
+    }
+
     /// Whether the append actor's IN-FLIGHT command batch has overrun the watchdog bound at
     /// `now_monotonic_nanos` — i.e. a HUNG durability fsync has wedged the actor thread (#862). A cheap
     /// LOCAL, non-blocking atomic read (it does NOT go through the actor, so it answers even while the
@@ -1374,6 +1406,12 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         self.client_ack_gate().is_some()
     }
 
+    fn span_sink(&self) -> Option<crate::obs::SpanSink> {
+        // A cheap local read: a clone of the installed sink (an `Arc` + an `f64`), or `None` when the
+        // serve path never installed one (`--enable-otlp-export` off). Never an actor round-trip.
+        self.span_sink.get().cloned()
+    }
+
     fn actor_watchdog_overran(&self, now_monotonic_nanos: u64) -> bool {
         // A non-blocking atomic read of the shared watchdog (#862): does NOT go through the actor, so
         // it answers even while the actor is wedged on a hung fsync. `false` until the serve path arms
@@ -1482,6 +1520,9 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
 #[cfg(test)]
 pub struct DirectEngine<F: Filesystem, C: Clock> {
     engine: std::cell::RefCell<Engine<F, C>>,
+    /// The optional distributed-tracing span sink (#770), so a test can drive the produce/deliver/ack
+    /// emission sites and assert what landed on the queue. `None` (the default) keeps emission a no-op.
+    span_sink: Option<crate::obs::SpanSink>,
 }
 
 #[cfg(test)]
@@ -1490,7 +1531,16 @@ impl<F: Filesystem, C: Clock + Clone> DirectEngine<F, C> {
     pub fn new(engine: Engine<F, C>) -> Self {
         DirectEngine {
             engine: std::cell::RefCell::new(engine),
+            span_sink: None,
         }
+    }
+
+    /// Attaches a span-emission sink (#770) so the produce/deliver/ack sites emit into it, for the
+    /// end-to-end distributed-tracing test.
+    #[must_use]
+    pub fn with_span_sink(mut self, sink: crate::obs::SpanSink) -> Self {
+        self.span_sink = Some(sink);
+        self
     }
 
     /// Borrows the engine mutably for a direct read or mutation the test does outside a session.
@@ -1520,6 +1570,10 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for DirectEngine<F, C> 
     fn consumer_credit_caps(&self) -> (u32, u64) {
         let e = self.engine.borrow();
         (e.consumer_credit(), e.consumer_credit_bytes())
+    }
+
+    fn span_sink(&self) -> Option<crate::obs::SpanSink> {
+        self.span_sink.clone()
     }
 }
 
@@ -1842,6 +1896,11 @@ where
             // The consume long-poll budget snapshot + shared commit-notify seam (push delivery).
             consume_longpoll_ms,
             commit_notify,
+            // No span-emission sink by default (#770): a non-tracing broker never installs one, so
+            // emission is a zero-cost no-op. A serve started with `--enable-otlp-export` installs the
+            // shared sink via [`EngineHandle::set_span_sink`] right after this returns, BEFORE any
+            // connection's handle is cloned, so every connection sees it.
+            span_sink: Arc::new(OnceLock::new()),
         },
         join,
     )
