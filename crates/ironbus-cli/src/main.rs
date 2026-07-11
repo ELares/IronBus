@@ -5301,7 +5301,10 @@ struct ServeConfig {
     /// The seek-by-time `.tindex` density (#772): one sparse timestamp anchor per this many records.
     /// A pure memory/latency trade over the seek-by-time accelerator — smaller scans fewer records
     /// per seek at a larger sidecar, larger the reverse — that never affects correctness, durability,
-    /// or the segment bytes. Clamped up to 1 by the storage builder.
+    /// or the segment bytes. Clamped up to 1 by the storage builder. Consumed only by the broker
+    /// serve path (`.with_tindex_stride_records`), which is `#[cfg(unix)]`-gated, so on a non-unix
+    /// target the field is set-but-unread — allow the dead-code lint there rather than gate the field.
+    #[cfg_attr(not(unix), allow(dead_code))]
     tindex_stride_records: u32,
     /// Consumer-safe size-retention bound (#13, #80): the broker reaps old fully-consumed sealed
     /// segments while the durable log is over this many RECORD bytes. `0` means unlimited
