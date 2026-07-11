@@ -657,6 +657,26 @@ impl Session {
         }
     }
 
+    /// SERVER-APPLIES this connection's pinned tenant to a client-chosen TRANSACTION id (#765). The
+    /// `txn_id` is an opaque, client-controlled key into a GLOBAL keyspace (the engine's txn-owner map,
+    /// the dedup prefix), so without scoping a tenant that learned another tenant's opaque id could
+    /// commit / rollback / squat that transaction — a cross-tenant WRITE. Prefixing the id byte string
+    /// with `<tenant>/` (the tenant token can never contain `/`) makes the keyspace injective per tenant
+    /// and disjoint across tenants, so TxnPrepare/Commit/Rollback/CheckResult all resolve strictly
+    /// within the caller's tenant. Single-tenant (`tenant` is `None`) returns the id unchanged.
+    fn tenant_txn_id(&self, client_txn_id: &[u8]) -> Vec<u8> {
+        match &self.tenant {
+            None => client_txn_id.to_vec(),
+            Some(t) => {
+                let mut scoped = Vec::with_capacity(t.as_str().len() + 1 + client_txn_id.len());
+                scoped.extend_from_slice(t.as_str().as_bytes());
+                scoped.push(b'/');
+                scoped.extend_from_slice(client_txn_id);
+                scoped
+            }
+        }
+    }
+
     /// The effective DEFAULT stream name for this connection: the empty string (`""`, the root log)
     /// for a single-tenant connection — byte-for-byte the historical default stream — or the tenant's
     /// own named stream (the bare tenant id) for a multi-tenant connection, so two tenants' "default"
@@ -2334,6 +2354,25 @@ impl Session {
             );
             return Ok(());
         }
+        // #765 SECURITY: broadcast cumulative-ack (`cumulative_ack_in`) is a ROOT-default-stream-only
+        // primitive — it targets the global broadcast-group map + root log keyed by the raw wire group,
+        // with NO named-stream sibling. A consumer BOUND to a named stream (`self.stream` non-empty),
+        // which INCLUDES every multi-tenant consumer (its bound stream is `<tenant>` or `<tenant>/…`),
+        // must never reach it: doing so would let a tenant read the root log's durable_head /
+        // earliest_retained via the out-of-range error and advance/corrupt a root broadcast cursor. So
+        // reject it typed for any named-stream consumer (broadcast cumulative-ack on a named/tenant
+        // stream is a phase-2 feature — it needs the named-stream broadcast machinery that does not yet
+        // exist). The default (empty) stream path below is byte-for-byte unchanged. This also closes a
+        // latent single-tenant `SubTo`-then-`CumulativeAck` hole onto the root broadcast cursor.
+        if !self.stream.is_empty() {
+            reply_err_coded(
+                out,
+                crate::codes::ErrorCode::ERR_CUMULATIVE_ACK_NOT_ALLOWED.as_str(),
+                "cumulative-ack is not supported on a named-stream consumer (ack per message, or use \
+                 StreamCommit for a Tier-S cursor)",
+            );
+            return Ok(());
+        }
         let Ok(ack) = decode_cumulative_ack(body) else {
             reply_err(out, "malformed cumulative-ack body");
             return Ok(());
@@ -3044,7 +3083,10 @@ impl Session {
         // `StreamCell::wait_for_change`), and each drain is a byte-for-byte fresh batch (nothing leased,
         // the credit/AIMD bounds computed once above and unconsumed). See `handle_flow` for the full
         // per-pass lost-wakeup / time-source rationale.
-        let longpoll_cell = engine.commit_notify().map(|n| n.cell(""));
+        // #765: the cell must match the BOUND stream (`self.stream`) — the root default when empty, the
+        // tenant/named stream otherwise — so a Fetch waits on the stream it actually polls below (was a
+        // root-only `cell("")`, a cross-tenant hole for a tenant consumer whose `self.stream` is named).
+        let longpoll_cell = engine.commit_notify().map(|n| n.cell(&self.stream));
         let longpoll_budget = std::time::Duration::from_millis(self.consume_longpoll_ms);
         let longpoll_start = std::time::Instant::now();
         loop {
@@ -3075,7 +3117,19 @@ impl Session {
                 // deliver the same records, in the same order, leased the same way, as N per-record polls.
                 let group = self.subscription.clone();
                 let member = self.member_id;
-                match engine.with(move |e| e.poll_now_in_member(&group, member))? {
+                // #765: route by the consumer's BOUND stream, exactly like `handle_flow`. The root
+                // `poll_now_in_member` is used ONLY for the default (empty) stream; a named/tenant
+                // stream drains its OWN id-routed log via `poll_in_stream_member`. Without this a
+                // multi-tenant Sub+Fetch drained the SHARED root default stream (a cross-tenant leak).
+                let stream = self.stream.clone();
+                match engine.with(move |e| {
+                    if stream.is_empty() {
+                        e.poll_now_in_member(&group, member)
+                    } else {
+                        let now = e.now_monotonic();
+                        e.poll_in_stream_member(&stream, &group, member, now)
+                    }
+                })? {
                     Ok(Poll::Message(d)) => {
                         // Compressed-delivery gate (#1066), IDENTICAL to `handle_flow`: a non-capable
                         // consumer gets a stored-COMPRESSED record decompressed (COMPRESSED bit cleared);
@@ -3195,8 +3249,17 @@ impl Session {
             break;
         }
         // Drop ownership of any offset now committed, keeping `leased` bounded — identical to `handle_flow`.
+        // #765: the committed cursor is read from the BOUND stream (root when empty, else the id-routed
+        // named/tenant cursor), mirroring the poll above — not the root-only `committed_offset_in`.
         let group = self.subscription.clone();
-        let committed = engine.with(move |e| e.committed_offset_in(&group).get())?;
+        let stream = self.stream.clone();
+        let committed = engine.with(move |e| {
+            if stream.is_empty() {
+                e.committed_offset_in(&group).get()
+            } else {
+                e.committed_offset_in_stream(&stream, &group).get()
+            }
+        })?;
         self.leased.retain(|&offset, _| offset >= committed);
         // CREDIT AUTO-TUNE keep-up (#552), identical to `handle_flow`: the consumer was window-bound and
         // drained the full grant, so grow the window toward the ceiling. A deadline-cut batch leaves
@@ -4467,7 +4530,9 @@ impl Session {
         // Build the OWNED half message (the wire body borrows the connection buffer, which the closure
         // cannot hold). The wire-only PUB flags (dedup/fire-and-forget bits) are masked off so only the
         // real stored content flags reach the durable half record.
-        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        // #765: SERVER-APPLY the tenant prefix to the opaque txn id, so the global txn keyspace is
+        // partitioned per tenant — a tenant can never commit/rollback/squat another tenant's txn.
+        let txn_id = Bytes::from(self.tenant_txn_id(decoded.txn_id));
         // #765: SERVER-APPLY the tenant prefix to the txn's target stream, and charge the per-tenant
         // stream + byte ceilings fail-closed BEFORE the half message is staged.
         let stream = self.tenant_stream(stream).into_owned();
@@ -4544,7 +4609,9 @@ impl Session {
             reply_err(out, "txn_id must not be empty");
             return Ok(());
         }
-        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        // #765: SERVER-APPLY the tenant prefix to the opaque txn id, so the global txn keyspace is
+        // partitioned per tenant — a tenant can never commit/rollback/squat another tenant's txn.
+        let txn_id = Bytes::from(self.tenant_txn_id(decoded.txn_id));
         let outcome = engine.with(move |e| e.txn_commit(&txn_id))?;
         match outcome {
             Ok(offset) => {
@@ -4596,7 +4663,9 @@ impl Session {
             reply_err(out, "txn_id must not be empty");
             return Ok(());
         }
-        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        // #765: SERVER-APPLY the tenant prefix to the opaque txn id, so the global txn keyspace is
+        // partitioned per tenant — a tenant can never commit/rollback/squat another tenant's txn.
+        let txn_id = Bytes::from(self.tenant_txn_id(decoded.txn_id));
         let outcome = engine.with(move |e| e.txn_rollback(&txn_id))?;
         match outcome {
             Ok(()) => {
@@ -4705,7 +4774,9 @@ impl Session {
             reply_err(out, "txn_id must not be empty");
             return Ok(());
         }
-        let txn_id = Bytes::copy_from_slice(decoded.txn_id);
+        // #765: SERVER-APPLY the tenant prefix to the opaque txn id, so the global txn keyspace is
+        // partitioned per tenant — a tenant can never commit/rollback/squat another tenant's txn.
+        let txn_id = Bytes::from(self.tenant_txn_id(decoded.txn_id));
         let decision = decoded.decision;
         // OWNERSHIP (#640 part 2, BLOCKER 1): pass THIS connection's registered listener group so the
         // engine can verify the answerer OWNS the txn's group before resolving an in-doubt half message.
@@ -17618,6 +17689,165 @@ mod tests {
             e.engine_mut().named_stream_count(),
             0,
             "no tenant stream is minted"
+        );
+    }
+
+    #[test]
+    fn a_multi_tenant_fetch_reads_only_the_tenants_stream_not_root() {
+        // Cross-tenant leak regression (review BLOCKING #1): the batch FETCH used to drain the ROOT
+        // default stream regardless of the consumer's bound (tenant) stream. A tenant's Sub+Fetch must
+        // return ONLY its own records — never a root/no-tenant principal's — nor lease them away from a
+        // root consumer.
+        let e = DirectEngine::new(engine());
+        // A no-tenant principal's record already sits in the shared ROOT default log.
+        produce(&e, b"root-secret");
+        let auth = mt_auth(
+            &[(
+                b"tok-f-888888888888888888888888888",
+                &[Scope::Publish, Scope::Subscribe],
+                "acme",
+            )],
+            &[],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-f-888888888888888888888888888", false);
+        a.process(&e, &pub_frame(b"A-data"), &mut Vec::new())
+            .unwrap();
+        // Bind a work-group on the tenant default stream, then FETCH.
+        a.process(&e, &frame(FrameType::Sub, b"g"), &mut Vec::new())
+            .unwrap();
+        let mut out = Vec::new();
+        a.process(&e, &fetch_frame(8, 0, 0, true), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"A-data".to_vec()],
+            "the tenant's Fetch reads ONLY its own stream, never the root log"
+        );
+        // The root record was neither delivered to the tenant nor leased away from a root consumer: a
+        // fresh competing poll on the ROOT group still finds it available.
+        let root_poll = e
+            .engine_mut()
+            .poll_now_in_member("g", MemberId::new(99))
+            .unwrap();
+        match root_poll {
+            Poll::Message(d) => assert_eq!(d.record.payload.as_ref(), b"root-secret"),
+            _ => panic!("the root record must remain available (not leased by the tenant's Fetch)"),
+        }
+    }
+
+    #[test]
+    fn a_multi_tenant_cumulative_ack_cannot_touch_the_root_broadcast_namespace() {
+        // Cross-tenant leak regression (review BLOCKING #2): a root broadcast group holds a durable
+        // cursor. A tenant consumer's CumulativeAck (naming that group) must be REJECTED before it
+        // reaches the engine — never reading root's durable_head via the out-of-range error, never
+        // advancing the root broadcast cursor.
+        let e = DirectEngine::new(engine());
+        e.engine_mut().set_broadcast_in("bcast", true).unwrap();
+        produce(&e, b"m0");
+        produce(&e, b"m1");
+        let auth = mt_auth(
+            &[(
+                b"tok-k-999999999999999999999999999",
+                &[Scope::Publish, Scope::Subscribe],
+                "acme",
+            )],
+            &[],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-k-999999999999999999999999999", false);
+        // Bind a group on the tenant stream (self.stream = "acme", non-empty), then try a broadcast
+        // cumulative-ack naming the ROOT broadcast group with a large up_to.
+        a.process(&e, &frame(FrameType::Sub, b"g"), &mut Vec::new())
+            .unwrap();
+        let mut ca = Vec::new();
+        ironbus_proto::message::encode_cumulative_ack(
+            &ironbus_proto::message::CumulativeAckBody {
+                up_to: 999,
+                group: b"bcast",
+            },
+            &mut ca,
+        );
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::CumulativeAck, &ca), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "a tenant consumer's cumulative-ack is refused"
+        );
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains(crate::codes::ErrorCode::ERR_CUMULATIVE_ACK_NOT_ALLOWED.as_str()),
+            "typed refusal (no root durable_head leaked via an out-of-range error): {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        // The root broadcast cursor was NOT advanced — no cross-namespace write.
+        assert_eq!(
+            e.engine_mut().committed_offset_in("bcast").get(),
+            0,
+            "the root broadcast cursor is untouched by the tenant"
+        );
+    }
+
+    #[test]
+    fn a_tenant_cannot_commit_or_rollback_another_tenants_txn() {
+        // The transaction keyspace is scoped per tenant (review upgrade of non-blocking #1): tenant b
+        // cannot commit/rollback tenant a's prepared txn even with the identical opaque txn_id.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[
+                (
+                    b"tok-t-a01010101010101010101010101",
+                    &[Scope::Publish],
+                    "acme",
+                ),
+                (
+                    b"tok-t-b01010101010101010101010101",
+                    &[Scope::Publish],
+                    "globex",
+                ),
+            ],
+            &[],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-t-a01010101010101010101010101", false);
+        let mut b = mt_session(&e, &auth, 2, b"tok-t-b01010101010101010101010101", false);
+        let mut prep = Vec::new();
+        ironbus_proto::message::encode_txn_prepare(
+            &ironbus_proto::message::TxnPrepareBody {
+                txn_id: b"tx1",
+                stream_id: b"",
+                pub_body: &pub_body(b"A-txn"),
+            },
+            &mut prep,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::TxnPrepare, &prep), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "a's prepare acked");
+        let mut resolve = Vec::new();
+        ironbus_proto::message::encode_txn_resolve(
+            &ironbus_proto::message::TxnResolveBody { txn_id: b"tx1" },
+            &mut resolve,
+        )
+        .unwrap();
+        // b tries to commit the SAME opaque id: unknown in b's scoped keyspace -> Err.
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::TxnCommit, &resolve), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "b cannot commit a's txn (scoped keyspace)"
+        );
+        // a commits its OWN txn successfully.
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::TxnCommit, &resolve), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAck,
+            "a commits its own txn"
         );
     }
 }
