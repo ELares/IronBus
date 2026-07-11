@@ -188,9 +188,48 @@ pub enum StorageError {
         /// The highest layout version this build supports ([`crate::layout::LAYOUT_VERSION`]).
         supported: u32,
     },
+    /// The per-log cold-segment manifest (`cold-manifest.ckpt`, #643 tiered storage) is CRC-valid but
+    /// STRUCTURALLY invalid (wrong magic, a future version, or a malformed entry table). Because the
+    /// manifest is the durable record of which absent segment files are REMOTE (offloaded, not lost),
+    /// an undecodable manifest is a fail-closed open — the log refuses rather than silently dropping
+    /// remote pointers and then tripping [`StorageError::SegmentChainBroken`] on the offloaded holes.
+    ColdManifestCorrupt,
+    /// An offload could not be recorded because the cold-segment manifest is at its slot payload cap
+    /// ([`crate::checkpoint::COLD_MANIFEST_PAYLOAD`]). Fail-closed: the prior manifest is left intact
+    /// and the offload simply does not advance, so a segment is never local-deleted without a durable
+    /// REMOTE record (never a torn or truncated manifest).
+    ColdManifestFull,
+    /// A read needed an offloaded (REMOTE) segment, but no [`crate::cold::ColdStore`] backend is
+    /// configured on this log. The durable copy lives in the object store the operator must
+    /// re-configure after a restart; surfaced fail-closed (never a silent empty read) so the read is
+    /// retried once the backend is attached.
+    ColdStoreUnavailable {
+        /// The offloaded segment id that could not be fetched.
+        segment_id: u64,
+    },
+    /// Fetching an offloaded (REMOTE) segment from the [`crate::cold::ColdStore`] failed — the object
+    /// is missing ([`crate::cold::ColdStoreError::NotFound`]) or a transport error occurred. Surfaced
+    /// to the reader as a typed, retryable/degraded error, NEVER a silent gap or a phantom record.
+    ColdFetch {
+        /// The offloaded segment id whose fetch failed.
+        segment_id: u64,
+        /// The underlying cold-store error.
+        source: crate::cold::ColdStoreError,
+    },
+    /// A fetched offloaded (REMOTE) segment failed RE-VERIFICATION against the manifest — the fetched
+    /// bytes have the wrong length, an undecodable segment header/footer, or a CRC32C that disagrees
+    /// with the manifest's recorded checksum. A corrupt object store therefore fails CLOSED (the read
+    /// errors and the poisoned bytes are never materialized as a local segment), rather than
+    /// delivering garbage as if it were durable data.
+    ColdCorrupt {
+        /// The offloaded segment id whose fetched bytes failed verification.
+        segment_id: u64,
+    },
 }
 
 impl core::fmt::Display for StorageError {
+    // A cohesive one-arm-per-variant dispatch; splitting it would only scatter the messages.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             StorageError::Io(e) => write!(f, "io error: {e}"),
@@ -275,6 +314,27 @@ impl core::fmt::Display for StorageError {
                 "data-dir layout version {found} is newer than this build supports ({supported}); \
                  refusing to open"
             ),
+            StorageError::ColdManifestCorrupt => write!(
+                f,
+                "cold-segment manifest is CRC-valid but structurally invalid; refusing to open"
+            ),
+            StorageError::ColdManifestFull => write!(
+                f,
+                "cold-segment manifest is at its payload cap; offload refused fail-closed"
+            ),
+            StorageError::ColdStoreUnavailable { segment_id } => write!(
+                f,
+                "offloaded segment {segment_id} needs a cold-store backend, but none is configured"
+            ),
+            StorageError::ColdFetch { segment_id, source } => write!(
+                f,
+                "fetching offloaded segment {segment_id} from the cold store failed: {source}"
+            ),
+            StorageError::ColdCorrupt { segment_id } => write!(
+                f,
+                "fetched offloaded segment {segment_id} failed re-verification (length/header/footer/CRC); \
+                 refusing to deliver"
+            ),
         }
     }
 }
@@ -285,6 +345,7 @@ impl std::error::Error for StorageError {
             StorageError::Record(e) => Some(e),
             StorageError::Segment(e) => Some(e),
             StorageError::ExcessiveRecoveryLoss(e) => Some(e),
+            StorageError::ColdFetch { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -329,6 +390,22 @@ impl StorageError {
     #[must_use]
     pub fn is_daily_write_budget_exceeded(&self) -> bool {
         matches!(self, StorageError::DailyWriteBudgetExceeded { .. })
+    }
+
+    /// Whether this is a tiered-storage COLD-STORE read failure (#643): the backend is not configured
+    /// ([`StorageError::ColdStoreUnavailable`]), a fetch failed ([`StorageError::ColdFetch`]), or the
+    /// fetched bytes failed re-verification ([`StorageError::ColdCorrupt`]). The engine surfaces this
+    /// as a distinct, retryable/degraded read outcome (the durable copy exists in the object store,
+    /// it just could not be served THIS attempt) rather than a lost record or a fatal error, so a
+    /// consumer read of an offloaded segment degrades cleanly instead of skipping data.
+    #[must_use]
+    pub fn is_cold_read_failure(&self) -> bool {
+        matches!(
+            self,
+            StorageError::ColdStoreUnavailable { .. }
+                | StorageError::ColdFetch { .. }
+                | StorageError::ColdCorrupt { .. }
+        )
     }
 }
 

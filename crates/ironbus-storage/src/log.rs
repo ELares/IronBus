@@ -9,8 +9,11 @@
 //! configured size; [`Log::sync`] makes the appended records durable. The read path is
 //! separate later work.
 
+use crate::cold::{
+    cold_object_name, ColdEntry, ColdManifest, ColdStorageConfig, ColdStore, COLD_MANIFEST_FILE,
+};
 use crate::fs::Filesystem;
-use crate::io::RandomAccessFile;
+use crate::io::{InMemoryFile, RandomAccessFile};
 use crate::loss::{LossEvent, LossReport, ReasonCode};
 use crate::naming::{segment_file_name, segment_ids};
 use crate::read_plane::{ReadPlane, SealedSegment};
@@ -869,6 +872,22 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// thing that sets it is a failed `start_segment` during a roll, and the next successful create
     /// clears it. While it is `Some`, `active` is `None` but the writer is RESUMABLE, not frozen.
     pending_roll: Option<PendingRoll>,
+    /// The durable per-log COLD-SEGMENT MANIFEST (#643, tiered storage): the record of which sealed
+    /// segments have been offloaded to the [`ColdStore`] and are now REMOTE (their local file may be
+    /// absent), plus the metadata a recovery/read needs. `None` until the first offload creates
+    /// `cold-manifest.ckpt`, OR — after a restart of a log that DID offload — opened at [`Log::open`]
+    /// from the existing file so recovery treats an offloaded segment as PRESENT, not a torn gap. A
+    /// log that never offloads has this `None` and a byte-for-byte unchanged data directory.
+    cold_manifest: Option<ColdManifest<F::File>>,
+    /// The [`ColdStore`] backend used to upload (offload), fetch (restore-on-read), and delete
+    /// (reap) remote segments (#643). Injected post-open via [`Log::set_cold_store`] (the engine
+    /// constructs a per-log-rooted backend), mirroring how compaction config is applied post-open.
+    /// `None` disables offload and makes a read of an already-offloaded segment fail closed with
+    /// [`StorageError::ColdStoreUnavailable`] until the operator re-attaches the backend.
+    cold_store: Option<Arc<dyn ColdStore>>,
+    /// The tiered-storage policy (#643): disabled by default (the log never offloads and writes no
+    /// new bytes). Set alongside the backend by [`Log::set_cold_store`].
+    cold_config: ColdStorageConfig,
 }
 
 /// A deferred active-segment creation: a [`Log::roll`] sealed the old segment but a transient fault
@@ -1160,7 +1179,46 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // v1, so this records a fact and reinterprets no segment, cursor, or DLQ byte. Recovery below
         // is unchanged. Reserves the `streams/` subtree for per-stream logs (M2-I2); does not create it.
         crate::layout::open_or_upgrade(&fs)?;
-        let ids = segment_ids(&fs)?;
+        // #643 tiered storage: read the cold manifest BEFORE the chain scan so recovery is
+        // manifest-AWARE. A local `seg-<id>.log` for a REMOTE (offloaded) id is a restore-on-access
+        // CACHE — "absent until verified against the manifest", NOT a chain anchor. Excluding every
+        // REMOTE id from the enumeration is the load-bearing fix: without it, a lagging consumer that
+        // restored only a NON-adjacent subset of the offloaded prefix (e.g. seg-0 via a low-offset
+        // read) leaves the still-remote segments between that restored file and the local tail as a
+        // phantom gap, and the strict contiguity scan hard-fails `SegmentChainBroken` before the
+        // manifest is ever consulted. The manifest's spliced prefix (below) provides the
+        // authoritative, contiguous chain for those ids; the on-disk cache copy is reconciled on
+        // read (`ensure_segment_local` verifies it against the manifest before trusting it).
+        let cold_manifest = Self::open_cold_manifest(&fs)?;
+        let remote_ids: std::collections::BTreeSet<u64> = cold_manifest
+            .as_ref()
+            .map_or_else(std::collections::BTreeSet::new, |m| {
+                m.entries().keys().copied().collect()
+            });
+        // PURGE any restore-on-access CACHE file for a REMOTE id BEFORE recovery. A cache file is a
+        // process-lifetime, re-fetchable copy of an offloaded segment — deleting it here means NO
+        // recovery scan (the compaction-segment probe, `reap_bad_trailing_segment`, the chain scan)
+        // can trip over a partial restore (a phantom gap) or a torn cache (a crash mid-restore, since
+        // the fs seam has no atomic rename). The authoritative copy is the object store + the manifest
+        // splice below; a later read re-fetches the segment cleanly. This is what makes a restart
+        // after a routine tiered read robust.
+        for &id in &remote_ids {
+            let name = segment_file_name(id);
+            match fs.remove(&name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Io(e)),
+            }
+        }
+        if !remote_ids.is_empty() {
+            fs.sync_dir().map_err(StorageError::Io)?;
+        }
+        // The remaining segment files are all genuine LOCAL segments (every REMOTE id's cache was
+        // purged above); the filter is defense-in-depth on the id list.
+        let ids: Vec<u64> = segment_ids(&fs)?
+            .into_iter()
+            .filter(|id| !remote_ids.contains(id))
+            .collect();
         // #868: a crash during `start_segment` (or bit-rot of the trailing header) can leave the
         // HIGHEST-id segment as a zero-length or undecodable-header file: an empty unsealed tail
         // that holds nothing durable, because the prior segment was sealed before this one was
@@ -1214,6 +1272,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // `read_plane()` call; a never-read log pays nothing.
                     read_plane: std::cell::RefCell::new(None),
                     pending_roll: None,
+                    // Tiered storage (#643): a fresh (empty) log has no manifest and never
+                    // offloads until a backend + policy are attached post-open.
+                    cold_manifest: None,
+                    cold_store: None,
+                    cold_config: ColdStorageConfig::default(),
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 log
@@ -1251,6 +1314,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 ReasonCode::CorruptSegmentHeader,
             ));
         }
+        // #643 tiered storage: attach the (already-read) cold manifest and SPLICE the offloaded
+        // (oldest) prefix back into the recovered chain so an offloaded segment recovers as PRESENT,
+        // never as a torn gap. The recovered local chain already EXCLUDES every REMOTE id (a restored
+        // cache file never anchored the scan), so the splice provides the sole, contiguous chain for
+        // those ids. Absent manifest => nothing happens (the default-OFF, byte-identical path).
+        log.cold_manifest = cold_manifest;
+        log.splice_cold_prefix()?;
         Ok(log)
     }
 
@@ -1596,6 +1666,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
             pending_roll: None,
+            // Tiered storage (#643): the cold manifest is ATTACHED after construction by
+            // `open` (which reads `cold-manifest.ckpt` if present); the backend + policy are
+            // injected post-open. A never-offloaded log leaves all three at their off defaults.
+            cold_manifest: None,
+            cold_store: None,
+            cold_config: ColdStorageConfig::default(),
         };
 
         if scan.footer.is_some() {
@@ -2123,6 +2199,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
             pending_roll: None,
+            // Tiered storage (#643): the cold manifest is ATTACHED after construction by
+            // `open` (which reads `cold-manifest.ckpt` if present); the backend + policy are
+            // injected post-open. A never-offloaded log leaves all three at their off defaults.
+            cold_manifest: None,
+            cold_store: None,
+            cold_config: ColdStorageConfig::default(),
         };
 
         // #836: record the covered survivor loss of any COMMITTED-but-corrupt compacted segment the
@@ -3646,6 +3728,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         &self,
         id: u64,
     ) -> Result<std::sync::Arc<SegmentReader<F::File>>, StorageError> {
+        // #643 tiered storage: restore an offloaded segment to local disk before opening it (a no-op
+        // for a local segment). Defense-in-depth: the read entry points already restore, but this is
+        // the canonical open-by-id, so it never hands back a NotFound for a REMOTE segment.
+        if self.is_segment_remote(id) {
+            self.ensure_segment_local(id)?;
+        }
         if id == self.active_id {
             return Ok(std::sync::Arc::new(SegmentReader::open(
                 self.fs.open(&segment_file_name(id))?,
@@ -3673,6 +3761,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         out: &mut Vec<OwnedRecord>,
         byte_total: &mut usize,
     ) -> Result<bool, StorageError> {
+        // #643 tiered storage: if this slot is offloaded and its local file is absent, restore it
+        // from the cold store (fetch + re-verify + re-materialize) BEFORE any open — the seek-index
+        // build, the sealed-reader open, and the fallback full-scan below all read the local file.
+        // A no-op for a local (never-offloaded or already-restored) segment.
+        if self.is_segment_remote(slot.id) {
+            self.ensure_segment_local(slot.id)?;
+        }
         let remaining = bounds.max - out.len();
         // A COMPACTED segment is SPARSE: SEEK via the resident #481 sparse index to the FIRST
         // survivor at or above the per-segment start, then read FORWARD up to `remaining`, instead of
@@ -3841,6 +3936,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 oldest,
             });
         }
+        // #643 tiered storage: restore an offloaded slot to local disk before the raw read opens it.
+        let slot_id = self.segments[self.segment_index_for(start_v)].id;
+        if self.is_segment_remote(slot_id) {
+            self.ensure_segment_local(slot_id)?;
+        }
         let slot = &self.segments[self.segment_index_for(start_v)];
         // A COMPACTED (sparse, v2) slot is NOT served raw (its byte run is non-contiguous): hand the
         // whole remainder to the materialize path from this segment's covered base (clamped to start).
@@ -3901,6 +4001,399 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             None
         };
         Ok((trimmed, tail_from))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Tiered storage: offload cold sealed segments to an object store (#643, V2-M10, phase 1).
+    // All of these run on the single append actor (the `&mut Log` owner), so they are serialized
+    // with seal/reap/compaction — there is no offload-vs-reap-vs-compaction race by construction.
+    // See `crate::cold` for the crash-window analysis.
+    // -----------------------------------------------------------------------------------------
+
+    /// Attaches the [`ColdStore`] backend and the offload policy to this log (#643), the tiered-storage
+    /// analogue of `Engine::set_compaction_config`: the engine constructs a per-log-rooted backend and
+    /// installs it here after [`Log::open`]. Enabling offload writes no bytes by itself — the first
+    /// [`Log::offload_cold_segments`] call is what lazily creates the manifest and tiers segments out.
+    pub fn set_cold_store(&mut self, store: Arc<dyn ColdStore>, config: ColdStorageConfig) {
+        self.cold_store = Some(store);
+        self.cold_config = config;
+    }
+
+    /// The tiered-storage policy currently in effect.
+    #[must_use]
+    pub fn cold_config(&self) -> ColdStorageConfig {
+        self.cold_config
+    }
+
+    /// Whether segment `id` is recorded REMOTE (offloaded) in the durable manifest. The single source
+    /// of truth for "is this segment's authoritative copy in the cold store" — every open-by-id and
+    /// the read plane derive their remote handling from it.
+    #[must_use]
+    pub fn is_segment_remote(&self, id: u64) -> bool {
+        self.cold_manifest.as_ref().is_some_and(|m| m.contains(id))
+    }
+
+    /// How many segments are currently offloaded (REMOTE) — the tiered-storage depth, for tests and
+    /// the engine's observability.
+    #[must_use]
+    pub fn cold_offloaded_count(&self) -> usize {
+        self.cold_manifest
+            .as_ref()
+            .map_or(0, ColdManifest::entry_count)
+    }
+
+    /// Reads the durable cold-segment manifest at `Log::open` (if `cold-manifest.ckpt` exists),
+    /// returning the recovered offloaded set. Kept separate from the splice so the caller can read it
+    /// FIRST — before the chain scan — and exclude REMOTE ids from the enumeration (#643). A no-op
+    /// (and a byte-for-byte unchanged data dir) for a log that never offloaded.
+    fn open_cold_manifest(fs: &F) -> Result<Option<ColdManifest<F::File>>, StorageError> {
+        if !fs.exists(COLD_MANIFEST_FILE).map_err(StorageError::Io)? {
+            return Ok(None);
+        }
+        let file = fs.open(COLD_MANIFEST_FILE).map_err(StorageError::Io)?;
+        Ok(Some(ColdManifest::open(file)?))
+    }
+
+    /// Splices ALL the manifest's offloaded segments into `self.segments` as a contiguous PREFIX below
+    /// the recovered oldest LOCAL segment, validating that the offloaded set abuts the local chain
+    /// exactly (offset/seq contiguity). A manifest inconsistent with the on-disk chain fails closed —
+    /// never a silent reinterpretation. The offloaded records still count toward retention totals
+    /// (they are retained data, just tiered off local disk).
+    ///
+    /// Every REMOTE id was already EXCLUDED from the local chain scan at open (a restored cache file
+    /// is "absent until verified"), so no offloaded segment is in `self.segments` yet and the whole
+    /// offloaded set is the prefix — including the crash-after-manifest-before-delete window (a
+    /// segment whose local file lingers is spliced from the manifest here and its cache file is
+    /// reconciled on read, never double-counted).
+    fn splice_cold_prefix(&mut self) -> Result<(), StorageError> {
+        let Some(manifest) = self.cold_manifest.as_ref() else {
+            return Ok(());
+        };
+        if manifest.entries().is_empty() {
+            return Ok(());
+        }
+        // Copy the entries out (id-ascending == base-offset-ascending), so we can mutate `segments`.
+        let entries: Vec<ColdEntry> = manifest.entries().values().copied().collect();
+        // The offloaded prefix must abut the recovered oldest LOCAL segment (or, if there is none,
+        // there is nothing valid to abut and the manifest is inconsistent with the local chain).
+        let local_oldest_base = self
+            .segments
+            .first()
+            .map(SegmentSlot::covered_base_offset)
+            .ok_or(StorageError::ColdManifestCorrupt)?;
+        // Validate internal contiguity (offset AND seq), strictly ascending, and the abutment to the
+        // local chain. Any disagreement is a fail-closed refuse, never a fabricated chain.
+        let mut splice_bytes = 0u64;
+        let mut splice_count = 0u64;
+        let mut new_slots: Vec<SegmentSlot> = Vec::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            if let Some(next) = entries.get(i + 1) {
+                let abuts_offset =
+                    entry.base_offset.checked_add(entry.record_count) == Some(next.base_offset);
+                let abuts_seq =
+                    entry.base_seq.checked_add(entry.record_count) == Some(next.base_seq);
+                if !abuts_offset || !abuts_seq {
+                    return Err(StorageError::ColdManifestCorrupt);
+                }
+            } else {
+                // The highest offloaded segment must end exactly where the local chain begins.
+                if entry.base_offset.checked_add(entry.record_count) != Some(local_oldest_base) {
+                    return Err(StorageError::ColdManifestCorrupt);
+                }
+            }
+            let record_bytes = entry
+                .byte_len
+                .saturating_sub(SEGMENT_HEADER_LEN as u64)
+                .saturating_sub(SEGMENT_FOOTER_LEN as u64);
+            splice_bytes = splice_bytes.saturating_add(record_bytes);
+            splice_count = splice_count.saturating_add(entry.record_count);
+            new_slots.push(SegmentSlot {
+                id: entry.id,
+                base_offset: entry.base_offset,
+                record_count: entry.record_count,
+                max_timestamp_ms: entry.max_timestamp_ms,
+                compacted_covered: None,
+            });
+        }
+        // Prepend the offloaded prefix, oldest first. The local chain (including the active segment,
+        // never offloaded) follows unchanged, so `next_offset`/`next_seq`/`active_id` are untouched.
+        new_slots.append(&mut self.segments);
+        self.segments = new_slots;
+        self.sealed_record_bytes = self.sealed_record_bytes.saturating_add(splice_bytes);
+        self.total_record_count = self.total_record_count.saturating_add(splice_count);
+        Ok(())
+    }
+
+    /// Ensures the durable cold-segment manifest exists and is open, creating `cold-manifest.ckpt`
+    /// (and dir-syncing its new entry) on first use. Called before the first offload records an entry,
+    /// so a log that never offloads never creates the file (default-OFF, byte-identical).
+    fn ensure_cold_manifest(&mut self) -> Result<(), StorageError> {
+        if self.cold_manifest.is_some() {
+            return Ok(());
+        }
+        let file = if self
+            .fs
+            .exists(COLD_MANIFEST_FILE)
+            .map_err(StorageError::Io)?
+        {
+            self.fs.open(COLD_MANIFEST_FILE).map_err(StorageError::Io)?
+        } else {
+            let f = self
+                .fs
+                .create_new(COLD_MANIFEST_FILE)
+                .map_err(StorageError::Io)?;
+            // The new manifest file's directory entry must be durable before its first slot write.
+            self.fs.sync_dir().map_err(StorageError::Io)?;
+            f
+        };
+        self.cold_manifest = Some(ColdManifest::open(file)?);
+        Ok(())
+    }
+
+    /// Offloads eligible COLD sealed segments to the [`ColdStore`], oldest first, and returns how many
+    /// were tiered out (#643). A no-op when offload is disabled or no backend is attached.
+    ///
+    /// ## Policy (deterministic, documented)
+    /// A sealed segment is offload-eligible iff it is a non-active, non-compacted sealed predecessor
+    /// AND there are more than `keep_recent_segments` sealed segments (so it is among the oldest
+    /// `sealed_count - keep_recent_segments`). Offload proceeds strictly oldest-first and STOPS at the
+    /// first compacted segment, so the offloaded set stays a CONTIGUOUS PREFIX of the chain — which is
+    /// what lets recovery splice it back as a prefix. (Offloading compacted v2 segments and non-prefix
+    /// holes are deferred follow-ups.)
+    ///
+    /// ## Crash safety (the load-bearing ordering)
+    /// Per segment: upload the bytes to the cold store (durable) → record the segment REMOTE in the
+    /// manifest and fsync it (the COMMIT POINT) → only THEN delete the local file. A crash before the
+    /// manifest commit recovers fully-local (the still-present file is authoritative; the orphaned
+    /// object is overwritten by an idempotent re-offload); a crash after the commit recovers
+    /// fully-remote-and-recorded. A local segment is NEVER unlinked before both its remote copy and
+    /// its manifest entry are durable.
+    ///
+    /// # Errors
+    /// Propagates an IO/upload error or [`StorageError::ColdManifestFull`]; on any error the offloaded
+    /// prefix so far is durable and consistent (a contiguous remote prefix), so a retry resumes.
+    pub fn offload_cold_segments(&mut self) -> Result<u64, StorageError> {
+        if !self.cold_config.enabled || self.cold_store.is_none() {
+            return Ok(0);
+        }
+        let active_present = self.active.is_some();
+        let sealed_count = if active_present {
+            self.segments.len().saturating_sub(1)
+        } else {
+            self.segments.len()
+        };
+        let keep = usize::try_from(self.cold_config.keep_recent_segments).unwrap_or(usize::MAX);
+        if sealed_count <= keep {
+            return Ok(0);
+        }
+        let offload_upto = sealed_count - keep;
+        let mut offloaded = 0u64;
+        for i in 0..offload_upto {
+            let slot = self.segments[i];
+            if self.is_segment_remote(slot.id) {
+                // Already offloaded (part of the contiguous remote prefix): skip.
+                continue;
+            }
+            if slot.compacted_covered.is_some() {
+                // Phase 1 does not offload compacted (v2) segments; stop here so the remote set stays
+                // a contiguous prefix (never a compacted hole below a later offloaded segment).
+                break;
+            }
+            self.offload_one_segment(slot)?;
+            offloaded = offloaded.saturating_add(1);
+        }
+        Ok(offloaded)
+    }
+
+    /// Offloads ONE ordinary sealed segment with the crash-safe upload → manifest → delete ordering.
+    fn offload_one_segment(&mut self, slot: SegmentSlot) -> Result<(), StorageError> {
+        let name = segment_file_name(slot.id);
+        // 1) Read the whole local segment file (header + records + footer) and checksum it.
+        let file = self.fs.open(&name)?;
+        let byte_len = file.len()?;
+        if byte_len < (SEGMENT_HEADER_LEN + SEGMENT_FOOTER_LEN) as u64 {
+            // A sealed segment is always at least a header + footer; anything shorter is not a
+            // tierable sealed segment (never a live sealed predecessor). Refuse fail-closed.
+            return Err(StorageError::ColdCorrupt {
+                segment_id: slot.id,
+            });
+        }
+        let byte_len_usize = usize::try_from(byte_len).map_err(|_| StorageError::ColdCorrupt {
+            segment_id: slot.id,
+        })?;
+        let mut bytes = vec![0u8; byte_len_usize];
+        file.read_exact_at(&mut bytes, 0)?;
+        let crc = crc32c::crc32c(&bytes);
+        // The base sequence lives only in the segment header (not the in-memory slot), so decode it.
+        let header = SegmentHeader::decode(&bytes[..SEGMENT_HEADER_LEN])?;
+        if header.segment_id != slot.id {
+            return Err(StorageError::ColdCorrupt {
+                segment_id: slot.id,
+            });
+        }
+        let entry = ColdEntry {
+            id: slot.id,
+            base_offset: slot.base_offset,
+            base_seq: header.base_seq.get(),
+            record_count: slot.record_count,
+            max_timestamp_ms: slot.max_timestamp_ms,
+            byte_len,
+            crc32c: crc,
+            compacted: false,
+        };
+        // 2) Upload to the cold store (durable) BEFORE the manifest records it.
+        let store = self
+            .cold_store
+            .as_ref()
+            .ok_or(StorageError::ColdStoreUnavailable {
+                segment_id: slot.id,
+            })?;
+        store
+            .put(&cold_object_name(slot.id), &bytes)
+            .map_err(|e| StorageError::ColdFetch {
+                segment_id: slot.id,
+                source: e,
+            })?;
+        // 3) THE COMMIT POINT: record the segment REMOTE in the durable manifest (fsync). After this
+        //    returns, the offload is committed and the local file may be safely deleted.
+        self.ensure_cold_manifest()?;
+        self.cold_manifest
+            .as_mut()
+            .expect("ensure_cold_manifest installed it")
+            .insert(entry)?;
+        // 4) Only now, with BOTH the object and the manifest entry durable, delete the local file.
+        self.fs.remove(&name)?;
+        self.fs.sync_dir()?;
+        // 5) Drop the retired local segment's resident seek index + cached reader (its file is gone).
+        self.evict_segment_index(slot.id);
+        // 6) Republish the off-actor read plane so its snapshot marks the segment REMOTE (a read of it
+        //    now falls back through the actor, which restores-on-access).
+        self.republish_read_plane();
+        Ok(())
+    }
+
+    /// Restore-on-access (#643): make REMOTE segment `id` readable locally. Its `seg-<id>.log` is a
+    /// process-lifetime restore CACHE (a re-fetchable copy of the offloaded object). A cache file
+    /// present WITHIN a run was written by THIS process's restore below — AFTER the fetched bytes were
+    /// verified against the manifest — so it is trusted by existence; only an absent one is fetched.
+    /// A torn/stale cache from a PRIOR run's crash never reaches here: [`Log::open`] PURGES every
+    /// REMOTE id's cache file before recovery, so a read always starts from either a valid cache this
+    /// run wrote or a clean fetch. Idempotent; runs on the actor.
+    ///
+    /// A fetch or verification failure is a TYPED, fail-closed error surfaced to the reader (never a
+    /// silent gap or a phantom record): the poisoned bytes are never materialized as a local segment.
+    fn ensure_segment_local(&self, id: u64) -> Result<(), StorageError> {
+        let name = segment_file_name(id);
+        if self.fs.exists(&name).map_err(StorageError::Io)? {
+            // Present: a genuine local segment, or a cache this run already restored (verified before
+            // it was written). Trusted by existence — `Log::open` purged any stale/torn prior cache.
+            return Ok(());
+        }
+        let Some(entry) = self.cold_manifest.as_ref().and_then(|m| m.get(id)).copied() else {
+            // Absent and NOT recorded REMOTE: let the caller's normal open surface a genuine NotFound.
+            return Ok(());
+        };
+        let store = self
+            .cold_store
+            .as_ref()
+            .ok_or(StorageError::ColdStoreUnavailable { segment_id: id })?;
+        let bytes = store
+            .get(&cold_object_name(id))
+            .map_err(|e| StorageError::ColdFetch {
+                segment_id: id,
+                source: e,
+            })?;
+        // Verify the fetched bytes (length + CRC32C + a structural header/footer scan) BEFORE
+        // materializing them, so a corrupt object store fails closed rather than caching garbage.
+        Self::verify_fetched_segment(id, &entry, &bytes)?;
+        match self.fs.create_new(&name) {
+            Ok(file) => {
+                file.write_all_at(&bytes, 0)?;
+                file.sync_all()?;
+                self.fs.sync_dir()?;
+            }
+            // A benign race on a shared fs: the bytes are byte-identical (both manifest-verified).
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(StorageError::Io(e)),
+        }
+        Ok(())
+    }
+
+    /// Re-verifies fetched offloaded-segment bytes against the manifest entry, fail-closed on any
+    /// mismatch (#643): the byte length, the CRC32C over the whole file, and a structural scan (a
+    /// decodable header whose id/base match, plus a body-consistent sealed footer whose record count
+    /// matches). A corrupt object store therefore fails closed rather than delivering garbage.
+    fn verify_fetched_segment(
+        id: u64,
+        entry: &ColdEntry,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        if bytes.len() as u64 != entry.byte_len || crc32c::crc32c(bytes) != entry.crc32c {
+            return Err(StorageError::ColdCorrupt { segment_id: id });
+        }
+        // Structural re-verify over the fetched bytes: open a reader and scan for a body-consistent
+        // sealed footer. Any decode/scan error, a header id/base mismatch, an unsealed result, or a
+        // record-count disagreement is a fail-closed corruption.
+        let reader = SegmentReader::open(Arc::new(InMemoryFile::from_bytes(bytes.to_vec())))
+            .map_err(|_| StorageError::ColdCorrupt { segment_id: id })?;
+        if reader.header().segment_id != id
+            || reader.header().base_offset.get() != entry.base_offset
+            || reader.header().base_seq.get() != entry.base_seq
+        {
+            return Err(StorageError::ColdCorrupt { segment_id: id });
+        }
+        let scan = reader
+            .scan()
+            .map_err(|_| StorageError::ColdCorrupt { segment_id: id })?;
+        if scan.footer.is_none() || !scan.clean || scan.records.len() as u64 != entry.record_count {
+            return Err(StorageError::ColdCorrupt { segment_id: id });
+        }
+        Ok(())
+    }
+
+    /// Retires the OLDEST segment's on-disk STORAGE for a reap and returns its (record bytes, record
+    /// count) for the running-total decrement (#643). Handles a REMOTE (offloaded) oldest segment: it
+    /// removes the manifest entry (fsync) FIRST — so no dangling REMOTE pointer can survive a crash —
+    /// then best-effort deletes the cold object (a failed delete leaks a bounded orphan, swept by a
+    /// follow-up, never blocks retention) and any lingering local cache file. A LOCAL oldest segment
+    /// keeps the exact prior discipline: read its bytes/count, unlink, dir-sync. In both cases the
+    /// durable removal precedes the caller's in-memory slot removal, so disk and memory never disagree.
+    fn reap_retire_oldest_files(
+        &mut self,
+        oldest: &SegmentSlot,
+    ) -> Result<(u64, u64), StorageError> {
+        if self.is_segment_remote(oldest.id) {
+            let entry = *self
+                .cold_manifest
+                .as_ref()
+                .and_then(|m| m.get(oldest.id))
+                .expect("is_segment_remote implies a manifest entry");
+            let record_bytes = entry
+                .byte_len
+                .saturating_sub(SEGMENT_HEADER_LEN as u64)
+                .saturating_sub(SEGMENT_FOOTER_LEN as u64);
+            // Manifest entry removal (fsync) FIRST: after this the segment is no longer REMOTE-recorded,
+            // so a crash before the object delete leaves at worst a bounded orphan object (no dangling
+            // pointer, no data-availability error). This is the only fatal step; if it fails the slot
+            // and manifest are unchanged, so a retry is consistent.
+            self.cold_manifest
+                .as_mut()
+                .expect("remote implies a manifest")
+                .remove(oldest.id)?;
+            // Best-effort object + local-cache cleanup: a failure here must not block retention or
+            // leave the manifest (already clean) inconsistent with the removed slot.
+            if let Some(store) = self.cold_store.as_ref() {
+                let _ = store.delete(&cold_object_name(oldest.id));
+            }
+            let _ = self.fs.remove(&segment_file_name(oldest.id));
+            let _ = self.fs.sync_dir();
+            Ok((record_bytes, entry.record_count))
+        } else {
+            let (bytes, count) = self.segment_record_bytes_and_count(oldest)?;
+            self.fs.remove(&segment_file_name(oldest.id))?;
+            self.fs.sync_dir()?;
+            Ok((bytes, count))
+        }
     }
 
     /// Reclaims disk by deleting whole OLD SEALED segments under any of three composable retention
@@ -4005,16 +4498,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             if next_base > protect_below_offset {
                 break;
             }
-            let name = segment_file_name(oldest.id);
-            // The reaped segment's durable RECORD bytes and COUNT, read the SAME way the running
-            // totals were accumulated. A compacted oldest segment is read via the v2 scan.
+            // The reaped segment's durable RECORD bytes and COUNT, and its storage retirement. A
+            // LOCAL oldest is read + unlinked as before; a REMOTE (offloaded) oldest removes its
+            // manifest entry (fsync) first, then best-effort deletes the cold object so no orphan
+            // leaks (#643). Either way the durable removal precedes the in-memory slot removal below,
+            // so memory never claims a segment is gone while it survives on disk.
             let (segment_record_bytes, segment_record_count) =
-                self.segment_record_bytes_and_count(&oldest)?;
-            // Unlink, then dir-sync so the removal is durable, BEFORE touching in-memory state:
-            // if either fails the slot stays and the running totals are untouched, so memory never
-            // claims a segment is gone while it survives on disk.
-            self.fs.remove(&name)?;
-            self.fs.sync_dir()?;
+                self.reap_retire_oldest_files(&oldest)?;
             self.segments.remove(0);
             // EVICT this retired segment's resident seek index (#483) the moment its slot leaves
             // memory: the id is now free to be... never reused (ADR 0002), but evicting here keeps
@@ -4098,17 +4588,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             return Ok(None);
         }
         let oldest = self.segments[0];
-        let name = segment_file_name(oldest.id);
-        // Read the reaped segment's durable RECORD bytes and COUNT the SAME way the running totals
-        // were accumulated, so both decrements are exact. A compacted oldest segment is read via the
-        // v2 scan.
+        // The reaped segment's durable RECORD bytes and COUNT, and its storage retirement (a REMOTE
+        // oldest deletes its manifest entry + cold object, #643). The durable removal precedes the
+        // in-memory slot removal below, so memory never claims a segment is gone while it survives.
         let (segment_record_bytes, segment_record_count) =
-            self.segment_record_bytes_and_count(&oldest)?;
-        // Unlink, then dir-sync so the removal is durable, BEFORE touching in-memory state: if
-        // either fails the slot stays and the running totals are untouched, so memory never claims
-        // a segment is gone while it survives on disk.
-        self.fs.remove(&name)?;
-        self.fs.sync_dir()?;
+            self.reap_retire_oldest_files(&oldest)?;
         self.segments.remove(0);
         // EVICT the force-reaped segment's resident seek index (#483) as its slot leaves memory, so
         // no stale index can outlive the segment it described (the same retirement guarantee `reap`
@@ -4384,9 +4868,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // counts already in RAM instead of re-scanning + CRC-validating every sealed segment on each
         // produce commit. The active slot is included but skipped by `select_dirty_run`'s
         // `id >= active_id` guard (its count is only meaningful once sealed anyway).
+        // #643: an OFFLOADED (REMOTE) segment's bytes are not on local disk, so it can never be a
+        // compaction source. Excluding it here keeps `select_dirty_run`'s candidate run to the local
+        // segments (the offloaded set is always the oldest contiguous prefix, so the remaining local
+        // segments still abut), and it upholds the "a segment is either offloaded or compacted, never
+        // concurrently" invariant.
         let sealed: Vec<crate::compaction::SealedSegmentMeta> = self
             .segments
             .iter()
+            .filter(|slot| !self.is_segment_remote(slot.id))
             .map(|slot| crate::compaction::SealedSegmentMeta {
                 id: slot.id,
                 base_offset: slot.base_offset,
@@ -4814,6 +5304,22 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         };
         let mut sealed = Vec::with_capacity(sealed_count);
         for slot in sealed_slots {
+            if self.is_segment_remote(slot.id) {
+                // #643: an OFFLOADED (REMOTE) sealed segment. Its local bytes may be absent, so DON'T
+                // open it to build anchors — publish it as a fetch-through-actor marker (like a
+                // compacted slot) so the snapshot's offset-to-segment search stays exact across the
+                // offloaded range and a read of it falls back to the actor (which restores-on-access).
+                sealed.push(SealedSegment {
+                    id: slot.id,
+                    base_offset: slot.base_offset,
+                    record_count: slot.record_count,
+                    compacted: false,
+                    remote: true,
+                    anchors: Vec::new(),
+                    valid_end: 0,
+                });
+                continue;
+            }
             if slot.compacted_covered.is_some() {
                 // A compacted sealed segment: the off-actor plane does not serve it (the through-
                 // actor v2 scan does). Record it as a fallback marker so the snapshot's offset-to-
@@ -4825,6 +5331,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                         c.covered_end_offset.saturating_sub(c.covered_base_offset)
                     }),
                     compacted: true,
+                    remote: false,
                     anchors: Vec::new(),
                     valid_end: 0,
                 });
@@ -4845,6 +5352,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 base_offset: slot.base_offset,
                 record_count: slot.record_count,
                 compacted: false,
+                remote: false,
                 anchors,
                 valid_end,
             });

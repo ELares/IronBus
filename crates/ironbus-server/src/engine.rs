@@ -4847,6 +4847,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.compaction = config;
     }
 
+    /// Installs the tiered-storage backend + policy on the DEFAULT log (#643, V2-M10): the
+    /// [`ColdStore`](ironbus_storage::cold::ColdStore) offloaded sealed segments are uploaded to,
+    /// fetched from, and reaped from. Configured ONCE on a serve with tiered storage enabled; a
+    /// broker that never enables it never calls this, so the default log's on-disk image is
+    /// byte-for-byte unchanged. Phase 1 wires the default stream only; named/partition logs are a
+    /// follow-up (they materialize lazily and would each install at open). The actual offload runs on
+    /// the retention tick ([`Engine::reap_for_retention`]), serialized with reap/compaction.
+    pub fn set_cold_storage(
+        &mut self,
+        store: std::sync::Arc<dyn ironbus_storage::cold::ColdStore>,
+        config: ironbus_storage::cold::ColdStorageConfig,
+    ) {
+        self.log.set_cold_store(store, config);
+    }
+
     /// Declare a set of NAMED local streams as READ-ONLY cross-cluster MIRRORS (#623, V2-C7-I1): a
     /// client PRODUCE to any of these is rejected with [`EngineError::MirrorReadOnly`], so a mirror's
     /// only writer stays the geo mirror-apply path (single-writer preserved). Configured ONCE on a
@@ -10606,6 +10621,28 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if self.compaction.enabled {
             // A frozen writer has no active segment; skip compaction rather than touch a dead log.
             let _ = self.log.maybe_compact(&self.compaction)?;
+        }
+        // The OPT-IN tiered-storage offload (#643): after compaction, tier the cold sealed prefix out
+        // to the object store. A no-op (cheap early return) unless a backend is attached AND offload
+        // is enabled, so a non-tiered broker pays nothing. Runs here on the retention tick, serialized
+        // with reap/compaction on the append actor, upholding the crash-safe upload->manifest->delete
+        // ordering. Phase 1 tiers the default log only.
+        //
+        // BEST-EFFORT and NON-FATAL: this tick runs AFTER a produce's commit, so a cold-store outage
+        // (`ColdFetch`) or a manifest at its slot cap (`ColdManifestFull`) must NEVER fail the produce
+        // — it would take writes down for a purely archival hiccup. On an error we bump the observable
+        // `ironbus_cold_offload_errors_total{reason}` counter + `warn!` and CONTINUE; the segment
+        // stays local and the next tick retries. (An offload error never corrupts state — the crash-
+        // safe ordering leaves a consistent, contiguous remote prefix on any partial failure.)
+        if let Err(e) = self.log.offload_cold_segments() {
+            let reason = ironbus_storage::cold::ColdOffloadErrorReason::for_error(&e);
+            ironbus_storage::cold::record_cold_offload_error(reason);
+            tracing::warn!(
+                error = %e,
+                reason = reason.metric_label(),
+                "tiered-storage offload failed on the retention tick; the segment stays local and \
+                 the next tick retries (produce path unaffected)"
+            );
         }
         Ok(())
     }

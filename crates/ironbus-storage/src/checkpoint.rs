@@ -102,6 +102,22 @@ pub const SHARED_WAL_REAP_PAYLOAD: usize = 60 * 1024;
 /// error and the previous table stays installed — never a torn or truncated snapshot.
 pub const BINDINGS_PAYLOAD: usize = 60 * 1024;
 
+/// The per-slot payload cap for the durable per-log COLD-SEGMENT MANIFEST (#643, V2-M10 tiered
+/// storage): the set of offloaded sealed segments and their fetch-verification metadata, rewritten
+/// and fsynced on every offload (BEFORE the local file is deleted) and every reap of a remote
+/// segment. Each entry is a fixed 53 bytes (six `u64` fields + a `u32` CRC + a flags byte) after a
+/// 9-byte header (magic + version + `u32` count), so this 60 KiB cap (under the slot's `u16` length
+/// field like the other large checkpoints) holds ~1150 offloaded segments — at a 64 MiB default
+/// segment size, ~70 GiB of tiered data per log. Like the shared-WAL reap floor and the binding
+/// table (and UNLIKE the tolerant cursor family) the payload is LOAD-BEARING: an acked REMOTE
+/// transition that a restart could not read back would strand a local-deleted segment, so a
+/// CRC-valid-but-undecodable snapshot fails the log open closed (see [`crate::cold::ColdManifest`]);
+/// the dual-slot discipline still reverts a TORN write to the prior durable manifest, which is
+/// always consistent because a local file is unlinked only AFTER its manifest entry is durable. An
+/// offload whose resulting manifest would exceed the cap is REFUSED fail-closed and the offload
+/// simply does not advance — never a torn or truncated manifest.
+pub const COLD_MANIFEST_PAYLOAD: usize = 60 * 1024;
+
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
 const CRC_LEN: usize = 4;
@@ -241,6 +257,14 @@ pub type SharedWalReapCheckpoint<F> = SlotCheckpoint<F, SHARED_WAL_REAP_PAYLOAD>
 /// the routing table.
 pub type BindingsCheckpoint<F> = SlotCheckpoint<F, BINDINGS_PAYLOAD>;
 
+/// The crash-safe checkpoint for the durable per-log COLD-SEGMENT MANIFEST (#643, V2-M10 tiered
+/// storage): a [`COLD_MANIFEST_PAYLOAD`]-per-slot [`SlotCheckpoint`]. It reuses the identical
+/// dual-slot CRC discipline as the other checkpoints — a torn (never-committed) write reverts to the
+/// prior durable manifest — and, like [`BindingsCheckpoint`], its payload is LOAD-BEARING: the
+/// write-then-delete discipline (the manifest records a segment REMOTE and is fsynced BEFORE its
+/// local file is unlinked) is what guarantees an offloaded segment is never stranded across a crash.
+pub type ColdManifestCheckpoint<F> = SlotCheckpoint<F, COLD_MANIFEST_PAYLOAD>;
+
 /// The classification a checkpoint file receives on [`SlotCheckpoint::open`] (#1142): the tri-state
 /// that separates a value that recovered, a checkpoint that was never durably written, and one that
 /// is EXTERNALLY DAMAGED (bit rot / a lost extent), which the old two-state `Option` collapsed into
@@ -315,11 +339,13 @@ pub enum CheckpointArtifact {
     Bindings,
     /// The geo/leaf origin-replication cursor checkpoint (`OriginCursorStore`, cluster).
     GeoCursor,
+    /// The per-log cold-segment manifest checkpoint (`cold-manifest.ckpt`, #643 tiered storage).
+    ColdManifest,
 }
 
 impl CheckpointArtifact {
     /// Every artifact in a fixed order; the index into the damage-counter array. Append-only.
-    pub const ALL: [CheckpointArtifact; 8] = [
+    pub const ALL: [CheckpointArtifact; 9] = [
         CheckpointArtifact::Cursor,
         CheckpointArtifact::Attempts,
         CheckpointArtifact::Counters,
@@ -328,6 +354,7 @@ impl CheckpointArtifact {
         CheckpointArtifact::SharedWalReap,
         CheckpointArtifact::Bindings,
         CheckpointArtifact::GeoCursor,
+        CheckpointArtifact::ColdManifest,
     ];
 
     /// This artifact's index into [`CheckpointArtifact::ALL`]. A total match in `ALL` order, so it is
@@ -343,6 +370,7 @@ impl CheckpointArtifact {
             CheckpointArtifact::SharedWalReap => 5,
             CheckpointArtifact::Bindings => 6,
             CheckpointArtifact::GeoCursor => 7,
+            CheckpointArtifact::ColdManifest => 8,
         }
     }
 
@@ -358,6 +386,7 @@ impl CheckpointArtifact {
             CheckpointArtifact::SharedWalReap => "shared_wal_reap",
             CheckpointArtifact::Bindings => "bindings",
             CheckpointArtifact::GeoCursor => "geo_cursor",
+            CheckpointArtifact::ColdManifest => "cold_manifest",
         }
     }
 }
@@ -368,8 +397,9 @@ impl CheckpointArtifact {
 /// is the low-coupling place to accumulate it without threading a return through every open signature;
 /// it is exactly Prometheus counter semantics (a monotonic, process-lifetime total for the one broker
 /// this process is). It is NOT part of any durable snapshot, so the on-disk formats are unchanged.
-// Eight explicit cells (MSRV 1.78 predates inline-const array repeat).
+// Nine explicit cells (MSRV 1.78 predates inline-const array repeat).
 static CHECKPOINT_DAMAGED: [core::sync::atomic::AtomicU64; CheckpointArtifact::ALL.len()] = [
+    core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
