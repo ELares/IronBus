@@ -209,6 +209,11 @@ pub enum AuthOutcome {
         identity: String,
         /// The pinned scope set.
         scopes: ScopeSet,
+        /// The resolved tenant (#765), pinned to the connection alongside the scopes. `None` is the
+        /// single-tenant default (no name prefixing). Carried here so the session pins the tenant
+        /// from the SAME irrefutable authentication outcome as the scopes — a connection can never be
+        /// authenticated into a tenant it did not authenticate as.
+        tenant: Option<crate::tenant::TenantId>,
     },
 }
 
@@ -224,6 +229,12 @@ pub struct Identity {
     pub scopes: ScopeSet,
     /// The credential binding for this identity's mechanism.
     pub credential: CredentialSet,
+    /// The TENANT (account) this identity belongs to (#765, V2-M7). `None` is the single-tenant
+    /// default: the identity's names are NOT prefixed and behavior is byte-for-byte the pre-tenant
+    /// broker. `Some(_)` binds every name this connection uses under `<tenant>/…` (streams/groups) or
+    /// `<tenant>.…` (subjects). This is the ONLY source of a connection's tenant — it is a property
+    /// of the resolved credential, never anything the client asserts, so it is non-spoofable.
+    pub tenant: Option<crate::tenant::TenantId>,
 }
 
 /// The additive credential set for an identity, one variant per mechanism (#631). Each carries a
@@ -304,6 +315,11 @@ pub struct AuthConfig {
     password_by_username: BTreeMap<String, Identity>,
     /// mTLS identities, indexed by accepted SAN identity string.
     mtls_by_san: BTreeMap<String, Identity>,
+    /// The broker's per-tenant quota registry (#765), if any tenant is configured. Rides the auth
+    /// config (a cohesive "who + which tenant + which ceilings" unit) so a session picks it up from
+    /// the same `Arc<AuthConfig>` it already receives — no new serve-path plumbing. `None` disables
+    /// quota enforcement; isolation (name prefixing) is independent and comes from `Identity::tenant`.
+    tenants: Option<std::sync::Arc<crate::tenant::TenantRegistry>>,
 }
 
 impl AuthConfig {
@@ -311,6 +327,18 @@ impl AuthConfig {
     #[must_use]
     pub fn new() -> AuthConfig {
         AuthConfig::default()
+    }
+
+    /// Attaches the broker's per-tenant quota registry (#765).
+    pub fn set_tenants(&mut self, tenants: std::sync::Arc<crate::tenant::TenantRegistry>) {
+        self.tenants = Some(tenants);
+    }
+
+    /// The broker's per-tenant quota registry (#765), if configured (a cheap `Arc` clone). The
+    /// session consults it at the connect / declare / produce quota gates.
+    #[must_use]
+    pub fn tenants(&self) -> Option<std::sync::Arc<crate::tenant::TenantRegistry>> {
+        self.tenants.clone()
     }
 
     /// Whether ANY auth identity is configured (#631 / #629). This is the "at least one auth identity
@@ -392,6 +420,7 @@ impl AuthConfig {
                 AuthOutcome::Authenticated {
                     identity: identity.name.clone(),
                     scopes: identity.scopes,
+                    tenant: identity.tenant.clone(),
                 },
             )),
             None => Err(AuthError),
@@ -437,6 +466,7 @@ impl AuthConfig {
                 AuthOutcome::Authenticated {
                     identity: identity.name.clone(),
                     scopes: identity.scopes,
+                    tenant: identity.tenant.clone(),
                 },
             ))
         } else {
@@ -462,6 +492,7 @@ impl AuthConfig {
                 AuthOutcome::Authenticated {
                     identity: identity.name.clone(),
                     scopes: identity.scopes,
+                    tenant: identity.tenant.clone(),
                 },
             )),
             None => Err(AuthError),
@@ -654,6 +685,7 @@ mod tests {
             name: "producer".to_string(),
             scopes: ScopeSet::from_scopes(&[Scope::Publish]),
             credential: cred,
+            tenant: None,
         };
         let mut cfg = AuthConfig::new();
         cfg.add_identity(identity.clone());
@@ -714,6 +746,7 @@ mod tests {
             credential: CredentialSet::Bearer {
                 digests: vec![parse_token_digest_hex(&sha256_hex(token)).unwrap()],
             },
+            tenant: None,
         });
         assert!(cfg.has_any_identity());
 
@@ -727,7 +760,11 @@ mod tests {
         // #889: an `Ok` outcome is by construction `Authenticated` and CARRIES the real pinned state —
         // the identity name and the identity's actual (non-empty) scope set, exactly what the session
         // handshake flips `authenticated` on. A success outcome can never be a no-scope shell.
-        let AuthOutcome::Authenticated { identity, scopes } = &outcome;
+        let AuthOutcome::Authenticated {
+            identity,
+            scopes,
+            tenant: _,
+        } = &outcome;
         assert_eq!(identity, "producer");
         assert_eq!(*scopes, id.scopes);
         assert!(scopes.has(Scope::Publish) && !scopes.has(Scope::Subscribe));
@@ -751,6 +788,7 @@ mod tests {
                 username: "alice".to_string(),
                 phc_hashes: vec![Secret::new(make_phc(b"correct horse").into_bytes())],
             },
+            tenant: None,
         });
 
         let good = AuthCredential {
@@ -786,6 +824,7 @@ mod tests {
             credential: CredentialSet::Mtls {
                 san_identities: vec!["spiffe://example.org/edge-fleet".to_string()],
             },
+            tenant: None,
         });
         let sel = AuthCredential {
             mechanism: WireMechanism::Mtls,
@@ -893,6 +932,7 @@ mod tests {
                 username: "bob".to_string(),
                 phc_hashes: vec![Secret::new(phc1.into_bytes())],
             },
+            tenant: None,
         });
         // The right password authenticates.
         let good = AuthCredential {

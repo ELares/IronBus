@@ -21,6 +21,8 @@ pub mod registry;
 pub mod rss;
 pub mod server;
 pub mod session;
+// Multi-tenant account isolation + per-tenant quotas (#765, V2-M7, phase 1).
+pub mod tenant;
 // TLS 1.3 transport config (ADR-0004, #766) — compiled only under `--features tls`; the default and
 // edge-min builds carry no TLS code and no new C (deny.toml's aws-lc-sys allowance is feature-scoped).
 #[cfg(feature = "tls")]
