@@ -1037,6 +1037,38 @@ are statistics, not durable state: `produced`, `produced_bytes`, `produce_reject
 
 ---
 
+### Delayed delivery (#555): the visibility gate and its operator-facing consequences
+
+Source: `crates/ironbus-core/src/delay.rs`, the four work-group delivery scans in
+`crates/ironbus-server/src/engine.rs`.
+
+A publish may carry a `DLY1` headers-prefix delay request (`magic(4) + delay_ms u64 LE`, the
+per-message `TTL1` precedent — no record-format or frame change). The BROKER resolves it against
+ITS OWN wall clock at append time into a stored absolute `DUE1` due-instant; until that instant the
+record is INVISIBLE to queue (work-group) delivery, and every scan HOLDS at the first un-due record
+without advancing the group cursor, so due records release strictly in LOG-SEQUENCE order
+(FIFO-with-delays). Three consequences an operator MUST know:
+
+- **Bounded head-of-line stall on a shared stream (by design, and bounded by `max_delay_ms`).**
+  Because the scan holds at the earliest un-due record, one delayed record at a stream's head
+  delays every record BEHIND it for EVERY consumer group on that stream — including other
+  producers' records. Any principal with publish access to a stream therefore holds a per-stream
+  delivery lever of up to `max_delay_ms` (default 3 days; the knob is the guard — tighten it per
+  deployment, and isolate scheduling-heavy producers onto their own streams, where the stall is
+  self-inflicted). An out-of-order-release due-index sidecar that removes the head-of-line property
+  is the named follow-up.
+- **Tier-S / streaming readers BYPASS the delay entirely.** A streaming (`stream_fetch`) or replay
+  reader is a LOG reader: it sees a delayed record IMMEDIATELY, with its `DUE1` block intact in the
+  delivered headers, exactly as it sees retention- and compaction-level views. Delayed delivery is
+  a QUEUE semantic only. Do not put embargo-sensitive payloads behind a delay on a stream that also
+  has streaming readers; the delay is a scheduling tool, not a confidentiality control.
+- **Only the broker mints `DUE1`.** A wire produce must carry the `DLY1` RELATIVE request; a raw
+  `DUE1` block in wire headers is rejected fail-closed (`ERR_INVALID_DELAY_HEADER`) because a
+  producer-chosen absolute instant would bypass both the `max_delay_ms` bound and the broker-clock
+  anchoring (self-scheduling `u64::MAX` would stall every group on the stream forever). Internal
+  already-minted `DUE1` records (DLQ moves/redrive, replication followers, geo mirror-apply)
+  re-inject via verbatim `Log::append`-level copies below the resolution seam and are unaffected.
+
 ## Report models
 
 Source: `crates/ironbus-storage/src/loss.rs` (issues #120, #8, #7, #16).
@@ -1278,6 +1310,8 @@ the `AckStatus` byte, so the frozen wire is byte-for-byte unchanged. A later wir
 | `ERR_MISSING_RECORD`              | an internal invariant broke (a deliverable offset had no record) | `EngineError::MissingRecord` |
 | `ERR_ZERO_MAX_IN_FLIGHT`          | `max_in_flight` was zero, rejected at open | `EngineError::ZeroMaxInFlight` |
 | `ERR_STORAGE`                     | a residual storage error (not the byte-cap shed) | `EngineError::Storage` |
+| `ERR_DELAY_TOO_LONG`              | a publish carried a `DLY1` delayed-delivery request over the broker's `max_delay_ms` (#555): rejected fail-closed, nothing appended, never silently clamped | `EngineError::DelayTooLong` |
+| `ERR_INVALID_DELAY_HEADER`        | a publish carried a raw broker-only `DUE1` due-instant block in its wire headers (#555 injection hardening): only the broker mints `DUE1`; send a `DLY1` relative request | `EngineError::DueTimeInjected` |
 
 ## Semantics conformance vectors (the executable spec)
 

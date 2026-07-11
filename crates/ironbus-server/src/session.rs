@@ -5471,12 +5471,17 @@ fn write_pub_reply(
         }
         ProduceOutcome::Failed(ref e) => {
             if !fire_and_forget {
-                // A DELAYED-delivery request over the broker's max (#555) is a TYPED, stable
-                // rejection the producer can branch on (resubmit under the bound), so it carries
-                // its frozen code + the bound-naming message instead of the anonymous fallback.
-                // Every other transient failure keeps the historical uncoded "produce failed"
+                // The two DELAYED-delivery rejects (#555) — an over-max `DLY1` request and a raw
+                // wire `DUE1` injection — are TYPED, stable rejections the producer can branch on
+                // (resubmit under the bound / switch to a `DLY1` request), so each carries its
+                // frozen code + self-describing message instead of the anonymous fallback. Every
+                // other transient failure keeps the historical uncoded "produce failed"
                 // byte-for-byte.
-                if matches!(e, crate::engine::EngineError::DelayTooLong { .. }) {
+                if matches!(
+                    e,
+                    crate::engine::EngineError::DelayTooLong { .. }
+                        | crate::engine::EngineError::DueTimeInjected { .. }
+                ) {
                     reply_err_coded(out, e.code().as_str(), &e.to_string());
                 } else {
                     reply_err(out, "produce failed");
@@ -10243,6 +10248,89 @@ mod tests {
             one_response(&out).0,
             FrameType::PubAck,
             "at the bound: accepted on the same connection"
+        );
+    }
+
+    #[test]
+    fn a_wire_pub_with_a_raw_due1_block_carries_the_injection_reject_code() {
+        // #555 injection hardening over the WIRE: a Pub whose headers open with a raw broker-only
+        // `DUE1` block (a self-scheduled absolute due-instant, dodging the max-delay bound and the
+        // broker-clock anchor) is a TYPED, connection-preserving Err carrying the frozen
+        // `ERR_INVALID_DELAY_HEADER` code — never a PubAck, never stored, never held.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let mut injected = Vec::new();
+        injected.extend_from_slice(&ironbus_core::delay::DUE_HEADER_MAGIC);
+        injected.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: &injected,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"self-scheduled",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "an injected DUE1 is an Err, not a PubAck"
+        );
+        let decoded = ironbus_proto::err::decode_err_body(&body);
+        assert_eq!(
+            decoded.code,
+            Some(ironbus_proto::err::ServerErrorCode::InvalidDelayHeader),
+            "the reject carries the stable code"
+        );
+        assert!(
+            decoded.message.contains("DLY1"),
+            "the message steers to the legitimate request form: {}",
+            decoded.message
+        );
+        // Nothing was stored, so nothing can ever be held: a consumer sees an empty stream.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(delivered_tokens(&out).is_empty(), "nothing was appended");
+        // The connection is preserved and a LEGITIMATE `DLY1` request right after is accepted.
+        let legit = ironbus_core::delay::encode_delay_headers(
+            ironbus_core::delay::Delay::from_millis(100),
+            b"",
+        );
+        let mut ok_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: &legit,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"legit-delay",
+            },
+            &mut ok_body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Pub, &ok_body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAck,
+            "a DLY1 request on the same connection is accepted"
         );
     }
 

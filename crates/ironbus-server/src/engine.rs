@@ -868,6 +868,21 @@ pub enum EngineError {
         /// The broker's configured maximum delay, in milliseconds.
         max_ms: u64,
     },
+    /// A publish carried a raw `DUE1` due-instant block in its wire headers (V2-M4 #555 injection
+    /// hardening). `DUE1` is the BROKER-MINTED stored form of a resolved delay — only the broker's
+    /// resolution seam writes it. Accepting one from the wire would bypass BOTH the
+    /// [`EngineConfig::max_delay_ms`] bound (it is not a `DLY1` request, so the bound is never
+    /// consulted: a producer could self-schedule `due_unix_ms = u64::MAX`, head-of-line-stalling
+    /// every group on the stream forever and pinning retention unboundedly) AND the broker-clock
+    /// anchoring the whole #555 skew-safety design rests on. REJECTED fail-closed at the produce
+    /// boundary (nothing appended): a wire produce must carry a `DLY1` relative delay request,
+    /// never a `DUE1`. Internal already-minted `DUE1` records (DLQ moves/redrive, replication
+    /// followers, geo mirror-apply) re-inject via verbatim `Log::append`-level copies below the
+    /// resolution seam and are unaffected. Non-fatal: the connection stays usable.
+    DueTimeInjected {
+        /// The absolute due-instant the wire tried to smuggle in, in Unix milliseconds.
+        due_unix_ms: u64,
+    },
 }
 
 impl core::fmt::Display for EngineError {
@@ -956,6 +971,11 @@ impl core::fmt::Display for EngineError {
             } => write!(
                 f,
                 "delayed delivery of {requested_ms} ms exceeds the broker's maximum of {max_ms} ms"
+            ),
+            EngineError::DueTimeInjected { due_unix_ms } => write!(
+                f,
+                "a publish may not carry a broker-resolved `DUE1` due-time block \
+                 (due_unix_ms = {due_unix_ms}); send a `DLY1` relative delay request instead"
             ),
         }
     }
@@ -6003,10 +6023,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
         // The DELAYED-delivery resolution seam (V2-M4, #555), the NAMED-stream produce chokepoint
         // (the default stream resolved above, inside `append_no_sync_checked`): reject an over-max
-        // `DLY1` request or rewrite it in place to the broker-clock-anchored `DUE1` instant BEFORE
-        // the partitioned / shared-WAL / per-stream-log branches below, so every named storage mode
-        // stores the same resolved instant. Idempotent (a resolved `DUE1` passes through), and the
-        // no-request fast path is untouched (zero allocation).
+        // `DLY1` request or a raw wire `DUE1` (the #555 injection hardening — only the broker
+        // mints `DUE1`; internal already-minted records re-inject via verbatim `Log::append`
+        // copies below this seam), else rewrite the request in place to the broker-clock-anchored
+        // `DUE1` instant BEFORE the partitioned / shared-WAL / per-stream-log branches below, so
+        // every named storage mode stores the same resolved instant. The no-request fast path is
+        // untouched (zero allocation).
         let delayed_headers;
         let delayed;
         let message: &Append<'_> = match ironbus_core::delay::resolve_delay_headers(
@@ -6026,11 +6048,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 };
                 &delayed
             }
-            Err(e) => {
+            Err(ironbus_core::delay::DelayHeaderError::TooLong(e)) => {
                 return Err(EngineError::DelayTooLong {
                     requested_ms: e.requested_ms,
                     max_ms: e.max_ms,
                 })
+            }
+            // A raw wire `DUE1` (the broker-only stored form): the #555 injection reject — it
+            // would bypass both the max-delay bound and the broker-clock anchor.
+            Err(ironbus_core::delay::DelayHeaderError::DueInjected { due_unix_ms }) => {
+                return Err(EngineError::DueTimeInjected { due_unix_ms })
             }
         };
         let id = StreamId::named(stream)?;
@@ -9135,9 +9162,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // compression seam below, so the stored record (and the replicated frame) carries the
         // resolved instant. The producer's wall clock never anchors visibility: `now` comes from
         // the engine's wall seam, never from the producer-controlled `timestamp_ms`. A headers
-        // blob with no request is untouched (`Ok(None)`, the zero-allocation fast path), and a
-        // resolved `DUE1` (a txn redrive, a re-entrant call) passes through idempotently, so the
-        // due-instant can never be re-anchored. When the headers ARE rewritten, the off-actor
+        // blob with no request is untouched (`Ok(None)`, the zero-allocation fast path); a RAW
+        // `DUE1` block is REJECTED fail-closed (the #555 injection hardening: only the broker
+        // mints `DUE1` — internal already-minted records re-inject via verbatim `Log::append`
+        // copies below this seam, never through here). When the headers ARE rewritten, the off-actor
         // precomputed body checksum no longer describes the stored bytes, so it is DROPPED and the
         // codec recomputes — exactly the compression seam's discipline.
         let delayed_headers;
@@ -9159,11 +9187,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 };
                 (&delayed, None)
             }
-            Err(e) => {
+            Err(ironbus_core::delay::DelayHeaderError::TooLong(e)) => {
                 return Err(EngineError::DelayTooLong {
                     requested_ms: e.requested_ms,
                     max_ms: e.max_ms,
                 })
+            }
+            // A raw wire `DUE1` (the broker-only stored form): the #555 injection reject — it
+            // would bypass both the max-delay bound and the broker-clock anchor.
+            Err(ironbus_core::delay::DelayHeaderError::DueInjected { due_unix_ms }) => {
+                return Err(EngineError::DueTimeInjected { due_unix_ms })
             }
         };
         // The write-path compression seam (#430, ADR-0003). The pass-through guard on an ALREADY
@@ -19940,6 +19973,108 @@ mod tests {
         // ...so the matching record behind it delivers immediately.
         let d = message(e.poll_now_in("f").unwrap());
         assert_eq!(d.record.payload.as_ref(), b"wanted-now");
+    }
+
+    #[test]
+    fn a_wire_due1_injection_is_rejected_at_both_chokepoints() {
+        // The #555 injection hardening: `DUE1` is the BROKER-MINTED stored form — a producer that
+        // hand-rolls one into its wire headers is trying to self-schedule an absolute due-instant,
+        // bypassing BOTH the max-delay bound (it is not a `DLY1` request, so the bound is never
+        // consulted) and the broker-clock anchor. `due_unix_ms = u64::MAX` would head-of-line-stall
+        // every group on the stream forever and pin the retention floor unboundedly. Both produce
+        // chokepoints reject it fail-closed (nothing appended), on the DEFAULT stream and a NAMED
+        // stream, bare and hidden behind a canonical leading TTL block — and regardless of the
+        // max-delay setting (the anchor bypass is independent of the bound: max = 0 here).
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        let mut injected = Vec::new();
+        injected.extend_from_slice(&ironbus_core::delay::DUE_HEADER_MAGIC);
+        injected.extend_from_slice(&u64::MAX.to_le_bytes());
+        injected.extend_from_slice(b"orig");
+        let ttl_wrapped = encode_ttl_headers(Ttl::from_millis(9_000), &injected);
+        for headers in [&injected, &ttl_wrapped] {
+            // Chokepoint 1: the default stream.
+            match e
+                .produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers,
+                    payload: b"self-scheduled",
+                })
+                .unwrap_err()
+            {
+                EngineError::DueTimeInjected { due_unix_ms } => {
+                    assert_eq!(due_unix_ms, u64::MAX);
+                }
+                other => panic!("expected DueTimeInjected, got {other:?}"),
+            }
+            // Chokepoint 2: a named stream.
+            match e
+                .produce_in_stream(
+                    "jobs",
+                    &Append {
+                        timestamp_ms: 0,
+                        flags: RecordFlags::EMPTY,
+                        key: b"",
+                        headers,
+                        payload: b"self-scheduled",
+                    },
+                )
+                .unwrap_err()
+            {
+                EngineError::DueTimeInjected { due_unix_ms } => {
+                    assert_eq!(due_unix_ms, u64::MAX);
+                }
+                other => panic!("expected DueTimeInjected, got {other:?}"),
+            }
+        }
+        assert_eq!(e.counters().produced, 0, "nothing was appended");
+        // The Display steers the producer to the legitimate request form.
+        let msg = EngineError::DueTimeInjected { due_unix_ms: 7 }.to_string();
+        assert!(msg.contains("DUE1"), "{msg}");
+        assert!(msg.contains("DLY1"), "{msg}");
+        // A legitimate `DLY1` request on the same broker still resolves and delivers.
+        let off = produce_delayed(&mut e, 0, Delay::from_millis(100), b"legit");
+        clock.set_unix_millis(100);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off);
+    }
+
+    #[test]
+    fn a_broker_minted_due1_rides_internal_appends_verbatim_the_dlq_copy_keeps_it() {
+        // The injection reject binds ONLY the wire chokepoints: internal re-injection paths copy
+        // already-minted `DUE1` records verbatim BELOW the resolution seam. Pinned via the DLQ
+        // move (the same `Log::append`-level copy family as redrive/replication/mirror-apply): a
+        // delayed record that became due, delivered, and poisoned is dead-lettered WITH its
+        // broker-resolved `DUE1` block intact — the move neither re-resolves nor rejects it.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        // max_deliver = 1, so the second delivery attempt dead-letters.
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        let off = produce_delayed(&mut e, 0, Delay::from_millis(100), b"poison-later");
+        // Held while un-due; at the due instant it delivers (attempt 1).
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        clock.set_unix_millis(100);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.deliveries, 1);
+        // Expire the lease; the redelivery (attempt 2) exceeds max_deliver and dead-letters.
+        clock.advance_monotonic_nanos(40);
+        match e.poll_now().unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected the poison Parked to the DLQ, got {other:?}"),
+        }
+        drop(e);
+        // The DLQ copy carries the broker-minted DUE1 verbatim: the internal append passed it
+        // through unblocked (a re-entry into the resolution seam would have rejected it).
+        let entries = read_dlq_entries(&probe).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            ironbus_core::delay::decode_due_headers(&entries[0].headers),
+            Some(100),
+            "the dead-lettered copy keeps the resolved due-instant intact"
+        );
     }
 
     #[test]

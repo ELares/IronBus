@@ -31,10 +31,13 @@
 //! - [`DELAY_HEADER_MAGIC`] (`DLY1`): the WIRE REQUEST — `delay_ms`, a duration RELATIVE to the
 //!   broker's append instant. Producers attach this; it never reaches storage.
 //! - [`DUE_HEADER_MAGIC`] (`DUE1`): the STORED RESOLUTION — `due_unix_ms`, ABSOLUTE broker-wall
-//!   Unix milliseconds. The broker rewrites `DLY1 -> DUE1` in place (same length) at its produce
-//!   chokepoints; replication/mirror/DLQ paths copy stored frames verbatim, so every replica holds
-//!   the SAME resolved due-instant and re-resolution is impossible (resolution is idempotent: a
-//!   `DUE1` block passes through untouched).
+//!   Unix milliseconds. ONLY the broker mints `DUE1`: the produce chokepoints rewrite `DLY1 ->
+//!   DUE1` in place (same length), and a WIRE headers blob carrying a raw `DUE1` is REJECTED
+//!   fail-closed ([`DelayHeaderError::DueInjected`]) — accepting it would bypass both the
+//!   max-delay bound and the broker-clock anchor (a producer could self-schedule `u64::MAX`,
+//!   stalling every group on the stream forever). Replication/mirror/DLQ paths copy already-minted
+//!   stored frames verbatim BELOW the resolution seam, so every replica holds the SAME resolved
+//!   due-instant and re-resolution is impossible.
 //!
 //! Anchoring to the broker wall clock (not the runtime monotonic clock) is what makes the due-time
 //! DURABLE: a record due in an hour, produced before a reboot, is still due at the same wall instant
@@ -90,6 +93,29 @@ pub struct DelayTooLong {
     pub requested_ms: u64,
     /// The broker's configured maximum delay, in milliseconds.
     pub max_ms: u64,
+}
+
+/// A rejected delayed-delivery header at the produce boundary (#555): the two fail-closed refusals
+/// [`resolve_delay_headers`] can return. Both refuse the publish with nothing appended; neither is
+/// ever a silent clamp or a silent pass-through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelayHeaderError {
+    /// The `DLY1` request's delay exceeds the broker's configured maximum ([`DelayTooLong`]): an
+    /// unbounded schedule would pin retention arbitrarily far into the future.
+    TooLong(DelayTooLong),
+    /// The wire headers carried a raw `DUE1` block — a BROKER-MINTED stored form the wire must
+    /// never carry (#555 injection hardening). Only the broker's resolution seam mints `DUE1`; a
+    /// producer-supplied absolute due-instant would bypass BOTH the `max_delay_ms` bound (the block
+    /// is not a `DLY1` request, so the bound is never consulted — `due_unix_ms = u64::MAX` would
+    /// head-of-line-stall every group on the stream forever and pin retention unboundedly) AND the
+    /// broker-clock anchoring (the whole clock-skew-safety design). Rejected fail-closed: a wire
+    /// produce must carry a `DLY1` relative request, never a `DUE1`. Legitimate already-minted
+    /// `DUE1` records (DLQ moves/redrive, replication followers, geo mirror-apply) re-inject via
+    /// verbatim `Log::append`-level copies BELOW this seam and are untouched by this rejection.
+    DueInjected {
+        /// The absolute due-instant the wire tried to smuggle in, in Unix milliseconds.
+        due_unix_ms: u64,
+    },
 }
 
 /// The 4-byte magic that opens a WIRE-REQUEST delay prefix inside a publish's `headers` blob:
@@ -154,41 +180,56 @@ pub fn encode_delay_headers(delay: Delay, original_headers: &[u8]) -> Vec<u8> {
 }
 
 /// RESOLVES a wire-request delay in `headers` against the BROKER's wall clock at append time
-/// (#555): the clock-skew-safety chokepoint every broker produce path funnels through.
+/// (#555): the clock-skew-safety chokepoint every WIRE produce path funnels through. Its callers
+/// are exactly the two produce chokepoints (the engine's default-stream and named-stream seams);
+/// every legitimate already-resolved record (a DLQ move/redrive, a replication follower, a geo
+/// mirror-apply) re-injects via verbatim `Log::append`-level frame copies BELOW this seam and never
+/// reaches it — which is what makes the `DUE1` rejection below sound.
 ///
-/// - No `DLY1` block (directly or after a leading TTL block): returns `Ok(None)` — the untouched
-///   fast path, zero allocation; a `DUE1` block already resolved (a DLQ re-append, a replica, a
-///   double call) passes through here too, so resolution is IDEMPOTENT and can never re-anchor.
+/// - No `DLY1` and no `DUE1` block (directly or after a leading TTL block): returns `Ok(None)` —
+///   the untouched non-delayed fast path, zero allocation.
 /// - A `DLY1` block whose `delay_ms` exceeds `max_delay_ms` (when `max_delay_ms > 0`; `0` means
-///   unbounded): returns `Err(DelayTooLong)` — the fail-closed produce rejection, so an unbounded
-///   schedule can never pin retention. The bound is on the REQUESTED duration, so a skewed producer
-///   cannot dodge it.
-/// - Otherwise: returns `Ok(Some(patched))`, a copy of `headers` with the block rewritten IN PLACE
-///   (same length) to `[DUE1(4)][due_unix_ms(8)]`, where `due_unix_ms = now_unix_ms + delay_ms`
-///   (saturating, so a delay near the clock ceiling never wraps into the past). A `delay_ms` of `0`
-///   resolves to "due now" (immediately visible), preserving the request shape without a special
-///   case.
+///   unbounded): returns `Err(DelayHeaderError::TooLong)` — the fail-closed produce rejection, so
+///   an unbounded schedule can never pin retention. The bound is on the REQUESTED duration, so a
+///   skewed producer cannot dodge it.
+/// - A raw `DUE1` block: returns `Err(DelayHeaderError::DueInjected)` — fail-closed. `DUE1` is the
+///   BROKER-MINTED stored form; accepting it from the wire would bypass both the `max_delay_ms`
+///   bound and the broker-clock anchoring (a producer could self-schedule `due_unix_ms = u64::MAX`,
+///   head-of-line-stalling every group on the stream forever and pinning retention unboundedly).
+///   A wire produce must carry a `DLY1` relative request, never a `DUE1`.
+/// - An accepted `DLY1`: returns `Ok(Some(patched))`, a copy of `headers` with the block rewritten
+///   IN PLACE (same length) to `[DUE1(4)][due_unix_ms(8)]`, where `due_unix_ms = now_unix_ms +
+///   delay_ms` (saturating, so a delay near the clock ceiling never wraps into the past). A
+///   `delay_ms` of `0` resolves to "due now" (immediately visible), preserving the request shape
+///   without a special case.
 ///
 /// `now_unix_ms` MUST come from the broker's clock seam ([`crate::clock::Clock::now_unix_millis`]),
 /// never from any producer-supplied field: the record's `timestamp_ms` is producer-controlled on
 /// the wire, so anchoring to it would let a skewed producer shift its own visibility instant.
 ///
 /// # Errors
-/// [`DelayTooLong`] when the requested delay exceeds a non-zero `max_delay_ms`.
+/// [`DelayHeaderError::TooLong`] when the requested delay exceeds a non-zero `max_delay_ms`;
+/// [`DelayHeaderError::DueInjected`] when the wire headers carry a broker-only `DUE1` block.
 pub fn resolve_delay_headers(
     headers: &[u8],
     now_unix_ms: u64,
     max_delay_ms: u64,
-) -> Result<Option<Vec<u8>>, DelayTooLong> {
+) -> Result<Option<Vec<u8>>, DelayHeaderError> {
     let at = delay_block_offset(headers);
     let Some(delay_ms) = block_millis(headers, at, DELAY_HEADER_MAGIC) else {
+        // Not a delay REQUEST. A raw broker-only `DUE1` here is a wire INJECTION (the bypass of
+        // both the max-delay bound and the broker-clock anchor): reject fail-closed. Anything else
+        // is the untouched non-delayed fast path.
+        if let Some(due_unix_ms) = block_millis(headers, at, DUE_HEADER_MAGIC) {
+            return Err(DelayHeaderError::DueInjected { due_unix_ms });
+        }
         return Ok(None);
     };
     if max_delay_ms != 0 && delay_ms > max_delay_ms {
-        return Err(DelayTooLong {
+        return Err(DelayHeaderError::TooLong(DelayTooLong {
             requested_ms: delay_ms,
             max_ms: max_delay_ms,
-        });
+        }));
     }
     let due_unix_ms = now_unix_ms.saturating_add(delay_ms);
     let mut patched = headers.to_vec();
@@ -248,13 +289,49 @@ mod tests {
     }
 
     #[test]
-    fn resolve_is_idempotent_and_never_re_anchors() {
+    fn a_wire_due1_block_is_rejected_never_passed_through() {
+        // The #555 injection hardening: `DUE1` is BROKER-MINTED — a wire blob carrying one would
+        // bypass both the max-delay bound (it is not a `DLY1` request, so the bound is never
+        // consulted) and the broker-clock anchor. It is rejected fail-closed at ANY bound setting,
+        // including unbounded (`max = 0`): the anchor bypass is independent of the bound.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&DUE_HEADER_MAGIC);
+        blob.extend_from_slice(&u64::MAX.to_le_bytes());
+        blob.extend_from_slice(b"orig");
+        for max in [0u64, 500] {
+            assert_eq!(
+                resolve_delay_headers(&blob, 10_000, max),
+                Err(DelayHeaderError::DueInjected {
+                    due_unix_ms: u64::MAX
+                }),
+                "a raw wire DUE1 is rejected (max = {max})"
+            );
+        }
+        // The same injection hidden behind a canonical leading TTL block is also caught.
+        let ttl_wrapped = encode_ttl_headers(Ttl::from_millis(9_000), &blob);
+        assert_eq!(
+            resolve_delay_headers(&ttl_wrapped, 10_000, 0),
+            Err(DelayHeaderError::DueInjected {
+                due_unix_ms: u64::MAX
+            })
+        );
+        // A block too short to be a full DUE1 is NOT an injection (opaque user bytes, the same
+        // tolerance the TTL decode has): passed through untouched.
+        assert_eq!(resolve_delay_headers(b"DUE1", 10_000, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_broker_minted_due1_is_honored_by_the_read_path() {
+        // The read seam is unchanged by the injection rejection: a broker-RESOLVED blob (minted by
+        // this module's own rewrite — the only legitimate source) still decodes and gates
+        // visibility. Internal re-injection paths (DLQ moves/redrive, replication, mirror-apply)
+        // copy such frames verbatim below the resolution seam, so they never re-enter
+        // `resolve_delay_headers` — pinned at the engine level by the DLQ-copy test.
         let blob = encode_delay_headers(Delay::from_millis(500), b"h");
         let patched = resolve_delay_headers(&blob, 10_000, 0).unwrap().unwrap();
-        // A second resolution (a DLQ re-append, a replica replay) sees DUE1, not DLY1: untouched,
-        // so the due-instant can never be pushed later by re-processing.
-        assert_eq!(resolve_delay_headers(&patched, 99_999, 0).unwrap(), None);
         assert_eq!(decode_due_headers(&patched), Some(10_500));
+        assert!(is_undue(&patched, 10_499));
+        assert!(!is_undue(&patched, 10_500));
     }
 
     #[test]
@@ -275,10 +352,10 @@ mod tests {
         let blob = encode_delay_headers(Delay::from_millis(501), b"");
         assert_eq!(
             resolve_delay_headers(&blob, 0, 500),
-            Err(DelayTooLong {
+            Err(DelayHeaderError::TooLong(DelayTooLong {
                 requested_ms: 501,
                 max_ms: 500,
-            })
+            }))
         );
         // Exactly at the max is accepted (the bound is inclusive).
         let at_max = encode_delay_headers(Delay::from_millis(500), b"");
