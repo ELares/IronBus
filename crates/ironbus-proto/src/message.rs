@@ -3225,6 +3225,92 @@ pub fn decode_sub_subject(body: &[u8]) -> Result<SubSubjectBody<'_>, BodyError> 
     })
 }
 
+// ===================================================================================
+// CONSUMER PAUSE/RESUME WIRE BODY (#771, V2-M1): the `PauseGroup` verb (tag 52). Rides the SAME
+// `body_version: u8` + `field_len: u16` frame as the explicit-stream-id verbs (#588), so a future
+// version appends fields without a wire break. The stream id is capped at [`MAX_STREAM_ID_LEN`]
+// BEFORE any read (fail-closed, the `read_stream_id` cap); the group's SHAPE is validated
+// server-side, as for a plain `Sub`. `pause_ms` is a REQUIRED `u64 LE` in the v1 block (`0` =
+// resume), so there is no optional-tail ambiguity: a future field appends AFTER it. An ADDITIVE
+// tag an old client never sends; every existing wire is unchanged.
+// ===================================================================================
+
+/// An operator's PAUSE (or RESUME) of a work-group's delivery (the `PauseGroup` frame body, tag 52,
+/// #771): the addressed `stream_id` (empty = the default stream), the work-group `group`, and the
+/// pause window `pause_ms` in milliseconds — `0` RESUMES a paused group immediately. The broker
+/// suspends the group's delivery (the Tier-W poll and the Tier-S fetch) until the window elapses
+/// (auto-resume) or a `pause_ms = 0` re-issue, with the group's leases, cursor, and subscriptions
+/// intact and the in-flight lease clock STOPPED for the paused span; it replies a body-less `Ok`,
+/// or a typed `Err` on a malformed name / unknown stream. Distinct from `Flow` credit (#292):
+/// credit is per-connection flow control that never outlives the connection, while a pause is
+/// GROUP state that survives reconnects (though not a broker restart, like the other in-memory
+/// group modes).
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
+/// `stream_id: u16-len + bytes`, `group: u16-len + bytes`, `pause_ms: u64 LE`. Trailing block
+/// bytes are tolerated (a future field appends after `pause_ms`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PauseGroupBody<'a> {
+    /// The addressed stream (empty = the default stream), validated server-side.
+    pub stream_id: &'a [u8],
+    /// The work-group to pause/resume. The default/empty group is refused server-side (a pause is
+    /// a per-NAMED-group control, mirroring the broadcast/key-shared mode setters).
+    pub group: &'a [u8],
+    /// The pause window in milliseconds; `0` resumes a paused group immediately.
+    pub pause_ms: u64,
+}
+
+/// Encodes a `PauseGroup` body onto the end of `out` (#771): the version byte, the field-block
+/// length, the stream id and group (each `u16`-length-prefixed), then the REQUIRED `pause_ms` as a
+/// `u64 LE`. `pause_ms` must remain the LAST v1 field of the block (a future field appends after
+/// it).
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the stream id or group exceeds the `u16` wire limit.
+pub fn encode_pause_group(req: &PauseGroupBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.stream_id.len() + 2 + req.group.len() + 8)
+        .map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.stream_id);
+    out.extend_from_slice(&group_len.to_le_bytes());
+    out.extend_from_slice(req.group);
+    out.extend_from_slice(&req.pause_ms.to_le_bytes());
+    Ok(())
+}
+
+/// Decodes a `PauseGroup` body (#771), cap-before-alloc and panic-free. The stream id is capped at
+/// [`MAX_STREAM_ID_LEN`] BEFORE the bytes are taken; `pause_ms` is REQUIRED (a v1 block that stops
+/// after `group` is [`BodyError::Truncated`], fail-closed — there is no meaningful default for a
+/// pause window, and requiring it keeps the block free of optional-tail ambiguity). Trailing block
+/// bytes after `pause_ms` are tolerated (forward-compatible). An EMPTY body is NOT valid, so it is
+/// [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap stream id,
+/// or [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_pause_group(body: &[u8]) -> Result<PauseGroupBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let stream_id = read_stream_id(&mut fr)?;
+    let group = fr.var()?;
+    let pause_ms = fr.u64()?;
+    Ok(PauseGroupBody {
+        stream_id,
+        group,
+        pause_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6545,6 +6631,101 @@ mod tests {
         let d = decode_sub_subject(&filtered).unwrap();
         assert_eq!(d.subject, b"orders.*");
         assert_eq!(d.group, b"w");
+    }
+
+    #[test]
+    fn pause_group_round_trips_named_default_and_resume() {
+        // #771: a named-stream pause, a default-stream pause, and the RESUME window (0) all
+        // round-trip through the version+length framed body.
+        let mut named = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"orders",
+                group: b"g1",
+                pause_ms: 30_000,
+            },
+            &mut named,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_pause_group(&named).unwrap(),
+            PauseGroupBody {
+                stream_id: b"orders",
+                group: b"g1",
+                pause_ms: 30_000,
+            }
+        );
+        let mut resume = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"",
+                group: b"g1",
+                pause_ms: 0,
+            },
+            &mut resume,
+        )
+        .unwrap();
+        let d = decode_pause_group(&resume).unwrap();
+        assert_eq!(d.stream_id, b"");
+        assert_eq!(d.group, b"g1");
+        assert_eq!(d.pause_ms, 0, "pause_ms 0 is the resume");
+    }
+
+    #[test]
+    fn pause_group_requires_the_window_and_tolerates_trailing_block_bytes() {
+        let mut buf = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"s",
+                group: b"g",
+                pause_ms: 7,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        // A v1 block that stops after `group` (no pause_ms) is fail-closed Truncated: there is no
+        // meaningful default for a pause window (unlike SubSubject's optional filter byte).
+        let mut short = buf.clone();
+        short.truncate(short.len() - 8);
+        let field_len = u16::from_le_bytes([short[1], short[2]]) - 8;
+        short[1..3].copy_from_slice(&field_len.to_le_bytes());
+        assert!(matches!(
+            decode_pause_group(&short),
+            Err(BodyError::Truncated)
+        ));
+        // Trailing block bytes AFTER pause_ms are tolerated (a future field appends there), so a
+        // NEWER encoder's body still decodes on this reader.
+        let mut extended = buf.clone();
+        extended.push(0xEE);
+        let field_len = u16::from_le_bytes([extended[1], extended[2]]) + 1;
+        extended[1..3].copy_from_slice(&field_len.to_le_bytes());
+        assert_eq!(decode_pause_group(&extended).unwrap().pause_ms, 7);
+    }
+
+    #[test]
+    fn pause_group_fails_closed_on_hostile_lengths_and_versions() {
+        // An empty body is Truncated, never a panic.
+        assert!(matches!(decode_pause_group(&[]), Err(BodyError::Truncated)));
+        // An unknown body version is a typed reject.
+        assert!(matches!(
+            decode_pause_group(&[9, 0, 0]),
+            Err(BodyError::BadHandshakeVersion { version: 9 })
+        ));
+        // A declared block longer than the body: cap-before-alloc Truncated.
+        assert!(matches!(
+            decode_pause_group(&[STREAM_WIRE_BODY_VERSION, 0xff, 0xff]),
+            Err(BodyError::Truncated)
+        ));
+        // A hostile over-cap stream-id length inside the block: BadLength BEFORE any read.
+        let mut hostile = Vec::new();
+        hostile.push(STREAM_WIRE_BODY_VERSION);
+        hostile.extend_from_slice(&4u16.to_le_bytes());
+        hostile.extend_from_slice(&0xffff_u16.to_le_bytes());
+        hostile.extend_from_slice(&[0, 0]);
+        assert!(matches!(
+            decode_pause_group(&hostile),
+            Err(BodyError::BadLength)
+        ));
     }
 
     #[test]

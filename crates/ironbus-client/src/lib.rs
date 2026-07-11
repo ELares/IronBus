@@ -64,15 +64,15 @@ use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
     decode_not_leader, decode_produce_confirm, decode_pub_ack, decode_stream_info_response,
     decode_truncated, decode_txn_resolve, encode_ack, encode_bind_subject, encode_connect,
-    encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_subject, encode_pub_to,
-    encode_stream_commit, encode_stream_declare, encode_stream_fetch, encode_stream_info,
-    encode_sub, encode_sub_subject, encode_sub_to, encode_txn_check_result, encode_txn_listen,
-    encode_txn_prepare, encode_txn_resolve, produce_confirm_status, AckBody, AckLevel, AckOp,
-    BindSubjectBody, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody,
-    FetchBody, PubBody, PubSubjectBody, PubToBody, StreamCommitBody, StreamDeclareBody,
-    StreamFetchBody, StreamInfoBody, SubBody, SubSubjectBody, SubToBody, TxnCheckDecision,
-    TxnCheckResultBody, TxnListenBody, TxnPrepareBody, TxnResolveBody, PUB_FLAG_ACK_LEVEL_MASK,
-    PUB_FLAG_ACK_LEVEL_SHIFT,
+    encode_cumulative_ack, encode_fetch, encode_pause_group, encode_pub, encode_pub_subject,
+    encode_pub_to, encode_stream_commit, encode_stream_declare, encode_stream_fetch,
+    encode_stream_info, encode_sub, encode_sub_subject, encode_sub_to, encode_txn_check_result,
+    encode_txn_listen, encode_txn_prepare, encode_txn_resolve, produce_confirm_status, AckBody,
+    AckLevel, AckOp, BindSubjectBody, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody,
+    DeliverBody, FetchBody, PauseGroupBody, PubBody, PubSubjectBody, PubToBody, StreamCommitBody,
+    StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubSubjectBody, SubToBody,
+    TxnCheckDecision, TxnCheckResultBody, TxnListenBody, TxnPrepareBody, TxnResolveBody,
+    PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 // The connection-scoped auth wire surface (#631, #884): the credential type and the encoder that
 // appends the auth section to an already-encoded `Connect` body. Re-exported below so a caller can
@@ -2962,6 +2962,55 @@ impl Client {
             (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
+    }
+
+    /// PAUSES delivery for the named work-group `group` of `stream` (the empty name addresses the
+    /// default stream) for `pause_ms` milliseconds (#771, the `PauseGroup` verb): the broker stops
+    /// delivering to the group (Tier-W poll and Tier-S fetch alike) until the window elapses
+    /// (AUTO-RESUME) or an explicit [`Client::resume_group`], while the group's committed cursor,
+    /// in-flight leases (their visibility clock STOPPED for the paused span), and subscriptions
+    /// all stay intact — messages already delivered may still be acked/nacked/extended. The pause
+    /// is broker-side GROUP state: it survives consumer reconnects (unlike `Flow` credit) but not
+    /// a broker restart (like the other group modes). `pause_ms = 0` is exactly
+    /// [`Client::resume_group`]. Requires the `admin` scope on an auth-enabled broker; addressing
+    /// a NAMED stream additionally requires the negotiated streams capability
+    /// ([`ClientConfig::understands_streams`]). The default/empty group is refused by the broker.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the broker rejects the pause (a malformed/default group
+    /// name, an unknown stream, the group cap, or a missing scope/capability),
+    /// [`ClientError::Body`] on an over-large field, or a frame/connection error.
+    pub fn pause_group(
+        &mut self,
+        stream: &str,
+        group: &str,
+        pause_ms: u64,
+    ) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+                pause_ms,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::PauseGroup, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// RESUMES delivery for a paused work-group immediately (#771): sugar for
+    /// [`Client::pause_group`] with `pause_ms = 0`. A no-op success on a group that is not paused.
+    ///
+    /// # Errors
+    /// As [`Client::pause_group`].
+    pub fn resume_group(&mut self, stream: &str, group: &str) -> Result<(), ClientError> {
+        self.pause_group(stream, group, 0)
     }
 
     /// Queries a NAMED stream's existence and durable head (#588, M2-I10): the `StreamInfo` verb.

@@ -41,16 +41,16 @@ use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_ack, decode_bind_subject, decode_connect, decode_cumulative_ack, decode_fetch,
-    decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit, decode_stream_declare,
-    decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
-    decode_txn_check_result, decode_txn_listen, decode_txn_prepare, decode_txn_resolve,
-    encode_dead_letter, encode_deliver, encode_deliver_batch_frame, encode_deliver_frame,
-    encode_gap_marker, encode_info, encode_not_leader, encode_produce_confirm, encode_pub_ack,
-    encode_stream_info_response, encode_truncated, encode_txn_resolve, gap_reason,
-    parse_connect_auth, produce_confirm_status, pub_ack_level, AckLevel, AckOp, ConsumeTier,
-    CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody, InfoBody,
-    NotLeaderBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody, TruncatedBody,
-    TxnResolveBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    decode_pause_group, decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit,
+    decode_stream_declare, decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject,
+    decode_sub_to, decode_txn_check_result, decode_txn_listen, decode_txn_prepare,
+    decode_txn_resolve, encode_dead_letter, encode_deliver, encode_deliver_batch_frame,
+    encode_deliver_frame, encode_gap_marker, encode_info, encode_not_leader,
+    encode_produce_confirm, encode_pub_ack, encode_stream_info_response, encode_truncated,
+    encode_txn_resolve, gap_reason, parse_connect_auth, produce_confirm_status, pub_ack_level,
+    AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody,
+    GapMarkerBody, InfoBody, NotLeaderBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody,
+    TruncatedBody, TxnResolveBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -1066,6 +1066,15 @@ impl Session {
             Some(FrameType::SubSubject) => {
                 self.require_scope(crate::auth::Scope::Subscribe, "SubSubject", out)?;
                 self.handle_sub_subject(engine, body, out).map(|()| false)
+            }
+            // Consumer PAUSE/RESUME (#771, V2-M1): PauseGroup mutates a work-group's delivery
+            // gate — consumer state — so like the other consumer-state mutators it requires the
+            // `admin` scope (#631: "anything that mutates retention, identities, or consumer
+            // state"). It changes no committed cursor, so it returns `false` (no interval
+            // checkpoint).
+            Some(FrameType::PauseGroup) => {
+                self.require_scope(crate::auth::Scope::Admin, "PauseGroup", out)?;
+                self.handle_pause_group(engine, body, out).map(|()| false)
             }
             // The TRANSACTIONAL half-message verbs (#640, V2-M8): a producer-side 2PC. Prepare/commit/
             // rollback all PRODUCE (or resolve a produce), so they require the `publish` scope, exactly
@@ -4236,6 +4245,57 @@ impl Session {
         Ok(())
     }
 
+    /// Handles a `PauseGroup` (#771, V2-M1): PAUSE (or, with `pause_ms = 0`, RESUME) a work-group's
+    /// delivery via [`Engine::pause_group_in_stream`] (the default stream when `stream_id` is
+    /// empty), replying a body-less `Ok` on success or the engine's typed `Err` (stable code) on a
+    /// malformed/default group name, an unknown stream, or the group cap. Addressing a NAMED stream
+    /// is gated on the negotiated streams capability exactly like the other stream-addressed verbs
+    /// (#588) — but a DEFAULT-stream pause is NOT gated, so a streams-oblivious admin client can
+    /// still pause a default-stream group (the verb itself is a new tag an old client never sends).
+    /// Fail-closed on a malformed body; never panics.
+    fn handle_pause_group<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(decoded) = decode_pause_group(body) else {
+            reply_err(out, "malformed pause-group body");
+            return Ok(());
+        };
+        let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
+            reply_err(out, "stream id must be valid UTF-8");
+            return Ok(());
+        };
+        let Ok(group) = core::str::from_utf8(decoded.group) else {
+            reply_err(out, "group must be valid UTF-8");
+            return Ok(());
+        };
+        if !stream.is_empty() && !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let stream = stream.to_string();
+        let group = group.to_string();
+        let pause_ms = decoded.pause_ms;
+        match engine.with(move |e| e.pause_group_in_stream(&stream, &group, pause_ms))? {
+            Ok(_resumes_at) => reply(out, FrameType::Ok, &[]),
+            Err(e) => reply_err_coded(out, e.code().as_str(), &e.to_string()),
+        }
+        Ok(())
+    }
+
     /// Handles a `PubSubject` (#585, M2-I9): publish BY SUBJECT. Resolves the literal subject through
     /// THIS connection's generation-guarded resolve cache (an O(1) hash lookup on a hot subject, a single
     /// wait-free trie walk on a miss) under the FAIL-CLOSED single-home default — exactly ONE bound
@@ -6947,6 +7007,148 @@ mod tests {
             delivered_payloads(&out),
             vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
             "the freed group still delivers every record to its new lone consumer"
+        );
+    }
+
+    #[test]
+    fn a_pause_group_frame_gates_flow_delivery_and_a_resume_frame_restores_it() {
+        // The #771 wire path end-to-end: PauseGroup (tag 52) answers a body-less Ok and gates the
+        // group's delivery so a Flow drains NOTHING; a `pause_ms = 0` re-issue answers Ok and the
+        // same Flow then drains everything in order — nothing lost, nothing skipped. (The
+        // lease-clock stop and eviction interplay are pinned by the engine-level #771 tests; this
+        // pins the frame decode -> scope -> engine routing -> reply path.)
+        use ironbus_proto::message::{encode_pause_group, PauseGroupBody};
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b"] {
+            produce(&e, p);
+        }
+        let mut s = connect_and_sub(&e, MemberId::new(1), b"g");
+        let mut body = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"",
+                group: b"g",
+                pause_ms: 60_000,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::PauseGroup, &body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "the pause is accepted");
+        // A Flow now delivers NOTHING: the GROUP is gated (this is not connection flow control).
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            Vec::<Vec<u8>>::new(),
+            "paused: the Flow drains nothing"
+        );
+        // RESUME over the same verb (`pause_ms = 0`).
+        let mut body = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"",
+                group: b"g",
+                pause_ms: 0,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::PauseGroup, &body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "the resume is accepted"
+        );
+        // The same Flow now drains both records in order.
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "resume continues exactly where the cursor left off"
+        );
+    }
+
+    #[test]
+    fn a_pause_group_frame_fails_closed_on_malformed_default_and_ungated_stream_bodies() {
+        // Fail-closed wire hygiene for the new verb (#771): a malformed body, the default/empty
+        // group, and a NAMED-stream address without the negotiated streams capability are each a
+        // typed Err — and the connection stays usable throughout.
+        use ironbus_proto::message::{encode_pause_group, PauseGroupBody};
+        let e = DirectEngine::new(engine());
+        let mut s = Session::with_member_id(MemberId::new(1));
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        // Malformed body.
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::PauseGroup, b"\xff"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Err, "malformed body");
+        // The default/empty group is refused with the engine's typed reason.
+        let mut body = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"",
+                group: b"",
+                pause_ms: 5,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::PauseGroup, &body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "default group refused"
+        );
+        // A NAMED stream address without `understands_streams` is fail-closed, exactly like the
+        // other stream-addressed verbs (#588).
+        let mut body = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"orders",
+                group: b"g",
+                pause_ms: 5,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::PauseGroup, &body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "streams not negotiated"
+        );
+        // The connection is still healthy: a default-stream pause of a NAMED group succeeds.
+        let mut body = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: b"",
+                group: b"g",
+                pause_ms: 5,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::PauseGroup, &body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "the connection survived"
         );
     }
 

@@ -604,8 +604,9 @@ numbers, planes, and purposes:
 | 49  | `TxnListen` | client to server | bind a transaction-state listener group to this connection (#640) |
 | 50  | `RaftAuth` | peer only | HMAC-authenticated raft peer frame: the interim shared-secret integrity + origin-auth envelope `[ver:1][mac:32][raft_pb]` around a `Raft` (27) body; a client never sends or receives it (#1067 Inc 2) |
 | 51  | `DataPlaneAuth` | peer only | HMAC-authenticated cluster DATA-plane peer frame: the interim shared-secret integrity + origin-auth envelope `[ver:1][mac:32][verb-tag:1][partition:u64-le][layer body]` wrapping ANY data-plane verb (`FetchRecords` 32 / `FetchResponse` 33 / `AckReplicated` 37 / `OffsetForLeaderEpoch` 38 / `CommittedHwQuery` 43), over a domain label distinct from `RaftAuth`; the real verb tag is re-embedded inside the authenticated content, and the MAC is streamed over the (up to 8 MiB) zero-copy `FetchResponse` run without copying it. A client never sends or receives it (#1067 Inc 3) |
+| 52  | `PauseGroup` | client to server | consumer PAUSE/RESUME of a work-group's delivery (#771): suspends the group's Tier-W poll and Tier-S fetch for `pause_ms` ms (auto-resume at the deadline; `pause_ms = 0` resumes immediately) with the cursor, subscriptions, and in-flight leases intact and the lease clock STOPPED for the paused span; `admin`-scoped under auth; the explicit typed control the dropped draft `Flow.pause` field gestured at (#292) |
 
-`from_u8` returns `None` for tag 0 and for tags 52 and above (unknown, still framed by the
+`from_u8` returns `None` for tag 0 and for tags 53 and above (unknown, still framed by the
 envelope). The tag map is HASH-PINNED by the registry gate (the `frame-tags-sha256` sentinel
 in [compat/versions.md](compat/versions.md)): a tag addition cannot land without re-pinning
 the registry and updating this table in the same commit. (This paragraph previously froze the
@@ -865,6 +866,45 @@ default group's consumers reach it on the implicit default subscription and neve
 so the cap could never bind them; an uncapped broadcast default group would let two pollers
 hold competing in-flight leases that a cumulative ack (with an empty group name) commits past,
 the same silent drop. So `--broadcast-group` marks a named group only.
+
+### PauseGroupBody (wire body of `PauseGroup`, tag 52, #771)
+
+The consumer PAUSE/RESUME control (V2-M1, the NATS-2.11 `PauseUntil` counterpart): an operator
+suspends a work-group's delivery for a window, or resumes it early, as an EXPLICIT typed verb.
+This is the capability the draft `Flow` `pause` field gestured at and #292 deliberately
+dropped; the real `Flow` (tag 10) stays a bare u32 credit, and pause is GROUP state, not
+connection flow control — it survives consumer reconnects (but, like the other in-memory group
+modes `broadcast`/`key_shared`/`streaming`/`filter`, not a broker restart; re-apply after one).
+Rides the same `body_version: u8` + `field_len: u16` outer framing as the explicit-stream-id
+verbs (#588); trailing block bytes after `pause_ms` are tolerated (a future field appends
+there).
+
+| field       | type  | width | notes |
+|-------------|-------|-------|-------|
+| `body_version` | u8 | 1     | `1`; an unknown version is rejected (`BadHandshakeVersion`) |
+| `field_len` | u16   | 2     | length of the v1 block below, little-endian |
+| `stream_id` | bytes | u16-len + n | the addressed stream (empty = the default stream); capped at the stream-id wire limit BEFORE any read |
+| `group`     | bytes | u16-len + n | the work-group to pause/resume; the default/empty group is REFUSED server-side (`ERR_INVALID_GROUP_NAME`) — pause is a per-NAMED-group control |
+| `pause_ms`  | u64   | 8     | the pause window in milliseconds, little-endian; REQUIRED (a block that stops after `group` is `Truncated`, fail-closed); `0` = RESUME immediately |
+
+Semantics: while paused, the group's Tier-W poll (`Flow`/`Fetch`) and Tier-S fetch
+(`StreamFetch`, per-record or raw `DeliverBatch`) deliver NOTHING — the committed cursor, the
+acked-ahead set, the subscriptions, and every in-flight lease are untouched, and acks / nacks /
+`progress` on already-delivered messages still apply. The in-flight LEASE CLOCK IS STOPPED for
+the paused span: no lease can be observed to expire mid-pause, and on resume every lease's
+deadline (and its per-attempt hard-cap budget) shifts by exactly the paused span, so a message
+with 10 s of visibility left before the pause has 10 s left after it (no pause-manufactured
+redelivery, no pause-extended loss of the redelivery contract). The window AUTO-RESUMES at its
+deadline with no further frame; a `pause_ms = 0` re-issue resumes early; a re-issue mid-pause
+re-arms the deadline without restarting the stop-the-clock accounting. A paused group is never
+idle-evicted (#277) mid-pause; once the window elapses the ordinary idle policy applies again.
+Replies: a body-less `Ok`, or a typed `Err` — `ERR_INVALID_GROUP_NAME` for the default/empty or
+a malformed group, `ERR_UNKNOWN_STREAM` for a never-declared stream, `ERR_TOO_MANY_GROUPS` at
+the group cap (the verb CREATES an absent group, so a pause may precede the group's first
+consumer). Under auth the verb is `admin`-scoped (#631: it mutates consumer state); addressing
+a NAMED stream additionally requires the negotiated streams capability (#588), while a
+default-stream pause is not capability-gated (the tag itself is new; an old client never sends
+it).
 
 ---
 
