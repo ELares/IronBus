@@ -2471,15 +2471,28 @@ pub struct StreamDeclareBody<'a> {
     /// It is an ADDITIVE wire field emitted ONLY when `> 1`, so an old client (or any single-partition
     /// declare) is byte-for-byte the historical `StreamDeclare` body and a partitioned stream is opt-in.
     pub partition_count: u32,
+    /// Whether the `partition_count` sub-logs are PRIORITY LANES rather than key-hash partitions
+    /// (M4-I3, #553): `false` (the DEFAULT) is a key-partitioned stream (or, with `partition_count <= 1`,
+    /// a plain single-log stream); `true` opts the stream into PRIORITY MODE, where the `P = partition_count`
+    /// sub-logs are priority levels `0..P` — a produce routes to the lane of its priority and delivery
+    /// drains the highest-priority non-empty lane first. It is an ADDITIVE wire field (a single `u8`
+    /// appended AFTER `partition_count`) emitted ONLY when `true`; a non-priority declare omits it and is
+    /// byte-for-byte the historical `StreamDeclare` body. Priority mode requires `partition_count >= 2`
+    /// (a single lane has no priorities to order) and is MUTUALLY EXCLUSIVE with key-partitioning — the
+    /// broker rejects `priority = true` with `partition_count <= 1` and never treats one stream as both.
+    pub priority: bool,
 }
 
 /// Encodes a `StreamDeclare` body onto the end of `out` (#588, #693).
 ///
 /// The `partition_count` is appended INSIDE the field-length block AFTER the stream id, and ONLY when
 /// it exceeds `1` (the default single partition), so a single-partition declare is byte-for-byte the
-/// pre-#693 body. It must remain the LAST additive field of the v1 block: a future field appends after
-/// it and, when set alongside a single-partition declare, must still emit `partition_count = 1` to keep
-/// the positional order the decoder reads.
+/// pre-#693 body. The `priority` flag (#553) is a single `u8` (`1`) appended AFTER `partition_count`,
+/// and ONLY when `true`; since priority mode requires `partition_count >= 2`, the count is always
+/// present when the flag is, so the decoder's positional read (count, then flag) is unambiguous. A
+/// non-priority declare omits the flag and is byte-for-byte the pre-#553 body. These two remain the
+/// LAST additive fields of the v1 block, in this order (count, then priority): a future field appends
+/// after them.
 ///
 /// # Errors
 /// Returns [`BodyError::FieldTooLarge`] if the stream id (or the framed block) exceeds the `u16` wire
@@ -2489,7 +2502,7 @@ pub fn encode_stream_declare(
     out: &mut Vec<u8>,
 ) -> Result<(), BodyError> {
     let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
-    let extra = usize::from(req.partition_count > 1) * 4;
+    let extra = usize::from(req.partition_count > 1) * 4 + usize::from(req.priority);
     let field_len =
         u16::try_from(2 + req.stream_id.len() + extra).map_err(|_| BodyError::FieldTooLarge)?;
     out.push(STREAM_WIRE_BODY_VERSION);
@@ -2498,6 +2511,12 @@ pub fn encode_stream_declare(
     out.extend_from_slice(req.stream_id);
     if req.partition_count > 1 {
         out.extend_from_slice(&req.partition_count.to_le_bytes());
+    }
+    // The priority-mode flag (#553) is the LAST additive field, a single `1` byte emitted only when
+    // set. It rides after `partition_count` (always present in priority mode, which requires P >= 2),
+    // so a non-priority declare is byte-for-byte the pre-#553 body.
+    if req.priority {
+        out.push(1);
     }
     Ok(())
 }
@@ -2528,9 +2547,16 @@ pub fn decode_stream_declare(body: &[u8]) -> Result<StreamDeclareBody<'_>, BodyE
     // folds to the default `1`. A missing/short remainder, or an out-of-range `0`, folds to `1` (never
     // an error), so the field stays forward-compatible and a partitioned stream is strictly opt-in.
     let partition_count = fr.u32().ok().filter(|&p| p >= 1).unwrap_or(1);
+    // The priority-mode flag (#553) is an ADDITIVE `u8` after the partition count: a priority-aware
+    // client emits `1`, while an old client (or any non-priority declare) omits it and it folds to
+    // `false`. A missing/short remainder folds to `false` (never an error), so the field stays
+    // forward-compatible and priority mode is strictly opt-in. Server-side validation rejects the
+    // meaningless `priority = true` with `partition_count <= 1`.
+    let priority = fr.u8().is_ok_and(|b| b != 0);
     Ok(StreamDeclareBody {
         stream_id,
         partition_count,
+        priority,
     })
 }
 
@@ -2642,32 +2668,52 @@ pub fn decode_stream_info_response(body: &[u8]) -> Result<StreamInfoResponseBody
 pub struct PubToBody<'a> {
     /// The target stream name (empty routes to the default stream, byte-for-byte a plain `Pub`).
     pub stream_id: &'a [u8],
+    /// The message PRIORITY (M4-I3, #553): the priority level for a produce to a PRIORITY-MODE stream,
+    /// where the broker routes the record to the lane of this priority and delivers higher priorities
+    /// first. `0` (the DEFAULT) is the lowest priority AND the byte-for-byte historical `PubTo` body (no
+    /// priority byte is emitted). It rides INSIDE the field-length block after the stream id, so the
+    /// `pub_body` tail is unchanged. Ignored (not stored) for a non-priority stream; a priority above
+    /// the stream's top level `P-1` saturates to the top lane, so a producer need not know `P`. The
+    /// record's priority is FIXED at produce (it is which lane the record lands in), never re-ordered.
+    pub priority: u8,
     /// The verbatim [`PubBody`] bytes, decoded by the caller with [`decode_pub`] (so the publish body
     /// codec is shared UNCHANGED with the default-stream `Pub`).
     pub pub_body: &'a [u8],
 }
 
-/// Encodes a `PubTo` body onto the end of `out` (#588): the version byte, the field-block length over
-/// the stream id, the stream id, then the verbatim `pub_body` bytes. The caller produces `pub_body`
-/// with [`encode_pub`].
+/// Encodes a `PubTo` body onto the end of `out` (#588, #553): the version byte, the field-block length
+/// over the stream id (plus the priority byte when non-zero), the stream id, the optional `priority`
+/// byte, then the verbatim `pub_body` bytes. The caller produces `pub_body` with [`encode_pub`].
+///
+/// The `priority` byte (#553) rides INSIDE the block after the stream id and ONLY when non-zero, so a
+/// default (priority-0) publish is byte-for-byte the pre-#553 body; the `pub_body` tail is unchanged
+/// either way (it is everything after the block).
 ///
 /// # Errors
-/// Returns [`BodyError::FieldTooLarge`] if the stream id exceeds the `u16` wire limit.
+/// Returns [`BodyError::FieldTooLarge`] if the stream id (or the framed block) exceeds the `u16` wire
+/// limit.
 pub fn encode_pub_to(req: &PubToBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
     let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
-    let field_len = u16::try_from(2 + req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let extra = usize::from(req.priority != 0);
+    let field_len =
+        u16::try_from(2 + req.stream_id.len() + extra).map_err(|_| BodyError::FieldTooLarge)?;
     out.push(STREAM_WIRE_BODY_VERSION);
     out.extend_from_slice(&field_len.to_le_bytes());
     out.extend_from_slice(&id_len.to_le_bytes());
     out.extend_from_slice(req.stream_id);
+    // The priority byte (#553) is the LAST field of the block, emitted only when non-zero so a
+    // default-priority publish is byte-for-byte the pre-#553 body.
+    if req.priority != 0 {
+        out.push(req.priority);
+    }
     out.extend_from_slice(req.pub_body);
     Ok(())
 }
 
-/// Decodes a `PubTo` body (#588) into its `stream_id` and the verbatim `pub_body` tail, cap-before-alloc
-/// and panic-free. The caller decodes `pub_body` with [`decode_pub`]. A body too short for its declared
-/// block, or a stream id over [`MAX_STREAM_ID_LEN`], is a typed [`BodyError`] (fail-closed). An EMPTY
-/// body is NOT valid, so it is [`BodyError::Truncated`].
+/// Decodes a `PubTo` body (#588, #553) into its `stream_id`, optional `priority`, and the verbatim
+/// `pub_body` tail, cap-before-alloc and panic-free. The caller decodes `pub_body` with [`decode_pub`].
+/// A body too short for its declared block, or a stream id over [`MAX_STREAM_ID_LEN`], is a typed
+/// [`BodyError`] (fail-closed). An EMPTY body is NOT valid, so it is [`BodyError::Truncated`].
 ///
 /// # Errors
 /// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id, or
@@ -2685,8 +2731,13 @@ pub fn decode_pub_to(body: &[u8]) -> Result<PubToBody<'_>, BodyError> {
     let pub_body = r.rest();
     let mut fr = Reader::new(block);
     let stream_id = read_stream_id(&mut fr)?;
+    // The priority byte (#553) is an ADDITIVE field after the stream id: a priority-aware client emits
+    // it, while an old client (or any priority-0 publish) omits it and it folds to `0` (the lowest
+    // priority AND the historical body). A missing remainder folds to `0` (never an error).
+    let priority = fr.u8().unwrap_or(0);
     Ok(PubToBody {
         stream_id,
+        priority,
         pub_body,
     })
 }
@@ -4734,7 +4785,7 @@ mod tests {
         ) {
             // PubTo (verbatim carrier): stream_id + arbitrary pub_body tail.
             let mut buf = Vec::new();
-            encode_pub_to(&PubToBody { stream_id: &stream_id, pub_body: &pub_body }, &mut buf).unwrap();
+            encode_pub_to(&PubToBody { stream_id: &stream_id, priority: 0, pub_body: &pub_body }, &mut buf).unwrap();
             let v = decode_pub_to(&buf).unwrap();
             prop_assert_eq!(v.stream_id, stream_id.as_slice());
             prop_assert_eq!(v.pub_body, pub_body.as_slice());
@@ -5945,6 +5996,7 @@ mod tests {
                 &StreamDeclareBody {
                     stream_id: id,
                     partition_count: 1,
+                    priority: false,
                 },
                 &mut buf,
             )
@@ -6000,6 +6052,7 @@ mod tests {
         encode_pub_to(
             &PubToBody {
                 stream_id: b"orders",
+                priority: 0,
                 pub_body: &pub_body,
             },
             &mut buf,
@@ -6346,6 +6399,7 @@ mod tests {
             }
             let msg = PubToBody {
                 stream_id: &stream_id,
+                priority: 0,
                 pub_body: &pub_body,
             };
             let mut buf = Vec::new();
@@ -6447,6 +6501,7 @@ mod tests {
         encode_pub_to(
             &PubToBody {
                 stream_id: &at_stream_cap,
+                priority: 0,
                 pub_body: &[],
             },
             &mut buf,
@@ -6540,6 +6595,7 @@ mod tests {
             &StreamDeclareBody {
                 stream_id: b"orders",
                 partition_count: 4,
+                priority: false,
             },
             &mut with_p,
         )
@@ -6553,6 +6609,7 @@ mod tests {
             &StreamDeclareBody {
                 stream_id: b"orders",
                 partition_count: 1,
+                priority: false,
             },
             &mut single,
         )
@@ -6577,6 +6634,103 @@ mod tests {
         zero.extend_from_slice(b"o");
         zero.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(decode_stream_declare(&zero).unwrap().partition_count, 1);
+    }
+
+    #[test]
+    fn stream_declare_carries_an_additive_priority_flag() {
+        // #553: a PRIORITY-mode declare appends a `1` byte AFTER the partition count; a non-priority
+        // declare omits it and is byte-for-byte the pre-#553 body (the byte-identity proof).
+        let mut prio = Vec::new();
+        encode_stream_declare(
+            &StreamDeclareBody {
+                stream_id: b"jobs",
+                partition_count: 3,
+                priority: true,
+            },
+            &mut prio,
+        )
+        .unwrap();
+        let d = decode_stream_declare(&prio).unwrap();
+        assert_eq!(d.stream_id, b"jobs");
+        assert_eq!(d.partition_count, 3);
+        assert!(d.priority, "the priority flag round-trips");
+
+        // A NON-priority declare (even partitioned) is byte-for-byte the pre-#553 body: no priority byte.
+        let mut plain = Vec::new();
+        encode_stream_declare(
+            &StreamDeclareBody {
+                stream_id: b"jobs",
+                partition_count: 3,
+                priority: false,
+            },
+            &mut plain,
+        )
+        .unwrap();
+        let mut legacy = vec![STREAM_WIRE_BODY_VERSION];
+        let field_len = u16::try_from(2 + "jobs".len() + 4).unwrap();
+        legacy.extend_from_slice(&field_len.to_le_bytes());
+        legacy.extend_from_slice(&u16::try_from("jobs".len()).unwrap().to_le_bytes());
+        legacy.extend_from_slice(b"jobs");
+        legacy.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            plain, legacy,
+            "a non-priority declare is byte-for-byte the pre-#553 body"
+        );
+        // The priority body is exactly the plain body plus the trailing `1` (one byte longer).
+        assert_eq!(prio.len(), plain.len() + 1);
+        assert_eq!(*prio.last().unwrap(), 1);
+        // And an OLD-client body (no priority byte) decodes to priority = false.
+        assert!(!decode_stream_declare(&legacy).unwrap().priority);
+    }
+
+    #[test]
+    fn pub_to_carries_an_additive_priority_byte() {
+        // #553: a PubTo carries an additive PRIORITY byte INSIDE its block (after the stream id); a
+        // priority-0 publish omits it and is byte-for-byte the pre-#553 body (the byte-identity proof).
+        let pub_body = b"\x00\x2a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00payload"; // a sample PubBody
+        let mut prio = Vec::new();
+        encode_pub_to(
+            &PubToBody {
+                stream_id: b"jobs",
+                priority: 7,
+                pub_body,
+            },
+            &mut prio,
+        )
+        .unwrap();
+        let d = decode_pub_to(&prio).unwrap();
+        assert_eq!(d.stream_id, b"jobs");
+        assert_eq!(d.priority, 7, "the priority byte round-trips");
+        assert_eq!(
+            d.pub_body, pub_body,
+            "the pub_body tail is intact past the priority byte"
+        );
+
+        // A priority-0 publish is byte-for-byte the pre-#553 body: no priority byte in the block.
+        let mut plain = Vec::new();
+        encode_pub_to(
+            &PubToBody {
+                stream_id: b"jobs",
+                priority: 0,
+                pub_body,
+            },
+            &mut plain,
+        )
+        .unwrap();
+        let mut legacy = vec![STREAM_WIRE_BODY_VERSION];
+        let field_len = u16::try_from(2 + "jobs".len()).unwrap();
+        legacy.extend_from_slice(&field_len.to_le_bytes());
+        legacy.extend_from_slice(&u16::try_from("jobs".len()).unwrap().to_le_bytes());
+        legacy.extend_from_slice(b"jobs");
+        legacy.extend_from_slice(pub_body);
+        assert_eq!(
+            plain, legacy,
+            "a priority-0 PubTo is byte-for-byte the pre-#553 body"
+        );
+        // An OLD-client body (no priority byte) decodes to priority = 0 with the same pub_body.
+        let old = decode_pub_to(&legacy).unwrap();
+        assert_eq!(old.priority, 0);
+        assert_eq!(old.pub_body, pub_body);
     }
 
     #[test]

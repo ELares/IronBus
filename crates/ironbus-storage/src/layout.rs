@@ -77,6 +77,20 @@ pub const STREAMS_SUBDIR: &str = "streams";
 /// so a deployment that never partitions never materializes `pstreams/` (its disk image is unchanged).
 pub const PARTITIONED_STREAMS_SUBDIR: &str = "pstreams";
 
+/// The reserved data-dir subtree for PRIORITY-LANE streams (M4-I3, #553): an OPT-IN priority-mode
+/// stream is backed by the SAME [`crate::partitioned::PartitionedStream`] primitive as a partitioned
+/// stream, but its `P` sub-logs are PRIORITY LANES (one per priority level `0..P`) rather than
+/// key-hash partitions — a produce routes to the lane of its priority and delivery drains the
+/// highest-priority non-empty lane first. It is a SEPARATE subtree from [`PARTITIONED_STREAMS_SUBDIR`]
+/// so the MODE (priority-lane vs key-partition) is encoded in the path itself: recovery reading
+/// `prstreams/` knows a stream is priority-mode without any marker file, and the two modes are
+/// physically MUTUALLY EXCLUSIVE (a name is a subdir under exactly one of the two). Each priority
+/// stream is rooted at `prstreams/<hex(name)>/`, whose `P` lane sub-logs live under
+/// `prstreams/<hex(name)>/p-<08x(i)>/` (the same lane-subdir naming as a partition). NOT created until
+/// a stream declares priority mode, so a deployment that never uses priorities never materializes
+/// `prstreams/` and its on-disk image is byte-for-byte unchanged.
+pub const PRIORITY_STREAMS_SUBDIR: &str = "prstreams";
+
 /// The reserved data-dir subtree for the SHARED WAL (M2-I13, #597 — the shared-WAL fallback for high
 /// stream counts): ONE [`crate::shared_wal::SharedWal`] commit log holding every shared-mode named
 /// stream's records interleaved and tagged, rooted at `shared-wal/`. It is a SEPARATE subtree from

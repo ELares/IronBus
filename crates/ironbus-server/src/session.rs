@@ -430,6 +430,15 @@ pub struct Session {
     /// on its OWN durable per-partition cursor); when `None` they use the unchanged
     /// `poll_in_stream_member` / `ack_in_stream`, or the default-stream path when `stream` is empty.
     partition: Option<u32>,
+    /// Whether this connection is subscribed to a PRIORITY-LANE stream (#553, M4-I3): set by a
+    /// whole-stream `SubTo` onto a priority stream, cleared by any other (re)bind alongside `partition`.
+    /// When `true` the Flow poll loop routes through the engine's `poll_priority` (drain the highest
+    /// non-empty lane first) and the Ack path through `ack_priority` (the composite delivery offset the
+    /// consumer echoes decodes to the lane). A priority stream is consumed as a WHOLE (the broker picks
+    /// the lane), so this is mutually exclusive with a bound `partition` — a lane-addressed subscribe on
+    /// a priority stream is rejected by `handle_sub_to`. `false` for every non-priority subscription
+    /// (byte-for-byte the pre-#553 paths).
+    priority_bound: bool,
     /// Whether this connection has EVER published a Level-2 (server+client-ack) produce (#497): set
     /// when an L2 publish is registered for confirmation, and NEVER cleared. It is the gate that keeps
     /// the per-pass `ProduceConfirm` drain off the actor for a connection that never opted into Level 2
@@ -1344,6 +1353,8 @@ impl Session {
         self.stream = GroupName::default();
         // #693: resetting to the default stream clears any partition binding (whole-stream consume).
         self.partition = None;
+        // #553: and any priority-stream binding (the default stream is never priority-mode).
+        self.priority_bound = false;
         // The server caps, read LOCALLY off the handle (NO actor round-trip), so the handshake never
         // touches the actor's checkpoint/fsync path and a stalled produce on one connection cannot
         // head-of-line-block this Connect (invariant 4, #177). The caps are static engine config.
@@ -1787,6 +1798,13 @@ impl Session {
             return self
                 .handle_ack_in_partition(engine, stream, partition, group, ack, &token, out);
         }
+        // #553: a PRIORITY-bound consumer routes its ACK through `ack_priority`, which decodes the
+        // composite delivery offset (which the consumer echoed) back to the lane it came from. Plain
+        // ack-or-fence, mirroring the partition path; a nack/term/progress fences (as the named/partition
+        // paths do this phase). Mutually exclusive with a bound partition (a priority sub is whole-stream).
+        if self.priority_bound {
+            return self.handle_ack_in_priority(engine, stream, group, ack, &token, out);
+        }
         if !stream.is_empty() {
             return self.handle_ack_in_stream(engine, stream, group, ack, &token, out);
         }
@@ -1962,6 +1980,45 @@ impl Session {
                 let status = match engine
                     .with(move |e| e.ack_partition(&stream, partition, &group, &token))?
                 {
+                    AckResult::Acked => 1u8,
+                    AckResult::Fenced => 0u8,
+                };
+                self.leased.remove(&ack.offset);
+                reply(out, FrameType::AckStatus, &[status]);
+                Ok(())
+            }
+            AckOp::Nack | AckOp::Term | AckOp::Progress => {
+                self.leased.remove(&ack.offset);
+                reply(out, FrameType::AckStatus, &[0]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles the ACK of a PRIORITY-stream delivery (#553), the priority twin of
+    /// [`Session::handle_ack_in_partition`]: routes an `Ack` to the lane the delivery came from via
+    /// [`Engine::ack_priority`], which decodes the COMPOSITE delivery offset (`token.offset`, which the
+    /// consumer echoed back) into the lane + lane offset and commits that lane's OWN durable cursor. The
+    /// lease-ownership check ran in [`Session::handle_ack`] before this. Nack/Term/Progress are not on
+    /// the priority consume path this phase (mirroring the partition scope): they reply FENCED, so the
+    /// lease expires and redelivers on schedule.
+    fn handle_ack_in_priority<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        stream: GroupName,
+        group: GroupName,
+        ack: ironbus_proto::message::AckBody,
+        token: &LeaseToken,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        match ack.op {
+            AckOp::Ack => {
+                let token = *token;
+                let status = match engine.with(move |e| e.ack_priority(&stream, &group, &token))? {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -2378,13 +2435,19 @@ impl Session {
                 let stream = self.stream.clone();
                 // #693: a PARTITION-addressed consumer (`SubTo` carried a partition selector) drains ONE
                 // partition's sub-log via `poll_partition` (plain competing, its OWN durable per-partition
-                // cursor); `stream` is guaranteed non-empty here (SubTo validated it). A whole-stream or
-                // default-stream consumer takes the unchanged member-aware paths below.
+                // cursor); `stream` is guaranteed non-empty here (SubTo validated it). #553: a
+                // PRIORITY-bound consumer drains the highest-priority non-empty lane via `poll_priority`
+                // (the composite delivery offset carries the lane). A whole-stream or default-stream
+                // consumer takes the unchanged member-aware paths below.
                 let partition = self.partition;
+                let priority_bound = self.priority_bound;
                 let poll = engine.with(move |e| {
                     if let Some(partition) = partition {
                         let now = e.now_monotonic();
                         e.poll_partition(&stream, partition, &group, now)
+                    } else if priority_bound {
+                        let now = e.now_monotonic();
+                        e.poll_priority(&stream, &group, now)
                     } else if stream.is_empty() {
                         e.poll_now_in_member(&group, member)
                     } else {
@@ -3540,6 +3603,8 @@ impl Session {
         self.stream = GroupName::default();
         // #693: resetting to the default stream clears any partition binding (whole-stream consume).
         self.partition = None;
+        // #553: and any priority-stream binding.
+        self.priority_bound = false;
         self.leased.clear();
         // If the new group is configured key_shared (#64), put it into that mode and join as a
         // member so this connection's keys route to it. A failure to enable the mode (an invalid
@@ -3630,15 +3695,25 @@ impl Session {
             return Ok(());
         }
         let stream = stream.to_string();
-        // #693: the additive `partition_count` decides the backing. `P <= 1` delegates to the plain
-        // single-log declare BYTE-FOR-BYTE; `P > 1` opts the stream into a `PartitionedStream` of `P`
-        // key-routed sub-logs. Both reply a body-less `Ok` (idempotent); a conflict (a different `P`, or
-        // a name already a single named stream) fails closed with the engine's typed reason.
+        // #693/#553: the additive `partition_count` + `priority` flag decide the backing. `priority =
+        // true` opts the stream into PRIORITY MODE (`P = partition_count` priority lanes, delivered
+        // highest-first); otherwise `P <= 1` delegates to the plain single-log declare BYTE-FOR-BYTE and
+        // `P > 1` opts into a key-partitioned `PartitionedStream`. All reply a body-less `Ok`
+        // (idempotent); a conflict (a different `P`/levels, a cross-mode name, `priority` with `P < 2`)
+        // fails closed with the engine's typed reason. The two partitioned modes are mutually exclusive.
         let partition_count = decoded.partition_count;
-        match engine.with(move |e| e.declare_partitioned_stream(&stream, partition_count))? {
+        let priority = decoded.priority;
+        let result = engine.with(move |e| {
+            if priority {
+                e.declare_priority_stream(&stream, partition_count)
+            } else {
+                e.declare_partitioned_stream(&stream, partition_count)
+            }
+        })?;
+        match result {
             // Idempotent: a first declare (`true`) and a re-declare (`false`) both reply a body-less Ok.
             Ok(_) => reply(out, FrameType::Ok, &[]),
-            // A malformed/over-long NAMED name (or a partition conflict) fails closed with the reason.
+            // A malformed/over-long NAMED name (or a partition/priority conflict) fails closed.
             Err(e) => reply_err_coded(out, e.code().as_str(), &e.to_string()),
         }
         Ok(())
@@ -3820,6 +3895,11 @@ impl Session {
             ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
         let stream = stream.to_string();
+        // #553: the wire PubTo carries an additive PRIORITY byte, threaded to the engine's
+        // priority-carrying produce. It is IGNORED for a non-priority stream (a `priority = 0` call is
+        // byte-for-byte `produce_in_stream`), so only a produce to a declared priority stream routes to
+        // the record's priority lane. Captured before the job moves `stream`.
+        let priority = decoded.priority;
         // Route the named-stream produce to its append SHARD (#811): hash the name (by ref) BEFORE the
         // job moves it, so no extra allocation. With one shard (today) this is always 0 and `with_on_shard`
         // is byte-for-byte `with`.
@@ -3833,7 +3913,7 @@ impl Session {
                 payload: &append.payload,
             };
             let level = append.ack_level;
-            let result = e.produce_in_stream(&stream, &view);
+            let result = e.produce_in_stream_prioritized(&stream, &view, priority);
             // Per-ack-level PRODUCE throughput (#571) for the named-stream produce path (which does not
             // route through the actor drain that counts the default path): attribute the accepted record
             // to its level only on a successful append, so the per-level sum matches the fresh-append
@@ -4260,11 +4340,28 @@ impl Session {
                 );
                 return Ok(());
             }
+            // A PRIORITY-lane stream (#553) is consumed as a WHOLE — the broker drains the highest
+            // non-empty lane — so a LANE-addressed subscribe on it is a typed reject (you do not address
+            // a priority lane; subscribe to the stream and the broker picks). Checked alongside the range
+            // check in one engine query.
             let stream_q = stream.to_string();
-            let in_range = engine.with(move |e| {
-                e.partition_count_of(&stream_q)
-                    .is_some_and(|pc| partition < pc.get())
+            let (in_range, is_priority) = engine.with(move |e| {
+                (
+                    e.partition_count_of(&stream_q)
+                        .is_some_and(|pc| partition < pc.get()),
+                    e.is_priority_stream(&stream_q),
+                )
             })?;
+            if is_priority {
+                reply_err(
+                    out,
+                    &format!(
+                        "stream {stream:?} is a priority stream (subscribe to it as a whole; the broker \
+                         drains the highest-priority lane first — a lane is not addressable)"
+                    ),
+                );
+                return Ok(());
+            }
             if !in_range {
                 reply_err(
                     out,
@@ -4282,6 +4379,9 @@ impl Session {
             self.stream = GroupName::from(stream);
             self.subscription = GroupName::from(group);
             self.partition = Some(partition);
+            // A lane-addressed subscribe is never priority-mode (rejected above): clear the flag in case
+            // this rebinds away from a prior priority subscription.
+            self.priority_bound = false;
             self.registered_subscription = false;
             self.ephemeral_subscription = false;
             self.joined_key_shared = false;
@@ -4347,6 +4447,12 @@ impl Session {
         self.subscription = GroupName::from(group);
         // A whole-stream SubTo consumes the stream as a whole (#693): clear any prior partition binding.
         self.partition = None;
+        // #553: a whole-stream SubTo onto a PRIORITY stream binds the priority consume path (the Flow
+        // poll + Ack route through `poll_priority` / `ack_priority`, draining the highest-priority lane
+        // first). A non-priority whole-stream subscribe clears it (byte-for-byte the pre-#553 path). One
+        // engine query; a false for every non-priority stream.
+        let stream_p = stream.to_string();
+        self.priority_bound = engine.with(move |e| e.is_priority_stream(&stream_p))?;
         // A DURABLE named-stream consume does not register in the default-stream broadcast subscriber
         // set (#676); an EPHEMERAL one registers per-stream membership (#771) that the leave path
         // routes by `self.stream`.
@@ -4743,6 +4849,8 @@ impl Session {
             self.subscription = GroupName::from(group);
             // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
             self.partition = None;
+            // #553: a subject subscribe is never priority-mode (priority streams have no subjects).
+            self.priority_bound = false;
             self.registered_subscription = false;
             self.ephemeral_subscription = false;
             self.joined_key_shared = false;
@@ -4787,6 +4895,8 @@ impl Session {
         self.subscription = GroupName::from(group);
         // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
         self.partition = None;
+        // #553: a subject subscribe is never priority-mode (priority streams have no subjects).
+        self.priority_bound = false;
         self.registered_subscription = false;
         self.ephemeral_subscription = false;
         self.joined_key_shared = false;
@@ -4828,6 +4938,8 @@ impl Session {
         self.stream = GroupName::default();
         // #693: resetting to the default stream clears any partition binding (whole-stream consume).
         self.partition = None;
+        // #553: and any priority-stream binding.
+        self.priority_bound = false;
         self.leased.clear();
         if !leaving.is_empty() {
             engine.with(move |e| {
@@ -13784,6 +13896,7 @@ mod tests {
             &ironbus_proto::message::StreamDeclareBody {
                 stream_id: b"orders",
                 partition_count: 2,
+                priority: false,
             },
             &mut declare,
         )
@@ -13902,6 +14015,155 @@ mod tests {
                 .get(),
             2,
             "partition 1's cursor committed both its records"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn priority_wire_declare_produce_and_consume_high_first_end_to_end() {
+        // #553 THE wire end-to-end: a `StreamDeclare` carrying `priority = true`, `partition_count = 3`
+        // backs "jobs" with a PRIORITY-mode stream; `PubTo`s carrying the additive priority byte route
+        // to their lane; a WHOLE-stream `SubTo` binds the priority consume path, and a `Flow` delivers
+        // HIGHEST-PRIORITY FIRST over the wire; each ack routes back to the right lane (status 1).
+        let (e, mut s, mut out) = connect_streams();
+
+        // Declare priority mode with 3 levels over the wire.
+        let mut declare = Vec::new();
+        ironbus_proto::message::encode_stream_declare(
+            &ironbus_proto::message::StreamDeclareBody {
+                stream_id: b"jobs",
+                partition_count: 3,
+                priority: true,
+            },
+            &mut declare,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::StreamDeclare, &declare), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "priority declare acked"
+        );
+        out.clear();
+        assert!(e.engine_mut().is_priority_stream("jobs"));
+
+        // A LANE-addressed SubTo on a priority stream is REJECTED (consume it as a whole).
+        let mut lane_sub = Vec::new();
+        ironbus_proto::message::encode_sub_to(
+            &ironbus_proto::message::SubToBody {
+                ephemeral: false,
+                stream_id: b"jobs",
+                group: b"w",
+                partition: Some(0),
+            },
+            &mut lane_sub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubTo, &lane_sub), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a lane-addressed subscribe on a priority stream is rejected"
+        );
+        out.clear();
+
+        // Publish at interleaved priorities over the wire (0 = lowest, 2 = highest).
+        let pubto = |priority: u8, payload: &[u8]| -> Vec<u8> {
+            let mut p = Vec::new();
+            ironbus_proto::message::encode_pub_to(
+                &ironbus_proto::message::PubToBody {
+                    stream_id: b"jobs",
+                    priority,
+                    pub_body: &pub_body(payload),
+                },
+                &mut p,
+            )
+            .unwrap();
+            frame(FrameType::PubTo, &p)
+        };
+        for f in [
+            pubto(0, b"lo"),
+            pubto(2, b"hi-a"),
+            pubto(1, b"mid"),
+            pubto(2, b"hi-b"),
+        ] {
+            s.process(&e, &f, &mut out).unwrap();
+            assert_eq!(
+                one_response(&out).0,
+                FrameType::PubAck,
+                "priority publish acked"
+            );
+            out.clear();
+        }
+
+        // WHOLE-stream SubTo (no partition selector) binds the priority consume path.
+        let mut sub = Vec::new();
+        ironbus_proto::message::encode_sub_to(
+            &ironbus_proto::message::SubToBody {
+                ephemeral: false,
+                stream_id: b"jobs",
+                group: b"w",
+                partition: None,
+            },
+            &mut sub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubTo, &sub), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "whole-stream SubTo acked"
+        );
+        out.clear();
+
+        // Flow: the two highest-priority records first (in produce order), then mid, then lo.
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![
+                b"hi-a".to_vec(),
+                b"hi-b".to_vec(),
+                b"mid".to_vec(),
+                b"lo".to_vec(),
+            ],
+            "the priority consumer sees highest-priority records first over the wire"
+        );
+
+        // Ack every delivered record; each composite offset routes back to its own lane (status 1).
+        for (ty, body) in decode_all(&out) {
+            if ty != FrameType::Deliver {
+                continue;
+            }
+            let d = decode_deliver(&body).unwrap();
+            let mut ack = Vec::new();
+            encode_ack(
+                &AckBody {
+                    offset: d.offset,
+                    generation: d.generation,
+                    op: AckOp::Ack,
+                    delay_ms: 0,
+                },
+                &mut ack,
+            );
+            let mut aout = Vec::new();
+            s.process(&e, &frame(FrameType::Ack, &ack), &mut aout)
+                .unwrap();
+            let (aty, abody) = one_response(&aout);
+            assert_eq!(aty, FrameType::AckStatus);
+            assert_eq!(abody, vec![1u8], "the priority ack committed to its lane");
+        }
+        out.clear();
+
+        // Nothing more to deliver (all lanes drained + acked).
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            delivered_payloads(&out).is_empty(),
+            "no more records after every lane is acked"
         );
     }
 
@@ -14466,6 +14728,7 @@ mod tests {
         ironbus_proto::message::encode_pub_to(
             &ironbus_proto::message::PubToBody {
                 stream_id: b"orders",
+                priority: 0,
                 pub_body: &pub_body(b"P"),
             },
             &mut pubto,
@@ -14651,6 +14914,7 @@ mod tests {
         ironbus_proto::message::encode_pub_to(
             &ironbus_proto::message::PubToBody {
                 stream_id: b"shipments",
+                priority: 0,
                 pub_body: &pub_body(b"s0"),
             },
             &mut pubto,

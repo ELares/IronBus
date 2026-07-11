@@ -764,6 +764,7 @@ fn build_vectors() -> Vec<Vector> {
         &StreamDeclareBody {
             stream_id: b"orders",
             partition_count: 1,
+            priority: false,
         },
         &mut body,
     )
@@ -813,6 +814,7 @@ fn build_vectors() -> Vec<Vector> {
     encode_pub_to(
         &PubToBody {
             stream_id: b"orders",
+            priority: 0,
             pub_body: &pub_body,
         },
         &mut body,
