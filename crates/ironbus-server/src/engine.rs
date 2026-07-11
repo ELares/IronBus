@@ -44,7 +44,8 @@ use ironbus_core::sublist::{Sublist, SublistBuilder, SublistError, SublistSnapsh
 use ironbus_core::ttl::{decode_ttl_headers, is_expired, Ttl};
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::checkpoint::{
-    AttemptsCheckpoint, BindingsCheckpoint, Checkpoint, CountersCheckpoint, ProducerSeqCheckpoint,
+    record_checkpoint_damage, AttemptsCheckpoint, BindingsCheckpoint, Checkpoint,
+    CheckpointArtifact, CountersCheckpoint, ProducerSeqCheckpoint, RecoveredCheckpoint,
     ATTEMPTS_PAYLOAD, BINDINGS_PAYLOAD, MAX_PAYLOAD, PRODUCER_SEQ_PAYLOAD,
 };
 use ironbus_storage::dlq::{DeadLetterExchange, DeadLetterReason, DlqSink, DLQ_SUBDIR};
@@ -1458,6 +1459,36 @@ impl RecoveryArtifact {
     }
 }
 
+/// Surfaces a checkpoint-open classification (#1142) and returns its recovered payload as an
+/// `Option`, preserving the pre-#1142 control flow at every call site. On
+/// [`RecoveredCheckpoint::Damaged`] — both slots carrying a nonzero sequence yet both failing CRC,
+/// which is impossible from any crash (a write touches one slot), so provable EXTERNAL damage — it
+/// emits a LOUD `warn!` and bumps `ironbus_checkpoint_damaged_total{artifact}`, then recovers as
+/// empty. This is the OBSERVABLE-NON-FATAL policy the tracking issue lands on for ALL checkpoint
+/// types: making the damage detectable + loud without turning a data-availability event into a
+/// broker-won't-start regression. The load-bearing checkpoints (bindings, reap) keep their existing
+/// independent fail-closed guards downstream — a loud `NoStream` for bindings, the physical-earliest
+/// cross-check for reap — so empty-recovery here is never a silent correctness loss.
+///
+/// `Valid`/`Empty` pass through silently (an `Empty` is a fresh/absent file or a torn first write,
+/// never damage). Used at the RECOVERY-READ call sites; write-handle re-opens that discard the
+/// recovered value do not re-observe (the recovery read already did, so damage counts once per open).
+pub(crate) fn observe_checkpoint_damage(
+    state: RecoveredCheckpoint,
+    artifact: CheckpointArtifact,
+) -> Option<Vec<u8>> {
+    if state.is_damaged() {
+        record_checkpoint_damage(artifact);
+        tracing::warn!(
+            artifact = artifact.metric_label(),
+            "checkpoint externally damaged: both dual-slots carry a nonzero sequence yet both fail \
+             their CRC, which is impossible from a crash (a write touches one slot) — bit rot or a \
+             lost extent. Recovering as empty (observable via ironbus_checkpoint_damaged_total)."
+        );
+    }
+    state.into_option()
+}
+
 /// The durable counters-snapshot format version (#98). A future field addition bumps this only if
 /// the decode rule must change; today the format is forward-compatible by construction (a shorter
 /// payload zero-fills missing trailing fields, a longer one ignores extra trailing bytes), so a
@@ -2417,8 +2448,11 @@ fn read_group_attempts<F: Filesystem>(fs: &F, group: &str) -> Result<Option<Vec<
     if !fs.exists(&name)? {
         return Ok(None);
     }
-    let (_, recovered) = AttemptsCheckpoint::open(fs.open(&name)?)?;
-    Ok(recovered)
+    let (_, state) = AttemptsCheckpoint::open(fs.open(&name)?)?;
+    Ok(observe_checkpoint_damage(
+        state,
+        CheckpointArtifact::Attempts,
+    ))
 }
 
 /// Builds a [`WorkGroup`] around a recovered `cursor` and seeds its lease table with the durable
@@ -2478,7 +2512,8 @@ fn recover_named_groups<F: Filesystem>(
         // clamped exactly like the default group, so MaxDeliver survives a restart in every group.
         let cursor_name = group_checkpoint_name(&gname);
         let gcursor = if fs.exists(&cursor_name)? {
-            let (_, recovered) = Checkpoint::open(fs.open(&cursor_name)?)?;
+            let (_, state) = Checkpoint::open(fs.open(&cursor_name)?)?;
+            let recovered = observe_checkpoint_damage(state, CheckpointArtifact::Cursor);
             resume_cursor_from_snapshot(recovered.as_deref(), flushed)
         } else {
             AckCursor::new()
@@ -2599,7 +2634,8 @@ fn recover_stream_groups_at<F: Filesystem>(
         // stream (#358), so `MaxDeliver` and the poison-cap survive a restart in every named stream.
         let cursor_name = group_checkpoint_name(&group);
         let cursor = if fs.exists(&cursor_name)? {
-            let (_, recovered) = Checkpoint::open(fs.open(&cursor_name)?)?;
+            let (_, state) = Checkpoint::open(fs.open(&cursor_name)?)?;
+            let recovered = observe_checkpoint_damage(state, CheckpointArtifact::Cursor);
             resume_cursor_from_snapshot(recovered.as_deref(), flushed)
         } else {
             AckCursor::new()
@@ -3206,9 +3242,11 @@ impl BindingTable {
                     .sum::<usize>(),
         );
         out.push(BINDINGS_SNAPSHOT_VERSION);
-        // The cap check bounds a WRITTEN snapshot to ~12k entries; `u32::MAX` is unreachable for any
-        // table that can exist in memory, so the saturation below is a formality, never a truncation
-        // that could be persisted (an over-cap payload is rejected before the write).
+        // Each entry frames as `u32` plen + pattern + `u32` slen + name = 8 bytes of overhead over a
+        // 9-byte minimum entry, so after the 5-byte header the `BINDINGS_PAYLOAD` cap check bounds a
+        // WRITTEN snapshot to ~6.8k worst-case minimal entries (~1400-1600 typical); `u32::MAX` is
+        // unreachable for any table that can exist in memory, so the saturation below is a formality,
+        // never a truncation that could be persisted (an over-cap payload is rejected before the write).
         let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&count.to_le_bytes());
         for (pattern, stream) in &self.entries {
@@ -3975,7 +4013,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 file
             }
         };
-        let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
+        let (checkpoint, cursor_state) = Checkpoint::open(checkpoint_file)?;
+        let recovered = observe_checkpoint_damage(cursor_state, CheckpointArtifact::Cursor);
 
         // Open (creating if absent) the default group's attempt-count checkpoint (#358) and recover
         // its snapshot, so the durable per-message attempt counts seed the default lease table below
@@ -4791,7 +4830,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 file
             }
         };
-        Ok(AttemptsCheckpoint::open(attempts_file)?)
+        let (cp, state) = AttemptsCheckpoint::open(attempts_file)?;
+        Ok((
+            cp,
+            observe_checkpoint_damage(state, CheckpointArtifact::Attempts),
+        ))
     }
 
     /// Opens the durable idempotent-producer SEQUENCE checkpoint (V2-M8) IF it already exists, and
@@ -4812,8 +4855,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Ok((None, None));
         }
         let file = fs.open(PRODUCER_SEQ_CHECKPOINT)?;
-        let (checkpoint, recovered) = ProducerSeqCheckpoint::open(file)?;
-        Ok((Some(checkpoint), recovered))
+        let (checkpoint, state) = ProducerSeqCheckpoint::open(file)?;
+        Ok((
+            Some(checkpoint),
+            observe_checkpoint_damage(state, CheckpointArtifact::ProducerSeq),
+        ))
     }
 
     /// RESTORES the recovered idempotent-producer SEQUENCE high-waters (V2-M8) into the registry at
@@ -4867,8 +4913,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Ok((None, None));
         }
         let file = fs.open(BINDINGS_CHECKPOINT)?;
-        let (checkpoint, recovered) = BindingsCheckpoint::open(file)?;
-        Ok((Some(checkpoint), recovered))
+        let (checkpoint, state) = BindingsCheckpoint::open(file)?;
+        Ok((
+            Some(checkpoint),
+            observe_checkpoint_damage(state, CheckpointArtifact::Bindings),
+        ))
     }
 
     /// Opens (creating + directory-fsyncing if absent) the durable binding-table checkpoint (#1106)
@@ -4932,7 +4981,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 file
             }
         };
-        let (counters_checkpoint, recovered) = CountersCheckpoint::open(counters_file)?;
+        let (counters_checkpoint, counters_state) = CountersCheckpoint::open(counters_file)?;
+        let recovered = observe_checkpoint_damage(counters_state, CheckpointArtifact::Counters);
         let mut counters = recovered
             .as_deref()
             .map_or_else(Counters::default, Counters::decode_snapshot);
@@ -5816,7 +5866,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let (cursor, recovered_a) = {
             let fs = self.log.filesystem();
             let cursor = if fs.exists(&name)? {
-                let (_, recovered) = Checkpoint::open(fs.open(&name)?)?;
+                let (_, state) = Checkpoint::open(fs.open(&name)?)?;
+                let recovered = observe_checkpoint_damage(state, CheckpointArtifact::Cursor);
                 resume_cursor_from_snapshot(recovered.as_deref(), flushed)
             } else {
                 AckCursor::new()

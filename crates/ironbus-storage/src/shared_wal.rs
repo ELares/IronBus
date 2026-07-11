@@ -269,8 +269,19 @@ impl<F: Filesystem, C: Clock> SharedWal<F, C> {
         // means no reap ever completed its checkpoint — and therefore, by the write-then-unlink
         // discipline, no reap ever unlinked a segment — which the physical-earliest check pins.
         let (reap_checkpoint, recovered) = if shared_fs.exists(REAP_CHECKPOINT)? {
-            let (cp, payload) = SharedWalReapCheckpoint::open(shared_fs.open(REAP_CHECKPOINT)?)?;
-            (Some(cp), payload)
+            let (cp, state) = SharedWalReapCheckpoint::open(shared_fs.open(REAP_CHECKPOINT)?)?;
+            if state.is_damaged() {
+                // Both slots carry a nonzero sequence yet both fail CRC — impossible from any crash,
+                // so provable external damage (#1142). Surface it via the metric (this is the storage
+                // crate; the loud `warn!` rides the server-side observer). Correctness is unaffected:
+                // the DAMAGED checkpoint recovers as "no reap floor" and the physical-earliest
+                // cross-check below still fail-closes if any segment was already unlinked, so the
+                // "leave reap's fail-close intact" policy holds.
+                crate::checkpoint::record_checkpoint_damage(
+                    crate::checkpoint::CheckpointArtifact::SharedWalReap,
+                );
+            }
+            (Some(cp), state.into_option())
         } else {
             (None, None)
         };

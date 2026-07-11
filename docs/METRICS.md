@@ -138,8 +138,10 @@ observed across all the paths.
 | `ironbus_corruption_repairs_total{artifact="segment"}` | A **corruption span in a log** — the root log, a named per-stream log, the shared WAL, or a partition sub-log (#1130) — was quarantined-and-dropped at recovery (or by the offline `ironbus repair`). | **Segment corruption repaired**: the headline corruption signal. NATS has **no** corruption-repair metric. |
 | `ironbus_corruption_repairs_total{artifact="cursor"}` | A **consumer cursor** corruption was repaired (reserved: a torn cursor reverts via its dual-slot checkpoint, so recovery does not emit one today; driven by the offline `ironbus repair` cursor path). | Reserved + offline-`repair`-driven, frozen up front. |
 | `ironbus_corruption_repairs_total{artifact="dlq"}` | A **DLQ** corruption was repaired (reserved, same shape as `cursor`). | Reserved + offline-`repair`-driven, frozen up front. |
+| `ironbus_checkpoint_damaged_total{artifact}` | A dual-slot checkpoint opened with **both** slots carrying a nonzero sequence yet **both** failing their CRC — impossible from any crash (each write touches one slot, so a crash tears at most one), so provable **external** damage (bit rot / a lost extent), NOT the never-written `None` the pre-#1142 open collapsed it into (#1142). One increment per damaged open, by on-disk `artifact` (`cursor`, `attempts`, `counters`, `producer_seq`, `metadata_snapshot`, `shared_wal_reap`, `bindings`, `geo_cursor`). The broker warns and recovers as **empty** — the load-bearing checkpoints (`bindings`, `shared_wal_reap`) keep their own downstream fail-closed guards (a loud NoStream; the physical-earliest cross-check), so empty-recovery is never a silent correctness loss. | **External-damage detection, observable + non-fatal**: turns a formerly SILENT empty-recovery into a LOUD, alertable data-availability event without making it a broker-won't-start regression. NATS has no analogue. |
 
-`ironbus_recovery_runs_total` and `ironbus_corruption_repairs_total` are **labeled**
+`ironbus_recovery_runs_total`, `ironbus_corruption_repairs_total`, and
+`ironbus_checkpoint_damaged_total` are **labeled**
 `_total` counters, so (exactly like `ironbus_cluster_ack_total{level}` and
 `ironbus_retry_shed_total{side}`) their sample lines are excluded from the
 unlabeled-`_total` frozen **resilience-counter** set by construction and are pinned

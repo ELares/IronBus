@@ -88,9 +88,12 @@ pub const SHARED_WAL_REAP_PAYLOAD: usize = 60 * 1024;
 /// `BindSubject` ack, so an acked bind always survives a restart. Bindings mutate rarely (a bind is
 /// an admin-scoped routing declaration, and no unbind verb exists yet, so the table only grows), so
 /// the full-table rewrite costs nothing at bind frequency and buys the simplest possible recovery:
-/// decode one snapshot, rebuild the trie once. Each entry is `2 + pattern + 2 + stream name (<= 64)`
-/// bytes; this 60 KiB cap (under the slot's `u16` length field, like the other large checkpoints)
-/// holds ~800 worst-case short-pattern entries and thousands of typical ones. Unlike the tolerant
+/// decode one snapshot, rebuild the trie once. Each entry is `4 + pattern + 4 + stream name (<= 64)`
+/// bytes — the codec length-prefixes BOTH the pattern and the stream name with a `u32`, so 8 bytes of
+/// per-entry framing over a 9-byte-minimum entry (a 1-byte pattern bound to the default `""` stream).
+/// After the 5-byte header (a version byte + a `u32` entry count), this 60 KiB cap (under the slot's
+/// `u16` length field, like the other large checkpoints) holds ~6.8k worst-case minimal entries and
+/// ~1400-1600 typical ones (a ~20-byte pattern + a ~12-byte stream name). Unlike the tolerant
 /// cursor checkpoints, this payload is LOAD-BEARING for routing correctness (an acked bind silently
 /// dropped would re-open the exact NoStream-after-restart gap #1106 closes), so a
 /// CRC-valid-but-undecodable snapshot fails the open closed (see `ironbus-server`'s engine open);
@@ -106,31 +109,56 @@ const CRC_LEN: usize = 4;
 /// `SLOT_OVERHEAD + PAYLOAD_CAP` bytes.
 const SLOT_OVERHEAD: usize = SEQ_LEN + LEN_LEN + CRC_LEN;
 
-/// Reads `[seq, len, payload]` from a `CAP`-payload slot and returns the payload if the slot is
-/// valid: a nonzero sequence, an in-range length, and a matching CRC over the meaningful bytes.
-fn decode_slot<const CAP: usize>(slot: &[u8]) -> Option<(u64, Vec<u8>)> {
+/// The classification of a single slot (#1142). The key distinction the old `Option` lacked is
+/// [`SlotDecode::Corrupt`] vs [`SlotDecode::Empty`]: a slot carrying a NONZERO sequence but failing
+/// its length bound or CRC was WRITTEN (so its corruption is meaningful), whereas a zero-sequence or
+/// short slot was never written. That separation is what lets [`SlotCheckpoint::open`] distinguish
+/// provable external damage (both slots `Corrupt`) from a fresh/torn-first file.
+enum SlotDecode {
+    /// Never written: a zero sequence, or a slot from a short/truncated file.
+    Empty,
+    /// Written (nonzero sequence) but invalid: an out-of-range length or a CRC mismatch. A torn or
+    /// bit-rotted slot.
+    Corrupt,
+    /// A fully valid slot: `(sequence, payload)`.
+    Valid(u64, Vec<u8>),
+}
+
+/// Reads `[seq, len, payload]` from a `CAP`-payload slot and classifies it. A nonzero sequence, an
+/// in-range length, and a matching CRC over the meaningful bytes is [`SlotDecode::Valid`]; a zero
+/// sequence or short slot is [`SlotDecode::Empty`] (never written); a nonzero sequence that then
+/// fails its length bound or CRC is [`SlotDecode::Corrupt`] (written but torn/damaged).
+fn decode_slot<const CAP: usize>(slot: &[u8]) -> SlotDecode {
     if slot.len() != SLOT_OVERHEAD + CAP {
-        return None;
+        return SlotDecode::Empty; // a short/truncated file: treat as never-written
     }
-    let seq = u64::from_le_bytes(slot[0..SEQ_LEN].try_into().ok()?);
+    let seq = u64::from_le_bytes(slot[0..SEQ_LEN].try_into().expect("SEQ_LEN bytes present"));
     if seq == 0 {
-        return None; // sequence 0 means "never written"
+        return SlotDecode::Empty; // sequence 0 means "never written"
     }
+    // The slot carries a nonzero sequence, so it WAS written: any failure below is a written-but-
+    // invalid (Corrupt) slot, distinct from a never-written one.
     let len = usize::from(u16::from_le_bytes(
-        slot[SEQ_LEN..SEQ_LEN + LEN_LEN].try_into().ok()?,
+        slot[SEQ_LEN..SEQ_LEN + LEN_LEN]
+            .try_into()
+            .expect("LEN_LEN bytes present"),
     ));
     if len > CAP {
-        return None;
+        return SlotDecode::Corrupt;
     }
     let payload_start = SEQ_LEN + LEN_LEN;
     let crc_start = payload_start + CAP;
-    let stored_crc = u32::from_le_bytes(slot[crc_start..crc_start + CRC_LEN].try_into().ok()?);
+    let stored_crc = u32::from_le_bytes(
+        slot[crc_start..crc_start + CRC_LEN]
+            .try_into()
+            .expect("CRC_LEN bytes present"),
+    );
     // The CRC covers the sequence, the length field, and the meaningful payload bytes
     // (the padding and the CRC field itself are excluded).
     if crc32c::crc32c(&slot[0..payload_start + len]) != stored_crc {
-        return None;
+        return SlotDecode::Corrupt;
     }
-    Some((seq, slot[payload_start..payload_start + len].to_vec()))
+    SlotDecode::Valid(seq, slot[payload_start..payload_start + len].to_vec())
 }
 
 fn encode_slot<const CAP: usize>(seq: u64, payload: &[u8]) -> Vec<u8> {
@@ -213,15 +241,180 @@ pub type SharedWalReapCheckpoint<F> = SlotCheckpoint<F, SHARED_WAL_REAP_PAYLOAD>
 /// the routing table.
 pub type BindingsCheckpoint<F> = SlotCheckpoint<F, BINDINGS_PAYLOAD>;
 
+/// The classification a checkpoint file receives on [`SlotCheckpoint::open`] (#1142): the tri-state
+/// that separates a value that recovered, a checkpoint that was never durably written, and one that
+/// is EXTERNALLY DAMAGED (bit rot / a lost extent), which the old two-state `Option` collapsed into
+/// the same `None` as a fresh file.
+///
+/// The distinction is provable from the dual-slot crash model. Each [`SlotCheckpoint::write`] touches
+/// exactly one slot (`slot = seq % 2`), so a crash mid-write tears AT MOST one slot; its sibling stays
+/// either durable-valid or zero-sequence ("never written"). Therefore:
+/// - a torn slot with a valid sibling recovers the sibling → [`RecoveredCheckpoint::Valid`];
+/// - a torn FIRST write (one corrupt slot, the other still zero-sequence) → [`RecoveredCheckpoint::Empty`]
+///   (a legitimate crash outcome, NOT damage);
+/// - BOTH slots carrying a nonzero sequence yet BOTH failing their CRC is impossible from any crash,
+///   so it is provably external damage → [`RecoveredCheckpoint::Damaged`].
+///
+/// `Damaged` is DETECTABLE (distinguishable from a fresh/absent file) but, per #1142, non-fatal by
+/// default: the caller surfaces it (a `warn!` + the `ironbus_checkpoint_damaged_total{artifact}`
+/// counter via [`record_checkpoint_damage`]) and then recovers as empty, turning a formerly SILENT
+/// empty-recovery into a LOUD, observable data-availability event without turning it into a
+/// broker-won't-start regression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveredCheckpoint {
+    /// A fully-valid slot recovered this payload (the highest durable sequence).
+    Valid(Vec<u8>),
+    /// No slot was ever durably written: a fresh, absent, or short file, OR exactly one slot torn by
+    /// a crash with no valid sibling (a torn first write). Recover as empty; NOT an error, no warning.
+    Empty,
+    /// Both slots carry a nonzero sequence yet both fail their CRC — impossible from any crash, so
+    /// EXTERNAL damage. Surfaced (warn + metric) and then recovered as empty by the caller.
+    Damaged,
+}
+
+impl RecoveredCheckpoint {
+    /// The recovered payload if a valid slot was found, else `None`. Both `Empty` and `Damaged` map
+    /// to `None` (the pre-#1142 behavior), so a call site that only needs the value — and observes
+    /// damage separately, or is a write-handle re-open where a prior read already observed it — reads
+    /// exactly as before.
+    #[must_use]
+    pub fn into_option(self) -> Option<Vec<u8>> {
+        match self {
+            RecoveredCheckpoint::Valid(payload) => Some(payload),
+            RecoveredCheckpoint::Empty | RecoveredCheckpoint::Damaged => None,
+        }
+    }
+
+    /// Whether the file was classified as externally damaged (both slots nonzero-seq, both CRC-bad).
+    #[must_use]
+    pub fn is_damaged(&self) -> bool {
+        matches!(self, RecoveredCheckpoint::Damaged)
+    }
+}
+
+/// The bounded, append-only vocabulary of on-disk checkpoint artifacts, for the
+/// `ironbus_checkpoint_damaged_total{artifact}` counter (#1142). One label per [`SlotCheckpoint`]
+/// consumer, mirroring the frozen [`crate::loss::ReasonCode`]-style discipline: a new variant goes at
+/// the END so the counter-array index order never shifts. The label strings are frozen alongside the
+/// metric name (a rename is a gated taxonomy change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointArtifact {
+    /// A consumer-cursor checkpoint (`cursor.ckpt` / `cursor-<hex>.ckpt`).
+    Cursor,
+    /// A durable per-message attempt-count checkpoint (`attempts*.ckpt`, #358).
+    Attempts,
+    /// The resilience-counters observability checkpoint (`counters.ckpt`, #98).
+    Counters,
+    /// The idempotent-producer sequence high-water checkpoint (`producer-seq.ckpt`, V2-M8).
+    ProducerSeq,
+    /// The metadata-raft snapshot checkpoint (`metadata snapshot`, V2-C1).
+    MetadataSnapshot,
+    /// The shared-WAL reap (demux-floor) checkpoint (`reap.ckpt`, #597).
+    SharedWalReap,
+    /// The subject->stream binding-table checkpoint (`bindings.ckpt`, #1106).
+    Bindings,
+    /// The geo/leaf origin-replication cursor checkpoint (`OriginCursorStore`, cluster).
+    GeoCursor,
+}
+
+impl CheckpointArtifact {
+    /// Every artifact in a fixed order; the index into the damage-counter array. Append-only.
+    pub const ALL: [CheckpointArtifact; 8] = [
+        CheckpointArtifact::Cursor,
+        CheckpointArtifact::Attempts,
+        CheckpointArtifact::Counters,
+        CheckpointArtifact::ProducerSeq,
+        CheckpointArtifact::MetadataSnapshot,
+        CheckpointArtifact::SharedWalReap,
+        CheckpointArtifact::Bindings,
+        CheckpointArtifact::GeoCursor,
+    ];
+
+    /// This artifact's index into [`CheckpointArtifact::ALL`]. A total match in `ALL` order, so it is
+    /// infallible and stays in sync with the array.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            CheckpointArtifact::Cursor => 0,
+            CheckpointArtifact::Attempts => 1,
+            CheckpointArtifact::Counters => 2,
+            CheckpointArtifact::ProducerSeq => 3,
+            CheckpointArtifact::MetadataSnapshot => 4,
+            CheckpointArtifact::SharedWalReap => 5,
+            CheckpointArtifact::Bindings => 6,
+            CheckpointArtifact::GeoCursor => 7,
+        }
+    }
+
+    /// The frozen Prometheus `artifact` label value.
+    #[must_use]
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            CheckpointArtifact::Cursor => "cursor",
+            CheckpointArtifact::Attempts => "attempts",
+            CheckpointArtifact::Counters => "counters",
+            CheckpointArtifact::ProducerSeq => "producer_seq",
+            CheckpointArtifact::MetadataSnapshot => "metadata_snapshot",
+            CheckpointArtifact::SharedWalReap => "shared_wal_reap",
+            CheckpointArtifact::Bindings => "bindings",
+            CheckpointArtifact::GeoCursor => "geo_cursor",
+        }
+    }
+}
+
+/// The process-wide, monotonic `ironbus_checkpoint_damaged_total{artifact}` counter store (#1142),
+/// one cell per [`CheckpointArtifact`]. Damage is detected at OPEN time, spread across several crates
+/// (the engine, the shared WAL, the cluster origin cursors, the metadata store), so a process-global
+/// is the low-coupling place to accumulate it without threading a return through every open signature;
+/// it is exactly Prometheus counter semantics (a monotonic, process-lifetime total for the one broker
+/// this process is). It is NOT part of any durable snapshot, so the on-disk formats are unchanged.
+// Eight explicit cells (MSRV 1.78 predates inline-const array repeat).
+static CHECKPOINT_DAMAGED: [core::sync::atomic::AtomicU64; CheckpointArtifact::ALL.len()] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Records one externally-damaged-checkpoint detection for `artifact`, bumping the monotonic
+/// `ironbus_checkpoint_damaged_total{artifact}` counter (#1142). Saturating; safe to call from any
+/// crate/thread on the recovery-read path.
+pub fn record_checkpoint_damage(artifact: CheckpointArtifact) {
+    CHECKPOINT_DAMAGED[artifact.index()].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current `ironbus_checkpoint_damaged_total{artifact}` value for `artifact` (#1142), for the
+/// `/metrics` render and tests.
+#[must_use]
+pub fn checkpoint_damaged_total(artifact: CheckpointArtifact) -> u64 {
+    CHECKPOINT_DAMAGED[artifact.index()].load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resets the damage counters to zero. Test-only: the store is a process-global, so a test that
+/// asserts an ABSOLUTE damage count resets first (parallel tests otherwise accumulate). Prefer a
+/// read-delta assertion where possible.
+#[cfg(test)]
+pub fn reset_checkpoint_damage() {
+    for cell in &CHECKPOINT_DAMAGED {
+        cell.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CAP> {
     /// Bytes per slot for this cap: sequence, payload length, payload, CRC.
     const SLOT_LEN: usize = SLOT_OVERHEAD + PAYLOAD_CAP;
     /// The whole checkpoint file is two slots.
     const FILE_LEN: u64 = (Self::SLOT_LEN * 2) as u64;
 
-    /// Opens a checkpoint file, reading both slots to recover the latest durable value.
-    /// A fresh (zeroed or short) file recovers nothing. Returns the checkpoint plus the
-    /// recovered payload, if any.
+    /// Opens a checkpoint file, reading both slots to CLASSIFY it (#1142): the higher-sequence valid
+    /// slot recovers as [`RecoveredCheckpoint::Valid`]; a fresh/absent/short file — or a torn first
+    /// write with no valid sibling — recovers as [`RecoveredCheckpoint::Empty`]; and a file whose BOTH
+    /// slots carry a nonzero sequence yet BOTH fail their CRC recovers as [`RecoveredCheckpoint::Damaged`]
+    /// (provable external damage — impossible from any crash, since a write touches one slot).
     ///
     /// The caller owns the file's existence: it must create the file (e.g. via
     /// [`crate::fs::Filesystem::create_new`]) and fsync the parent directory (so the file
@@ -231,7 +424,7 @@ impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CA
     /// Propagates an IO error.
     pub fn open(
         file: F,
-    ) -> Result<(SlotCheckpoint<F, PAYLOAD_CAP>, Option<Vec<u8>>), StorageError> {
+    ) -> Result<(SlotCheckpoint<F, PAYLOAD_CAP>, RecoveredCheckpoint), StorageError> {
         let slot_len = Self::SLOT_LEN;
         let len = file.len()?;
         let mut buf = vec![0u8; slot_len * 2];
@@ -240,26 +433,42 @@ impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CA
         }
         let a = decode_slot::<PAYLOAD_CAP>(&buf[0..slot_len]);
         let b = decode_slot::<PAYLOAD_CAP>(&buf[slot_len..slot_len * 2]);
-        // The higher valid sequence wins.
+        // Whether each slot was WRITTEN-but-invalid, captured before the by-value match consumes them.
+        // Both slots corrupt is the external-damage signature (see below).
+        let both_corrupt = matches!(a, SlotDecode::Corrupt) && matches!(b, SlotDecode::Corrupt);
+        // The higher valid sequence wins; a torn slot with a valid sibling recovers the sibling.
         let best = match (a, b) {
-            (Some((sa, pa)), Some((sb, pb))) => {
+            (SlotDecode::Valid(sa, pa), SlotDecode::Valid(sb, pb)) => {
                 if sa >= sb {
                     Some((sa, pa))
                 } else {
                     Some((sb, pb))
                 }
             }
-            (Some(x), None) | (None, Some(x)) => Some(x),
-            (None, None) => None,
+            (SlotDecode::Valid(s, p), _) | (_, SlotDecode::Valid(s, p)) => Some((s, p)),
+            _ => None,
         };
-        let (next_seq, payload) = match best {
-            Some((seq, payload)) => (
+        let (next_seq, recovered) = if let Some((seq, payload)) = best {
+            (
                 seq.checked_add(1).ok_or(StorageError::SegmentFull)?,
-                Some(payload),
-            ),
-            None => (1, None),
+                RecoveredCheckpoint::Valid(payload),
+            )
+        } else {
+            // No valid slot. Each `write` touches exactly one slot (`slot = seq % 2`), so a crash
+            // tears AT MOST one slot while its sibling stays durable-valid or zero-sequence. Both
+            // slots carrying a nonzero sequence yet both failing CRC is therefore IMPOSSIBLE from any
+            // crash — it is provable external damage (bit rot / a lost extent), and is distinguishable
+            // from a fresh/absent file or a torn first write (one corrupt slot, one still zero-seq),
+            // which stay `Empty`. Damage recovers as empty here too (the caller surfaces it loudly);
+            // `next_seq` starts at 1 so the next two writes heal both slots.
+            let recovered = if both_corrupt {
+                RecoveredCheckpoint::Damaged
+            } else {
+                RecoveredCheckpoint::Empty
+            };
+            (1, recovered)
         };
-        Ok((SlotCheckpoint { file, next_seq }, payload))
+        Ok((SlotCheckpoint { file, next_seq }, recovered))
     }
 
     /// Durably writes a new checkpoint payload (fsync). The previous value remains intact
@@ -296,7 +505,10 @@ mod tests {
     const CHECKPOINT_LEN: u64 = (SLOT_LEN * 2) as u64;
 
     fn decode_slot(slot: &[u8]) -> Option<(u64, Vec<u8>)> {
-        super::decode_slot::<MAX_PAYLOAD>(slot)
+        match super::decode_slot::<MAX_PAYLOAD>(slot) {
+            SlotDecode::Valid(seq, payload) => Some((seq, payload)),
+            SlotDecode::Empty | SlotDecode::Corrupt => None,
+        }
     }
 
     fn encode_slot(seq: u64, payload: &[u8]) -> Vec<u8> {
@@ -308,6 +520,12 @@ mod tests {
     }
 
     fn reopen(file: &Arc<InMemoryFile>) -> Option<Vec<u8>> {
+        let cp: (Checkpoint<Arc<InMemoryFile>>, _) = Checkpoint::open(Arc::clone(file)).unwrap();
+        cp.1.into_option()
+    }
+
+    /// The tri-state classification a reopen produces, for the #1142 damage tests.
+    fn reopen_state(file: &Arc<InMemoryFile>) -> RecoveredCheckpoint {
         let cp: (Checkpoint<Arc<InMemoryFile>>, _) = Checkpoint::open(Arc::clone(file)).unwrap();
         cp.1
     }
@@ -321,7 +539,7 @@ mod tests {
     fn write_then_reopen_round_trips() {
         let file = fresh();
         let (mut cp, recovered) = Checkpoint::open(Arc::clone(&file)).unwrap();
-        assert_eq!(recovered, None);
+        assert_eq!(recovered, RecoveredCheckpoint::Empty);
         cp.write(b"hello").unwrap();
         assert_eq!(reopen(&file), Some(b"hello".to_vec()));
     }
@@ -372,19 +590,116 @@ mod tests {
     }
 
     #[test]
-    fn both_slots_torn_recovers_nothing() {
+    fn both_slots_corrupt_is_detected_as_external_damage() {
+        // Both slots carry a nonzero sequence (seq 1 and seq 2) yet both fail CRC. A crash tears at
+        // most one slot, so this is IMPOSSIBLE from any crash — it is provable external damage (#1142).
+        // It is DETECTED as `Damaged` (distinct from a fresh file's `Empty`) yet still recovers as
+        // empty via `into_option`, preserving the pre-#1142 control flow.
         let file = fresh();
         let (mut cp, _) = Checkpoint::open(Arc::clone(&file)).unwrap();
-        cp.write(b"a").unwrap();
-        cp.write(b"b").unwrap();
+        cp.write(b"a").unwrap(); // seq 1 -> slot 1
+        cp.write(b"b").unwrap(); // seq 2 -> slot 0
         let mut bytes = file.snapshot();
-        // Corrupt a payload byte in both slots.
+        // Corrupt a CRC-covered payload byte in BOTH slots.
         bytes[SEQ_LEN + LEN_LEN] ^= 0xff;
         bytes[SLOT_LEN + SEQ_LEN + LEN_LEN] ^= 0xff;
         file.set_len(0).unwrap();
         file.write_all_at(&bytes, 0).unwrap();
         file.sync_data().unwrap();
-        assert_eq!(reopen(&file), None);
+        assert_eq!(reopen_state(&file), RecoveredCheckpoint::Damaged);
+        assert_eq!(reopen(&file), None, "damage still recovers as empty");
+    }
+
+    #[test]
+    fn a_torn_first_write_is_empty_not_damaged() {
+        // The crash-model corner the loose "any corrupt slot" rule would false-alarm on: the FIRST
+        // write (seq 1 -> slot 1) is torn by a crash, leaving slot 1 corrupt and slot 0 still
+        // zero-sequence (never written). This is a LEGITIMATE crash outcome, so it MUST classify as
+        // `Empty`, NOT `Damaged` — else a real power loss during the first checkpoint would raise a
+        // false external-damage alarm (#1142).
+        let file = fresh();
+        let (mut cp, _) = Checkpoint::open(Arc::clone(&file)).unwrap();
+        cp.write(b"only").unwrap(); // seq 1 -> slot 1; slot 0 stays all-zero
+        let mut bytes = file.snapshot();
+        // Corrupt slot 1 (the only written slot); slot 0 remains zero-sequence.
+        bytes[SLOT_LEN + SEQ_LEN + LEN_LEN] ^= 0xff;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(
+            reopen_state(&file),
+            RecoveredCheckpoint::Empty,
+            "a torn first write with a zero-seq sibling is Empty, never Damaged"
+        );
+    }
+
+    #[test]
+    fn a_torn_single_slot_with_a_valid_sibling_is_valid_not_damaged() {
+        // Two durable writes, then ONE slot torn (the crash model's at-most-one-torn invariant). The
+        // valid sibling must recover as `Valid` — never `Damaged` — so a real crash never trips the
+        // external-damage signal.
+        let file = fresh();
+        let (mut cp, _) = Checkpoint::open(Arc::clone(&file)).unwrap();
+        cp.write(b"first").unwrap(); // seq 1 -> slot 1
+        cp.write(b"second").unwrap(); // seq 2 -> slot 0
+        let mut bytes = file.snapshot();
+        bytes[SEQ_LEN + LEN_LEN] ^= 0xff; // corrupt only slot 0 (the newest)
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(
+            reopen_state(&file),
+            RecoveredCheckpoint::Valid(b"first".to_vec()),
+            "a torn single slot recovers its valid sibling, never Damaged"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_fresh_file_is_empty_not_damaged() {
+        // A brand-new (absent/zero-length) file, and a freshly-created zero-seq file, both classify
+        // as `Empty` with no warning — the never-false-alarm floor.
+        assert_eq!(reopen_state(&fresh()), RecoveredCheckpoint::Empty);
+        let file = fresh();
+        // Materialize a full-size all-zero file (both slots zero-sequence), as create+truncate would.
+        file.write_all_at(&[0u8; SLOT_LEN * 2], 0).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(reopen_state(&file), RecoveredCheckpoint::Empty);
+    }
+
+    #[test]
+    fn the_damage_counter_is_bumped_per_artifact() {
+        // The `ironbus_checkpoint_damaged_total{artifact}` counter increments once per recorded
+        // damage, per artifact. A read-delta assertion, robust against the process-global being
+        // touched by other tests running in parallel.
+        let before = checkpoint_damaged_total(CheckpointArtifact::Bindings);
+        record_checkpoint_damage(CheckpointArtifact::Bindings);
+        record_checkpoint_damage(CheckpointArtifact::Bindings);
+        assert_eq!(
+            checkpoint_damaged_total(CheckpointArtifact::Bindings),
+            before + 2
+        );
+        // Distinct artifacts count independently.
+        let cursor_before = checkpoint_damaged_total(CheckpointArtifact::Cursor);
+        record_checkpoint_damage(CheckpointArtifact::Cursor);
+        assert_eq!(
+            checkpoint_damaged_total(CheckpointArtifact::Cursor),
+            cursor_before + 1
+        );
+    }
+
+    #[test]
+    fn every_artifact_label_is_distinct_and_indexed() {
+        // The frozen taxonomy invariant: `ALL` order matches `index()`, and every label is unique.
+        for (i, artifact) in CheckpointArtifact::ALL.iter().enumerate() {
+            assert_eq!(artifact.index(), i);
+        }
+        let mut labels: Vec<&str> = CheckpointArtifact::ALL
+            .iter()
+            .map(|a| a.metric_label())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), CheckpointArtifact::ALL.len());
     }
 
     #[test]
@@ -488,9 +803,16 @@ mod tests {
             file.write_all_at(&bytes, 0).unwrap();
             file.sync_data().unwrap();
 
-            // open must not panic; whatever it returns must be a value we actually wrote.
+            // open must not panic; whatever it returns must be a value we actually wrote, and a
+            // SINGLE-byte flip must NEVER classify as external Damage — a lone flip corrupts at most
+            // one slot, so the crash-model invariant (both-slots-corrupt is impossible from a crash)
+            // holds and no false damage alarm can fire (#1142).
             let recovered = Checkpoint::open(Arc::clone(&file)).unwrap().1;
-            if let Some(payload) = recovered {
+            prop_assert!(
+                !recovered.is_damaged(),
+                "a single-byte flip must not be classified as external damage",
+            );
+            if let Some(payload) = recovered.into_option() {
                 prop_assert!(
                     payloads.iter().any(|p| p == &payload),
                     "fabricated a payload never written: {payload:?}",
@@ -506,11 +828,11 @@ mod tests {
     fn a_counters_checkpoint_round_trips_a_full_size_payload() {
         let file = fresh();
         let (mut cp, recovered) = CountersCheckpoint::open(Arc::clone(&file)).unwrap();
-        assert_eq!(recovered, None);
+        assert_eq!(recovered, RecoveredCheckpoint::Empty);
         let payload = vec![0x42; COUNTERS_PAYLOAD];
         cp.write(&payload).unwrap();
         let reopened = CountersCheckpoint::open(Arc::clone(&file)).unwrap().1;
-        assert_eq!(reopened, Some(payload));
+        assert_eq!(reopened.into_option(), Some(payload));
     }
 
     #[test]
@@ -540,7 +862,10 @@ mod tests {
         assert_eq!(bytes.len(), counters_slot_len * 2);
         // Recovery regresses to the previous durable value, never a torn one.
         assert_eq!(
-            CountersCheckpoint::open(Arc::clone(&file)).unwrap().1,
+            CountersCheckpoint::open(Arc::clone(&file))
+                .unwrap()
+                .1
+                .into_option(),
             Some(vec![1u8; COUNTERS_PAYLOAD])
         );
     }
@@ -548,7 +873,13 @@ mod tests {
     #[test]
     fn a_fresh_counters_checkpoint_recovers_nothing() {
         let file = fresh();
-        assert_eq!(CountersCheckpoint::open(Arc::clone(&file)).unwrap().1, None);
+        assert_eq!(
+            CountersCheckpoint::open(Arc::clone(&file))
+                .unwrap()
+                .1
+                .into_option(),
+            None
+        );
     }
 
     // The attempt-count checkpoint (#358) reuses the identical dual-slot crash-safe machinery with
@@ -559,11 +890,11 @@ mod tests {
     fn an_attempts_checkpoint_round_trips_a_full_size_payload() {
         let file = fresh();
         let (mut cp, recovered) = AttemptsCheckpoint::open(Arc::clone(&file)).unwrap();
-        assert_eq!(recovered, None);
+        assert_eq!(recovered, RecoveredCheckpoint::Empty);
         let payload = vec![0x42; ATTEMPTS_PAYLOAD];
         cp.write(&payload).unwrap();
         let reopened = AttemptsCheckpoint::open(Arc::clone(&file)).unwrap().1;
-        assert_eq!(reopened, Some(payload));
+        assert_eq!(reopened.into_option(), Some(payload));
     }
 
     #[test]
@@ -591,7 +922,10 @@ mod tests {
         file.sync_data().unwrap();
         // Recovery regresses to the previous durable value, never a torn one.
         assert_eq!(
-            AttemptsCheckpoint::open(Arc::clone(&file)).unwrap().1,
+            AttemptsCheckpoint::open(Arc::clone(&file))
+                .unwrap()
+                .1
+                .into_option(),
             Some(vec![1u8; 64])
         );
     }
@@ -611,7 +945,8 @@ mod tests {
             let f = DirectFile::create_new(&path).unwrap();
             let (mut cp, recovered) = Checkpoint::open(f).unwrap();
             assert_eq!(
-                recovered, None,
+                recovered,
+                RecoveredCheckpoint::Empty,
                 "a fresh direct-mode checkpoint recovers nothing"
             );
             // Several alternating-slot writes: each slot write RMWs the shared boundary block.
@@ -624,7 +959,7 @@ mod tests {
         let (_cp, recovered) = Checkpoint::open(g).unwrap();
         assert_eq!(
             recovered,
-            Some(b"five".to_vec()),
+            RecoveredCheckpoint::Valid(b"five".to_vec()),
             "direct-mode checkpoint recovers the latest value"
         );
     }
