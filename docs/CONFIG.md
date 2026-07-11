@@ -211,6 +211,7 @@ Also still deferred are the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which
 | `segment_size` | `--max-segment-bytes` / `IRONBUS_MAX_SEGMENT_BYTES` | u64 | `67108864` (64 MiB, `DEFAULT_MAX_SEGMENT_BYTES`) | bytes | `>= 4096` (`MIN_MAX_SEGMENT_BYTES`) | COLD (coupled with `segment_roll`) |
 | `data_dir` | `--data-dir` / `IRONBUS_DATA_DIR` | path | required (no default) | path | a writable directory; created 0700 if absent, probe-write verified (#89) | COLD |
 | `max_total_bytes` | `--max-total-bytes` / `IRONBUS_MAX_TOTAL_BYTES` | u64 | `0` = unlimited (`DEFAULT_MAX_TOTAL_BYTES`) | bytes | `0` (off) or any u64 | HOT |
+| `tindex_stride_records` | `--tindex-stride-records` / `IRONBUS_TINDEX_STRIDE_RECORDS` | u32 | `1024` (`DEFAULT_TINDEX_STRIDE_RECORDS`) | records | any u32; clamped up to `1` | HOT (applies to segments sealed after the change; a derived, rebuildable accelerator) |
 | `segment_roll` | SPECIFIED-NOT-YET-A-FIELD | duration | `0` = size-only (specified) | duration (`{ms,s,m,h,d}`) | `0` (off) or a positive duration | COLD (coupled with `segment_size`) |
 | (no file key: flag/env ONLY) | `--storage` / `IRONBUS_STORAGE` | enum | `disk` (`DEFAULT_STORAGE`) | -- | `disk \| memory` (#443) | COLD (the backend is an open-time decision) |
 | (no file key: flag/env ONLY) | `--ephemeral-loss-ack` / `IRONBUS_EPHEMERAL_LOSS_ACK` | bool | `false` | -- | `true` to permit `--storage memory` | COLD (coupled with the backend) |

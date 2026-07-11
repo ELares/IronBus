@@ -2535,6 +2535,8 @@ impl Client {
         start_offset: u64,
         max_records: u32,
         max_bytes: u64,
+        start_time_ms: Option<u64>,
+        end_time_ms: Option<u64>,
     ) -> Result<usize, ClientError> {
         let max_records = match self.negotiated_credit {
             Some(credit) => max_records.min(credit),
@@ -2544,6 +2546,8 @@ impl Client {
             start_offset,
             max_records,
             max_bytes,
+            start_time_ms,
+            end_time_ms,
         };
         let mut body = Vec::new();
         encode_stream_fetch(&req, &mut body);
@@ -2599,7 +2603,33 @@ impl Client {
         max_records: u32,
         max_bytes: u64,
     ) -> Result<Fetch, ClientError> {
-        let limit = self.send_stream_fetch(start_offset, max_records, max_bytes)?;
+        let limit = self.send_stream_fetch(start_offset, max_records, max_bytes, None, None)?;
+        self.read_stream_fetch_response(limit)
+    }
+
+    /// STREAMING (Tier-S) SEEK-BY-TIME fetch (#772): the wall-clock twin of [`Client::stream_fetch`].
+    /// Instead of a consumer-managed offset, delivery begins at the FIRST record whose producer
+    /// timestamp is at or after `start_time_ms` (milliseconds since the Unix epoch), resolved off the
+    /// broker's sparse per-segment `.tindex`, and is OPTIONALLY bounded above by `end_time_ms`
+    /// (exclusive) for a `[start, end)` time-window replay. This reaches NATS `JetStream`
+    /// `DeliverByStartTime` / Kafka `offsetsForTimes` parity. The resolution is offset-authoritative
+    /// and exact versus a full scan even for non-monotonic producer timestamps; a `start_time_ms`
+    /// older than the earliest retained record clamps to the earliest offset, and one newer than
+    /// every record starts at the tail. `max_records` / `max_bytes` bound the batch exactly as
+    /// [`Client::stream_fetch`]. Settle by offset via [`Client::stream_commit`], never [`Client::ack`].
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error (the group is not streaming, or the
+    /// connection did not negotiate Tier-S), or a server that streams more frames than the cap.
+    pub fn stream_fetch_by_time(
+        &mut self,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+        max_records: u32,
+        max_bytes: u64,
+    ) -> Result<Fetch, ClientError> {
+        let limit =
+            self.send_stream_fetch(0, max_records, max_bytes, Some(start_time_ms), end_time_ms)?;
         self.read_stream_fetch_response(limit)
     }
 
@@ -3919,6 +3949,8 @@ impl StreamingConsumer<'_> {
                 self.next_offset,
                 self.window_records(),
                 self.config.max_bytes,
+                None,
+                None,
             )?;
             self.prefetch = Some(limit);
         }
@@ -9019,6 +9051,7 @@ toYtkjmdU2eQ2pK/3gM=
                 start_offset: 0,
                 max_records: 1_000,
                 max_bytes: 0,
+                ..StreamFetchBody::default()
             },
             &mut body,
         );

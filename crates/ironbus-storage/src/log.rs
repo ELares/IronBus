@@ -15,7 +15,7 @@ use crate::cold::{
 use crate::fs::Filesystem;
 use crate::io::{InMemoryFile, RandomAccessFile};
 use crate::loss::{LossEvent, LossReport, ReasonCode};
-use crate::naming::{segment_file_name, segment_ids};
+use crate::naming::{segment_file_name, segment_ids, segment_tindex_name};
 use crate::read_plane::{ReadPlane, SealedSegment};
 use crate::segment::{
     OwnedRecord, RawByteRun, RecoveryScan, SegmentReader, SegmentWriter, StorageError,
@@ -107,6 +107,19 @@ pub struct LogConfig {
     /// write of the day (the append-on-empty rule that keeps an oversized first record from wedging
     /// the log applies here too), so the broker always makes some daily progress.
     pub daily_physical_write_budget_bytes: u64,
+
+    /// The density of the per-sealed-segment `.tindex` timestamp -> offset index (#772): one sparse
+    /// `(offset, prefix-max timestamp)` anchor is written per this many records. A seek-by-time
+    /// binary-searches the anchors then forward-scans at most this many records to the exact offset,
+    /// so this is a pure memory/latency trade: SMALLER anchors more records (a shorter forward scan,
+    /// a larger sidecar), LARGER fewer (a longer scan, a tinier sidecar). It never affects
+    /// correctness (a seek matches a full scan for any value) or durability (the `.tindex` is a
+    /// derived, rebuildable accelerator, never a durability dependency), and it does NOT change the
+    /// segment `.log` bytes, so a default consume is byte-identical regardless of this value.
+    /// Clamped up to 1 (a `0` cannot anchor every record). Changing it takes effect for segments
+    /// sealed AFTER the change; older sidecars keep their built-in density until rebuilt or reaped.
+    /// [`LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS`] (1024) is the safe default.
+    pub tindex_stride_records: u32,
 }
 
 impl LogConfig {
@@ -118,6 +131,15 @@ impl LogConfig {
     /// is bounded out of the box; an operator can lower it (for a tiny edge disk) or set `0` to
     /// disable the cap entirely.
     pub const DEFAULT_MAX_QUARANTINE_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// The default `.tindex` density (#772): one sparse timestamp anchor per 1024 records. A
+    /// seek-by-time forward-scans at most ~1024 records past the anchor (microseconds), and the
+    /// sidecar holds `ceil(record_count / 1024)` 16-byte anchors — e.g. a densely packed segment of
+    /// ~233k small records needs ~228 anchors (~3.6 KiB), negligible next to the segment. Mirrors
+    /// the offset index's sparse `SEGMENT_INDEX_STRIDE_BYTES` philosophy (a bounded accelerator,
+    /// rebuilt from the durable frames), keyed by record count rather than bytes so the forward
+    /// scan is bounded in RECORDS.
+    pub const DEFAULT_TINDEX_STRIDE_RECORDS: u32 = 1024;
 
     /// The smallest sane `max_segment_bytes`: the segment header and footer plus room for at
     /// least two minimum-size records, so a segment can always hold more than one record. A
@@ -149,6 +171,7 @@ impl LogConfig {
             max_quarantine_bytes: LogConfig::DEFAULT_MAX_QUARANTINE_BYTES,
             // The daily physical write budget is OFF by default; an operator opts in (#118).
             daily_physical_write_budget_bytes: 0,
+            tindex_stride_records: LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS,
         })
     }
 
@@ -182,6 +205,16 @@ impl LogConfig {
     #[must_use]
     pub fn with_daily_physical_write_budget_bytes(mut self, budget: u64) -> LogConfig {
         self.daily_physical_write_budget_bytes = budget;
+        self
+    }
+
+    /// Sets the `.tindex` density ([`LogConfig::tindex_stride_records`]) and returns the updated
+    /// config. Clamped up to 1. A pure memory/latency trade over the seek-by-time accelerator; it
+    /// never affects correctness, durability, or the segment `.log` bytes. Most callers keep the
+    /// [`LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS`] default.
+    #[must_use]
+    pub fn with_tindex_stride_records(mut self, stride: u32) -> LogConfig {
+        self.tindex_stride_records = stride.max(1);
         self
     }
 }
@@ -226,6 +259,8 @@ impl Default for LogConfig {
             // The daily physical write budget is OFF by default (#118): existing behavior is
             // unchanged unless an operator opts in to the flash-wear governor.
             daily_physical_write_budget_bytes: 0,
+            // The safe default seek-by-time index density (#772): one anchor per 1024 records.
+            tindex_stride_records: LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS,
         }
     }
 }
@@ -637,6 +672,11 @@ impl CompactedIndex {
     }
 }
 
+/// A shared, resident sparse `.tindex` anchor list (#772): the ascending `(offset, exclusive
+/// prefix-max timestamp)` anchors for ONE sealed segment, behind an `Arc` so a `&self` seek clones it
+/// out of the resident cache and scans without holding the `RefCell` borrow.
+type ResidentTimeIndex = std::sync::Arc<Vec<(u64, u64)>>;
+
 /// The default number of opened SEALED-segment readers the through-actor `Log` keeps resident (#808).
 /// Each entry is one fd + a validated header; the cache is FIFO-bounded so a retention-off cold full
 /// scan opens-and-reuses a working set instead of leaking one fd per sealed segment. 256 sits well under
@@ -843,6 +883,31 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// and caches an entry behind a `RefCell`, holding only derived data (dropping or rebuilding it
     /// changes nothing a reader observes — same survivors, same CRC validation).
     compacted_indexes: std::cell::RefCell<std::collections::HashMap<u64, CompactedIndex>>,
+    /// The RESIDENT, per-OPEN-SEALED-segment SPARSE timestamp -> offset anchors keyed by segment id
+    /// (#772): the parsed `.tindex` sidecar (or, when it is missing/torn/corrupt, the anchors
+    /// rebuilt from a segment scan), cached so a repeated seek-by-time over a hot sealed segment
+    /// loads once. Each value is the ascending `(offset, exclusive prefix-max timestamp)` anchor list
+    /// (see [`crate::tindex`]). Built lazily the first time a time seek consults the segment, and
+    /// EVICTED by the same [`Log::evict_segment_index`] retirement path that drops the offset index,
+    /// so a stale time index can never outlive its segment. Resident-only, derived data: dropping or
+    /// rebuilding it changes nothing a seek resolves (the on-disk `.tindex` and the segment frames
+    /// are the source of truth). An `Arc` so a `&self` seek can clone it out from behind the cell and
+    /// scan without holding the borrow.
+    time_indexes: std::cell::RefCell<std::collections::HashMap<u64, ResidentTimeIndex>>,
+    /// The ACTIVE (unsealed) segment's accumulating sparse time anchors (#772): the same
+    /// `(offset, exclusive prefix-max timestamp)` anchors [`crate::tindex::build_anchors`] would
+    /// produce, extended in lockstep as the active segment appends (like `segment_indexes`), so a
+    /// seek-by-time into the ACTIVE segment bounds its forward scan without scanning from the base.
+    /// In-memory ONLY (never written on seal — a sealed segment's `.tindex` is built lazily on the
+    /// first seek); reset for each new active segment by `install_started_segment`.
+    active_time_anchors: Vec<(u64, u64)>,
+    /// The base offset of the active segment `active_time_anchors` covers (its first anchor's offset).
+    active_time_anchor_base: u64,
+    /// Whether `active_time_anchors` covers the active segment FROM ITS BASE. `false` after a
+    /// recovery `resume` or a truncation (whose pre-existing prefix anchors were not reconstructed),
+    /// so an active-segment seek scans the whole readable range rather than trusting a partial anchor
+    /// set. `true` for a freshly started segment, the steady-state case.
+    active_time_anchors_complete: bool,
     /// The resident, FIFO-bounded cache of OPENED sealed-segment readers (#808): the through-actor read
     /// path (e.g. the Tier-W per-record poll, which reads `read_from(off, 1)` per delivered message)
     /// reuses one opened `SegmentReader` per sealed segment instead of re-opening (open+fstat+header-CRC)
@@ -1267,6 +1332,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // A fresh log has no compacted segment, so the sparse index map (#481) starts
                     // empty; it is filled lazily the first time a compacted slot is read.
                     compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+                    time_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+                    active_time_anchors: Vec::new(),
+                    active_time_anchor_base: 0,
+                    // Safe default: a segment reset by `install_started_segment` flips this to
+                    // `true`; a resumed (post-recovery) active segment leaves it `false` so its seal
+                    // skips a would-be-incomplete `.tindex` and a later seek rebuilds from frames.
+                    active_time_anchors_complete: false,
                     sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
                     // The off-actor read plane (#539) is built lazily on the first consumer
                     // `read_plane()` call; a never-read log pays nothing.
@@ -1662,6 +1734,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The compacted (sparse) seek index map (#481) is likewise resident-only: a reopen
             // rebuilds it lazily from the durable frames the first time a compacted slot is read.
             compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            time_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            active_time_anchors: Vec::new(),
+            active_time_anchor_base: 0,
+            active_time_anchors_complete: false,
             sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
@@ -2195,6 +2271,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The compacted (sparse) seek index map (#481) starts empty and is filled lazily on the
             // read path; the recovered chain may include compacted segments, indexed on first read.
             compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            time_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            active_time_anchors: Vec::new(),
+            active_time_anchor_base: 0,
+            active_time_anchors_complete: false,
             sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
@@ -2391,6 +2471,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 flushed_end: SEGMENT_HEADER_LEN as u64,
             },
         );
+        // Reset the ACTIVE segment's accumulating `.tindex` anchors (#772): a fresh segment starts
+        // empty and its anchors are COMPLETE from the base, so appends extend them in lockstep and a
+        // seek into the still-active segment bounds its scan. (A resumed post-recovery segment does
+        // NOT pass through here; it leaves its anchors incomplete so an active-segment seek scans.)
+        self.active_time_anchors = Vec::new();
+        self.active_time_anchor_base = base_offset.get();
+        self.active_time_anchors_complete = true;
     }
 
     /// The next FRESH segment id, strictly greater than any id ever used: `max(active_id, the
@@ -2443,6 +2530,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if let Some(idx) = self.segment_indexes.borrow_mut().get_mut(&self.active_id) {
             idx.flushed_end = idx.valid_end;
         }
+        // NOTE (#772): the `.tindex` timestamp sidecar is DELIBERATELY NOT written here on the roll.
+        // Writing a derived sidecar on the produce/roll hot path would add fsync + directory IO that
+        // perturbs the byte-identity, determinism, and fault-injection (op-counting) conformance
+        // gates over produce/recovery, and would make the on-disk image depend on whether a segment
+        // was produced in one run or resumed across a restart. Instead the sidecar is built and
+        // fsynced LAZILY the first time the segment is actually seeked by time (see
+        // [`Log::load_or_rebuild_tindex`]), from a deterministic scan of the durable frames — so a
+        // pure offset-only workload writes no sidecars and stays byte-identical to before the feature.
         // The segment footer is durable physical write volume (#118): `seal` wrote and fsynced the
         // 32-byte footer, so charge it to the wear total here (the per-record frames and this
         // segment's header were charged on append and `start_segment`).
@@ -3108,6 +3203,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             .next_offset
             .checked_next()
             .ok_or(StorageError::SegmentFull)?;
+        // Capture the writer's running max timestamp BEFORE this append: it is the EXCLUSIVE prefix
+        // max at this record's offset (the max over every record already in the segment), the value
+        // a `.tindex` anchor stores (#772). Captured on BOTH the encode and verbatim paths (the
+        // writer folds the timestamp in either way), so a follower-applied record is indexed too.
+        let time_max_before = self
+            .active
+            .as_ref()
+            .map_or(0, SegmentWriter::max_timestamp_ms);
         // Lay the record into the active segment (encode-and-checksum, or copy the already-validated
         // verbatim frame). Returns the assigned offset, the frame's start byte position, and its
         // encoded length — the seek-index maintenance below needs all three.
@@ -3142,6 +3245,21 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 } else {
                     indexes.remove(&self.active_id);
                 }
+            }
+        }
+        // EXTEND the active segment's in-memory `.tindex` anchors in lockstep (#772): anchor this
+        // record when it STARTS a new stride bucket (its index within the segment is a multiple of
+        // the density), carrying the exclusive prefix max captured above. These bound a seek into the
+        // still-ACTIVE segment; a SEALED segment's sidecar is (re)built from a scan on the first seek,
+        // and the (offset, prefix-max) shape here is byte-identical to that scan. Only while the
+        // anchors are COMPLETE from the base (a fresh segment); a resumed segment leaves this false so
+        // an active-segment seek scans.
+        if self.active_time_anchors_complete {
+            let stride = u64::from(self.config.tindex_stride_records.max(1));
+            let idx_in_segment = offset.get().saturating_sub(self.active_time_anchor_base);
+            if idx_in_segment % stride == 0 {
+                self.active_time_anchors
+                    .push((offset.get(), time_max_before));
             }
         }
         // Write-amplification accounting (#118), charged only after the append returned Ok (a failed
@@ -4829,6 +4947,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // The kept active segment's resident seek index must be rebuilt from the truncated bytes, so
         // evict any stale one (a later read rebuilds it). The dropped segments' indexes were evicted.
         self.evict_segment_index(last_id);
+        // The kept active segment was RESUMED over its truncated bytes (not started from its base),
+        // so its accumulating `.tindex` anchors are incomplete: reset them and mark incomplete so an
+        // active-segment seek scans rather than trusting a partial anchor set (#772).
+        self.active_time_anchors = Vec::new();
+        self.active_time_anchor_base = 0;
+        self.active_time_anchors_complete = false;
         // The truncation RETIRED the divergent suffix: republish the off-actor read plane so any
         // concurrent reader's snapshot drops the now-removed offsets and cannot seek into them.
         self.republish_read_plane();
@@ -5236,9 +5360,246 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     fn evict_segment_index(&mut self, id: u64) {
         self.segment_indexes.borrow_mut().remove(&id);
         self.compacted_indexes.borrow_mut().remove(&id);
+        // Drop the resident `.tindex` anchors for the retired segment in lockstep (#772): a rebuilt
+        // higher-id segment reloads from its own sidecar/frames, and ids never recycle (ADR 0002),
+        // so this only ever drops a now-gone segment's derived anchors. The retired segment's ON-DISK
+        // `.tindex` (if a prior seek wrote one) is deliberately NOT unlinked here: touching the
+        // filesystem on the reap/retire hot path would perturb the byte-identity and fault-injection
+        // (op-counting) gates, and a leftover sidecar is HARMLESS — segment enumeration matches only
+        // `.log`, ids never recycle, and a stale sidecar is rejected by the id/base/count cross-check
+        // on load. Orphaned sidecars are a tiny, offline-cleanable disk cost, never a correctness risk.
+        self.time_indexes.borrow_mut().remove(&id);
         // Drop the cached open reader (and its fd) for the retired segment in lockstep (#808), so a
         // reaped/compacted-away segment's fd is released, not leaked.
         self.sealed_readers.evict(id);
+    }
+
+    /// Rebuilds a sealed segment's sparse `.tindex` anchors from a validating scan of its durable
+    /// frames (#772), the deterministic source of truth for the sidecar. Used by
+    /// [`Log::load_or_rebuild_tindex`] on a missing/torn/stale sidecar.
+    fn rebuild_tindex_anchors(&self, id: u64) -> Result<Vec<(u64, u64)>, StorageError> {
+        let reader = SegmentReader::open(self.fs.open(&segment_file_name(id))?)?;
+        reader.time_anchors(self.config.tindex_stride_records)
+    }
+
+    /// The durable write of a `.tindex` sidecar: remove any stale file, create it fresh, write,
+    /// fsync the file, then fsync the directory so the new entry is crash-visible — the same
+    /// write-then-dir-sync discipline the segment/checkpoint writers use. Returns any IO error to
+    /// the (best-effort) caller.
+    fn write_tindex_file(&self, id: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        let name = segment_tindex_name(id);
+        // A leftover sidecar for this id cannot describe a DIFFERENT segment (ids never recycle,
+        // ADR 0002); remove it so `create_new` never fails on a stale file from a prior attempt.
+        let _ = self.fs.remove(&name);
+        let file = self.fs.create_new(&name)?;
+        file.write_all_at(bytes, 0)?;
+        file.sync_all()?;
+        self.fs.sync_dir()?;
+        Ok(())
+    }
+
+    /// Loads (or rebuilds) the resident SPARSE `.tindex` anchors for a SEALED ORDINARY (v1) segment
+    /// `slot`, for a seek-by-time (#772). Returns `None` for a COMPACTED (v2, sparse) segment (the
+    /// caller scans its covered range directly) and for the ACTIVE segment (its live anchors are
+    /// consulted separately). For a sealed ordinary segment it serves the resident cache, else tries
+    /// the on-disk `.tindex` (validating magic/version/CRC and that the segment id, base offset, and
+    /// record count match the slot), else REBUILDS from a validating segment scan — a missing, torn,
+    /// or stale sidecar is silently rebuilt, never an error and never trusted blindly. The result is
+    /// cached (an `Arc`, cloned out so the seek scans without holding the borrow).
+    ///
+    /// # Errors
+    /// Propagates only a genuine segment-read IO error from the rebuild scan (the segment itself is
+    /// unreadable); a bad/absent SIDECAR is handled by rebuilding, never surfaced.
+    fn segment_time_anchors(
+        &self,
+        slot: &SegmentSlot,
+    ) -> Result<Option<ResidentTimeIndex>, StorageError> {
+        if slot.compacted_covered.is_some() || slot.id == self.active_id {
+            return Ok(None);
+        }
+        if let Some(anchors) = self.time_indexes.borrow().get(&slot.id) {
+            return Ok(Some(std::sync::Arc::clone(anchors)));
+        }
+        let anchors = self.load_or_rebuild_tindex(slot)?;
+        let arc = std::sync::Arc::new(anchors);
+        self.time_indexes
+            .borrow_mut()
+            .insert(slot.id, std::sync::Arc::clone(&arc));
+        Ok(Some(arc))
+    }
+
+    /// Reads and validates the on-disk `.tindex` for `slot`, or rebuilds the anchors from a segment
+    /// scan when it is absent, unreadable, torn, corrupt, or stale (#772). Never trusts an
+    /// unvalidated sidecar and never fails on a bad one.
+    fn load_or_rebuild_tindex(&self, slot: &SegmentSlot) -> Result<Vec<(u64, u64)>, StorageError> {
+        if let Some(anchors) = self.try_load_tindex(slot) {
+            return Ok(anchors);
+        }
+        // Missing/torn/corrupt/stale sidecar: rebuild from the durable frames (the source of truth),
+        // then PERSIST the fresh `.tindex` LAZILY (best-effort) so the next seek and a restart load it
+        // instead of rescanning. Writing HERE (on the first time-seek) rather than on seal keeps the
+        // produce/roll hot path free of sidecar IO — an offset-only workload writes no sidecars and
+        // stays byte-identical — and the write is off the durability contract: a failure just leaves
+        // no sidecar and the next seek rebuilds again. The bytes are deterministic (the same scan on
+        // any node yields the same anchors), so a persisted sidecar is byte-identical across nodes.
+        let anchors = self.rebuild_tindex_anchors(slot.id)?;
+        let bytes = crate::tindex::encode(
+            slot.id,
+            slot.base_offset,
+            slot.record_count,
+            self.config.tindex_stride_records,
+            &anchors,
+        );
+        let _ = self.write_tindex_file(slot.id, &bytes);
+        Ok(anchors)
+    }
+
+    /// Attempts to read and fully validate `slot`'s on-disk `.tindex`, returning its anchors only
+    /// when the file is present, decodes cleanly (magic/version/CRC/structure), and its identifying
+    /// fields (segment id, base offset, record count) match the slot. Any other outcome — no file,
+    /// an IO error, a decode/CRC failure, or a staleness mismatch — is `None`, so the caller rebuilds
+    /// from the frames. The sidecar is thus a pure accelerator: it is used only when provably
+    /// consistent with the segment it sits beside.
+    fn try_load_tindex(&self, slot: &SegmentSlot) -> Option<Vec<(u64, u64)>> {
+        let file = self.fs.open(&segment_tindex_name(slot.id)).ok()?;
+        let len = usize::try_from(file.len().ok()?).ok()?;
+        // Guard against an absurd sidecar length before allocating.
+        if len == 0 || len > 256 * 1024 * 1024 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        file.read_exact_at(&mut buf, 0).ok()?;
+        let parsed = crate::tindex::decode(&buf)?;
+        if parsed.segment_id != slot.id
+            || parsed.base_offset != slot.base_offset
+            || parsed.record_count != slot.record_count
+        {
+            return None;
+        }
+        Some(parsed.anchors)
+    }
+
+    /// Resolves a wall-clock timestamp to the FIRST log offset whose record satisfies the time
+    /// predicate, for the streaming seek-by-time path (#772). With `at_or_after == true` it finds
+    /// the first offset whose producer timestamp is `>= time_ms` (a START seek, `DeliverByStartTime`
+    /// parity); with `at_or_after == false`, the first offset whose timestamp is `> time_ms` (an
+    /// EXCLUSIVE end bound, `[start, end)` replay).
+    ///
+    /// The result is OFFSET-AUTHORITATIVE and EXACT versus a full forward scan even for NON-MONOTONIC
+    /// producer timestamps (delayed messages, #555): the coarse per-segment `max_timestamp_ms` skips
+    /// whole segments that cannot contain a match, then the segment's sparse `.tindex` prefix-max
+    /// anchors bound the search to a single stride bucket, whose bounded forward read returns the
+    /// exact first match. Because the anchors carry the EXCLUSIVE PREFIX MAX (not a raw timestamp),
+    /// the anchor is a true lower bound — no matching record before it is ever skipped. The only
+    /// honest caveat is RETENTION: a match in a reaped segment is gone, so the seek resolves to the
+    /// earliest RETAINED matching offset (never below `earliest_offset`). When no retained record
+    /// satisfies the predicate the seek resolves to the FLUSHED frontier (the tail), so a consumer
+    /// starts where durable data ends and receives future matching records as they arrive.
+    ///
+    /// # Errors
+    /// Propagates an IO/segment error from reading a segment (the same errors `read_range` raises).
+    pub fn resolve_time_offset(
+        &self,
+        time_ms: u64,
+        at_or_after: bool,
+    ) -> Result<Offset, StorageError> {
+        let flushed = self.flushed_offset.get();
+        // A record's timestamp "meets" the predicate: `>= T` for a start seek, `> T` for an
+        // exclusive end bound. Monotone in the threshold, so the prefix-max anchor search is valid.
+        let meets = |ts: u64| {
+            if at_or_after {
+                ts >= time_ms
+            } else {
+                ts > time_ms
+            }
+        };
+        if flushed == 0 {
+            // An empty (or fully-unflushed) log: the tail is the earliest readable offset.
+            return Ok(Offset::new(flushed));
+        }
+        // Iterate segments in OFFSET order. Because segments are contiguous offset ranges, the first
+        // segment (by offset) that CAN contain a match holds the GLOBAL first match: every earlier
+        // segment was skipped because its max timestamp cannot meet the predicate.
+        for i in 0..self.segments.len() {
+            let slot = self.segments[i];
+            let base = slot.covered_base_offset();
+            if base >= flushed {
+                break; // this segment and every later one begins beyond the durable head
+            }
+            // The segment's max producer timestamp: the live writer max for the ACTIVE segment
+            // (its slot's stored max is stale/0 until sealed), else the slot's frozen max.
+            let seg_max = if slot.id == self.active_id {
+                self.active
+                    .as_ref()
+                    .map_or(0, SegmentWriter::max_timestamp_ms)
+            } else {
+                slot.max_timestamp_ms
+            };
+            if !meets(seg_max) {
+                continue; // no record in this segment can satisfy the predicate — skip it whole
+            }
+            if let Some(found) = self.resolve_time_in_segment(&slot, flushed, meets)? {
+                return Ok(found);
+            }
+            // The segment's max met the predicate but no READABLE (below-flushed) record did — the
+            // only matches sit in an unflushed tail. Fall through to later segments / the tail.
+        }
+        // No retained, readable record satisfies the predicate: resolve to the flushed frontier.
+        Ok(Offset::new(flushed))
+    }
+
+    /// Finds the first offset in ONE segment `slot` whose record satisfies `meets`, using the sparse
+    /// `.tindex` anchors to bound the forward scan to a single stride bucket, or scanning the
+    /// segment's readable range when there is no `.tindex` (a compacted or active segment). Returns
+    /// `None` when no readable (below `flushed`) record in the segment matches. The forward read
+    /// goes through `read_range`, so every returned record is fully CRC-validated and compacted
+    /// holes are skipped exactly as a normal consume would.
+    fn resolve_time_in_segment<M: Fn(u64) -> bool>(
+        &self,
+        slot: &SegmentSlot,
+        flushed: u64,
+        meets: M,
+    ) -> Result<Option<Offset>, StorageError> {
+        let base = slot.covered_base_offset();
+        // The exclusive readable end of this segment: its dense end for an ordinary sealed segment,
+        // its covered end for a compacted one, and the flushed frontier for the active segment (whose
+        // stored count is 0). Always clamped to `flushed` so the scan never targets an unflushed frame.
+        let seg_end = if slot.id == self.active_id {
+            flushed
+        } else if let Some(cover) = slot.compacted_covered {
+            cover.covered_end_offset.min(flushed)
+        } else {
+            base.saturating_add(slot.record_count).min(flushed)
+        };
+        if seg_end <= base {
+            return Ok(None);
+        }
+        // Determine the bounded window `[scan_from, scan_bound)` the first match must lie in.
+        let (scan_from, scan_bound) =
+            if slot.id == self.active_id && self.active_time_anchors_complete {
+                crate::tindex::scan_window(&self.active_time_anchors, base, seg_end, &meets)
+            } else if let Some(anchors) = self.segment_time_anchors(slot)? {
+                crate::tindex::scan_window(&anchors, base, seg_end, &meets)
+            } else {
+                // No anchors (a compacted segment, or a resumed active one): scan the whole readable range.
+                (base, seg_end)
+            };
+        let scan_bound = scan_bound.min(seg_end);
+        if scan_bound <= scan_from {
+            return Ok(None);
+        }
+        let want = usize::try_from(scan_bound.saturating_sub(scan_from)).unwrap_or(usize::MAX);
+        // Read the bounded window (CRC-validated, compaction-hole-aware) and return the first match.
+        let records = self.read_range(Offset::new(scan_from), want, None)?;
+        for record in records {
+            if record.offset.get() >= scan_bound {
+                break;
+            }
+            if meets(record.timestamp_ms) {
+                return Ok(Some(record.offset));
+            }
+        }
+        Ok(None)
     }
 
     fn segment_index_for(&self, offset: u64) -> usize {
@@ -5521,6 +5882,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.segment_indexes.borrow_mut().clear();
     }
 
+    /// Drops EVERY cached `.tindex` anchor set, forcing the next seek-by-time to reload from the
+    /// on-disk sidecar (or rebuild from the frames). A test uses this to prove the reloaded /
+    /// rebuilt path resolves the same offset as the append-seeded one (#772).
+    #[cfg(test)]
+    fn clear_time_indexes(&self) {
+        self.time_indexes.borrow_mut().clear();
+    }
+
     /// Installs a deliberately CORRUPT seek index for segment `id` with ONE anchor pointing at a
     /// byte position WELL PAST the segment's records (`valid_end`), so a seek that consulted it would
     /// read nothing (the wrong, empty result) for every covered offset. A test installs this,
@@ -5752,6 +6121,274 @@ mod tests {
     fn read_back<G: Filesystem>(fs: &G, id: u64) -> Vec<OwnedRecord> {
         let file = fs.open(&segment_file_name(id)).unwrap();
         SegmentReader::open(file).unwrap().scan().unwrap().records
+    }
+
+    // ---- Seek-by-time (#772) ----
+
+    // The BRUTE-FORCE reference for a seek: the first READABLE offset (in `[earliest, flushed)`)
+    // whose timestamp meets the predicate, or the flushed frontier if none does. A full linear scan,
+    // the ground truth `resolve_time_offset` must equal for ANY (incl. non-monotonic) timestamps.
+    fn brute_first_offset_meeting<G: Filesystem, K: Clock, M: Fn(u64) -> bool>(
+        log: &Log<G, K>,
+        meets: M,
+    ) -> u64 {
+        let earliest = log.earliest_offset().get();
+        let flushed = log.flushed_offset().get();
+        if flushed <= earliest {
+            return flushed;
+        }
+        let span = usize::try_from(flushed - earliest).unwrap();
+        let records = log.read_range(Offset::new(earliest), span, None).unwrap();
+        for r in &records {
+            if meets(r.timestamp_ms) {
+                return r.offset.get();
+            }
+        }
+        flushed
+    }
+
+    // Assert `resolve_time_offset` equals the brute-force scan for BOTH the inclusive start seek
+    // (`ts >= t`) and the exclusive end bound (`ts > t`) across every probe time.
+    fn sweep_seek<G: Filesystem, K: Clock>(log: &Log<G, K>, probes: &[u64]) {
+        for &t in probes {
+            let start = log.resolve_time_offset(t, true).unwrap().get();
+            assert_eq!(
+                start,
+                brute_first_offset_meeting(log, |x| x >= t),
+                "start seek t={t}"
+            );
+            let end = log.resolve_time_offset(t, false).unwrap().get();
+            assert_eq!(
+                end,
+                brute_first_offset_meeting(log, |x| x > t),
+                "end seek t={t}"
+            );
+        }
+    }
+
+    // A non-monotonic producer-timestamp sequence (delayed messages, #555): values in [1,50] that
+    // rise and fall, spanning many small segments so the seek exercises coarse segment skipping,
+    // within-segment prefix-max anchoring, and the active-segment tail.
+    fn non_monotonic_timestamps() -> Vec<u64> {
+        (0..48u64).map(|i| ((i * 31 + 7) % 50) + 1).collect()
+    }
+
+    fn build_time_log(config: LogConfig, timestamps: &[u64]) -> Log<InMemoryFs, ManualClock> {
+        let mut log = open_mem(config);
+        for (i, &ts) in timestamps.iter().enumerate() {
+            log.append(&rec_at(ts, &[u8::try_from(i % 251).unwrap(); 16]))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        log
+    }
+
+    fn time_config() -> LogConfig {
+        // Small segments force many rolls (many sealed `.tindex` sidecars); a small stride gives
+        // several anchors per segment so the within-segment bucket search is exercised.
+        LogConfig {
+            max_segment_bytes: 300,
+            tindex_stride_records: 2,
+            ..LogConfig::default()
+        }
+    }
+
+    #[test]
+    fn seek_by_time_matches_brute_force_scan_incl_non_monotonic() {
+        let ts = non_monotonic_timestamps();
+        let log = build_time_log(time_config(), &ts);
+        let probes: Vec<u64> = (0..=52).collect();
+        // 1) Live log: sealed segments resolve from the anchors cached on seal, the active segment
+        //    from its in-memory append-seeded anchors.
+        sweep_seek(&log, &probes);
+        // 2) Drop the resident anchors so each sealed-segment seek RELOADS from its on-disk `.tindex`
+        //    and proves the persisted sidecar resolves identically.
+        log.clear_time_indexes();
+        sweep_seek(&log, &probes);
+    }
+
+    #[test]
+    fn seek_by_time_matches_after_reopen() {
+        let ts = non_monotonic_timestamps();
+        let log = build_time_log(time_config(), &ts);
+        let fs = log.into_filesystem();
+        // The `.tindex` sidecars are on disk beside the sealed segments; a reopen resolves across the
+        // restart from them (the resumed active segment falls back to a bounded scan).
+        let log = Log::open(fs, ManualClock::new(), time_config()).unwrap();
+        sweep_seek(&log, &(0..=52).collect::<Vec<_>>());
+    }
+
+    #[test]
+    // Test-controlled file names are always lowercase; the extension filter is exact by design.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    fn seek_by_time_rebuilds_from_missing_or_torn_tindex_without_error() {
+        for torn in [false, true] {
+            let ts = non_monotonic_timestamps();
+            let log = build_time_log(time_config(), &ts);
+            // Seek across the log to trigger the LAZY persist of every sealed segment's `.tindex`
+            // (the sidecar is written on the first time-seek, not on seal, #772).
+            sweep_seek(&log, &(0..=52).collect::<Vec<_>>());
+            let fs = log.into_filesystem();
+            // A `.tindex` MUST be present beside at least one sealed segment before we damage it.
+            let sidecars: Vec<String> = fs
+                .list()
+                .unwrap()
+                .into_iter()
+                .filter(|n| n.ends_with(".tindex"))
+                .collect();
+            assert!(
+                !sidecars.is_empty(),
+                "seal should have written `.tindex` sidecars"
+            );
+            for name in &sidecars {
+                fs.remove(name).unwrap();
+                if torn {
+                    // Replace with garbage: a bad magic/CRC must be treated as absent, never trusted.
+                    let f = fs.create_new(name).unwrap();
+                    f.write_all_at(b"not-a-tindex-at-all-really-garbage!!", 0)
+                        .unwrap();
+                }
+            }
+            // A missing/torn sidecar must REBUILD from the frames — never fail the open, never a wrong
+            // seek.
+            let log = Log::open(fs, ManualClock::new(), time_config()).unwrap();
+            sweep_seek(&log, &(0..=52).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn seek_by_time_active_segment_only() {
+        // A single (unsealed, active) segment: the seek resolves via the in-memory append-seeded
+        // anchors, still exactly matching a full scan for non-monotonic timestamps.
+        let ts = vec![10u64, 5, 30, 2, 50, 1, 40, 25, 5, 60];
+        let mut log = open_mem(LogConfig {
+            max_segment_bytes: 64 * 1024, // large: no roll, everything stays in the active segment
+            tindex_stride_records: 3,
+            ..LogConfig::default()
+        });
+        for (i, &t) in ts.iter().enumerate() {
+            log.append(&rec_at(t, &[u8::try_from(i).unwrap(); 8]))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.segment_index_count() >= 1);
+        sweep_seek(&log, &(0..=62).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seek_by_time_below_earliest_retained_clamps_to_earliest() {
+        let ts = non_monotonic_timestamps();
+        let mut log = build_time_log(time_config(), &ts);
+        // Reap the oldest sealed segments so the earliest retained offset rises above 0.
+        log.reap_oldest_forced().unwrap();
+        log.reap_oldest_forced().unwrap();
+        let earliest = log.earliest_offset().get();
+        assert!(
+            earliest > 0,
+            "a reap should have raised the earliest offset"
+        );
+        // Seeking to a time older than (or at) every RETAINED record resolves to the earliest
+        // retained offset — never below it — matching the brute-force scan over the retained window.
+        let resolved = log.resolve_time_offset(0, true).unwrap().get();
+        assert!(
+            resolved >= earliest,
+            "seek must never resolve below earliest retained"
+        );
+        // The full sweep still matches the brute-force scan over the RETAINED records (the reaped
+        // `.tindex` sidecars were cleaned up; the survivors rebuild/serve correctly).
+        sweep_seek(&log, &(0..=52).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seek_by_time_future_time_resolves_to_the_tail() {
+        let ts = non_monotonic_timestamps();
+        let log = build_time_log(time_config(), &ts);
+        // No record has a timestamp > 1000, so a start seek to a future time resolves to the tail
+        // (the flushed frontier), where a consumer awaits future matching records.
+        let flushed = log.flushed_offset().get();
+        assert_eq!(log.resolve_time_offset(1000, true).unwrap().get(), flushed);
+    }
+
+    #[test]
+    fn seek_by_time_end_bound_defines_a_time_window() {
+        // A `[start, end)` offset window resolved from `[start_time, end_time]` returns exactly the
+        // records a full scan filtered by time would, under these MONOTONIC timestamps.
+        let ts: Vec<u64> = (0..40u64).map(|i| i * 10).collect(); // 0,10,20,...,390 monotonic
+        let log = build_time_log(time_config(), &ts);
+        let start = log.resolve_time_offset(100, true).unwrap(); // first ts >= 100 -> offset 10
+        let end = log.resolve_time_offset(250, false).unwrap(); // first ts > 250 -> offset 26
+        assert_eq!(start.get(), 10);
+        assert_eq!(end.get(), 26);
+        // The window `[10, 26)` is exactly the records with 100 <= ts <= 250.
+        let want = usize::try_from(end.get() - start.get()).unwrap();
+        let records = log.read_range(start, want, None).unwrap();
+        for r in &records {
+            assert!(r.timestamp_ms >= 100 && r.timestamp_ms <= 250, "in-window");
+        }
+        assert_eq!(records.len(), 16); // offsets 10..=25
+    }
+
+    #[test]
+    // Test-controlled file names are always lowercase; the extension filter is exact by design.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    fn tindex_sidecars_sit_beside_sealed_segments_and_never_perturb_the_log() {
+        let ts = non_monotonic_timestamps();
+        // Seek by time so the LAZY `.tindex` sidecars are written (#772), then confirm each is a
+        // SEPARATE file that segment enumeration ignores (byte-identity of the log is preserved).
+        let log = build_time_log(time_config(), &ts);
+        sweep_seek(&log, &(0..=52).collect::<Vec<_>>());
+        let fs = log.into_filesystem();
+        let names = fs.list().unwrap();
+        let logs: Vec<&String> = names.iter().filter(|n| n.ends_with(".log")).collect();
+        let tindexes: Vec<&String> = names.iter().filter(|n| n.ends_with(".tindex")).collect();
+        assert!(
+            !tindexes.is_empty(),
+            "a seeked sealed segment must carry a `.tindex` sidecar"
+        );
+        // Segment enumeration matches ONLY `.log` files: a `.tindex` is never seen as a segment.
+        let ids = segment_ids(&fs).unwrap();
+        assert_eq!(ids.len(), logs.len());
+        // Reopen and read the whole log: the records are byte-identical regardless of the sidecars.
+        let log = Log::open(fs, ManualClock::new(), time_config()).unwrap();
+        let all = log.read_range(Offset::ZERO, ts.len(), None).unwrap();
+        assert_eq!(all.len(), ts.len());
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(r.timestamp_ms, ts[i]);
+        }
+    }
+
+    #[test]
+    fn tindex_density_config_bounds_the_sidecar_size() {
+        // A LARGER stride yields FEWER anchors for the same records (a pure size/latency trade), and
+        // the seek stays exact at every density.
+        let ts: Vec<u64> = (0..64u64).map(|i| (i * 13) % 40).collect();
+        for stride in [1u32, 4, 16, 1024] {
+            let cfg = LogConfig {
+                max_segment_bytes: 64 * 1024, // one segment, so one `.tindex` covers all records
+                tindex_stride_records: stride,
+                ..LogConfig::default()
+            };
+            let mut log = open_mem(cfg);
+            for (i, &t) in ts.iter().enumerate() {
+                log.append(&rec_at(t, &[u8::try_from(i).unwrap(); 8]))
+                    .unwrap();
+            }
+            // Force a seal so the `.tindex` is written, then verify the anchor count is bounded by
+            // ceil(record_count / stride) and the seek is still exact.
+            log.seal_active_segment().unwrap();
+            let anchors = log
+                .segment_time_anchors(&log.segments[0])
+                .unwrap()
+                .expect("sealed ordinary segment has anchors");
+            let expected_max = ts.len().div_ceil(stride as usize);
+            assert!(
+                anchors.len() <= expected_max,
+                "stride={stride}: {} anchors exceeds ceil({}/{stride})={expected_max}",
+                anchors.len(),
+                ts.len()
+            );
+            sweep_seek(&log, &(0..=42).collect::<Vec<_>>());
+        }
     }
 
     fn view(seq: u64, payload: &[u8]) -> RecordView<'_> {

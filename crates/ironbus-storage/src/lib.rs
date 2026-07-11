@@ -63,6 +63,11 @@ pub mod streamset;
 /// the SAFE T1 O_DIRECT tier's config surface + the network-durable-storage probe. See the module
 /// docs; the io-strategy itself lives in [`io::DirectFile`] behind [`io::MaybeDirectFile`].
 pub mod substrate;
+/// The per-sealed-segment timestamp -> offset SPARSE index sidecar (`.tindex`, #772): a derived,
+/// rebuildable accelerator that resolves a wall-clock seek to a starting offset in `O(log n)`. The
+/// on-disk format, the prefix-max sparse-anchor build, and the bounded-window seek resolution live
+/// here (pure, no IO); the seal/rebuild/read wiring is in [`log`].
+pub mod tindex;
 /// The durable transactional half-message store (`txn/` sub-log, V2-M8, #640 part 1/2): a second
 /// segmented [`log::Log`] (modeled on the `dlq/` sink) holding the durable, consumer-INVISIBLE half
 /// (prepared) messages and their resolution (commit/rollback) op-markers, plus the in-memory

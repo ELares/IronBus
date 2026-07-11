@@ -4264,6 +4264,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The DLQ must NEVER shed: a poison record is durable evidence, so it carries no daily
             // physical write budget (the flash-wear governor is for the main produce path only, #118).
             daily_physical_write_budget_bytes: 0,
+            // The DLQ inherits the main log's seek-by-time index density (#772); it is a pure
+            // accelerator, harmless if never seeked by time.
+            tindex_stride_records: config.log.tindex_stride_records,
         };
         // The dead-letter TARGET subdirs (#551): the configured dead-letter EXCHANGE's ordered
         // target list, or the single default fixed `dlq/` (byte-identical to today) when none is
@@ -4427,6 +4430,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             max_total_bytes: 0,
             max_quarantine_bytes: 0,
             daily_physical_write_budget_bytes: 0,
+            // Inherit the main log's seek-by-time index density (#772); a pure, harmless accelerator.
+            tindex_stride_records: config.log.tindex_stride_records,
         };
         let txn = if Self::txn_dir_exists(&log) {
             Some(TxnStore::open(
@@ -13782,6 +13787,79 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             records,
             next_offset,
         })
+    }
+
+    /// Resolves the SEEK-BY-TIME bounds of a Tier-S streaming fetch in the DEFAULT work-group to log
+    /// offsets (#772): `start_time_ms` to the first offset whose producer timestamp is at or after it
+    /// (an inclusive start), and `end_time_ms` to the first offset whose timestamp is strictly after
+    /// it (an EXCLUSIVE end). Either is `None` when the fetch does not carry that bound. Applies the
+    /// SAME wrong-mode guard as [`Engine::stream_fetch_in`] (a streaming fetch belongs to a streaming
+    /// group only), then resolves off the durable log's sparse `.tindex`. The returned offsets are
+    /// offset-authoritative and never below the earliest retained offset (an old time clamps to the
+    /// earliest, a future one to the tail); the caller uses the start as the read's `start_offset` and
+    /// the exclusive end to bound the window.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::CumulativeAckOnWorkGroup`] if the group is not streaming, or a storage
+    /// error from reading a segment during resolution.
+    pub fn stream_resolve_time_in(
+        &mut self,
+        group: &str,
+        start_time_ms: Option<u64>,
+        end_time_ms: Option<u64>,
+    ) -> Result<(Option<Offset>, Option<Offset>), EngineError> {
+        if !self.is_streaming_in(group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        let start = start_time_ms
+            .map(|t| self.log.resolve_time_offset(t, true))
+            .transpose()?;
+        let end = end_time_ms
+            .map(|t| self.log.resolve_time_offset(t, false))
+            .transpose()?;
+        Ok((start, end))
+    }
+
+    /// The named-stream twin of [`Engine::stream_resolve_time_in`] (#772): resolves the seek-by-time
+    /// bounds against a NAMED stream's own durable log, reopening an LRU-evicted known stream and
+    /// rejecting a never-declared one exactly as [`Engine::stream_fetch_in_stream`] does, and applying
+    /// the same streaming-group wrong-mode guard. The default stream (`""`) delegates to
+    /// [`Engine::stream_resolve_time_in`].
+    ///
+    /// # Errors
+    /// Returns [`EngineError::UnknownStream`] for a never-declared stream,
+    /// [`EngineError::CumulativeAckOnWorkGroup`] if the group is not streaming, or a storage error.
+    pub fn stream_resolve_time_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        start_time_ms: Option<u64>,
+        end_time_ms: Option<u64>,
+    ) -> Result<(Option<Offset>, Option<Offset>), EngineError> {
+        if stream.is_empty() {
+            return self.stream_resolve_time_in(group, start_time_ms, end_time_ms);
+        }
+        let id = StreamId::named(stream)?;
+        if !self.ensure_named_stream_resident(&id)? {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        if !self.is_streaming_in_stream(stream, group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        let Some(log) = self.streams.get(&id) else {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        };
+        let start = start_time_ms
+            .map(|t| log.resolve_time_offset(t, true))
+            .transpose()?;
+        let end = end_time_ms
+            .map(|t| log.resolve_time_offset(t, false))
+            .transpose()?;
+        Ok((start, end))
     }
 
     /// Serves a Tier-S STREAMING fetch as RAW on-disk frame bytes (#541, M1-I5): the zero-copy twin of
@@ -26298,6 +26376,67 @@ mod tests {
         assert_eq!(again.records[0].offset, Offset::ZERO);
         assert_eq!(e.in_flight_in("s"), 0);
         assert_eq!(e.committed_offset_in("s"), Offset::ZERO);
+    }
+
+    #[test]
+    fn stream_seek_by_time_resolves_bounds_and_serves_the_window() {
+        // #772: seek-by-time resolves wall-clock bounds to offsets on the streaming consume path.
+        let mut e = open(config(10, 5));
+        // Non-monotonic producer timestamps (delayed messages, #555): offset -> ts is
+        // 0:10 1:30 2:20 3:50 4:40 5:5 6:60 7:35.
+        let ts = [10u64, 30, 20, 50, 40, 5, 60, 35];
+        for (i, &t) in ts.iter().enumerate() {
+            e.produce(&Append {
+                timestamp_ms: t,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[u8::try_from(i).unwrap()],
+            })
+            .unwrap();
+        }
+        e.set_streaming_in("s", true).unwrap();
+
+        // Start seek to time 25: the FIRST offset with ts >= 25 is offset 1 (ts=30), even though a
+        // LATER offset (5, ts=5) has a smaller timestamp — the resolution is offset-authoritative.
+        let (start, end) = e.stream_resolve_time_in("s", Some(25), None).unwrap();
+        assert_eq!(start, Some(Offset::new(1)));
+        assert_eq!(end, None);
+
+        // A [25, 45] window: start = offset 1 (first ts >= 25); exclusive end = first ts > 45 =
+        // offset 3 (ts=50). The window [1, 3) is served contiguously.
+        let (start2, end2) = e.stream_resolve_time_in("s", Some(25), Some(45)).unwrap();
+        assert_eq!((start2, end2), (Some(Offset::new(1)), Some(Offset::new(3))));
+        let want = usize::try_from(end2.unwrap().get() - start2.unwrap().get()).unwrap();
+        let batch = e
+            .stream_fetch_in("s", member(1), start2.unwrap(), want, None)
+            .unwrap();
+        // Offsets 1 (ts=30) and 2 (ts=20): the contiguous run from the start offset. Offset 2's ts
+        // (20) is below start_time — the documented offset-authoritative + terminating-predicate
+        // semantics deliver it because it sits after the resolved start offset.
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .map(|r| r.offset.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // A future time resolves to the tail (no record is newer), so a consumer awaits new records.
+        let (fut, _) = e.stream_resolve_time_in("s", Some(1000), None).unwrap();
+        assert_eq!(fut, Some(Offset::new(ts.len() as u64)));
+
+        // An old time clamps to the earliest offset (every record meets ts >= 0).
+        let (old, _) = e.stream_resolve_time_in("s", Some(0), None).unwrap();
+        assert_eq!(old, Some(Offset::ZERO));
+
+        // Wrong-mode guard: a non-streaming group is rejected exactly as a plain streaming fetch is.
+        e.set_streaming_in("s", false).unwrap();
+        assert!(matches!(
+            e.stream_resolve_time_in("s", Some(1), None),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
     }
 
     #[test]

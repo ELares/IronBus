@@ -1334,6 +1334,22 @@ struct SparseWalk {
 /// valid record region ends (`valid_end`), the read-forward upper bound.
 pub type SparsePositions = (Vec<(u64, u64)>, u64);
 
+/// The running result of a [`SegmentReader::walk_time_anchors`] walk (#772): the sparse
+/// `(offset, exclusive prefix-max timestamp)` anchors plus the seal cross-check facts (record count
+/// and last sequence) and whether the region decoded cleanly.
+struct TimeAnchorWalk {
+    /// The sparse `(offset, exclusive prefix-max timestamp)` anchors, ascending by offset.
+    anchors: Vec<(u64, u64)>,
+    /// The last valid record's sequence (`None` if the region held no record), for the seal check.
+    last_seq: Option<Seq>,
+    /// How many valid records the walk decoded (the seal check cross-checks the footer's count).
+    count: u64,
+    /// Bytes consumed relative to the walk's start offset (the valid prefix length).
+    cursor: u64,
+    /// `true` if the region decoded cleanly with no torn or corrupt tail.
+    clean: bool,
+}
+
 /// The running result of a streaming body walk: see [`SegmentReader::scan_body_streaming`].
 struct BodyWalk {
     /// Valid records seen before the first torn or corrupt frame.
@@ -1724,6 +1740,131 @@ impl<F: RandomAccessFile> SegmentReader<F> {
 
         let walk = self.walk_sparse_positions(header_end, self.file_len, stride)?;
         Ok((walk.anchors, header_end + walk.cursor))
+    }
+
+    /// Rebuilds the SPARSE timestamp -> offset anchors for this segment's `.tindex` (#772) from a
+    /// validating frame walk of the durable record region: one `(offset, exclusive prefix-max
+    /// timestamp)` anchor every `stride_records` records (index `0, stride, 2*stride, ...`),
+    /// byte-identical to the anchors [`crate::tindex::build_anchors`] produces from the same
+    /// timestamps (the seal path accumulates those incrementally; this is the rebuild path for a
+    /// missing/torn/corrupt sidecar). It steps the SAME full-CRC-validating `codec::decode` walk the
+    /// offset-index build uses, so it stops at the exact valid prefix a scan would and never anchors
+    /// a timestamp past a torn or body-corrupt frame. Memory is bounded to one per-frame scratch
+    /// buffer plus the sparse anchors, never the whole region.
+    ///
+    /// `stride_records` is clamped up to 1 so a degenerate `0` cannot anchor every record.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::FooterSegmentMismatch`] if a body-consistent footer names a different
+    /// segment (the recycled/mixed-file guard `scan` applies), or an IO error reading the region.
+    pub fn time_anchors(&self, stride_records: u32) -> Result<Vec<(u64, u64)>, StorageError> {
+        let header_end = SEGMENT_HEADER_LEN as u64;
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
+        // Mirror `sparse_record_byte_positions`/`scan` seal handling so the walked region (and thus
+        // the anchor set) is byte-identical to what the append path sealed: a trailing footer is
+        // trusted (and excluded) only when it is consistent with the body.
+        let candidate = if self.file_len >= header_end + footer_len {
+            let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+            self.file
+                .read_exact_at(&mut fbuf, self.file_len - footer_len)?;
+            SegmentFooter::decode(&fbuf).ok()
+        } else {
+            None
+        };
+        if let Some(footer) = candidate {
+            let body_end = self.file_len - footer_len;
+            let walk = self.walk_time_anchors(header_end, body_end, stride_records)?;
+            let ends_at_footer = walk.clean && header_end + walk.cursor == body_end;
+            let expected_last_seq = walk.last_seq.unwrap_or(self.header.base_seq);
+            let body_matches = u64::from(footer.record_count) == walk.count
+                && footer.last_seq == expected_last_seq;
+            if ends_at_footer && body_matches {
+                if footer.segment_id != self.header.segment_id {
+                    return Err(StorageError::FooterSegmentMismatch {
+                        header: self.header.segment_id,
+                        footer: footer.segment_id,
+                    });
+                }
+                return Ok(walk.anchors);
+            }
+        }
+        Ok(self
+            .walk_time_anchors(header_end, self.file_len, stride_records)?
+            .anchors)
+    }
+
+    /// Streams `[start, end)` frame-by-frame, FULL-CRC-validating each frame (the SAME `codec::decode`
+    /// the offset-index/recovery walks use), collecting one `(offset, exclusive prefix-max
+    /// timestamp)` anchor every `stride_records` records and stopping at the first torn OR
+    /// body-corrupt frame (#772). The running max is the max producer timestamp across the records
+    /// strictly BEFORE the anchored offset, exactly the value [`crate::tindex::build_anchors`]
+    /// stores, so a rebuilt index resolves the same offset as the append-seeded one.
+    fn walk_time_anchors(
+        &self,
+        start: u64,
+        end: u64,
+        stride_records: u32,
+    ) -> Result<TimeAnchorWalk, StorageError> {
+        let stride = u64::from(stride_records.max(1));
+        let base = self.header.base_offset.get();
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut pos = start;
+        let mut count = 0u64;
+        let mut running_max = 0u64;
+        let mut last_seq = None;
+        let mut clean = true;
+        let mut anchors: Vec<(u64, u64)> = Vec::new();
+        while pos < end {
+            let remaining = end - pos;
+            if remaining < RECORD_HEADER_LEN as u64 {
+                clean = false;
+                break;
+            }
+            scratch.resize(RECORD_HEADER_LEN, 0);
+            self.file.read_exact_at(&mut scratch, pos)?;
+            if has_post_header_prefix_field(scratch[ironbus_core::format::header_offsets::FLAGS])
+                && remaining >= (RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX) as u64
+            {
+                scratch.resize(RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX, 0);
+                self.file.read_exact_at(
+                    &mut scratch[RECORD_HEADER_LEN..],
+                    pos + RECORD_HEADER_LEN as u64,
+                )?;
+            }
+            let Ok(total) = codec::decoded_len(&scratch) else {
+                clean = false;
+                break;
+            };
+            if total as u64 > remaining {
+                clean = false;
+                break;
+            }
+            scratch.resize(total, 0);
+            self.file.read_exact_at(
+                &mut scratch[RECORD_HEADER_LEN..],
+                pos + RECORD_HEADER_LEN as u64,
+            )?;
+            let Ok((view, consumed)) = codec::decode(&scratch) else {
+                clean = false;
+                break;
+            };
+            // Anchor this record when it starts a new stride bucket, carrying the EXCLUSIVE prefix
+            // max (the running max BEFORE folding in this record's timestamp).
+            if count % stride == 0 {
+                anchors.push((base.saturating_add(count), running_max));
+            }
+            running_max = running_max.max(view.timestamp_ms);
+            last_seq = Some(view.seq);
+            count += 1;
+            pos += consumed as u64;
+        }
+        Ok(TimeAnchorWalk {
+            anchors,
+            last_seq,
+            count,
+            cursor: pos - start,
+            clean,
+        })
     }
 
     /// Streams `[start, end)` frame-by-frame, FULL-CRC-validating each frame (the SAME `codec::decode`
