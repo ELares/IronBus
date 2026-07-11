@@ -430,6 +430,78 @@ impl BoundedSpanQueue {
     }
 }
 
+/// The process-wide monotonic source of span ids (#770). Each emitted produce/deliver/ack span takes a
+/// fresh id here, which drives BOTH its exported span id and the deterministic head-sampling position
+/// ([`sampling_position`]). Starts at 1 (never the all-zero invalid id) and wraps harmlessly. Relaxed:
+/// it is a pure id generator, never a synchronization point.
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Returns a fresh, process-unique span id for an emitted span (#770). Monotonic and allocation-free,
+/// so the emission sites pay only an atomic increment. Wrapping past `u64::MAX` is harmless (the
+/// exporter forces a non-zero span id regardless).
+#[must_use]
+pub fn next_span_id() -> u64 {
+    NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The process span-EMISSION sink (#770): the handle the produce/deliver/ack hot-path sites use to
+/// offer a span for export, or `None` (via [`crate::actor::EngineAccess::span_sink`]) when tracing
+/// export is not wired, in which case emission is a compiled-in but zero-cost no-op. It pairs the
+/// SAME [`BoundedSpanQueue`] the OTLP exporter drains (#352) with the head-sampling ratio (#99), so
+/// [`SpanSink::emit`] applies the identical [`should_sample`] gate the exporter uses BEFORE the
+/// bounded-lossy push — a non-sampled span never even touches the queue, keeping the produce path
+/// bounded. This type carries NO `opentelemetry`: it is always-on plain data (an `Arc` + an `f64`),
+/// so the default and `edge-min` builds link none of the exporter; only the DRAIN is feature-gated.
+#[derive(Clone, Debug)]
+pub struct SpanSink {
+    /// The bounded-lossy queue the OTLP exporter drains. Shared (`Arc`) so the emitting connection
+    /// threads and the drain thread reference the one queue.
+    queue: std::sync::Arc<BoundedSpanQueue>,
+    /// The head-sampling ratio in `[0.0, 1.0]` applied at emission time (the same gate the exporter
+    /// applies at drain), so a non-tracing ratio (`0.0`, the default) admits only ERROR/WARN and drops
+    /// the Info-level produce/deliver spans at the cheapest point.
+    sample_ratio: f64,
+}
+
+impl SpanSink {
+    /// Builds an emission sink over `queue` (the exporter's bounded-lossy queue) at `sample_ratio`.
+    #[must_use]
+    pub fn new(queue: std::sync::Arc<BoundedSpanQueue>, sample_ratio: f64) -> SpanSink {
+        SpanSink {
+            queue,
+            sample_ratio,
+        }
+    }
+
+    /// Offers `record` for export, HEAD-SAMPLED and NON-BLOCKING (#770, #99). Applies the same
+    /// [`should_sample`] decision the exporter uses (an ERROR/WARN span is always admitted; an
+    /// Info-level produce/deliver span passes only under the ratio), then a bounded-lossy
+    /// [`BoundedSpanQueue::push`] that DROPS-and-counts when full rather than blocking the produce
+    /// path. A sampled-out span is skipped before the push, so the hot path pays only the sampling
+    /// hash when tracing is on and nothing when the sink is absent (the `None` fast-path lives at the
+    /// call site). The push outcome is intentionally not surfaced: a full-queue drop is the
+    /// bounded-lossy contract, counted on the queue, never the producing thread's concern.
+    pub fn emit(&self, record: SpanRecord) {
+        if !should_sample(record, self.sample_ratio, sampling_position(record.id)) {
+            return;
+        }
+        let _ = self.queue.push(record);
+    }
+
+    /// The sink's head-sampling ratio (for diagnostics/tests).
+    #[must_use]
+    pub fn sample_ratio(&self) -> f64 {
+        self.sample_ratio
+    }
+
+    /// A clone of the underlying bounded-lossy queue handle (for diagnostics/tests that assert what
+    /// was emitted).
+    #[must_use]
+    pub fn queue(&self) -> std::sync::Arc<BoundedSpanQueue> {
+        std::sync::Arc::clone(&self.queue)
+    }
+}
+
 /// The runtime tracing/export configuration (#99). The JSON log layer is always installed by
 /// `init_tracing`; the OTLP fields are inert unless the `otlp` feature is compiled in AND export is
 /// turned on, so the default and `edge-min` builds carry no opentelemetry cost.
@@ -1701,5 +1773,41 @@ mod tests {
     fn a_server_span_carries_the_server_kind() {
         let rec = SpanRecord::server(1, Severity::Info);
         assert_eq!(rec.ctx.kind, SpanKindTag::Server);
+    }
+
+    #[test]
+    fn the_span_sink_emits_under_a_full_sample_ratio() {
+        // At ratio 1.0 an Info-level produce span is enqueued onto the SAME queue the exporter drains.
+        let queue = std::sync::Arc::new(BoundedSpanQueue::with_capacity(8));
+        let sink = SpanSink::new(std::sync::Arc::clone(&queue), 1.0);
+        sink.emit(SpanRecord::produce(next_span_id(), Severity::Info, None));
+        assert_eq!(
+            queue.len(),
+            1,
+            "a full-ratio Info produce span is pushed onto the exporter's queue"
+        );
+    }
+
+    #[test]
+    fn the_span_sink_head_samples_out_info_at_zero_ratio() {
+        // At the default 0.0 ratio an Info-level produce/deliver span is dropped at the sampling gate
+        // BEFORE the push, so a non-tracing broker's produce path never even touches the queue.
+        let queue = std::sync::Arc::new(BoundedSpanQueue::with_capacity(8));
+        let sink = SpanSink::new(std::sync::Arc::clone(&queue), 0.0);
+        sink.emit(SpanRecord::produce(next_span_id(), Severity::Info, None));
+        assert_eq!(
+            queue.len(),
+            0,
+            "a 0.0-ratio Info span is sampled out, not pushed"
+        );
+        assert_eq!(queue.dropped(), 0, "a sampled-out span is not a queue drop");
+    }
+
+    #[test]
+    fn next_span_id_is_monotonic_and_never_zero() {
+        let a = next_span_id();
+        let b = next_span_id();
+        assert_ne!(a, 0, "a span id is never the all-zero invalid id");
+        assert_ne!(a, b, "successive span ids differ");
     }
 }
