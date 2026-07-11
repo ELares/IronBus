@@ -1340,11 +1340,41 @@ impl AsyncClient {
     /// a malformed/over-long name), [`ClientError::Body`] on an over-large field, or a frame/connection
     /// error.
     pub async fn declare_stream(&mut self, stream: &str) -> Result<(), ClientError> {
+        self.declare_stream_with(stream, 1, false).await
+    }
+
+    /// CREATE-OR-ENSURE a PRIORITY-MODE stream with `levels` priority lanes (#553): the async port of
+    /// [`ironbus_client::Client::declare_priority_stream`]. `levels` must be `>= 2`; delivery drains the
+    /// highest-priority non-empty lane first. MUTUALLY EXCLUSIVE with key-partitioning.
+    ///
+    /// # Errors
+    /// As [`AsyncClient::declare_stream`], plus a server rejection for `levels < 2` or a mode conflict.
+    pub async fn declare_priority_stream(
+        &mut self,
+        stream: &str,
+        levels: u32,
+    ) -> Result<(), ClientError> {
+        self.declare_stream_with(stream, levels, true).await
+    }
+
+    /// The shared `StreamDeclare` path behind [`AsyncClient::declare_stream`] and
+    /// [`AsyncClient::declare_priority_stream`], sending the additive `partition_count` + `priority`
+    /// flag and awaiting the body-less `Ok`.
+    ///
+    /// # Errors
+    /// As [`AsyncClient::declare_stream`].
+    async fn declare_stream_with(
+        &mut self,
+        stream: &str,
+        partition_count: u32,
+        priority: bool,
+    ) -> Result<(), ClientError> {
         let mut body = Vec::new();
         encode_stream_declare(
             &StreamDeclareBody {
                 stream_id: stream.as_bytes(),
-                partition_count: 1,
+                partition_count,
+                priority,
             },
             &mut body,
         )
@@ -1452,6 +1482,22 @@ impl AsyncClient {
         stream: &str,
         message: &PubBody<'_>,
     ) -> Result<u64, ClientError> {
+        self.publish_to_with_priority(stream, 0, message).await
+    }
+
+    /// PUBLISH `message` to a PRIORITY-MODE stream at priority `priority` (#553): the async port of
+    /// [`ironbus_client::Client::publish_to_with_priority`]. The broker routes the record to the lane of
+    /// this priority (higher delivered first; over-max saturates to the top lane). `priority = 0` is
+    /// exactly [`AsyncClient::publish_to`]. At-least-once (server-ack, Level 1).
+    ///
+    /// # Errors
+    /// As [`AsyncClient::publish_to`].
+    pub async fn publish_to_with_priority(
+        &mut self,
+        stream: &str,
+        priority: u8,
+        message: &PubBody<'_>,
+    ) -> Result<u64, ClientError> {
         // Force at-least-once server-ack (Level 1) on the carried body: the named-stream path accepts
         // only that level this phase, mirroring the sync `publish_to` exactly. An old caller never set a
         // level bit, so this is a no-op for them and a guard against a mismatched method/wire for everyone.
@@ -1465,6 +1511,7 @@ impl AsyncClient {
         encode_pub_to(
             &PubToBody {
                 stream_id: stream.as_bytes(),
+                priority,
                 pub_body: &pub_body,
             },
             &mut body,

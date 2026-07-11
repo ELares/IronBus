@@ -3152,11 +3152,45 @@ impl Client {
     /// a malformed/over-long name), [`ClientError::Body`] on an over-large field, or a frame/connection
     /// error.
     pub fn declare_stream(&mut self, stream: &str) -> Result<(), ClientError> {
+        self.declare_stream_with(stream, 1, false)
+    }
+
+    /// CREATE-OR-ENSURE a PRIORITY-MODE stream with `levels` priority lanes (M4-I3, #553): the
+    /// `StreamDeclare` verb with the priority flag set. A produce to this stream via
+    /// [`Client::publish_to_with_priority`] routes to the lane of its priority, and delivery drains the
+    /// highest-priority non-empty lane first (strict priority). `levels` must be `>= 2` (a single lane
+    /// has no priorities to order). Idempotent — re-declaring with the SAME `levels` is a no-op success;
+    /// a name already resident in another mode is rejected. A priority stream is MUTUALLY EXCLUSIVE with
+    /// key-partitioning. Requires the stream-addressing capability (see [`Client::declare_stream`]).
+    ///
+    /// # Errors
+    /// As [`Client::declare_stream`], plus a server rejection for `levels < 2` or a mode conflict.
+    pub fn declare_priority_stream(
+        &mut self,
+        stream: &str,
+        levels: u32,
+    ) -> Result<(), ClientError> {
+        self.declare_stream_with(stream, levels, true)
+    }
+
+    /// The shared `StreamDeclare` path behind [`Client::declare_stream`] (single-log) and
+    /// [`Client::declare_priority_stream`] (priority lanes): sends the additive `partition_count` +
+    /// `priority` flag and awaits the body-less `Ok`.
+    ///
+    /// # Errors
+    /// As [`Client::declare_stream`].
+    fn declare_stream_with(
+        &mut self,
+        stream: &str,
+        partition_count: u32,
+        priority: bool,
+    ) -> Result<(), ClientError> {
         let mut body = Vec::new();
         encode_stream_declare(
             &StreamDeclareBody {
                 stream_id: stream.as_bytes(),
-                partition_count: 1,
+                partition_count,
+                priority,
             },
             &mut body,
         )
@@ -3263,6 +3297,24 @@ impl Client {
     /// malformed name, or a non-server-ack level), [`ClientError::Body`] on an over-large field,
     /// [`ClientError::BadResponse`] on a malformed ack, or a frame/connection error.
     pub fn publish_to(&mut self, stream: &str, message: &PubBody<'_>) -> Result<u64, ClientError> {
+        self.publish_to_with_priority(stream, 0, message)
+    }
+
+    /// PUBLISH `message` to a PRIORITY-MODE stream at priority `priority` (M4-I3, #553): the broker
+    /// routes the record to the lane of this priority (higher = delivered first; a priority above the
+    /// stream's top level saturates to the top lane), and it is an ordinary FIFO-by-offset record WITHIN
+    /// that lane. `priority = 0` is exactly [`Client::publish_to`] (the lowest priority AND the
+    /// byte-for-byte historical `PubTo` body). Ignored for a non-priority stream. At-least-once
+    /// (server-ack, Level 1), as [`Client::publish_to`].
+    ///
+    /// # Errors
+    /// As [`Client::publish_to`].
+    pub fn publish_to_with_priority(
+        &mut self,
+        stream: &str,
+        priority: u8,
+        message: &PubBody<'_>,
+    ) -> Result<u64, ClientError> {
         // Force at-least-once server-ack (Level 1) on the carried body: the named-stream path accepts
         // only that level this phase, and an old caller never set a level bit, so this is a no-op for
         // them and a guard against a mismatched method/wire for everyone.
@@ -3276,6 +3328,7 @@ impl Client {
         encode_pub_to(
             &PubToBody {
                 stream_id: stream.as_bytes(),
+                priority,
                 pub_body: &pub_body,
             },
             &mut body,

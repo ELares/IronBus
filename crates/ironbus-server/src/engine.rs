@@ -50,7 +50,9 @@ use ironbus_storage::checkpoint::{
 };
 use ironbus_storage::dlq::{DeadLetterExchange, DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
-use ironbus_storage::layout::{PARTITIONED_STREAMS_SUBDIR, SHARED_WAL_SUBDIR, STREAMS_SUBDIR};
+use ironbus_storage::layout::{
+    PARTITIONED_STREAMS_SUBDIR, PRIORITY_STREAMS_SUBDIR, SHARED_WAL_SUBDIR, STREAMS_SUBDIR,
+};
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds, SyncTicket};
 use ironbus_storage::loss::LossReport;
 use ironbus_storage::naming::{
@@ -2857,6 +2859,117 @@ where
     Ok((partitioned, consumers, recoveries))
 }
 
+/// The recovered PRIORITY-LANE stream state (#553): the reopened priority-mode [`PartitionedStream`]s
+/// (keyed by [`StreamId`], to be merged into [`Engine::partitioned`]), each lane's resumed per-group
+/// consumer state (keyed `(stream, lane index)`, merged into [`Engine::partition_consumers`]), the SET
+/// of priority-mode stream names ([`Engine::priority_streams`]), and every lane sub-log's INDEPENDENT
+/// recovery summary. Named so the tuple does not trip `type_complexity`.
+type PriorityRecovery<F, C> = (
+    BTreeMap<StreamId, PartitionedStream<F, C>>,
+    BTreeMap<(StreamId, u32), NamedStream>,
+    std::collections::BTreeSet<StreamId>,
+    Vec<PartitionRecovery>,
+);
+
+/// Reopens every PRIORITY-LANE stream (#553) under `prstreams/<hex(name)>/`, the priority-mode twin of
+/// [`recover_partitioned_streams`]. It is byte-for-byte the same machinery — reopen the `P` lane
+/// sub-logs (with `P` derived from the materialized `p-<08x>/` lane-subdir count) as a
+/// [`PartitionedStream`], and resume each lane's per-group consumer cursor from its own lane subdir —
+/// except that it reads the SEPARATE `prstreams/` subtree, so a stream found here is KNOWN to be
+/// priority-mode (the mode is encoded in the path, needing no marker file), and it collects the set of
+/// recovered names so the engine can re-mark them in [`Engine::priority_streams`]. The recovered maps
+/// are MERGED into the same `partitioned` / `partition_consumers` the partitioned recovery populates
+/// (the two modes share the storage/consumer machinery but live in disjoint subtrees, so their keys
+/// never collide). A data dir with no `prstreams/` subtree returns empty state and never materializes
+/// it (the non-priority image is unchanged).
+///
+/// # Errors
+/// Propagates a storage error from enumerating `prstreams/`, opening/recovering a lane's log, or
+/// reading a lane's checkpoint files.
+fn recover_priority_streams<F, C>(
+    root_log: &Log<F, C>,
+    lease: LeaseConfig,
+    opened_at: u64,
+) -> Result<PriorityRecovery<F, C>, EngineError>
+where
+    F: Filesystem + Clone,
+    C: Clock + Clone,
+{
+    let mut partitioned = BTreeMap::new();
+    let mut consumers = BTreeMap::new();
+    let mut priority = std::collections::BTreeSet::new();
+    let mut recoveries = Vec::new();
+    let root = root_log.filesystem();
+    if !root.subdir_exists(PRIORITY_STREAMS_SUBDIR)? {
+        return Ok((partitioned, consumers, priority, recoveries));
+    }
+    let pfs = root.subdir(PRIORITY_STREAMS_SUBDIR)?;
+    let config = root_log.config();
+    for dir in pfs.list_subdirs()? {
+        let Some(name) = parse_stream_subdir_name(&dir) else {
+            continue;
+        };
+        let Ok(id) = StreamId::named(&name) else {
+            continue;
+        };
+        let stream_root = pfs.subdir(&dir)?;
+        // P = the count of canonical `p-<08x>/` lane subdirs materialized under this priority stream.
+        let count = stream_root
+            .list_subdirs()?
+            .iter()
+            .filter(|d| parse_partition_subdir_name(d).is_some())
+            .count();
+        let Some(pc) = u32::try_from(count).ok().and_then(PartitionCount::new) else {
+            continue;
+        };
+        let (ps, lane_recoveries) =
+            PartitionedStream::open(&stream_root, root_log.clock_clone(), config, pc)
+                .map_err(EngineError::Storage)?;
+        recoveries.extend(lane_recoveries);
+        // Resume each lane's per-group consumer cursor from its own lane subdir (identical to a
+        // partition's cursor resume — a lane IS a partition sub-log, only the delivery order differs).
+        for i in 0..pc.get() {
+            let idx = PartitionIndex::new(i);
+            if let Some(plog) = ps.partition(idx) {
+                let ns = recover_one_named_stream(plog, lease, opened_at)?;
+                if !ns.groups.is_empty() || !ns.group_last_checkpointed.is_empty() {
+                    consumers.insert((id.clone(), i), ns);
+                }
+            }
+        }
+        priority.insert(id.clone());
+        partitioned.insert(id, ps);
+    }
+    Ok((partitioned, consumers, priority, recoveries))
+}
+
+/// The bit shift separating the LANE (top 8 bits) from the lane OFFSET (low 56 bits) in a composite
+/// priority delivery offset (#553). 56 bits of offset is `~7.2e16` records per lane — unreachable in
+/// practice — and 8 bits of lane covers the 256-lane `Engine::MAX_PRIORITY_LEVELS` ceiling.
+pub(crate) const PRIORITY_LANE_SHIFT: u64 = 56;
+
+/// Composes a priority stream's COMPOSITE delivery offset (#553): the `lane` in the top 8 bits, the
+/// per-lane `raw` offset in the low 56. Globally unique across a stream's lanes for one consumer, so the
+/// offset-keyed lease map and the wire ack need no lane field. See [`decompose_priority_offset`] for the
+/// inverse. A free `pub(crate)` fn (not an `Engine` method) so the session layer's lease bookkeeping can
+/// lane-scope its composite offsets with the SAME encoding.
+#[must_use]
+pub(crate) fn compose_priority_offset(lane: PartitionIndex, raw: Offset) -> u64 {
+    let mask = (1u64 << PRIORITY_LANE_SHIFT) - 1;
+    (u64::from(lane.get()) << PRIORITY_LANE_SHIFT) | (raw.get() & mask)
+}
+
+/// Decomposes a composite priority delivery offset (#553) back into `(lane, lane offset)` — the inverse
+/// of [`compose_priority_offset`]. Used by `Engine::ack_priority` to route an ack (whose offset the
+/// consumer echoed verbatim) to the right lane's cursor, and by the session's `Poll::Truncated` lease
+/// prune to lane-SCOPE the pruning so a reap in one lane never drops another lane's in-flight leases.
+#[must_use]
+pub(crate) fn decompose_priority_offset(composite: u64) -> (u32, Offset) {
+    let mask = (1u64 << PRIORITY_LANE_SHIFT) - 1;
+    let lane = u32::try_from(composite >> PRIORITY_LANE_SHIFT).unwrap_or(u32::MAX);
+    (lane, Offset::new(composite & mask))
+}
+
 /// Reconstructs a group's carried attempt counts from a recovered `attempts.ckpt` payload, clamped
 /// to the durable log head `flushed` and the resumed committed watermark `committed`: a carried
 /// count is only meaningful for an offset that still exists (`< flushed`) and has NOT been committed
@@ -3765,6 +3878,19 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// A partition's cursor lives in ITS sub-log's `pstreams/<hex(name)>/p-<08x(i)>/cursor-<hex>.ckpt`,
     /// so it recovers beside its own records. EMPTY until a partitioned stream is consumed.
     partition_consumers: BTreeMap<(StreamId, u32), NamedStream>,
+    /// The MODE marker for PRIORITY-LANE streams (M4-I3, #553): the subset of [`Engine::partitioned`]
+    /// keys whose `P` sub-logs are PRIORITY LANES (levels `0..P`) rather than key-hash partitions. A
+    /// priority-mode stream reuses the SAME [`PartitionedStream`] storage (in `partitioned`) and the
+    /// SAME per-lane consumer state (in `partition_consumers`) as a key-partitioned stream — only the
+    /// PRODUCE routing (to the record's priority lane, not `xxh3_64(key) % P`) and the CONSUME order
+    /// (drain the highest-priority non-empty lane first) differ. Membership here is the ONLY thing that
+    /// distinguishes the two modes at the engine layer; on disk they are physically disjoint (a priority
+    /// stream lives under `prstreams/`, a key-partitioned one under `pstreams/`), so the mode survives a
+    /// restart WITHOUT any marker file — recovery re-derives it from which subtree the stream was found
+    /// in. The two modes are MUTUALLY EXCLUSIVE: a name is in `partitioned`, and if so it is in this set
+    /// (priority) XOR not (key-partition), never both. EMPTY until a stream declares priority mode, so a
+    /// deployment that never uses priorities is byte-for-byte unchanged.
+    priority_streams: std::collections::BTreeSet<StreamId>,
     /// The durable TRANSACTIONAL HALF-MESSAGE store (V2-M8, #640): the `txn/` sub-log that buffers
     /// prepared (half) messages INVISIBLE to consumers and their commit/rollback op-markers, plus the
     /// in-memory lifecycle table it rebuilds at open. Opened LAZILY on the first `TxnPrepare` (so a
@@ -4377,8 +4503,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // partition's own subdir — the per-partition twin of `recover_named_stream_groups` above. A
         // deployment that never declared `P > 1` has no `pstreams/` subtree, so this is a no-op and the
         // on-disk image is byte-for-byte unchanged.
-        let (partitioned, partition_consumers, partition_recoveries) =
+        let (mut partitioned, mut partition_consumers, mut partition_recoveries) =
             recover_partitioned_streams(&log, config.lease, opened_at)?;
+        // Recover each PRIORITY-LANE stream (#553) from its SEPARATE `prstreams/<hex(name)>/` subtree,
+        // marking the recovered names as priority-mode and MERGING its lanes into the SAME `partitioned`
+        // / `partition_consumers` maps (the two modes share the storage/consumer machinery but live in
+        // disjoint subtrees, so keys never collide). The lane sub-log loss reports fold into the same
+        // recovery-event accounting below. A deployment that never used priorities has no `prstreams/`
+        // subtree, so this is a no-op and the on-disk image is byte-for-byte unchanged.
+        let (priority_partitioned, priority_consumers, priority_streams, priority_recoveries) =
+            recover_priority_streams(&log, config.lease, opened_at)?;
+        partitioned.extend(priority_partitioned);
+        partition_consumers.extend(priority_consumers);
+        partition_recoveries.extend(priority_recoveries);
 
         // Recovery-EVENT counters (#575), folded in ONCE per open across EVERY recovery path
         // (#1130): the root log, each NAMED per-stream recovery, the SHARED WAL's single recovery
@@ -4596,9 +4733,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // recovered stream whose `dlq/` subdir already exists; the rest open lazily on first poison.
             named_dlq,
             // The per-partitioned-stream storage + per-partition consumer state (#693), recovered above
-            // from `pstreams/`. Empty for a deployment that never declared `P > 1`.
+            // from `pstreams/`, plus every priority-lane stream (#553) merged in from `prstreams/`.
+            // Empty for a deployment that never declared `P > 1`.
             partitioned,
             partition_consumers,
+            // The priority-lane MODE marker (#553): the subset of `partitioned` recovered from
+            // `prstreams/`. Empty for a deployment that never used priorities.
+            priority_streams,
             // The transactional half-message store (V2-M8, #640): opened above iff the `txn/` subdir
             // already exists, else `None` until the first `TxnPrepare` lazily creates it. A
             // non-transactional broker keeps this `None`, so the produce/consume hot path is unchanged.
@@ -4823,6 +4964,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         "this data directory holds partitioned streams (pstreams/), which are \
                          per-stream-log storage; the shared-WAL storage mode does not support \
                          partitioned streams — reopen with the default per-stream-logs mode"
+                            .to_string(),
+                    ));
+                }
+                if fs.subdir_exists(PRIORITY_STREAMS_SUBDIR)? {
+                    return Err(storage_mode_mismatch(
+                        "this data directory holds priority-lane streams (prstreams/), which are \
+                         per-stream-log storage; the shared-WAL storage mode does not support \
+                         priority streams — reopen with the default per-stream-logs mode"
                             .to_string(),
                     ));
                 }
@@ -6218,6 +6367,50 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     where
         F: Clone,
     {
+        self.produce_in_stream_inner(stream, message, subject, 0)
+    }
+
+    /// The PRIORITY-carrying named-stream produce entry (M4-I3, #553): identical to
+    /// [`Engine::produce_in_stream`], but a produce to a PRIORITY-MODE stream (declared via
+    /// [`Engine::declare_priority_stream`]) routes the record to the LANE of `priority` (higher =
+    /// delivered first; a priority above the top level saturates to the top lane) instead of the
+    /// default lowest lane. For any NON-priority stream — the default stream, a single named stream, or
+    /// a key-partitioned stream — `priority` is IGNORED and the append is byte-for-byte the historical
+    /// path, so a `priority = 0` call is exactly [`Engine::produce_in_stream`]. It stores no subject (a
+    /// priority stream does not compose with subject filters this phase, a documented follow-up).
+    ///
+    /// # Errors
+    /// Same as [`Engine::produce_in_stream`].
+    pub fn produce_in_stream_prioritized(
+        &mut self,
+        stream: &str,
+        message: &Append<'_>,
+        priority: u8,
+    ) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
+        self.produce_in_stream_inner(stream, message, b"", priority)
+    }
+
+    /// The shared named-stream produce body behind [`Engine::produce_in_stream_with_subject`] (subject,
+    /// priority 0) and [`Engine::produce_in_stream_prioritized`] (no subject, a priority): resolves the
+    /// delayed-delivery seam once, then routes to the stream's backing — a PRIORITY-mode stream by
+    /// `priority` (#553), a KEY-partitioned stream by key hash (#693), the shared WAL, or the stream's
+    /// own single log — so both entry points share one delay/mirror/cap/retention path.
+    ///
+    /// # Errors
+    /// Same as [`Engine::produce_in_stream`].
+    fn produce_in_stream_inner(
+        &mut self,
+        stream: &str,
+        message: &Append<'_>,
+        subject: &[u8],
+        priority: u8,
+    ) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
         // The default stream is today's root log, byte-for-byte: route straight to the existing
         // single-log produce on `self.log`, persisting the subject (#594). NOTHING about the default
         // path changes when a stream id is supplied as `""` — an old client (no stream id) and a new
@@ -6274,6 +6467,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             }
         };
         let id = StreamId::named(stream)?;
+        // #553: a PRIORITY-mode stream routes the produce to the LANE of its priority (higher =
+        // delivered first), NOT by key hash. Checked BEFORE the key-partition branch because a priority
+        // stream lives in the SAME `partitioned` map (so the next branch would otherwise key-route it),
+        // distinguished only by `priority_streams` membership. A no-op for the common case (no priority
+        // streams declared): one set lookup.
+        if self.priority_streams.contains(&id) {
+            return self
+                .produce_priority(&id, message, priority)
+                .map(|(_, offset)| offset);
+        }
         // #693: a PARTITIONED stream (declared with `P > 1`) routes the produce BY KEY to its partition
         // sub-log (`xxh3_64(key) % P`, #591), NOT to a single named-stream log. This runs BEFORE the
         // single-stream path below so a partitioned name never materializes a plain `streams/<hex>/`
@@ -6562,6 +6765,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             PartitionCount::new(partition_count).ok_or_else(|| EngineError::InvalidStreamName {
                 name: stream.to_string(),
             })?;
+        // A name already resident as a PRIORITY-lane stream (#553) cannot be re-declared key-partitioned
+        // — the two partitioned modes are mutually exclusive. Checked BEFORE the count comparison below,
+        // because a priority stream shares the `partitioned` map and could otherwise look like an
+        // idempotent same-count re-declare.
+        if self.priority_streams.contains(&id) {
+            return Err(EngineError::InvalidStreamName {
+                name: stream.to_string(),
+            });
+        }
         // Idempotent re-declare: SAME P -> Ok(false); DIFFERENT P -> fail-closed (no live repartition).
         if let Some(existing) = self.partitioned.get(&id) {
             if existing.count() == pc {
@@ -7097,6 +7309,363 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 .insert(group.to_string(), committed);
         }
         Ok(())
+    }
+
+    // ===================================================================================
+    // PRIORITY-LANE WIRING (#553, V2-M4-I3): OPT-IN message priorities. A priority-mode stream reuses
+    // the SAME `PartitionedStream` (#591/#693) storage primitive as a key-partitioned stream — `P`
+    // independent sub-logs — but its `P` sub-logs are PRIORITY LANES (levels `0..P`) rather than
+    // key-hash partitions. The two differences from key-partitioning, and NOTHING else:
+    //   1. PRODUCE routes to the LANE OF THE RECORD'S PRIORITY (`min(priority, P-1)`), not
+    //      `xxh3_64(key) % P`. A record's priority is FIXED at produce (it IS which lane it lands in),
+    //      so there is no re-prioritization race and, within a lane, records stay STRICT FIFO-by-offset.
+    //   2. CONSUME drains the HIGHEST-priority non-empty lane FIRST (lanes scanned `P-1 .. 0`), so a
+    //      higher-priority record is delivered ahead of a lower-priority one. Each lane keeps its OWN
+    //      durable per-lane cursor + lease table (`ack_partition`/`deliver_from_partition`, reused
+    //      VERBATIM), so at-least-once + MaxDeliver->park + delayed-delivery + per-lane retention all
+    //      compose per lane exactly as for a partition.
+    //
+    // STARVATION POLICY: STRICT priority (RabbitMQ-style, the documented Phase-1 behavior). A sustained
+    // stream of high-priority records CAN starve lower lanes indefinitely; a bounded-fairness / aging
+    // policy is a documented follow-up. This is the honest tradeoff the issue names ("trades the log's
+    // O(1) append/scan locality for priority-bucketed delivery; matches RabbitMQ priority queues").
+    //
+    // ACK DISAMBIGUATION (the one subtlety): a priority consumer draws from MULTIPLE lanes, and each
+    // lane has its OWN offset space (every lane starts at 0), so a raw offset is ambiguous across lanes.
+    // `poll_priority` therefore delivers a COMPOSITE offset — the lane in the top 8 bits, the lane
+    // offset in the low 56 — which is globally unique across lanes for one consumer, exactly as a
+    // single-partition consumer's raw offsets are unique. The consumer treats the offset as OPAQUE (it
+    // echoes it in the ack), and `ack_priority` decomposes it back to `(lane, offset)` and routes to
+    // that lane's cursor. This needs NO wire-format change (the offset field is already a `u64`) and
+    // reuses the existing offset-keyed lease map unchanged.
+    //
+    // MUTUAL EXCLUSION: a priority stream is stored in the SAME `partitioned` map as a key-partitioned
+    // one, distinguished ONLY by `priority_streams` membership, and on disk lives under a SEPARATE
+    // `prstreams/` subtree. A name is one mode XOR the other, never both — every declare fail-closed
+    // rejects a cross-mode or repartition conflict. `P == 1` is meaningless for priority (one lane has
+    // no priorities to order), so priority mode requires `P >= 2`.
+    // ===================================================================================
+
+    /// The maximum number of priority LEVELS (lanes) a priority-mode stream may declare (#553): the top
+    /// 8 bits of the composite delivery offset carry the lane, so at most `256` lanes are addressable.
+    /// A wire `priority` byte is a `u8` (`0..=255`), so this also matches the produce field's range —
+    /// every representable priority maps to a lane (saturating at the top when `priority >= P`).
+    const MAX_PRIORITY_LEVELS: u32 = 256;
+
+    /// Rewrites every offset a lane's [`Poll`] surfaces into the COMPOSITE lane-tagged offset (#553), so
+    /// a priority consumer's leases, acks, and in-band advisories all carry the globally-unique offset.
+    /// `Poll::Idle` never reaches here (the scan continues past an idle lane); every other variant has
+    /// its `Offset` fields tagged with `lane`.
+    #[must_use]
+    fn compose_priority_poll(lane: PartitionIndex, poll: Poll) -> Poll {
+        let tag = |o: Offset| Offset::new(compose_priority_offset(lane, o));
+        match poll {
+            Poll::Message(mut d) => {
+                d.token.offset = tag(d.token.offset);
+                d.offset = tag(d.offset);
+                Poll::Message(d)
+            }
+            Poll::Parked { offset, record } => Poll::Parked {
+                offset: tag(offset),
+                record,
+            },
+            Poll::Truncated {
+                earliest_retained,
+                skipped,
+            } => Poll::Truncated {
+                earliest_retained: tag(earliest_retained),
+                skipped,
+            },
+            Poll::Compacted { from, to } => Poll::Compacted {
+                from: tag(from),
+                to: tag(to),
+            },
+            Poll::Filtered { from, to } => Poll::Filtered {
+                from: tag(from),
+                to: tag(to),
+            },
+            Poll::Idle => Poll::Idle,
+        }
+    }
+
+    /// Whether `stream` is an OPT-IN PRIORITY-LANE stream (#553): declared via
+    /// [`Engine::declare_priority_stream`], so a produce routes by priority and a consume drains the
+    /// highest-priority lane first. `false` for the default stream, a single named stream, and a
+    /// KEY-partitioned stream (#693) — the two partitioned modes are mutually exclusive. The query the
+    /// wire/session layer uses to route a produce/consume through the priority path and to reject a
+    /// lane-addressed subscribe on a priority stream.
+    #[must_use]
+    pub fn is_priority_stream(&self, stream: &str) -> bool {
+        StreamId::named(stream).is_ok_and(|id| self.priority_streams.contains(&id))
+    }
+
+    /// Declares a stream with `levels` PRIORITY LANES (#553): the engine-side of the additive `priority`
+    /// flag on the `StreamDeclare` wire verb. Opens (or idempotently re-ensures) a [`PartitionedStream`]
+    /// of `P = levels` independent sub-logs under `prstreams/<hex(name)>/`, marked priority-mode, where
+    /// lane `i` is priority level `i` (higher = delivered first). Requires `2 <= levels <= 256` (a single
+    /// lane has no priorities to order; the ceiling is [`Engine::MAX_PRIORITY_LEVELS`]).
+    ///
+    /// Idempotent: re-declaring an existing priority stream with the SAME `levels` is `Ok(false)`; a
+    /// FIRST declare is `Ok(true)`. Re-declaring with a DIFFERENT `levels` (a repartition, which would
+    /// reshuffle every record's lane), or declaring a name already resident as a single named stream OR
+    /// a KEY-partitioned stream, is rejected fail-closed — the two partitioned modes never overlap.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for `levels < 2` or `> 256`, the empty/default name, a
+    /// malformed named name, a name already resident in another mode, or a re-declare with a different
+    /// level count; [`EngineError::TooManyStreams`] at the distinct-stream cap; a
+    /// [`shared_mode_unsupported`] reject in shared-WAL mode (priority streams are per-stream-log
+    /// storage); else a storage error from opening the priority stream's lane sub-logs.
+    pub fn declare_priority_stream(
+        &mut self,
+        stream: &str,
+        levels: u32,
+    ) -> Result<bool, EngineError>
+    where
+        F: Clone,
+    {
+        // Priority mode needs at least two lanes (nothing to order with one), and at most one lane per
+        // representable priority level (the composite-offset lane field is 8 bits).
+        if !(2..=Self::MAX_PRIORITY_LEVELS).contains(&levels) {
+            return Err(EngineError::InvalidStreamName {
+                name: stream.to_string(),
+            });
+        }
+        // SHARED-WAL mode (#597): priority streams are per-stream-log storage (P lane sub-logs under
+        // prstreams/) and do not compose with the one shared commit log — fail-closed typed reject,
+        // matching the open-time prstreams/ layout refusal.
+        if self.shared_wal.is_some() {
+            return Err(shared_mode_unsupported(
+                "a priority-lane stream declare (#553, priority mode)",
+            ));
+        }
+        // The default stream is the root log and is never priority-partitioned.
+        if stream.is_empty() {
+            return Err(EngineError::InvalidStreamName {
+                name: String::new(),
+            });
+        }
+        let id = StreamId::named(stream)?;
+        let pc = PartitionCount::new(levels).ok_or_else(|| EngineError::InvalidStreamName {
+            name: stream.to_string(),
+        })?;
+        // Idempotent re-declare of an EXISTING priority stream (same levels -> Ok(false)); a different
+        // level count, or a name already resident in the OTHER mode (a key-partitioned stream shares the
+        // `partitioned` map but is NOT in `priority_streams`), is a fail-closed conflict.
+        if let Some(existing) = self.partitioned.get(&id) {
+            if self.priority_streams.contains(&id) && existing.count() == pc {
+                return Ok(false);
+            }
+            return Err(EngineError::InvalidStreamName {
+                name: stream.to_string(),
+            });
+        }
+        // A name already resident as a SINGLE named stream cannot also be a priority stream.
+        if self.known_named_streams.contains(&id) {
+            return Err(EngineError::InvalidStreamName {
+                name: stream.to_string(),
+            });
+        }
+        // Distinct-stream cap (#863): priority streams live in `partitioned`, counted alongside named +
+        // key-partitioned streams (inode/fd bound).
+        if self.max_streams != 0
+            && self.known_named_streams.len() + self.partitioned.len() >= self.max_streams
+        {
+            return Err(EngineError::TooManyStreams {
+                max: self.max_streams,
+            });
+        }
+        let root = self.priority_stream_root(&id)?;
+        let (ps, _recoveries) =
+            PartitionedStream::open(&root, self.log.clock_clone(), self.log.config(), pc)
+                .map_err(EngineError::Storage)?;
+        self.partitioned.insert(id.clone(), ps);
+        self.priority_streams.insert(id);
+        Ok(true)
+    }
+
+    /// Resolves the `prstreams/<hex(name)>/` root filesystem for a priority stream `id` (#553), creating
+    /// the `prstreams/` subtree + the stream's subdir on first use. The [`PartitionedStream`] then roots
+    /// its `P` lane sub-logs under this handle. The priority-mode twin of
+    /// [`Engine::partitioned_stream_root`] — a SEPARATE subtree so the mode is encoded in the path.
+    fn priority_stream_root(&self, id: &StreamId) -> Result<F, EngineError>
+    where
+        F: Clone,
+    {
+        let pfs = self.log.filesystem().subdir(PRIORITY_STREAMS_SUBDIR)?;
+        let root = pfs.subdir(&stream_subdir_name(id.name()))?;
+        Ok(root)
+    }
+
+    /// Produces `message` to the priority stream `id` at `priority` (#553), routing it to the LANE of
+    /// its priority — `min(priority, P-1)`, so a priority at or above the top level saturates to the top
+    /// lane and a producer need not know `P`. Appends to that ONE lane's sub-log and commits it with the
+    /// stream's OWN [`PartitionedStream::commit_tick`] group-commit barrier. Returns the lane it landed
+    /// in and the [`Offset`] within that lane. The record's priority is FIXED here (it IS the lane), so
+    /// there is no re-prioritization; within a lane records stay strict FIFO-by-offset.
+    ///
+    /// The durability contract is per LANE, identical to [`Engine::produce_partitioned`]: the record is
+    /// acked only after its lane's covering `fdatasync`; a lane whose barrier FROZE surfaces a fatal
+    /// [`StorageError::WriterFrozen`] rather than acking a non-durable record (I2). Per-lane retention
+    /// runs after the durable commit.
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownStream`] if `id` is not a priority stream, a storage error from the append,
+    /// or [`StorageError::WriterFrozen`] if the chosen lane's commit barrier froze.
+    fn produce_priority(
+        &mut self,
+        id: &StreamId,
+        message: &Append<'_>,
+        priority: u8,
+    ) -> Result<(PartitionIndex, Offset), EngineError> {
+        // Route + append to the priority's lane (short mutable borrow of the storage map). The lane is
+        // `min(priority, P-1)`: priority mode requires `P >= 2`, so `P - 1 >= 1` never underflows, and a
+        // priority >= P saturates to the top (highest) lane.
+        let (idx, offset) = {
+            let ps = self
+                .partitioned
+                .get_mut(id)
+                .ok_or_else(|| EngineError::UnknownStream {
+                    name: id.name().to_string(),
+                })?;
+            let top = ps.count().get() - 1;
+            let idx = PartitionIndex::new(u32::from(priority).min(top));
+            let log = ps
+                .partition_mut(idx)
+                .ok_or_else(|| EngineError::UnknownStream {
+                    name: id.name().to_string(),
+                })?;
+            let offset = log.append(message).map_err(EngineError::Storage)?;
+            (idx, offset)
+        };
+        // Per-stream PRODUCE throughput (#571), keyed by the stream name (bounded/overflow-folded).
+        self.registry.record_stream_produced(id.name().as_bytes());
+        // ONE cross-lane group-commit tick (#591): a lane whose covering fdatasync FAILED is FROZEN
+        // (its durable head did not advance) -> surface WriterFrozen rather than ack a non-durable
+        // record (I2), exactly as the key-partitioned produce path does on a froze.
+        let froze = {
+            let ps = self
+                .partitioned
+                .get_mut(id)
+                .expect("priority stream present after append");
+            ps.commit_tick().froze.contains(&idx)
+        };
+        if froze {
+            return Err(EngineError::Storage(StorageError::WriterFrozen));
+        }
+        // Per-LANE retention + compaction (#566, reused per lane): reclaim disk on the chosen lane's own
+        // sub-log, floored at that lane's min-committed offset so a slow consumer's records are never
+        // reaped. A no-op unless retention/compaction is configured.
+        self.reap_partition_for_retention(id, idx)?;
+        Ok((idx, offset))
+    }
+
+    /// Polls the priority stream `stream` in competing work-group `group` (#553), delivering the next
+    /// record off the HIGHEST-priority non-empty lane. It scans the lanes `P-1 .. 0` (highest priority
+    /// first) and returns the first lane's delivery, so a higher-priority record is always delivered
+    /// ahead of a lower-priority one (STRICT priority — a sustained high-priority load can starve lower
+    /// lanes, the documented Phase-1 tradeoff). Each lane drains on its OWN durable per-lane cursor +
+    /// lease table via the reused [`Engine::deliver_from_partition`], so at-least-once, MaxDeliver->park,
+    /// delayed-delivery, and per-lane retention all hold per lane. The delivered offset is a COMPOSITE
+    /// (lane in the top 8 bits, lane offset in the low 56) so it is globally unique across lanes for one
+    /// consumer; the consumer echoes it verbatim and [`Engine::ack_priority`] routes the ack back to the
+    /// right lane.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed name, [`EngineError::UnknownStream`] if
+    /// `stream` is not a priority stream, [`EngineError::InvalidGroupName`] /
+    /// [`EngineError::TooManyGroups`] from the per-lane group gate, else a storage error from a read.
+    pub fn poll_priority(
+        &mut self,
+        stream: &str,
+        group: &str,
+        now: u64,
+    ) -> Result<Poll, EngineError> {
+        let id = StreamId::named(stream)?;
+        // Resolve the lane count, rejecting a stream that is not priority-mode (a key-partitioned or
+        // single stream is consumed through its own path, never here).
+        let count = match self.partitioned.get(&id) {
+            Some(ps) if self.priority_streams.contains(&id) => ps.count(),
+            _ => {
+                return Err(EngineError::UnknownStream {
+                    name: stream.to_string(),
+                })
+            }
+        };
+        validate_group_name(group)?;
+        // Ensure the group's work-group exists in EVERY lane (idempotent, under the per-lane group cap),
+        // so a lane the scan has not yet reached still has a tracked cursor — which the per-lane
+        // retention floor reads to PROTECT that lane's undelivered records from a reap (a starved low
+        // lane must not be reaped out from under a consumer that has simply not drained down to it yet).
+        let lease_config = self.lease_config;
+        let max_groups = self.max_groups;
+        for i in 0..count.get() {
+            let ns = self
+                .partition_consumers
+                .entry((id.clone(), i))
+                .or_insert_with(NamedStream::new);
+            if !ns.groups.contains_key(group) {
+                if max_groups != 0 && ns.groups.len() >= max_groups {
+                    return Err(EngineError::TooManyGroups { max: max_groups });
+                }
+                ns.groups
+                    .insert(group.to_string(), WorkGroup::new(lease_config, now));
+            }
+        }
+        // Scan lanes HIGH -> LOW: deliver from the highest-priority lane that yields anything but
+        // `Poll::Idle`. An idle lane (nothing deliverable now — caught up, window full, or holding an
+        // un-due delayed record) falls through to the next lower priority; a Message/Parked/Truncated/
+        // Compacted is returned immediately with its offsets tagged to the lane (strict priority).
+        for lane_i in (0..count.get()).rev() {
+            let idx = PartitionIndex::new(lane_i);
+            let flushed = self
+                .partitioned
+                .get(&id)
+                .and_then(|ps| ps.partition(idx))
+                .map_or(0, |log| log.flushed_offset().get());
+            match self.deliver_from_partition(&id, idx, group, now, flushed)? {
+                Poll::Idle => {}
+                other => return Ok(Self::compose_priority_poll(idx, other)),
+            }
+        }
+        Ok(Poll::Idle)
+    }
+
+    /// Acks a priority-stream delivery (#553): decomposes the COMPOSITE offset the consumer echoed back
+    /// into `(lane, lane offset)` and commits that lane's work-group cursor past it, reusing
+    /// [`Engine::ack_partition`] verbatim (a priority lane IS a partition sub-log). A stale token
+    /// (already acked or redelivered) is a [`AckResult::Fenced`] no-op, and the durable per-lane cursor
+    /// checkpoint is interval-gated exactly as the partition ack. `stream` must be a priority stream (a
+    /// composite offset on any other stream fences).
+    #[must_use]
+    pub fn ack_priority(&mut self, stream: &str, group: &str, token: &LeaseToken) -> AckResult {
+        if !self.is_priority_stream(stream) {
+            return AckResult::Fenced;
+        }
+        let (lane, raw) = decompose_priority_offset(token.offset.get());
+        self.ack_partition(
+            stream,
+            lane,
+            group,
+            &LeaseToken {
+                offset: raw,
+                generation: token.generation,
+            },
+        )
+    }
+
+    /// The current committed offset of priority stream `(stream, group)`'s lane `lane` (#553): the
+    /// exclusive next-to-deliver position on that lane's OWN cursor, for tests and observability of a
+    /// priority group's per-lane progress. Reuses [`Engine::committed_offset_in_partition`] (a lane IS a
+    /// partition sub-log). `0` for an unknown stream/lane/group.
+    #[must_use]
+    pub fn committed_offset_in_priority_lane(
+        &self,
+        stream: &str,
+        lane: u32,
+        group: &str,
+    ) -> Offset {
+        self.committed_offset_in_partition(stream, lane, group)
     }
 
     // ===================================================================================
@@ -7886,9 +8455,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Ok(id) = StreamId::named(stream) else {
             return false;
         };
-        // A stream EXISTS if it is a known single named stream OR a declared PARTITIONED stream (#693):
-        // the two are disjoint namespaces, but both are client-reachable and both must report existence
-        // (e.g. a `SubTo` / `StreamInfo` on a partitioned stream).
+        // A stream EXISTS if it is a known single named stream OR a declared PARTITIONED stream (#693)
+        // OR a declared PRIORITY-lane stream (#553, which also lives in `partitioned`): the namespaces
+        // are disjoint, but all are client-reachable and must report existence (e.g. a `SubTo` /
+        // `StreamInfo` on a partitioned or priority stream).
         self.known_named_streams.contains(&id) || self.partitioned.contains_key(&id)
     }
 
@@ -30123,6 +30693,305 @@ mod tests {
             r.counters().segments_reaped >= 1,
             "per-partition retention reaped at least one old sealed segment"
         );
+    }
+
+    // ===================== OPT-IN MESSAGE PRIORITIES (#553, V2-M4-I3) =====================
+
+    /// A produce to a priority stream at `priority` (no key routing — the lane IS the priority).
+    fn prio_append(payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    /// Produces `payload` to priority stream `stream` at `priority`, returning the lane offset.
+    fn produce_prio(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        priority: u8,
+        payload: &[u8],
+    ) -> Offset {
+        e.produce_in_stream_prioritized(stream, &prio_append(payload), priority)
+            .unwrap()
+    }
+
+    /// Drains a priority stream via `poll_priority`, acking each delivery, returning the payloads in
+    /// DELIVERY order (which is the priority order: highest-priority lane first, FIFO within a lane).
+    fn drain_priority(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        group: &str,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let now = e.now_monotonic();
+            match e.poll_priority(stream, group, now).unwrap() {
+                Poll::Message(d) => {
+                    out.push(d.record.payload.to_vec());
+                    assert_eq!(e.ack_priority(stream, group, &d.token), AckResult::Acked);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected priority poll: {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// #553 (headline): higher-priority records are delivered AHEAD of lower ones, and within one
+    /// priority level records stay strict FIFO-by-offset. Priorities produced INTERLEAVED still drain
+    /// strictly highest-first.
+    #[test]
+    fn priority_delivery_drains_highest_lane_first_fifo_within_a_level() {
+        let mut e = open(config(64, 5));
+        assert!(e.declare_priority_stream("jobs", 3).unwrap());
+        assert!(e.is_priority_stream("jobs"));
+        assert_eq!(e.partition_count_of("jobs").unwrap().get(), 3);
+        // Produce interleaved across three priority levels (0 = lowest, 2 = highest).
+        produce_prio(&mut e, "jobs", 0, b"lo-a");
+        produce_prio(&mut e, "jobs", 2, b"hi-a");
+        produce_prio(&mut e, "jobs", 1, b"mid-a");
+        produce_prio(&mut e, "jobs", 2, b"hi-b");
+        produce_prio(&mut e, "jobs", 0, b"lo-b");
+        produce_prio(&mut e, "jobs", 1, b"mid-b");
+        // Delivery order: BOTH priority-2 first (in produce order), then both priority-1, then both
+        // priority-0 — strict priority, FIFO within each level.
+        assert_eq!(
+            drain_priority(&mut e, "jobs", "w"),
+            vec![
+                b"hi-a".to_vec(),
+                b"hi-b".to_vec(),
+                b"mid-a".to_vec(),
+                b"mid-b".to_vec(),
+                b"lo-a".to_vec(),
+                b"lo-b".to_vec(),
+            ]
+        );
+    }
+
+    /// #553: a produce at a priority AT OR ABOVE the top level saturates to the TOP lane (a producer
+    /// need not know `P`), and priority `0` (the default) is the LOWEST lane, delivered last.
+    #[test]
+    fn priority_saturates_above_top_and_zero_is_lowest() {
+        let mut e = open(config(64, 5));
+        e.declare_priority_stream("jobs", 3).unwrap(); // lanes 0,1,2
+        produce_prio(&mut e, "jobs", 0, b"floor");
+        produce_prio(&mut e, "jobs", 250, b"way-over"); // saturates to lane 2 (top)
+        produce_prio(&mut e, "jobs", 2, b"top-explicit");
+        // The two top-lane records (saturated + explicit) deliver first in produce order, then the floor.
+        assert_eq!(
+            drain_priority(&mut e, "jobs", "w"),
+            vec![
+                b"way-over".to_vec(),
+                b"top-explicit".to_vec(),
+                b"floor".to_vec(),
+            ]
+        );
+    }
+
+    /// #553: each lane keeps its OWN durable per-lane cursor, and the composite delivery offset routes
+    /// an ack to the RIGHT lane even when two lanes both hold a record at lane-offset 0 (the ambiguity
+    /// the composite offset resolves). Acking one lane's delivery never commits another's.
+    #[test]
+    fn priority_composite_offset_acks_route_to_the_right_lane() {
+        let mut e = open(config(64, 5));
+        e.declare_priority_stream("jobs", 3).unwrap();
+        produce_prio(&mut e, "jobs", 2, b"hi"); // lane 2, offset 0
+        produce_prio(&mut e, "jobs", 0, b"lo"); // lane 0, offset 0 — SAME lane offset
+                                                // First poll delivers the high-lane record; hold its lease (do NOT ack yet).
+        let now = e.now_monotonic();
+        let hi = message(e.poll_priority("jobs", "w", now).unwrap());
+        assert_eq!(&*hi.record.payload, b"hi");
+        // Next poll falls through the (now in-flight) high lane to the low lane.
+        let now = e.now_monotonic();
+        let lo = message(e.poll_priority("jobs", "w", now).unwrap());
+        assert_eq!(&*lo.record.payload, b"lo");
+        // The two composite offsets are DISTINCT even though both are lane-offset 0.
+        assert_ne!(
+            hi.offset.get(),
+            lo.offset.get(),
+            "composite offsets disambiguate the two lanes"
+        );
+        // Ack the LOW-lane delivery: it commits lane 0 only, lane 2 is untouched.
+        assert_eq!(e.ack_priority("jobs", "w", &lo.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in_priority_lane("jobs", 0, "w").get(), 1);
+        assert_eq!(
+            e.committed_offset_in_priority_lane("jobs", 2, "w").get(),
+            0,
+            "acking lane 0 never advanced lane 2"
+        );
+        // Ack the HIGH-lane delivery: now lane 2 commits.
+        assert_eq!(e.ack_priority("jobs", "w", &hi.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in_priority_lane("jobs", 2, "w").get(), 1);
+    }
+
+    /// #553: a priority stream + its P per-lane cursors survive a restart (recovered from `prstreams/`),
+    /// resuming past each lane's durable committed offset — no redelivery of acked records, and priority
+    /// order continues across the restart.
+    #[test]
+    fn priority_stream_and_per_lane_cursors_survive_restart() {
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+            e.declare_priority_stream("jobs", 3).unwrap();
+            produce_prio(&mut e, "jobs", 2, b"hi-0");
+            produce_prio(&mut e, "jobs", 2, b"hi-1");
+            produce_prio(&mut e, "jobs", 0, b"lo-0");
+            // Drain + ack ONLY the two high-priority records; leave the low one un-consumed.
+            let now = e.now_monotonic();
+            let d0 = message(e.poll_priority("jobs", "w", now).unwrap());
+            assert_eq!(&*d0.record.payload, b"hi-0");
+            assert_eq!(e.ack_priority("jobs", "w", &d0.token), AckResult::Acked);
+            let now = e.now_monotonic();
+            let d1 = message(e.poll_priority("jobs", "w", now).unwrap());
+            assert_eq!(&*d1.record.payload, b"hi-1");
+            assert_eq!(e.ack_priority("jobs", "w", &d1.token), AckResult::Acked);
+            assert_eq!(e.committed_offset_in_priority_lane("jobs", 2, "w").get(), 2);
+            e.checkpoint_all_groups().unwrap(); // clean-shutdown durable flush
+        }
+        // Reopen over the SAME storage: the priority stream + its lane cursors recover from prstreams/.
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+            assert!(
+                e.is_priority_stream("jobs"),
+                "the priority MODE recovered (from the prstreams/ subtree, no marker file)"
+            );
+            assert_eq!(e.partition_count_of("jobs").unwrap().get(), 3);
+            assert_eq!(
+                e.committed_offset_in_priority_lane("jobs", 2, "w").get(),
+                2,
+                "the high lane's cursor resumed at its durable committed offset"
+            );
+            // Only the un-consumed low-priority record remains — the acked high ones do NOT redeliver.
+            assert_eq!(drain_priority(&mut e, "jobs", "w"), vec![b"lo-0".to_vec()]);
+        }
+        // On disk: the priority stream lives under prstreams/, NEVER pstreams/ (mode-disjoint subtrees).
+        let e = Engine::open(fs, ManualClock::new(), config(64, 5)).unwrap();
+        assert!(e
+            .log
+            .filesystem()
+            .subdir_exists(PRIORITY_STREAMS_SUBDIR)
+            .unwrap());
+        assert!(
+            !e.log
+                .filesystem()
+                .subdir_exists(PARTITIONED_STREAMS_SUBDIR)
+                .unwrap(),
+            "a priority stream never materializes the key-partition pstreams/ subtree"
+        );
+    }
+
+    /// #553: STARVATION is STRICT priority (the documented Phase-1 behavior). A sustained high-priority
+    /// load keeps a lower lane from ever delivering — this test PINS that honest property (so a future
+    /// fairness/aging policy is a deliberate change, not an accident).
+    #[test]
+    fn priority_strict_high_first_can_starve_a_lower_lane() {
+        let mut e = open(config(64, 5));
+        e.declare_priority_stream("jobs", 2).unwrap();
+        produce_prio(&mut e, "jobs", 0, b"starved"); // one low-priority record, present the whole time
+                                                     // A steady stream of high-priority work: every poll serves the HIGH lane, never the low one.
+        for n in 0..5u8 {
+            produce_prio(&mut e, "jobs", 1, &[b'h', n]);
+            let now = e.now_monotonic();
+            let d = message(e.poll_priority("jobs", "w", now).unwrap());
+            assert_eq!(
+                &*d.record.payload,
+                &[b'h', n][..],
+                "the high lane is always served first"
+            );
+            assert_eq!(e.ack_priority("jobs", "w", &d.token), AckResult::Acked);
+        }
+        // The low-priority record was NEVER delivered while high-priority work kept arriving.
+        assert_eq!(
+            e.committed_offset_in_priority_lane("jobs", 0, "w").get(),
+            0,
+            "strict priority starved the low lane (documented Phase-1 behavior)"
+        );
+        // Once the high lane drains, the starved low record finally delivers (no loss).
+        assert_eq!(
+            drain_priority(&mut e, "jobs", "w"),
+            vec![b"starved".to_vec()]
+        );
+    }
+
+    /// #553: `MaxDeliver` composes PER LANE — a poison in one lane parks after `max_deliver` attempts
+    /// (committed past, surfaced as `Poll::Parked`) exactly as on a partition, and a lower lane keeps
+    /// delivering. Neither dropped nor duplicated beyond the at-least-once redelivery budget.
+    #[test]
+    fn priority_max_deliver_parks_per_lane() {
+        let mut e = open(config(64, 1)); // max_deliver = 1 (lease visibility 30ns, hard cap 100ns)
+        e.declare_priority_stream("jobs", 2).unwrap();
+        produce_prio(&mut e, "jobs", 1, b"poison"); // high lane
+        produce_prio(&mut e, "jobs", 0, b"good"); // low lane
+                                                  // First delivery of the high-lane poison (now = 0), left un-acked.
+        let d = message(e.poll_priority("jobs", "w", 0).unwrap());
+        assert_eq!(&*d.record.payload, b"poison");
+        // Expire the lease (now = 40, past the 30ns visibility) WITHOUT acking: the 2nd attempt exceeds
+        // max_deliver = 1 and PARKS the poison (committed past) — per-lane MaxDeliver.
+        match e.poll_priority("jobs", "w", 40).unwrap() {
+            Poll::Parked { record, .. } => assert_eq!(record.payload.as_ref(), b"poison"),
+            other => panic!("expected Parked, got {other:?}"),
+        }
+        // With the high lane's poison committed past, the low lane now delivers its good record.
+        let d = message(e.poll_priority("jobs", "w", 80).unwrap());
+        assert_eq!(&*d.record.payload, b"good");
+        assert_eq!(e.ack_priority("jobs", "w", &d.token), AckResult::Acked);
+    }
+
+    /// #553: priority mode is MUTUALLY EXCLUSIVE with key-partitioning and requires `2 <= levels <= 256`.
+    /// Every cross-mode / out-of-range declare is rejected fail-closed (no stream is ever both modes).
+    #[test]
+    fn priority_and_partitioned_are_mutually_exclusive_and_bounded() {
+        let mut e = open(config(64, 5));
+        // A first priority declare succeeds; an identical re-declare is idempotent.
+        assert!(e.declare_priority_stream("p", 3).unwrap());
+        assert!(!e.declare_priority_stream("p", 3).unwrap());
+        // A DIFFERENT level count is a fail-closed conflict (no live repartition).
+        assert!(e.declare_priority_stream("p", 4).is_err());
+        // The SAME name cannot be re-declared as a KEY-partitioned stream (cross-mode reject).
+        assert!(e.declare_partitioned_stream("p", 4).is_err());
+        assert!(e.is_priority_stream("p"));
+        // And a KEY-partitioned name cannot be re-declared priority.
+        assert!(e.declare_partitioned_stream("kp", 4).unwrap());
+        assert!(e.declare_priority_stream("kp", 4).is_err());
+        assert!(!e.is_priority_stream("kp"));
+        // A single named stream cannot be re-declared priority.
+        e.declare_stream("single").unwrap();
+        assert!(e.declare_priority_stream("single", 3).is_err());
+        // Level bounds: `< 2` (nothing to order) and `> 256` (composite lane field is 8 bits) reject.
+        assert!(e.declare_priority_stream("bad-lo", 1).is_err());
+        assert!(e.declare_priority_stream("bad-hi", 257).is_err());
+        assert!(!e.is_priority_stream("bad-lo"));
+        // The valid ceiling is accepted.
+        assert!(e.declare_priority_stream("max", 256).unwrap());
+    }
+
+    /// #553: the composite delivery-offset encoding round-trips lane + lane-offset losslessly across the
+    /// full lane range and a large offset — the property the ack routing depends on.
+    #[test]
+    fn priority_composite_offset_round_trips() {
+        for lane in [0u32, 1, 7, 42, 255] {
+            for raw in [0u64, 1, 1000, (1u64 << 55) - 1] {
+                let composite =
+                    compose_priority_offset(PartitionIndex::new(lane), Offset::new(raw));
+                let (dl, doff) = decompose_priority_offset(composite);
+                assert_eq!(dl, lane);
+                assert_eq!(doff.get(), raw);
+                // Same-lane composites are ORDER-PRESERVING on the low 56 bits — the property the
+                // session's lane-scoped `Poll::Truncated` prune relies on.
+                if raw > 0 {
+                    let lower =
+                        compose_priority_offset(PartitionIndex::new(lane), Offset::new(raw - 1));
+                    assert!(
+                        lower < composite,
+                        "within a lane, offset order is preserved"
+                    );
+                }
+            }
+        }
     }
 
     // ===================== EPHEMERAL CONSUMER GROUPS (#771, V2-M1) =====================
