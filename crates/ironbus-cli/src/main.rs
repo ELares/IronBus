@@ -221,9 +221,12 @@ const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 0;
 
 /// The default seek-by-time `.tindex` density for `serve` (#772): one sparse timestamp anchor per
-/// this many records, taken from the storage default so the two cannot drift. A pure memory/latency
-/// trade over the seek accelerator; changing it never affects correctness or durability.
-const DEFAULT_TINDEX_STRIDE_RECORDS: u32 = LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS;
+/// this many records. A pure memory/latency trade over the seek accelerator; changing it never
+/// affects correctness or durability. A literal (not `LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS`)
+/// because the `LogConfig` import is `#[cfg(unix)]`-gated with the rest of the broker run, so a path
+/// reference would not resolve on non-unix targets; kept equal to the storage default (asserted in a
+/// test) so the two cannot silently drift.
+const DEFAULT_TINDEX_STRIDE_RECORDS: u32 = 1024;
 
 /// The default consumer-safe size-retention bound for `serve` (0 = unlimited, retention OFF,
 /// matching the engine default): the broker never reaps old sealed segments until an operator
@@ -13957,6 +13960,17 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn tindex_stride_default_matches_the_storage_default() {
+        // The CLI default is a LITERAL (the `LogConfig` import is `#[cfg(unix)]`-gated, so a path
+        // reference would not build on Windows); pin it to the storage source of truth so they can
+        // never silently drift (#772).
+        assert_eq!(
+            DEFAULT_TINDEX_STRIDE_RECORDS,
+            LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS
+        );
+    }
 
     /// Spawns the append actor over `engine` and a wire server bound to an ephemeral port, returning
     /// the address, the shutdown flag, the server join handle, and the actor join handle (so the test
