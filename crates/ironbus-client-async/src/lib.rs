@@ -462,6 +462,11 @@ pub struct AsyncClient {
     deliver_batch_enabled: bool,
     /// Whether the stream-addressed wire verbs are ACTIVE on this connection.
     streams_enabled: bool,
+    /// Whether the server CONFIRMED the ephemeral-groups capability for this connection (#771):
+    /// `true` only when [`ClientConfig::request_ephemeral_groups`] was advertised AND the server's
+    /// `Info` echoed the confirmation. Gates the ephemeral subscribe locally: an OLD server never
+    /// confirms, so the client fails typed instead of silently binding a durable group.
+    ephemeral_groups_enabled: bool,
     /// The connection-wide DEFAULT consume tier the SERVER adopted for this connection (echoed in
     /// `Info`), or `None`.
     negotiated_default_tier: Option<ConsumeTier>,
@@ -527,6 +532,7 @@ impl AsyncClient {
             streaming_enabled: false,
             deliver_batch_enabled: false,
             streams_enabled: false,
+            ephemeral_groups_enabled: false,
             negotiated_default_tier: None,
             next_txn_seq: 0,
         };
@@ -536,6 +542,7 @@ impl AsyncClient {
         let mut connect_body = Vec::new();
         encode_connect(
             &ConnectBody {
+                wants_ephemeral_groups: config.request_ephemeral_groups,
                 requested_credit: config.requested_consumer_credit,
                 requested_credit_bytes: config.requested_consumer_credit_bytes,
                 wants_gap_marker: config.request_gap_marker,
@@ -590,6 +597,7 @@ impl AsyncClient {
                 client.negotiated_default_tier = info.default_tier.map(ConsumeTier::from_u8);
                 client.deliver_batch_enabled = info.deliver_batch;
                 client.streams_enabled = info.streams;
+                client.ephemeral_groups_enabled = info.ephemeral_groups;
                 Ok(client)
             }
             (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
@@ -642,6 +650,16 @@ impl AsyncClient {
     #[must_use]
     pub fn streams_enabled(&self) -> bool {
         self.streams_enabled
+    }
+
+    /// Whether EPHEMERAL consumer groups are ACTIVE on this connection (#771): `true` only when
+    /// this client advertised [`ClientConfig::request_ephemeral_groups`] AND the server confirmed
+    /// the capability in `Info`. When `false`, [`AsyncClient::subscribe_ephemeral`] fails locally
+    /// with [`ClientError::CapabilityNotNegotiated`] — the guard against an OLD server that would
+    /// tolerate the subscribe flag and silently bind a DURABLE group.
+    #[must_use]
+    pub fn ephemeral_groups_enabled(&self) -> bool {
+        self.ephemeral_groups_enabled
     }
 
     /// The connection-wide DEFAULT consume tier the SERVER adopted for this connection (echoed in
@@ -1483,6 +1501,50 @@ impl AsyncClient {
                 stream_id: stream.as_bytes(),
                 group: group.as_bytes(),
                 partition: None,
+                ephemeral: false,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::SubTo, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Subscribes this connection's consume path to an EPHEMERAL work-group (#771, V2-M1), the
+    /// async port of the sync client's `subscribe_ephemeral` (see there for the full contract): a
+    /// `SubTo` carrying the ephemeral subscribe flag binds a group with NO durable broker state,
+    /// reaped in full when its last subscriber disconnects or unsubscribes — at-least-once within
+    /// this subscription's lifetime only; a re-subscribe starts fresh at the earliest retained
+    /// offset. An EMPTY `stream` targets the default stream; a NAMED stream must already exist.
+    /// Checked LOCALLY against the negotiated capability, because an old server would tolerate the
+    /// flag byte and silently bind a DURABLE group.
+    ///
+    /// # Errors
+    /// [`ClientError::CapabilityNotNegotiated`] when ephemeral groups were not negotiated,
+    /// [`ClientError::Server`] on a typed broker reject (unknown stream, name/cap validation, a
+    /// durability-mode conflict), [`ClientError::Body`] on an over-large field, or a
+    /// frame/connection error.
+    pub async fn subscribe_ephemeral(
+        &mut self,
+        stream: &str,
+        group: &str,
+    ) -> Result<(), ClientError> {
+        if !self.ephemeral_groups_enabled {
+            return Err(ClientError::CapabilityNotNegotiated(
+                "ephemeral consumer groups (#771)",
+            ));
+        }
+        let mut body = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+                partition: None,
+                ephemeral: true,
             },
             &mut body,
         )
@@ -2173,6 +2235,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_info(
             &ironbus_proto::message::InfoBody {
+                ephemeral_groups: false,
                 credit: None,
                 credit_bytes: Some(ironbus_proto::message::CreditAdvert {
                     negotiated,
@@ -2634,6 +2697,60 @@ mod tests {
         assert_eq!(second[0].generation, 4);
         assert_eq!(second[0].key, b"k1");
         assert_eq!(second[0].payload, b"after-the-err");
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    // ===================== EPHEMERAL CONSUMER GROUPS (#771, V2-M1) =====================
+
+    /// An `Info` body confirming (or not) the ephemeral-groups capability (#771).
+    fn info_with_ephemeral(confirmed: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_info(
+            &ironbus_proto::message::InfoBody {
+                credit: None,
+                credit_bytes: None,
+                gap_marker: false,
+                default_ack_level: None,
+                streaming: false,
+                default_tier: None,
+                deliver_batch: false,
+                streams: true,
+                ephemeral_groups: confirmed,
+            },
+            &mut body,
+        );
+        frame(FrameType::Info, &body)
+    }
+
+    #[tokio::test]
+    async fn subscribe_ephemeral_requires_the_confirmed_capability_and_binds_when_it_is() {
+        // CONFIRMED: the scripted server echoes the capability, so the subscribe goes to the wire
+        // and its scripted Ok completes it.
+        let mut script = info_with_ephemeral(true);
+        script.extend_from_slice(&frame(FrameType::Ok, b""));
+        let (addr, handle) = raw_server(script);
+        let cfg = ClientConfig {
+            request_ephemeral_groups: true,
+            understands_streams: true,
+            ..ClientConfig::default()
+        };
+        let mut c = AsyncClient::connect_with(addr, &cfg).await.unwrap();
+        assert!(c.ephemeral_groups_enabled());
+        c.subscribe_ephemeral("orders", "eph").await.unwrap();
+        drop(c);
+        handle.join().unwrap();
+
+        // NOT confirmed (an OLD server never emits the Info flags2 byte): the subscribe fails
+        // LOCALLY with the typed error and puts NOTHING on the wire — an old server would tolerate
+        // the flag byte and silently bind a DURABLE group, the exact failure this gate forecloses.
+        let (addr, handle) = raw_server(info_with_ephemeral(false));
+        let mut c = AsyncClient::connect_with(addr, &cfg).await.unwrap();
+        assert!(!c.ephemeral_groups_enabled());
+        assert!(matches!(
+            c.subscribe_ephemeral("orders", "eph").await,
+            Err(ClientError::CapabilityNotNegotiated(_))
+        ));
         drop(c);
         handle.join().unwrap();
     }

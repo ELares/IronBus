@@ -1327,6 +1327,22 @@ pub const CONNECT_FLAG2_COMPRESSED_DELIVERY: u8 = 0b0000_0001;
 /// beyond this bit; it takes the next free bit after [`CONNECT_FLAG2_COMPRESSED_DELIVERY`].
 pub const CONNECT_FLAG2_WANTS_SUBJECT_FILTER: u8 = 0b0000_0010;
 
+/// The THIRD bit of the `Connect` handshake's `flags2` byte (#771, V2-M1), by which a consumer
+/// advertises that it UNDERSTANDS (and intends to use) EPHEMERAL consumer groups: a `SubTo` carrying
+/// the [`SUBTO_FLAG_EPHEMERAL`] flag binds a work-group that keeps NO durable state — the broker
+/// never writes its cursor or attempts checkpoints — and is REAPED in full (memory plus any stray
+/// files) the moment its last subscriber disconnects or unsubscribes. When set, the server may honor
+/// an ephemeral `SubTo` on this connection AND confirms the capability back via the `Info` `flags2`
+/// echo ([`INFO_FLAG2_EPHEMERAL_GROUPS`]). When CLEAR (an old client, one that opts out, or the empty
+/// `Connect` body) the server FAIL-CLOSED rejects an ephemeral `SubTo` with a typed error: a
+/// subscription is never silently made ephemeral (which would silently forfeit its durable resume).
+/// The reverse direction is the client's duty: a client MUST NOT send an ephemeral `SubTo` unless the
+/// server's `Info` confirmed the capability, because an OLD server tolerates the appended subscribe
+/// flag byte and would otherwise silently bind a DURABLE group (leaving checkpoints the client never
+/// wanted). It is a pure capability flag, taking the next free bit after
+/// [`CONNECT_FLAG2_WANTS_SUBJECT_FILTER`].
+pub const CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS: u8 = 0b0000_0100;
+
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
 /// and a client then keeps its own local credit (backward-compat).
@@ -1385,6 +1401,20 @@ pub const INFO_FLAG_DELIVER_BATCH: u8 = 0b0100_0000;
 /// / [`INFO_FLAG_DELIVER_BATCH`] confirmations. It is the LAST free bit (bit 7) of the `Info` `flags`
 /// byte.
 pub const INFO_FLAG_STREAMS: u8 = 0b1000_0000;
+
+/// The FIRST bit of the `Info` reply's appended `flags2` byte (#771, V2-M1), by which the server
+/// CONFIRMS this connection may bind EPHEMERAL consumer groups: `true` only when the client
+/// advertised [`CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS`] AND the server supports the mode. The
+/// negotiation is AND, mirroring [`INFO_FLAG_STREAMING`] / [`INFO_FLAG_STREAMS`]. This confirmation
+/// is what protects a NEW client against an OLD server: an old server never emits an `Info` `flags2`
+/// byte, so the bit decodes clear and the client refuses to send an ephemeral `SubTo` (an old server
+/// would tolerate the appended subscribe flag and silently bind a DURABLE group). It rides in a
+/// SECOND `Info` flags byte because the historical `Info` `flags` byte is FULL (bits 1..=128 are all
+/// allocated); like the `Connect` `flags2` (#1066) it is an APPENDED in-block byte following the v1
+/// fixed fields and any appended `default_ack_level`/`default_tier` bytes, emitted ONLY when
+/// non-zero, so a server that confirms no `flags2` capability sends a body byte-for-byte the
+/// historical layout and an old client (which stops reading after the fields it knows) ignores it.
+pub const INFO_FLAG2_EPHEMERAL_GROUPS: u8 = 0b0000_0001;
 
 /// A client's handshake request (the `Connect` frame body, #292). The client MAY request a
 /// per-consumer message credit and/or byte budget; the server clamps each to its own cap and replies
@@ -1479,6 +1509,16 @@ pub struct ConnectBody {
     /// is never silently placed in filtered mode. Advertising it sets a bit in the same appended
     /// `flags2` byte, so leaving it `false` keeps the body byte-for-byte the historical layout.
     pub wants_subject_filter: bool,
+    /// Whether this consumer UNDERSTANDS (and intends to use) EPHEMERAL consumer groups (#771): the
+    /// [`CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS`] capability bit (the third bit of the appended
+    /// `flags2` byte). When `true`, the server may honor a `SubTo` carrying [`SUBTO_FLAG_EPHEMERAL`]
+    /// — a work-group with NO durable state, reaped when its last subscriber leaves — and confirms
+    /// the capability in the `Info` `flags2` echo ([`INFO_FLAG2_EPHEMERAL_GROUPS`]). When `false`
+    /// (the default, an old client, or the empty `Connect` body) the server FAIL-CLOSED rejects an
+    /// ephemeral `SubTo`, so a subscription is never silently made ephemeral. Advertising it sets a
+    /// bit in the same appended `flags2` byte, so leaving it `false` keeps the body byte-for-byte
+    /// the historical layout.
+    pub wants_ephemeral_groups: bool,
 }
 
 /// The number of bytes in the `Connect` v1 known-field block with NO appended bytes (#494, #543):
@@ -1611,6 +1651,9 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     if req.wants_subject_filter {
         flags2 |= CONNECT_FLAG2_WANTS_SUBJECT_FILTER;
     }
+    if req.wants_ephemeral_groups {
+        flags2 |= CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS;
+    }
     // The block length is the historical fixed block plus ONE byte for each present appended field, in
     // declared order (ack-level, tier, then flags2). An all-absent request encodes the historical length
     // and bytes verbatim (byte-identity, #494/#543/#1066).
@@ -1741,6 +1784,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     let understands_streams = flags & CONNECT_FLAG_UNDERSTANDS_STREAMS != 0;
     let understands_compressed_delivery = flags2 & CONNECT_FLAG2_COMPRESSED_DELIVERY != 0;
     let wants_subject_filter = flags2 & CONNECT_FLAG2_WANTS_SUBJECT_FILTER != 0;
+    let wants_ephemeral_groups = flags2 & CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS != 0;
     Ok(ConnectBody {
         requested_credit,
         requested_credit_bytes,
@@ -1752,6 +1796,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         understands_streams,
         understands_compressed_delivery,
         wants_subject_filter,
+        wants_ephemeral_groups,
     })
 }
 
@@ -1955,6 +2000,15 @@ pub struct InfoBody {
     /// verbs AND the server supports named streams. `false` (an old server, or a client that did not
     /// advertise) tells the client it will only ever use the default-stream verbs.
     pub streams: bool,
+    /// Whether the server CONFIRMS this connection may bind EPHEMERAL consumer groups (#771): the
+    /// [`INFO_FLAG2_EPHEMERAL_GROUPS`] capability echo (the first bit of the appended `Info`
+    /// `flags2` byte), the server->client twin of [`ConnectBody::wants_ephemeral_groups`]. `true`
+    /// only when the client advertised the capability AND the server supports the mode. `false` (an
+    /// old server, which never emits the `flags2` byte, or a client that did not advertise) tells
+    /// the client it MUST NOT send an ephemeral `SubTo` — an old server would tolerate the appended
+    /// subscribe flag and silently bind a DURABLE group, so the client fails such a subscribe closed
+    /// locally instead.
+    pub ephemeral_groups: bool,
 }
 
 /// The number of bytes in the `Info` v1 known-field block with NO appended bytes (#494, #543):
@@ -1973,11 +2027,22 @@ const INFO_V1_FIELD_LEN: u16 = 1 + 4 + 4 + 8 + 8;
 /// this; [`decode_info`] accepts both.
 pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     out.push(HANDSHAKE_BODY_VERSION);
+    // The SECOND `Info` capability-flags byte (#771): the historical `Info` `flags` byte is FULL
+    // (bits 1..=128 all allocated), so a new capability echo rides here. An APPENDED in-block byte
+    // (after the conditional ack-level/tier bytes), emitted ONLY when non-zero, so a reply that
+    // confirms no `flags2` capability keeps the body byte-for-byte the historical layout.
+    let mut flags2 = 0u8;
+    if info.ephemeral_groups {
+        flags2 |= INFO_FLAG2_EPHEMERAL_GROUPS;
+    }
     let mut field_len = INFO_V1_FIELD_LEN;
     if info.default_ack_level.is_some() {
         field_len += 1;
     }
     if info.default_tier.is_some() {
+        field_len += 1;
+    }
+    if flags2 != 0 {
         field_len += 1;
     }
     out.extend_from_slice(&field_len.to_le_bytes());
@@ -2028,6 +2093,13 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     if let Some(tier) = info.default_tier {
         out.push(tier);
     }
+    // The appended `Info` `flags2` byte (#771) follows the tier byte, present ONLY when a flags2
+    // capability is confirmed. The decoder reads it after tier from whatever remains in the block,
+    // so a clear flags2 keeps the body byte-for-byte the historical layout and an old reader
+    // ignores the (absent) byte, exactly the `Connect` `flags2` discipline (#1066).
+    if flags2 != 0 {
+        out.push(flags2);
+    }
 }
 
 /// Decodes an `Info` body (#292), cap-before-alloc and panic-free.
@@ -2070,6 +2142,13 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
     // The appended tier byte (#543) follows the ack-level byte in the SAME conditional order the
     // encoder wrote them, read AFTER ack-level; a clear bit (or short block) reads no byte.
     let default_tier = (flags & INFO_FLAG_HAS_DEFAULT_TIER != 0).then(|| fr.u8().unwrap_or(0));
+    // The appended `Info` `flags2` byte (#771) is the FIRST byte of the block PAST the v1 fixed
+    // fields and the conditional ack-level/tier bytes, mirroring the `Connect` `flags2` (#1066). An
+    // old server (which stops there) leaves nothing, so `unwrap_or(0)` reads no capability and every
+    // `flags2` bit is clear — byte-for-byte the historical decode. A future in-block additive VALUE
+    // field must follow the whole `flags2` byte, so reading exactly this one byte stays
+    // forward-compatible.
+    let flags2 = fr.u8().unwrap_or(0);
     let credit = (flags & INFO_FLAG_HAS_CREDIT != 0).then_some(CreditAdvert {
         negotiated: credit_negotiated,
         cap: credit_cap,
@@ -2082,6 +2161,7 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
     let streaming = flags & INFO_FLAG_STREAMING != 0;
     let deliver_batch = flags & INFO_FLAG_DELIVER_BATCH != 0;
     let streams = flags & INFO_FLAG_STREAMS != 0;
+    let ephemeral_groups = flags2 & INFO_FLAG2_EPHEMERAL_GROUPS != 0;
     Ok(InfoBody {
         credit,
         credit_bytes,
@@ -2091,6 +2171,7 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
         default_tier,
         deliver_batch,
         streams,
+        ephemeral_groups,
     })
 }
 
@@ -2610,6 +2691,19 @@ pub fn decode_pub_to(body: &[u8]) -> Result<PubToBody<'_>, BodyError> {
     })
 }
 
+/// The `SubTo` subscribe-flags bit (#771, V2-M1) marking the subscription EPHEMERAL: the bound
+/// work-group keeps NO durable state (the broker suppresses its cursor and attempts checkpoints on
+/// every cadence) and is REAPED — in-memory state removed, any stray durable files deleted — the
+/// moment its last subscriber unsubscribes or disconnects. At-least-once holds WITHIN the
+/// subscription's lifetime only: a reconnect after the reap binds a FRESH group that starts at the
+/// earliest retained offset, redelivering everything still retained. Capability-gated BOTH ways: the
+/// server honors it only on a connection that advertised [`CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS`]
+/// (else a typed reject), and a client sends it only after the server's `Info` confirmed
+/// [`INFO_FLAG2_EPHEMERAL_GROUPS`] (an old server tolerates the appended byte and would silently
+/// bind a DURABLE group). The remaining `sub_flags` bits are reserved (senders MUST leave them
+/// clear; readers ignore them).
+pub const SUBTO_FLAG_EPHEMERAL: u8 = 0b0000_0001;
+
 /// A consumer's subscribe to a NAMED stream's work-group (the `SubTo` frame body, tag 31, #588): an
 /// explicit `stream_id` plus the work-`group` name. It binds the connection's subsequent
 /// stream-scoped `Flow`/`Ack` to that stream's OWN competing work-group (independent per stream). The
@@ -2617,9 +2711,13 @@ pub fn decode_pub_to(body: &[u8]) -> Result<PubToBody<'_>, BodyError> {
 /// the default group.
 ///
 /// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
-/// `stream_id: u16-len + bytes`, `group: u16-len + bytes`, then — ONLY when the consumer addresses a
-/// specific partition — an ADDITIVE `partition: u32 LE` (#693, V2-M2-I11b). All fields ride INSIDE the
-/// declared block, so a future version appends after them. Trailing block bytes are tolerated.
+/// `stream_id: u16-len + bytes`, `group: u16-len + bytes`, then the ADDITIVE TAIL — ONLY when the
+/// consumer addresses a specific partition, a `partition: u32 LE` (#693, V2-M2-I11b), and — ONLY
+/// when a subscribe flag is set — a `sub_flags: u8` (#771) which always FOLLOWS the (possibly
+/// absent) partition slot. The tail is disambiguated by its LENGTH (see [`decode_sub_to`]): `0` =
+/// neither, `1` = flags only, `4` = partition only, `>= 5` = partition then flags. All fields ride
+/// INSIDE the declared block, so a future version appends after them (after the flags byte, updating
+/// the tail-length disambiguation). Trailing block bytes are tolerated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubToBody<'a> {
     /// The target stream name (empty selects the default stream).
@@ -2632,20 +2730,35 @@ pub struct SubToBody<'a> {
     /// OWN sub-log + its own per-partition durable cursor — the SIMPLE/STATIC assignment (one consumer,
     /// one explicit partition). Emitted ONLY when `Some`, so an old client's `SubTo` is unchanged.
     pub partition: Option<u32>,
+    /// Whether this subscription binds an EPHEMERAL work-group (#771, the [`SUBTO_FLAG_EPHEMERAL`]
+    /// bit of the appended `sub_flags` byte): no durable checkpoints ever written, full reap on
+    /// last-subscriber departure, never resurrected across a restart. Emitted ONLY when `true` (the
+    /// flags byte is appended only when non-zero), so a durable subscribe is byte-for-byte the
+    /// pre-#771 body. Requires the negotiated capability (see [`SUBTO_FLAG_EPHEMERAL`]); mutually
+    /// exclusive with `partition` server-side today (a partition-addressed ephemeral subscribe is a
+    /// typed reject — the flag still rides the wire so a future slice can lift that).
+    pub ephemeral: bool,
 }
 
-/// Encodes a `SubTo` body onto the end of `out` (#588, #693): the version byte, the field-block length,
-/// then the stream id and group (each `u16`-length-prefixed), and — ONLY when `partition` is `Some` —
-/// the addressed partition as a `u32 LE` appended to the block. A `None` partition emits nothing extra,
-/// so a whole-stream `SubTo` is byte-for-byte the pre-#693 body. The partition must remain the LAST
-/// additive field of the block (a future field appends after it).
+/// Encodes a `SubTo` body onto the end of `out` (#588, #693, #771): the version byte, the
+/// field-block length, then the stream id and group (each `u16`-length-prefixed), and the ADDITIVE
+/// TAIL — the addressed partition as a `u32 LE` ONLY when `partition` is `Some`, then the
+/// `sub_flags: u8` ONLY when a flag is set (`ephemeral`). A `None`-partition, non-ephemeral `SubTo`
+/// emits nothing extra, so it is byte-for-byte the pre-#693 body; a partition-only one is
+/// byte-for-byte the pre-#771 body. The flags byte, when present, always FOLLOWS the (possibly
+/// absent) partition slot — the tail length is what disambiguates (see [`decode_sub_to`]) — so a
+/// future additive field must append AFTER the flags byte and extend the length rule.
 ///
 /// # Errors
 /// Returns [`BodyError::FieldTooLarge`] if the stream id or group exceeds the `u16` wire limit.
 pub fn encode_sub_to(req: &SubToBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
     let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
     let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
-    let extra = usize::from(req.partition.is_some()) * 4;
+    let mut sub_flags = 0u8;
+    if req.ephemeral {
+        sub_flags |= SUBTO_FLAG_EPHEMERAL;
+    }
+    let extra = usize::from(req.partition.is_some()) * 4 + usize::from(sub_flags != 0);
     let field_len = u16::try_from(2 + req.stream_id.len() + 2 + req.group.len() + extra)
         .map_err(|_| BodyError::FieldTooLarge)?;
     out.push(STREAM_WIRE_BODY_VERSION);
@@ -2656,6 +2769,9 @@ pub fn encode_sub_to(req: &SubToBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyE
     out.extend_from_slice(req.group);
     if let Some(partition) = req.partition {
         out.extend_from_slice(&partition.to_le_bytes());
+    }
+    if sub_flags != 0 {
+        out.push(sub_flags);
     }
     Ok(())
 }
@@ -2679,14 +2795,33 @@ pub fn decode_sub_to(body: &[u8]) -> Result<SubToBody<'_>, BodyError> {
     let mut fr = Reader::new(block);
     let stream_id = read_stream_id(&mut fr)?;
     let group = fr.var()?;
-    // The addressed partition is an ADDITIVE field appended after the group (#693): a partition-aware
-    // consumer emits a `u32`, an old client omits it (folding to `None` = whole-stream subscribe). A
-    // missing/short remainder folds to `None`, never an error, so the field stays forward-compatible.
-    let partition = fr.u32().ok();
+    // The ADDITIVE TAIL after the group (#693, #771), disambiguated by its LENGTH: `0` = neither
+    // field (the historical body), `1` = the `sub_flags` byte alone (an ephemeral whole-stream
+    // subscribe), `4` = the `partition: u32 LE` alone (byte-for-byte the #693 body — exactly what
+    // `fr.u32().ok()` read before #771), `>= 5` = partition then flags (any bytes past the fifth
+    // are a future field, tolerated). A `2`- or `3`-byte tail is foreign and folds to
+    // neither-present, never an error, matching the pre-#771 decoder (whose `u32().ok()` also folded
+    // a short tail to `None`), so every historical body decodes bit-identically.
+    let tail = fr.rest();
+    let (partition, sub_flags) = match tail.len() {
+        0 => (None, 0u8),
+        1 => (None, tail[0]),
+        4 => (
+            Some(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]])),
+            0u8,
+        ),
+        n if n >= 5 => (
+            Some(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]])),
+            tail[4],
+        ),
+        _ => (None, 0u8),
+    };
+    let ephemeral = sub_flags & SUBTO_FLAG_EPHEMERAL != 0;
     Ok(SubToBody {
         stream_id,
         group,
         partition,
+        ephemeral,
     })
 }
 
@@ -3440,6 +3575,7 @@ mod tests {
         // A consumer that wants gap markers sets the capability bit; the bit round-trips and a
         // default (old client) request leaves it clear.
         let req = ConnectBody {
+            wants_ephemeral_groups: false,
             requested_credit: None,
             requested_credit_bytes: None,
             wants_gap_marker: true,
@@ -3467,6 +3603,7 @@ mod tests {
     #[test]
     fn info_carries_the_gap_marker_capability_bit() {
         let info = InfoBody {
+            ephemeral_groups: false,
             credit: None,
             credit_bytes: None,
             gap_marker: true,
@@ -4626,7 +4763,7 @@ mod tests {
             // SubTo: stream_id + group (both u16-len framed inside the block).
             let mut buf = Vec::new();
             encode_sub_to(
-                &SubToBody { stream_id: &stream_id, group: &group, partition: None },
+                &SubToBody { ephemeral: false, stream_id: &stream_id, group: &group, partition: None },
                 &mut buf,
             )
             .unwrap();
@@ -4725,7 +4862,7 @@ mod tests {
             understands_streams in any::<bool>(),
             understands_compressed_delivery in any::<bool>(),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch, understands_streams, understands_compressed_delivery, wants_subject_filter: false };
+            let req = ConnectBody { wants_ephemeral_groups: false, requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch, understands_streams, understands_compressed_delivery, wants_subject_filter: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -4747,7 +4884,7 @@ mod tests {
             deliver_batch in any::<bool>(),
             streams in any::<bool>(),
         ) {
-            let info = InfoBody {
+            let info = InfoBody { ephemeral_groups: false,
                 credit: credit.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
                 credit_bytes: credit_bytes.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
                 gap_marker,
@@ -4784,14 +4921,14 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false, understands_streams: false, understands_compressed_delivery: false, wants_subject_filter: false };
+            let req = ConnectBody { wants_ephemeral_groups: false, requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false, understands_streams: false, understands_compressed_delivery: false, wants_subject_filter: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
             extended.extend_from_slice(&trailing);
             prop_assert_eq!(decode_connect(&extended).unwrap(), req, "trailing future bytes are ignored");
 
-            let info = InfoBody {
+            let info = InfoBody { ephemeral_groups: false,
                 credit: credit.map(|c| CreditAdvert { negotiated: c, cap: c }),
                 credit_bytes: None,
                 gap_marker: false,
@@ -4867,6 +5004,7 @@ mod tests {
         assert_eq!(
             decode_connect(&[]).unwrap(),
             ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -4894,6 +5032,7 @@ mod tests {
         let mut full = Vec::new();
         encode_connect(
             &ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: Some(32),
                 requested_credit_bytes: Some(1024),
                 wants_gap_marker: true,
@@ -4944,6 +5083,7 @@ mod tests {
             let mut body = Vec::new();
             encode_connect(
                 &ConnectBody {
+                    wants_ephemeral_groups: false,
                     requested_credit: Some(7),
                     requested_credit_bytes: None,
                     wants_gap_marker: false,
@@ -5080,6 +5220,7 @@ mod tests {
         assert_eq!(
             decode_info(&[]).unwrap(),
             InfoBody {
+                ephemeral_groups: false,
                 credit: None,
                 credit_bytes: None,
                 gap_marker: false,
@@ -5095,6 +5236,7 @@ mod tests {
     #[test]
     fn connect_round_trips_a_full_request() {
         let req = ConnectBody {
+            wants_ephemeral_groups: false,
             requested_credit: Some(32),
             requested_credit_bytes: Some(1024),
             wants_gap_marker: true,
@@ -5119,6 +5261,7 @@ mod tests {
     #[test]
     fn info_round_trips_a_full_advert() {
         let info = InfoBody {
+            ephemeral_groups: false,
             credit: Some(CreditAdvert {
                 negotiated: 32,
                 cap: 64,
@@ -5364,6 +5507,7 @@ mod tests {
         // byte-for-byte the pre-#494 Connect (no appended byte, the historical field_len). Compare the
         // two encodings directly.
         let no_level = ConnectBody {
+            wants_ephemeral_groups: false,
             requested_credit: Some(7),
             requested_credit_bytes: None,
             wants_gap_marker: false,
@@ -5420,6 +5564,7 @@ mod tests {
     #[test]
     fn info_carries_the_default_ack_level_and_old_server_is_byte_identical() {
         let no_level = InfoBody {
+            ephemeral_groups: false,
             credit: None,
             credit_bytes: None,
             gap_marker: false,
@@ -5459,6 +5604,7 @@ mod tests {
         // and MAY append a connection-default tier byte. An old client (or one that defers both) leaves
         // them clear/None, so the body is byte-for-byte the layout WITHOUT them.
         let none = ConnectBody {
+            wants_ephemeral_groups: false,
             requested_credit: Some(7),
             requested_credit_bytes: None,
             wants_gap_marker: false,
@@ -5532,6 +5678,7 @@ mod tests {
         // the layout without the echo; a confirming server flips the capability bit and may append the
         // echoed default-tier byte.
         let none = InfoBody {
+            ephemeral_groups: false,
             credit: None,
             credit_bytes: None,
             gap_marker: false,
@@ -5573,6 +5720,7 @@ mod tests {
         // (ack-level, then tier) and read in the SAME order, so each lands at its own offset and both
         // round-trip — the appended-byte discipline composes.
         let both = ConnectBody {
+            wants_ephemeral_groups: false,
             requested_credit: None,
             requested_credit_bytes: None,
             wants_gap_marker: false,
@@ -5636,6 +5784,7 @@ mod tests {
         assert_eq!(
             decode_connect(&connect).unwrap(),
             ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: Some(9),
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -5659,6 +5808,7 @@ mod tests {
         assert_eq!(
             decode_info(&info).unwrap(),
             InfoBody {
+                ephemeral_groups: false,
                 credit: None,
                 credit_bytes: None,
                 gap_marker: false,
@@ -6219,7 +6369,7 @@ mod tests {
             group in prop::collection::vec(any::<u8>(), 0..256),
             partition in prop::option::of(any::<u32>()),
         ) {
-            let msg = SubToBody {
+            let msg = SubToBody { ephemeral: false,
                 stream_id: &stream_id,
                 group: &group,
                 partition,
@@ -6310,6 +6460,7 @@ mod tests {
         let mut buf = Vec::new();
         encode_sub_to(
             &SubToBody {
+                ephemeral: false,
                 stream_id: &at_stream_cap,
                 group: b"g",
                 partition: None,
@@ -6360,6 +6511,7 @@ mod tests {
             let mut buf = Vec::new();
             encode_sub_to(
                 &SubToBody {
+                    ephemeral: false,
                     stream_id: id,
                     group,
                     partition: None,
@@ -6434,6 +6586,7 @@ mod tests {
         let mut addressed = Vec::new();
         encode_sub_to(
             &SubToBody {
+                ephemeral: false,
                 stream_id: b"orders",
                 group: b"w",
                 partition: Some(2),
@@ -6449,6 +6602,7 @@ mod tests {
         let mut whole = Vec::new();
         encode_sub_to(
             &SubToBody {
+                ephemeral: false,
                 stream_id: b"orders",
                 group: b"w",
                 partition: None,
@@ -6785,5 +6939,132 @@ mod tests {
         let mut bad_utf8 = vec![NOT_LEADER_BODY_VERSION];
         push_var(&mut bad_utf8, &[0xff, 0xfe]).unwrap();
         assert_eq!(decode_not_leader(&bad_utf8), Err(BodyError::Truncated));
+    }
+
+    // ===================== EPHEMERAL CONSUMER GROUPS (#771, V2-M1) =====================
+
+    #[test]
+    fn sub_to_round_trips_the_ephemeral_flag_in_every_tail_shape() {
+        // The additive tail is disambiguated by LENGTH: 0 (neither), 1 (flags), 4 (partition),
+        // 5 (partition + flags). Every combination must round-trip losslessly.
+        for (partition, ephemeral) in [
+            (None, false),
+            (None, true),
+            (Some(3u32), false),
+            (Some(3u32), true),
+        ] {
+            let body = SubToBody {
+                stream_id: b"orders",
+                group: b"g",
+                partition,
+                ephemeral,
+            };
+            let mut buf = Vec::new();
+            encode_sub_to(&body, &mut buf).unwrap();
+            assert_eq!(
+                decode_sub_to(&buf).unwrap(),
+                body,
+                "{partition:?}/{ephemeral}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_ephemeral_sub_to_is_byte_identical_to_the_pre_771_body() {
+        // Hand-rolled pre-#771 encoding: version, field_len, stream, group, optional partition —
+        // no flags byte. The new encoder with `ephemeral: false` must emit exactly these bytes,
+        // and the new decoder must fold them to `ephemeral: false` (old peers unchanged, both
+        // directions).
+        fn legacy(stream: &[u8], group: &[u8], partition: Option<u32>) -> Vec<u8> {
+            let mut out = Vec::new();
+            let extra = usize::from(partition.is_some()) * 4;
+            let field_len = u16::try_from(2 + stream.len() + 2 + group.len() + extra).unwrap();
+            out.push(STREAM_WIRE_BODY_VERSION);
+            out.extend_from_slice(&field_len.to_le_bytes());
+            out.extend_from_slice(&u16::try_from(stream.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(stream);
+            out.extend_from_slice(&u16::try_from(group.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(group);
+            if let Some(p) = partition {
+                out.extend_from_slice(&p.to_le_bytes());
+            }
+            out
+        }
+        for partition in [None, Some(7u32)] {
+            let mut new_bytes = Vec::new();
+            encode_sub_to(
+                &SubToBody {
+                    stream_id: b"orders",
+                    group: b"g",
+                    partition,
+                    ephemeral: false,
+                },
+                &mut new_bytes,
+            )
+            .unwrap();
+            let old_bytes = legacy(b"orders", b"g", partition);
+            assert_eq!(new_bytes, old_bytes, "encoder identity ({partition:?})");
+            let decoded = decode_sub_to(&old_bytes).unwrap();
+            assert!(!decoded.ephemeral, "an old body decodes durable");
+            assert_eq!(decoded.partition, partition);
+        }
+    }
+
+    #[test]
+    fn a_foreign_two_or_three_byte_sub_to_tail_folds_to_neither_field() {
+        // A 2- or 3-byte tail is a future shape this decoder does not know: it folds to
+        // partition-absent + no flags (exactly what the pre-#771 `u32().ok()` did), never an error.
+        for extra in [2usize, 3] {
+            let mut out = Vec::new();
+            let field_len = u16::try_from(2 + 1 + 2 + 1 + extra).unwrap();
+            out.push(STREAM_WIRE_BODY_VERSION);
+            out.extend_from_slice(&field_len.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.push(b's');
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.push(b'g');
+            out.extend(std::iter::repeat_n(0xffu8, extra));
+            let decoded = decode_sub_to(&out).unwrap();
+            assert_eq!(decoded.partition, None);
+            assert!(!decoded.ephemeral);
+        }
+    }
+
+    #[test]
+    fn connect_round_trips_the_ephemeral_groups_capability_and_stays_identical_without_it() {
+        let mut with = Vec::new();
+        encode_connect(
+            &ConnectBody {
+                wants_ephemeral_groups: true,
+                ..ConnectBody::default()
+            },
+            &mut with,
+        );
+        assert!(decode_connect(&with).unwrap().wants_ephemeral_groups);
+        // Without the capability the body carries NO flags2 byte: byte-for-byte the historical
+        // layout (version + field_len + the v1 fixed block).
+        let mut without = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut without);
+        assert!(!decode_connect(&without).unwrap().wants_ephemeral_groups);
+        assert_eq!(without.len(), 1 + 2 + usize::from(CONNECT_V1_FIELD_LEN));
+    }
+
+    #[test]
+    fn info_round_trips_the_ephemeral_groups_confirmation_and_stays_identical_without_it() {
+        let mut with = Vec::new();
+        encode_info(
+            &InfoBody {
+                ephemeral_groups: true,
+                ..InfoBody::default()
+            },
+            &mut with,
+        );
+        assert!(decode_info(&with).unwrap().ephemeral_groups);
+        // Without the confirmation the reply carries NO Info flags2 byte: byte-for-byte the
+        // historical layout, so an old client reads exactly the bytes it always has.
+        let mut without = Vec::new();
+        encode_info(&InfoBody::default(), &mut without);
+        assert!(!decode_info(&without).unwrap().ephemeral_groups);
+        assert_eq!(without.len(), 1 + 2 + usize::from(INFO_V1_FIELD_LEN));
     }
 }

@@ -144,6 +144,12 @@ pub enum ClientError {
     UnknownFrameType(u8),
     /// The response had the expected type but a malformed shape for the request.
     BadResponse(&'static str),
+    /// A request needs a wire capability this connection did not NEGOTIATE (#771): either this
+    /// client did not advertise it in its `Connect` (see the `ClientConfig` request flag), or the
+    /// server did not confirm it in `Info` (an OLD server). Failing locally is the protection: for
+    /// ephemeral groups, an old server would TOLERATE the appended subscribe flag and silently bind
+    /// a DURABLE group — the opposite of what was asked — so the client refuses to send it.
+    CapabilityNotNegotiated(&'static str),
     /// The producer's LOCAL transaction failed inside [`Client::transact`] (#640 part 2): the half
     /// message was ROLLED BACK (discarded, never delivered) and the local transaction's error message is
     /// carried here. The broker side is consistent (the half message is gone); this surfaces the local
@@ -213,6 +219,11 @@ impl core::fmt::Display for ClientError {
                 write!(f, "unknown response frame type tag {tag}")
             }
             ClientError::BadResponse(why) => write!(f, "malformed response: {why}"),
+            ClientError::CapabilityNotNegotiated(what) => write!(
+                f,
+                "capability not negotiated: {what} (advertise it in the client config AND use a \
+                 server that confirms it in Info)"
+            ),
             ClientError::LocalTransaction(m) => {
                 write!(
                     f,
@@ -455,6 +466,18 @@ pub struct ClientConfig {
     /// and a filtered subscribe is FAIL-CLOSED rejected by the server with a typed error — an old
     /// client (or one that opted out) can never be silently placed in filtered mode.
     pub request_subject_filter: bool,
+    /// Whether this client ADVERTISES that it understands (and intends to use) EPHEMERAL consumer
+    /// groups (#771): when `true`, the `Connect` sets the ephemeral-groups capability bit
+    /// (`ironbus_proto::message::CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS`, the third bit of the
+    /// appended `flags2` byte), the server confirms it in the `Info` `flags2` echo, and the client
+    /// may then bind an ephemeral group via the ephemeral subscribe method — a work-group that
+    /// keeps NO durable broker state (no cursor/attempts checkpoints, ever) and is REAPED in full
+    /// the moment its last subscriber disconnects or unsubscribes; at-least-once holds within the
+    /// subscription's lifetime only, and a re-subscribe starts fresh at the earliest retained
+    /// offset. When `false` (the default, backward-compatible) the flag is not advertised, the
+    /// `Connect` body is byte-for-byte the layout without it, and the ephemeral subscribe fails
+    /// locally with a typed error (never a silent durable subscribe against an old server).
+    pub request_ephemeral_groups: bool,
     /// The connection-scoped authentication credential this client presents in its `Connect`
     /// handshake (#631, #884), or `None` (the default) for an unauthenticated connection. When
     /// `Some(cred)`, `connect_with` appends the auth section the broker verifies (via
@@ -532,6 +555,12 @@ impl Default for ClientConfig {
             // consume path opts in by setting this (typically alongside `understands_streams` and
             // `request_gap_marker`).
             request_subject_filter: false,
+            // Off by default: an unconfigured client does not advertise ephemeral groups, so its
+            // `Connect` flags2 byte is byte-for-byte the pre-#771 layout and the ephemeral
+            // subscribe fails locally with a typed error. A caller that wants connection-lifetime
+            // consumer groups opts in by setting this (typically alongside `understands_streams`,
+            // since the ephemeral flag rides the `SubTo` verb).
+            request_ephemeral_groups: false,
             // None by default: an unconfigured client presents NO credential, so `connect_with`
             // appends no auth section and the `Connect` body is byte-for-byte the pre-#631 layout — an
             // unauthenticated connect to a no-auth broker is unchanged (#884). A caller opts into auth
@@ -1269,6 +1298,11 @@ pub struct Client {
     /// (an old server, or the client did not advertise), the client may use only the default-stream
     /// verbs.
     streams_enabled: bool,
+    /// Whether the server CONFIRMED the ephemeral-groups capability for this connection (#771):
+    /// `true` only when [`ClientConfig::request_ephemeral_groups`] was advertised AND the server's
+    /// `Info` echoed the confirmation. Gates the ephemeral subscribe locally: an OLD server never
+    /// confirms, so the client fails typed instead of silently binding a durable group.
+    ephemeral_groups_enabled: bool,
     /// The connection-wide DEFAULT consume tier the SERVER adopted for this connection (#543, V2-M1),
     /// echoed in `Info`, or `None` if the server did not echo one (an old server, or it defaulted to
     /// Tier-W). A subscription that does not pick its own tier consumes at this default server-side.
@@ -1331,6 +1365,7 @@ impl Client {
             streaming_enabled: false,
             deliver_batch_enabled: false,
             streams_enabled: false,
+            ephemeral_groups_enabled: false,
             negotiated_default_tier: None,
             confirm_cache: Vec::new(),
             next_txn_seq: 0,
@@ -1342,6 +1377,7 @@ impl Client {
         let mut connect_body = Vec::new();
         encode_connect(
             &ConnectBody {
+                wants_ephemeral_groups: config.request_ephemeral_groups,
                 requested_credit: config.requested_consumer_credit,
                 requested_credit_bytes: config.requested_consumer_credit_bytes,
                 wants_gap_marker: config.request_gap_marker,
@@ -1429,6 +1465,7 @@ impl Client {
                 // only when the client advertised it understands them), so an old server's empty Info
                 // leaves it off and the client uses only the default-stream verbs (#588).
                 client.streams_enabled = info.streams;
+                client.ephemeral_groups_enabled = info.ephemeral_groups;
                 Ok(client)
             }
             (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
@@ -1489,6 +1526,16 @@ impl Client {
     #[must_use]
     pub fn streams_enabled(&self) -> bool {
         self.streams_enabled
+    }
+
+    /// Whether EPHEMERAL consumer groups are ACTIVE on this connection (#771): `true` only when
+    /// this client advertised [`ClientConfig::request_ephemeral_groups`] AND the server confirmed
+    /// the capability in `Info`. When `false`, [`Client::subscribe_ephemeral`] fails locally with
+    /// [`ClientError::CapabilityNotNegotiated`] — the guard against an OLD server that would
+    /// tolerate the subscribe flag and silently bind a DURABLE group.
+    #[must_use]
+    pub fn ephemeral_groups_enabled(&self) -> bool {
+        self.ephemeral_groups_enabled
     }
 
     /// The connection-wide DEFAULT consume tier the server adopted for this connection (#543, V2-M1),
@@ -3386,6 +3433,56 @@ impl Client {
                 stream_id: stream.as_bytes(),
                 group: group.as_bytes(),
                 partition: None,
+                ephemeral: false,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::SubTo, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Subscribes this connection's consume path to an EPHEMERAL work-group (#771, V2-M1): a
+    /// `SubTo` carrying the ephemeral subscribe flag. The bound group keeps NO durable broker
+    /// state — its cursor and per-message attempt counts are never checkpointed, on any cadence —
+    /// and is REAPED in full the moment its last subscriber disconnects or unsubscribes, so it can
+    /// never resurrect across a broker restart and never pins retention once gone. At-least-once
+    /// holds WITHIN this subscription's lifetime only: leases, redelivery, max-deliver, and
+    /// dead-lettering behave normally while subscribed, but a disconnect discards the group's
+    /// position and a re-subscribe starts a FRESH group at the earliest retained offset. An EMPTY
+    /// `stream` targets the default stream; a NAMED stream must already exist. The group name is
+    /// required (the default/empty group cannot be ephemeral) and must not conflict with a durable
+    /// group's live state or on-disk checkpoints (`ERR_EPHEMERAL_GROUP_CONFLICT`).
+    ///
+    /// Requires BOTH negotiated capabilities: [`ClientConfig::request_ephemeral_groups`] confirmed
+    /// by the server (see [`Client::ephemeral_groups_enabled`]) — checked LOCALLY, because an old
+    /// server would tolerate the flag byte and silently bind a DURABLE group — and the
+    /// stream-addressing capability ([`ClientConfig::understands_streams`]): the ephemeral flag
+    /// rides the `SubTo` verb (tag 31), which the server gates as a whole, EMPTY stream id
+    /// included.
+    ///
+    /// # Errors
+    /// [`ClientError::CapabilityNotNegotiated`] when ephemeral groups were not negotiated,
+    /// [`ClientError::Server`] on a typed broker reject (unknown stream, name/cap validation, a
+    /// durability-mode conflict), [`ClientError::Body`] on an over-large field, or a
+    /// frame/connection error.
+    pub fn subscribe_ephemeral(&mut self, stream: &str, group: &str) -> Result<(), ClientError> {
+        if !self.ephemeral_groups_enabled {
+            return Err(ClientError::CapabilityNotNegotiated(
+                "ephemeral consumer groups (#771)",
+            ));
+        }
+        let mut body = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+                partition: None,
+                ephemeral: true,
             },
             &mut body,
         )
@@ -6299,6 +6396,7 @@ toYtkjmdU2eQ2pK/3gM=
         let mut body = Vec::new();
         ironbus_proto::message::encode_info(
             &ironbus_proto::message::InfoBody {
+                ephemeral_groups: false,
                 credit: None,
                 credit_bytes: Some(ironbus_proto::message::CreditAdvert {
                     negotiated,
@@ -6379,6 +6477,7 @@ toYtkjmdU2eQ2pK/3gM=
         let mut body = Vec::new();
         ironbus_proto::message::encode_info(
             &ironbus_proto::message::InfoBody {
+                ephemeral_groups: false,
                 credit: None,
                 credit_bytes: None,
                 gap_marker: true,
@@ -9237,6 +9336,62 @@ toYtkjmdU2eQ2pK/3gM=
         }
         drop(b);
         drop(consumer);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    // ===================== EPHEMERAL CONSUMER GROUPS (#771, V2-M1) =====================
+
+    #[test]
+    fn an_ephemeral_subscription_negotiates_consumes_and_starts_fresh_after_the_reap() {
+        let (addr, shutdown, handle) = start_server();
+        produce_n(addr, 3);
+        // WITHOUT the advertised capability the ephemeral subscribe fails LOCALLY with the typed
+        // error — the client never puts the flag on the wire toward a server that did not confirm
+        // it (an OLD server would tolerate the byte and silently bind a DURABLE group).
+        let mut plain = Client::connect(addr).unwrap();
+        assert!(!plain.ephemeral_groups_enabled());
+        assert!(matches!(
+            plain.subscribe_ephemeral("", "eph"),
+            Err(ClientError::CapabilityNotNegotiated(_))
+        ));
+        drop(plain);
+        // WITH it: the server confirms in Info, the subscribe binds, and consumption is the
+        // ordinary lease/ack path.
+        let cfg = ClientConfig {
+            request_ephemeral_groups: true,
+            // The ephemeral flag rides the `SubTo` verb (tag 31), which is gated on the streams
+            // capability as a whole — so an ephemeral consumer advertises BOTH.
+            understands_streams: true,
+            ..ClientConfig::default()
+        };
+        let mut c = Client::connect_with(addr, &cfg).unwrap();
+        assert!(c.ephemeral_groups_enabled());
+        c.subscribe_ephemeral("", "eph").unwrap();
+        let fetched = c
+            .fetch_batch(3, 0, std::time::Duration::from_secs(1), false)
+            .unwrap();
+        assert_eq!(fetched.messages.len(), 3, "normal at-least-once consume");
+        let acks: Vec<(u64, u64)> = fetched
+            .messages
+            .iter()
+            .map(|m| (m.offset, m.generation))
+            .collect();
+        assert!(c.ack_many(&acks).unwrap().iter().all(|&ok| ok));
+        // The synchronous Unsub is the deterministic last-member departure: the broker reaps the
+        // group before replying Ok. A re-subscribe then binds a FRESH group at the earliest
+        // retained offset — the fully-acked position did NOT survive, which is the ephemeral
+        // contract (at-least-once within the subscription's lifetime only).
+        c.unsubscribe().unwrap();
+        c.subscribe_ephemeral("", "eph").unwrap();
+        let again = c
+            .fetch_batch(3, 0, std::time::Duration::from_secs(1), false)
+            .unwrap();
+        assert_eq!(
+            again.messages.iter().map(|m| m.offset).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the re-subscribe sees the whole retained log again (nothing durable survived)"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
