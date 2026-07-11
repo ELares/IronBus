@@ -408,6 +408,12 @@ const DEFAULT_WAL_FSYNC_HEADROOM_BYTES: u64 =
 /// or format change.
 const DEFAULT_CONSUME_LONGPOLL_MS: u64 = 0;
 
+/// The default `--default-message-ttl-ms` for `serve` (V2-M4 #549, wired by #710): `0` = OFF (the
+/// tunability-safe default), so no record ever expires on read and a zero-config broker is
+/// byte-identical. A NON-ZERO value opts every record of the default stream into the per-stream
+/// TTL (lower-wins with any per-message `TTL1` headers-prefix TTL a producer attaches).
+const DEFAULT_MESSAGE_TTL_MS_OFF: u64 = 0;
+
 /// The default COUNT bound on each per-producer dedup window for `serve` (#3, #33), aliased to the
 /// engine's [`ironbus_core::dedup::DEFAULT_MAX_IDS`] so the CLI and engine default are one source of
 /// truth. Dedup is OFF by default and activates per-producer only when a publish carries a `msg_id`;
@@ -998,7 +1004,7 @@ USAGE:
     ironbus stream (purge | rm) <name> --data-dir <dir> --force [--json]
     ironbus dlq (ls | peek [--limit <n>] | redrive) --data-dir <dir> [--json]
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
-    ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
+    ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq [--exchange <name>]]
                   [--raw] [--require-dict]
     ironbus scrub --data-dir <dir> [--json]
     ironbus verify --data-dir <dir> [--json]
@@ -1205,10 +1211,12 @@ Notes:
     read only up to the durable high-water mark and mark, never hide, any torn or corrupt
     tail. peek shows a window (default 10 records); dump streams every record, one per line
     (NDJSON with --json). Both bound memory to one segment at a time.
-    dump --dlq instead streams the durable dead-letter SINK (the dlq/ subdirectory): one line
-    per poison record showing dlq_offset, source_offset, group, attempt, ts_ms, and the
-    key/payload sizes (NDJSON with --json). It is read-only and never mutates the directory;
-    an empty or never-poisoned broker shows nothing.
+    dump --dlq instead streams a durable dead-letter SINK: the default dlq/ subdirectory, or a
+    configured dead-letter EXCHANGE target subdir with --exchange <name> (#551/#710). One line
+    per poison record showing dlq_offset, source_offset, group, attempt, ts_ms, the dead-letter
+    reason (max-deliver-exceeded / ttl-expired / rejected), and the key/payload sizes (NDJSON
+    with --json). It is read-only and never mutates the directory; an empty or never-poisoned
+    broker (or a never-routed target) shows nothing.
     dump --raw shows the on-disk frame and --require-dict fails strictly (exit 3) on a record
     whose dictionary is missing. A broker served with --compression lz4 (#12, #387, wired by
     #430, default lz4) stores each compressible payload at or over the 64-byte threshold as a
@@ -2543,6 +2551,16 @@ struct ServeFlags {
     /// The event-driven consume long-poll budget in MILLISECONDS (push delivery); `None` -> default
     /// (`0` = off, the byte-identical empty-and-return consume path).
     consume_longpoll_ms: Option<u64>,
+    /// The per-stream DEFAULT message TTL in MILLISECONDS (V2-M4 #549, wired by #710); `None` ->
+    /// default (`0` = off, records never expire on read — byte-identical).
+    default_message_ttl_ms: Option<u64>,
+    /// The dead-letter EXCHANGE target list (V2-M4 #551, wired by #710): a comma-separated list of
+    /// data-dir subdir names a dead message fans out to; `None` -> default (no exchange, the fixed
+    /// `dlq/` sink byte-identical). The classic sink is addressable as the target named `dlq`.
+    dead_letter_exchange: Option<String>,
+    /// Whether a TTL-EXPIRED message is dead-lettered to the exchange (reason `ttl-expired`)
+    /// instead of being reclaimed by retention (#549/#551); bare flag, inert without an exchange.
+    dead_letter_expired: bool,
     /// The fsync-headroom admission window in BYTES (#378); `None` -> default (`0` = off).
     wal_fsync_headroom_bytes: Option<u64>,
     /// The graceful-shutdown drain timeout in MILLISECONDS (#637); `None` -> default (30 s). `0` waits
@@ -2850,6 +2868,20 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--consume-longpoll-ms" => {
                 f.consume_longpoll_ms = Some(take_number("--consume-longpoll-ms", args, &mut i)?);
+            }
+            // V2-M4 routing richness (#549/#551), the #710 serve surface: the per-stream default
+            // message TTL, the dead-letter exchange target list, and the expired-routing flag.
+            "--default-message-ttl-ms" => {
+                f.default_message_ttl_ms =
+                    Some(take_number("--default-message-ttl-ms", args, &mut i)?);
+            }
+            "--dead-letter-exchange" => {
+                f.dead_letter_exchange = Some(take_value("--dead-letter-exchange", args, &mut i)?);
+            }
+            // A bare boolean flag: advance ONE token. Inert without a dead-letter exchange.
+            "--dead-letter-expired" => {
+                f.dead_letter_expired = true;
+                i += 1;
             }
             "--wal-fsync-headroom-bytes" => {
                 f.wal_fsync_headroom_bytes =
@@ -3318,6 +3350,36 @@ fn parse_serve_flags_with_env_and_reader(
             "`{source}` must be `disk` or `memory`, got `{storage_arg}`"
         ))
     })?;
+    // The dead-letter EXCHANGE target list (V2-M4 #551, wired by #710): flag > env > FILE > default
+    // (none), a comma-separated list of data-dir subdir names. Validated HERE by the exact rule the
+    // engine enforces ([`ironbus_storage::dlq::DeadLetterExchange::new`]) so a bad target (invalid
+    // chars, a reserved layout name like `streams`, a duplicate, or more than the bounded maximum)
+    // is a typed USAGE error naming its source at parse time — caught by `--check-only` and
+    // `config validate` — never a failed boot.
+    let dlx_from_flag = f.dead_letter_exchange.is_some();
+    let dead_letter_exchange: Vec<String> = match resolve_opt_string(
+        "--dead-letter-exchange",
+        f.dead_letter_exchange.clone(),
+        env,
+    ) {
+        Some(raw) => {
+            let targets: Vec<String> = raw
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            let source = if dlx_from_flag {
+                "--dead-letter-exchange".to_string()
+            } else {
+                env_var_name("--dead-letter-exchange")
+            };
+            if let Err(e) = ironbus_storage::dlq::DeadLetterExchange::new(targets.clone()) {
+                return Err(CliError::Usage(format!("`{source}`: {e}")));
+            }
+            targets
+        }
+        None => Vec::new(),
+    };
     let mut parsed = ParsedServe {
         addr: resolve_string("--addr", f.addr, env, DEFAULT_ADDR),
         data_dir: resolve_opt_string("--data-dir", f.data_dir, env),
@@ -3588,6 +3650,17 @@ fn parse_serve_flags_with_env_and_reader(
                 env,
                 DEFAULT_CONSUME_LONGPOLL_MS,
             )?,
+            // V2-M4 routing richness (#549/#551), the #710 serve surface. Each defaults to its
+            // disabling value (no TTL, no exchange, expired-routing off), so a zero-config broker
+            // is byte-for-byte the historical fixed-`dlq/` broker.
+            default_message_ttl_ms: resolve_number(
+                "--default-message-ttl-ms",
+                f.default_message_ttl_ms,
+                env,
+                DEFAULT_MESSAGE_TTL_MS_OFF,
+            )?,
+            dead_letter_exchange,
+            dead_letter_expired: resolve_bool("--dead-letter-expired", f.dead_letter_expired, env)?,
             // The fsync-headroom admission window (#378), flag > env > default `0` (OFF), so a
             // zero-config broker is unchanged; a non-zero value bounds the un-fsynced write frontier.
             wal_fsync_headroom_bytes: resolve_number(
@@ -3750,6 +3823,18 @@ fn parse_serve_flags_with_env_and_reader(
     parsed
         .config_warnings
         .extend(verdict.warnings.iter().cloned());
+    // Coupled-set WARNING (#549/#551, #710): `--dead-letter-expired` has an effect only when a
+    // dead-letter exchange is configured — with none, an expired message is always reclaimed by
+    // retention. A no-op setting is surfaced loudly (never silently swallowed), but does not fail
+    // the start: the operator may be staging a rollout that adds the exchange next.
+    if parsed.config.dead_letter_expired && parsed.config.dead_letter_exchange.is_empty() {
+        parsed.config_warnings.push(
+            "dead_letter_expired is set but no dead-letter exchange is configured: expired \
+             messages are reclaimed by retention, not dead-lettered (set --dead-letter-exchange \
+             to route them)"
+                .to_string(),
+        );
+    }
     Ok(parsed)
 }
 
@@ -5415,6 +5500,23 @@ struct ServeConfig {
     /// `Flow`/`Fetch` block up to this budget on the broker's commit-notify seam and re-poll the
     /// instant a record commits. Threaded into [`EngineConfig::consume_longpoll_ms`]. Server-only.
     consume_longpoll_ms: u64,
+    /// The per-stream DEFAULT message TTL in MILLISECONDS (V2-M4 #549, wired by #710): a record
+    /// older than this (its durable producer `timestamp_ms + ttl` against the wall-clock seam) is
+    /// EXPIRED — skipped on read, never delivered, reclaimed by the segment reap. `0` = OFF (the
+    /// default), byte-identical. Combines LOWER-WINS with any per-message `TTL1` headers-prefix TTL.
+    /// Threaded into [`EngineConfig::default_message_ttl_ms`].
+    default_message_ttl_ms: u64,
+    /// The dead-letter EXCHANGE target subdirs (V2-M4 #551, wired by #710), already VALIDATED at
+    /// parse by [`ironbus_storage::dlq::DeadLetterExchange::new`]. EMPTY = no exchange (the fixed
+    /// `dlq/` sink, byte-identical). Non-empty routes EVERY dead-letter (max-deliver, TTL-expired
+    /// with the flag below, and `Term` rejects) to EVERY listed target, reason-tagged; named
+    /// streams route through the same list under their own `streams/<hex>/` tree. Threaded into
+    /// [`EngineConfig::dead_letter_exchange`].
+    dead_letter_exchange: Vec<String>,
+    /// Whether a TTL-EXPIRED message is dead-lettered to the exchange (reason `ttl-expired`)
+    /// instead of reclaimed by retention (#549/#551). Inert without an exchange (a coupled-set
+    /// warning says so). Threaded into [`EngineConfig::dead_letter_expired`].
+    dead_letter_expired: bool,
     /// The fsync-HEADROOM admission window in BYTES (#378): the most un-fsynced (buffered-but-not-
     /// durable) record bytes the BUFFERED write frontier may run ahead of the DURABLE frontier before
     /// a new produce is throttled (a group-commit drain forced first) or shed. `0` = DISABLED (the
@@ -5452,6 +5554,11 @@ impl ServeConfig {
     fn bench_default() -> ServeConfig {
         ServeConfig {
             consume_longpoll_ms: 0,
+            // V2-M4 routing richness (#549/#551) at its shipped defaults: no TTL, no dead-letter
+            // exchange (the fixed `dlq/`), expired-routing off — the historical broker.
+            default_message_ttl_ms: 0,
+            dead_letter_exchange: Vec::new(),
+            dead_letter_expired: false,
             // The bench broker is the shipped default set, i.e. the `balanced` profile.
             profile: Profile::Balanced,
             profile_schema_version: PROFILE_SCHEMA_VERSION,
@@ -9882,6 +9989,13 @@ fn cmd_serve(
         // `-D warnings` build trips field-never-read, invisible to a macOS reviewer (the recurring
         // #288/#99 footgun).
         config.consume_longpoll_ms,
+        // The V2-M4 routing knobs (#549/#551, wired by #710) are read only on the Unix serve path
+        // (they build the engine's TTL + dead-letter exchange config), so the non-Unix stub must
+        // consume them too or the Windows `-D warnings` build trips field-never-read, invisible to
+        // a macOS reviewer (the recurring #288/#99 footgun). The exchange list is borrowed (owned Vec).
+        config.default_message_ttl_ms,
+        &config.dead_letter_exchange,
+        config.dead_letter_expired,
         // The #378 fsync-headroom knob is read only on the Unix serve path (it wires the engine's
         // wal_fsync_headroom_bytes), so the non-Unix stub must consume it too or the Windows
         // `-D warnings` build trips field-never-read, invisible to a macOS reviewer (the recurring
@@ -10019,6 +10133,22 @@ fn open_memory_engine(
     )
 }
 
+/// Rebuilds the validated dead-letter EXCHANGE (#551/#710) from the resolved target list, or
+/// `None` when the list is empty (no exchange: the fixed `dlq/` sink, byte-identical). The list
+/// was already validated at parse by the SAME constructor, so a failure here is an internal
+/// invariant break — surfaced as a typed error, never a panic.
+#[cfg(unix)]
+fn dead_letter_exchange_config(
+    config: &ServeConfig,
+) -> Result<Option<ironbus_storage::dlq::DeadLetterExchange>, CliError> {
+    if config.dead_letter_exchange.is_empty() {
+        return Ok(None);
+    }
+    ironbus_storage::dlq::DeadLetterExchange::new(config.dead_letter_exchange.clone())
+        .map(Some)
+        .map_err(|e| CliError::Internal(format!("dead-letter exchange: {e}")))
+}
+
 /// Builds the broker engine over ANY [`Filesystem`] (#443): the ONE place the resolved
 /// [`ServeConfig`] becomes an `EngineConfig`, shared by [`open_disk_engine`] and
 /// [`open_memory_engine`] so the two storage backends can never drift apart in engine behavior
@@ -10067,13 +10197,16 @@ fn open_engine_with<F: Filesystem + Clone>(
             lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
             max_in_flight: config.max_in_flight,
-            // V2-M4 routing richness (per-message/stream TTL + dead-letter exchanges, #549/#551): the
-            // engine + storage capability is present and tested; the serve CLI flags to configure it
-            // are the follow-up, so these default to inert here — no TTL, the existing fixed-DLQ
-            // behavior — keeping the serve path byte-for-byte the historical behavior.
-            default_message_ttl_ms: 0,
-            dead_letter_exchange: None,
-            dead_letter_expired: false,
+            // V2-M4 routing richness (per-message/stream TTL + dead-letter exchanges, #549/#551),
+            // wired from `--default-message-ttl-ms` / `--dead-letter-exchange` /
+            // `--dead-letter-expired` (#710). Every knob defaults to its disabling value (no TTL,
+            // no exchange, expired-routing off), so a zero-config broker keeps the historical
+            // fixed-`dlq/` behavior byte-for-byte. The target list was already validated at parse;
+            // re-constructing the typed exchange here cannot fail on a parsed config (surfaced as
+            // an internal error, not a panic, if the invariant ever breaks).
+            default_message_ttl_ms: config.default_message_ttl_ms,
+            dead_letter_exchange: dead_letter_exchange_config(config)?,
+            dead_letter_expired: config.dead_letter_expired,
             // The per-CONSUMER (per-connection) standing in-flight credit CEILING (#65, #552): the most
             // un-acked messages one connection may EVER hold — the ceiling the auto-tuning credit window
             // grows toward from a 64 floor as the consumer keeps draining. The effective Flow bound is
@@ -10660,7 +10793,7 @@ fn run_dlq_peek(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir = data_dir
         .ok_or_else(|| CliError::Usage("dlq peek requires `--data-dir <dir>`".to_string()))?;
-    cmd_inspect_dlq(Path::new(&data_dir), limit, json, out)
+    cmd_inspect_dlq(Path::new(&data_dir), None, limit, json, out)
 }
 
 /// Fetches and renders the `/admin` v1 view (#15, #99). Kept apart from [`run_admin`] (the flag
@@ -10742,6 +10875,7 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut limit: Option<u64> = None;
     let mut json = false;
     let mut dlq = false;
+    let mut exchange: Option<String> = None;
     let mut raw = false;
     let mut require_dict = false;
     let mut i = 0;
@@ -10761,6 +10895,20 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "--dlq" => {
                 dlq = true;
                 i += 1;
+            }
+            // The dead-letter EXCHANGE target subdir to inspect (#551/#710): `dump --dlq` reads the
+            // default `dlq/` sink; `--exchange <name>` points it at a configured DLX target instead.
+            // Validated by the same rule the engine enforces, so a traversal-shaped name is a usage
+            // error, never a filesystem walk.
+            "--exchange" => {
+                let name = take_value("--exchange", args, &mut i)?;
+                if !ironbus_storage::dlq::DeadLetterExchange::is_valid_target_name(&name) {
+                    return Err(CliError::Usage(format!(
+                        "`--exchange` needs a valid dead-letter target name \
+                         ([A-Za-z0-9._-], not `.`/`..`), got `{name}`"
+                    )));
+                }
+                exchange = Some(name);
             }
             // The committed compression-inspection surface (#92), LIVE since the write path was
             // wired (#430): `--raw` shows the on-disk frame of a compressed record (stored sizes,
@@ -10796,8 +10944,14 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "`--raw`/`--require-dict` are not valid with `--dlq`".to_string(),
         ));
     }
+    // `--exchange` selects WHICH dead-letter sink `--dlq` reads, so it is meaningless alone.
+    if exchange.is_some() && !dlq {
+        return Err(CliError::Usage(
+            "`--exchange` is only valid with `--dlq`".to_string(),
+        ));
+    }
     if dlq {
-        return cmd_inspect_dlq(Path::new(&data_dir), limit, json, out);
+        return cmd_inspect_dlq(Path::new(&data_dir), exchange.as_deref(), limit, json, out);
     }
     cmd_inspect(Path::new(&data_dir), 0, limit, json, raw, require_dict, out)
 }
@@ -11439,20 +11593,23 @@ fn write_loss(report: &LossReport, json: bool, out: &mut impl Write) -> Result<(
     Ok(())
 }
 
-/// Decodes a stopped broker's DURABLE DEAD-LETTER SINK (the `dlq/` subdirectory) offline and writes
-/// its dead-letter records (at most `limit` of them) to `out`, READ-ONLY, never mutating the
-/// directory (#63). Each line shows the DLQ position, the source offset, the original timestamp, the
-/// group, the attempt, and the key/payload lengths. An ABSENT or empty DLQ shows nothing (a clean,
-/// never-poisoned broker), which is not an error. Reuses the same offline reader as `dump`, so the
+/// Decodes a stopped broker's DURABLE DEAD-LETTER SINK offline — the default `dlq/` subdirectory,
+/// or the configured dead-letter EXCHANGE target subdir named by `exchange` (#551/#710) — and
+/// writes its dead-letter records (at most `limit` of them) to `out`, READ-ONLY, never mutating
+/// the directory (#63). Each line shows the DLQ position, the source offset, the original
+/// timestamp, the group, the attempt, the dead-letter REASON, and the key/payload lengths. An
+/// ABSENT or empty sink shows nothing (a clean, never-poisoned broker — or a target this broker
+/// never routed to), which is not an error. Reuses the same offline reader as `dump`, so the
 /// frozen offline exit codes apply (a missing DATA directory is still not-found).
 #[cfg(unix)]
 fn cmd_inspect_dlq(
     data_dir: &Path,
+    exchange: Option<&str>,
     limit: Option<u64>,
     json: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    // A missing DATA directory is not-found (exit 2), matching plain `dump`; an absent `dlq/`
+    // A missing DATA directory is not-found (exit 2), matching plain `dump`; an absent sink
     // subdirectory inside an existing data directory is simply an empty DLQ (shown as nothing).
     if !data_dir.is_dir() {
         return Err(CliError::NotFound(format!(
@@ -11460,8 +11617,10 @@ fn cmd_inspect_dlq(
             data_dir.display()
         )));
     }
-    let entries = read_dlq_entries(&StdFs::new(data_dir.to_path_buf()))
-        .map_err(|e| map_offline_err(data_dir, &e))?;
+    let subdir = exchange.unwrap_or(ironbus_storage::dlq::DLQ_SUBDIR);
+    let entries =
+        ironbus_storage::dlq::read_dead_letter_entries(&StdFs::new(data_dir.to_path_buf()), subdir)
+            .map_err(|e| map_offline_err(data_dir, &e))?;
     // `--limit` caps how many records are shown; `usize::MAX` (no limit) shows them all.
     let cap = limit.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
     for entry in entries.iter().take(cap) {
@@ -11478,7 +11637,7 @@ fn write_dlq_entry(entry: &DlqEntry, json: bool, out: &mut impl Write) -> Result
     if json {
         writeln!(
             out,
-            "{{\"dlq_offset\":{},\"source_offset\":{},\"group\":\"{}\",\"attempt\":{},\"ts_ms\":{},\"bytes\":{},\"key_bytes\":{}}}",
+            "{{\"dlq_offset\":{},\"source_offset\":{},\"group\":\"{}\",\"attempt\":{},\"ts_ms\":{},\"bytes\":{},\"key_bytes\":{},\"reason\":\"{}\"}}",
             entry.dlq_offset.get(),
             entry.source_offset,
             escape_json(&entry.group),
@@ -11486,11 +11645,12 @@ fn write_dlq_entry(entry: &DlqEntry, json: bool, out: &mut impl Write) -> Result
             entry.timestamp_ms,
             entry.payload.len(),
             entry.key.len(),
+            entry.reason.label(),
         )?;
     } else {
         writeln!(
             out,
-            "dlq_offset={} source_offset={} group={:?} attempt={} ts_ms={} bytes={} key_bytes={}",
+            "dlq_offset={} source_offset={} group={:?} attempt={} ts_ms={} bytes={} key_bytes={} reason={}",
             entry.dlq_offset.get(),
             entry.source_offset,
             entry.group,
@@ -11498,6 +11658,7 @@ fn write_dlq_entry(entry: &DlqEntry, json: bool, out: &mut impl Write) -> Result
             entry.timestamp_ms,
             entry.payload.len(),
             entry.key.len(),
+            entry.reason.label(),
         )?;
     }
     Ok(())
@@ -13615,11 +13776,12 @@ fn cmd_inspect(
 #[cfg(not(unix))]
 fn cmd_inspect_dlq(
     data_dir: &Path,
+    exchange: Option<&str>,
     limit: Option<u64>,
     json: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let _ = (data_dir, limit, json, out);
+    let _ = (data_dir, exchange, limit, json, out);
     Err(CliError::Internal(
         "ironbus dump --dlq requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
     ))
@@ -13757,6 +13919,11 @@ mod tests {
     fn test_serve_config(max_in_flight: u32, checkpoint_interval: u64) -> ServeConfig {
         ServeConfig {
             consume_longpoll_ms: 0,
+            // V2-M4 routing (#549/#551) at its inert defaults: no TTL, no exchange, no
+            // expired-routing — the historical fixed-`dlq/` broker.
+            default_message_ttl_ms: 0,
+            dead_letter_exchange: Vec::new(),
+            dead_letter_expired: false,
             profile: Profile::Balanced,
             profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -13946,6 +14113,122 @@ mod tests {
         assert_eq!(parsed.config.consumer_credit, DEFAULT_CONSUMER_CREDIT);
         assert!(parsed.config_warnings.is_empty(), "no file, no warnings");
         assert!(parsed.config_path.is_none());
+    }
+
+    // ---- #710 V2-M4 routing serve surface: TTL + dead-letter-exchange flags / env / file ----
+
+    #[test]
+    fn the_dead_letter_serve_flags_parse_and_default_to_the_inert_historical_broker() {
+        // Zero-config: no TTL, no exchange, no expired-routing — byte-identical serve.
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert_eq!(parsed.config.default_message_ttl_ms, 0);
+        assert!(parsed.config.dead_letter_exchange.is_empty());
+        assert!(!parsed.config.dead_letter_expired);
+        // Flags: the TTL number, the exchange comma-list (order preserved, whitespace trimmed,
+        // the classic `dlq` addressable), and the bare expired-routing bool.
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--default-message-ttl-ms",
+            "60000",
+            "--dead-letter-exchange",
+            "dead-a, dead-b,dlq",
+            "--dead-letter-expired",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.config.default_message_ttl_ms, 60_000);
+        assert_eq!(
+            parsed.config.dead_letter_exchange,
+            vec!["dead-a", "dead-b", "dlq"]
+        );
+        assert!(parsed.config.dead_letter_expired);
+        assert!(
+            parsed.config_warnings.is_empty(),
+            "expired WITH an exchange draws no warning"
+        );
+    }
+
+    #[test]
+    fn a_bad_dead_letter_exchange_target_is_a_usage_error_naming_its_source() {
+        // A traversal-shaped target from the FLAG names the flag.
+        let err =
+            parse_serve_flags(&serve_args(&["--dead-letter-exchange", "../escape"])).unwrap_err();
+        match err {
+            CliError::Usage(m) => {
+                assert!(m.contains("--dead-letter-exchange"), "{m}");
+                assert!(m.contains("../escape"), "{m}");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // A RESERVED storage-layout name is refused (it would root a sink inside another tree).
+        let err =
+            parse_serve_flags(&serve_args(&["--dead-letter-exchange", "streams"])).unwrap_err();
+        match err {
+            CliError::Usage(m) => assert!(m.contains("reserved"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // The same bad value from the ENV names the env var (the source discipline).
+        let env =
+            |name: &str| (name == "IRONBUS_DEAD_LETTER_EXCHANGE").then(|| "bad name".to_string());
+        let err = parse_serve_flags_with_env(&serve_args(&[]), &env).unwrap_err();
+        match err {
+            CliError::Usage(m) => assert!(m.contains("IRONBUS_DEAD_LETTER_EXCHANGE"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_dead_letter_keys_resolve_from_env_and_the_config_file() {
+        // ENV layer: the IRONBUS_<FLAG> grammar covers all three knobs.
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "IRONBUS_DEFAULT_MESSAGE_TTL_MS".to_string(),
+            "1500".to_string(),
+        );
+        env.insert(
+            "IRONBUS_DEAD_LETTER_EXCHANGE".to_string(),
+            "dead-env".to_string(),
+        );
+        env.insert(
+            "IRONBUS_DEAD_LETTER_EXPIRED".to_string(),
+            "true".to_string(),
+        );
+        let env_fn = |name: &str| env.get(name).cloned();
+        let parsed = parse_serve_flags_with_env(&serve_args(&[]), &env_fn).unwrap();
+        assert_eq!(parsed.config.default_message_ttl_ms, 1_500);
+        assert_eq!(parsed.config.dead_letter_exchange, vec!["dead-env"]);
+        assert!(parsed.config.dead_letter_expired);
+
+        // FILE layer: the `[delivery]` keys flow through the same resolution (file < env < flag).
+        let doc = "[delivery]\ndefault_message_ttl_ms = \"2s\"\n\
+                   dead_letter_exchange = \"dead-file,audit\"\ndead_letter_expired = true\n";
+        let parsed = parse_with_env_and_file(
+            &serve_args(&["--config", "/x.toml"]),
+            &std::collections::HashMap::new(),
+            doc,
+        )
+        .unwrap();
+        assert_eq!(parsed.config.default_message_ttl_ms, 2_000);
+        assert_eq!(
+            parsed.config.dead_letter_exchange,
+            vec!["dead-file", "audit"]
+        );
+        assert!(parsed.config.dead_letter_expired);
+    }
+
+    #[test]
+    fn dead_letter_expired_without_an_exchange_draws_a_coupled_set_warning() {
+        // The no-op combination is surfaced loudly (never silently swallowed) but does not fail
+        // the start: the operator may be staging a rollout that adds the exchange next.
+        let parsed = parse_serve_flags(&serve_args(&["--dead-letter-expired"])).unwrap();
+        assert!(parsed.config.dead_letter_expired);
+        assert!(parsed.config.dead_letter_exchange.is_empty());
+        assert!(
+            parsed
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("dead_letter_expired")),
+            "expected the coupled-set warning, got {:?}",
+            parsed.config_warnings
+        );
     }
 
     #[test]
@@ -15677,6 +15960,14 @@ mod tests {
     /// deterministically. Returns the data directory path.
     #[cfg(unix)]
     fn make_dlq_data_dir(tag: &str) -> std::path::PathBuf {
+        make_dead_letter_data_dir(tag, &[])
+    }
+
+    /// Like [`make_dlq_data_dir`] but with a configurable dead-letter EXCHANGE (#551/#710): an
+    /// EMPTY `exchange` keeps the fixed `dlq/` sink; a non-empty list fans the poison out to the
+    /// named target subdirs instead.
+    #[cfg(unix)]
+    fn make_dead_letter_data_dir(tag: &str, exchange: &[&str]) -> std::path::PathBuf {
         use ironbus_core::clock::ManualClock;
         let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -15728,7 +16019,11 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
-                dead_letter_exchange: None,
+                dead_letter_exchange: if exchange.is_empty() {
+                    None
+                } else {
+                    Some(ironbus_storage::dlq::DeadLetterExchange::new(exchange.to_vec()).unwrap())
+                },
                 dead_letter_expired: false,
             },
         )
@@ -15800,6 +16095,82 @@ mod tests {
             "dump --dlq must not mutate the data directory"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_dlq_exchange_inspects_a_configured_dlx_target_subdir() {
+        // #710(3): `dump --dlq --exchange <name>` reads a configured dead-letter EXCHANGE target
+        // instead of the fixed `dlq/`. The broker fanned the poison out to TWO targets; each is
+        // inspectable by name (with the recorded reason), the default `dlq/` view is empty (it was
+        // not a target), and the read never mutates the tree.
+        let dir = make_dead_letter_data_dir("dumpdlx", &["dead-a", "dead-b"]);
+        let before = dir_snapshot(&dir);
+        for target in ["dead-a", "dead-b"] {
+            let mut buf = Vec::new();
+            run_dump(
+                &[
+                    "--data-dir".to_string(),
+                    dir.display().to_string(),
+                    "--dlq".to_string(),
+                    "--exchange".to_string(),
+                    target.to_string(),
+                ],
+                &mut buf,
+            )
+            .unwrap();
+            let text = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 1, "exactly one record in {target}: {text}");
+            assert!(lines[0].contains("source_offset=0"), "{text}");
+            assert!(lines[0].contains("reason=max-deliver-exceeded"), "{text}");
+        }
+        // The fixed dlq/ was not a target: the default view is empty.
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--dlq".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        assert!(buf.is_empty(), "the fixed dlq/ was never written");
+        // Read-only across all three reads.
+        assert_eq!(before, dir_snapshot(&dir), "inspection must not mutate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_exchange_flag_is_validated_and_requires_dlq() {
+        // `--exchange` without `--dlq` is a usage error (it selects WHICH dead-letter sink to read).
+        let mut buf = Vec::new();
+        let e = run_dump(
+            &[
+                "--data-dir".to_string(),
+                "/tmp".to_string(),
+                "--exchange".to_string(),
+                "dead-a".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        // A traversal-shaped target name is a usage error, never a filesystem walk.
+        let e = run_dump(
+            &[
+                "--data-dir".to_string(),
+                "/tmp".to_string(),
+                "--dlq".to_string(),
+                "--exchange".to_string(),
+                "../etc".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
     }
 
     #[cfg(unix)]
@@ -17216,6 +17587,10 @@ mod tests {
     fn validation_config() -> ServeConfig {
         ServeConfig {
             consume_longpoll_ms: 0,
+            // V2-M4 routing (#549/#551) at its inert defaults, mirroring production.
+            default_message_ttl_ms: 0,
+            dead_letter_exchange: Vec::new(),
+            dead_letter_expired: false,
             profile: Profile::Balanced,
             profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: DEFAULT_MAX_CONNECTIONS,

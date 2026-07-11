@@ -468,19 +468,29 @@ poison record is preserved verbatim (its `key`, `payload`, and original `timesta
 and the dead-letter metadata is packed as a fixed, self-describing prefix of the DLQ
 record's `headers` blob, ahead of the original headers.
 
-The DEFAULT stream's sink lives at the data-dir root `dlq/` (or the configured dead-letter
-EXCHANGE subdir, #551). A NAMED stream's poison (#681 DLQ follow-up) routes to that stream's
-OWN sink, `streams/<hex(stream)>/dlq/` — the same on-disk record format and the same
-crash-atomic, exactly-once move, keyed by `(stream, group, source_offset)` so dead-letters
-(and their per-group idempotency set) are ISOLATED per stream, co-located with the stream's
-log. This is a new LOCATION, not a new byte layout: the DLQ record format / `FORMAT_VERSION`
-is unchanged. The move ordering is identical to the default's: APPEND+FSYNC the forensic copy,
-THEN commit the source cursor (in memory; the named cursor's durability is the lagging #681
-checkpoint), so a crash between the two redelivers-and-re-poisons and the sink's rebuilt exact
-set makes the re-poison a no-op append (never lost, never doubled). The sink is opened lazily on
-a stream's first dead-letter (a stream that never poisons never creates `dlq/`) or eagerly at
-open when the subdir already exists, so the idempotency set is present before the first
-re-poison.
+The DEFAULT stream's sink lives at the data-dir root `dlq/` — or, with a configured
+dead-letter EXCHANGE (#551), one sink PER exchange target at the root `<target>/` subdirs.
+An exchange is an ORDERED, bounded (at most 16), validated list of target subdir names
+(`[A-Za-z0-9._-]`, never a reserved layout name); the classic sink is addressable as the
+target literally named `dlq`. A dead message (max-deliver, TTL-expired with the routing
+flag, or an explicit `Term` reject) FANS OUT: the forensic copy is appended+fsynced to
+EVERY target BEFORE the source cursor commits, each target guarded by its OWN per-group
+exact-offset idempotency set — so a crash anywhere mid-fan-out redelivers-and-re-poisons
+and only the missing targets are appended (never a lost copy, never a doubled one, per
+target). A NAMED stream's poison (#681 DLQ follow-up) routes to that stream's OWN sinks,
+`streams/<hex(stream)>/<target>/` (the fixed `streams/<hex(stream)>/dlq/` when no exchange
+is configured) — the same on-disk record format and the same crash-atomic, exactly-once
+move, keyed by `(stream, group, source_offset)` so dead-letters (and their per-group
+idempotency sets) are ISOLATED per stream, co-located with the stream's log. These are new
+LOCATIONS, not new byte layouts: the DLQ record format / `FORMAT_VERSION` is unchanged
+(an exchange target holds v2 reason-carrying records; the unconfigured fixed `dlq/` keeps
+v1, byte-identical). The move ordering is identical to the default's: APPEND+FSYNC the
+forensic copy to every target, THEN commit the source cursor (in memory; the named cursor's
+durability is the lagging #681 checkpoint), so a crash between the two redelivers-and-
+re-poisons and each sink's rebuilt exact set makes its re-poison a no-op append (never
+lost, never doubled). Each sink is opened lazily on its first dead-letter (a broker that
+never poisons never creates any sink subdir) or eagerly at open when the subdir already
+exists, so every idempotency set is present before the first re-poison.
 
 ### DLQ headers metadata prefix (on-disk, within a DLQ record's `headers`)
 

@@ -406,6 +406,21 @@ pub const KEY_TABLE: &[KeySpec] = &[
         key: "delivery.max_prepared_bytes",
         kind: KeyKind::Integer,
     },
+    // V2-M4 routing richness (#549/#551, wired on serve by #710): the per-stream default
+    // message TTL, the dead-letter exchange target list (comma-separated subdir names), and
+    // whether a TTL-expired message dead-letters to the exchange.
+    KeySpec {
+        key: "delivery.default_message_ttl_ms",
+        kind: KeyKind::Duration,
+    },
+    KeySpec {
+        key: "delivery.dead_letter_exchange",
+        kind: KeyKind::Str,
+    },
+    KeySpec {
+        key: "delivery.dead_letter_expired",
+        kind: KeyKind::Bool,
+    },
     // [network]
     KeySpec {
         key: "network.listen",

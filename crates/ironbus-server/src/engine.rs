@@ -47,7 +47,7 @@ use ironbus_storage::checkpoint::{
     AttemptsCheckpoint, BindingsCheckpoint, Checkpoint, CountersCheckpoint, ProducerSeqCheckpoint,
     ATTEMPTS_PAYLOAD, BINDINGS_PAYLOAD, MAX_PAYLOAD, PRODUCER_SEQ_PAYLOAD,
 };
-use ironbus_storage::dlq::{DeadLetterReason, DlqSink, DLQ_SUBDIR};
+use ironbus_storage::dlq::{DeadLetterExchange, DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::layout::{PARTITIONED_STREAMS_SUBDIR, SHARED_WAL_SUBDIR, STREAMS_SUBDIR};
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds, SyncTicket};
@@ -613,13 +613,18 @@ pub struct EngineConfig {
     /// to today (records never expire on read). This is the DELIVERY-skip TTL; the disk-reclamation
     /// counterpart is [`EngineConfig::max_age_ms`] (the segment reap), which the TTL piggybacks on.
     pub default_message_ttl_ms: u64,
-    /// The configurable dead-letter EXCHANGE (V2-M4, #551): the data-dir SUBDIR a dead-lettered
-    /// message is routed to. `None` (the default) keeps the existing FIXED behavior byte-identical —
-    /// max-deliver dead-letters go to the default `dlq/` sink via the unchanged reason-less path. A
-    /// `Some(subdir)` routes EVERY dead-letter (max-deliver, TTL-expired, rejected) to that named
-    /// sink instead, recording the [`DeadLetterReason`](ironbus_storage::dlq::DeadLetterReason) —
-    /// the `RabbitMQ` DLX-parity beat over a single fixed DLQ.
-    pub dead_letter_exchange: Option<String>,
+    /// The configurable dead-letter EXCHANGE (V2-M4, #551): the ORDERED list of data-dir target
+    /// SUBDIRS a dead-lettered message FANS OUT to (validated by construction, at most
+    /// [`ironbus_storage::dlq::MAX_DEAD_LETTER_TARGETS`]). `None` (the default) keeps the existing
+    /// FIXED behavior byte-identical — max-deliver dead-letters go to the default `dlq/` sink via
+    /// the unchanged reason-less path. A `Some(exchange)` routes EVERY dead-letter (max-deliver,
+    /// TTL-expired, rejected via `Term`) to EVERY target, recording the
+    /// [`DeadLetterReason`](ironbus_storage::dlq::DeadLetterReason) — the `RabbitMQ` DLX-parity
+    /// beat over a single fixed DLQ, plus the many-target fan-out `RabbitMQ` gets from exchange
+    /// bindings. Named streams route through the SAME exchange, per-stream-rooted
+    /// (`streams/<hex(name)>/<target>/`), falling back to their fixed per-stream `dlq/` when this
+    /// is `None`. The classic sink is addressable as the target literally named `dlq`.
+    pub dead_letter_exchange: Option<DeadLetterExchange>,
     /// Whether a TTL-EXPIRED message is dead-lettered (routed to the dead-letter exchange with
     /// [`DeadLetterReason::TtlExpired`](ironbus_storage::dlq::DeadLetterReason)) rather than silently
     /// reclaimed by retention (V2-M4, #549/#551). `false` (the default) reclaims an expired message
@@ -3535,27 +3540,39 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// or `None` if none has been dead-lettered. A gauge-style companion to the
     /// `dead_lettered` counter.
     last_dead_lettered: Option<Offset>,
-    /// The durable dead-letter SINK (#63): a second segmented log under the `dlq/` subdirectory
-    /// holding every poison record for later inspection. Opened LAZILY on the first dead-letter
-    /// (so a broker that never dead-letters never creates the subdirectory), or eagerly by
-    /// [`Engine::open`] when the subdirectory already exists, so the per-group dead-lettered
-    /// offset set (the idempotency key) is rebuilt before the first poison redelivers.
-    dlq: Option<DlqSink<F, C>>,
+    /// The durable dead-letter SINKS (#63, fan-out #551): one slot per dead-letter TARGET, in
+    /// [`Engine::dead_letter_targets`] order (`dlq[i]` is the sink for `dead_letter_targets[i]`).
+    /// One slot rooted at the fixed `dlq/` when no exchange is configured (byte-identical to the
+    /// pre-#551 single sink), or one per exchange target. Each slot is opened LAZILY on the first
+    /// dead-letter (so a broker that never dead-letters never creates any sink subdirectory), or
+    /// eagerly by [`Engine::open`] when its subdirectory already exists, so every target's
+    /// per-group dead-lettered offset set (the idempotency key) is rebuilt before the first
+    /// poison redelivers.
+    dlq: Vec<Option<DlqSink<F, C>>>,
+    /// The resolved dead-letter TARGET subdirs (#551), fixed at open: the configured exchange's
+    /// ordered target list, or the single fixed [`DLQ_SUBDIR`] when no exchange is configured. A
+    /// dead message is appended+fsynced to EVERY target (in this order) BEFORE its source cursor
+    /// commits, each target guarded by its OWN exact-offset idempotency set — so a crash anywhere
+    /// mid-fan-out resumes exactly (never a lost copy, never a doubled one). Never empty.
+    dead_letter_targets: Vec<String>,
     /// The [`LogConfig`] the DLQ sink's log is opened with: the same segment sizing as the main
     /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
     /// evidence of a dropped message).
     dlq_config: LogConfig,
-    /// The per-NAMED-stream durable dead-letter SINKS (#681 follow-up), the per-stream twin of `dlq`
-    /// above: each named stream's poison records route to a sink rooted in THAT stream's OWN
-    /// subdirectory (`streams/<hex(name)>/dlq/`), co-located with — and recovered beside — its log,
-    /// the `dlq/` subdir pattern generalized (exactly as its cursor checkpoints are, #681). Keyed by
-    /// [`StreamId`] so dead-letters (and the per-group exact-offset idempotency set) are ISOLATED per
-    /// stream; the group is the key WITHIN a stream's sink. Each entry is opened LAZILY on that
-    /// stream's first dead-letter (so a stream that never poisons never creates its `dlq/`), or
-    /// EAGERLY by [`Engine::open`] when the subdir already exists, so the idempotency set is rebuilt
-    /// before the first poison redelivers after a crash. Empty for a deployment that never
-    /// dead-letters a named stream, so the default and no-poison paths cost nothing.
-    named_dlq: BTreeMap<StreamId, DlqSink<F, C>>,
+    /// The per-NAMED-stream durable dead-letter SINKS (#681 follow-up, fan-out #551), the
+    /// per-stream twin of `dlq` above: each named stream's poison records route to sinks rooted in
+    /// THAT stream's OWN subdirectory — one slot per [`Engine::dead_letter_targets`] entry, at
+    /// `streams/<hex(name)>/<target>/` (the fixed `streams/<hex(name)>/dlq/` when no exchange is
+    /// configured) — co-located with, and recovered beside, its log. A configured exchange thus
+    /// applies to NAMED streams too (closing the #1110-review gap where a named stream always
+    /// hard-coded its `dlq/`), while per-stream isolation is preserved: targets are subdirs of the
+    /// stream's own tree, so two streams sharing a group name can never collide in one idempotency
+    /// set. Keyed by [`StreamId`]; the group is the key WITHIN a stream's per-target sink. Each slot
+    /// is opened LAZILY on that stream's first dead-letter (so a stream that never poisons never
+    /// creates a sink subdir), or EAGERLY by [`Engine::open`] when the subdir already exists, so the
+    /// idempotency set is rebuilt before the first poison redelivers after a crash. Empty for a
+    /// deployment that never dead-letters a named stream.
+    named_dlq: BTreeMap<StreamId, Vec<Option<DlqSink<F, C>>>>,
     /// The per-PARTITIONED-stream storage (#693, V2-M2-I11b): each entry is a
     /// [`PartitionedStream`] of `P > 1` independent, key-routed sub-logs rooted under
     /// `pstreams/<hex(name)>/` (the `PartitionedStream` #591 primitive, threaded through the engine).
@@ -3619,11 +3636,13 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// out `max_age_ms`. [`Ttl::NONE`] (the default) means no per-stream TTL, so a non-TTL stream is
     /// byte-identical (records never expire on read). See [`EngineConfig::default_message_ttl_ms`].
     default_message_ttl: Ttl,
-    /// The configurable dead-letter EXCHANGE target subdir (V2-M4, #551), or `None` for the default
-    /// fixed `dlq/` sink. When set, EVERY dead-letter (max-deliver, TTL-expired, rejected) routes to
-    /// this named sink via the reason-carrying append; `None` keeps the existing fixed-DLQ path
-    /// byte-identical. See [`EngineConfig::dead_letter_exchange`].
-    dead_letter_exchange: Option<String>,
+    /// The configured dead-letter EXCHANGE (V2-M4, #551), or `None` for the default fixed `dlq/`
+    /// sink. When set, EVERY dead-letter (max-deliver, TTL-expired, rejected via `Term`) FANS OUT
+    /// to all its targets via the reason-carrying append; `None` keeps the existing fixed-DLQ path
+    /// byte-identical. The resolved target list lives in [`Engine::dead_letter_targets`]; this
+    /// `Option` remains the v1-vs-v2 record switch and the expired/rejected routing gate. See
+    /// [`EngineConfig::dead_letter_exchange`].
+    dead_letter_exchange: Option<DeadLetterExchange>,
     /// Whether a TTL-EXPIRED message is DEAD-LETTERED (to the configured exchange, with reason
     /// [`DeadLetterReason::TtlExpired`]) rather than reclaimed by retention (V2-M4, #549/#551). Has
     /// effect only when `dead_letter_exchange` is `Some`; with no exchange an expired message is
@@ -4066,50 +4085,74 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // physical write budget (the flash-wear governor is for the main produce path only, #118).
             daily_physical_write_budget_bytes: 0,
         };
-        // The dead-letter sink's subdir: the configured dead-letter EXCHANGE target (#551), or the
-        // default fixed `dlq/` (byte-identical to today) when none is configured.
-        let dlq_subdir = config
-            .dead_letter_exchange
-            .as_deref()
-            .unwrap_or(DLQ_SUBDIR)
-            .to_string();
-        // Eagerly open (recovering its dead-lettered offset set) the dead-letter sink IF its subdirectory
-        // already exists from a prior run, so the idempotency key is present before the first poison
-        // redelivers after a crash. A fresh data directory has no sink subdir yet, so the sink stays
-        // unopened (lazy) and the no-dead-letter path never creates it.
-        let dlq = if Self::dlq_dir_exists(&log, &dlq_subdir) {
-            Some(DlqSink::open_at(
-                log.filesystem(),
-                &dlq_subdir,
-                log.clock_clone(),
-                dlq_config,
-            )?)
-        } else {
-            None
+        // The dead-letter TARGET subdirs (#551): the configured dead-letter EXCHANGE's ordered
+        // target list, or the single default fixed `dlq/` (byte-identical to today) when none is
+        // configured. Fixed for the engine's life; `dlq[i]` below is the sink for target `i`.
+        let dead_letter_targets: Vec<String> = match &config.dead_letter_exchange {
+            Some(exchange) => exchange.targets().to_vec(),
+            None => vec![DLQ_SUBDIR.to_string()],
         };
+        // Eagerly open (recovering its dead-lettered offset set) EACH dead-letter target sink whose
+        // subdirectory already exists from a prior run, so the idempotency key is present before the
+        // first poison redelivers after a crash — per TARGET, because a crash mid-fan-out leaves a
+        // strict prefix-by-order (in general: an arbitrary subset) of the targets durable, and each
+        // must recognize its own already-appended offsets independently. A fresh data directory has
+        // no sink subdirs yet, so every slot stays unopened (lazy) and the no-dead-letter path never
+        // creates them.
+        let dlq: Vec<Option<DlqSink<F, C>>> = dead_letter_targets
+            .iter()
+            .map(|subdir| {
+                if Self::dlq_dir_exists(&log, subdir) {
+                    Ok(Some(DlqSink::open_at(
+                        log.filesystem(),
+                        subdir,
+                        log.clock_clone(),
+                        dlq_config,
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<_, EngineError>>()?;
         // Eagerly open (recovering its per-group idempotency set) EACH named stream's own dead-letter
-        // sink IF its `streams/<hex(name)>/dlq/` subdir already exists from a prior run (#681 follow-up),
-        // the per-stream twin of the default eager open above: a named-stream poison that was fsynced to
-        // the sink but whose (lagging) cursor commit was lost to a crash must be recognized as
-        // already-dead-lettered on its redelivery, so the exact-offset set is present before the first
-        // re-poison. Iterate EVERY recovered stream (not just those with a consumer cursor): a stream
-        // that dead-lettered but never checkpointed a cursor/attempts file is absent from
-        // `named_streams` yet still has a durable `dlq/`, and its record must be reopened so the depth
-        // metric and the idempotency set are correct. A stream that never dead-lettered has no `dlq/`
-        // subdir and stays unopened (lazy), so a no-poison deployment never materializes one.
-        let mut named_dlq: BTreeMap<StreamId, DlqSink<F, C>> = BTreeMap::new();
+        // sinks — one PER dead-letter target (#551) — whose `streams/<hex(name)>/<target>/` subdir
+        // already exists from a prior run (#681 follow-up), the per-stream twin of the default eager
+        // open above: a named-stream poison that was fsynced to a sink but whose (lagging) cursor
+        // commit was lost to a crash must be recognized as already-dead-lettered on its redelivery,
+        // so each target's exact-offset set is present before the first re-poison (and a crash
+        // MID-fan-out resumes with only the missing targets appended). Iterate EVERY recovered
+        // stream (not just those with a consumer cursor): a stream that dead-lettered but never
+        // checkpointed a cursor/attempts file is absent from `named_streams` yet still has a durable
+        // sink, and its record must be reopened so the depth metric and the idempotency set are
+        // correct. A stream that never dead-lettered has no sink subdirs and its slots stay unopened
+        // (lazy), so a no-poison deployment never materializes one.
+        let mut named_dlq: BTreeMap<StreamId, Vec<Option<DlqSink<F, C>>>> = BTreeMap::new();
         if let Some(known) = &shared_known {
-            // SHARED-WAL mode (#597): a named stream's DLQ sink still lives in its OWN
-            // `streams/<hex(name)>/dlq/` metadata subdir (the #1110 layout, unchanged) even though
-            // its LOG is shared — resolve it there instead of via a per-stream log.
+            // SHARED-WAL mode (#597): a named stream's DLQ sinks still live in its OWN
+            // `streams/<hex(name)>/` metadata subdir (the #1110 layout, unchanged) even though
+            // its LOG is shared — resolve them there instead of via a per-stream log.
             for id in known {
                 let meta = log
                     .filesystem()
                     .subdir(STREAMS_SUBDIR)?
                     .subdir(&stream_subdir_name(id.name()))?;
-                if meta.subdir_exists(DLQ_SUBDIR).unwrap_or(false) {
-                    let sink = DlqSink::open_at(&meta, DLQ_SUBDIR, log.clock_clone(), dlq_config)?;
-                    named_dlq.insert(id.clone(), sink);
+                let mut slots: Vec<Option<DlqSink<F, C>>> = Vec::new();
+                let mut any = false;
+                for subdir in &dead_letter_targets {
+                    if meta.subdir_exists(subdir).unwrap_or(false) {
+                        slots.push(Some(DlqSink::open_at(
+                            &meta,
+                            subdir,
+                            log.clock_clone(),
+                            dlq_config,
+                        )?));
+                        any = true;
+                    } else {
+                        slots.push(None);
+                    }
+                }
+                if any {
+                    named_dlq.insert(id.clone(), slots);
                 }
             }
         } else {
@@ -4120,18 +4163,27 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 let Some(stream_log) = streams.get(&id) else {
                     continue;
                 };
-                if stream_log
-                    .filesystem()
-                    .subdir_exists(DLQ_SUBDIR)
-                    .unwrap_or(false)
-                {
-                    let sink = DlqSink::open_at(
-                        stream_log.filesystem(),
-                        DLQ_SUBDIR,
-                        stream_log.clock_clone(),
-                        dlq_config,
-                    )?;
-                    named_dlq.insert(id, sink);
+                let mut slots: Vec<Option<DlqSink<F, C>>> = Vec::new();
+                let mut any = false;
+                for subdir in &dead_letter_targets {
+                    if stream_log
+                        .filesystem()
+                        .subdir_exists(subdir)
+                        .unwrap_or(false)
+                    {
+                        slots.push(Some(DlqSink::open_at(
+                            stream_log.filesystem(),
+                            subdir,
+                            stream_log.clock_clone(),
+                            dlq_config,
+                        )?));
+                        any = true;
+                    } else {
+                        slots.push(None);
+                    }
+                }
+                if any {
+                    named_dlq.insert(id, slots);
                 }
             }
         }
@@ -4350,6 +4402,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             ),
             last_dead_lettered: None,
             dlq,
+            dead_letter_targets,
             dlq_config,
             // The per-named-stream dead-letter sinks (#681 follow-up), eagerly opened above for every
             // recovered stream whose `dlq/` subdir already exists; the rest open lazily on first poison.
@@ -8101,9 +8154,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             });
         }
         // A poison captured above: run the crash-atomic per-stream DLQ move OUTSIDE the group borrow —
-        // APPEND+FSYNC the forensic copy to this stream's own `dlq/` sink, THEN commit the cursor past
+        // APPEND+FSYNC the forensic copy to every one of this stream's own target sinks (#551 fan-out;
+        // the fixed per-stream `dlq/` when no exchange is configured), THEN commit the cursor past
         // it and return `Poll::Parked` (the session maps it to the `DeadLetter` advisory). Byte-for-byte
-        // the default stream's `dead_letter_in`, keyed to this stream's own sink (#681 DLQ follow-up).
+        // the default stream's `dead_letter_in`, keyed to this stream's own sinks (#681 DLQ follow-up).
         if let Some((off, deliveries, record)) = dead_letter {
             return self.named_dead_letter_in(id, group, off, deliveries, record);
         }
@@ -8111,25 +8165,47 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     }
 
     /// Lazily opens (recovering its per-group dead-lettered offset set) a NAMED stream's own durable
-    /// DLQ sink on first use, returning a mutable borrow (#681 DLQ follow-up). The sink is rooted at
-    /// that stream's `streams/<hex(name)>/dlq/` subdir (its log's own filesystem), so a named stream's
-    /// dead-letters are ISOLATED per stream and co-located with its log — the per-stream twin of
-    /// [`Engine::dlq_sink`]. Created on the stream's first dead-letter (so a stream that never poisons
-    /// never creates `dlq/`), or eagerly by [`Engine::open`] when the subdir already exists. Opening
-    /// rebuilds the exact dead-lettered offset set from the durable records, so the idempotency key is
-    /// present before the first (re-)append regardless of whether the eager open ran.
+    /// DLQ sink for dead-letter target `slot` on first use, returning a mutable borrow (#681 DLQ
+    /// follow-up, target-generalized by #551). The sink is rooted at that stream's
+    /// `streams/<hex(name)>/<target>/` subdir (its log's own filesystem) — `streams/<hex(name)>/dlq/`
+    /// when no exchange is configured — so a named stream's dead-letters are ISOLATED per stream and
+    /// co-located with its log: the per-stream twin of [`Engine::dlq_sink_slot`]. Created on the
+    /// stream's first dead-letter (so a stream that never poisons never creates a sink subdir), or
+    /// eagerly by [`Engine::open`] when the subdir already exists. Opening rebuilds the exact
+    /// dead-lettered offset set from the durable records, so the idempotency key is present before
+    /// the first (re-)append regardless of whether the eager open ran.
     ///
     /// # Errors
     /// Propagates a storage error from opening the sink, or a missing-stream surface (unreachable: the
     /// poll path read a record off this stream's log immediately before capturing the poison).
-    fn named_dlq_sink(&mut self, id: &StreamId) -> Result<&mut DlqSink<F, C>, EngineError> {
+    fn named_dlq_slot(
+        &mut self,
+        id: &StreamId,
+        slot: usize,
+    ) -> Result<&mut DlqSink<F, C>, EngineError> {
+        if slot >= self.dead_letter_targets.len() {
+            // Unreachable: every caller iterates 0..dead_letter_targets.len(). Surface loudly
+            // rather than panic if the invariant ever breaks.
+            return Err(EngineError::MissingRecord { offset: 0 });
+        }
         if !self.named_dlq.contains_key(id) {
-            // The sink roots at the stream's own `streams/<hex(name)>/dlq/` in BOTH modes (#1110):
-            // via its log's filesystem in the default mode, or via its consumer-METADATA subdir in
-            // SHARED-WAL mode (#597) — the same on-disk location and format either way.
+            let slots: Vec<Option<DlqSink<F, C>>> =
+                (0..self.dead_letter_targets.len()).map(|_| None).collect();
+            self.named_dlq.insert(id.clone(), slots);
+        }
+        let open = self
+            .named_dlq
+            .get(id)
+            .is_some_and(|slots| slots.get(slot).is_some_and(Option::is_some));
+        if !open {
+            // Each target sink roots at the stream's own `streams/<hex(name)>/<target>/` in BOTH
+            // modes (#1110 layout, target-generalized by #551): via its log's filesystem in the
+            // default mode, or via its consumer-METADATA subdir in SHARED-WAL mode (#597) — the
+            // same on-disk location and format either way.
+            let subdir = self.dead_letter_targets[slot].clone();
             let sink = if self.shared_wal.is_some() {
                 let meta = self.named_stream_meta_fs(id)?;
-                DlqSink::open_at(&meta, DLQ_SUBDIR, self.log.clock_clone(), self.dlq_config)?
+                DlqSink::open_at(&meta, &subdir, self.log.clock_clone(), self.dlq_config)?
             } else {
                 let Some(log) = self.streams.get(id) else {
                     // Unreachable: the poll captured the poison from a record just read off this log.
@@ -8137,32 +8213,39 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 };
                 DlqSink::open_at(
                     log.filesystem(),
-                    DLQ_SUBDIR,
+                    &subdir,
                     log.clock_clone(),
                     self.dlq_config,
                 )?
             };
-            self.named_dlq.insert(id.clone(), sink);
+            if let Some(slots) = self.named_dlq.get_mut(id) {
+                slots[slot] = Some(sink);
+            }
         }
         // Just-inserted above when absent, so this is always Some.
         self.named_dlq
             .get_mut(id)
+            .and_then(|slots| slots.get_mut(slot))
+            .and_then(Option::as_mut)
             .ok_or(EngineError::MissingRecord { offset: 0 })
     }
 
-    /// Performs the crash-atomic, EXACTLY-ONCE dead-letter move for a poison message of NAMED stream
-    /// `id`'s work-group `group` at source offset `off` after `attempt` deliveries (#681 DLQ follow-up),
-    /// then commits that group's cursor past it and returns [`Poll::Parked`]. The per-stream twin of
-    /// [`Engine::dead_letter_in`], keyed to this stream's OWN sink.
+    /// Performs the crash-atomic, EXACTLY-ONCE-PER-TARGET dead-letter move for a poison message of
+    /// NAMED stream `id`'s work-group `group` at source offset `off` after `attempt` deliveries
+    /// (#681 DLQ follow-up, #551 fan-out), then commits that group's cursor past it and returns
+    /// [`Poll::Parked`]. The per-stream twin of [`Engine::dead_letter_in`], keyed to this stream's
+    /// OWN sinks.
     ///
     /// The ordering is the SAME crash-safety contract as the default stream: APPEND the poison record
-    /// to the durable per-stream DLQ sink and FSYNC it, THEN commit the source cursor (in memory; the
-    /// named cursor's durability is the lagging #681 checkpoint). A crash between the two leaves the
-    /// source uncommitted (it redelivers and is re-poisoned) and the DLQ record already durable; on
-    /// reopen the eagerly-/lazily-rebuilt per-group EXACT dead-lettered set makes the re-poison a no-op
-    /// append so the message is committed-past WITHOUT a duplicate DLQ write. A configured dead-letter
-    /// EXCHANGE records the reason (mirroring the default's max-deliver append); with none this is the
-    /// reason-less v1 append, byte-identical to the default stream's fixed-DLQ max-deliver path.
+    /// to EVERY per-stream target sink and FSYNC each, THEN commit the source cursor (in memory; the
+    /// named cursor's durability is the lagging #681 checkpoint). A crash anywhere before the commit
+    /// leaves the source uncommitted (it redelivers and is re-poisoned) with any already-appended
+    /// targets durable; on reopen each target's eagerly-/lazily-rebuilt per-group EXACT dead-lettered
+    /// set makes its re-poison a no-op append and appends only the missing targets, so the message is
+    /// committed-past with EXACTLY ONE copy per target. A configured dead-letter EXCHANGE routes to
+    /// its targets under this stream's own tree and records the reason (the #1110 gap closed); with
+    /// none this is the reason-less v1 append to the fixed per-stream `dlq/`, byte-identical to the
+    /// default stream's fixed-DLQ max-deliver path.
     ///
     /// The lease was already dropped by the caller, so on success the message holds no lease and never
     /// redelivers.
@@ -8178,33 +8261,37 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         attempt: u32,
         record: OwnedRecord,
     ) -> Result<Poll, EngineError> {
-        // Idempotency: if this EXACT (group, source offset) is already durably in this stream's DLQ, do
-        // NOT append a second copy (the #800 exact-membership rule). This is the path a redelivered-
-        // then-re-poisoned message takes after a crash between the DLQ append and the cursor commit.
-        let already = self
-            .named_dlq_sink(id)?
-            .already_dead_lettered(group, off.get());
-        if !already {
-            // APPEND to the sink and FSYNC, BEFORE committing the source cursor. A storage error
-            // propagates WITHOUT committing the source, so the move simply did not happen and the
-            // message redelivers, never lost and never half-moved. A configured dead-letter EXCHANGE
-            // records the reason (max-deliver); with none this is the reason-less v1 append, so a named
-            // stream's fixed-DLQ record is byte-identical to the default stream's.
-            if self.dead_letter_exchange.is_some() {
-                self.named_dlq_sink(id)?.append_dead_letter(
+        // FAN OUT to every dead-letter target of THIS stream (#551, closing the #1110-review gap:
+        // a configured exchange now applies to named streams instead of being ignored), each rooted
+        // at `streams/<hex(name)>/<target>/` — the fixed per-stream `dlq/` when no exchange is
+        // configured, byte-identical to before. APPEND+FSYNC each target BEFORE committing the
+        // source cursor, each guarded by its OWN exact-offset idempotency set (#800): a crash
+        // anywhere mid-fan-out leaves the source uncommitted, so the redelivered re-poison appends
+        // only the missing targets — exactly the `fan_out_dead_letter` argument, per stream. A
+        // storage error propagates WITHOUT committing the source, so the move simply did not happen
+        // and the message redelivers, never lost and never half-moved. A configured exchange records
+        // the reason (max-deliver); with none this is the reason-less v1 append, so a named stream's
+        // fixed-DLQ record is byte-identical to the default stream's.
+        let versioned = self.dead_letter_exchange.is_some();
+        for slot in 0..self.dead_letter_targets.len() {
+            let sink = self.named_dlq_slot(id, slot)?;
+            if sink.already_dead_lettered(group, off.get()) {
+                continue;
+            }
+            if versioned {
+                sink.append_dead_letter(
                     group,
                     &record,
                     attempt,
                     DeadLetterReason::MaxDeliverExceeded,
                 )?;
             } else {
-                self.named_dlq_sink(id)?
-                    .append_poison(group, &record, attempt)?;
+                sink.append_poison(group, &record, attempt)?;
             }
         }
-        // The DLQ record is now durable (or was already), so commit the source cursor past the poison:
-        // drop nothing, never redeliver. In-memory here (the named cursor's durability is the lagging
-        // #681 checkpoint), the idempotent set covering the crash window as described above.
+        // Every target's record is now durable (or already was), so commit the source cursor past the
+        // poison: drop nothing, never redeliver. In-memory here (the named cursor's durability is the
+        // lagging #681 checkpoint), the idempotent sets covering the crash window as described above.
         let committed = if let Some(g) = self.named_group_mut(id, group) {
             g.cursor.ack(off);
             g.cursor.committed().get()
@@ -8217,10 +8304,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // Per-stream metric parity (#600): this NAMED stream's own dead-lettered (poison) count.
         self.registry
             .record_stream_dead_lettered(id.name().as_bytes());
-        // #800: prune this stream's DLQ dedup set below the group's committed watermark — those source
-        // offsets can never redeliver or re-poison, bounding the per-group set by the in-flight window.
-        if let Some(sink) = self.named_dlq.get_mut(id) {
-            sink.prune_below(group, committed);
+        // #800: prune this stream's every open target sink's dedup set below the group's committed
+        // watermark — those source offsets can never redeliver or re-poison, bounding the per-group
+        // set by the in-flight window.
+        if let Some(slots) = self.named_dlq.get_mut(id) {
+            for sink in slots.iter_mut().flatten() {
+                sink.prune_below(group, committed);
+            }
         }
         Ok(Poll::Parked {
             offset: off,
@@ -10346,13 +10436,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if ghost == GhostPolicy::Release {
             self.group_last_checkpointed.remove(group);
         }
-        // Free the evicted group's DLQ dedup entry (#905). Only when the sink is ALREADY open — never
-        // force it open here, so a broker that never dead-lettered still never creates `dlq/`. The
-        // evicted group's cursor is gone, so nothing re-poisons under it in-process; a reopen rebuilds
-        // any still-durable entries from the DLQ records regardless. Without this, the per-group key
-        // (an empty-after-pruning `BTreeSet` plus the group-name `String`) leaks once per evicted
-        // group that ever dead-lettered, reclaimed only on reopen.
-        if let Some(sink) = self.dlq.as_mut() {
+        // Free the evicted group's DLQ dedup entry in EVERY target sink (#905). Only slots that are
+        // ALREADY open — never force one open here, so a broker that never dead-lettered still never
+        // creates a sink subdir. The evicted group's cursor is gone, so nothing re-poisons under it
+        // in-process; a reopen rebuilds any still-durable entries from the DLQ records regardless.
+        // Without this, the per-group key (an empty-after-pruning `BTreeSet` plus the group-name
+        // `String`) leaks once per evicted group that ever dead-lettered, reclaimed only on reopen.
+        for sink in self.dlq.iter_mut().flatten() {
             sink.forget_group(group);
         }
         Ok(())
@@ -10827,18 +10917,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
     }
 
-    /// Performs the crash-atomic, EXACTLY-ONCE dead-letter move for a poison message in `group` at
-    /// source offset `off` after `attempt` deliveries (#63), then commits the source group's cursor
-    /// past it and returns [`Poll::Parked`].
+    /// Performs the crash-atomic, EXACTLY-ONCE-PER-TARGET dead-letter move for a poison message in
+    /// `group` at source offset `off` after `attempt` deliveries (#63, #551 fan-out), then commits
+    /// the source group's cursor past it and returns [`Poll::Parked`].
     ///
-    /// The ordering is the crash-safety contract: APPEND the poison record to the durable DLQ sink
-    /// and FSYNC it, THEN commit the source cursor. A crash between the two leaves the source
-    /// uncommitted (it redelivers and is re-poisoned on the next run) and the DLQ record already
-    /// durable; on reopen the per-group EXACT dead-lettered set, rebuilt from the DLQ itself, makes
-    /// the re-poison a no-op append so the message is committed-past WITHOUT a duplicate DLQ write.
-    /// The reconciliation key is the EXACT `(group, source_offset)` (#800): an offset already in the
-    /// group's set is in the sink, so it is committed-past without a second append — but a genuinely
-    /// new lower offset (poison order is not ascending) is appended, never suppressed by a higher one.
+    /// The ordering is the crash-safety contract: APPEND the poison record to EVERY durable target
+    /// sink and FSYNC each, THEN commit the source cursor. A crash anywhere before the commit leaves
+    /// the source uncommitted (it redelivers and is re-poisoned on the next run) with any
+    /// already-appended targets durable; on reopen each target's per-group EXACT dead-lettered set,
+    /// rebuilt from that target itself, makes its re-poison a no-op append and appends only the
+    /// missing targets, so the message is committed-past with exactly one copy per target (see
+    /// [`Engine::fan_out_dead_letter`]). The reconciliation key is the EXACT `(group,
+    /// source_offset)` (#800): an offset already in a target's set is in that sink, so it is not
+    /// re-appended there — but a genuinely new lower offset (poison order is not ascending) is
+    /// appended, never suppressed by a higher one.
     ///
     /// The lease has already been dropped by the caller, so on success the message holds no lease
     /// and never redelivers.
@@ -10849,31 +10941,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         attempt: u32,
         record: OwnedRecord,
     ) -> Result<Poll, EngineError> {
-        // Idempotency: if this EXACT (group, source offset) is already durably in the DLQ, do NOT
-        // append a second copy (#800). This is the path a redelivered-then-re-poisoned message takes
-        // after a crash that landed between the DLQ append and the cursor commit: the sink already has
-        // this exact offset, so we only commit past it. A different (e.g. lower) offset is appended.
-        let already = self.dlq_sink()?.already_dead_lettered(group, off.get());
-        if !already {
-            // APPEND to the DLQ and FSYNC, BEFORE committing the source cursor. A storage error
-            // (including a frozen DLQ writer) propagates WITHOUT committing the source, so the move
-            // simply did not happen and the message redelivers, never lost and never half-moved.
-            // A configured dead-letter EXCHANGE (#551) records the reason; with no exchange this
-            // stays the reason-less v1 max-deliver append, byte-identical to before #551.
-            if self.dead_letter_exchange.is_some() {
-                self.dlq_sink()?.append_dead_letter(
-                    group,
-                    &record,
-                    attempt,
-                    DeadLetterReason::MaxDeliverExceeded,
-                )?;
-            } else {
-                self.dlq_sink()?.append_poison(group, &record, attempt)?;
-            }
-        }
-        // The DLQ record is now durable (or was already), so commit the source cursor past the
-        // poison message: drop nothing, never redeliver. This is the second, ordered durability
-        // step; only after the append's fsync does the source advance. The shared commit also fires
+        // FAN OUT to every dead-letter target (#551) — append+fsync each BEFORE committing the
+        // source cursor, each target guarded by its OWN exact-offset idempotency set (#800). See
+        // `fan_out_dead_letter` for the crash-resume argument. With no exchange this is the single
+        // fixed `dlq/` target via the reason-less v1 append, byte-identical to before #551.
+        self.fan_out_dead_letter(
+            group,
+            off,
+            attempt,
+            &record,
+            DeadLetterReason::MaxDeliverExceeded,
+        )?;
+        // Every target's record is now durable (or already was), so commit the source cursor past
+        // the poison message: drop nothing, never redeliver. This is the second, ordered durability
+        // step; only after the appends' fsyncs does the source advance. The shared commit also fires
         // the Level-2 designated-group dead-letter terminal (#497) and the lag/counter bookkeeping.
         self.commit_dead_letter_past(group, off);
         Ok(Poll::Parked {
@@ -10882,26 +10963,75 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         })
     }
 
-    /// Lazily opens (recovering its per-group dead-lettered offset set) the durable DLQ sink on first
-    /// use, returning a mutable borrow. The sink is created on the first dead-letter, so a broker that
-    /// never dead-letters never creates the `dlq/` subdirectory (the no-poison path never touches
-    /// it). After a restart that already has a `dlq/` directory, [`Engine::open`] eagerly opens it
-    /// so the dead-lettered offset set is present before the first poison redelivers.
-    fn dlq_sink(&mut self) -> Result<&mut DlqSink<F, C>, EngineError> {
-        if self.dlq.is_none() {
-            // Route to the configured dead-letter EXCHANGE subdir (#551) when set, else the default
-            // fixed `dlq/` (byte-identical to the pre-#551 path).
-            let subdir = self.dead_letter_exchange.as_deref().unwrap_or(DLQ_SUBDIR);
+    /// Crash-atomically appends the forensic dead-letter copy of `record` to EVERY dead-letter
+    /// target (#551 fan-out), in the fixed [`Engine::dead_letter_targets`] order, fsyncing each
+    /// append. The caller commits the source cursor past `off` ONLY after this returns `Ok` — the
+    /// commit-past is strictly LAST, which is the whole crash-safety design:
+    ///
+    /// - A crash (or storage error) anywhere MID-fan-out leaves some targets durable and some not,
+    ///   with the source cursor uncommitted, so the message REDELIVERS and re-dead-letters. On that
+    ///   resume, each target's OWN exact-offset `(group, source_offset)` idempotency set (#800,
+    ///   rebuilt from the target's durable records at open) makes the already-appended targets a
+    ///   no-op and appends ONLY the missing ones — so across any number of crashes every target ends
+    ///   with EXACTLY ONE copy: never lost (the commit-past waited for all), never doubled (the
+    ///   per-target exact set). The fixed order is for determinism; correctness never depends on it.
+    /// - A storage error propagates WITHOUT committing the source, so the move simply has not
+    ///   happened yet and the message redelivers — never lost and never half-moved.
+    ///
+    /// The record version is the exchange switch: a configured exchange writes the reason-carrying
+    /// v2 record to every target; no exchange writes the reason-less v1 to the single fixed `dlq/`,
+    /// byte-identical to the pre-#551 broker.
+    fn fan_out_dead_letter(
+        &mut self,
+        group: &str,
+        off: Offset,
+        attempt: u32,
+        record: &OwnedRecord,
+        reason: DeadLetterReason,
+    ) -> Result<(), EngineError> {
+        let versioned = self.dead_letter_exchange.is_some();
+        for slot in 0..self.dead_letter_targets.len() {
+            let sink = self.dlq_sink_slot(slot)?;
+            // Idempotency per target: if this EXACT (group, source offset) is already durably in
+            // THIS target, do NOT append a second copy (#800). This is the path a redelivered-then-
+            // re-poisoned message takes after a crash between an append and the cursor commit — the
+            // targets appended before the crash skip, the rest append. A different (e.g. lower)
+            // offset is appended, never suppressed by a higher one.
+            if sink.already_dead_lettered(group, off.get()) {
+                continue;
+            }
+            if versioned {
+                sink.append_dead_letter(group, record, attempt, reason)?;
+            } else {
+                sink.append_poison(group, record, attempt)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lazily opens (recovering its per-group dead-lettered offset set) the durable DLQ sink for
+    /// dead-letter target `slot` on first use, returning a mutable borrow. A sink is created on the
+    /// first dead-letter, so a broker that never dead-letters never creates any sink subdirectory
+    /// (the no-poison path never touches them). After a restart that already has a target's
+    /// directory, [`Engine::open`] eagerly opens that slot so the dead-lettered offset set is
+    /// present before the first poison redelivers.
+    fn dlq_sink_slot(&mut self, slot: usize) -> Result<&mut DlqSink<F, C>, EngineError> {
+        if self.dlq.get(slot).is_none() {
+            // Unreachable: every caller iterates 0..dead_letter_targets.len() and `dlq` is sized
+            // to it at open. Surface loudly rather than panic if the invariant ever breaks.
+            return Err(EngineError::MissingRecord { offset: 0 });
+        }
+        if self.dlq[slot].is_none() {
             let sink = DlqSink::open_at(
                 self.log.filesystem(),
-                subdir,
+                &self.dead_letter_targets[slot],
                 self.log.clock_clone(),
                 self.dlq_config,
             )?;
-            self.dlq = Some(sink);
+            self.dlq[slot] = Some(sink);
         }
         // Just-assigned above when None, so this is always Some.
-        self.dlq
+        self.dlq[slot]
             .as_mut()
             .ok_or(EngineError::MissingRecord { offset: 0 })
     }
@@ -10963,19 +11093,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         attempt: u32,
         record: OwnedRecord,
     ) -> Result<Poll, EngineError> {
-        // Idempotency: a re-expired message whose EXACT source offset is already durably in the
-        // exchange is committed-past WITHOUT a second append, exactly as the poison path (#800).
-        let already = self.dlq_sink()?.already_dead_lettered(group, off.get());
-        if !already {
-            // APPEND the reason-carrying (TtlExpired) dead-letter and FSYNC, BEFORE committing the
-            // source cursor: the same crash-safety contract as the max-deliver path.
-            self.dlq_sink()?.append_dead_letter(
-                group,
-                &record,
-                attempt,
-                DeadLetterReason::TtlExpired,
-            )?;
-        }
+        // FAN OUT the reason-carrying (TtlExpired) dead-letter to every exchange target and FSYNC
+        // each, BEFORE committing the source cursor: the same crash-safety + per-target idempotency
+        // contract as the max-deliver path (see `fan_out_dead_letter`). A re-expired message whose
+        // EXACT source offset is already durable in a target skips that target (#800).
+        self.fan_out_dead_letter(group, off, attempt, &record, DeadLetterReason::TtlExpired)?;
         self.commit_dead_letter_past(group, off);
         Ok(Poll::Parked {
             offset: off,
@@ -11009,11 +11131,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.confirm_registry
                 .terminate(off, ConfirmStatus::DeadLettered);
         }
-        // #800: the cursor has committed past `off`, so prune the DLQ dedup set below the group's
-        // committed watermark — those source offsets can never redeliver or re-poison, so their
-        // exact-membership entries are no longer needed. This bounds each per-group set by the
-        // in-flight/ahead window. Only when the sink is already open (never lazily create it to prune).
-        if let Some(sink) = self.dlq.as_mut() {
+        // #800: the cursor has committed past `off`, so prune EVERY target sink's dedup set below
+        // the group's committed watermark — those source offsets can never redeliver or re-poison,
+        // so their exact-membership entries are no longer needed. This bounds each per-group set by
+        // the in-flight/ahead window. Only already-open slots (never lazily create one to prune).
+        for sink in self.dlq.iter_mut().flatten() {
             sink.prune_below(group, committed);
         }
     }
@@ -13049,19 +13171,85 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     }
 
     /// Terminates delivery of the message named by `token`: an intentional drop that commits
-    /// past it so it never redelivers and is NOT dead-lettered. Mechanically a commit, like
-    /// [`Engine::ack`], and distinct only in the caller's intent (a future metrics or
-    /// dead-letter-policy split can diverge them); sharing the commit path keeps the cursor
-    /// and lease invariants identical to a normal ack.
-    pub fn term(&mut self, token: &LeaseToken) -> AckResult {
+    /// past it so it never redelivers. With NO dead-letter exchange configured it is NOT
+    /// dead-lettered — mechanically a commit, like [`Engine::ack`], byte-identical to the
+    /// historical drop. With an exchange configured, a `Term` is the explicit REJECT trigger
+    /// (V2-M4, #551 — `RabbitMQ` `basic.reject(requeue=false)` parity): the forensic copy fans out
+    /// to every exchange target with [`DeadLetterReason::Rejected`] BEFORE the commit. See
+    /// [`Engine::term_in`].
+    ///
+    /// # Errors
+    /// As [`Engine::term_in`].
+    pub fn term(&mut self, token: &LeaseToken) -> Result<AckResult, EngineError> {
         self.term_in(DEFAULT_GROUP, token)
     }
 
-    /// Terminates `token` in a named work-group (#9): an intentional drop that commits past
-    /// it in that group without dead-lettering. Mechanically a commit, like
-    /// [`Engine::ack_in`].
-    pub fn term_in(&mut self, group: &str, token: &LeaseToken) -> AckResult {
-        self.ack_in(group, token)
+    /// Terminates `token` in a named work-group (#9): an intentional drop that commits past it in
+    /// that group. This was always "distinct from ack only in the caller's intent, so a future
+    /// dead-letter-policy split can diverge them" — #551 is that split: with a dead-letter EXCHANGE
+    /// configured, the terminated (rejected) message is FANNED OUT to every exchange target with
+    /// [`DeadLetterReason::Rejected`], append+fsync BEFORE the commit, under the same per-target
+    /// exact-offset idempotency as every other dead-letter (a crash or error before the commit
+    /// redelivers; the re-`Term` appends only the missing targets). With no exchange the historical
+    /// no-dead-letter drop is byte-identical, and no sink directory is ever created.
+    ///
+    /// A stale token is fenced BEFORE any append (a fenced `Term` must not dead-letter), via the
+    /// non-mutating lease lookup; a token whose record was compacted away simply drops (there is
+    /// nothing left to copy).
+    ///
+    /// # Errors
+    /// Propagates a storage error from the fan-out append/fsync or the record read; on any error
+    /// NOTHING is committed (the lease is untouched), so the message redelivers and a retried
+    /// `Term` resumes idempotently — never lost, never half-moved.
+    pub fn term_in(&mut self, group: &str, token: &LeaseToken) -> Result<AckResult, EngineError> {
+        if self.dead_letter_exchange.is_some() {
+            // The attempt count for the forensic record, doubling as the NON-mutating validity
+            // check: `deliveries` is `Some` only while this exact token generation still owns the
+            // lease, so a stale/unknown token fences here with NO append and NO commit.
+            let Some(attempt) = self
+                .groups
+                .get(group)
+                .and_then(|g| g.leases.deliveries(token))
+            else {
+                return Ok(AckResult::Fenced);
+            };
+            // Read the record for the forensic copy. A read at a compacted-away offset returns the
+            // next survivor; the filter drops it so a compacted message terms as a plain drop.
+            let record = self
+                .log
+                .read_from(token.offset, 1)?
+                .into_iter()
+                .next()
+                .filter(|r| r.offset == token.offset);
+            if let Some(record) = record {
+                // FAN OUT with reason Rejected, append+fsync BEFORE the commit below — the same
+                // ordering + per-target idempotency contract as `dead_letter_in`. An error
+                // propagates with the lease intact, so the message redelivers, never half-moved.
+                self.fan_out_dead_letter(
+                    group,
+                    token.offset,
+                    attempt,
+                    &record,
+                    DeadLetterReason::Rejected,
+                )?;
+                // A recorded rejection IS a dead-letter: account it (the commit itself runs through
+                // the plain ack path below, which does not know it is a reject).
+                self.counters.dead_lettered += 1;
+                self.last_dead_lettered = Some(token.offset);
+            }
+        }
+        let result = self.ack_in(group, token);
+        // #800 hygiene: the commit advanced the group's watermark, so prune every open target
+        // sink's dedup set below it (mirroring `commit_dead_letter_past`; a plain ack path does
+        // not otherwise prune). Only already-open slots — never create one to prune.
+        if matches!(result, AckResult::Acked) {
+            if let Some(committed) = self.groups.get(group).map(|g| g.cursor.committed().get()) {
+                for sink in self.dlq.iter_mut().flatten() {
+                    sink.prune_below(group, committed);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Extends the lease named by `token` by one visibility window (the consumer is still
@@ -13326,14 +13514,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// records present when the sink was opened plus every poison record appended since. Zero when
     /// nothing has been dead-lettered (a sink is then never even opened). Exposed on `/metrics`
     /// as `ironbus_dlq_records_total`. Unlike `dead_lettered` (an in-memory counter reset on
-    /// restart), this is reconstructed from the durable sink, so it survives a restart. Sums the
-    /// default stream's sink AND every NAMED stream's own per-stream sink (#681 DLQ follow-up), so the
-    /// operator's dead-letter depth accounts for poison in every stream.
+    /// restart), this is reconstructed from the durable sink, so it survives a restart. Sums EVERY
+    /// dead-letter target sink of the default stream AND of every NAMED stream (#681 DLQ follow-up,
+    /// #551 fan-out), so the operator's dead-letter depth accounts for poison in every stream — and
+    /// counts one RECORD per target: a dead letter fanned out to an N-target exchange contributes N
+    /// (it IS N durable forensic records).
     #[must_use]
     pub fn dlq_records(&self) -> u64 {
-        let default = self.dlq.as_ref().map_or(0, DlqSink::records);
+        let default = self
+            .dlq
+            .iter()
+            .flatten()
+            .map(DlqSink::records)
+            .fold(0, u64::saturating_add);
         self.named_dlq
             .values()
+            .flat_map(|slots| slots.iter().flatten())
             .map(DlqSink::records)
             .fold(default, u64::saturating_add)
     }
@@ -13343,7 +13539,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// map used to prove the evicted-group entry is dropped (#905).
     #[cfg(test)]
     fn dlq_dedup_highest_for_group(&self, group: &str) -> Option<u64> {
-        self.dlq.as_ref().and_then(|s| s.highest_for_group(group))
+        self.dlq
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(|s| s.highest_for_group(group))
     }
 
     /// The number of messages currently in flight (leased, not yet acked).
@@ -16350,11 +16549,14 @@ mod tests {
         let d = message(e.poll_now().unwrap());
         // Term is an intentional drop: it commits past the message (cursor advances) so it
         // never redelivers, the same mechanism as ack.
-        assert_eq!(e.term(&d.token), AckResult::Acked);
+        assert_eq!(e.term(&d.token).unwrap(), AckResult::Acked);
         assert_eq!(e.committed_offset().get(), 1);
         assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
         // A stale term is fenced (no double-commit).
-        assert_eq!(e.term(&d.token), AckResult::Fenced);
+        assert_eq!(e.term(&d.token).unwrap(), AckResult::Fenced);
+        // With NO dead-letter exchange, a Term never dead-letters and never creates a sink dir.
+        assert_eq!(e.dlq_records(), 0);
+        assert!(!e.into_filesystem().subdir_exists(DLQ_SUBDIR).unwrap());
     }
 
     #[test]
@@ -18926,7 +19128,7 @@ mod tests {
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms,
-            dead_letter_exchange: Some(exchange.to_string()),
+            dead_letter_exchange: Some(DeadLetterExchange::new([exchange]).unwrap()),
             dead_letter_expired: true,
             ..config(64, 5)
         }
@@ -19135,7 +19337,7 @@ mod tests {
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms: 1_000,
-            dead_letter_exchange: Some("dlx-unused".to_string()),
+            dead_letter_exchange: Some(DeadLetterExchange::new(["dlx-unused"]).unwrap()),
             dead_letter_expired: false, // routing OFF: reclaim, do not dead-letter
             ..config(64, 5)
         };
@@ -19427,6 +19629,305 @@ mod tests {
             read_dlq_entries(&probe).unwrap().len(),
             1,
             "exactly one across two crashes"
+        );
+    }
+
+    // ----- Dead-letter exchange FAN-OUT + the Term reject trigger + named routing (#551, #710) -----
+
+    /// A config with a MULTI-target dead-letter exchange (#551 fan-out): every dead letter is
+    /// appended to every listed target. `max_deliver` small so the poison trigger fires.
+    fn config_with_fan_out(max_deliver: u32, targets: &[&str]) -> EngineConfig {
+        EngineConfig {
+            consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
+            dead_letter_exchange: Some(DeadLetterExchange::new(targets.to_vec()).unwrap()),
+            ..config(10, max_deliver)
+        }
+    }
+
+    #[test]
+    fn a_max_deliver_poison_fans_out_to_every_exchange_target_exactly_once() {
+        // THE #551 fan-out: a dead-letter exchange is an ORDERED LIST of targets, and a dead
+        // message lands in EVERY one of them — one forensic copy per target, reason-tagged —
+        // before the source cursor commits past. The fixed default `dlq/` is never touched
+        // (it is not in the list).
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(
+            fs,
+            std::sync::Arc::clone(&clock),
+            config_with_fan_out(1, &["dead-a", "dead-b"]),
+        )
+        .unwrap();
+        let off = poison_once(&mut e, &clock, b"fan-me-out");
+        assert_eq!(e.counters().dead_lettered, 1, "ONE dead-letter event");
+        assert_eq!(
+            e.dlq_records(),
+            2,
+            "the depth counts one durable record PER target"
+        );
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "never redelivers"
+        );
+        drop(e);
+        for target in ["dead-a", "dead-b"] {
+            let entries = read_dead_letter_entries(&probe, target).unwrap();
+            assert_eq!(entries.len(), 1, "exactly one copy in `{target}`");
+            assert_eq!(entries[0].source_offset, off.get());
+            assert_eq!(entries[0].attempt, 2);
+            assert_eq!(entries[0].reason, DeadLetterReason::MaxDeliverExceeded);
+            assert_eq!(entries[0].payload, b"fan-me-out");
+        }
+        assert!(
+            read_dlq_entries(&probe).unwrap().is_empty(),
+            "the fixed default dlq/ is not a target, so it is never written"
+        );
+    }
+
+    #[test]
+    fn a_crash_after_a_partial_fan_out_resumes_appending_only_the_missing_targets() {
+        // THE partial-fan-out crash (#551): some targets durable, some not, source cursor
+        // uncommitted. Constructed exactly: poison under a ONE-target exchange (`dead-shared`
+        // durable), crash with the cursor checkpoint lost, then recover under a TWO-target
+        // exchange (`dead-shared`, `dead-extra`) — the on-disk state IS a mid-fan-out crash
+        // (a durable prefix of the target list). The redelivered re-poison must append ONLY the
+        // missing target: never a second copy in the durable one, never a lost copy in the new one.
+        use ironbus_storage::fault::FaultFs;
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let (faultfs, _control) = FaultFs::new(InMemoryFs::new());
+        let probe = faultfs.inner().clone();
+        let mut cfg = config_with_fan_out(1, &["dead-shared"]);
+        cfg.checkpoint_interval = 1_000_000; // the poison's cursor advance is never checkpointed
+        let mut e = Engine::open(faultfs, std::sync::Arc::clone(&clock), cfg).unwrap();
+        let off = poison_once(&mut e, &clock, b"partial");
+        drop(e);
+
+        // CRASH: the fsynced `dead-shared` copy survives; the un-checkpointed source commit is lost.
+        probe.simulate_power_loss();
+
+        // RECOVER under the two-target exchange: the durable-prefix state of a mid-fan-out crash.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut cfg2 = config_with_fan_out(1, &["dead-shared", "dead-extra"]);
+        cfg2.checkpoint_interval = 1_000_000;
+        let mut e = Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), cfg2).unwrap();
+        assert_eq!(
+            e.committed_offset(),
+            Offset::ZERO,
+            "the source commit was lost, so the poison redelivers"
+        );
+        let _ = message(e.poll_now().unwrap());
+        clock2.advance_monotonic_nanos(40);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Parked { .. }));
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        drop(e);
+
+        // EXACTLY ONE copy per target: the already-durable target was skipped (its exact-offset
+        // set was rebuilt at open), the missing one was appended.
+        for target in ["dead-shared", "dead-extra"] {
+            let entries = read_dead_letter_entries(&probe, target).unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "`{target}` holds exactly one copy across the partial-fan-out crash"
+            );
+            assert_eq!(entries[0].source_offset, off.get());
+        }
+    }
+
+    #[test]
+    fn a_crash_after_the_full_fan_out_but_before_the_commit_doubles_no_target() {
+        // The fan-out twin of `a_crash_between_the_dlq_append_and_the_source_commit_yields_exactly_
+        // one_dlq_entry`: every target append is durable, the source commit is lost. The
+        // redelivered re-poison must be a no-op append in EVERY target.
+        use ironbus_storage::fault::FaultFs;
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let (faultfs, _control) = FaultFs::new(InMemoryFs::new());
+        let probe = faultfs.inner().clone();
+        let mut cfg = config_with_fan_out(1, &["dead-a", "dead-b"]);
+        cfg.checkpoint_interval = 1_000_000;
+        let mut e = Engine::open(faultfs, std::sync::Arc::clone(&clock), cfg.clone()).unwrap();
+        let off = poison_once(&mut e, &clock, b"no-doubles");
+        drop(e);
+        probe.simulate_power_loss();
+
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), cfg).unwrap();
+        assert_eq!(e.dlq_records(), 2, "both copies survived the crash");
+        assert_eq!(e.committed_offset(), Offset::ZERO, "the commit did not");
+        let _ = message(e.poll_now().unwrap());
+        clock2.advance_monotonic_nanos(40);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Parked { .. }));
+        assert_eq!(
+            e.dlq_records(),
+            2,
+            "the re-poison was a no-op append in every target"
+        );
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        drop(e);
+        for target in ["dead-a", "dead-b"] {
+            assert_eq!(read_dead_letter_entries(&probe, target).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_expired_record_fans_out_to_every_exchange_target_with_the_ttl_reason() {
+        // The TTL trigger fans out too (#549/#551): with the expired-routing flag on, an expired
+        // record lands in EVERY exchange target with reason `TtlExpired`.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut cfg = config_with_fan_out(64, &["dead-a", "dead-b"]);
+        cfg.default_message_ttl_ms = 1_000;
+        cfg.dead_letter_expired = true;
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), cfg).unwrap();
+        let off = produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"expire-everywhere");
+        clock.set_unix_millis(1_000);
+        match e.poll_now().unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected the expired record Parked to the exchange, got {other:?}"),
+        }
+        assert_eq!(e.counters().dead_lettered, 1);
+        assert_eq!(e.counters().expired, 0, "DLX'd, not silently reclaimed");
+        drop(e);
+        for target in ["dead-a", "dead-b"] {
+            let entries = read_dead_letter_entries(&probe, target).unwrap();
+            assert_eq!(entries.len(), 1, "one TtlExpired copy in `{target}`");
+            assert_eq!(entries[0].reason, DeadLetterReason::TtlExpired);
+            assert_eq!(entries[0].source_offset, off.get());
+        }
+    }
+
+    #[test]
+    fn a_term_with_an_exchange_records_a_rejected_dead_letter_in_every_target() {
+        // The REJECT trigger (#551): with an exchange configured, `Term` — the explicit
+        // "drop this, do not redeliver" verb — records the rejection: the forensic copy fans out
+        // to every target with reason `Rejected` BEFORE the commit, RabbitMQ
+        // basic.reject(requeue=false)-to-DLX parity.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(
+            fs,
+            std::sync::Arc::clone(&clock),
+            config_with_fan_out(5, &["dead-a", "dead-b"]),
+        )
+        .unwrap();
+        let off = e
+            .produce(&Append {
+                timestamp_ms: 7,
+                flags: RecordFlags::EMPTY,
+                key: b"reject-key",
+                headers: b"",
+                payload: b"reject-me",
+            })
+            .unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(e.term(&d.token).unwrap(), AckResult::Acked);
+        assert_eq!(
+            e.counters().dead_lettered,
+            1,
+            "a recorded rejection IS a dead-letter"
+        );
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "never redelivers"
+        );
+        // A STALE token must not dead-letter: the second term is fenced with no further append.
+        assert_eq!(e.term(&d.token).unwrap(), AckResult::Fenced);
+        assert_eq!(e.dlq_records(), 2, "still one copy per target");
+        drop(e);
+        for target in ["dead-a", "dead-b"] {
+            let entries = read_dead_letter_entries(&probe, target).unwrap();
+            assert_eq!(entries.len(), 1, "one Rejected copy in `{target}`");
+            assert_eq!(entries[0].reason, DeadLetterReason::Rejected);
+            assert_eq!(entries[0].source_offset, off.get());
+            assert_eq!(entries[0].attempt, 1, "rejected on the first delivery");
+            assert_eq!(entries[0].payload, b"reject-me");
+        }
+        assert!(
+            read_dlq_entries(&probe).unwrap().is_empty(),
+            "the fixed default dlq/ is not a target"
+        );
+    }
+
+    #[test]
+    fn a_named_stream_poison_routes_through_the_configured_exchange_closing_the_1110_gap() {
+        // The #1110-review gap, closed: a NAMED stream's dead letters previously always landed in
+        // its hard-coded `streams/<hex>/dlq/`, IGNORING a configured exchange. Now the exchange
+        // applies per stream: each target roots under the stream's OWN tree
+        // (`streams/<hex>/<target>/`), preserving per-stream isolation, and the classic `dlq`
+        // name in the list addresses the stream's classic sink location (with the reason-carrying
+        // v2 record).
+        use ironbus_storage::layout::STREAMS_SUBDIR;
+        use ironbus_storage::naming::stream_subdir_name;
+
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let cfg = config_with_fan_out(1, &["dead-x", "dlq"]);
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), cfg.clone()).unwrap();
+        let off = e
+            .produce_in_stream(
+                "orders",
+                &Append {
+                    timestamp_ms: 42,
+                    flags: RecordFlags::EMPTY,
+                    key: b"poison-key",
+                    headers: b"",
+                    payload: b"named-poison",
+                },
+            )
+            .unwrap();
+        let d = message(e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap());
+        assert_eq!(d.offset, off);
+        clock.advance_monotonic_nanos(40);
+        match e.poll_in_stream("orders", "g", e.now_monotonic()).unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected Parked, got {other:?}"),
+        }
+        assert_eq!(
+            e.committed_offset_in_stream("orders", "g"),
+            Offset::new(off.get() + 1)
+        );
+        assert_eq!(e.dlq_records(), 2, "one record per target, in THIS stream");
+        drop(e);
+
+        // Both targets live under the STREAM's own tree; the reason is recorded in both (the
+        // classic `dlq` location included — it is an exchange target here, so it gets v2 records).
+        let stream_fs = probe
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("orders"))
+            .unwrap();
+        for target in ["dead-x", "dlq"] {
+            let entries = read_dead_letter_entries(&stream_fs, target).unwrap();
+            assert_eq!(entries.len(), 1, "one copy in the stream's `{target}`");
+            assert_eq!(entries[0].group, "g");
+            assert_eq!(entries[0].source_offset, off.get());
+            assert_eq!(entries[0].reason, DeadLetterReason::MaxDeliverExceeded);
+            assert_eq!(entries[0].payload, b"named-poison");
+        }
+        // Per-stream isolation holds: NOTHING landed at the data-dir root.
+        assert!(
+            !probe.subdir_exists("dead-x").unwrap(),
+            "the root `dead-x/` must not exist for a named-stream poison"
+        );
+        assert!(
+            !probe.subdir_exists(DLQ_SUBDIR).unwrap(),
+            "the root `dlq/` must not exist for a named-stream poison"
+        );
+
+        // The depth survives a restart: `Engine::open` eagerly reopens EVERY existing per-stream
+        // target sink (rebuilding the idempotency sets before any redelivery).
+        let e2 = Engine::open(probe, std::sync::Arc::new(ManualClock::new()), cfg).unwrap();
+        assert_eq!(
+            e2.dlq_records(),
+            2,
+            "both per-stream targets rebuilt at open"
         );
     }
 

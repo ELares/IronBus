@@ -1801,17 +1801,34 @@ impl Session {
                     }
                 }
             }
-            // Term is an intentional drop: commit past the message (the same mechanism as
-            // ack) so it never redelivers and is not dead-lettered. 1 = dropped, 0 = fenced.
-            AckOp::Term => {
-                let status = match engine.with(move |e| e.term_in(&group, &token))? {
-                    AckResult::Acked => 1u8,
-                    AckResult::Fenced => 0u8,
-                };
-                self.leased.remove(&ack.offset);
-                reply(out, FrameType::AckStatus, &[status]);
-                Ok(())
-            }
+            // Term is an intentional drop: commit past the message (the same mechanism as ack) so
+            // it never redelivers. With a dead-letter EXCHANGE configured it is the explicit REJECT
+            // trigger (#551): the engine fans the forensic copy out to every exchange target
+            // (reason `Rejected`) BEFORE the commit, so a storage error is surfaced (the lease is
+            // intact and the message redelivers; a retried Term resumes idempotently) rather than
+            // silently degrading to an unrecorded drop. 1 = dropped, 0 = fenced.
+            AckOp::Term => match engine.with(move |e| e.term_in(&group, &token))? {
+                Ok(AckResult::Acked) => {
+                    self.leased.remove(&ack.offset);
+                    reply(out, FrameType::AckStatus, &[1]);
+                    Ok(())
+                }
+                Ok(AckResult::Fenced) => {
+                    self.leased.remove(&ack.offset);
+                    reply(out, FrameType::AckStatus, &[0]);
+                    Ok(())
+                }
+                // A fatal engine state wedges every future claim, so end the session rather
+                // than let the client hammer a dead engine — exactly the nack arm's policy.
+                Err(e) if e.is_fatal() => {
+                    reply_err(out, "fatal storage error");
+                    Err(SessionError::EngineFatal(e))
+                }
+                Err(_) => {
+                    reply_err(out, "term failed");
+                    Ok(())
+                }
+            },
             // Progress extends the lease (the consumer is still working). 1 = extended,
             // 2 = cap reached (the lease will expire and the message redeliver on schedule),
             // 0 = fenced.

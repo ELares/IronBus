@@ -184,6 +184,9 @@ fn key_to_env_name(key: &str) -> Option<&'static str> {
         "delivery.dedup_max_producers" => "IRONBUS_DEDUP_MAX_PRODUCERS",
         "delivery.max_prepared" => "IRONBUS_MAX_PREPARED",
         "delivery.max_prepared_bytes" => "IRONBUS_MAX_PREPARED_BYTES",
+        "delivery.default_message_ttl_ms" => "IRONBUS_DEFAULT_MESSAGE_TTL_MS",
+        "delivery.dead_letter_exchange" => "IRONBUS_DEAD_LETTER_EXCHANGE",
+        "delivery.dead_letter_expired" => "IRONBUS_DEAD_LETTER_EXPIRED",
         "network.listen" => "IRONBUS_ADDR",
         "network.health_addr" => "IRONBUS_HEALTH_ADDR",
         "network.health_allow_public" => "IRONBUS_HEALTH_ALLOW_PUBLIC",
@@ -464,6 +467,27 @@ mod tests {
         assert_eq!(
             layer.lookup_env_name("IRONBUS_BACKOFF_MS"),
             Some("100,500,2000".to_string())
+        );
+    }
+
+    #[test]
+    fn the_dead_letter_keys_map_to_their_env_names() {
+        // The #710 V2-M4 routing keys: a duration (normalized to ms), a string target list, and a
+        // bool, each exposed under its IRONBUS_<FLAG> env name for the shared resolution path.
+        let doc = "[delivery]\ndefault_message_ttl_ms = \"30s\"\n\
+                   dead_letter_exchange = \"dead-a,dead-b\"\ndead_letter_expired = true\n";
+        let layer = load_config_file("/x.toml", false, &reader(doc)).unwrap();
+        assert_eq!(
+            layer.lookup_env_name("IRONBUS_DEFAULT_MESSAGE_TTL_MS"),
+            Some("30000".to_string())
+        );
+        assert_eq!(
+            layer.lookup_env_name("IRONBUS_DEAD_LETTER_EXCHANGE"),
+            Some("dead-a,dead-b".to_string())
+        );
+        assert_eq!(
+            layer.lookup_env_name("IRONBUS_DEAD_LETTER_EXPIRED"),
+            Some("true".to_string())
         );
     }
 
