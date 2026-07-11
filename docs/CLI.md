@@ -912,18 +912,21 @@ note: <bytes> byte(s) past the durable head are torn or corrupt and were not sho
 {"loss":{"bytes":<bytes>,"events":[{"segment":<id>,"start":<s>,"end":<e>,"reason":"<reason>"}]}}
 ```
 
-### Dead-letter output shapes (`dump --dlq`)
+### Dead-letter output shapes (`dump --dlq [--exchange <name>]`)
 
-One line per poison record. Human form:
+One line per poison record; `--exchange <name>` reads a configured dead-letter EXCHANGE
+target subdir instead of the fixed `dlq/` (#551/#710). `reason` is the recorded dead-letter
+trigger (`max-deliver-exceeded` — also what a reason-less v1 record decodes as — or
+`ttl-expired` / `rejected`). Human form:
 
 ```
-dlq_offset=<n> source_offset=<n> group="<name>" attempt=<a> ts_ms=<ms> bytes=<payload-len> key_bytes=<key-len>
+dlq_offset=<n> source_offset=<n> group="<name>" attempt=<a> ts_ms=<ms> bytes=<payload-len> key_bytes=<key-len> reason=<reason>
 ```
 
 `--json` form (one object per line, group name JSON-escaped):
 
 ```json
-{"dlq_offset":<n>,"source_offset":<n>,"group":"<name>","attempt":<a>,"ts_ms":<ms>,"bytes":<payload-len>,"key_bytes":<key-len>}
+{"dlq_offset":<n>,"source_offset":<n>,"group":"<name>","attempt":<a>,"ts_ms":<ms>,"bytes":<payload-len>,"key_bytes":<key-len>,"reason":"<reason>"}
 ```
 
 ## Exit codes

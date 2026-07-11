@@ -50,6 +50,167 @@ use std::collections::{BTreeMap, BTreeSet};
 /// this is only the default sink when no DLX is configured — kept byte-identical to today.
 pub const DLQ_SUBDIR: &str = "dlq";
 
+/// The most targets a [`DeadLetterExchange`] may fan a dead message out to (#551). Every dead
+/// letter is appended+fsynced to EVERY target before its source cursor commits, so an unbounded
+/// list would make one poison message cost an unbounded number of fsyncs; 16 is far above any
+/// sane routing topology while keeping the worst case bounded. A larger list is a typed
+/// [`DeadLetterExchangeError::TooManyTargets`] at construction, never a silent truncation.
+pub const MAX_DEAD_LETTER_TARGETS: usize = 16;
+
+/// The longest allowed [`DeadLetterExchange`] target name, in bytes. Targets are data-dir
+/// subdirectory names, so the bound keeps every filesystem happy and an error message readable.
+pub const MAX_DEAD_LETTER_TARGET_LEN: usize = 64;
+
+/// Data-dir subdirectory names RESERVED by the storage layout: a dead-letter target must not
+/// collide with them, or the exchange would root a [`DlqSink`] inside (and corrupt) an unrelated
+/// artifact tree. `dlq` is deliberately NOT reserved — naming it targets the CLASSIC default sink,
+/// so an exchange can fan out to the classic `dlq/` plus extra targets.
+const RESERVED_TARGET_NAMES: &[&str] = &[
+    crate::layout::STREAMS_SUBDIR,
+    crate::layout::PARTITIONED_STREAMS_SUBDIR,
+    crate::layout::SHARED_WAL_SUBDIR,
+    crate::quarantine::QUARANTINE_SUBDIR,
+    // `crate::dict_store::DICTS_SUBDIR`, spelled literally because the module is gated behind
+    // the `zstd` feature while the reservation must hold on EVERY build (a non-zstd broker's
+    // data dir may later be opened by a zstd one).
+    "dicts",
+    crate::txn::TXN_SUBDIR,
+];
+
+/// A dead-letter EXCHANGE (V2-M4, #551): the validated, ORDERED list of target sink subdirs a
+/// dead message (max-deliver exceeded, TTL-expired, or rejected) fans out to. Each target is a
+/// full [`DlqSink`] — the same durable forensic record format, the same per-target exact-offset
+/// idempotency set — rooted at `<target>/` for the default stream and `streams/<hex(name)>/<target>/`
+/// for a named stream. The classic fixed sink is the target literally named `dlq`
+/// ([`DLQ_SUBDIR`]), so an exchange of `["dlq"]` routes exactly where an unconfigured broker does
+/// (but with the reason-carrying v2 record).
+///
+/// Validated BY CONSTRUCTION ([`DeadLetterExchange::new`]): non-empty, at most
+/// [`MAX_DEAD_LETTER_TARGETS`], no duplicates, and every target a safe subdirectory name
+/// (`[A-Za-z0-9._-]`, 1..=[`MAX_DEAD_LETTER_TARGET_LEN`] bytes, not `.`/`..`, not a reserved
+/// layout name) — so a target can never escape the data dir or collide with another artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadLetterExchange {
+    targets: Vec<String>,
+}
+
+/// Why a [`DeadLetterExchange`] could not be constructed (#551): every variant is a configuration
+/// error surfaced at open/parse time (fail-closed), never a silent truncation or sanitization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeadLetterExchangeError {
+    /// The target list was empty: an exchange must name at least one target (use `None` — no
+    /// exchange at all — for the classic fixed-`dlq/` behavior).
+    Empty,
+    /// More targets than [`MAX_DEAD_LETTER_TARGETS`].
+    TooManyTargets {
+        /// How many targets were supplied.
+        got: usize,
+    },
+    /// The same target named twice: a duplicate would double-append every dead letter.
+    DuplicateTarget {
+        /// The duplicated target name.
+        name: String,
+    },
+    /// A target name that is empty, too long, carries a character outside `[A-Za-z0-9._-]`,
+    /// or is `.`/`..` — anything that could escape the data dir or upset a filesystem.
+    InvalidTarget {
+        /// The rejected target name.
+        name: String,
+    },
+    /// A target name that collides with a RESERVED storage-layout subdirectory (`streams`,
+    /// `pstreams`, `shared-wal`, `quarantine`, `dicts`, `txn`): rooting a sink there would
+    /// corrupt an unrelated artifact tree.
+    ReservedTarget {
+        /// The rejected target name.
+        name: String,
+    },
+}
+
+impl std::fmt::Display for DeadLetterExchangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeadLetterExchangeError::Empty => {
+                write!(f, "a dead-letter exchange must name at least one target")
+            }
+            DeadLetterExchangeError::TooManyTargets { got } => write!(
+                f,
+                "a dead-letter exchange may name at most {MAX_DEAD_LETTER_TARGETS} targets, got {got}"
+            ),
+            DeadLetterExchangeError::DuplicateTarget { name } => {
+                write!(f, "duplicate dead-letter target `{name}`")
+            }
+            DeadLetterExchangeError::InvalidTarget { name } => write!(
+                f,
+                "invalid dead-letter target `{name}` (need 1..={MAX_DEAD_LETTER_TARGET_LEN} \
+                 chars of [A-Za-z0-9._-], not `.`/`..`)"
+            ),
+            DeadLetterExchangeError::ReservedTarget { name } => write!(
+                f,
+                "dead-letter target `{name}` is a reserved storage-layout name"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeadLetterExchangeError {}
+
+impl DeadLetterExchange {
+    /// Builds a validated exchange from an ordered target list. The ORDER is preserved: the
+    /// engine appends to targets in exactly this order (determinism, not correctness — the
+    /// per-target idempotency set makes any resume order safe).
+    ///
+    /// # Errors
+    /// A typed [`DeadLetterExchangeError`] for an empty list, too many targets, a duplicate, an
+    /// invalid name, or a reserved layout name.
+    pub fn new<I, S>(targets: I) -> Result<DeadLetterExchange, DeadLetterExchangeError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let targets: Vec<String> = targets.into_iter().map(Into::into).collect();
+        if targets.is_empty() {
+            return Err(DeadLetterExchangeError::Empty);
+        }
+        if targets.len() > MAX_DEAD_LETTER_TARGETS {
+            return Err(DeadLetterExchangeError::TooManyTargets { got: targets.len() });
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for name in &targets {
+            if !Self::is_valid_target_name(name) {
+                return Err(DeadLetterExchangeError::InvalidTarget { name: name.clone() });
+            }
+            if RESERVED_TARGET_NAMES.contains(&name.as_str()) {
+                return Err(DeadLetterExchangeError::ReservedTarget { name: name.clone() });
+            }
+            if !seen.insert(name.as_str()) {
+                return Err(DeadLetterExchangeError::DuplicateTarget { name: name.clone() });
+            }
+        }
+        Ok(DeadLetterExchange { targets })
+    }
+
+    /// The ordered target sink subdirs. Never empty (validated at construction).
+    #[must_use]
+    pub fn targets(&self) -> &[String] {
+        &self.targets
+    }
+
+    /// Whether `name` is a safe target subdirectory name: 1..=[`MAX_DEAD_LETTER_TARGET_LEN`]
+    /// bytes of `[A-Za-z0-9._-]` and not `.`/`..`. Pure and total, so the CLI can pre-validate
+    /// a flag value with the exact rule the constructor enforces.
+    #[must_use]
+    pub fn is_valid_target_name(name: &str) -> bool {
+        if name.is_empty() || name.len() > MAX_DEAD_LETTER_TARGET_LEN {
+            return false;
+        }
+        if name == "." || name == ".." {
+            return false;
+        }
+        name.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    }
+}
+
 /// The 4-byte magic that opens a v1 DLQ record's metadata header, also pinning the v1 metadata
 /// layout. A header that does not begin with a recognized DLQ magic is not a DLQ record this build
 /// understands. v1 carries no reason byte; it decodes as [`DeadLetterReason::MaxDeliverExceeded`]
@@ -862,5 +1023,85 @@ mod tests {
         // Forgetting an untracked group is a harmless no-op.
         sink.forget_group("never");
         assert_eq!(sink.highest_for_group("never"), None);
+    }
+
+    // ----- The dead-letter EXCHANGE type (#551): validated-by-construction fan-out targets -----
+
+    #[test]
+    fn a_dead_letter_exchange_preserves_target_order_and_accepts_the_classic_dlq() {
+        let ex = DeadLetterExchange::new(["dead-a", "dlq", "audit.2"]).unwrap();
+        assert_eq!(ex.targets(), &["dead-a", "dlq", "audit.2"]);
+    }
+
+    #[test]
+    fn a_dead_letter_exchange_rejects_bad_target_lists_with_typed_errors() {
+        // Empty list: an exchange must name at least one target.
+        assert_eq!(
+            DeadLetterExchange::new(Vec::<String>::new()),
+            Err(DeadLetterExchangeError::Empty)
+        );
+        // Bounded fan-out: one past the maximum is a typed error, never a truncation.
+        let too_many: Vec<String> = (0..=MAX_DEAD_LETTER_TARGETS)
+            .map(|i| format!("t{i}"))
+            .collect();
+        assert_eq!(
+            DeadLetterExchange::new(too_many),
+            Err(DeadLetterExchangeError::TooManyTargets {
+                got: MAX_DEAD_LETTER_TARGETS + 1
+            })
+        );
+        // A duplicate would double-append every dead letter.
+        assert_eq!(
+            DeadLetterExchange::new(["a", "b", "a"]),
+            Err(DeadLetterExchangeError::DuplicateTarget {
+                name: "a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_dead_letter_target_name_cannot_escape_the_data_dir_or_hit_a_reserved_tree() {
+        // Path-traversal-shaped and malformed names are invalid: `/`, `..`, `.`, empty, over-long,
+        // non-ASCII-word characters. The rule is the pure `is_valid_target_name`, shared with the CLI.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../x",
+            "a b",
+            "a\u{e9}",
+            &"x".repeat(65),
+        ] {
+            assert_eq!(
+                DeadLetterExchange::new([bad]),
+                Err(DeadLetterExchangeError::InvalidTarget {
+                    name: bad.to_string()
+                }),
+                "`{bad}` must be invalid"
+            );
+            assert!(!DeadLetterExchange::is_valid_target_name(bad));
+        }
+        // Reserved storage-layout names would root a sink inside an unrelated artifact tree.
+        for reserved in [
+            "streams",
+            "pstreams",
+            "shared-wal",
+            "quarantine",
+            "dicts",
+            "txn",
+        ] {
+            assert_eq!(
+                DeadLetterExchange::new([reserved]),
+                Err(DeadLetterExchangeError::ReservedTarget {
+                    name: reserved.to_string()
+                }),
+                "`{reserved}` must be reserved"
+            );
+        }
+        // The classic sink name is deliberately NOT reserved: it addresses the fixed `dlq/`.
+        assert!(DeadLetterExchange::new(["dlq"]).is_ok());
+        // A max-length valid name is accepted.
+        assert!(DeadLetterExchange::is_valid_target_name(&"x".repeat(64)));
     }
 }
