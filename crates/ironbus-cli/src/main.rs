@@ -414,6 +414,14 @@ const DEFAULT_CONSUME_LONGPOLL_MS: u64 = 0;
 /// TTL (lower-wins with any per-message `TTL1` headers-prefix TTL a producer attaches).
 const DEFAULT_MESSAGE_TTL_MS_OFF: u64 = 0;
 
+/// The default `--max-delay-ms` for `serve` (V2-M4 #555): 3 days, the `RocketMQ` 5.x timer-max
+/// parity point. A publish carrying a `DLY1` delayed-delivery request over this bound is REJECTED
+/// fail-closed (typed `ERR_DELAY_TOO_LONG`), never silently clamped, because an un-due record pins
+/// its group cursors and thereby the retention reap floor — an unbounded schedule would pin
+/// retention forever. `0` = UNBOUNDED (no cap), for deployments that accept that pin (tunability:
+/// the bound is a config, with a safe default).
+const DEFAULT_MAX_DELAY_MS: u64 = 259_200_000;
+
 /// The default COUNT bound on each per-producer dedup window for `serve` (#3, #33), aliased to the
 /// engine's [`ironbus_core::dedup::DEFAULT_MAX_IDS`] so the CLI and engine default are one source of
 /// truth. Dedup is OFF by default and activates per-producer only when a publish carries a `msg_id`;
@@ -2554,6 +2562,10 @@ struct ServeFlags {
     /// The per-stream DEFAULT message TTL in MILLISECONDS (V2-M4 #549, wired by #710); `None` ->
     /// default (`0` = off, records never expire on read — byte-identical).
     default_message_ttl_ms: Option<u64>,
+    /// The maximum accepted per-message delivery DELAY in MILLISECONDS (V2-M4 #555); `None` ->
+    /// default (3 days, `DEFAULT_MAX_DELAY_MS`). `0` = unbounded. A `DLY1` request over the bound
+    /// is rejected fail-closed at produce.
+    max_delay_ms: Option<u64>,
     /// The dead-letter EXCHANGE target list (V2-M4 #551, wired by #710): a comma-separated list of
     /// data-dir subdir names a dead message fans out to; `None` -> default (no exchange, the fixed
     /// `dlq/` sink byte-identical). The classic sink is addressable as the target named `dlq`.
@@ -2874,6 +2886,10 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--default-message-ttl-ms" => {
                 f.default_message_ttl_ms =
                     Some(take_number("--default-message-ttl-ms", args, &mut i)?);
+            }
+            // The maximum accepted per-message delivery delay (V2-M4 #555); `0` = unbounded.
+            "--max-delay-ms" => {
+                f.max_delay_ms = Some(take_number("--max-delay-ms", args, &mut i)?);
             }
             "--dead-letter-exchange" => {
                 f.dead_letter_exchange = Some(take_value("--dead-letter-exchange", args, &mut i)?);
@@ -3658,6 +3674,14 @@ fn parse_serve_flags_with_env_and_reader(
                 f.default_message_ttl_ms,
                 env,
                 DEFAULT_MESSAGE_TTL_MS_OFF,
+            )?,
+            // The maximum accepted per-message delivery delay (V2-M4 #555), flag > env > the
+            // 3-day default; `0` = unbounded (the operator accepts the retention pin).
+            max_delay_ms: resolve_number(
+                "--max-delay-ms",
+                f.max_delay_ms,
+                env,
+                DEFAULT_MAX_DELAY_MS,
             )?,
             dead_letter_exchange,
             dead_letter_expired: resolve_bool("--dead-letter-expired", f.dead_letter_expired, env)?,
@@ -5506,6 +5530,13 @@ struct ServeConfig {
     /// default), byte-identical. Combines LOWER-WINS with any per-message `TTL1` headers-prefix TTL.
     /// Threaded into [`EngineConfig::default_message_ttl_ms`].
     default_message_ttl_ms: u64,
+    /// The maximum accepted per-message delivery DELAY in MILLISECONDS (V2-M4 #555): a publish
+    /// whose `DLY1` delayed-delivery request exceeds this is REJECTED fail-closed (typed
+    /// `ERR_DELAY_TOO_LONG`), never silently clamped — an un-due record pins its group cursors and
+    /// thereby the retention reap floor, so an unbounded schedule would pin retention forever.
+    /// Default 3 days (`DEFAULT_MAX_DELAY_MS`, the `RocketMQ` 5.x timer-max parity point); `0` =
+    /// UNBOUNDED. Threaded into [`EngineConfig::max_delay_ms`].
+    max_delay_ms: u64,
     /// The dead-letter EXCHANGE target subdirs (V2-M4 #551, wired by #710), already VALIDATED at
     /// parse by [`ironbus_storage::dlq::DeadLetterExchange::new`]. EMPTY = no exchange (the fixed
     /// `dlq/` sink, byte-identical). Non-empty routes EVERY dead-letter (max-deliver, TTL-expired
@@ -5557,6 +5588,7 @@ impl ServeConfig {
             // V2-M4 routing richness (#549/#551) at its shipped defaults: no TTL, no dead-letter
             // exchange (the fixed `dlq/`), expired-routing off — the historical broker.
             default_message_ttl_ms: 0,
+            max_delay_ms: DEFAULT_MAX_DELAY_MS,
             dead_letter_exchange: Vec::new(),
             dead_letter_expired: false,
             // The bench broker is the shipped default set, i.e. the `balanced` profile.
@@ -9994,6 +10026,7 @@ fn cmd_serve(
         // consume them too or the Windows `-D warnings` build trips field-never-read, invisible to
         // a macOS reviewer (the recurring #288/#99 footgun). The exchange list is borrowed (owned Vec).
         config.default_message_ttl_ms,
+        config.max_delay_ms,
         &config.dead_letter_exchange,
         config.dead_letter_expired,
         // The #378 fsync-headroom knob is read only on the Unix serve path (it wires the engine's
@@ -10205,6 +10238,9 @@ fn open_engine_with<F: Filesystem + Clone>(
             // re-constructing the typed exchange here cannot fail on a parsed config (surfaced as
             // an internal error, not a panic, if the invariant ever breaks).
             default_message_ttl_ms: config.default_message_ttl_ms,
+            // The max accepted per-message delivery delay (V2-M4 #555), wired from
+            // `--max-delay-ms` / `delivery.max_delay_ms`; `0` = unbounded.
+            max_delay_ms: config.max_delay_ms,
             dead_letter_exchange: dead_letter_exchange_config(config)?,
             dead_letter_expired: config.dead_letter_expired,
             // The per-CONSUMER (per-connection) standing in-flight credit CEILING (#65, #552): the most
@@ -13922,6 +13958,7 @@ mod tests {
             // V2-M4 routing (#549/#551) at its inert defaults: no TTL, no exchange, no
             // expired-routing — the historical fixed-`dlq/` broker.
             default_message_ttl_ms: 0,
+            max_delay_ms: DEFAULT_MAX_DELAY_MS,
             dead_letter_exchange: Vec::new(),
             dead_letter_expired: false,
             profile: Profile::Balanced,
@@ -16019,6 +16056,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: if exchange.is_empty() {
                     None
                 } else {
@@ -17053,6 +17091,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -17144,6 +17183,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -17589,6 +17629,7 @@ mod tests {
             consume_longpoll_ms: 0,
             // V2-M4 routing (#549/#551) at its inert defaults, mirroring production.
             default_message_ttl_ms: 0,
+            max_delay_ms: DEFAULT_MAX_DELAY_MS,
             dead_letter_exchange: Vec::new(),
             dead_letter_expired: false,
             profile: Profile::Balanced,
@@ -21465,6 +21506,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -21555,6 +21597,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },

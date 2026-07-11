@@ -5469,9 +5469,23 @@ fn write_pub_reply(
             }
             Ok(())
         }
-        ProduceOutcome::Failed(_) => {
+        ProduceOutcome::Failed(ref e) => {
             if !fire_and_forget {
-                reply_err(out, "produce failed");
+                // The two DELAYED-delivery rejects (#555) — an over-max `DLY1` request and a raw
+                // wire `DUE1` injection — are TYPED, stable rejections the producer can branch on
+                // (resubmit under the bound / switch to a `DLY1` request), so each carries its
+                // frozen code + self-describing message instead of the anonymous fallback. Every
+                // other transient failure keeps the historical uncoded "produce failed"
+                // byte-for-byte.
+                if matches!(
+                    e,
+                    crate::engine::EngineError::DelayTooLong { .. }
+                        | crate::engine::EngineError::DueTimeInjected { .. }
+                ) {
+                    reply_err_coded(out, e.code().as_str(), &e.to_string());
+                } else {
+                    reply_err(out, "produce failed");
+                }
             }
             Ok(())
         }
@@ -5544,6 +5558,7 @@ mod tests {
             // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
             // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
             default_message_ttl_ms: 0,
+            max_delay_ms: 0,
             dead_letter_exchange: None,
             dead_letter_expired: false,
         }
@@ -5653,6 +5668,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -5718,6 +5734,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -6040,6 +6057,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -8793,6 +8811,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -9991,6 +10010,7 @@ mod tests {
                     // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                     // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                     default_message_ttl_ms: 0,
+                    max_delay_ms: 0,
                     dead_letter_exchange: None,
                     dead_letter_expired: false,
                 },
@@ -10092,6 +10112,226 @@ mod tests {
             "status 1 = committed"
         );
         assert_eq!(e.engine_mut().committed_offset().get(), 1);
+    }
+
+    #[test]
+    fn a_wire_pub_with_a_delay_request_is_invisible_until_due_then_delivers() {
+        // #555 over the WIRE: a Pub whose headers carry the `DLY1` delay request rides the session's
+        // off-actor precomputed-body-checksum path (#830), so this pins the resolution seam's
+        // checksum discipline end to end — the broker PATCHES the headers to the resolved `DUE1`
+        // instant, DROPS the now-stale precomputed checksum, and the stored record still reads back
+        // checksum-clean (a wrong stored checksum would fail this read). Delivery-wise: Flow before
+        // the due instant delivers nothing; at the instant it delivers, attempt 1.
+        let clock = Arc::new(ManualClock::at_unix_millis(0));
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        // Publish with a 500 ms delay request in the headers blob (the producer surface).
+        let headers = ironbus_core::delay::encode_delay_headers(
+            ironbus_core::delay::Delay::from_millis(500),
+            b"user-headers",
+        );
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                // A wildly skewed producer wall clock: MUST NOT shift visibility (broker-anchored).
+                timestamp_ms: u64::MAX,
+                key: b"",
+                headers: &headers,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"delayed-over-the-wire",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck, "accepted");
+        // Un-due: a Flow delivers nothing.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(
+            delivered_tokens(&out).is_empty(),
+            "invisible before the broker-anchored due instant"
+        );
+        // At the due instant (broker wall 0 + 500): delivered, checksum-clean read-back.
+        clock.set_unix_millis(500);
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(delivered_tokens(&out).len(), 1, "due: delivered");
+    }
+
+    #[test]
+    fn a_wire_pub_over_the_max_delay_carries_the_stable_reject_code() {
+        // #555: an over-max `DLY1` request is a TYPED, connection-preserving wire rejection — an Err
+        // frame carrying the frozen `ERR_DELAY_TOO_LONG` code + the bound-naming message, never a
+        // PubAck and never a session teardown, so the producer can branch (resubmit under the bound).
+        let clock = Arc::new(ManualClock::new());
+        let cfg = EngineConfig {
+            max_delay_ms: 500,
+            ..test_config()
+        };
+        let e =
+            DirectEngine::new(Engine::open(InMemoryFs::new(), Arc::clone(&clock), cfg).unwrap());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let headers = ironbus_core::delay::encode_delay_headers(
+            ironbus_core::delay::Delay::from_millis(501),
+            b"",
+        );
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: &headers,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"too-far-out",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "an over-max delay is an Err, not a PubAck"
+        );
+        let decoded = ironbus_proto::err::decode_err_body(&body);
+        assert_eq!(
+            decoded.code,
+            Some(ironbus_proto::err::ServerErrorCode::DelayTooLong),
+            "the reject carries the stable code"
+        );
+        assert!(
+            decoded.message.contains("501") && decoded.message.contains("500"),
+            "the message names both the request and the bound: {}",
+            decoded.message
+        );
+        // The connection is preserved: a compliant publish right after succeeds.
+        let ok_headers = ironbus_core::delay::encode_delay_headers(
+            ironbus_core::delay::Delay::from_millis(500),
+            b"",
+        );
+        let mut ok_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: &ok_headers,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"at-the-bound",
+            },
+            &mut ok_body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Pub, &ok_body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAck,
+            "at the bound: accepted on the same connection"
+        );
+    }
+
+    #[test]
+    fn a_wire_pub_with_a_raw_due1_block_carries_the_injection_reject_code() {
+        // #555 injection hardening over the WIRE: a Pub whose headers open with a raw broker-only
+        // `DUE1` block (a self-scheduled absolute due-instant, dodging the max-delay bound and the
+        // broker-clock anchor) is a TYPED, connection-preserving Err carrying the frozen
+        // `ERR_INVALID_DELAY_HEADER` code — never a PubAck, never stored, never held.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let mut injected = Vec::new();
+        injected.extend_from_slice(&ironbus_core::delay::DUE_HEADER_MAGIC);
+        injected.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: &injected,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"self-scheduled",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "an injected DUE1 is an Err, not a PubAck"
+        );
+        let decoded = ironbus_proto::err::decode_err_body(&body);
+        assert_eq!(
+            decoded.code,
+            Some(ironbus_proto::err::ServerErrorCode::InvalidDelayHeader),
+            "the reject carries the stable code"
+        );
+        assert!(
+            decoded.message.contains("DLY1"),
+            "the message steers to the legitimate request form: {}",
+            decoded.message
+        );
+        // Nothing was stored, so nothing can ever be held: a consumer sees an empty stream.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(delivered_tokens(&out).is_empty(), "nothing was appended");
+        // The connection is preserved and a LEGITIMATE `DLY1` request right after is accepted.
+        let legit = ironbus_core::delay::encode_delay_headers(
+            ironbus_core::delay::Delay::from_millis(100),
+            b"",
+        );
+        let mut ok_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: &legit,
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"legit-delay",
+            },
+            &mut ok_body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Pub, &ok_body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAck,
+            "a DLY1 request on the same connection is accepted"
+        );
     }
 
     #[test]
@@ -10401,6 +10641,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -10465,6 +10706,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -10682,6 +10924,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -11732,6 +11975,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },

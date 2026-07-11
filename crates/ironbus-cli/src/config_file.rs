@@ -185,6 +185,7 @@ fn key_to_env_name(key: &str) -> Option<&'static str> {
         "delivery.max_prepared" => "IRONBUS_MAX_PREPARED",
         "delivery.max_prepared_bytes" => "IRONBUS_MAX_PREPARED_BYTES",
         "delivery.default_message_ttl_ms" => "IRONBUS_DEFAULT_MESSAGE_TTL_MS",
+        "delivery.max_delay_ms" => "IRONBUS_MAX_DELAY_MS",
         "delivery.dead_letter_exchange" => "IRONBUS_DEAD_LETTER_EXCHANGE",
         "delivery.dead_letter_expired" => "IRONBUS_DEAD_LETTER_EXPIRED",
         "network.listen" => "IRONBUS_ADDR",

@@ -69,6 +69,7 @@ fn open_engine() -> Engine<InMemoryFs, SystemClock> {
             sync_max_dirty_bytes: 0,
             compression: ironbus_core::compress::Codec::None,
             default_message_ttl_ms: 0,
+            max_delay_ms: 0,
             dead_letter_exchange: None,
             dead_letter_expired: false,
         },

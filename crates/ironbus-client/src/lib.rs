@@ -4380,6 +4380,7 @@ mod tests {
                 // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
                 // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -4442,6 +4443,7 @@ mod tests {
                 sync_max_dirty_bytes: 0,
                 compression: ironbus_core::compress::Codec::None,
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -4536,6 +4538,7 @@ mod tests {
                 sync_max_dirty_bytes: 0,
                 compression,
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -8317,6 +8320,7 @@ toYtkjmdU2eQ2pK/3gM=
                 sync_max_dirty_bytes: 0,
                 compression: ironbus_core::compress::Codec::None,
                 default_message_ttl_ms: 0,
+                max_delay_ms: 0,
                 dead_letter_exchange: None,
                 dead_letter_expired: false,
             },
@@ -8643,6 +8647,7 @@ toYtkjmdU2eQ2pK/3gM=
             sync_max_dirty_bytes: 0,
             compression: ironbus_core::compress::Codec::None,
             default_message_ttl_ms: 0,
+            max_delay_ms: 0,
             dead_letter_exchange: None,
             dead_letter_expired: false,
         }
