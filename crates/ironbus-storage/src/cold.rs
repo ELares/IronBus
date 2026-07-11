@@ -64,6 +64,77 @@ const COLD_MANIFEST_MAGIC: [u8; 4] = *b"IBCM";
 /// segment `FORMAT_VERSION` and the `layout.meta` marker).
 const COLD_MANIFEST_VERSION: u8 = 1;
 
+/// A category of tiered-storage OFFLOAD error (#643), for the `ironbus_cold_offload_errors_total{reason}`
+/// counter. Offload runs BEST-EFFORT on the retention tick — a cold-store outage or a manifest at its
+/// slot cap must NEVER fail a produce — so an error there is surfaced as this observable counter (plus
+/// a `warn!`) and the offload is retried on the next tick, rather than propagated to the writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColdOffloadErrorReason {
+    /// The [`ColdStore`] backend failed (a `put` transport error, a missing object, or no backend
+    /// configured): `ColdStoreUnavailable` / `ColdFetch`.
+    ColdStore,
+    /// Any other offload failure (the manifest is at its slot cap, a local IO error reading the
+    /// segment, etc.): the segment stays local and offload retries next tick.
+    Other,
+}
+
+impl ColdOffloadErrorReason {
+    /// Every reason in a fixed order; the index into the counter array. Append-only.
+    pub const ALL: [ColdOffloadErrorReason; 2] = [
+        ColdOffloadErrorReason::ColdStore,
+        ColdOffloadErrorReason::Other,
+    ];
+
+    /// This reason's index into [`ColdOffloadErrorReason::ALL`].
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            ColdOffloadErrorReason::ColdStore => 0,
+            ColdOffloadErrorReason::Other => 1,
+        }
+    }
+
+    /// The frozen Prometheus `reason` label value.
+    #[must_use]
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            ColdOffloadErrorReason::ColdStore => "cold_store",
+            ColdOffloadErrorReason::Other => "other",
+        }
+    }
+
+    /// Classifies a [`StorageError`] from an offload pass into a counter reason.
+    #[must_use]
+    pub fn for_error(err: &StorageError) -> ColdOffloadErrorReason {
+        if err.is_cold_read_failure() {
+            ColdOffloadErrorReason::ColdStore
+        } else {
+            ColdOffloadErrorReason::Other
+        }
+    }
+}
+
+/// The process-wide, monotonic `ironbus_cold_offload_errors_total{reason}` counter store (#643), one
+/// cell per [`ColdOffloadErrorReason`]. A best-effort retention-tick offload records here on failure
+/// instead of failing the produce path; the value is the operator's alert signal that tiering is
+/// degraded (a cold-store outage or a full manifest).
+static COLD_OFFLOAD_ERRORS: [core::sync::atomic::AtomicU64; ColdOffloadErrorReason::ALL.len()] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Records one best-effort offload error for `reason`, bumping `ironbus_cold_offload_errors_total{reason}`.
+/// Saturating; safe to call from the append actor.
+pub fn record_cold_offload_error(reason: ColdOffloadErrorReason) {
+    COLD_OFFLOAD_ERRORS[reason.index()].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current `ironbus_cold_offload_errors_total{reason}` value, for the `/metrics` render and tests.
+#[must_use]
+pub fn cold_offload_errors_total(reason: ColdOffloadErrorReason) -> u64 {
+    COLD_OFFLOAD_ERRORS[reason.index()].load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The fixed byte size of one encoded [`ColdEntry`]: six `u64` fields, a `u32` CRC, and a `u8` flags
 /// byte. Every entry is fixed width, so the manifest payload is `HEADER_LEN + ENTRY_LEN * count`.
 const ENTRY_LEN: usize = 8 * 6 + 4 + 1;
@@ -679,5 +750,33 @@ mod tests {
         assert_eq!(ColdEntry::decode(&buf), Some(e));
         // Wrong length decodes to None.
         assert_eq!(ColdEntry::decode(&buf[..ENTRY_LEN - 1]), None);
+    }
+
+    #[test]
+    fn offload_error_reason_classifies_and_counts() {
+        // A cold-store outage classifies as ColdStore; a manifest-at-cap as Other.
+        assert_eq!(
+            ColdOffloadErrorReason::for_error(&StorageError::ColdStoreUnavailable {
+                segment_id: 1
+            }),
+            ColdOffloadErrorReason::ColdStore
+        );
+        assert_eq!(
+            ColdOffloadErrorReason::for_error(&StorageError::ColdManifestFull),
+            ColdOffloadErrorReason::Other
+        );
+        // The frozen Prometheus label values.
+        assert_eq!(
+            ColdOffloadErrorReason::ColdStore.metric_label(),
+            "cold_store"
+        );
+        assert_eq!(ColdOffloadErrorReason::Other.metric_label(), "other");
+        // The counter records a DELTA (process-global; assert the delta, not an absolute).
+        let before = cold_offload_errors_total(ColdOffloadErrorReason::Other);
+        record_cold_offload_error(ColdOffloadErrorReason::Other);
+        assert_eq!(
+            cold_offload_errors_total(ColdOffloadErrorReason::Other),
+            before + 1
+        );
     }
 }

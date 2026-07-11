@@ -488,13 +488,19 @@ version, malformed entry table) REFUSES the open (`StorageError::ColdManifestCor
 `reap.ckpt`/`bindings.ckpt` posture) rather than dropping remote pointers and then tripping
 `SegmentChainBroken` on the offloaded holes; a TORN slot (a never-committed write) regresses to the
 prior durable manifest. The file is created LAZILY on the first offload, so a broker that never
-offloads has a byte-for-byte unchanged disk image (the default-OFF conformance guarantee). At open,
-recovery SPLICES the manifest's offloaded (oldest, absent) prefix back into the chain so an
-offloaded segment recovers as PRESENT (never a torn gap), validating that the offloaded set abuts
-the local chain exactly. A pre-#643 broker cannot open a log whose oldest segments are offloaded (it
-would trip `SegmentChainBroken` on the absent files); a #643+ broker requires the object-store
-backend re-attached after a restart to read an offloaded segment (`StorageError::ColdStoreUnavailable`
-is surfaced fail-closed until it is).
+offloads has a byte-for-byte unchanged disk image (the default-OFF conformance guarantee). Recovery
+is MANIFEST-AWARE: it reads the manifest FIRST, PURGES any restore-on-access cache file for a REMOTE
+id (a `seg-<id>.log` a prior run re-materialized on a cold read is a process-lifetime, re-fetchable
+copy — never a chain anchor, so a partial or torn restore can never create a phantom gap or trip the
+compaction probe), then SPLICES the manifest's offloaded (oldest) prefix back into the chain so an
+offloaded segment recovers as PRESENT (never a torn `SegmentChainBroken` gap), validating that the
+offloaded set abuts the local chain exactly. A pre-#643 broker cannot open a log whose oldest
+segments are offloaded (it would trip `SegmentChainBroken` on the absent files); a #643+ broker
+requires the object-store backend re-attached after a restart to read an offloaded segment
+(`StorageError::ColdStoreUnavailable` is surfaced fail-closed until it is). Offload runs BEST-EFFORT
+on the retention tick (after a produce's commit), so a cold-store outage or a full manifest can
+never fail a produce — it bumps `ironbus_cold_offload_errors_total{reason}` + `warn!`s and the next
+tick retries.
 
 ---
 

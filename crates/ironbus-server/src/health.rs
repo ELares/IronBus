@@ -1167,6 +1167,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&recovery_event_lines(&counters.recovery));
     body.push_str(&checkpoint_damage_lines());
+    body.push_str(&cold_offload_error_lines());
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&edge_metric_lines(&edge, rss, disk_free));
     body.push_str(&connz_metric_lines(connz));
@@ -2159,6 +2160,31 @@ fn checkpoint_damage_lines() -> String {
             "ironbus_checkpoint_damaged_total{{artifact=\"{}\"}} {}",
             artifact.metric_label(),
             ironbus_storage::checkpoint::checkpoint_damaged_total(artifact),
+        );
+    }
+    s
+}
+
+/// Renders the `ironbus_cold_offload_errors_total{reason}` counter (#643, tiered storage): one labeled
+/// sample per [`ColdOffloadErrorReason`], read from the process-wide monotonic offload-error store. A
+/// non-zero value means the BEST-EFFORT retention-tick offload could not tier a cold segment out (a
+/// cold-store outage or a manifest at its slot cap) — the produce path is unaffected and the segment
+/// stays local, so this is the OBSERVABILITY signal an operator alerts on to notice degraded tiering,
+/// not a failure. All series are always emitted (zero when healthy). Being a LABELED `_total`, its
+/// sample lines are excluded from the unlabeled-`_total` resilience-taxonomy test by construction
+/// (exactly like `ironbus_checkpoint_damaged_total{artifact}`), so it is pinned only in
+/// `FROZEN_METRIC_TYPES`.
+fn cold_offload_error_lines() -> String {
+    let mut s = String::from(
+        "# HELP ironbus_cold_offload_errors_total Best-effort tiered-storage (#643) offloads that failed on the retention tick (a cold-store outage or a full manifest), by reason. The produce path is unaffected; the segment stays local and the next tick retries.\n\
+         # TYPE ironbus_cold_offload_errors_total counter\n",
+    );
+    for reason in ironbus_storage::cold::ColdOffloadErrorReason::ALL {
+        let _ = writeln!(
+            s,
+            "ironbus_cold_offload_errors_total{{reason=\"{}\"}} {}",
+            reason.metric_label(),
+            ironbus_storage::cold::cold_offload_errors_total(reason),
         );
     }
     s
@@ -5830,6 +5856,11 @@ mod tests {
         // `ironbus_corruption_repairs_total{artifact}` — it is pinned ONLY here and excluded from the
         // unlabeled-`_total` resilience-taxonomy set by construction.
         ("ironbus_checkpoint_damaged_total", "counter"),
+        // The best-effort tiered-storage offload-error counter (#643): offloads that failed on the
+        // retention tick, by reason. A LABELED `_total` (like `ironbus_checkpoint_damaged_total{artifact}`),
+        // so it is pinned ONLY here and excluded from the unlabeled-`_total` resilience-taxonomy set by
+        // construction.
+        ("ironbus_cold_offload_errors_total", "counter"),
         // Reconciled skip/loss gauges (the resilience watermarks; NOT `_total`).
         ("ironbus_records_skipped", "gauge"),
         ("ironbus_bytes_skipped", "gauge"),

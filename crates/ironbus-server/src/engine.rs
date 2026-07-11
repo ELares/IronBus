@@ -10627,7 +10627,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // is enabled, so a non-tiered broker pays nothing. Runs here on the retention tick, serialized
         // with reap/compaction on the append actor, upholding the crash-safe upload->manifest->delete
         // ordering. Phase 1 tiers the default log only.
-        let _ = self.log.offload_cold_segments()?;
+        //
+        // BEST-EFFORT and NON-FATAL: this tick runs AFTER a produce's commit, so a cold-store outage
+        // (`ColdFetch`) or a manifest at its slot cap (`ColdManifestFull`) must NEVER fail the produce
+        // — it would take writes down for a purely archival hiccup. On an error we bump the observable
+        // `ironbus_cold_offload_errors_total{reason}` counter + `warn!` and CONTINUE; the segment
+        // stays local and the next tick retries. (An offload error never corrupts state — the crash-
+        // safe ordering leaves a consistent, contiguous remote prefix on any partial failure.)
+        if let Err(e) = self.log.offload_cold_segments() {
+            let reason = ironbus_storage::cold::ColdOffloadErrorReason::for_error(&e);
+            ironbus_storage::cold::record_cold_offload_error(reason);
+            tracing::warn!(
+                error = %e,
+                reason = reason.metric_label(),
+                "tiered-storage offload failed on the retention tick; the segment stays local and \
+                 the next tick retries (produce path unaffected)"
+            );
+        }
         Ok(())
     }
 

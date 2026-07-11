@@ -1179,7 +1179,46 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // v1, so this records a fact and reinterprets no segment, cursor, or DLQ byte. Recovery below
         // is unchanged. Reserves the `streams/` subtree for per-stream logs (M2-I2); does not create it.
         crate::layout::open_or_upgrade(&fs)?;
-        let ids = segment_ids(&fs)?;
+        // #643 tiered storage: read the cold manifest BEFORE the chain scan so recovery is
+        // manifest-AWARE. A local `seg-<id>.log` for a REMOTE (offloaded) id is a restore-on-access
+        // CACHE — "absent until verified against the manifest", NOT a chain anchor. Excluding every
+        // REMOTE id from the enumeration is the load-bearing fix: without it, a lagging consumer that
+        // restored only a NON-adjacent subset of the offloaded prefix (e.g. seg-0 via a low-offset
+        // read) leaves the still-remote segments between that restored file and the local tail as a
+        // phantom gap, and the strict contiguity scan hard-fails `SegmentChainBroken` before the
+        // manifest is ever consulted. The manifest's spliced prefix (below) provides the
+        // authoritative, contiguous chain for those ids; the on-disk cache copy is reconciled on
+        // read (`ensure_segment_local` verifies it against the manifest before trusting it).
+        let cold_manifest = Self::open_cold_manifest(&fs)?;
+        let remote_ids: std::collections::BTreeSet<u64> = cold_manifest
+            .as_ref()
+            .map_or_else(std::collections::BTreeSet::new, |m| {
+                m.entries().keys().copied().collect()
+            });
+        // PURGE any restore-on-access CACHE file for a REMOTE id BEFORE recovery. A cache file is a
+        // process-lifetime, re-fetchable copy of an offloaded segment — deleting it here means NO
+        // recovery scan (the compaction-segment probe, `reap_bad_trailing_segment`, the chain scan)
+        // can trip over a partial restore (a phantom gap) or a torn cache (a crash mid-restore, since
+        // the fs seam has no atomic rename). The authoritative copy is the object store + the manifest
+        // splice below; a later read re-fetches the segment cleanly. This is what makes a restart
+        // after a routine tiered read robust.
+        for &id in &remote_ids {
+            let name = segment_file_name(id);
+            match fs.remove(&name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Io(e)),
+            }
+        }
+        if !remote_ids.is_empty() {
+            fs.sync_dir().map_err(StorageError::Io)?;
+        }
+        // The remaining segment files are all genuine LOCAL segments (every REMOTE id's cache was
+        // purged above); the filter is defense-in-depth on the id list.
+        let ids: Vec<u64> = segment_ids(&fs)?
+            .into_iter()
+            .filter(|id| !remote_ids.contains(id))
+            .collect();
         // #868: a crash during `start_segment` (or bit-rot of the trailing header) can leave the
         // HIGHEST-id segment as a zero-length or undecodable-header file: an empty unsealed tail
         // that holds nothing durable, because the prior segment was sealed before this one was
@@ -1275,11 +1314,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 ReasonCode::CorruptSegmentHeader,
             ));
         }
-        // #643 tiered storage: if a cold-segment manifest exists, it records which absent segment
-        // files are REMOTE (offloaded), not lost. Read it and SPLICE the offloaded (oldest) prefix
-        // back into the recovered chain so an offloaded segment recovers as PRESENT, never as a torn
-        // gap. Absent manifest => nothing happens (the default-OFF, byte-identical path).
-        log.attach_and_splice_cold_manifest()?;
+        // #643 tiered storage: attach the (already-read) cold manifest and SPLICE the offloaded
+        // (oldest) prefix back into the recovered chain so an offloaded segment recovers as PRESENT,
+        // never as a torn gap. The recovered local chain already EXCLUDES every REMOTE id (a restored
+        // cache file never anchored the scan), so the splice provides the sole, contiguous chain for
+        // those ids. Absent manifest => nothing happens (the default-OFF, byte-identical path).
+        log.cold_manifest = cold_manifest;
+        log.splice_cold_prefix()?;
         Ok(log)
     }
 
@@ -4001,29 +4042,29 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             .map_or(0, ColdManifest::entry_count)
     }
 
-    /// Reads the durable cold-segment manifest (if `cold-manifest.ckpt` exists) and SPLICES the
-    /// offloaded (oldest) segment prefix back into the recovered chain, so an offloaded segment
-    /// recovers as PRESENT rather than a torn gap (#643). Called once at the end of [`Log::open`].
-    /// A no-op — and a byte-for-byte unchanged data dir — for a log that never offloaded.
-    fn attach_and_splice_cold_manifest(&mut self) -> Result<(), StorageError> {
-        if !self
-            .fs
-            .exists(COLD_MANIFEST_FILE)
-            .map_err(StorageError::Io)?
-        {
-            return Ok(());
+    /// Reads the durable cold-segment manifest at `Log::open` (if `cold-manifest.ckpt` exists),
+    /// returning the recovered offloaded set. Kept separate from the splice so the caller can read it
+    /// FIRST — before the chain scan — and exclude REMOTE ids from the enumeration (#643). A no-op
+    /// (and a byte-for-byte unchanged data dir) for a log that never offloaded.
+    fn open_cold_manifest(fs: &F) -> Result<Option<ColdManifest<F::File>>, StorageError> {
+        if !fs.exists(COLD_MANIFEST_FILE).map_err(StorageError::Io)? {
+            return Ok(None);
         }
-        let file = self.fs.open(COLD_MANIFEST_FILE).map_err(StorageError::Io)?;
-        let manifest = ColdManifest::open(file)?;
-        self.cold_manifest = Some(manifest);
-        self.splice_cold_prefix()
+        let file = fs.open(COLD_MANIFEST_FILE).map_err(StorageError::Io)?;
+        Ok(Some(ColdManifest::open(file)?))
     }
 
-    /// Splices the manifest's offloaded segments into `self.segments` as a contiguous PREFIX below the
-    /// recovered oldest LOCAL segment, validating that the offloaded set abuts the local chain exactly
-    /// (offset/seq contiguity). A manifest inconsistent with the on-disk chain fails closed — never a
-    /// silent reinterpretation. The offloaded records still count toward retention totals (they are
-    /// retained data, just tiered off local disk).
+    /// Splices ALL the manifest's offloaded segments into `self.segments` as a contiguous PREFIX below
+    /// the recovered oldest LOCAL segment, validating that the offloaded set abuts the local chain
+    /// exactly (offset/seq contiguity). A manifest inconsistent with the on-disk chain fails closed —
+    /// never a silent reinterpretation. The offloaded records still count toward retention totals
+    /// (they are retained data, just tiered off local disk).
+    ///
+    /// Every REMOTE id was already EXCLUDED from the local chain scan at open (a restored cache file
+    /// is "absent until verified"), so no offloaded segment is in `self.segments` yet and the whole
+    /// offloaded set is the prefix — including the crash-after-manifest-before-delete window (a
+    /// segment whose local file lingers is spliced from the manifest here and its cache file is
+    /// reconciled on read, never double-counted).
     fn splice_cold_prefix(&mut self) -> Result<(), StorageError> {
         let Some(manifest) = self.cold_manifest.as_ref() else {
             return Ok(());
@@ -4032,27 +4073,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             return Ok(());
         }
         // Copy the entries out (id-ascending == base-offset-ascending), so we can mutate `segments`.
-        let all_entries: Vec<ColdEntry> = manifest.entries().values().copied().collect();
-        // Only entries whose LOCAL FILE is ABSENT are spliced in: an entry whose local file still
-        // exists is the crash-after-manifest-before-delete window (the offload committed REMOTE but
-        // the local unlink did not durably complete). That segment is already in the recovered local
-        // chain (enumerated by `segment_ids`) — it stays a normal slot, still flagged REMOTE by the
-        // manifest (so a restore-on-access is a harmless no-op and a reap deletes both copies), so
-        // splicing it too would double-count it and break the abutment. The genuinely-offloaded
-        // (absent) entries are always the oldest contiguous prefix (offload deletes oldest-first).
-        let mut entries: Vec<ColdEntry> = Vec::with_capacity(all_entries.len());
-        for entry in all_entries {
-            if !self
-                .fs
-                .exists(&segment_file_name(entry.id))
-                .map_err(StorageError::Io)?
-            {
-                entries.push(entry);
-            }
-        }
-        if entries.is_empty() {
-            return Ok(());
-        }
+        let entries: Vec<ColdEntry> = manifest.entries().values().copied().collect();
         // The offloaded prefix must abut the recovered oldest LOCAL segment (or, if there is none,
         // there is nothing valid to abut and the manifest is inconsistent with the local chain).
         let local_oldest_base = self
@@ -4251,20 +4272,25 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(())
     }
 
-    /// Restore-on-access (#643): if segment `id` is REMOTE and its local file is absent, fetch it from
-    /// the cold store, RE-VERIFY it against the manifest (byte length + CRC32C + a structural
-    /// header/footer scan), and re-materialize the local `seg-<id>.log` file so the normal read path
-    /// serves it transparently. Idempotent (a no-op if the file is already local). Runs on the actor.
+    /// Restore-on-access (#643): make REMOTE segment `id` readable locally. Its `seg-<id>.log` is a
+    /// process-lifetime restore CACHE (a re-fetchable copy of the offloaded object). A cache file
+    /// present WITHIN a run was written by THIS process's restore below — AFTER the fetched bytes were
+    /// verified against the manifest — so it is trusted by existence; only an absent one is fetched.
+    /// A torn/stale cache from a PRIOR run's crash never reaches here: [`Log::open`] PURGES every
+    /// REMOTE id's cache file before recovery, so a read always starts from either a valid cache this
+    /// run wrote or a clean fetch. Idempotent; runs on the actor.
     ///
-    /// A fetch failure or a verification failure is a TYPED, fail-closed error surfaced to the reader
-    /// (never a silent gap or a phantom record): the poisoned bytes are never materialized.
+    /// A fetch or verification failure is a TYPED, fail-closed error surfaced to the reader (never a
+    /// silent gap or a phantom record): the poisoned bytes are never materialized as a local segment.
     fn ensure_segment_local(&self, id: u64) -> Result<(), StorageError> {
         let name = segment_file_name(id);
         if self.fs.exists(&name).map_err(StorageError::Io)? {
+            // Present: a genuine local segment, or a cache this run already restored (verified before
+            // it was written). Trusted by existence — `Log::open` purged any stale/torn prior cache.
             return Ok(());
         }
         let Some(entry) = self.cold_manifest.as_ref().and_then(|m| m.get(id)).copied() else {
-            // Not recorded REMOTE: let the caller's normal open surface a genuine NotFound.
+            // Absent and NOT recorded REMOTE: let the caller's normal open surface a genuine NotFound.
             return Ok(());
         };
         let store = self
@@ -4277,15 +4303,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 segment_id: id,
                 source: e,
             })?;
+        // Verify the fetched bytes (length + CRC32C + a structural header/footer scan) BEFORE
+        // materializing them, so a corrupt object store fails closed rather than caching garbage.
         Self::verify_fetched_segment(id, &entry, &bytes)?;
-        // Materialize the local cache file (durable). A concurrent restorer that already created it
-        // (AlreadyExists) is a benign race — the bytes are byte-identical (both verified).
         match self.fs.create_new(&name) {
             Ok(file) => {
                 file.write_all_at(&bytes, 0)?;
                 file.sync_all()?;
                 self.fs.sync_dir()?;
             }
+            // A benign race on a shared fs: the bytes are byte-identical (both manifest-verified).
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(StorageError::Io(e)),
         }

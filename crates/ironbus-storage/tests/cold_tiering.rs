@@ -13,7 +13,10 @@
 //! - a retention reap of an offloaded segment DELETES the remote object (no orphan);
 //! - a cold-store `get` failure / a corrupt fetched object is a TYPED fail-closed error, never a
 //!   silent gap or garbage;
-//! - with offload DISABLED the on-disk image is byte-for-byte unchanged (no manifest file).
+//! - with offload DISABLED the on-disk image is byte-for-byte unchanged (no manifest file);
+//! - a restore-on-access CACHE file NEVER breaks the next restart (a partial/non-adjacent restore
+//!   must not create a phantom gap) and is NEVER trusted torn (verified against the manifest);
+//! - an offload error (a cold-store outage) leaves the segment LOCAL and retries — never a loss.
 
 // A test helper filters `seg-*.log` files by suffix; the file-extension lint is not meaningful here.
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
@@ -23,6 +26,7 @@ use std::sync::Arc;
 use ironbus_core::clock::ManualClock;
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::cold::{cold_object_name, ColdStorageConfig, ColdStore, FsColdStore};
+use ironbus_storage::fault::FaultFs;
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
 use ironbus_storage::io::RandomAccessFile;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
@@ -395,5 +399,146 @@ fn disabled_offload_is_byte_identical_and_writes_no_manifest() {
         image(&plain_fs),
         image(&disabled_fs),
         "a disabled cold tier changes no on-disk byte"
+    );
+}
+
+/// The exact recovery repro (#1152 review): offload a prefix, restore ONLY the segment covering
+/// `restore_at` via a single-record low-offset read (a normal lagging consumer), then RESTART. The
+/// restored `seg-<id>.log` for a still-REMOTE id must NOT anchor the chain scan (it is "absent until
+/// verified"), so the log opens cleanly with no phantom `SegmentChainBroken` gap, and every record
+/// reads back byte-exact (the still-remote segments re-fetched).
+fn restore_then_restart_reads_clean(restore_at: u64) {
+    let data_fs = InMemoryFs::new();
+    let cold_fs = InMemoryFs::new();
+    let baseline;
+    {
+        let mut log = open_with_cold(&data_fs, &cold_fs);
+        append_n(&mut log, 60);
+        baseline = read_all(&log);
+        let offloaded = log.offload_cold_segments().unwrap();
+        assert!(
+            offloaded > 1,
+            "need several offloaded segments so a partial restore leaves a gap"
+        );
+        // Restore ONLY the segment covering `restore_at`: a single-record read materializes just it.
+        let _ = log.read_from(Offset::new(restore_at), 1).unwrap();
+    }
+    // RESTART: recovery must EXCLUDE the restored-but-still-REMOTE cache file from the contiguity
+    // scan. Before the fix this panicked with `SegmentChainBroken` (a phantom gap).
+    let log2 = open_with_cold(&data_fs, &cold_fs);
+    assert_eq!(
+        read_all(&log2),
+        baseline,
+        "all records readable after a partial-restore restart (remote re-fetched)"
+    );
+}
+
+#[test]
+fn restart_after_restoring_the_oldest_offloaded_segment_opens_clean() {
+    // seg-0 restored, segs 1..k still remote, local tail newest => a definite non-adjacent gap.
+    restore_then_restart_reads_clean(0);
+}
+
+#[test]
+fn restart_after_restoring_a_middle_offloaded_segment_opens_clean() {
+    // A middle offloaded offset: restores a middle segment, leaving remote holes on BOTH sides.
+    restore_then_restart_reads_clean(20);
+}
+
+#[test]
+fn restart_after_restoring_the_whole_prefix_opens_clean() {
+    // The originally-passing contiguous case (a full replay restores everything): still reopens.
+    let data_fs = InMemoryFs::new();
+    let cold_fs = InMemoryFs::new();
+    let baseline;
+    {
+        let mut log = open_with_cold(&data_fs, &cold_fs);
+        append_n(&mut log, 60);
+        baseline = read_all(&log);
+        assert!(log.offload_cold_segments().unwrap() > 1);
+        let _ = read_all(&log); // restore the ENTIRE prefix (contiguous)
+    }
+    let log2 = open_with_cold(&data_fs, &cold_fs);
+    assert_eq!(read_all(&log2), baseline);
+}
+
+#[test]
+fn a_torn_restored_cache_file_is_purged_at_open_and_refetched_never_served() {
+    let data_fs = InMemoryFs::new();
+    let cold_fs = InMemoryFs::new();
+    let baseline;
+    {
+        let mut log = open_with_cold(&data_fs, &cold_fs);
+        append_n(&mut log, 60);
+        baseline = read_all(&log);
+        log.offload_cold_segments().unwrap();
+        assert!(log.is_segment_remote(0));
+        assert!(!data_fs.exists(&format!("seg-{:016x}.log", 0u64)).unwrap());
+    }
+    // Plant a TORN cache file for the REMOTE seg-0 (garbage that does not match the manifest), as a
+    // crash mid-restore under the no-atomic-rename fs seam would leave in a PRIOR run.
+    let seg0 = data_fs
+        .create_new(&format!("seg-{:016x}.log", 0u64))
+        .unwrap();
+    seg0.write_all_at(b"garbage that is not a valid segment", 0)
+        .unwrap();
+    seg0.sync_all().unwrap();
+    data_fs.sync_dir().unwrap();
+
+    // RESTART: recovery PURGES the torn cache for the REMOTE id (so it never anchors the chain scan
+    // or trips the compaction probe), opens cleanly, and a read RE-FETCHES the authoritative bytes —
+    // the torn cache is never served as authoritative.
+    let log2 = open_with_cold(&data_fs, &cold_fs);
+    assert_eq!(
+        read_all(&log2),
+        baseline,
+        "torn cache purged at open + re-fetched, never served as authoritative"
+    );
+    // The re-fetched cache is now the correct, manifest-matching bytes.
+    assert!(log2.is_segment_remote(0));
+}
+
+#[test]
+fn offload_error_leaves_the_segment_local_and_retries() {
+    // Non-blocker #2 (storage contract): a cold-store PUT outage must never lose data — the segment
+    // stays LOCAL (nothing recorded REMOTE, no local file deleted) and offload retries next tick. The
+    // engine wraps this best-effort (warn + `ironbus_cold_offload_errors_total` + continue), so a
+    // produce is never failed by a tiering hiccup.
+    let data_fs = InMemoryFs::new();
+    let (cold_fault, cold_ctl) = FaultFs::new(InMemoryFs::new());
+    let mut log = Log::open(data_fs, ManualClock::new(), config()).unwrap();
+    let store: Arc<dyn ColdStore> = Arc::new(FsColdStore::new(cold_fault));
+    log.set_cold_store(store, ColdStorageConfig::enabled(1));
+    append_n(&mut log, 60);
+    let baseline = read_all(&log);
+
+    cold_ctl.set_fail_write(true); // the cold-store PUT fails
+    let err = log.offload_cold_segments().unwrap_err();
+    assert!(
+        err.is_cold_read_failure(),
+        "a put outage surfaces a cold-read error: {err:?}"
+    );
+    assert_eq!(
+        log.cold_offloaded_count(),
+        0,
+        "nothing offloaded under a put outage"
+    );
+    assert!(!log.is_segment_remote(0));
+    assert_eq!(
+        read_all(&log),
+        baseline,
+        "no loss: every record still local + readable"
+    );
+
+    cold_ctl.set_fail_write(false); // backend recovers
+    assert!(
+        log.offload_cold_segments().unwrap() > 0,
+        "the next tick retries and succeeds"
+    );
+    assert!(log.is_segment_remote(0));
+    assert_eq!(
+        read_all(&log),
+        baseline,
+        "readable after a successful retry"
     );
 }

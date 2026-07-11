@@ -203,6 +203,10 @@ directory of self-describing files is the authority, no manifest required").
   the local file**, so a local segment is never unlinked before both its remote copy and its
   manifest entry are durable. On a reap of a remote segment the manifest entry is removed
   (fsync) first, then the object is deleted (no orphaned-object leak, no dangling pointer).
+- Recovery is MANIFEST-AWARE: `Log::open` reads this manifest FIRST and PURGES any
+  restore-on-access cache file for a REMOTE id (a `seg-<id>.log` a prior run re-materialized on a
+  cold read is a process-lifetime, re-fetchable copy — never a chain anchor), so a partial or
+  torn restore can never create a phantom gap or trip the compaction probe before the splice.
 - Load-bearing (like `reap.ckpt`/`bindings.ckpt`): a CRC-valid-but-undecodable manifest fails
   the open closed (`StorageError::ColdManifestCorrupt`); a torn slot regresses to the prior
   durable manifest.
