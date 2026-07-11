@@ -6379,6 +6379,7 @@ fn load_tls_termination(
 /// [`CliError::Usage`] for a missing/unsafe secret file (`StrictModes`), a malformed table, an unknown
 /// scope, or a credential that does not parse (a fail-closed reject, never a silent skip).
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)] // identity table + #765 tenant/quota table parsing, one cohesive loader
 fn load_auth_config(
     transport: &TransportSecurityFlags,
     audit: Option<&ironbus_server::audit::AuditEmitter>,
@@ -6456,11 +6457,54 @@ fn load_auth_config(
         }
         // Exactly one mechanism per identity, by which credential list is present.
         let credential = load_one_credential(&name, ident).map_err(CliError::Usage)?;
+        // #765: the optional `tenant` key binds this identity to a tenant (account). Every name this
+        // identity's connections use is then server-prefixed under that tenant — the client never
+        // supplies a tenant, so it is non-spoofable. Absent = the single-tenant (byte-identical) mode.
+        let tenant = match ident.get("tenant").and_then(toml::Value::as_str) {
+            Some(t) => Some(ironbus_server::tenant::TenantId::parse(t).map_err(|e| {
+                CliError::Usage(format!(
+                    "--auth-config identity `{name}` has an invalid `tenant`: {e}"
+                ))
+            })?),
+            None => None,
+        };
         cfg.add_identity(Identity {
             name,
             scopes,
             credential,
+            tenant,
         });
+    }
+    // #765: the optional top-level `[[tenant]]` tables carry each tenant's per-fleet ceilings (max
+    // streams / storage bytes / connections). A tenant referenced by an identity but absent here is
+    // valid and simply unlimited. Wired onto the auth config so the session picks it up for free.
+    if let Some(tenant_tables) = parsed.get("tenant").and_then(toml::Value::as_array) {
+        use ironbus_server::tenant::{TenantId, TenantQuotas, TenantRegistry};
+        let mut quotas = std::collections::HashMap::new();
+        for (i, t) in tenant_tables.iter().enumerate() {
+            let name = t.get("name").and_then(toml::Value::as_str).ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--auth-config `[[tenant]]` #{i} is missing a string `name`"
+                ))
+            })?;
+            let id = TenantId::parse(name).map_err(|e| {
+                CliError::Usage(format!("--auth-config tenant `{name}` is invalid: {e}"))
+            })?;
+            let as_u64 = |key: &str| {
+                t.get(key)
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|v| u64::try_from(v).ok())
+            };
+            quotas.insert(
+                id,
+                TenantQuotas {
+                    max_streams: as_u64("max_streams"),
+                    max_storage_bytes: as_u64("max_storage_bytes"),
+                    max_connections: as_u64("max_connections"),
+                },
+            );
+        }
+        cfg.set_tenants(std::sync::Arc::new(TenantRegistry::new(quotas)));
     }
     Ok(Some(std::sync::Arc::new(cfg)))
 }

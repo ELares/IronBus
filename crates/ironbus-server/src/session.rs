@@ -497,6 +497,21 @@ pub struct Session {
     /// is always `None`, so an mTLS-mechanism connect fails closed (no verified cert) until TLS lands —
     /// the safe behavior, never a default-scope grant.
     peer_san: Option<String>,
+    /// This connection's TENANT (account), pinned at a successful `Connect` from the AUTHENTICATED
+    /// identity (#765, V2-M7). `None` is the single-tenant default: no name prefixing, byte-for-byte
+    /// the pre-tenant broker. `Some(_)` binds every client-supplied resource name under `<tenant>/…`
+    /// (streams/groups) or `<tenant>.…` (subjects) at the session→engine boundary, so a connection is
+    /// STRUCTURALLY unable to name another tenant's resource. Derived ONLY from the credential (via
+    /// [`crate::auth::AuthOutcome`]) — never from anything the client asserts — so it is non-spoofable.
+    tenant: Option<crate::tenant::TenantId>,
+    /// The broker's shared per-tenant quota registry (#765), if configured. `None` disables quota
+    /// enforcement (isolation via `tenant` above is independent of it). Consulted at the connect /
+    /// declare / produce gates to fail-closed a tenant that hit a ceiling. A cheap `Arc` clone.
+    tenants: Option<std::sync::Arc<crate::tenant::TenantRegistry>>,
+    /// The RAII connection reservation (#765): held for the connection's lifetime so the tenant's
+    /// fleet-wide concurrent-connection count is decremented on drop (connection close). `None` on a
+    /// single-tenant / no-registry connection.
+    conn_guard: Option<crate::tenant::ConnGuard>,
     /// The shared connection-signal ("connz") metric (#572), if the server wired one in. `None` for a
     /// session that does not report connz (every test, and a `serve` overload built with the legacy
     /// un-scraped metric). When `Some(_)`, the session records the AUTHED-FLIP (a successful `Connect`
@@ -574,10 +589,14 @@ impl Session {
         auth_config: std::sync::Arc<crate::auth::AuthConfig>,
         peer_san: Option<String>,
     ) -> Session {
+        // Pick up the per-tenant quota registry (#765) from the same auth config, so the whole
+        // existing accept path wires tenancy for free (no serve-signature change).
+        let tenants = auth_config.tenants();
         Session {
             member_id,
             auth_config: Some(auth_config),
             peer_san,
+            tenants,
             ..Session::default()
         }
     }
@@ -590,6 +609,151 @@ impl Session {
     pub fn with_connz(mut self, connz: std::sync::Arc<crate::connz::ConnectionMetrics>) -> Session {
         self.connz = Some(connz);
         self
+    }
+
+    /// Attaches the broker's per-tenant quota registry (#765). A builder-style setter (like
+    /// [`with_connz`](Session::with_connz)) so every existing call site is unchanged and only the
+    /// server's live accept path opts in. Isolation (name prefixing) does NOT depend on this — it
+    /// only governs the per-tenant connect/declare/produce ceilings.
+    #[must_use]
+    pub fn with_tenants(
+        mut self,
+        tenants: std::sync::Arc<crate::tenant::TenantRegistry>,
+    ) -> Session {
+        self.tenants = Some(tenants);
+        self
+    }
+
+    /// SERVER-APPLIES this connection's pinned tenant to a client-supplied STREAM id (#765). A
+    /// single-tenant connection (`tenant` is `None`) returns the name unchanged (`Cow::Borrowed`), so
+    /// the on-disk/wire image is byte-for-byte the pre-tenant broker; a multi-tenant connection nests
+    /// the name under its tenant (`Cow::Owned`). Applied at every session→engine seam where a client
+    /// stream id enters, so the engine only ever sees an already-tenant-scoped name.
+    fn tenant_stream<'a>(&self, client_name: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.tenant {
+            None => std::borrow::Cow::Borrowed(client_name),
+            Some(t) => std::borrow::Cow::Owned(t.scope_stream(client_name)),
+        }
+    }
+
+    /// SERVER-APPLIES this connection's pinned tenant to a client-supplied SUBJECT or bind pattern
+    /// (#765), as an implicit leading token. Single-tenant is byte-identical (`Cow::Borrowed`).
+    fn tenant_subject<'a>(&self, client_subject: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.tenant {
+            None => std::borrow::Cow::Borrowed(client_subject),
+            Some(t) => std::borrow::Cow::Owned(t.scope_subject(client_subject)),
+        }
+    }
+
+    /// SERVER-APPLIES this connection's pinned tenant to a client-supplied GROUP name for the one
+    /// group-only routing seam (the transaction back-check listener group, #765). Every other group
+    /// is already isolated by its paired (scoped) stream, so this is used only there.
+    fn tenant_group(&self, client_group: &[u8]) -> Vec<u8> {
+        match &self.tenant {
+            None => client_group.to_vec(),
+            Some(t) => t
+                .scope_group(&String::from_utf8_lossy(client_group))
+                .into_bytes(),
+        }
+    }
+
+    /// The effective DEFAULT stream name for this connection: the empty string (`""`, the root log)
+    /// for a single-tenant connection — byte-for-byte the historical default stream — or the tenant's
+    /// own named stream (the bare tenant id) for a multi-tenant connection, so two tenants' "default"
+    /// streams are distinct isolated logs. Used wherever the session binds/reset the default stream.
+    fn default_stream(&self) -> String {
+        match &self.tenant {
+            None => String::new(),
+            Some(t) => t.scope_stream(""),
+        }
+    }
+
+    /// Charges a SCOPED stream against this connection's tenant stream ceiling (#765). A no-op
+    /// (`Ok`) on a single-tenant connection or when no quota registry is wired. Idempotent per stream.
+    ///
+    /// # Errors
+    /// [`crate::tenant::QuotaError::MaxStreams`] at the ceiling.
+    fn reserve_tenant_stream(&self, scoped: &str) -> Result<(), crate::tenant::QuotaError> {
+        match (&self.tenant, &self.tenants) {
+            (Some(tenant), Some(reg)) => reg.reserve_stream(tenant, scoped),
+            _ => Ok(()),
+        }
+    }
+
+    /// Charges `n` produced bytes against this connection's tenant byte ceiling (#765). A no-op
+    /// (`Ok`) on a single-tenant connection or when no quota registry is wired.
+    ///
+    /// # Errors
+    /// [`crate::tenant::QuotaError::MaxStorageBytes`] at the ceiling.
+    fn reserve_tenant_bytes(&self, n: u64) -> Result<(), crate::tenant::QuotaError> {
+        match (&self.tenant, &self.tenants) {
+            (Some(tenant), Some(reg)) => reg.reserve_bytes(tenant, n),
+            _ => Ok(()),
+        }
+    }
+
+    /// Establishes a multi-tenant connection's tenant state at `Connect` (#765): the per-tenant
+    /// CONNECTION ceiling, the tenant's own default stream, and the default-stream binding. A no-op
+    /// (returns `Ok(())`) for a single-tenant connection, so the pre-tenant path is byte-for-byte
+    /// unchanged. Idempotent under a repeated `Connect`: the connection reservation is taken once
+    /// (`conn_guard`) and the declare is idempotent.
+    ///
+    /// # Errors
+    /// Replies the typed [`crate::codes::ErrorCode::ERR_TENANT_MAX_CONNECTIONS`] /
+    /// `ERR_TENANT_MAX_STREAMS` and returns [`SessionError::AuthViolation`] (closing the connection)
+    /// when the tenant is at its connection or (default-stream) stream ceiling; a fatal storage error
+    /// while declaring the default stream ends the session as [`SessionError::EngineFatal`].
+    fn establish_tenant<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let Some(tenant) = self.tenant.clone() else {
+            return Ok(());
+        };
+        // The per-tenant CONNECTION ceiling, counted across the whole fleet (distinct from the
+        // per-connection #633 cap). Taken exactly once per connection: a repeated `Connect` finds the
+        // guard already held and does not re-charge.
+        if self.conn_guard.is_none() {
+            if let Some(reg) = self.tenants.clone() {
+                match reg.acquire_connection(&tenant) {
+                    Ok(guard) => self.conn_guard = Some(guard),
+                    Err(e) => {
+                        reply_err_coded(out, e.code(), e.message());
+                        return Err(SessionError::AuthViolation);
+                    }
+                }
+            }
+        }
+        // Ensure the tenant's default stream exists (charged against the stream ceiling) so a
+        // consumer that subscribes BEFORE anyone produces still binds a real, isolated log.
+        let default = tenant.scope_stream("");
+        if let Some(reg) = self.tenants.as_ref() {
+            if let Err(e) = reg.reserve_stream(&tenant, &default) {
+                reply_err_coded(out, e.code(), e.message());
+                return Err(SessionError::AuthViolation);
+            }
+        }
+        let name = default.clone();
+        match engine.with(move |e| e.declare_stream(&name))? {
+            Ok(_) => {}
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                return Err(SessionError::EngineFatal(e));
+            }
+            Err(e) => {
+                reply_err_coded(out, e.code().as_str(), &e.to_string());
+                return Err(SessionError::AuthViolation);
+            }
+        }
+        // Bind the tenant default stream so every default-stream consume/ack path routes to the
+        // tenant's isolated log (those handlers key on `self.stream`, which is now non-empty).
+        self.stream = GroupName::from(default.as_str());
+        Ok(())
     }
 
     /// Seeds the event-driven consume LONG-POLL budget in MILLISECONDS (push delivery) from the engine
@@ -1169,7 +1333,7 @@ impl Session {
     // the one place the connection's capabilities are established.
     #[allow(clippy::too_many_lines)]
     fn handle_connect<
-        F: Filesystem + 'static,
+        F: Filesystem + Clone + 'static,
         C: Clock + Clone + 'static,
         E: EngineAccess<F, C>,
     >(
@@ -1251,8 +1415,16 @@ impl Session {
             // the scope-pinning: `self.authenticated` can never be set without a resolved identity, and if
             // a non-success variant is ever added to `AuthOutcome` this destructure fails to compile rather
             // than silently leaving an authenticated-but-no-scope connection (#889).
-            let crate::auth::AuthOutcome::Authenticated { identity, scopes } = &outcome;
+            let crate::auth::AuthOutcome::Authenticated {
+                identity,
+                scopes,
+                tenant,
+            } = &outcome;
             self.scopes = *scopes;
+            // Pin the TENANT (#765) from the SAME irrefutable authentication outcome as the scopes, so
+            // a connection's tenant is fixed at auth from its credential and can never be re-asserted by
+            // a later frame. `None` keeps the single-tenant (byte-identical) path.
+            self.tenant.clone_from(tenant);
             self.identity_name.clone_from(identity);
             self.authenticated = true;
             // Emit the SUCCESSFUL authn outcome to the audit stream (#635): the resolved identity NAME,
@@ -1285,6 +1457,13 @@ impl Session {
         // and a repeated Connect re-runs this idempotently (the slot is already released).
         self.half_open_slot = None;
         self.connected = true;
+        // Establish the connection's TENANT (#765): enforce the per-tenant CONNECTION ceiling
+        // (fail-closed, counted across the whole fleet), ensure the tenant's default stream exists,
+        // and bind it as this connection's default stream so every consume/ack path routes to the
+        // tenant's isolated log. A single-tenant connection (`tenant` is `None`) is a no-op — this
+        // returns `Ok(())` immediately and the historical default-stream path is byte-for-byte
+        // unchanged. On the connection ceiling this replies the typed rejection and closes.
+        self.establish_tenant(engine, out)?;
         // Record the client's request (re-recorded on a repeated Connect, which re-negotiates
         // idempotently). It is also used by the lazy `credit_ceiling` fallback for a session that never
         // ran a Connect through this handler (some tests inject `connected` directly).
@@ -1478,7 +1657,12 @@ impl Session {
     /// caller releases the parked acks in FIFO submission order (see [`drain_parked`]); every
     /// immediate (pre-submit) reply below first drains `parked`, so a validation error's `Err`
     /// frame never overtakes an earlier produce's ack on the wire.
-    fn handle_pub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+    #[allow(clippy::too_many_lines)] // one cohesive produce path + the #765 tenant redirect
+    fn handle_pub<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
         &mut self,
         engine: &E,
         body: &[u8],
@@ -1563,20 +1747,26 @@ impl Session {
         // the produce path is byte-for-byte today's. NEVER a false `NOT_LEADER` on the leader (it returns
         // `Local`) or on a non-clustered / pre-bootstrap partition (also `Local`). The default-stream log
         // maps to the cluster default partition; multi-partition routing is the flagged #693 follow-up.
-        if let crate::cluster::client_ack::ClusterProduceRouting::Redirect { leader_hint } =
-            engine.cluster_produce_routing(crate::cluster::client_ack::DEFAULT_PARTITION)
-        {
-            // Preserve the wire reply order: flush the earlier pipelined produces' acks FIRST (exactly
-            // like every other pre-submit return in this function), THEN the redirect.
-            drain_parked(engine, member_id, parked, out)?;
-            // A LEVEL-0 (fire-and-forget) produce expects NO reply by contract: drop it silently (the
-            // record is simply not appended on this wrong node — the QoS-0 producer accepts loss and will
-            // re-fire to the leader on its own). An at-least-once produce gets the typed `NOT_LEADER` frame
-            // carrying the leader hint so the client transparently reconnects/retries to the leader.
-            if !fire_and_forget {
-                reply_not_leader(out, leader_hint);
+        // #765: a MULTI-TENANT connection's plain `Pub` targets the tenant's own NAMED default stream
+        // (not the cluster default partition of the shared root), so the default-partition NOT_LEADER
+        // redirect below is a single-tenant concern — skip it for a tenant connection (clustered
+        // multi-tenant partition routing is a documented phase-1 follow-up).
+        if self.tenant.is_none() {
+            if let crate::cluster::client_ack::ClusterProduceRouting::Redirect { leader_hint } =
+                engine.cluster_produce_routing(crate::cluster::client_ack::DEFAULT_PARTITION)
+            {
+                // Preserve the wire reply order: flush the earlier pipelined produces' acks FIRST (exactly
+                // like every other pre-submit return in this function), THEN the redirect.
+                drain_parked(engine, member_id, parked, out)?;
+                // A LEVEL-0 (fire-and-forget) produce expects NO reply by contract: drop it silently (the
+                // record is simply not appended on this wrong node — the QoS-0 producer accepts loss and will
+                // re-fire to the leader on its own). An at-least-once produce gets the typed `NOT_LEADER` frame
+                // carrying the leader hint so the client transparently reconnects/retries to the leader.
+                if !fire_and_forget {
+                    reply_not_leader(out, leader_hint);
+                }
+                return Ok(());
             }
-            return Ok(());
         }
         // Enforce the dedup id length caps (#33) at the wire boundary, BEFORE the bytes cross into
         // owned storage. The `producer_id` keys the per-producer window map and the `msg_id` keys the
@@ -1690,6 +1880,15 @@ impl Session {
         // as absent and never rejects the produce. Head-sampled + bounded-lossy; a `None` sink (export
         // off) is a zero-cost no-op. Emitted BEFORE `append` moves into the submit below.
         emit_produce_span(engine.span_sink(), msg.headers);
+        // #765: a MULTI-TENANT connection's plain `Pub` is produced SYNCHRONOUSLY to the tenant's OWN
+        // default stream (`<tenant>`, ensured to exist at Connect), NOT the shared root log — so two
+        // tenants' default-stream producers are fully isolated. This is the named-stream
+        // Level-1-equivalent produce path (charged against the tenant byte ceiling); the pipelined root
+        // window is a single-tenant optimization. A SINGLE-TENANT connection (`tenant` is `None`) takes
+        // the byte-for-byte historical root path below.
+        if self.tenant.is_some() {
+            return self.produce_to_tenant_default(engine, append, out);
+        }
         // LEVEL 0 (no-ack fast path, #495): submit the produce with NO reply channel and return
         // immediately — do NOT park. The producer fired and forgot, so there is no PubAck to write, no
         // reply-channel allocation, and no fsync to wait for. The connection-thread byte-cap pre-check
@@ -1723,6 +1922,72 @@ impl Session {
             wants_confirm,
         });
         Ok(())
+    }
+
+    /// Produces a MULTI-TENANT connection's plain `Pub` to the tenant's own default stream (#765),
+    /// synchronously via the engine's id-routed produce (the named-stream Level-1-equivalent path a
+    /// `PubTo` uses), charged against the tenant byte ceiling. Reached ONLY on a multi-tenant
+    /// connection, so the single-tenant pipelined root path is byte-for-byte unchanged. A fire-and-
+    /// forget (Level-0) publish still receives NO reply; an at-least-once publish gets its `PubAck`
+    /// after the tenant stream's covering fsync. Per-stream dedup / L0-batch / L2-confirm are the same
+    /// documented follow-ups as the `PubTo` named-stream path.
+    fn produce_to_tenant_default<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        append: OwnedAppend,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let stream = self.default_stream();
+        let fire_and_forget = append.fire_and_forget;
+        let size = (append.payload.len() + append.key.len() + append.headers.len()) as u64;
+        if let Err(e) = self.reserve_tenant_bytes(size) {
+            if !fire_and_forget {
+                reply_err_coded(out, e.code(), e.message());
+            }
+            return Ok(());
+        }
+        let level = append.ack_level;
+        let outcome = engine.with(move |e| {
+            let view = Append {
+                timestamp_ms: append.timestamp_ms,
+                flags: RecordFlags::from_bits(append.flags),
+                key: &append.key,
+                headers: &append.headers,
+                payload: &append.payload,
+            };
+            let result = e.produce_in_stream_prioritized(&stream, &view, 0);
+            if result.is_ok() {
+                e.record_produce_ack_level(level);
+            }
+            result
+        })?;
+        match outcome {
+            Ok(offset) => {
+                if !fire_and_forget {
+                    let ack = PubAckBody {
+                        offset: offset.get(),
+                    };
+                    let mut ack_body = Vec::new();
+                    encode_pub_ack(&ack, &mut ack_body);
+                    reply(out, FrameType::PubAck, &ack_body);
+                }
+                Ok(())
+            }
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            Err(e) => {
+                if !fire_and_forget {
+                    reply_err_coded(out, e.code().as_str(), &e.to_string());
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Flushes the pass-scoped Level-0 batch ([`Session::level0_pending`]) to the actor as ONE
@@ -3583,7 +3848,92 @@ impl Session {
         reply(out, FrameType::GapMarker, frame_body);
     }
 
-    fn handle_sub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+    /// Subscribes a MULTI-TENANT connection to one of its tenant-scoped streams (#765): the tenant's
+    /// default stream (from a plain `Sub`, ensured to exist at `Connect`) or `<tenant>/<name>`. This
+    /// mirrors the durable / ephemeral NAMED-stream subscribe path of [`Session::handle_sub_to`] — the
+    /// `(stream, group)`-keyed cursor and per-stream group state are what provide the isolation, so a
+    /// group name is bound verbatim (it is already isolated by the scoped stream). No existence probe
+    /// is needed: a not-yet-produced tenant stream simply yields nothing until produced, so a
+    /// first-`Sub`-then-`Pub` order works. Reached ONLY on a multi-tenant connection, so the
+    /// single-tenant root-log path is byte-for-byte unchanged.
+    fn subscribe_tenant_stream<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        stream: &str,
+        group: &str,
+        ephemeral: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let member = self.member_id;
+        // Register the NEW ephemeral subscription FIRST (register-before-deregister), or gate a
+        // durable subscribe against a live-ephemeral conflict — exactly like `handle_sub_to`.
+        if ephemeral {
+            let (s, g) = (stream.to_string(), group.to_string());
+            match engine.with(move |e| e.subscribe_ephemeral_in_stream(&s, &g, member))? {
+                Ok(()) => {}
+                Err(e) => {
+                    reply_err_coded(out, e.code().as_str(), &e.to_string());
+                    return Ok(());
+                }
+            }
+        } else {
+            let (s, g) = (stream.to_string(), group.to_string());
+            if engine.with(move |e| e.is_ephemeral_in_stream(&s, &g))? {
+                reply_err_coded(
+                    out,
+                    crate::codes::ErrorCode::ERR_EPHEMERAL_GROUP_CONFLICT.as_str(),
+                    "work-group is live as ephemeral: a durable subscribe cannot bind it",
+                );
+                return Ok(());
+            }
+        }
+        let same_binding = *self.stream == *stream && *self.subscription == *group;
+        self.leave_current_key_shared(engine)?;
+        if !same_binding {
+            self.leave_current_subscription(engine)?;
+        }
+        self.stream = GroupName::from(stream);
+        self.subscription = GroupName::from(group);
+        self.partition = None;
+        let stream_p = stream.to_string();
+        self.priority_bound = engine.with(move |e| e.is_priority_stream(&stream_p))?;
+        self.registered_subscription = ephemeral;
+        self.ephemeral_subscription = ephemeral;
+        self.leased.clear();
+        let stream_name = self.stream.clone();
+        let sub = self.subscription.clone();
+        let joined = engine.with(move |e| {
+            if e.is_configured_key_shared(&sub)
+                && e.set_key_ordering_in_stream(&stream_name, &sub, KeyOrdering::KeyShared)
+                    .is_ok()
+            {
+                e.join_member_in_stream(&stream_name, &sub, member);
+                true
+            } else {
+                false
+            }
+        })?;
+        self.joined_key_shared = joined;
+        if self.default_tier == ConsumeTier::Streaming {
+            let stream_name = self.stream.clone();
+            let sub = self.subscription.clone();
+            engine.with(move |e| {
+                let _ = e.set_streaming_in_stream(&stream_name, &sub, true);
+            })?;
+        }
+        reply(out, FrameType::Ok, &[]);
+        Ok(())
+    }
+
+    fn handle_sub<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
         &mut self,
         engine: &E,
         body: &[u8],
@@ -3618,6 +3968,16 @@ impl Session {
                 "the default/empty group cannot be ephemeral (name a group)",
             );
             return Ok(());
+        }
+        // #765: a MULTI-TENANT connection's plain `Sub` (the default stream) is served against the
+        // tenant's OWN default stream (`<tenant>`, ensured to exist at Connect), NOT the shared root
+        // log — so two tenants' default-stream consumers are fully isolated. The named-stream consume
+        // machinery (its `(stream, group)`-keyed cursor + group state) does the isolation. A
+        // SINGLE-TENANT connection (`tenant` is `None`) falls through to the byte-for-byte historical
+        // root-log path below unchanged.
+        if self.tenant.is_some() {
+            let stream = self.default_stream();
+            return self.subscribe_tenant_stream(engine, &stream, group, ephemeral, out);
         }
         // Register as an active subscriber of the NEW group FIRST (#288), so the BROADCAST
         // group-of-one cap is enforced BEFORE any of this connection's state is torn down. A
@@ -3782,7 +4142,13 @@ impl Session {
             reply_err(out, "cannot declare the default stream (empty id)");
             return Ok(());
         }
-        let stream = stream.to_string();
+        // #765: SERVER-APPLY the tenant prefix so the engine only ever sees `<tenant>/<name>`, and
+        // charge the per-tenant stream ceiling fail-closed BEFORE the declare touches the log.
+        let stream = self.tenant_stream(stream).into_owned();
+        if let Err(e) = self.reserve_tenant_stream(&stream) {
+            reply_err_coded(out, e.code(), e.message());
+            return Ok(());
+        }
         // #693/#553: the additive `partition_count` + `priority` flag decide the backing. `priority =
         // true` opts the stream into PRIORITY MODE (`P = partition_count` priority lanes, delivered
         // highest-first); otherwise `P <= 1` delegates to the plain single-log declare BYTE-FOR-BYTE and
@@ -3840,7 +4206,9 @@ impl Session {
             reply_err(out, "stream id must be valid UTF-8");
             return Ok(());
         };
-        let stream = stream.to_string();
+        // #765: a StreamInfo existence/head probe is answered ONLY within the caller's tenant — the
+        // client name is prefixed so a client can never probe for another tenant's stream.
+        let stream = self.tenant_stream(stream).into_owned();
         // One round-trip reads both the existence bit and the durable head: the head is meaningful only
         // when the stream exists, and `stream_head` reports `0` for an unknown/malformed stream (which
         // the response folds with `exists = false`), so the two reads are consistent.
@@ -3982,7 +4350,20 @@ impl Session {
             // counters; this named-stream produce path counts it explicitly in the engine job below.
             ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
-        let stream = stream.to_string();
+        // #765: SERVER-APPLY the tenant prefix (the engine only ever sees `<tenant>/<name>`), then
+        // charge the per-tenant STREAM ceiling (a named produce declares-on-first-produce) and BYTE
+        // ceiling fail-closed BEFORE the produce reaches the log.
+        let stream = self.tenant_stream(stream).into_owned();
+        if let Err(e) = self.reserve_tenant_stream(&stream) {
+            reply_err_coded(out, e.code(), e.message());
+            return Ok(());
+        }
+        if let Err(e) = self
+            .reserve_tenant_bytes((msg.payload.len() + msg.key.len() + msg.headers.len()) as u64)
+        {
+            reply_err_coded(out, e.code(), e.message());
+            return Ok(());
+        }
         // #553: the wire PubTo carries an additive PRIORITY byte, threaded to the engine's
         // priority-carrying produce. It is IGNORED for a non-priority stream (a `priority = 0` call is
         // byte-for-byte `produce_in_stream`), so only a produce to a declared priority stream routes to
@@ -4087,7 +4468,19 @@ impl Session {
         // cannot hold). The wire-only PUB flags (dedup/fire-and-forget bits) are masked off so only the
         // real stored content flags reach the durable half record.
         let txn_id = Bytes::copy_from_slice(decoded.txn_id);
-        let stream = stream.to_string();
+        // #765: SERVER-APPLY the tenant prefix to the txn's target stream, and charge the per-tenant
+        // stream + byte ceilings fail-closed BEFORE the half message is staged.
+        let stream = self.tenant_stream(stream).into_owned();
+        if let Err(e) = self.reserve_tenant_stream(&stream) {
+            reply_err_coded(out, e.code(), e.message());
+            return Ok(());
+        }
+        if let Err(e) = self
+            .reserve_tenant_bytes((msg.payload.len() + msg.key.len() + msg.headers.len()) as u64)
+        {
+            reply_err_coded(out, e.code(), e.message());
+            return Ok(());
+        }
         let timestamp_ms = msg.timestamp_ms;
         let flags = msg.flags & !PUB_WIRE_ONLY_FLAGS;
         let key = Bytes::copy_from_slice(msg.key);
@@ -4254,7 +4647,12 @@ impl Session {
             reply_err(out, "listener group must not be empty");
             return Ok(());
         }
-        let group = decoded.group.to_vec();
+        // #765: SERVER-APPLY the tenant prefix to the back-check listener group — the one group-only
+        // routing seam not already isolated by a paired (scoped) stream — so a `TxnCheck` for one
+        // tenant's in-doubt half message can NEVER be routed to another tenant that registered the
+        // same group name. `handle_txn_prepare` reads `self.txn_listener_group` (this scoped value),
+        // so the prepare-side owner and the register-side owner stay consistent.
+        let group = self.tenant_group(decoded.group);
         // Bind the group to this connection in the engine's back-check router (superseding any prior
         // binding), and remember it on the session so future prepares record it as the half message
         // owner and the per-pass scan/drain is enabled for this connection.
@@ -4396,6 +4794,13 @@ impl Session {
             reply_err(out, "stream id must be valid UTF-8");
             return Ok(());
         };
+        // #765: SERVER-APPLY the tenant prefix. Every downstream use — the existence check, the
+        // (stream, group) binding pinned into `self.stream`, key_shared join, tier — then resolves
+        // strictly within the caller's tenant, so a SubTo can never bind another tenant's stream (an
+        // unknown-to-the-tenant name is the standard "does not exist" reject). The group is isolated
+        // by the scoped stream (group state is keyed by (stream, group)), so it needs no own prefix.
+        let scoped_stream = self.tenant_stream(stream).into_owned();
+        let stream = scoped_stream.as_str();
         let Ok(group) = core::str::from_utf8(decoded.group) else {
             reply_err(out, "group name must be valid UTF-8");
             return Ok(());
@@ -4627,8 +5032,16 @@ impl Session {
             reply_err(out, "subject pattern must be valid UTF-8");
             return Ok(());
         };
-        let stream = stream.to_string();
-        let pattern = pattern.to_string();
+        // #765: SERVER-APPLY the tenant prefix to BOTH names. The pattern becomes `<tenant>.<pattern>`
+        // (an implicit leading token), so a bound wildcard can NEVER match another tenant's subjects;
+        // the stream nests under `<tenant>/…`. bind_subject declares the stream, so charge the
+        // per-tenant stream ceiling fail-closed first.
+        let stream = self.tenant_stream(stream).into_owned();
+        if let Err(e) = self.reserve_tenant_stream(&stream) {
+            reply_err_coded(out, e.code(), e.message());
+            return Ok(());
+        }
+        let pattern = self.tenant_subject(pattern).into_owned();
         match engine.with(move |e| e.bind_subject(&stream, &pattern))? {
             Ok(_generation) => reply(out, FrameType::Ok, &[]),
             // A malformed pattern/name or a fork-bound rejection fails closed with the engine's typed
@@ -4679,7 +5092,10 @@ impl Session {
             );
             return Ok(());
         }
-        let stream = stream.to_string();
+        // #765: SERVER-APPLY the tenant prefix (a client's default stream maps to the tenant's own
+        // named default `<tenant>`); scoped AFTER the streams-capability gate above, which keys on the
+        // client's raw empty-vs-named intent. The group is isolated by the scoped stream.
+        let stream = self.tenant_stream(stream).into_owned();
         let group = group.to_string();
         let pause_ms = decoded.pause_ms;
         match engine.with(move |e| e.pause_group_in_stream(&stream, &group, pause_ms))? {
@@ -4703,6 +5119,7 @@ impl Session {
     /// the resolve reads the shared, lock-free trie. The append then routes through the SAME id-routed
     /// produce path a `PubTo` uses, so a subject-addressed publish is at-least-once Level-1-equivalent
     /// (a `PubAck` after the resolved stream's covering fsync), exactly like `PubTo`.
+    #[allow(clippy::too_many_lines)] // one cohesive resolve+produce path + the #765 tenant scoping
     fn handle_pub_subject<
         F: Filesystem + Clone + 'static,
         C: Clock + Clone + 'static,
@@ -4801,7 +5218,16 @@ impl Session {
             // counters; this subject-routed produce path counts it explicitly in the engine job below.
             ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
-        let subject = subject.to_string();
+        // #765: SERVER-APPLY the tenant prefix — the subject becomes `<tenant>.<subject>`, so it
+        // resolves ONLY against this tenant's bindings and the record is stored under the tenant's
+        // subject subtree. Charge the per-tenant byte ceiling fail-closed before the produce.
+        if let Err(e) = self
+            .reserve_tenant_bytes((msg.payload.len() + msg.key.len() + msg.headers.len()) as u64)
+        {
+            reply_err_coded(out, e.code(), e.message());
+            return Ok(());
+        }
+        let subject = self.tenant_subject(subject).into_owned();
         // Move the per-connection resolve cache into the job; the job returns it (and the produce
         // outcome) so the cache's freshly-cached entry + adopted generation persist across publishes.
         let cache = std::mem::take(&mut self.subject_cache);
@@ -4857,6 +5283,7 @@ impl Session {
     /// work-group (single-home). A wildcard subject that single-home-resolves (covers exactly one bound
     /// stream) is accepted; a wildcard covering MANY bound streams is `AmbiguousSubject` here (the
     /// multi-stream wildcard fan-out subscribe is the flagged later issue, not this PR).
+    #[allow(clippy::too_many_lines)] // two filter-mode arms + the #765 tenant subject scoping
     fn handle_sub_subject<
         F: Filesystem + Clone + 'static,
         C: Clock + Clone + 'static,
@@ -4915,11 +5342,16 @@ impl Session {
             // a per-GROUP property (D3: shared by every consumer in the group, so the durable cursor
             // stays coherent). Resolve + bind run in ONE actor job.
             let group_owned = group.to_string();
-            let pattern_owned = subject.to_string();
+            // #765: SERVER-APPLY the tenant prefix to the filter PATTERN (`<tenant>.<pattern>`), so it
+            // covers ONLY this tenant's subjects. When no named stream covers it, the filtered consume
+            // falls back to the tenant's OWN default stream (`default_stream()`), NOT the shared root
+            // ("") — so a multi-tenant filtered subscribe can never bind the global default log.
+            let pattern_owned = self.tenant_subject(subject).into_owned();
+            let default_stream = self.default_stream();
             let (resolved_stream, set) = engine.with(move |e| {
                 let stream = e
                     .covering_named_stream_for_filter(&pattern_owned)
-                    .map_or_else(String::new, |id| id.name().to_string());
+                    .map_or(default_stream, |id| id.name().to_string());
                 let set =
                     e.set_subject_filter_in_stream(&stream, &group_owned, Some(&pattern_owned));
                 (stream, set)
@@ -4959,7 +5391,9 @@ impl Session {
         // client sends is resolved through the engine's pattern-aware path below instead. To keep the
         // bind simple and single-home, resolve via `resolve_subject` (literal) and fall back to a typed
         // reject for a non-literal/unbound/ambiguous subject.
-        let subject_owned = subject.to_string();
+        // #765: SERVER-APPLY the tenant prefix so the single-home resolve reads only this tenant's
+        // bindings; an unbound-within-tenant subject is the standard NoStreamForSubject reject.
+        let subject_owned = self.tenant_subject(subject).into_owned();
         let cache = std::mem::take(&mut self.subject_cache);
         let (cache, resolved) = engine.with(move |e| {
             let mut cache = cache;
@@ -15138,6 +15572,7 @@ mod tests {
                     crate::auth::parse_token_digest_hex(&sha256_hex_token(token)).unwrap(),
                 ],
             },
+            tenant: None,
         });
         Arc::new(cfg)
     }
@@ -15337,6 +15772,7 @@ mod tests {
                 username: "alice".to_string(),
                 phc_hashes: vec![Secret::new(phc.into_bytes())],
             },
+            tenant: None,
         });
         let e = DirectEngine::new(engine());
         let mut s = Session::with_member_id_and_auth(MemberId::new(0), Arc::new(cfg), None);
@@ -16629,5 +17065,559 @@ mod tests {
         );
         // The holder's subscription is untouched by the rejected attempt.
         assert!(e.engine_mut().is_ephemeral_in_stream("orders", "g"));
+    }
+
+    // ================================================================================================
+    // #765 MULTI-TENANT ACCOUNT ISOLATION + PER-TENANT QUOTAS — the isolation suite (a leak is a hard
+    // failure). Every test drives real Sessions (tenant derived from the authenticated identity) over a
+    // real Engine, so it exercises the actual server-applied prefixing at the session→engine boundary.
+    // ================================================================================================
+
+    /// Builds an auth config whose identities each carry a tenant (`token`, `scopes`, `tenant`), plus an
+    /// optional per-tenant quota table. The tenant is a property of the credential — the client never
+    /// supplies it — so it is non-spoofable.
+    fn mt_auth(
+        specs: &[(&[u8], &[Scope], &str)],
+        quotas: &[(&str, crate::tenant::TenantQuotas)],
+    ) -> Arc<AuthConfig> {
+        use crate::tenant::{TenantId, TenantRegistry};
+        let mut cfg = AuthConfig::new();
+        for (i, (token, scopes, tenant)) in specs.iter().enumerate() {
+            cfg.add_identity(Identity {
+                name: format!("id{i}"),
+                scopes: ScopeSet::from_scopes(scopes),
+                credential: CredentialSet::Bearer {
+                    digests: vec![
+                        crate::auth::parse_token_digest_hex(&sha256_hex_token(token)).unwrap(),
+                    ],
+                },
+                tenant: Some(TenantId::parse(tenant).unwrap()),
+            });
+        }
+        if !quotas.is_empty() {
+            let mut q = std::collections::HashMap::new();
+            for (name, quota) in quotas {
+                q.insert(TenantId::parse(name).unwrap(), *quota);
+            }
+            cfg.set_tenants(std::sync::Arc::new(TenantRegistry::new(q)));
+        }
+        Arc::new(cfg)
+    }
+
+    /// A `Connect` frame carrying a bearer credential, optionally advertising the stream/subject
+    /// capabilities (needed for the `SubTo`/`PubTo`/`BindSubject`/`SubSubject` verbs).
+    fn mt_connect(token: &[u8], streams: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_connect(
+            &ConnectBody {
+                wants_ephemeral_groups: false,
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
+                understands_deliver_batch: false,
+                understands_streams: streams,
+                understands_compressed_delivery: false,
+                wants_subject_filter: streams,
+            },
+            &mut body,
+        );
+        append_connect_auth(
+            &mut body,
+            &AuthCredential {
+                mechanism: WireMechanism::Bearer,
+                material: token.to_vec(),
+            },
+        )
+        .unwrap();
+        frame(FrameType::Connect, &body)
+    }
+
+    /// Authenticates a fresh tenant session and returns it (asserting the handshake succeeded).
+    fn mt_session(
+        e: &DirectEngine<InMemoryFs, ManualClock>,
+        auth: &Arc<AuthConfig>,
+        member: u64,
+        token: &[u8],
+        streams: bool,
+    ) -> Session {
+        let mut s = Session::with_member_id_and_auth(MemberId::new(member), Arc::clone(auth), None);
+        let mut out = Vec::new();
+        s.process(e, &mt_connect(token, streams), &mut out)
+            .expect("tenant handshake succeeds");
+        assert!(s.authenticated, "the credential authenticated");
+        s
+    }
+
+    fn pubto_frame(stream: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        ironbus_proto::message::encode_pub_to(
+            &ironbus_proto::message::PubToBody {
+                stream_id: stream,
+                priority: 0,
+                pub_body: &pub_body(payload),
+            },
+            &mut p,
+        )
+        .unwrap();
+        frame(FrameType::PubTo, &p)
+    }
+
+    fn flow(s: &mut Session, e: &DirectEngine<InMemoryFs, ManualClock>, credit: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Flow, &credit.to_le_bytes()), &mut out)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn tenant_default_stream_pub_and_sub_are_isolated() {
+        // Two tenants both use the BARE default-stream verbs (plain Pub / plain Sub). Tenant a's record
+        // must be invisible to tenant b, and each tenant consumes only its own — proving the
+        // default-stream redirect isolates the (otherwise shared) root log.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[
+                (
+                    b"tok-a-000000000000000000000000000",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-000000000000000000000000000",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+            ],
+            &[],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-000000000000000000000000000", false);
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-000000000000000000000000000", false);
+
+        // a plain-Pubs a secret; b plain-Pubs its own.
+        let mut out = Vec::new();
+        a.process(&e, &pub_frame(b"secret-A"), &mut out).unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck, "a's pub acked");
+        out.clear();
+        b.process(&e, &pub_frame(b"data-B"), &mut out).unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck, "b's pub acked");
+
+        // b plain-Subs (a named work-group on its tenant default stream) + Flows: sees ONLY b's own
+        // record, NEVER a's secret.
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::Sub, b"g"), &mut out)
+            .unwrap();
+        let got = delivered_payloads(&flow(&mut b, &e, 8));
+        assert_eq!(
+            got,
+            vec![b"data-B".to_vec()],
+            "b sees only its own default-stream record"
+        );
+
+        // a plain-Subs + Flows: sees ONLY a's own record.
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::Sub, b"g"), &mut out)
+            .unwrap();
+        let got = delivered_payloads(&flow(&mut a, &e, 8));
+        assert_eq!(
+            got,
+            vec![b"secret-A".to_vec()],
+            "a sees only its own default-stream record"
+        );
+
+        // Structurally: the two default streams are DISTINCT isolated logs, neither is the shared root.
+        assert_eq!(e.engine_mut().stream_head("acme").get(), 1);
+        assert_eq!(e.engine_mut().stream_head("globex").get(), 1);
+        assert_eq!(
+            e.engine_mut().stream_head("").get(),
+            0,
+            "the shared root log is untouched"
+        );
+    }
+
+    #[test]
+    fn two_tenants_with_the_same_named_stream_are_isolated() {
+        // Both tenants declare/produce a stream with the SAME logical name "orders". A consumer sees
+        // only its own tenant's records; the engine holds two distinct scoped logs.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[
+                (
+                    b"tok-a-111111111111111111111111111",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "acme",
+                ),
+                (
+                    b"tok-b-111111111111111111111111111",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "globex",
+                ),
+            ],
+            &[],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-111111111111111111111111111", true);
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-111111111111111111111111111", true);
+
+        let mut out = Vec::new();
+        a.process(&e, &pubto_frame(b"orders", b"A-order"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        out.clear();
+        b.process(&e, &pubto_frame(b"orders", b"B-order"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+
+        // b SubTo("orders") binds b/orders and sees ONLY B-order.
+        let mut out = Vec::new();
+        b.process(&e, &sub_to_frame(b"orders", b"workers"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert_eq!(
+            delivered_payloads(&flow(&mut b, &e, 8)),
+            vec![b"B-order".to_vec()]
+        );
+
+        // Two distinct scoped logs exist; the unscoped "orders" name was never created.
+        assert_eq!(e.engine_mut().stream_head("acme/orders").get(), 1);
+        assert_eq!(e.engine_mut().stream_head("globex/orders").get(), 1);
+        assert!(
+            !e.engine_mut().stream_exists("orders"),
+            "no unscoped 'orders' stream exists"
+        );
+    }
+
+    #[test]
+    fn a_tenant_cannot_reach_another_tenants_named_stream() {
+        // Tenant a produces to "orders"; tenant b's SubTo("orders") resolves to b/orders (which does not
+        // exist), so b is structurally told it does not exist — it can never bind a/orders.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[
+                (
+                    b"tok-a-222222222222222222222222222",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-222222222222222222222222222",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+            ],
+            &[],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-222222222222222222222222222", true);
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-222222222222222222222222222", true);
+        let mut out = Vec::new();
+        a.process(&e, &pubto_frame(b"orders", b"A-secret"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        out.clear();
+        b.process(&e, &sub_to_frame(b"orders", b"g"), &mut out)
+            .unwrap();
+        // b sees a's stream as non-existent (it is a/orders, not b/orders): a fail-closed Err reject.
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a's stream is invisible to b"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_subject_subscribe_never_crosses_tenants() {
+        // Each tenant binds the SAME wildcard "events.>" and publishes "events.x". A filtered wildcard
+        // consume (pattern ">") for tenant b yields ONLY b's record — a's subjects live under the token
+        // `acme.` and can never match b's leading token `globex.`.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[
+                (
+                    b"tok-a-333333333333333333333333333",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "acme",
+                ),
+                (
+                    b"tok-b-333333333333333333333333333",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "globex",
+                ),
+            ],
+            &[],
+        );
+        let bind = |stream: &[u8], pattern: &[u8]| -> Vec<u8> {
+            let mut b = Vec::new();
+            ironbus_proto::message::encode_bind_subject(
+                &ironbus_proto::message::BindSubjectBody {
+                    stream_id: stream,
+                    pattern,
+                },
+                &mut b,
+            )
+            .unwrap();
+            frame(FrameType::BindSubject, &b)
+        };
+        let pubsub = |subject: &[u8], payload: &[u8]| -> Vec<u8> {
+            let mut p = Vec::new();
+            ironbus_proto::message::encode_pub_subject(
+                &ironbus_proto::message::PubSubjectBody {
+                    subject,
+                    pub_body: &pub_body(payload),
+                },
+                &mut p,
+            )
+            .unwrap();
+            frame(FrameType::PubSubject, &p)
+        };
+        let subsub = |subject: &[u8], group: &[u8], mode: u8| -> Vec<u8> {
+            let mut s = Vec::new();
+            ironbus_proto::message::encode_sub_subject(
+                &ironbus_proto::message::SubSubjectBody {
+                    subject,
+                    group,
+                    filter_mode: mode,
+                },
+                &mut s,
+            )
+            .unwrap();
+            frame(FrameType::SubSubject, &s)
+        };
+
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-333333333333333333333333333", true);
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-333333333333333333333333333", true);
+        let mut out = Vec::new();
+        for f in [bind(b"ev", b"events.>"), pubsub(b"events.x", b"A-secret")] {
+            a.process(&e, &f, &mut out).unwrap();
+        }
+        out.clear();
+        for f in [bind(b"ev", b"events.>"), pubsub(b"events.x", b"B-data")] {
+            b.process(&e, &f, &mut out).unwrap();
+        }
+        // b filtered-subscribes with the wildcard "events.>" (resolves to b's covering stream): the
+        // scoped filter `globex.events.>` covers ONLY b's subjects.
+        out.clear();
+        b.process(&e, &subsub(b"events.>", b"w", 1), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "b's filtered wildcard subscribe resolved"
+        );
+        let got = delivered_payloads(&flow(&mut b, &e, 8));
+        assert_eq!(
+            got,
+            vec![b"B-data".to_vec()],
+            "the wildcard never matched a's subjects"
+        );
+        // a's record is under the scoped subject subtree, in a's own stream.
+        assert_eq!(e.engine_mut().stream_head("acme/ev").get(), 1);
+        assert_eq!(e.engine_mut().stream_head("globex/ev").get(), 1);
+    }
+
+    #[test]
+    fn an_injected_delimiter_cannot_escape_the_tenant() {
+        // Tenant "a" tries to address stream id "globex/orders" (an injected delimiter aiming at tenant
+        // globex). The server prefix still dominates: it lands at "acme/globex/orders", NEVER at
+        // "globex/orders". Tenant globex's own "orders" is a different, empty stream.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[
+                (
+                    b"tok-a-444444444444444444444444444",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "acme",
+                ),
+                (
+                    b"tok-b-444444444444444444444444444",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "globex",
+                ),
+            ],
+            &[],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-444444444444444444444444444", true);
+        let mut out = Vec::new();
+        a.process(&e, &pubto_frame(b"globex/orders", b"A-injected"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        // The record landed strictly under acme's prefix; globex's namespace is untouched.
+        assert_eq!(e.engine_mut().stream_head("acme/globex/orders").get(), 1);
+        assert!(
+            !e.engine_mut().stream_exists("globex/orders"),
+            "the injected name never reached globex"
+        );
+        // And globex, subscribing to its own "orders", sees nothing of a's injected record.
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-444444444444444444444444444", true);
+        b.process(&e, &pubto_frame(b"orders", b"B-real"), &mut Vec::new())
+            .unwrap();
+        let mut out = Vec::new();
+        b.process(&e, &sub_to_frame(b"orders", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert_eq!(
+            delivered_payloads(&flow(&mut b, &e, 8)),
+            vec![b"B-real".to_vec()]
+        );
+    }
+
+    #[test]
+    fn per_tenant_connection_quota_counts_across_connections() {
+        // A tenant capped at 2 concurrent connections: the third is refused fail-closed with the typed
+        // code, and a slot freed by a closed connection is reusable — counted across the fleet, not
+        // per-connection.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[(
+                b"tok-c-555555555555555555555555555",
+                &[Scope::Publish],
+                "acme",
+            )],
+            &[(
+                "acme",
+                crate::tenant::TenantQuotas {
+                    max_connections: Some(2),
+                    ..Default::default()
+                },
+            )],
+        );
+        let c1 = mt_session(&e, &auth, 1, b"tok-c-555555555555555555555555555", false);
+        let _c2 = mt_session(&e, &auth, 2, b"tok-c-555555555555555555555555555", false);
+        // The third connection's Connect is refused and closes.
+        let mut c3 = Session::with_member_id_and_auth(MemberId::new(3), Arc::clone(&auth), None);
+        let mut out = Vec::new();
+        let err = c3
+            .process(
+                &e,
+                &mt_connect(b"tok-c-555555555555555555555555555", false),
+                &mut out,
+            )
+            .unwrap_err();
+        assert!(matches!(err, SessionError::AuthViolation));
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+        assert!(
+            String::from_utf8_lossy(&body).contains("connection quota"),
+            "typed tenant-connection rejection: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        // Free a slot; a new connection now succeeds.
+        drop(c1);
+        let _c4 = mt_session(&e, &auth, 4, b"tok-c-555555555555555555555555555", false);
+    }
+
+    #[test]
+    fn per_tenant_stream_quota_is_enforced_at_declare() {
+        // A tenant capped at 2 streams: its default stream (auto-created at Connect) is the first, one
+        // declared named stream is the second, and a third declare is refused fail-closed.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[(
+                b"tok-s-666666666666666666666666666",
+                &[Scope::Admin],
+                "acme",
+            )],
+            &[(
+                "acme",
+                crate::tenant::TenantQuotas {
+                    max_streams: Some(2),
+                    ..Default::default()
+                },
+            )],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-s-666666666666666666666666666", true);
+        let declare = |name: &[u8]| -> Vec<u8> {
+            let mut d = Vec::new();
+            ironbus_proto::message::encode_stream_declare(
+                &ironbus_proto::message::StreamDeclareBody {
+                    stream_id: name,
+                    partition_count: 0,
+                    priority: false,
+                },
+                &mut d,
+            )
+            .unwrap();
+            frame(FrameType::StreamDeclare, &d)
+        };
+        let mut out = Vec::new();
+        a.process(&e, &declare(b"orders"), &mut out).unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "second stream (after the default) is allowed"
+        );
+        out.clear();
+        a.process(&e, &declare(b"invoices"), &mut out).unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "third stream is refused at the tenant ceiling"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("stream quota"));
+        // A re-declare of an already-owned stream is idempotent (does not re-charge).
+        out.clear();
+        a.process(&e, &declare(b"orders"), &mut out).unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "re-declare is idempotent"
+        );
+    }
+
+    #[test]
+    fn per_tenant_byte_quota_is_enforced_at_produce() {
+        // A tenant capped at a small byte ceiling: a produce within budget is acked; one that would
+        // cross the ceiling is refused fail-closed BEFORE it reaches the log.
+        let e = DirectEngine::new(engine());
+        let auth = mt_auth(
+            &[(
+                b"tok-y-777777777777777777777777777",
+                &[Scope::Publish],
+                "acme",
+            )],
+            &[(
+                "acme",
+                crate::tenant::TenantQuotas {
+                    max_storage_bytes: Some(10),
+                    ..Default::default()
+                },
+            )],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-y-777777777777777777777777777", false);
+        let mut out = Vec::new();
+        a.process(&e, &pub_frame(b"12345"), &mut out).unwrap(); // 5 bytes, ok
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        out.clear();
+        a.process(&e, &pub_frame(b"123456"), &mut out).unwrap(); // 5 + 6 = 11 > 10, refused
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err, "the over-ceiling produce is refused");
+        assert!(String::from_utf8_lossy(&body).contains("storage-bytes quota"));
+        // The refused record never reached the log (still just the one accepted record).
+        assert_eq!(e.engine_mut().stream_head("acme").get(), 1);
+    }
+
+    #[test]
+    fn a_single_tenant_connection_is_byte_identical_on_the_default_path() {
+        // With NO tenant (a no-auth loopback session), a plain Pub takes the historical root path: a
+        // PubAck at offset 0, the record in the ROOT log "", and NO tenant-scoped stream is minted.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(&e, &pub_frame(b"plain"), &mut out).unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        assert_eq!(
+            e.engine_mut().stream_head("").get(),
+            1,
+            "the record is in the shared root log"
+        );
+        assert_eq!(
+            e.engine_mut().named_stream_count(),
+            0,
+            "no tenant stream is minted"
+        );
     }
 }

@@ -214,6 +214,22 @@ impl ErrorCode {
     /// produce must carry a `DLY1` relative delay request. Maps [`EngineError::DueTimeInjected`].
     pub const ERR_INVALID_DELAY_HEADER: ErrorCode = ErrorCode("ERR_INVALID_DELAY_HEADER");
 
+    /// A connection was refused because its TENANT is at its concurrent-connection ceiling (#765).
+    /// Counted across ALL of the tenant's connections, distinct from the per-connection #633 cap.
+    /// Not an `EngineError`: it is the [`crate::tenant::QuotaError::MaxConnections`] gate outcome.
+    pub const ERR_TENANT_MAX_CONNECTIONS: ErrorCode = ErrorCode("ERR_TENANT_MAX_CONNECTIONS");
+
+    /// A stream declare/produce was refused because the TENANT is at its live-stream ceiling (#765).
+    /// Not an `EngineError`: it is the [`crate::tenant::QuotaError::MaxStreams`] gate outcome, the
+    /// per-tenant twin of the per-engine [`Self::ERR_TOO_MANY_STREAMS`].
+    pub const ERR_TENANT_MAX_STREAMS: ErrorCode = ErrorCode("ERR_TENANT_MAX_STREAMS");
+
+    /// A produce was refused because the TENANT is at its produced-bytes ceiling (#765), rejected
+    /// before the write reaches the log. Not an `EngineError`: it is the
+    /// [`crate::tenant::QuotaError::MaxStorageBytes`] gate outcome, the per-tenant twin of the
+    /// per-log [`Self::ERR_AT_CAPACITY`].
+    pub const ERR_TENANT_MAX_STORAGE_BYTES: ErrorCode = ErrorCode("ERR_TENANT_MAX_STORAGE_BYTES");
+
     /// Maps an [`EngineError`] to its stable code. The single source of truth the conformance
     /// vectors and any wire error-code scheme share. A storage error is split into the two named
     /// outcomes ([`Self::ERR_AT_CAPACITY`] for the byte-cap shed) plus the residual
@@ -345,6 +361,19 @@ mod tests {
         assert_eq!(
             ErrorCode::ERR_TXN_CHECK_UNAUTHORIZED.as_str(),
             "ERR_TXN_CHECK_UNAUTHORIZED"
+        );
+        // #765 per-tenant quota codes, and their pin to `tenant::QuotaError::code`.
+        assert_eq!(
+            ErrorCode::ERR_TENANT_MAX_CONNECTIONS.as_str(),
+            crate::tenant::QuotaError::MaxConnections.code()
+        );
+        assert_eq!(
+            ErrorCode::ERR_TENANT_MAX_STREAMS.as_str(),
+            crate::tenant::QuotaError::MaxStreams.code()
+        );
+        assert_eq!(
+            ErrorCode::ERR_TENANT_MAX_STORAGE_BYTES.as_str(),
+            crate::tenant::QuotaError::MaxStorageBytes.code()
         );
     }
 
