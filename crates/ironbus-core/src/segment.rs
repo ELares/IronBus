@@ -7,10 +7,10 @@
 
 use crate::format::{
     compaction_meta_offsets as moff, segment_footer_offsets as foff,
-    segment_header_offsets as hoff, CHECKSUM_ALGO_CRC32C, COMPACTION_META_CRC_RANGE,
-    COMPACTION_META_LEN, FORMAT_VERSION, FORMAT_VERSION_COMPACTED, SEGMENT_FLAG_COMPACTED,
-    SEGMENT_FOOTER_CRC_RANGE, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC, SEGMENT_HEADER_CRC_RANGE,
-    SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
+    segment_header_offsets as hoff, AEAD_SUITE_NONE, CHECKSUM_ALGO_CRC32C,
+    COMPACTION_META_CRC_RANGE, COMPACTION_META_LEN, FORMAT_VERSION, FORMAT_VERSION_COMPACTED,
+    SEGMENT_FLAG_COMPACTED, SEGMENT_FLAG_ENCRYPTED, SEGMENT_FOOTER_CRC_RANGE, SEGMENT_FOOTER_LEN,
+    SEGMENT_FOOTER_MAGIC, SEGMENT_HEADER_CRC_RANGE, SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{Offset, Seq};
@@ -85,14 +85,42 @@ impl SegmentHeader {
         self.flags & SEGMENT_FLAG_COMPACTED != 0
     }
 
+    /// Whether this header marks an AEAD-ENCRYPTED segment (#780): the [`SEGMENT_FLAG_ENCRYPTED`] bit
+    /// is set in `flags`. An encrypted segment additionally records its AEAD suite and key-id in the
+    /// header's reserved `[44, 60)` bytes (see [`SegmentHeader::encode_encrypted`] /
+    /// [`SegmentHeader::aead_params`]). It is a DISTINCT bit from [`SEGMENT_FLAG_COMPACTED`]: a
+    /// segment may be both compacted and encrypted.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        self.flags & SEGMENT_FLAG_ENCRYPTED != 0
+    }
+
     /// Encodes the header into its fixed 64-byte on-disk form.
     ///
     /// The `version` byte is stamped [`FORMAT_VERSION_COMPACTED`] (`2`) ONLY when the
     /// [`SEGMENT_FLAG_COMPACTED`] bit is set in `flags` (#337); otherwise it stays
     /// [`FORMAT_VERSION`] (`1`), so a non-compacted header is byte-for-byte the v1 layout. A v1
     /// reader refuses the version-2 bump (fail-closed) rather than mis-stitching the sparse chain.
+    /// The reserved `[44, 60)` bytes (the at-rest encryption slots) are written as zero here; an
+    /// encrypted segment uses [`SegmentHeader::encode_encrypted`] instead.
     #[must_use]
     pub fn encode(&self) -> [u8; SEGMENT_HEADER_LEN] {
+        self.encode_inner(self.flags, AEAD_SUITE_NONE, 0)
+    }
+
+    /// Encodes the header for an AEAD-ENCRYPTED segment (#780), setting the [`SEGMENT_FLAG_ENCRYPTED`]
+    /// flag bit and writing `aead_suite` and `key_id` into the reserved `[44, 60)` region (still
+    /// inside the frozen `header_crc` scope `[0, 60)`, so they are integrity-protected for free with
+    /// no offset move). The `version` byte is UNCHANGED by encryption — it stays `1` (or `2` if the
+    /// segment is also compacted) — because encryption reuses reserved bytes rather than bumping the
+    /// format version. `key_id` identifies the key (NEVER the key itself); `aead_suite` records the
+    /// primitive so a read is unambiguous regardless of the reading host's CPU.
+    #[must_use]
+    pub fn encode_encrypted(&self, aead_suite: u8, key_id: u64) -> [u8; SEGMENT_HEADER_LEN] {
+        self.encode_inner(self.flags | SEGMENT_FLAG_ENCRYPTED, aead_suite, key_id)
+    }
+
+    fn encode_inner(&self, flags: u16, aead_suite: u8, key_id: u64) -> [u8; SEGMENT_HEADER_LEN] {
         let mut h = [0u8; SEGMENT_HEADER_LEN];
         h[hoff::MAGIC..hoff::MAGIC + 8].copy_from_slice(&SEGMENT_MAGIC);
         h[hoff::VERSION] = if self.is_compacted() {
@@ -101,16 +129,37 @@ impl SegmentHeader {
             FORMAT_VERSION
         };
         h[hoff::CHECKSUM_ALGO] = CHECKSUM_ALGO_CRC32C;
-        h[hoff::FLAGS..hoff::FLAGS + 2].copy_from_slice(&self.flags.to_le_bytes());
+        h[hoff::FLAGS..hoff::FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
         h[hoff::SEGMENT_ID..hoff::SEGMENT_ID + 8].copy_from_slice(&self.segment_id.to_le_bytes());
         h[hoff::BASE_SEQ..hoff::BASE_SEQ + 8].copy_from_slice(&self.base_seq.get().to_le_bytes());
         h[hoff::BASE_OFFSET..hoff::BASE_OFFSET + 8]
             .copy_from_slice(&self.base_offset.get().to_le_bytes());
         h[hoff::CREATED_MS..hoff::CREATED_MS + 8]
             .copy_from_slice(&self.created_unix_ms.to_le_bytes());
+        // The at-rest encryption slots (#780) in the reserved [44, 60) region. Both are zero on a
+        // plaintext segment, so `encode()` reproduces the pre-encryption bytes exactly.
+        h[hoff::AEAD_SUITE] = aead_suite;
+        h[hoff::KEY_ID..hoff::KEY_ID + 8].copy_from_slice(&key_id.to_le_bytes());
         let crc = crc32c::crc32c(&h[SEGMENT_HEADER_CRC_RANGE]);
         h[hoff::HEADER_CRC..hoff::HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
         h
+    }
+
+    /// Reads the at-rest AEAD parameters (`aead_suite`, `key_id`) from a 64-byte segment-header
+    /// buffer (#780). Returns `Some((aead_suite, key_id))` iff the [`SEGMENT_FLAG_ENCRYPTED`] flag
+    /// bit is set, else `None` (a plaintext segment). The caller should already have validated the
+    /// header via [`SegmentHeader::decode`] (which checks the CRC that covers these bytes), so this is
+    /// a plain field read; it returns `None` for a buffer shorter than a header rather than panicking.
+    #[must_use]
+    pub fn aead_params(bytes: &[u8]) -> Option<(u8, u64)> {
+        if bytes.len() < SEGMENT_HEADER_LEN {
+            return None;
+        }
+        let flags = read_u16(bytes, hoff::FLAGS);
+        if flags & SEGMENT_FLAG_ENCRYPTED == 0 {
+            return None;
+        }
+        Some((bytes[hoff::AEAD_SUITE], read_u64(bytes, hoff::KEY_ID)))
     }
 
     /// Decodes a header from the first 64 bytes of `bytes`, accepting BOTH the v1 layout
@@ -453,6 +502,66 @@ mod tests {
         assert_eq!(bytes[hoff::VERSION], FORMAT_VERSION_COMPACTED);
         assert!(h.is_compacted());
         assert_eq!(SegmentHeader::decode(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn a_plaintext_header_leaves_the_encryption_reserved_bytes_zero() {
+        // DEFAULT-OFF byte identity (#780): a plaintext header writes the reserved [44, 60) region
+        // (the at-rest encryption slots) as ALL zero, so it is byte-for-byte the pre-encryption
+        // layout, and `aead_params` reports it as unencrypted.
+        let h = sample_header();
+        assert!(!h.is_encrypted());
+        let bytes = h.encode();
+        assert!(
+            bytes[44..60].iter().all(|&b| b == 0),
+            "the at-rest reserved [44, 60) region must be zero on a plaintext segment"
+        );
+        assert_eq!(SegmentHeader::aead_params(&bytes), None);
+        // The encryption flag bit is clear.
+        assert_eq!(read_u16(&bytes, hoff::FLAGS) & SEGMENT_FLAG_ENCRYPTED, 0);
+    }
+
+    #[test]
+    fn an_encrypted_header_records_suite_and_key_id_and_round_trips() {
+        use crate::format::AEAD_SUITE_AES_256_GCM;
+        let h = sample_header();
+        let key_id = 0x0102_0304_0506_0708u64;
+        let bytes = h.encode_encrypted(AEAD_SUITE_AES_256_GCM, key_id);
+        // Encryption does NOT bump the version (an encrypted, non-compacted segment stays v1).
+        assert_eq!(bytes[hoff::VERSION], FORMAT_VERSION);
+        // The reserved region carries the suite (byte 44) and the key-id ([45, 53)).
+        assert_eq!(bytes[44], AEAD_SUITE_AES_256_GCM);
+        // The header decodes: the ENCRYPTED flag is set and preserved, the base fields are intact.
+        let decoded = SegmentHeader::decode(&bytes).unwrap();
+        assert!(decoded.is_encrypted());
+        assert_eq!(decoded.segment_id, h.segment_id);
+        assert_eq!(decoded.base_seq, h.base_seq);
+        // aead_params recovers the recorded suite and key-id (never the key).
+        assert_eq!(
+            SegmentHeader::aead_params(&bytes),
+            Some((AEAD_SUITE_AES_256_GCM, key_id))
+        );
+        // The suite and key-id are CRC-protected for free: flipping the suite byte fails the header CRC.
+        let mut corrupt = bytes;
+        corrupt[44] ^= 0xFF;
+        assert_eq!(SegmentHeader::decode(&corrupt), Err(SegmentError::BadCrc));
+    }
+
+    #[test]
+    fn an_encrypted_and_compacted_header_keeps_both_flags_and_v2() {
+        use crate::format::AEAD_SUITE_CHACHA20_POLY1305;
+        // A segment may be BOTH compacted and encrypted: the version is 2 (compaction), and both flag
+        // bits plus the AEAD params are present.
+        let h = compacted_header();
+        let bytes = h.encode_encrypted(AEAD_SUITE_CHACHA20_POLY1305, 42);
+        assert_eq!(bytes[hoff::VERSION], FORMAT_VERSION_COMPACTED);
+        let decoded = SegmentHeader::decode(&bytes).unwrap();
+        assert!(decoded.is_compacted());
+        assert!(decoded.is_encrypted());
+        assert_eq!(
+            SegmentHeader::aead_params(&bytes),
+            Some((AEAD_SUITE_CHACHA20_POLY1305, 42))
+        );
     }
 
     #[test]

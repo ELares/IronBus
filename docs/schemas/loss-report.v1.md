@@ -111,11 +111,14 @@ JSON name) triple is pinned by `golden_reason_code_vocabulary_is_frozen`.
 | `5`  | `"SequenceGap"`           | `sequence_gap`            | a checksum-valid record carried an out-of-order sequence (a recycled or mixed-up frame), so the segment was abandoned at that record |
 | `6`  | `"ScrubberSuspect"`       | `scrubber_suspect`        | the at-rest scrubber (#92) flagged a span as suspect during a background integrity pass (silent bit rot: a checksum that no longer verifies on a previously-durable record). Reserved for the scrubber; recovery itself never emits it today, but the reason is appended now so the scrubber emits into a frozen vocabulary. Appended per #59; APPEND-ONLY, so it does NOT bump `schema_version` |
 | `7`  | `"UnresolvedDictId"`      | `unresolved_dict_id`      | a checksum-VALID record referenced a compression `dict_id` the reader could resolve from neither the on-disk `dicts/` sidecar nor the embedded active set, so the record could not be decompressed and was skipped as bounded, reported loss (#357, #78, `../DICTIONARY_LIFECYCLE.md` §5). DISTINCT from a corrupt body (codes 2/3): the framing and CRCs all PASS; the dictionary is simply ABSENT, so reporting it as bit-rot would mislead an operator. Appended per #357; APPEND-ONLY, so it does NOT bump `schema_version` |
+| `8`  | `"UnknownKeyId"`          | `unknown_key_id`          | an at-rest-ENCRYPTED segment (#780, `../AT_REST_ENCRYPTION.md`) whose header `key_id` matches NO loaded key, so its records cannot be decrypted at all. DISTINCT from a corrupt body (codes 2/3): the framing and CRCs all PASS; the key is simply MISSING, so an operator sees an actionable key-management gap ("load key X for segment S"), not "your disk is corrupt". Appended per #780; APPEND-ONLY, so it does NOT bump `schema_version` |
+| `9`  | `"AeadTagMismatch"`       | `aead_tag_mismatch`       | an at-rest-ENCRYPTED record (#780) whose `key_id` matched a loaded key and whose CRC over the ciphertext PASSED, but whose AEAD authentication tag FAILED under that key (a wrong/rotated key or a forgery). DELIBERATELY DISTINCT from `CorruptRecordBody` (code 3): the CRC is verified BEFORE the AEAD, so a tag failure here is genuine authenticity failure, NOT bit-rot — a wrong or rotated key must never masquerade as corruption. Appended per #780; APPEND-ONLY, so it does NOT bump `schema_version` |
 
-Codes `6` and `7` were appended without a `schema_version` bump, which is the whole point of the
-append-only rule: a `v1` reader that predates `ScrubberSuspect`/`UnresolvedDictId` still reads such an
-event's numeric span (`bytes_skipped`, the offset range, the record estimate); it just renders the
-reason as an unknown name. Codes `1` through `5` are byte-identical to before.
+Codes `6`, `7`, `8`, and `9` were appended without a `schema_version` bump, which is the whole point
+of the append-only rule: a `v1` reader that predates
+`ScrubberSuspect`/`UnresolvedDictId`/`UnknownKeyId`/`AeadTagMismatch` still reads such an event's
+numeric span (`bytes_skipped`, the offset range, the record estimate); it just renders the reason as
+an unknown name. Codes `1` through `5` are byte-identical to before.
 
 ## Data loss vs. reported skip (the torn-tail exclusion)
 

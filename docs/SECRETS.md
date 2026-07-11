@@ -315,7 +315,7 @@ and is gated by `cargo-deny` advisories (`deny.toml`). The surface, by sibling s
 | Need | Crate (specified) | Owner | License posture |
 | --- | --- | --- | --- |
 | TLS 1.3 transport | `rustls` (with `ring` or `aws-lc-rs` as its crypto provider) | #107 | rustls is Apache-2.0 / MIT / ISC; the provider is permissive (ISC-style / Apache-2.0). Both fit the `deny.toml` allow-list. |
-| At-rest AEAD (AES-256-GCM, ChaCha20-Poly1305) | the RustCrypto AEAD crates (`aes-gcm`, `chacha20poly1305`, over the `aead` trait) | #108 | MIT / Apache-2.0, pure Rust, already covered by the allow-list. |
+| At-rest AEAD (AES-256-GCM, ChaCha20-Poly1305) | the RustCrypto AEAD crates (`aes-gcm`, `chacha20poly1305`, over the `aead` trait), behind the opt-in `encryption` feature (#780) | #108, #780 | MIT / Apache-2.0, pure Rust, no C-FFI, already covered by the allow-list; deny-clean in the default build AND under the feature. **Shipped (phase 1).** |
 | Password hashing | `argon2` (RustCrypto), at the m=19 MiB / t=2 / p=1 edge profile | #106 | MIT / Apache-2.0, pure Rust. |
 | Token hashing | `sha2` (RustCrypto), SHA-256 for bearer-token storage | #106 | MIT / Apache-2.0, pure Rust. |
 | Constant-time compare | `subtle` (RustCrypto), the non-short-circuiting equality the token and hash compares use | #106 | MIT, pure Rust. |
@@ -376,7 +376,7 @@ sourcing remain specified-only. Do not assume the latter.
 | The structured, secret-free audit-event schema (sequence + wall clock) | **Implemented** as a structured log STREAM (`--audit-log stderr` / `@file`); a `/metrics` counter family (the #16 alternative transport) is still additive/future | #109, #635, #16 |
 | The frozen security-event set test | **Implemented** (`audit::tests::the_event_set_is_frozen`) | #109, #635 |
 | #15 diagnostics redacting stored credentials (the new credential path) | **Implemented by construction** (credentials held in the redacting newtype; no diagnostic reaches past it) | #109, #15 |
-| The crypto dependency surface (rustls + AEAD + argon2 + sha2 + subtle + zeroize) in the SBOM and under cargo-deny | argon2/sha2/subtle/zeroize **shipped** (#631); rustls + AEAD land with #107/#108 | #109, #17, #106, #107, #108 |
+| The crypto dependency surface (rustls + AEAD + argon2 + sha2 + subtle + zeroize) in the SBOM and under cargo-deny | argon2/sha2/subtle/zeroize **shipped** (#631); the at-rest AEAD (`aes-gcm`/`chacha20poly1305`) **shipped** behind the opt-in `encryption` feature (#780, deny-clean, pure Rust); rustls landed with #766/#107 | #109, #17, #106, #107, #108, #780 |
 
 ---
 

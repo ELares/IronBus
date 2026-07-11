@@ -225,6 +225,14 @@ pub enum StorageError {
         /// The offloaded segment id whose fetched bytes failed verification.
         segment_id: u64,
     },
+    /// An at-rest-ENCRYPTED record could not be decrypted (#780): the segment's `key_id` matches no
+    /// loaded key ([`crate::crypto::DecryptError::UnknownKeyId`]), the AEAD tag failed under the named
+    /// key ([`crate::crypto::DecryptError::TagMismatch`]), or the segment names an unsupported AEAD
+    /// suite. A DISTINCT, reported class (mapped to a distinct [`ReasonCode`] via
+    /// [`crate::crypto::DecryptError::reason_code`]) — NEVER a silent skip, a crash, or a read of
+    /// garbage plaintext. Behind the `encryption` feature.
+    #[cfg(feature = "encryption")]
+    Decrypt(crate::crypto::DecryptError),
 }
 
 impl core::fmt::Display for StorageError {
@@ -335,6 +343,8 @@ impl core::fmt::Display for StorageError {
                 "fetched offloaded segment {segment_id} failed re-verification (length/header/footer/CRC); \
                  refusing to deliver"
             ),
+            #[cfg(feature = "encryption")]
+            StorageError::Decrypt(e) => write!(f, "at-rest decryption failed: {e}"),
         }
     }
 }
@@ -603,6 +613,14 @@ pub struct SegmentWriter<F: RandomAccessFile> {
     pending: Vec<u8>,
     /// The file position where `pending` begins: everything below it is already in the file.
     pending_base: u64,
+    /// The active at-rest encryption context (#780), or `None` for a plaintext writer (the default).
+    /// When `Some`, every record body this writer appends is AEAD-encrypted IN PLACE before framing
+    /// (the frame carries the ciphertext + tag and the `ENCRYPTED` flag), keyed by the deterministic
+    /// nonce `segment_id || record_ordinal`; the segment header records the suite and key-id. Set only
+    /// via [`SegmentWriter::with_crypto`] on a FRESH writer (before any append), so a segment is
+    /// uniformly encrypted or uniformly plaintext. Behind the `encryption` feature.
+    #[cfg(feature = "encryption")]
+    crypto: Option<Arc<crate::crypto::SegmentCrypto>>,
 }
 
 /// The spill cap for the writer's pending buffer (#452): a relaxed durability level can run a
@@ -618,6 +636,77 @@ const PENDING_SPILL_BYTES: usize = 256 * 1024;
 /// window, except that a single frame larger than the window grows it just enough to fit that one
 /// frame — the same one-record bound the previous per-record path already tolerated.
 const RECOVERY_WINDOW_BYTES: usize = 256 * 1024;
+
+/// Frames one PLAINTEXT record into `pending`, dispatching on the optional subject (#594) / stream-tag
+/// (#597) slots and the off-actor precomputed checksums (#830). This is the historical
+/// [`SegmentWriter::append_encoded`] encode dispatch, lifted to a free function so the encrypted path
+/// can sit beside it as a clean alternative. The emitted bytes are byte-for-byte the pre-encryption
+/// frame. A non-empty subject and a non-empty stream-tag are mutually exclusive (the codec helpers
+/// debug-assert it).
+fn encode_plaintext(
+    pending: &mut Vec<u8>,
+    record: &RecordView<'_>,
+    subject: &[u8],
+    stream_tag: &[u8],
+    precomputed: Option<BodyChecksums>,
+) -> Result<usize, codec::EncodeError> {
+    if stream_tag.is_empty() {
+        match (precomputed, subject.is_empty()) {
+            (Some(checksums), true) => codec::encode_precomputed(record, checksums, pending),
+            (None, true) => codec::encode(record, pending),
+            (Some(checksums), false) => {
+                codec::encode_precomputed_with_subject(record, subject, checksums, pending)
+            }
+            (None, false) => codec::encode_with_subject(record, subject, pending),
+        }
+    } else {
+        match precomputed {
+            Some(checksums) => {
+                codec::encode_precomputed_with_stream_tag(record, stream_tag, checksums, pending)
+            }
+            None => codec::encode_with_stream_tag(record, stream_tag, pending),
+        }
+    }
+}
+
+/// AEAD-encrypts a record body IN PLACE and frames the ciphertext + tag into `pending` (#780). The
+/// nonce is `segment_id || record_counter` (the writer's pre-increment per-segment ordinal), which is
+/// unique for the life of the log under the active key. The `key_len`/`hdr_len`/`payload_len` written
+/// to the header are the PLAINTEXT lengths; the on-disk body is ciphertext (same length) plus the
+/// 16-byte tag, with the CRC over the ciphertext. The transient plaintext COPY assembled here is
+/// zeroized after encryption (defence in depth; the caller's original body bytes are its own).
+#[cfg(feature = "encryption")]
+fn encrypt_and_frame(
+    record: &RecordView<'_>,
+    crypto: &crate::crypto::SegmentCrypto,
+    segment_id: u64,
+    record_counter: u32,
+    pending: &mut Vec<u8>,
+) -> Result<usize, codec::EncodeError> {
+    use zeroize::Zeroize;
+    let key_len = u32::try_from(record.key.len()).map_err(|_| codec::EncodeError::TooLarge)?;
+    let hdr_len = u32::try_from(record.headers.len()).map_err(|_| codec::EncodeError::TooLarge)?;
+    let payload_len =
+        u32::try_from(record.payload.len()).map_err(|_| codec::EncodeError::TooLarge)?;
+    let mut plaintext =
+        Vec::with_capacity(record.key.len() + record.headers.len() + record.payload.len());
+    plaintext.extend_from_slice(record.key);
+    plaintext.extend_from_slice(record.headers);
+    plaintext.extend_from_slice(record.payload);
+    let (ciphertext, tag) = crypto.encrypt(segment_id, record_counter, &plaintext);
+    plaintext.zeroize();
+    codec::encode_encrypted(
+        record.seq,
+        record.timestamp_ms,
+        record.flags,
+        key_len,
+        hdr_len,
+        payload_len,
+        &ciphertext,
+        &tag,
+        pending,
+    )
+}
 
 impl<F: RandomAccessFile> SegmentWriter<F> {
     /// Creates a new segment, writing the header at offset 0. The file should be
@@ -638,7 +727,54 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             max_timestamp_ms: 0,
             pending: Vec::new(),
             pending_base: SEGMENT_HEADER_LEN as u64,
+            #[cfg(feature = "encryption")]
+            crypto: None,
         })
+    }
+
+    /// Creates a new AEAD-ENCRYPTED segment (#780): writes the header via
+    /// [`SegmentHeader::encode_encrypted`] (setting the `SEGMENT_FLAG_ENCRYPTED` flag and recording
+    /// `crypto`'s suite and key-id in the reserved header bytes), and attaches the write-side
+    /// encryption context so every appended record body is AEAD-encrypted in place. The frame layout,
+    /// the durability boundary, and the roll trigger are otherwise identical to [`SegmentWriter::create`]
+    /// — only the body bytes are ciphertext plus the 16-byte tag.
+    ///
+    /// # Errors
+    /// Propagates IO errors writing the header.
+    #[cfg(feature = "encryption")]
+    pub fn create_encrypted(
+        file: F,
+        header: SegmentHeader,
+        crypto: Arc<crate::crypto::SegmentCrypto>,
+    ) -> Result<SegmentWriter<F>, StorageError> {
+        file.write_all_at(
+            &header.encode_encrypted(crypto.suite().id(), crypto.key_id()),
+            0,
+        )?;
+        Ok(SegmentWriter {
+            file: Arc::new(file),
+            header,
+            write_pos: SEGMENT_HEADER_LEN as u64,
+            record_count: 0,
+            last_seq: header.base_seq,
+            max_timestamp_ms: 0,
+            pending: Vec::new(),
+            pending_base: SEGMENT_HEADER_LEN as u64,
+            crypto: Some(crypto),
+        })
+    }
+
+    /// Attaches an at-rest encryption context to a RESUMED writer (#780), for continuing to append to
+    /// an already-encrypted segment after recovery. Unlike [`SegmentWriter::create_encrypted`] this
+    /// does NOT rewrite the header (the on-disk header already carries the encryption flag/suite/key-id
+    /// from when the segment was first created); it only lets subsequent appends keep encrypting under
+    /// the same key. The caller MUST pass the SAME suite/key-id the segment header records, so the
+    /// nonce space stays consistent across the restart.
+    #[cfg(feature = "encryption")]
+    #[must_use]
+    pub fn with_crypto(mut self, crypto: Arc<crate::crypto::SegmentCrypto>) -> SegmentWriter<F> {
+        self.crypto = Some(crypto);
+        self
     }
 
     /// Resumes appending to an existing, already-validated segment at its recovered
@@ -670,6 +806,8 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             max_timestamp_ms,
             pending: Vec::new(),
             pending_base: write_pos,
+            #[cfg(feature = "encryption")]
+            crypto: None,
         }
     }
 
@@ -702,6 +840,8 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             max_timestamp_ms: 0,
             pending: Vec::new(),
             pending_base: SEGMENT_HEADER_LEN as u64,
+            #[cfg(feature = "encryption")]
+            crypto: None,
         })
     }
 
@@ -970,36 +1110,31 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         // intermediate copy. The bytes reach the file at the next flush point; on encode failure
         // the buffer is truncated back so a rejected record leaves no partial frame behind.
         let before = self.pending.len();
-        // A non-empty subject routes to the subject-storing codec path (#594) and a non-empty
-        // stream_tag to the tag-storing path (#597), each laying down its optional post-header field;
-        // an empty pair is byte-for-byte the historical frame. Subject and tag are mutually exclusive
-        // (the encode helpers debug-assert it), so the tag branch is taken only when there is no
-        // subject.
-        let encoded = if stream_tag.is_empty() {
-            match (precomputed, subject.is_empty()) {
-                (Some(checksums), true) => {
-                    codec::encode_precomputed(record, checksums, &mut self.pending)
-                }
-                (None, true) => codec::encode(record, &mut self.pending),
-                (Some(checksums), false) => codec::encode_precomputed_with_subject(
-                    record,
-                    subject,
-                    checksums,
-                    &mut self.pending,
-                ),
-                (None, false) => codec::encode_with_subject(record, subject, &mut self.pending),
-            }
+        // At-rest encryption (#780): when a crypto context is attached, the record body is
+        // AEAD-encrypted IN PLACE and framed with `encode_encrypted`, keyed by the deterministic
+        // nonce `segment_id || record_ordinal` (the ordinal is the pre-increment `record_count`). The
+        // nonce is unique for the life of the log under this key (segment-ids never recycle, the
+        // ordinal is monotonic and u32-bounded). Encryption is uniform per segment and, in v1,
+        // mutually exclusive with the optional subject/stream-tag slots. The plaintext CRC offload
+        // (`precomputed`) does not apply — the CRC is recomputed over the ciphertext.
+        #[cfg(feature = "encryption")]
+        let encoded = if let Some(crypto) = self.crypto.clone() {
+            debug_assert!(
+                subject.is_empty() && stream_tag.is_empty(),
+                "at-rest encryption carries no subject/stream-tag slot in v1 (#780)"
+            );
+            encrypt_and_frame(
+                record,
+                &crypto,
+                self.header.segment_id,
+                self.record_count,
+                &mut self.pending,
+            )
         } else {
-            match precomputed {
-                Some(checksums) => codec::encode_precomputed_with_stream_tag(
-                    record,
-                    stream_tag,
-                    checksums,
-                    &mut self.pending,
-                ),
-                None => codec::encode_with_stream_tag(record, stream_tag, &mut self.pending),
-            }
+            encode_plaintext(&mut self.pending, record, subject, stream_tag, precomputed)
         };
+        #[cfg(not(feature = "encryption"))]
+        let encoded = encode_plaintext(&mut self.pending, record, subject, stream_tag, precomputed);
         if encoded.is_err() {
             self.pending.truncate(before);
             return Err(StorageError::SegmentFull);
@@ -1372,6 +1507,15 @@ pub struct SegmentReader<F: RandomAccessFile> {
     file: F,
     header: SegmentHeader,
     file_len: u64,
+    /// The at-rest AEAD parameters `(aead_suite_id, key_id)` read from the header at open, or `None`
+    /// for a plaintext segment (#780). Behind the `encryption` feature.
+    #[cfg(feature = "encryption")]
+    aead: Option<(u8, u64)>,
+    /// The loaded key ring for decrypting an encrypted segment (#780), or `None` (a plaintext reader,
+    /// or an encrypted segment opened without keys — which then reports `UnknownKeyId`). Behind the
+    /// `encryption` feature.
+    #[cfg(feature = "encryption")]
+    keyring: Option<Arc<crate::crypto::KeyRing>>,
 }
 
 impl<F: RandomAccessFile> SegmentReader<F> {
@@ -1389,10 +1533,18 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let mut hbuf = [0u8; SEGMENT_HEADER_LEN];
         file.read_exact_at(&mut hbuf, 0)?;
         let header = SegmentHeader::decode(&hbuf)?;
+        // Read the at-rest AEAD params (suite id + key-id) from the header's reserved region; `None`
+        // for a plaintext segment. The header CRC (validated above) already covers these bytes.
+        #[cfg(feature = "encryption")]
+        let aead = SegmentHeader::aead_params(&hbuf);
         Ok(SegmentReader {
             file,
             header,
             file_len,
+            #[cfg(feature = "encryption")]
+            aead,
+            #[cfg(feature = "encryption")]
+            keyring: None,
         })
     }
 
@@ -1400,6 +1552,123 @@ impl<F: RandomAccessFile> SegmentReader<F> {
     #[must_use]
     pub fn header(&self) -> &SegmentHeader {
         &self.header
+    }
+
+    /// Opens a segment WITH a loaded key ring so [`SegmentReader::scan_decrypted`] can decrypt an
+    /// at-rest-encrypted segment (#780). A plaintext segment ignores the ring. Behind the `encryption`
+    /// feature.
+    ///
+    /// # Errors
+    /// Same as [`SegmentReader::open`].
+    #[cfg(feature = "encryption")]
+    pub fn open_with_keyring(
+        file: F,
+        keyring: Arc<crate::crypto::KeyRing>,
+    ) -> Result<SegmentReader<F>, StorageError> {
+        let mut reader = SegmentReader::open(file)?;
+        reader.keyring = Some(keyring);
+        Ok(reader)
+    }
+
+    /// Scans an at-rest-ENCRYPTED segment and returns its records with the bodies DECRYPTED (#780),
+    /// materializing each `OwnedRecord`'s key/headers/payload from the recovered plaintext. Every
+    /// record is validated CRC-first (the codec checks the CRC over the on-disk ciphertext + tag
+    /// BEFORE any decrypt), then AEAD-decrypted under the segment header's suite/key-id and the
+    /// deterministic nonce `segment_id || record_ordinal`.
+    ///
+    /// A decrypt failure is a DISTINCT, reported [`StorageError::Decrypt`] (unknown key-id vs tag
+    /// mismatch), never a silent skip, a crash, or garbage plaintext. A plaintext segment (no
+    /// `SEGMENT_FLAG_ENCRYPTED`) falls back to the ordinary [`SegmentReader::scan`].
+    ///
+    /// This is the focused, self-contained decrypt read for phase 1; threading decryption through
+    /// every zero-copy/replication/compaction read path is the tracked follow-on.
+    ///
+    /// # Errors
+    /// [`StorageError::Decrypt`] on a key/tag failure, [`StorageError::Record`] on a corrupt frame,
+    /// [`StorageError::Segment`] on a bad footer, or an IO error.
+    #[cfg(feature = "encryption")]
+    pub fn scan_decrypted(&self) -> Result<Vec<OwnedRecord>, StorageError> {
+        use ironbus_core::codec;
+        // A plaintext segment: ordinary scan (its bodies are already cleartext).
+        let Some((suite_id, key_id)) = self.aead else {
+            return Ok(self.scan()?.records);
+        };
+        let suite = crate::crypto::AeadSuite::from_id(suite_id).ok_or(StorageError::Decrypt(
+            crate::crypto::DecryptError::UnsupportedSuite(suite_id),
+        ))?;
+        let keyring = self.keyring.as_ref();
+        let header_end = SEGMENT_HEADER_LEN as u64;
+        // Determine the body end: just before a sealed footer if present, else the clamped file end.
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
+        let body_end = if self.file_len >= header_end + footer_len {
+            let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+            self.file
+                .read_exact_at(&mut fbuf, self.file_len - footer_len)?;
+            if SegmentFooter::decode(&fbuf).is_ok() {
+                self.file_len - footer_len
+            } else {
+                self.file_len
+            }
+        } else {
+            self.file_len
+        };
+        if body_end <= header_end {
+            return Ok(Vec::new());
+        }
+        let body_len =
+            usize::try_from(body_end - header_end).map_err(|_| StorageError::SegmentFull)?;
+        let mut body = BytesMut::zeroed(body_len);
+        self.file.read_exact_at(&mut body, header_end)?;
+        let body = body.freeze();
+
+        let segment_id = self.header.segment_id;
+        let base_offset = self.header.base_offset.get();
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        let mut ordinal = 0u32;
+        while pos < body.len() {
+            let (view, consumed) = codec::decode_encrypted(&body[pos..])?;
+            // Decrypt this record's ciphertext under the segment's suite/key-id and its ordinal nonce.
+            let plaintext = match keyring {
+                Some(ring) => ring
+                    .decrypt_record(
+                        suite,
+                        key_id,
+                        segment_id,
+                        ordinal,
+                        view.ciphertext,
+                        view.tag,
+                    )
+                    .map_err(StorageError::Decrypt)?,
+                None => {
+                    // No keys loaded at all: the same reported UnknownKeyId class, never a silent read.
+                    return Err(StorageError::Decrypt(
+                        crate::crypto::DecryptError::UnknownKeyId(key_id),
+                    ));
+                }
+            };
+            // Split the recovered plaintext into key/headers/payload by the header's plaintext lengths.
+            let key_len = view.key_len as usize;
+            let hdr_len = view.hdr_len as usize;
+            let plain = Bytes::from(plaintext);
+            let offset = Offset::new(base_offset + u64::from(ordinal));
+            out.push(OwnedRecord {
+                offset,
+                seq: view.seq,
+                timestamp_ms: view.timestamp_ms,
+                // Expose the DECRYPTED record as a normal plaintext record downstream (the ENCRYPTED
+                // bit is a storage-internal, on-disk concern, cleared on the materialized record).
+                flags: RecordFlags::from_bits(view.flags.bits() & !RecordFlags::ENCRYPTED.bits()),
+                key: plain.slice(0..key_len),
+                headers: plain.slice(key_len..key_len + hdr_len),
+                payload: plain.slice(key_len + hdr_len..),
+                subject: Bytes::new(),
+                stream_tag: Bytes::new(),
+            });
+            pos += consumed;
+            ordinal = ordinal.checked_add(1).ok_or(StorageError::SegmentFull)?;
+        }
+        Ok(out)
     }
 
     /// Clamps this reader's view of the file to end at `end` (never grown past the real length,
@@ -4226,5 +4495,252 @@ mod tests {
             ),
             "a compacted footer naming a different segment must be rejected, got {err:?}"
         );
+    }
+
+    // --- At-rest AEAD encryption, end-to-end at the segment level (#780) ---
+    #[cfg(feature = "encryption")]
+    mod at_rest_encryption {
+        use super::*;
+        use crate::crypto::{AeadKey, AeadSuite, DecryptError, KeyRing, SegmentCrypto};
+
+        fn enc_header(segment_id: u64, base: u64) -> SegmentHeader {
+            SegmentHeader {
+                segment_id,
+                base_seq: Seq::new(base),
+                base_offset: Offset::new(base),
+                created_unix_ms: 0,
+                flags: 0,
+            }
+        }
+
+        fn key(seed: u8) -> AeadKey {
+            AeadKey::from_bytes([seed; 32])
+        }
+
+        fn crypto(suite: AeadSuite, key_id: u64, seed: u8) -> Arc<SegmentCrypto> {
+            Arc::new(SegmentCrypto::new(suite, key_id, key(seed)))
+        }
+
+        #[test]
+        fn write_seal_reopen_decrypt_round_trips_both_suites() {
+            for suite in [AeadSuite::Aes256Gcm, AeadSuite::ChaCha20Poly1305] {
+                let file = Arc::new(InMemoryFile::new());
+                let mut w = SegmentWriter::create_encrypted(
+                    Arc::clone(&file),
+                    enc_header(3, 0),
+                    crypto(suite, 5, 0xAB),
+                )
+                .unwrap();
+                let bodies: [&[u8]; 3] = [b"alpha", b"a slightly longer bravo body", b"charlie"];
+                for (i, b) in bodies.iter().enumerate() {
+                    w.append(&rec(i as u64, b)).unwrap();
+                }
+                w.seal().unwrap();
+
+                // The header advertises encryption + records the suite and key-id.
+                let raw = file.snapshot();
+                assert_eq!(
+                    SegmentHeader::aead_params(&raw[..SEGMENT_HEADER_LEN]),
+                    Some((suite.id(), 5))
+                );
+                // The record bodies are NOT plaintext on disk (they are ciphertext).
+                for b in &bodies {
+                    assert!(
+                        !contains_subslice(&raw, b),
+                        "plaintext body {b:?} must not appear on disk under {}",
+                        suite.name()
+                    );
+                }
+
+                // Reopen with the key loaded: decrypt round-trips byte-exact.
+                let mut ring = KeyRing::new();
+                ring.insert(5, key(0xAB));
+                let reader =
+                    SegmentReader::open_with_keyring(Arc::clone(&file), Arc::new(ring)).unwrap();
+                assert!(reader.header().is_encrypted());
+                let recs = reader.scan_decrypted().unwrap();
+                assert_eq!(recs.len(), 3, "{}", suite.name());
+                for (i, b) in bodies.iter().enumerate() {
+                    assert_eq!(recs[i].payload.as_ref(), *b, "{}", suite.name());
+                    assert_eq!(recs[i].offset, Offset::new(i as u64));
+                    assert_eq!(recs[i].seq, Seq::new(i as u64));
+                    // The materialized record is plaintext downstream (ENCRYPTED bit cleared).
+                    assert!(!recs[i].flags.contains(RecordFlags::ENCRYPTED));
+                }
+            }
+        }
+
+        #[test]
+        fn a_plaintext_reader_refuses_encrypted_frames() {
+            // The anti-silent-garbage guarantee end-to-end: a reader with NO keyring opening an
+            // encrypted segment reports UnknownKeyId, never reads ciphertext as plaintext.
+            let file = Arc::new(InMemoryFile::new());
+            let mut w = SegmentWriter::create_encrypted(
+                Arc::clone(&file),
+                enc_header(1, 0),
+                crypto(AeadSuite::Aes256Gcm, 9, 0x01),
+            )
+            .unwrap();
+            w.append(&rec(0, b"secret")).unwrap();
+            w.seal().unwrap();
+            let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+            assert!(matches!(
+                reader.scan_decrypted(),
+                Err(StorageError::Decrypt(DecryptError::UnknownKeyId(9)))
+            ));
+        }
+
+        #[test]
+        fn wrong_key_is_reported_not_silent_and_not_garbage() {
+            let file = Arc::new(InMemoryFile::new());
+            let mut w = SegmentWriter::create_encrypted(
+                Arc::clone(&file),
+                enc_header(2, 0),
+                crypto(AeadSuite::ChaCha20Poly1305, 4, 0xAA),
+            )
+            .unwrap();
+            w.append(&rec(0, b"top secret")).unwrap();
+            w.seal().unwrap();
+
+            // A keyring with the RIGHT key-id but the WRONG key bytes -> a reported tag mismatch.
+            let mut wrong = KeyRing::new();
+            wrong.insert(4, key(0xBB));
+            let reader =
+                SegmentReader::open_with_keyring(Arc::clone(&file), Arc::new(wrong)).unwrap();
+            let err = reader.scan_decrypted().unwrap_err();
+            match err {
+                StorageError::Decrypt(e) => {
+                    assert_eq!(e, DecryptError::TagMismatch);
+                    // Routed to the DISTINCT reason code, never CorruptRecordBody.
+                    assert_eq!(e.reason_code(), ReasonCode::AeadTagMismatch);
+                }
+                other => panic!("expected a reported Decrypt error, got {other:?}"),
+            }
+
+            // A keyring missing the key-id entirely -> a reported unknown-key error.
+            let mut missing = KeyRing::new();
+            missing.insert(99, key(0xAA));
+            let reader2 =
+                SegmentReader::open_with_keyring(Arc::clone(&file), Arc::new(missing)).unwrap();
+            match reader2.scan_decrypted().unwrap_err() {
+                StorageError::Decrypt(e) => {
+                    assert_eq!(e, DecryptError::UnknownKeyId(4));
+                    assert_eq!(e.reason_code(), ReasonCode::UnknownKeyId);
+                }
+                other => panic!("expected UnknownKeyId, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn crc_over_ciphertext_detects_a_torn_tail_without_the_key() {
+            // Corrupt a ciphertext byte in a sealed encrypted segment. Recovery-style validation
+            // (codec::decode_encrypted) catches it as BadBodyCrc using ONLY the CRC over the
+            // ciphertext — NO key needed. This is the key-free torn-tail/bit-rot guarantee.
+            let file = Arc::new(InMemoryFile::new());
+            let mut w = SegmentWriter::create_encrypted(
+                Arc::clone(&file),
+                enc_header(7, 0),
+                crypto(AeadSuite::Aes256Gcm, 1, 0x55),
+            )
+            .unwrap();
+            w.append(&rec(0, b"first")).unwrap();
+            w.append(&rec(1, b"second record body")).unwrap();
+            w.sync().unwrap();
+            let mut raw = file.snapshot();
+            // Size the FIRST frame key-free (recovery-style), then flip a byte inside the SECOND
+            // record's ciphertext body — no key involved anywhere.
+            let (_v0, n0) =
+                ironbus_core::codec::decode_encrypted(&raw[SEGMENT_HEADER_LEN..]).unwrap();
+            let second_start = SEGMENT_HEADER_LEN + n0;
+            // A byte one past the second frame's 36-byte header lands inside its ciphertext.
+            raw[second_start + RECORD_HEADER_LEN + 1] ^= 0xFF;
+            assert_eq!(
+                ironbus_core::codec::decode_encrypted(&raw[second_start..]),
+                Err(ironbus_core::codec::DecodeError::BadBodyCrc),
+                "a corrupt ciphertext byte is caught by the CRC over the ciphertext, no key needed"
+            );
+        }
+
+        #[test]
+        fn rotation_two_segments_two_keys_one_reader_reads_all() {
+            // Rotation is new-segments-only: segment A under key-id 1, segment B under key-id 2 (a
+            // fresh, never-recycled segment id). A reader with BOTH keys loaded reads both, keyed by
+            // each segment's own header key-id. Distinct segment ids also mean the (segment_id, ctr)
+            // nonce space never collides across the rotation.
+            let file_a = Arc::new(InMemoryFile::new());
+            let mut wa = SegmentWriter::create_encrypted(
+                Arc::clone(&file_a),
+                enc_header(10, 0),
+                crypto(AeadSuite::Aes256Gcm, 1, 0x11),
+            )
+            .unwrap();
+            wa.append(&rec(0, b"under-key-one")).unwrap();
+            wa.seal().unwrap();
+
+            let file_b = Arc::new(InMemoryFile::new());
+            let mut wb = SegmentWriter::create_encrypted(
+                Arc::clone(&file_b),
+                enc_header(11, 0),
+                crypto(AeadSuite::ChaCha20Poly1305, 2, 0x22),
+            )
+            .unwrap();
+            wb.append(&rec(0, b"under-key-two")).unwrap();
+            wb.seal().unwrap();
+
+            // The two segments carry DIFFERENT ids and DIFFERENT key-ids and DIFFERENT suites.
+            assert_ne!(
+                SegmentHeader::aead_params(&file_a.snapshot()[..SEGMENT_HEADER_LEN]),
+                SegmentHeader::aead_params(&file_b.snapshot()[..SEGMENT_HEADER_LEN])
+            );
+
+            let mut ring = KeyRing::new();
+            ring.insert(1, key(0x11));
+            ring.insert(2, key(0x22));
+            let ring = Arc::new(ring);
+            let ra =
+                SegmentReader::open_with_keyring(Arc::clone(&file_a), Arc::clone(&ring)).unwrap();
+            let rb =
+                SegmentReader::open_with_keyring(Arc::clone(&file_b), Arc::clone(&ring)).unwrap();
+            assert_eq!(
+                ra.scan_decrypted().unwrap()[0].payload.as_ref(),
+                b"under-key-one"
+            );
+            assert_eq!(
+                rb.scan_decrypted().unwrap()[0].payload.as_ref(),
+                b"under-key-two"
+            );
+        }
+
+        #[test]
+        fn default_off_is_byte_identical_to_a_plaintext_segment() {
+            // DEFAULT-OFF byte identity: a writer with NO crypto produces the EXACT bytes it always
+            // did — the encryption code path is inert unless a key is configured.
+            let plain = Arc::new(InMemoryFile::new());
+            let mut wp = SegmentWriter::create(Arc::clone(&plain), enc_header(1, 0)).unwrap();
+            wp.append(&rec(0, b"one")).unwrap();
+            wp.append(&rec(1, b"two")).unwrap();
+            wp.seal().unwrap();
+
+            // A byte-for-byte reference built the SAME way but through the plaintext codec directly.
+            let reference = Arc::new(InMemoryFile::new());
+            let mut wr = SegmentWriter::create(Arc::clone(&reference), enc_header(1, 0)).unwrap();
+            wr.append(&rec(0, b"one")).unwrap();
+            wr.append(&rec(1, b"two")).unwrap();
+            wr.seal().unwrap();
+
+            assert_eq!(plain.snapshot(), reference.snapshot());
+            // The header's encryption region is all zero, and the segment is not flagged encrypted.
+            let raw = plain.snapshot();
+            assert!(raw[44..60].iter().all(|&b| b == 0));
+            assert_eq!(SegmentHeader::aead_params(&raw[..SEGMENT_HEADER_LEN]), None);
+            assert!(!SegmentReader::open(Arc::clone(&plain))
+                .unwrap()
+                .header()
+                .is_encrypted());
+        }
+
+        fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
     }
 }
