@@ -613,6 +613,16 @@ pub struct EngineConfig {
     /// to today (records never expire on read). This is the DELIVERY-skip TTL; the disk-reclamation
     /// counterpart is [`EngineConfig::max_age_ms`] (the segment reap), which the TTL piggybacks on.
     pub default_message_ttl_ms: u64,
+    /// The maximum accepted per-message DELIVERY DELAY in MILLISECONDS (V2-M4, #555): a publish
+    /// carrying a `DLY1` delay request over this bound is REJECTED fail-closed (typed
+    /// [`EngineError::DelayTooLong`], nothing appended) — never silently clamped — because an
+    /// unbounded schedule pins retention arbitrarily far into the future (the un-due record holds
+    /// its group cursors, which floor the reap). The bound applies to the producer's REQUESTED
+    /// duration, before the broker anchors it to its own wall clock, so a skewed producer cannot
+    /// dodge it. `0` means UNBOUNDED (no cap — consistent with the other `0 = no constraint`
+    /// knobs); the CLI `serve` default is 3 days ([`DEFAULT_MAX_DELAY_MS`] there), the `RocketMQ`
+    /// 5.x timer-max parity point. Tunable per deployment (the tunability principle).
+    pub max_delay_ms: u64,
     /// The configurable dead-letter EXCHANGE (V2-M4, #551): the ORDERED list of data-dir target
     /// SUBDIRS a dead-lettered message FANS OUT to (validated by construction, at most
     /// [`ironbus_storage::dlq::MAX_DEAD_LETTER_TARGETS`]). `None` (the default) keeps the existing
@@ -846,6 +856,18 @@ pub enum EngineError {
     /// forged-cross-producer-resolution hole: a connection cannot commit/discard another producer's
     /// in-doubt txn with a forged `TxnCheckResult{txn_id, decision}`.
     TxnCheckUnauthorized,
+    /// A publish carried a `DLY1` delayed-delivery request whose delay exceeds the broker's
+    /// configured maximum ([`EngineConfig::max_delay_ms`], V2-M4 #555). REJECTED fail-closed at the
+    /// produce boundary (nothing appended), never silently clamped: an unbounded schedule would pin
+    /// retention arbitrarily far into the future (the un-due record holds its group cursors, which
+    /// floor the reap). Carries the requested and maximum delays so the producer can resubmit under
+    /// the bound. Non-fatal: the connection stays usable.
+    DelayTooLong {
+        /// The delay the producer requested, in milliseconds.
+        requested_ms: u64,
+        /// The broker's configured maximum delay, in milliseconds.
+        max_ms: u64,
+    },
 }
 
 impl core::fmt::Display for EngineError {
@@ -927,6 +949,13 @@ impl core::fmt::Display for EngineError {
                 f,
                 "back-check answer refused: the connection does not own this transaction's listener \
                  group (it registered no listener, or a different group), so it may not resolve it"
+            ),
+            EngineError::DelayTooLong {
+                requested_ms,
+                max_ms,
+            } => write!(
+                f,
+                "delayed delivery of {requested_ms} ms exceeds the broker's maximum of {max_ms} ms"
             ),
         }
     }
@@ -3636,6 +3665,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// out `max_age_ms`. [`Ttl::NONE`] (the default) means no per-stream TTL, so a non-TTL stream is
     /// byte-identical (records never expire on read). See [`EngineConfig::default_message_ttl_ms`].
     default_message_ttl: Ttl,
+    /// The maximum accepted per-message delivery DELAY in milliseconds (V2-M4, #555), snapshotted
+    /// from [`EngineConfig::max_delay_ms`] at open: a publish whose `DLY1` request exceeds it is
+    /// REJECTED fail-closed ([`EngineError::DelayTooLong`]) at the produce chokepoints, before the
+    /// broker anchors the due-time to its own wall clock. `0` means unbounded.
+    max_delay_ms: u64,
     /// The configured dead-letter EXCHANGE (V2-M4, #551), or `None` for the default fixed `dlq/`
     /// sink. When set, EVERY dead-letter (max-deliver, TTL-expired, rejected via `Term`) FANS OUT
     /// to all its targets via the reason-carrying append; `None` keeps the existing fixed-DLQ path
@@ -4490,6 +4524,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The per-stream default message TTL (V2-M4, #549), as the pure `Ttl` policy type; `0`
             // (the default) is `Ttl::NONE`, so a non-TTL broker never expires a record on read.
             default_message_ttl: Ttl::from_millis(config.default_message_ttl_ms),
+            // The max accepted per-message delivery delay (V2-M4, #555); `0` = unbounded. Enforced
+            // at the produce chokepoints, where the `DLY1` request is broker-clock resolved.
+            max_delay_ms: config.max_delay_ms,
             // The configurable dead-letter exchange + the expired-routing flag (#551), inert by
             // default (`None` keeps the fixed `dlq/` sink byte-identical).
             dead_letter_exchange: config.dead_letter_exchange,
@@ -5964,6 +6001,38 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 name: stream.to_string(),
             });
         }
+        // The DELAYED-delivery resolution seam (V2-M4, #555), the NAMED-stream produce chokepoint
+        // (the default stream resolved above, inside `append_no_sync_checked`): reject an over-max
+        // `DLY1` request or rewrite it in place to the broker-clock-anchored `DUE1` instant BEFORE
+        // the partitioned / shared-WAL / per-stream-log branches below, so every named storage mode
+        // stores the same resolved instant. Idempotent (a resolved `DUE1` passes through), and the
+        // no-request fast path is untouched (zero allocation).
+        let delayed_headers;
+        let delayed;
+        let message: &Append<'_> = match ironbus_core::delay::resolve_delay_headers(
+            message.headers,
+            self.log.now_unix_millis(),
+            self.max_delay_ms,
+        ) {
+            Ok(None) => message,
+            Ok(Some(patched)) => {
+                delayed_headers = patched;
+                delayed = Append {
+                    timestamp_ms: message.timestamp_ms,
+                    flags: message.flags,
+                    key: message.key,
+                    headers: &delayed_headers,
+                    payload: message.payload,
+                };
+                &delayed
+            }
+            Err(e) => {
+                return Err(EngineError::DelayTooLong {
+                    requested_ms: e.requested_ms,
+                    max_ms: e.max_ms,
+                })
+            }
+        };
         let id = StreamId::named(stream)?;
         // #693: a PARTITIONED stream (declared with `P > 1`) routes the produce BY KEY to its partition
         // sub-log (`xxh3_64(key) % P`, #591), NOT to a single named-stream log. This runs BEFORE the
@@ -6501,6 +6570,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         flushed: u64,
     ) -> Result<Poll, EngineError> {
         let key = (id.clone(), idx.get());
+        // The wall-clock seam instant the DELAYED-delivery hold below compares due-instants against
+        // (V2-M4, #555), read once per poll exactly as the other scans do.
+        let now_unix_millis = self.log.now_unix_millis();
         // The oldest record still retained in this partition (rises above 0 only after a retention reap).
         let earliest = self
             .partitioned
@@ -6600,6 +6672,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                             from: off,
                             to: record.offset,
                         });
+                    }
+                    // DELAYED-delivery HOLD (V2-M4, #555), partition path: an un-due record is
+                    // INVISIBLE — release the just-claimed lease (removing it whole, so the un-due
+                    // claim never counts toward MaxDeliver) and STOP without advancing this
+                    // partition's cursor, holding the partition group at the un-due record; due
+                    // records release in per-partition log-sequence order (see `record_is_undue`).
+                    if Self::record_is_undue(now_unix_millis, &record) {
+                        if let Some(g) = self
+                            .partition_consumers
+                            .get_mut(&key)
+                            .and_then(|ns| ns.groups.get_mut(group))
+                        {
+                            g.leases.ack(&token);
+                        }
+                        break;
                     }
                     match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => {
@@ -7845,6 +7932,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let filter = filter_str
             .as_deref()
             .and_then(|p| SubjectPattern::parse(p).ok());
+        // The wall-clock seam instant the DELAYED-delivery holds below compare due-instants against
+        // (V2-M4, #555), read ONCE per poll exactly as `poll_in` reads its TTL instant — seam-
+        // anchored and `ManualClock`-deterministic, never a per-record host-clock read.
+        let now_unix_millis = self.log.now_unix_millis();
         let mut filtered_from: Option<u64> = None;
         // A poison message (claimed but over max-deliver) to DEAD-LETTER to this stream's own DLQ,
         // captured so the crash-atomic per-stream DLQ move runs OUTSIDE the per-record group borrow —
@@ -7938,6 +8029,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         offset += 1;
                         continue;
                     }
+                }
+                // DELAYED-delivery HOLD (V2-M4, #555), named key_shared path: an un-due record is
+                // INVISIBLE to every member — stop the scan here (no lease is held on this
+                // peek-first path) without advancing the cursor or routing, holding the whole
+                // group at the un-due record; due records release in log-sequence order (see
+                // `record_is_undue`). After the filter (a record this group never delivers must
+                // not hold it), before the route/claim.
+                if Self::record_is_undue(now_unix_millis, &record) {
+                    break;
                 }
                 // 4. ROUTE: this member takes the record only if its key rendezvous-routes to it and the
                 //    key is free. A not-owner / busy offset is skipped WITHOUT a claim, left for its owner
@@ -8081,34 +8181,50 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     offset += 1;
                     continue;
                 }
-                if let Some(from) = filtered_from.take() {
-                    // Flush the coalesced skip run BEFORE delivering this match. STASH the already-read,
-                    // already-leased match for the next poll (a `Deliver` disposition) so it is not read
-                    // twice; a rare `DeadLetter` match releases its lease and is re-derived after the gap
-                    // (the poison path stays the normal named DeadLetter arm below). Either way surface
-                    // the gap span `[from, off)` now.
-                    match self.delivery.disposition(deliveries) {
-                        Disposition::Deliver => {
-                            if let Some(g) = self.named_group_mut(id, group) {
-                                g.pending_match = Some(Delivery {
-                                    offset: off,
-                                    token,
-                                    deliveries,
-                                    record,
-                                });
-                            }
-                        }
-                        Disposition::DeadLetter => {
-                            if let Some(g) = self.named_group_mut(id, group) {
-                                g.leases.ack(&token);
-                            }
+            }
+            // DELAYED-delivery HOLD (V2-M4, #555), named plain path: an un-due record is INVISIBLE
+            // — release the just-claimed lease (removing it whole, so the un-due claim never counts
+            // toward MaxDeliver) and STOP without advancing the durable cursor, holding the group
+            // at the un-due record; due records release in log-sequence order (FIFO-with-delays,
+            // see `record_is_undue`). After the filter non-match skip (a record this group never
+            // delivers must not hold it) and BEFORE the filter match-stash below (a stashed match
+            // delivers zero-read on the NEXT poll, which must never smuggle out an un-due record).
+            // The un-advanced durable cursor is also what pins this stream's reap protect floor
+            // (`min_committed_offset_named`), keeping the un-due record retention-safe (#566).
+            if Self::record_is_undue(now_unix_millis, &record) {
+                if let Some(g) = self.named_group_mut(id, group) {
+                    g.leases.ack(&token);
+                }
+                break;
+            }
+            // (Reached only under a filter: `filtered_from` accumulates only in the non-match arm.)
+            if let Some(from) = filtered_from.take() {
+                // Flush the coalesced skip run BEFORE delivering this match. STASH the already-read,
+                // already-leased match for the next poll (a `Deliver` disposition) so it is not read
+                // twice; a rare `DeadLetter` match releases its lease and is re-derived after the gap
+                // (the poison path stays the normal named DeadLetter arm below). Either way surface
+                // the gap span `[from, off)` now.
+                match self.delivery.disposition(deliveries) {
+                    Disposition::Deliver => {
+                        if let Some(g) = self.named_group_mut(id, group) {
+                            g.pending_match = Some(Delivery {
+                                offset: off,
+                                token,
+                                deliveries,
+                                record,
+                            });
                         }
                     }
-                    return Ok(Poll::Filtered {
-                        from: Offset::new(from),
-                        to: off,
-                    });
+                    Disposition::DeadLetter => {
+                        if let Some(g) = self.named_group_mut(id, group) {
+                            g.leases.ack(&token);
+                        }
+                    }
                 }
+                return Ok(Poll::Filtered {
+                    from: Offset::new(from),
+                    to: off,
+                });
             }
             match self.delivery.disposition(deliveries) {
                 Disposition::Deliver => {
@@ -9013,6 +9129,43 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         precomputed: Option<BodyChecksums>,
         subject: &[u8],
     ) -> Result<Offset, EngineError> {
+        // The DELAYED-delivery resolution seam (V2-M4, #555), the default-stream produce
+        // chokepoint: a `DLY1` wire request in the headers is REJECTED over the configured max or
+        // rewritten IN PLACE to the broker-clock-anchored absolute `DUE1` due-instant, BEFORE the
+        // compression seam below, so the stored record (and the replicated frame) carries the
+        // resolved instant. The producer's wall clock never anchors visibility: `now` comes from
+        // the engine's wall seam, never from the producer-controlled `timestamp_ms`. A headers
+        // blob with no request is untouched (`Ok(None)`, the zero-allocation fast path), and a
+        // resolved `DUE1` (a txn redrive, a re-entrant call) passes through idempotently, so the
+        // due-instant can never be re-anchored. When the headers ARE rewritten, the off-actor
+        // precomputed body checksum no longer describes the stored bytes, so it is DROPPED and the
+        // codec recomputes — exactly the compression seam's discipline.
+        let delayed_headers;
+        let delayed;
+        let (message, precomputed) = match ironbus_core::delay::resolve_delay_headers(
+            message.headers,
+            self.log.now_unix_millis(),
+            self.max_delay_ms,
+        ) {
+            Ok(None) => (message, precomputed),
+            Ok(Some(patched)) => {
+                delayed_headers = patched;
+                delayed = Append {
+                    timestamp_ms: message.timestamp_ms,
+                    flags: message.flags,
+                    key: message.key,
+                    headers: &delayed_headers,
+                    payload: message.payload,
+                };
+                (&delayed, None)
+            }
+            Err(e) => {
+                return Err(EngineError::DelayTooLong {
+                    requested_ms: e.requested_ms,
+                    max_ms: e.max_ms,
+                })
+            }
+        };
         // The write-path compression seam (#430, ADR-0003). The pass-through guard on an ALREADY
         // COMPRESSED message is load-bearing: the wire legally delivers bit 0 set (a producer may
         // publish a pre-compressed stored object), and compressing it again would wrap a
@@ -10825,32 +10978,54 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                             offset += 1;
                             continue;
                         }
-                        if let Some(from) = filtered_from.take() {
-                            // Flush the coalesced skip run BEFORE delivering this match. To avoid a
-                            // second read of the match (the re-scan cliff), STASH the already-read,
-                            // already-leased match for the next poll to deliver — but ONLY when its
-                            // disposition is `Deliver`; a `DeadLetter` match (over max-deliver) is rare,
-                            // so release its lease and let the next poll re-derive the dead-letter after
-                            // the gap, keeping the poison path unchanged. Either way, surface the gap
-                            // span `[from, off)` now.
-                            match self.delivery.disposition(deliveries) {
-                                Disposition::Deliver => {
-                                    g.pending_match = Some(Delivery {
-                                        offset: off,
-                                        token,
-                                        deliveries,
-                                        record,
-                                    });
-                                }
-                                Disposition::DeadLetter => {
-                                    g.leases.ack(&token);
-                                }
+                    }
+                    // DELAYED-delivery HOLD (V2-M4, #555): a record whose broker-resolved due-
+                    // instant lies in the future is INVISIBLE — the scan releases the just-claimed
+                    // lease (removing it whole, so the un-due claim never counts a delivery
+                    // attempt toward MaxDeliver and never leaves in-flight residue) and STOPS
+                    // WITHOUT advancing the cursor, holding the group at the un-due record. Due
+                    // records therefore release strictly in log-sequence order (FIFO-with-delays;
+                    // the honest head-of-line property is documented on `record_is_undue`). Placed
+                    // AFTER the TTL check (an expired record is reclaimed whether or not it is
+                    // due — a TTL that elapses before the due-instant expires the record
+                    // un-delivered) and AFTER the filter non-match skip (a record this group will
+                    // NEVER deliver must not hold it), but BEFORE the filter match-stash below (a
+                    // stashed match is delivered zero-read on the NEXT poll, which must never
+                    // smuggle out an un-due record). The un-advanced cursor is also what keeps the
+                    // un-due record retention-safe: the reap's protect floor is the min committed
+                    // offset of the touched groups, which this hold pins. The non-delayed fast
+                    // path is one 4-byte compare.
+                    if Self::record_is_undue(now_unix_millis, &record) {
+                        g.leases.ack(&token);
+                        break;
+                    }
+                    // (Reached only under a filter: `filtered_from` accumulates only in the
+                    // non-match arm above, so no `filter.is_some()` re-check is needed here.)
+                    if let Some(from) = filtered_from.take() {
+                        // Flush the coalesced skip run BEFORE delivering this match. To avoid a
+                        // second read of the match (the re-scan cliff), STASH the already-read,
+                        // already-leased match for the next poll to deliver — but ONLY when its
+                        // disposition is `Deliver`; a `DeadLetter` match (over max-deliver) is rare,
+                        // so release its lease and let the next poll re-derive the dead-letter after
+                        // the gap, keeping the poison path unchanged. Either way, surface the gap
+                        // span `[from, off)` now.
+                        match self.delivery.disposition(deliveries) {
+                            Disposition::Deliver => {
+                                g.pending_match = Some(Delivery {
+                                    offset: off,
+                                    token,
+                                    deliveries,
+                                    record,
+                                });
                             }
-                            return Ok(Poll::Filtered {
-                                from: Offset::new(from),
-                                to: off,
-                            });
+                            Disposition::DeadLetter => {
+                                g.leases.ack(&token);
+                            }
                         }
+                        return Ok(Poll::Filtered {
+                            from: Offset::new(from),
+                            to: off,
+                        });
                     }
                     match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => {
@@ -11052,6 +11227,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return false;
         }
         is_expired(ttl, record.timestamp_ms, now_unix_millis)
+    }
+
+    /// Whether `record` is still UN-DUE at the wall-clock seam (V2-M4, #555): its broker-resolved
+    /// `DUE1` due-instant (decoded from the headers prefix, absolute broker-wall Unix ms assigned
+    /// at append) lies in the future at `now_unix_millis`. A record with no due-instant is never
+    /// un-due (the non-delayed fast path, one 4-byte compare). The delivery scans HOLD at the first
+    /// un-due record — they release its just-claimed lease (if any) and stop WITHOUT advancing the
+    /// group cursor — so due records release strictly in LOG-SEQUENCE order (FIFO-with-delays): a
+    /// later-sequence record with an earlier due-instant waits behind it, and NO wall-clock
+    /// comparison between two records ever decides release order (the #555 clock-skew-safety core).
+    /// The honest head-of-line consequence: one long-delayed record delays everything behind it in
+    /// the same group (the documented v1 semantics; an out-of-order-release due-index sidecar is a
+    /// possible follow-up). Free of `&self` for the same borrow reason as
+    /// [`Engine::record_is_expired`]; the caller reads the wall seam once per poll and threads it.
+    fn record_is_undue(now_unix_millis: u64, record: &OwnedRecord) -> bool {
+        ironbus_core::delay::is_undue(&record.headers, now_unix_millis)
     }
 
     /// Whether `record`'s STORED subject matches the filtered group's `pattern` (#594). A record with
@@ -11614,6 +11805,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 expired_inline = true;
                 offset += 1;
                 continue;
+            }
+            // DELAYED-delivery HOLD (V2-M4, #555), key_shared path: an un-due record is INVISIBLE
+            // to EVERY member — the scan STOPS here (no lease is held yet on this peek-first path,
+            // so there is nothing to release) without advancing the cursor or routing, holding the
+            // whole group at the un-due record. Due records release in log-sequence order across
+            // the members (FIFO-with-delays; see `record_is_undue`). After the TTL check for the
+            // same reason as the plain scan: a TTL that elapses first expires the record un-delivered.
+            if Self::record_is_undue(now_unix_millis, &record) {
+                break;
             }
             let Some(router) = g.router.as_ref() else {
                 // Unreachable: the mode check above proved the router is present.
@@ -13795,6 +13995,7 @@ mod tests {
             // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
             // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
             default_message_ttl_ms: 0,
+            max_delay_ms: 0,
             dead_letter_exchange: None,
             dead_letter_expired: false,
         }
@@ -19116,6 +19317,7 @@ mod tests {
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms,
+            max_delay_ms: 0,
             ..config(64, 5)
         }
     }
@@ -19128,6 +19330,7 @@ mod tests {
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms,
+            max_delay_ms: 0,
             dead_letter_exchange: Some(DeadLetterExchange::new([exchange]).unwrap()),
             dead_letter_expired: true,
             ..config(64, 5)
@@ -19304,6 +19507,441 @@ mod tests {
         assert_eq!(entries[0].source_offset, off.get());
     }
 
+    // ----- Arbitrary-timestamp scheduled/delayed messages, clock-skew-safe (V2-M4, #555) -----
+
+    use ironbus_core::delay::{decode_due_headers, encode_delay_headers, Delay};
+
+    /// A config with a maximum accepted per-message delay (#555); `0` = unbounded. Spread from the
+    /// shared `config` so every other field keeps its golden-path value.
+    fn config_with_max_delay(max_delay_ms: u64) -> EngineConfig {
+        EngineConfig {
+            consume_longpoll_ms: 0,
+            storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
+            max_delay_ms,
+            ..config(64, 5)
+        }
+    }
+
+    /// Produces one record carrying a WIRE `DLY1` delay request (the producer surface), stamping the
+    /// PRODUCER-supplied `timestamp_ms` (which the broker must ignore for visibility — the skew
+    /// core), and returns its offset. The broker resolves the request against ITS wall seam at
+    /// append into the stored `DUE1` instant.
+    fn produce_delayed<F: Filesystem>(
+        e: &mut Engine<F, std::sync::Arc<ManualClock>>,
+        producer_timestamp_ms: u64,
+        delay: Delay,
+        payload: &[u8],
+    ) -> Offset {
+        let headers = encode_delay_headers(delay, b"orig");
+        e.produce(&Append {
+            timestamp_ms: producer_timestamp_ms,
+            flags: RecordFlags::EMPTY,
+            key: b"k",
+            headers: &headers,
+            payload,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_delayed_record_is_invisible_until_due_then_delivers_with_the_resolved_instant() {
+        // The marquee #555 behavior, driven by a ManualClock so due-ness is DETERMINISTIC: a record
+        // published at broker wall-clock 100 with a 500 ms delay is INVISIBLE (poll = Idle, cursor
+        // held) strictly before 600 and delivered normally at/after 600. Repeated held polls never
+        // inflate the delivery count (the un-due claim is released whole), so the eventual delivery
+        // is attempt 1 and MaxDeliver accounting starts only at visibility. The delivered record
+        // carries the broker-RESOLVED absolute `DUE1` instant, not the wire `DLY1` request.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(100));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        let off = produce_delayed(&mut e, 100, Delay::from_millis(500), b"later");
+
+        // Held at every instant strictly before the due instant, across many polls (each poll also
+        // advances the monotonic clock past the lease window, proving no lease residue builds up).
+        for wall in [100, 300, 599] {
+            clock.set_unix_millis(wall);
+            assert!(
+                matches!(e.poll_now().unwrap(), Poll::Idle),
+                "un-due at wall {wall}: held"
+            );
+            clock.advance_monotonic_nanos(60);
+        }
+        assert_eq!(e.counters().delivered, 0, "nothing delivered while un-due");
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(off.get()),
+            "the hold never advanced the cursor past the un-due record"
+        );
+
+        // AT the due instant (100 + 500): delivered, attempt 1, with the resolved DUE1 header.
+        clock.set_unix_millis(600);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off);
+        assert_eq!(
+            d.deliveries, 1,
+            "held polls never counted toward MaxDeliver"
+        );
+        assert_eq!(
+            decode_due_headers(&d.record.headers),
+            Some(600),
+            "the stored record carries the broker-resolved absolute due instant"
+        );
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+    }
+
+    #[test]
+    fn due_records_release_in_log_sequence_order_never_wall_clock_order() {
+        // THE #555 acceptance core (the RocketMQ-5.x-adopting, clock-skew-safe ordering): release
+        // order among due records is LOG SEQUENCE, never a wall-clock sort. r0 (earlier sequence,
+        // LATER due at 1_000) HOLDS r1 (later sequence, EARLIER due at 100): at wall 100..999 the
+        // group delivers NOTHING (r1 is due but sits behind the un-due r0 — the documented
+        // FIFO-with-delays head-of-line property), and at 1_000 both release IN APPEND ORDER
+        // (r0 then r1). No comparison between the two records' timestamps ever decides the order.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        let r0 = produce_delayed(&mut e, 0, Delay::from_millis(1_000), b"r0-late-due");
+        let r1 = produce_delayed(&mut e, 0, Delay::from_millis(100), b"r1-early-due");
+
+        // r1's due instant has passed, but the scan holds at the un-due HEAD r0: nothing delivers.
+        clock.set_unix_millis(100);
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "a due record behind an un-due one waits (seq order, not due order)"
+        );
+        clock.set_unix_millis(999);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+
+        // At r0's due instant both are due: they release strictly in APPEND order.
+        clock.set_unix_millis(1_000);
+        let d0 = message(e.poll_now().unwrap());
+        assert_eq!(d0.offset, r0, "the earlier-sequence record releases first");
+        assert_eq!(e.ack(&d0.token), AckResult::Acked);
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.offset, r1, "then the later-sequence record");
+        assert_eq!(e.ack(&d1.token), AckResult::Acked);
+    }
+
+    #[test]
+    fn a_skewed_producer_wall_clock_cannot_shift_or_reorder_visibility() {
+        // Clock-skew safety (#555): the record's producer-supplied `timestamp_ms` is IGNORED for
+        // visibility — the broker anchors the delay to ITS OWN wall seam at append. A producer
+        // whose clock reads the far FUTURE (u64::MAX) and one reading 0 both publish a 100 ms
+        // delay at broker wall 50: both resolve to due = 150 on the broker clock and release in
+        // append order, so no skewed producer can push its record earlier, later, or ahead of a
+        // peer's.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(50));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        let skewed = produce_delayed(&mut e, u64::MAX, Delay::from_millis(100), b"skewed");
+        let honest = produce_delayed(&mut e, 0, Delay::from_millis(100), b"honest");
+
+        clock.set_unix_millis(149);
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "the far-future producer timestamp did not make the record early"
+        );
+        clock.set_unix_millis(150);
+        let d0 = message(e.poll_now().unwrap());
+        assert_eq!(d0.offset, skewed, "append order, broker-anchored due");
+        assert_eq!(
+            decode_due_headers(&d0.record.headers),
+            Some(150),
+            "due = broker append instant + delay, independent of the producer timestamp"
+        );
+        assert_eq!(e.ack(&d0.token), AckResult::Acked);
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.offset, honest);
+        assert_eq!(e.ack(&d1.token), AckResult::Acked);
+    }
+
+    #[test]
+    fn a_delay_over_the_configured_max_is_rejected_fail_closed_at_the_max_accepted() {
+        // The retention-pin bound (#555): a `DLY1` request over `max_delay_ms` is REFUSED with the
+        // typed error (nothing appended), exactly at the max is accepted (inclusive bound), and a
+        // `0` max is unbounded. The bound applies to the REQUESTED duration, so the far-future
+        // producer timestamp in the reject case cannot dodge it.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(500), std::sync::Arc::clone(&clock));
+        let headers = encode_delay_headers(Delay::from_millis(501), b"");
+        let err = e
+            .produce(&Append {
+                timestamp_ms: u64::MAX,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: &headers,
+                payload: b"too-far",
+            })
+            .unwrap_err();
+        match err {
+            EngineError::DelayTooLong {
+                requested_ms,
+                max_ms,
+            } => {
+                assert_eq!(requested_ms, 501);
+                assert_eq!(max_ms, 500);
+            }
+            other => panic!("expected DelayTooLong, got {other:?}"),
+        }
+        assert_eq!(e.counters().produced, 0, "nothing was appended");
+        // The Display names both bounds so a producer can resubmit under the max.
+        let msg = err.to_string();
+        assert!(msg.contains("501"), "{msg}");
+        assert!(msg.contains("500"), "{msg}");
+
+        // Exactly AT the max: accepted, and it delivers at its due instant.
+        let off = produce_delayed(&mut e, 0, Delay::from_millis(500), b"at-max");
+        clock.set_unix_millis(500);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off);
+    }
+
+    #[test]
+    fn a_delayed_record_whose_ttl_expires_first_is_expired_never_delivered() {
+        // TTL x delay composition (#549 x #555): the TTL clock starts at the record's producer
+        // `timestamp_ms` (unchanged by the delay), so a TTL deadline that passes BEFORE the due
+        // instant expires the record un-delivered — it is reclaimed (cursor past, counted), never
+        // released late. Canonical header order: TTL1 outermost, then DLY1.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        let inner = encode_delay_headers(Delay::from_millis(1_000), b"orig");
+        let headers = encode_ttl_headers(Ttl::from_millis(500), &inner);
+        let off = e
+            .produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: &headers,
+                payload: b"expires-before-due",
+            })
+            .unwrap();
+
+        // Still un-due AND un-expired: held.
+        clock.set_unix_millis(499);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        assert_eq!(e.counters().expired, 0);
+        // At its due instant the TTL (deadline 500) has long passed: expired, reclaimed, never
+        // delivered.
+        clock.set_unix_millis(1_000);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        assert_eq!(e.counters().expired, 1, "expired un-delivered, accounted");
+        assert_eq!(e.counters().delivered, 0);
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(off.get() + 1),
+            "the expired record was committed past (reclaimed), the hold released"
+        );
+
+        // The converse composition: a TTL comfortably past the due instant delivers normally.
+        let inner = encode_delay_headers(Delay::from_millis(100), b"orig");
+        let headers = encode_ttl_headers(Ttl::from_millis(60_000), &inner);
+        let off2 = e
+            .produce(&Append {
+                timestamp_ms: 1_000,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: &headers,
+                payload: b"delivers-after-due",
+            })
+            .unwrap();
+        clock.set_unix_millis(1_100);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off2);
+        assert_eq!(d.deliveries, 1);
+    }
+
+    #[test]
+    fn retention_never_reaps_an_un_due_record_a_touched_group_still_needs() {
+        // The retention interaction (#555 x #424): the hold never advances the touched group's
+        // committed cursor past the un-due record, and the reap's protect floor is the slowest
+        // TOUCHED group's cursor — so however much is produced behind it, the un-due record's
+        // segment is never reaped, and it still delivers at its due instant. (The same slow-consumer
+        // protection an unacked live record gets; only the disk-full FORCED drop-oldest, which
+        // deliberately overrides the floor, can reap it — surfaced as Poll::Truncated as for any
+        // record.)
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut cfg = config_with_retention(320);
+        cfg.max_delay_ms = 0;
+        let mut e = open_with_clock(cfg, std::sync::Arc::clone(&clock));
+        let off = produce_delayed(&mut e, 0, Delay::from_millis(5_000), b"pinned");
+        // Touch the default group (a poll is consumer intent): it now pins the retention floor at
+        // the un-due record.
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        // Produce far past the 320-byte retention bound: without the pin these reap.
+        for _ in 0..30 {
+            produce_delayed(&mut e, 0, Delay::NONE, &[0xab; 16]);
+        }
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "the un-due record's un-advanced cursor pins the reap floor"
+        );
+        // At the due instant the pinned record delivers intact.
+        clock.set_unix_millis(5_000);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off);
+        assert_eq!(d.record.payload.as_ref(), b"pinned");
+    }
+
+    #[test]
+    fn a_delayed_record_survives_a_restart_and_still_delivers_at_its_due_instant() {
+        // Due-time durability (#555): the resolved `DUE1` instant lives in the record's durable
+        // headers (broker-WALL anchored, like the TTL deadline), so a broker restart mid-delay
+        // changes nothing — the reopened broker still holds before the instant and delivers at it.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        let off = produce_delayed(&mut e, 0, Delay::from_millis(1_000), b"survives");
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+
+        // RESTART mid-delay (drop + reopen the same data dir; the wall clock keeps running).
+        let fs = e.into_filesystem();
+        clock.set_unix_millis(500);
+        let mut e =
+            Engine::open(fs, std::sync::Arc::clone(&clock), config_with_max_delay(0)).unwrap();
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "still un-due after the restart: the due instant is durable, not runtime state"
+        );
+        clock.set_unix_millis(1_000);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off);
+        assert_eq!(d.deliveries, 1);
+        assert_eq!(decode_due_headers(&d.record.headers), Some(1_000));
+    }
+
+    #[test]
+    fn a_delayed_record_is_held_and_released_on_a_named_stream() {
+        // The named-stream scan (#555 on `deliver_from_named_stream`): the hold + seq-order release
+        // apply to a named stream's own durable cursor exactly as to the default stream.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        let headers = encode_delay_headers(Delay::from_millis(400), b"");
+        e.produce_in_stream(
+            "jobs",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: &headers,
+                payload: b"named-later",
+            },
+        )
+        .unwrap();
+        let now = e.now_monotonic();
+        assert!(matches!(
+            e.poll_in_stream("jobs", "g", now).unwrap(),
+            Poll::Idle
+        ));
+        clock.set_unix_millis(399);
+        assert!(matches!(
+            e.poll_in_stream("jobs", "g", now).unwrap(),
+            Poll::Idle
+        ));
+        clock.set_unix_millis(400);
+        let d = message(e.poll_in_stream("jobs", "g", now).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"named-later");
+        assert_eq!(d.deliveries, 1, "held named polls never counted attempts");
+    }
+
+    #[test]
+    fn a_delayed_record_is_held_and_released_in_a_key_shared_group() {
+        // The key_shared member scan (#555 on `poll_in_member`): an un-due record is invisible to
+        // EVERY member (the peek-first path holds without claiming), then routes normally at due.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        e.set_key_ordering_in("ks", KeyOrdering::KeyShared).unwrap();
+        assert!(e.join_member_in("ks", MemberId::new(1)));
+        let headers = encode_delay_headers(Delay::from_millis(250), b"");
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"routing-key",
+            headers: &headers,
+            payload: b"keyed-later",
+        })
+        .unwrap();
+        assert!(matches!(
+            e.poll_now_in_member("ks", MemberId::new(1)).unwrap(),
+            Poll::Idle
+        ));
+        clock.set_unix_millis(250);
+        let d = message(e.poll_now_in_member("ks", MemberId::new(1)).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"keyed-later");
+        assert_eq!(d.deliveries, 1);
+    }
+
+    #[test]
+    fn a_delayed_record_is_held_and_released_in_a_partition() {
+        // The partition scan (#555 on `deliver_from_partition`): the hold + release apply per
+        // partition sub-log, and the resolution ran once at the produce chokepoint (the routed
+        // append stores the resolved instant).
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        e.declare_partitioned_stream("orders", 2).unwrap();
+        let pc = PartitionCount::new(2).unwrap();
+        let k0 = key_for_partition(0, pc);
+        let headers = encode_delay_headers(Delay::from_millis(300), b"");
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: &k0,
+                headers: &headers,
+                payload: b"part-later",
+            },
+        )
+        .unwrap();
+        let now = e.now_monotonic();
+        assert!(matches!(
+            e.poll_partition("orders", 0, "w", now).unwrap(),
+            Poll::Idle
+        ));
+        clock.set_unix_millis(300);
+        let d = message(e.poll_partition("orders", 0, "w", now).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"part-later");
+        assert_eq!(d.deliveries, 1);
+    }
+
+    #[test]
+    fn a_filtered_group_is_not_held_by_an_un_due_record_it_would_never_deliver() {
+        // The filter x delay order (#555): the subject-filter non-match skip runs BEFORE the due
+        // hold, so an un-due record this group will NEVER deliver cannot head-of-line block it —
+        // the group commits past it (the coalesced Filtered gap) and reaches later matches. A
+        // MATCHING un-due record still holds (checked before the match-stash, so a stash can never
+        // smuggle out an un-due record).
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_max_delay(0), std::sync::Arc::clone(&clock));
+        e.set_subject_filter_in("f", Some("wanted")).unwrap();
+        // An un-due record on a NON-matching subject, then a due record on the matching one.
+        let headers = encode_delay_headers(Delay::from_millis(10_000), b"");
+        e.produce_with_subject(
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: &headers,
+                payload: b"unwanted-and-late",
+            },
+            b"unwanted",
+        )
+        .unwrap();
+        e.produce_with_subject(
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"wanted-now",
+            },
+            b"wanted",
+        )
+        .unwrap();
+        // The non-matching un-due record is committed past as a filtered gap (never a hold)...
+        assert!(matches!(e.poll_now_in("f").unwrap(), Poll::Filtered { .. }));
+        // ...so the matching record behind it delivers immediately.
+        let d = message(e.poll_now_in("f").unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"wanted-now");
+    }
+
     #[test]
     fn a_max_deliver_dead_letter_with_no_exchange_is_byte_identical_v1() {
         // Back-compat (#551): with NO dead-letter exchange configured, the max-deliver dead-letter
@@ -19337,6 +19975,7 @@ mod tests {
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             default_message_ttl_ms: 1_000,
+            max_delay_ms: 0,
             dead_letter_exchange: Some(DeadLetterExchange::new(["dlx-unused"]).unwrap()),
             dead_letter_expired: false, // routing OFF: reclaim, do not dead-letter
             ..config(64, 5)

@@ -413,6 +413,12 @@ pub const KEY_TABLE: &[KeySpec] = &[
         key: "delivery.default_message_ttl_ms",
         kind: KeyKind::Duration,
     },
+    // V2-M4 delayed delivery (#555): the maximum accepted per-message delay. A `DLY1` request
+    // over it is rejected fail-closed at produce; `0` = unbounded (the serve default is 3 days).
+    KeySpec {
+        key: "delivery.max_delay_ms",
+        kind: KeyKind::Duration,
+    },
     KeySpec {
         key: "delivery.dead_letter_exchange",
         kind: KeyKind::Str,

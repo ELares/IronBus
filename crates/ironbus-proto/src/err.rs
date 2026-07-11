@@ -91,6 +91,10 @@ pub enum ServerErrorCode {
     Txn,
     /// `ERR_TXN_CHECK_UNAUTHORIZED`: a back-check answer was refused on ownership.
     TxnCheckUnauthorized,
+    /// `ERR_DELAY_TOO_LONG`: a publish carried a delayed-delivery request over the broker's
+    /// configured maximum delay (#555) — a permanent reject for that request; resubmit under the
+    /// bound.
+    DelayTooLong,
 }
 
 impl ServerErrorCode {
@@ -125,6 +129,7 @@ impl ServerErrorCode {
             "ERR_ZERO_MAX_IN_FLIGHT" => Self::ZeroMaxInFlight,
             "ERR_TXN" => Self::Txn,
             "ERR_TXN_CHECK_UNAUTHORIZED" => Self::TxnCheckUnauthorized,
+            "ERR_DELAY_TOO_LONG" => Self::DelayTooLong,
             _ => return None,
         };
         Some(code)
@@ -159,6 +164,7 @@ impl ServerErrorCode {
             Self::ZeroMaxInFlight => "ERR_ZERO_MAX_IN_FLIGHT",
             Self::Txn => "ERR_TXN",
             Self::TxnCheckUnauthorized => "ERR_TXN_CHECK_UNAUTHORIZED",
+            Self::DelayTooLong => "ERR_DELAY_TOO_LONG",
         }
     }
 }
@@ -301,6 +307,7 @@ mod tests {
             ServerErrorCode::ZeroMaxInFlight,
             ServerErrorCode::Txn,
             ServerErrorCode::TxnCheckUnauthorized,
+            ServerErrorCode::DelayTooLong,
         ] {
             assert_eq!(ServerErrorCode::from_token(code.as_token()), Some(code));
         }

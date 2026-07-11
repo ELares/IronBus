@@ -21,6 +21,7 @@ pub mod confirm;
 pub mod crc;
 pub mod cursor;
 pub mod dedup;
+pub mod delay;
 pub mod delivery;
 /// The trained-dictionary lifecycle compute (ZDICT training, content-addressed `dict_id`), behind
 /// the OPT-IN `zstd` feature. IO-free: the on-disk sidecar IO and the embedded set live above this

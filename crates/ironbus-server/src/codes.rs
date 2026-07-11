@@ -198,6 +198,11 @@ impl ErrorCode {
     /// Maps [`EngineError::TxnCheckUnauthorized`].
     pub const ERR_TXN_CHECK_UNAUTHORIZED: ErrorCode = ErrorCode("ERR_TXN_CHECK_UNAUTHORIZED");
 
+    /// A publish carried a delayed-delivery request over the broker's configured maximum delay
+    /// (V2-M4, #555): rejected fail-closed at the produce boundary (nothing appended), never
+    /// silently clamped. Maps [`EngineError::DelayTooLong`].
+    pub const ERR_DELAY_TOO_LONG: ErrorCode = ErrorCode("ERR_DELAY_TOO_LONG");
+
     /// Maps an [`EngineError`] to its stable code. The single source of truth the conformance
     /// vectors and any wire error-code scheme share. A storage error is split into the two named
     /// outcomes ([`Self::ERR_AT_CAPACITY`] for the byte-cap shed) plus the residual
@@ -226,6 +231,7 @@ impl ErrorCode {
             EngineError::ZeroMaxInFlight => Self::ERR_ZERO_MAX_IN_FLIGHT,
             EngineError::Txn(_) => Self::ERR_TXN,
             EngineError::TxnCheckUnauthorized => Self::ERR_TXN_CHECK_UNAUTHORIZED,
+            EngineError::DelayTooLong { .. } => Self::ERR_DELAY_TOO_LONG,
             EngineError::Storage(_) if error.is_at_capacity() => Self::ERR_AT_CAPACITY,
             EngineError::Storage(_) => Self::ERR_STORAGE,
         }
@@ -285,6 +291,7 @@ mod tests {
             ErrorCode::ERR_STORAGE,
             ErrorCode::ERR_TXN,
             ErrorCode::ERR_TXN_CHECK_UNAUTHORIZED,
+            ErrorCode::ERR_DELAY_TOO_LONG,
             ErrorCode::ERR_AT_CAPACITY,
             ErrorCode::ERR_NOT_ENOUGH_ISR,
             ErrorCode::ERR_PRODUCER_FENCED,
@@ -437,6 +444,13 @@ mod tests {
             (
                 EngineError::TxnCheckUnauthorized,
                 ErrorCode::ERR_TXN_CHECK_UNAUTHORIZED,
+            ),
+            (
+                EngineError::DelayTooLong {
+                    requested_ms: 1_000,
+                    max_ms: 500,
+                },
+                ErrorCode::ERR_DELAY_TOO_LONG,
             ),
             (
                 EngineError::Storage(StorageError::WriterFrozen),
