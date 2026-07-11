@@ -4847,6 +4847,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.compaction = config;
     }
 
+    /// Installs the tiered-storage backend + policy on the DEFAULT log (#643, V2-M10): the
+    /// [`ColdStore`](ironbus_storage::cold::ColdStore) offloaded sealed segments are uploaded to,
+    /// fetched from, and reaped from. Configured ONCE on a serve with tiered storage enabled; a
+    /// broker that never enables it never calls this, so the default log's on-disk image is
+    /// byte-for-byte unchanged. Phase 1 wires the default stream only; named/partition logs are a
+    /// follow-up (they materialize lazily and would each install at open). The actual offload runs on
+    /// the retention tick ([`Engine::reap_for_retention`]), serialized with reap/compaction.
+    pub fn set_cold_storage(
+        &mut self,
+        store: std::sync::Arc<dyn ironbus_storage::cold::ColdStore>,
+        config: ironbus_storage::cold::ColdStorageConfig,
+    ) {
+        self.log.set_cold_store(store, config);
+    }
+
     /// Declare a set of NAMED local streams as READ-ONLY cross-cluster MIRRORS (#623, V2-C7-I1): a
     /// client PRODUCE to any of these is rejected with [`EngineError::MirrorReadOnly`], so a mirror's
     /// only writer stays the geo mirror-apply path (single-writer preserved). Configured ONCE on a
@@ -10607,6 +10622,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // A frozen writer has no active segment; skip compaction rather than touch a dead log.
             let _ = self.log.maybe_compact(&self.compaction)?;
         }
+        // The OPT-IN tiered-storage offload (#643): after compaction, tier the cold sealed prefix out
+        // to the object store. A no-op (cheap early return) unless a backend is attached AND offload
+        // is enabled, so a non-tiered broker pays nothing. Runs here on the retention tick, serialized
+        // with reap/compaction on the append actor, upholding the crash-safe upload->manifest->delete
+        // ordering. Phase 1 tiers the default log only.
+        let _ = self.log.offload_cold_segments()?;
         Ok(())
     }
 

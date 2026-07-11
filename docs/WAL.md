@@ -186,8 +186,31 @@ directory of self-describing files is the authority, no manifest required").
   re-upgraded to v1, bounded to a single marker rewrite, so a bad marker never bricks an
   otherwise-valid data dir and never fabricates a future version.
 
+### 7. The `cold-manifest.ckpt` tiered-storage manifest (#643, opt-in)
+
+- Present ONLY when tiered storage (offload of cold SEALED segments to an object store) is
+  enabled AND at least one segment has been offloaded; a broker that never offloads has a
+  byte-for-byte unchanged data dir. It is a per-log file at the log's root.
+- Format: the same two-slot, CRC32C'd, alternating-write `Checkpoint` file
+  (`checkpoint.rs`, `ColdManifestCheckpoint`). Its payload is a 4-byte magic (`IBCM`), a
+  `u8` version, a `u32` entry count, and fixed 53-byte entries — one per offloaded segment,
+  carrying its id/base-offset/base-seq/record-count/max-timestamp/byte-length/CRC32C. See
+  [CONTRACTS.md](CONTRACTS.md) ("Cold-segment manifest snapshot").
+- Purpose: it records which SEALED segments are now REMOTE (offloaded), so a read can
+  transparently fetch one back and recovery can splice the offloaded (oldest) prefix into the
+  chain as PRESENT rather than tripping `SegmentChainBroken` on the absent files. It is the
+  COMMIT POINT of an offload: **upload the object → fsync the manifest REMOTE → THEN delete
+  the local file**, so a local segment is never unlinked before both its remote copy and its
+  manifest entry are durable. On a reap of a remote segment the manifest entry is removed
+  (fsync) first, then the object is deleted (no orphaned-object leak, no dangling pointer).
+- Load-bearing (like `reap.ckpt`/`bindings.ckpt`): a CRC-valid-but-undecodable manifest fails
+  the open closed (`StorageError::ColdManifestCorrupt`); a torn slot regresses to the prior
+  durable manifest.
+
 There is no other on-disk state. In particular there is no index sidecar, no time
-index, no `current` pointer file, and no manifest (all verified absent; see
+index, and no `current` pointer file; the only manifest is the opt-in tiered-storage
+`cold-manifest.ckpt` above (section 7), and it is absent from any log that never offloads.
+The Kafka-style per-record/per-segment INDEX manifest remains absent (see
 [below](#specified-but-not-yet-implemented)).
 
 ---

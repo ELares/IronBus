@@ -456,6 +456,46 @@ stream via declare-on-first-produce — identical to the live table's semantics.
 ignores the file entirely (bindings simply start empty, the historical behavior), so the artifact
 is ADDITIVE and downgrade-safe.
 
+### Cold-segment manifest snapshot (the checkpoint payload, #643 tiered storage)
+
+Source: `crates/ironbus-storage/src/cold.rs` (`ColdManifest::encode_payload` /
+`decode_payload`, `ColdEntry`); slot machinery `crates/ironbus-storage/src/checkpoint.rs`
+(`ColdManifestCheckpoint`, `COLD_MANIFEST_PAYLOAD` = 60 KiB per slot). This is the payload stored
+in `cold-manifest.ckpt` at a LOG's ROOT (per-log, one per data dir for the default log): the set of
+SEALED segments that have been offloaded to the object store ([`ColdStore`]) and are now REMOTE
+(their local `seg-<id>.log` may be absent), plus each one's fetch-verification metadata.
+
+| field       | type    | width    | notes |
+|-------------|---------|----------|-------|
+| `magic`     | bytes[4]| 4        | `IBCM` ("IronBus Cold Manifest"); a CRC-valid slot with a wrong magic is a corrupt manifest, never silently empty |
+| `version`   | u8      | 1        | cold-manifest version = 1; an UNKNOWN (higher) version fails the open closed, never a mis-decode |
+| `count`     | u32     | 4        | number of `entries[]` that follow |
+| `entries[]` | records | 53 each  | `count` fixed-width entries (id-ascending), each: `segment_id: u64`, `base_offset: u64`, `base_seq: u64`, `record_count: u64`, `max_timestamp_ms: u64`, `byte_len: u64` (the exact uploaded file length), `crc32c: u32` (over the whole uploaded segment file), `flags: u8` (bit 0 = compacted, reserved) |
+
+Durability discipline (the #643 contract, where a bug is PERMANENT DATA LOSS): the manifest is
+the COMMIT POINT of an offload. Per segment the ordering is **upload the bytes to the object store
+(durable) → record the segment REMOTE in the manifest and FSYNC it → only THEN delete the local
+`seg-<id>.log`** — a local segment is NEVER unlinked before BOTH its remote copy AND its manifest
+entry are durable. A crash before the manifest fsync recovers fully-local (the still-present local
+file is authoritative; the orphaned object is overwritten by an idempotent re-offload); a crash
+after it recovers fully-remote-and-recorded. On a retention reap of a remote segment the manifest
+entry is removed (fsync) FIRST, then the object is best-effort deleted, so a crash leaves at worst a
+bounded orphan object (no dangling REMOTE pointer). A fetch RE-VERIFIES the fetched bytes against
+`byte_len` + `crc32c` + a structural header/footer scan and fails closed (`StorageError::ColdCorrupt`)
+on any mismatch, so a corrupt object store never delivers garbage. UNLIKE the tolerant cursor
+family, this payload is LOAD-BEARING: a CRC-VALID slot that fails to decode (wrong magic, unknown
+version, malformed entry table) REFUSES the open (`StorageError::ColdManifestCorrupt`, the
+`reap.ckpt`/`bindings.ckpt` posture) rather than dropping remote pointers and then tripping
+`SegmentChainBroken` on the offloaded holes; a TORN slot (a never-committed write) regresses to the
+prior durable manifest. The file is created LAZILY on the first offload, so a broker that never
+offloads has a byte-for-byte unchanged disk image (the default-OFF conformance guarantee). At open,
+recovery SPLICES the manifest's offloaded (oldest, absent) prefix back into the chain so an
+offloaded segment recovers as PRESENT (never a torn gap), validating that the offloaded set abuts
+the local chain exactly. A pre-#643 broker cannot open a log whose oldest segments are offloaded (it
+would trip `SegmentChainBroken` on the absent files); a #643+ broker requires the object-store
+backend re-attached after a restart to read an offloaded segment (`StorageError::ColdStoreUnavailable`
+is surfaced fail-closed until it is).
+
 ---
 
 ## On-disk DLQ model

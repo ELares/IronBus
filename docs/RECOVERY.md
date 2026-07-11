@@ -648,7 +648,9 @@ oracle for a restore exactly as it is for a repair.
 - **`ironbus backup --data-dir <dir> --out <backup> [--json]`** — a **point-consistent**
   snapshot of the log + the consumer cursors + the DLQ (and every other durable
   artifact: `counters.ckpt`, `layout.meta`, the `dlq-redrive.ckpt` watermark, any
-  `streams/<name>/` subtree, the `quarantine/` store) captured at ONE logical point. It
+  `streams/<name>/` subtree, the `quarantine/` store, and — when tiered storage (#643)
+  is enabled — the `cold-manifest.ckpt` that records which sealed segments are offloaded
+  REMOTE) captured at ONE logical point. It
   takes the **EXCLUSIVE data-dir lock** first (exit **5** if a broker is running — a
   running broker's data dir is not a consistent point), and because the broker is
   stopped and the lock is held, the on-disk checkpoints are SETTLED: capturing all three

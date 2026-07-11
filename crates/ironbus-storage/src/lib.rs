@@ -4,6 +4,11 @@
 
 pub mod admin;
 pub mod checkpoint;
+/// Tiered storage (#643, V2-M10): the [`cold::ColdStore`] seam for offloading cold, immutable SEALED
+/// segments to an object store, its local-directory [`cold::FsColdStore`] backend, the offload
+/// policy ([`cold::ColdStorageConfig`]), and the durable per-log [`cold::ColdManifest`]. Absent from
+/// the on-disk image of any log that never enables offload (default-OFF, byte-identical).
+pub mod cold;
 pub mod compaction;
 /// The on-disk trained-dictionary sidecar store and resolver (`dicts/<dict_id>.zstd`), behind the
 /// OPT-IN `zstd` feature (#357, `docs/DICTIONARY_LIFECYCLE.md` §3-§4). Absent from the default build.

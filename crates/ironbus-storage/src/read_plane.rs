@@ -160,6 +160,11 @@ pub(crate) struct SealedSegment {
     /// falls back to the actor for it). A snapshot can include the slot so the offset-to-segment
     /// search stays exact across a compacted hole, but a read of it reports a fallback.
     pub(crate) compacted: bool,
+    /// `true` for a REMOTE (offloaded to a cold store, #643) segment, whose local bytes may be
+    /// absent. Like a compacted slot, this plane does NOT serve it: a read falls back to the actor,
+    /// which restores the segment from the cold store on access. The slot is carried (with no
+    /// anchors) so the snapshot's offset-to-segment search stays exact across the offloaded range.
+    pub(crate) remote: bool,
     /// The SPARSE `(offset, frame START byte position)` anchors, ascending by offset: one per
     /// `stride` bytes of frame data (#537). Empty for a compacted slot. A read seeks to the nearest
     /// anchor at or before the target and scans forward at most one stride to it.
@@ -418,9 +423,11 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
             if out.len() >= max_records {
                 break;
             }
-            // A COMPACTED (v2, sparse) slot is served by the through-actor v2 scan, not this plane:
-            // hand the remainder back from this segment's covered base (clamped to `start`).
-            if slot.compacted {
+            // A COMPACTED (v2, sparse) slot is served by the through-actor v2 scan, not this plane;
+            // a REMOTE (offloaded, #643) slot is likewise served by the actor (which restores it from
+            // the cold store). Either way hand the remainder back from this segment's covered base
+            // (clamped to `start`).
+            if slot.compacted || slot.remote {
                 fallback_from = Some(start.max(slot.base_offset));
                 break;
             }
@@ -533,9 +540,10 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         let slot_index = self.segment_index_for(start);
         let slot = &self.segments[slot_index];
         let seg_start = start.max(slot.base_offset);
-        // A COMPACTED (v2, sparse) slot is served by the through-actor v2 scan, not this plane: a
-        // sparse survivor run is not a dense contiguous byte range, so hand the remainder back.
-        if slot.compacted {
+        // A COMPACTED (v2, sparse) slot is served by the through-actor v2 scan, not this plane; a
+        // REMOTE (offloaded, #643) slot is served by the actor (which restores it from the cold
+        // store). Either way hand the remainder back.
+        if slot.compacted || slot.remote {
             return Ok(empty(Some(seg_start)));
         }
         let Some((anchor_offset, byte_pos)) = slot.seek_anchor(seg_start) else {
