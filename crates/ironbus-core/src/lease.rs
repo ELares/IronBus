@@ -501,6 +501,23 @@ impl LeaseTable {
         }
     }
 
+    /// Shifts every live lease's clock forward by `delta` nanoseconds — BOTH the deadline and the
+    /// attempt start — the consumer-pause resume seam (#771): a paused group's lease clock is
+    /// STOPPED for the paused span, so on resume each in-flight lease keeps exactly the remaining
+    /// visibility it had when the pause began (a lease with 10 s left before a 60 s pause has 10 s
+    /// left after it, not an instant expiry). Shifting `attempt_start` alongside the deadline also
+    /// stops the per-attempt HARD-CAP clock (`extend` clamps to `attempt_start + hard_cap`), so a
+    /// post-resume `progress` extends against the same in-attempt budget it had unpaused, and the
+    /// `deadline <= attempt_start + hard_cap` invariant is preserved unchanged. Saturating, so a
+    /// pathological delta can never wrap a deadline backwards. Generations, delivery counts, and
+    /// the carried attempt set are untouched (a pause is not a delivery event).
+    pub fn shift_deadlines(&mut self, delta: u64) {
+        for lease in self.leases.values_mut() {
+            lease.deadline = lease.deadline.saturating_add(delta);
+            lease.attempt_start = lease.attempt_start.saturating_add(delta);
+        }
+    }
+
     /// The offsets whose visibility has expired at `now` (deadline at or before `now`),
     /// in ascending order. These are reclaimable: the janitor redelivers them by
     /// claiming them again.
@@ -925,6 +942,53 @@ mod tests {
         match t.claim(off(7), 30) {
             Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 2),
             other => panic!("at-deadline should redeliver, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_deadlines_preserves_remaining_visibility_and_the_hard_cap_budget() {
+        // #771: the pause-resume seam. A lease claimed at 0 (deadline 30) is paused at 10 for a
+        // 1000 ns span; after the shift its remaining visibility is exactly the 20 ns it had left.
+        let mut t = LeaseTable::new(cfg()); // visibility 30, hard cap 100
+        let tok = token(t.claim(off(0), 0));
+        t.shift_deadlines(1000);
+        // Still held at the instant the pause would have expired it un-shifted...
+        assert!(
+            t.holds_active(&tok, 1005),
+            "the paused span did not expire it"
+        );
+        assert!(t.holds_active(&tok, 1029), "remaining visibility preserved");
+        // ...and expires exactly when the ORIGINAL remaining 20 ns (from the pause point 10,
+        // shifted to 1010) elapse: deadline 30 + 1000 = 1030.
+        assert!(
+            !t.holds_active(&tok, 1030),
+            "expires after the shifted deadline"
+        );
+        // The hard-cap clock shifted too: the cap is now attempt_start (1000) + 100 = 1100, so an
+        // extend at 1090 clamps to 1100 (the same in-attempt budget it had unpaused) and the cap
+        // is reached at 1100, NOT at the pre-shift 100.
+        assert_eq!(t.extend(&tok, 1029), ExtendOutcome::Extended(1059));
+        assert_eq!(t.extend(&tok, 1090), ExtendOutcome::Extended(1100));
+        assert_eq!(t.extend(&tok, 1100), ExtendOutcome::CapReached);
+        // The token still owns the lease (no generation was consumed) and acks cleanly.
+        assert_eq!(t.ack(&tok), AckOutcome::Acked);
+    }
+
+    #[test]
+    fn shift_deadlines_touches_neither_counts_nor_carried_state() {
+        // A shift is not a delivery: the attempt count, the redelivery-dirtiness counter, and the
+        // carried set are all untouched, so pause/resume can never perturb MaxDeliver accounting.
+        let mut t = LeaseTable::new(cfg());
+        t.resume_attempts([(off(5).get(), 3)]);
+        let tok = token(t.claim(off(0), 0));
+        let dirty_before = t.redeliveries_since_flush();
+        t.shift_deadlines(500);
+        assert_eq!(t.deliveries(&tok), Some(1), "attempt count unchanged");
+        assert_eq!(t.redeliveries_since_flush(), dirty_before);
+        // The carried count is consumed by the NEXT claim exactly as before the shift.
+        match t.claim(off(5), 0) {
+            Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 4, "carried resume intact"),
+            other => panic!("expected Granted, got {other:?}"),
         }
     }
 

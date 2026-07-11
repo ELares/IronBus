@@ -64,12 +64,12 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
     decode_not_leader, decode_pub_ack, decode_stream_info_response, encode_ack, encode_connect,
-    encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_to, encode_stream_commit,
-    encode_stream_declare, encode_stream_fetch, encode_stream_info, encode_sub, encode_sub_to,
-    encode_txn_prepare, encode_txn_resolve, AckBody, AckLevel, AckOp, ConnectBody, ConsumeTier,
-    CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody, StreamCommitBody,
-    StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody, TxnPrepareBody,
-    TxnResolveBody,
+    encode_cumulative_ack, encode_fetch, encode_pause_group, encode_pub, encode_pub_to,
+    encode_stream_commit, encode_stream_declare, encode_stream_fetch, encode_stream_info,
+    encode_sub, encode_sub_to, encode_txn_prepare, encode_txn_resolve, AckBody, AckLevel, AckOp,
+    ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PauseGroupBody, PubBody,
+    PubToBody, StreamCommitBody, StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody,
+    SubToBody, TxnPrepareBody, TxnResolveBody,
 };
 // The connection-scoped auth encoder (#631, #884): appends the auth section the broker verifies to
 // an already-encoded `Connect` body. A verbatim port of the sync client's `connect_with` auth wiring;
@@ -1337,6 +1337,53 @@ impl AsyncClient {
             (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
+    }
+
+    /// PAUSES delivery for the named work-group `group` of `stream` for `pause_ms` milliseconds
+    /// (#771, the `PauseGroup` verb): the async port of [`ironbus_client::Client::pause_group`].
+    /// The empty stream name addresses the default stream; `pause_ms = 0` is exactly
+    /// [`AsyncClient::resume_group`]. The broker gates the group's delivery until the window
+    /// elapses (auto-resume) or an explicit resume, with the group's cursor, in-flight leases
+    /// (their visibility clock stopped for the paused span), and subscriptions intact. Requires
+    /// the `admin` scope on an auth-enabled broker; a NAMED stream additionally requires the
+    /// negotiated streams capability.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the broker rejects the pause (a malformed/default group
+    /// name, an unknown stream, the group cap, or a missing scope/capability),
+    /// [`ClientError::Body`] on an over-large field, or a frame/connection error.
+    pub async fn pause_group(
+        &mut self,
+        stream: &str,
+        group: &str,
+        pause_ms: u64,
+    ) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_pause_group(
+            &PauseGroupBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+                pause_ms,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::PauseGroup, &body).await?;
+        match self.read_frame().await? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// RESUMES delivery for a paused work-group immediately (#771): sugar for
+    /// [`AsyncClient::pause_group`] with `pause_ms = 0`. A no-op success on a group that is not
+    /// paused.
+    ///
+    /// # Errors
+    /// As [`AsyncClient::pause_group`].
+    pub async fn resume_group(&mut self, stream: &str, group: &str) -> Result<(), ClientError> {
+        self.pause_group(stream, group, 0).await
     }
 
     /// Queries a NAMED stream's existence and durable head (#588): the `StreamInfo` verb. The async port

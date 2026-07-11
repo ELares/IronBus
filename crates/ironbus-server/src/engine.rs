@@ -2873,6 +2873,35 @@ struct WorkGroup {
     /// exactly once. The stashed lease stays in-flight (at-least-once unaffected), and a stash is
     /// only ever set for a `Deliver` disposition, so it never bypasses dead-lettering.
     pending_match: Option<Delivery>,
+    /// The group's PAUSE window (#771, V2-M1): `Some` while an operator `PauseGroup` is in force,
+    /// `None` otherwise (the default: delivery gated by nothing). While paused, every delivery
+    /// path ([`Engine::poll_in`], [`Engine::poll_in_member`], the named-stream twin, and the
+    /// Tier-S [`Engine::stream_fetch_in`] family) returns idle/empty WITHOUT scanning, claiming,
+    /// or expiring anything, so the group's leases, cursor, acked-ahead set, and subscriptions
+    /// are untouched — a pause is a delivery GATE on the group, not flow control on a connection
+    /// (that is `Flow` credit, #292, which never outlives the connection). The pause AUTO-RESUMES
+    /// when the deadline passes: the first delivery-path touch at or after `until` shifts the
+    /// lease clock forward by the paused span ([`LeaseTable::shift_deadlines`]) — so an in-flight
+    /// lease keeps exactly the remaining visibility it had when the pause began, and no lease can
+    /// expire *during* a pause (expiry is only ever observed on the gated delivery paths) — and
+    /// clears the window. In-memory only, like `broadcast`/`router`/`streaming`/`filter`: a pause
+    /// survives consumer reconnects (it is group state, not connection state) but not a broker
+    /// restart. A paused group is never idle-evicted mid-pause (#277 interplay): the pause is an
+    /// explicit operator hold, so [`Engine::is_evictable`] refuses it until the window elapses.
+    paused: Option<GroupPause>,
+}
+
+/// A work-group's live pause window (#771): the monotonic instant the pause BEGAN (`paused_at`,
+/// the moment the lease clock stopped) and the instant it AUTO-RESUMES (`until`). The paused span
+/// applied to the lease clock on resume is exactly `until - paused_at` for an auto-resume, or
+/// `now - paused_at` for an explicit early resume (`pause_ms = 0`), so the clock is stopped for
+/// precisely as long as delivery was actually gated.
+#[derive(Clone, Copy, Debug)]
+struct GroupPause {
+    /// Monotonic nanoseconds when the pause began (the lease clock stop point).
+    paused_at: u64,
+    /// Monotonic nanoseconds when the pause auto-resumes (delivery un-gates at or after this).
+    until: u64,
 }
 
 /// What happens to an evicted group's `group_last_checkpointed` entry (#432): `Keep` leaves it
@@ -2918,7 +2947,86 @@ impl WorkGroup {
             filter: None,
             // No stashed filtered match on a fresh/resumed group.
             pending_match: None,
+            // Not paused (#771): a fresh/resumed group delivers. Like the other group modes the
+            // pause window is in-memory only, never restored from disk.
+            paused: None,
         }
+    }
+
+    /// Whether this group's delivery is CURRENTLY gated by a pause (#771), settling an elapsed
+    /// window as a side effect: `true` while `now` is inside the pause window (the caller must
+    /// return idle/empty WITHOUT scanning or claiming); `false` once no pause is in force — and if
+    /// the window just ELAPSED, the auto-resume is applied HERE, exactly once: the lease clock is
+    /// shifted forward by the paused span (`until - paused_at`, see
+    /// [`LeaseTable::shift_deadlines`]) so every in-flight lease resumes with the remaining
+    /// visibility it had when the pause began, and the window is cleared. Lazy settlement is
+    /// exact, not approximate: leases are only ever OBSERVED to expire on the delivery paths and
+    /// the eviction sweep, and every one of those calls through here first, so no observer can see
+    /// an un-shifted deadline after a pause.
+    fn pause_active(&mut self, now: u64) -> bool {
+        let Some(p) = self.paused else {
+            return false;
+        };
+        if now < p.until {
+            return true;
+        }
+        // The window elapsed: auto-resume. Shift the lease clock by exactly the paused span, so
+        // the stop-the-clock contract holds (#771), then clear the window.
+        self.leases
+            .shift_deadlines(p.until.saturating_sub(p.paused_at));
+        self.paused = None;
+        false
+    }
+
+    /// The instant at which lease EXPIRY should be observed for this group at wall instant `now`
+    /// (#771), for IMMUTABLE readers that cannot settle a pause window themselves (e.g. the
+    /// per-consumer credit seam [`Engine::holds_active_lease_in`]): while MID-pause the lease
+    /// clock is stopped, so expiry is observed as of the pause instant (`paused_at` — nothing can
+    /// have expired since); after an ELAPSED-but-unsettled window the pending settlement will
+    /// shift every deadline forward by the paused span, which is exactly equivalent to observing
+    /// the un-shifted deadlines at `now - span`. This keeps every reader in exact agreement with
+    /// what the delivery paths observe after [`WorkGroup::pause_active`] settles.
+    fn lease_observe_now(&self, now: u64) -> u64 {
+        match self.paused {
+            Some(p) if now < p.until => p.paused_at,
+            Some(p) => now.saturating_sub(p.until.saturating_sub(p.paused_at)),
+            None => now,
+        }
+    }
+
+    /// Applies a `PauseGroup` verb to this group at monotonic `now` (#771): `pause_ms > 0` starts
+    /// (or re-arms) a pause ending at `now + pause_ms`; `pause_ms == 0` RESUMES immediately.
+    /// Returns the monotonic instant delivery (re)starts: the new `until` for a pause, `now` for a
+    /// resume. The state machine keeps the stop-the-clock accounting exact across every path:
+    /// - An ELAPSED-but-unsettled prior window is settled FIRST (via [`WorkGroup::pause_active`]),
+    ///   so re-pausing after an unobserved auto-resume never double-counts the old span.
+    /// - Re-arming MID-pause (extend or shorten) keeps the ORIGINAL `paused_at`: the clock has
+    ///   been stopped since the first pause instant and stays stopped; only the deadline moves.
+    /// - An explicit resume mid-pause shifts the lease clock by the span the clock was ACTUALLY
+    ///   stopped (`now - paused_at`), not the un-served remainder.
+    fn apply_pause(&mut self, now: u64, pause_ms: u64) -> u64 {
+        // Settle a window that already elapsed on its own (nobody polled since), so the arithmetic
+        // below always starts from a coherent "paused or not" state.
+        let _ = self.pause_active(now);
+        if pause_ms == 0 {
+            if let Some(p) = self.paused.take() {
+                // Explicit early resume: the clock was stopped for [paused_at, now].
+                self.leases.shift_deadlines(now.saturating_sub(p.paused_at));
+            }
+            return now;
+        }
+        let until = now.saturating_add(pause_ms.saturating_mul(1_000_000));
+        match self.paused.as_mut() {
+            // Mid-pause re-arm: the clock stays stopped from the ORIGINAL instant.
+            Some(p) => p.until = until,
+            None => {
+                self.paused = Some(GroupPause {
+                    paused_at: now,
+                    until,
+                });
+            }
+        }
+        until
     }
 }
 
@@ -7597,6 +7705,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             Some(g) => {
                 g.last_activity = now;
                 g.touched = true;
+                // The PAUSE gate (#771), the named-stream twin of the `poll_in` gate — one gate
+                // here covers BOTH named poll entries (plain and member-aware): a paused named
+                // group's poll is Idle without scanning, claiming, or observing lease expiry.
+                if g.pause_active(now) {
+                    return Ok(Poll::Idle);
+                }
                 if let Some(d) = g.pending_match.take() {
                     Setup::Stashed(d)
                 } else {
@@ -10170,6 +10284,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
         let flushed = self.log.flushed_offset().get();
         let window = self.group_idle_evict_nanos;
+        // Settle any ELAPSED pause window first (#771): the auto-resume lease-clock shift is
+        // applied lazily and the sweep is an expiry observer, so it must never judge a group
+        // through an un-settled window. After this pass, `paused.is_some()` in `is_evictable`
+        // means exactly "mid-pause", which is the never-evict operator hold.
+        for g in self.groups.values_mut() {
+            let _ = g.pause_active(now);
+        }
         // Collect the evictable names first (an immutable borrow), then evict them (a mutable
         // borrow): a BTreeMap cannot be mutated while iterated. The evictable set is bounded by the
         // group cap, so the temporary vector is small.
@@ -10250,6 +10371,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if group.router.is_some() {
             return false;
         }
+        // A PAUSED group is never evicted (#771): the pause is an explicit operator hold on
+        // in-memory group state, and evicting would silently drop it (the mode is not durable).
+        // Callers settle elapsed windows before this predicate, so `Some` means mid-pause.
+        if group.paused.is_some() {
+            return false;
+        }
         // Fully caught up: committed at the head with no acked-ahead set. A BEHIND group (committed
         // below the head, or holding an out-of-order acked-ahead set above the head it has not yet
         // bridged) is never evicted, so re-creation can never lose its position or redeliver.
@@ -10301,7 +10428,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return false;
         }
         let flushed = self.log.flushed_offset().get();
-        let Some(g) = self.groups.get(group) else {
+        let now = self.log.now_monotonic();
+        let Some(g) = self.groups.get_mut(group) else {
             // The group is not live: it may have been sweep-evicted earlier while this connection
             // stayed subscribed, leaving a GHOST floor entry (#432). The explicit Unsub is the
             // consumer renouncing the position, so release the ghost here. Safe to remove
@@ -10317,6 +10445,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.group_last_checkpointed.remove(group);
             return false;
         };
+        // Settle an ELAPSED pause window first (#771), exactly as the sweep does, so the predicate
+        // below never judges the group through an un-settled window. A group still MID-pause is
+        // refused by `is_evictable` (the pause is an operator hold that outlives the subscriber —
+        // that is the point of a pause surviving reconnects), and the natural sweep reclaims it
+        // after the window elapses if it stays idle.
+        let _ = g.pause_active(now);
         // `now == last_activity` with a window of 0 makes the idle clause vacuously true, so the
         // predicate reduces to exactly the position-safety clauses; the explicit Unsub is what
         // authorizes skipping the idle wait.
@@ -10419,6 +10553,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // poll (deliverable or idle) keeps the polled group alive against the next sweep.
         g.last_activity = now;
         g.touched = true;
+        // The PAUSE gate (#771): a paused group's poll is Idle WITHOUT scanning, claiming, or
+        // observing lease expiry — the stashed match, truncation reset, and redelivery scan below
+        // are all deferred until the window elapses (auto-resume, settled inside the gate) or an
+        // explicit resume. Placed AFTER the activity stamp so a polled-while-paused group is never
+        // idle-evicted out from under its pause.
+        if g.pause_active(now) {
+            return Ok(Poll::Idle);
+        }
         // Deliver a match a prior filtered scan STASHED after flushing its coalesced gap (#594),
         // BEFORE anything else: the record was already read and leased, so this is a zero-read
         // delivery of the match that immediately follows the just-emitted gap. Drained first so it
@@ -11241,6 +11383,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // current is consistent and cheap.
         g.last_activity = now;
         g.touched = true;
+        // The PAUSE gate (#771), the key_shared twin of the plain-competing gate in `poll_in`: a
+        // paused group's poll is Idle without scanning, routing, or observing lease expiry.
+        if g.pause_active(now) {
+            return Ok(Poll::Idle);
+        }
         let committed = g.cursor.committed().get();
         // The same below-earliest truncation signal as poll_in (#84): reset the cursor up to the
         // oldest retained record and surface the truncation once. The router's in-flight key map is
@@ -11747,6 +11894,117 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.groups.get(group).is_some_and(|g| g.streaming)
     }
 
+    /// PAUSES (or RESUMES) delivery for the named work-group `group` (#771, V2-M1, the `PauseGroup`
+    /// verb): `pause_ms > 0` suspends every delivery path — the Tier-W [`Engine::poll_in`] /
+    /// [`Engine::poll_in_member`] scan AND the Tier-S [`Engine::stream_fetch_in`] read — until
+    /// `now + pause_ms` (the AUTO-RESUME deadline), then delivery continues by itself; `pause_ms ==
+    /// 0` resumes a paused group immediately. Returns the monotonic instant delivery (re)starts.
+    ///
+    /// The pause is a delivery GATE on the group, not flow control on a connection: the group's
+    /// committed cursor, acked-ahead set, in-flight leases, and subscriptions are all untouched,
+    /// acks/nacks/progress on already-delivered messages still apply, and the gate survives
+    /// consumer reconnects (it is group state). The in-flight LEASE CLOCK IS STOPPED for the
+    /// paused span: no lease can be observed to expire while paused (expiry is only observed on
+    /// the gated delivery paths), and on resume every lease's deadline — and its per-attempt
+    /// hard-cap budget — is shifted by exactly the paused span, so a lease with 10 s of visibility
+    /// left before the pause has 10 s left after it. Re-issuing a pause MID-pause re-arms the
+    /// deadline (extend or shorten) without restarting the clock accounting. In-memory only, like
+    /// the other group modes (`broadcast`/`key_shared`/`streaming`/`filter`): re-apply after a
+    /// broker restart. Distinct from `Flow` credit (#292, the deliberately dropped draft
+    /// `Flow.pause` field): credit is per-connection and dies with it; this is the explicit typed
+    /// per-group control.
+    ///
+    /// An absent group is CREATED (validated name, under the group cap), mirroring the other mode
+    /// setters — an operator may pause a group BEFORE its consumers arrive, and the pause is
+    /// then already in force at their first poll. The default/empty group is refused (it is the
+    /// wire's implicit unnamed group; pausing it would gate every bare-`Flow` consumer at once —
+    /// name a group to pause it), via the same [`EngineError::InvalidGroupName`] every empty-name
+    /// consumer op maps to.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidGroupName`] for the default/empty or a malformed group name,
+    /// [`EngineError::TooManyGroups`] if creating the group would exceed the cap, or a storage
+    /// error resuming a durable cursor for a re-created group.
+    pub fn pause_group_in(&mut self, group: &str, pause_ms: u64) -> Result<u64, EngineError> {
+        // Validate FIRST and unconditionally: the empty (default) group is refused even though it
+        // always exists, and a malformed name never creates anything.
+        validate_group_name(group)?;
+        let now = self.log.now_monotonic();
+        if !self.groups.contains_key(group) {
+            if self.max_groups != 0 && self.groups.len() >= self.max_groups {
+                return Err(EngineError::TooManyGroups {
+                    max: self.max_groups,
+                });
+            }
+            // Create-or-durable-resume, exactly like the poll path (#277): pausing a group that
+            // was idle-evicted resumes its checkpointed cursor, so the pause never resets one.
+            self.ensure_group(group, now)?;
+        }
+        let Some(g) = self.groups.get_mut(group) else {
+            // Unreachable: `ensure_group` just inserted it. Kept as a typed error, never a panic.
+            return Err(EngineError::InvalidGroupName);
+        };
+        // A pause/resume is an operator interaction: refresh the idle stamp so the sweep never
+        // reaps the group between the verb and its window (#277). The pause itself also blocks
+        // eviction while in force (see `is_evictable`).
+        g.last_activity = now;
+        Ok(g.apply_pause(now, pause_ms))
+    }
+
+    /// The NAMED-stream twin of [`Engine::pause_group_in`] (#771): pauses/resumes `group` OF the
+    /// named `stream`, gating that stream's Tier-W poll ([`Engine::poll_in_stream`] /
+    /// [`Engine::poll_in_stream_member`]) and Tier-S fetch ([`Engine::stream_fetch_in_stream`])
+    /// paths. It lives on that stream's own [`WorkGroup`], so the same group name in two streams
+    /// pauses independently. Mirrors [`Engine::set_streaming_in_stream`]: the named `stream` must
+    /// already be resident (declared via produce/bind — a pause never creates a stream), the
+    /// stream's group is created if absent (validated name, under the PER-STREAM group cap), and
+    /// the default stream (`""`) routes to [`Engine::pause_group_in`] BYTE-FOR-BYTE.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed stream name, [`EngineError::UnknownStream`]
+    /// for a never-declared stream, or as [`Engine::pause_group_in`].
+    pub fn pause_group_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        pause_ms: u64,
+    ) -> Result<u64, EngineError> {
+        if stream.is_empty() {
+            return self.pause_group_in(group, pause_ms);
+        }
+        let id = StreamId::named(stream)?;
+        // Reopen a KNOWN stream the hot-set LRU evicted, else reject a never-declared one: a pause
+        // is a consumer-state op, so it resumes an evicted stream but never creates a new one
+        // (matching the named poll/fetch entry points).
+        if !self.ensure_named_stream_resident(&id)? {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        validate_group_name(group)?;
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        let lease_config = self.lease_config;
+        let max_groups = self.max_groups;
+        let named = self
+            .named_streams
+            .entry(id)
+            .or_insert_with(NamedStream::new);
+        if !named.groups.contains_key(group) {
+            if max_groups != 0 && named.groups.len() >= max_groups {
+                return Err(EngineError::TooManyGroups { max: max_groups });
+            }
+            named
+                .groups
+                .insert(group.to_string(), WorkGroup::new(lease_config, now));
+        }
+        let Some(g) = named.groups.get_mut(group) else {
+            // Unreachable: just inserted. Typed, never a panic.
+            return Err(EngineError::InvalidGroupName);
+        };
+        g.last_activity = now;
+        Ok(g.apply_pause(now, pause_ms))
+    }
+
     /// The NAMED-stream twin of [`Engine::set_streaming_in`] (#681 follow-up, Tier-S for named streams):
     /// marks `group` OF the named `stream` a TIER-S STREAMING consumer (or clears it). A streaming named
     /// group is served by [`Engine::stream_fetch_in_stream`] / [`Engine::stream_commit_in_stream`] off
@@ -12234,6 +12492,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if let Some(g) = self.groups.get_mut(group) {
             g.last_activity = now;
             g.touched = true;
+            // The PAUSE gate (#771), the Tier-S twin of the `poll_in` gate: a paused streaming
+            // group's fetch is an EMPTY batch (resuming at the caller's own offset, so nothing is
+            // skipped) without reading the log. A streaming group holds no leases, so the gate is
+            // pure delivery suppression here.
+            if g.pause_active(now) {
+                return Ok(StreamBatch {
+                    records: Vec::new(),
+                    next_offset: start_offset,
+                });
+            }
         }
         // The contiguous read off the durable, flushed prefix. `Log::read_range` bounds the read by the
         // flushed frontier (no un-flushed record is served), `max_records`, and `max_bytes`, and
@@ -12334,6 +12602,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if let Some(g) = self.named_group_mut(&id, group) {
             g.last_activity = now;
             g.touched = true;
+            // The PAUSE gate (#771), the named Tier-S twin of the `stream_fetch_in` gate: a paused
+            // named streaming group's fetch is an EMPTY batch at the caller's own offset.
+            if g.pause_active(now) {
+                return Ok(StreamBatch {
+                    records: Vec::new(),
+                    next_offset: start_offset,
+                });
+            }
         }
         // The contiguous read off THIS stream's durable, flushed prefix — the SAME `Log::read_range`
         // primitive the default streaming fetch and the Tier-W named poll use. NO lease, NO cursor write.
@@ -12389,6 +12665,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if let Some(g) = self.groups.get_mut(group) {
             g.last_activity = now;
             g.touched = true;
+            // The PAUSE gate (#771), identical to `stream_fetch_in`'s: a paused streaming group's
+            // raw fetch is an EMPTY batch at the caller's own offset, no log read.
+            if g.pause_active(now) {
+                return Ok(StreamRawBatch {
+                    raw: RawByteRun {
+                        bytes: bytes::Bytes::new(),
+                        first_offset: start_offset,
+                        record_count: 0,
+                        next_offset: start_offset,
+                    },
+                    tail: Vec::new(),
+                    next_offset: start_offset,
+                });
+            }
         }
         // The contiguous SEALED prefix as raw on-disk frame bytes (zero-copy, no body decode), plus the
         // resume point for anything this single-segment raw read did not serve.
@@ -12488,6 +12778,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if let Some(g) = self.named_group_mut(&id, group) {
             g.last_activity = now;
             g.touched = true;
+            // The PAUSE gate (#771), identical to the default-stream raw fetch's: a paused named
+            // streaming group's raw fetch is an EMPTY batch at the caller's own offset.
+            if g.pause_active(now) {
+                return Ok(StreamRawBatch {
+                    raw: RawByteRun {
+                        bytes: bytes::Bytes::new(),
+                        first_offset: start_offset,
+                        record_count: 0,
+                        next_offset: start_offset,
+                    },
+                    tail: Vec::new(),
+                    next_offset: start_offset,
+                });
+            }
         }
         let Some(log) = self.streams.get(&id) else {
             return Err(EngineError::UnknownStream {
@@ -13117,9 +13421,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn holds_active_lease_in(&self, group: &str, token: &LeaseToken) -> bool {
         let now = self.log.now_monotonic();
+        // Observe expiry through the group's PAUSE lens (#771): while the group is paused the
+        // lease clock is stopped, so a generation-matching lease stays ACTIVE for the whole window
+        // (its slot is not freed, and no redelivery can occur while delivery is gated) — this
+        // reader agrees exactly with what the delivery paths observe after the window settles.
         self.groups
             .get(group)
-            .is_some_and(|g| g.leases.holds_active(token, now))
+            .is_some_and(|g| g.leases.holds_active(token, g.lease_observe_now(now)))
     }
 
     /// Per-work-group consumer stats for the metrics endpoint (#16): committed offset and
@@ -21537,6 +21845,273 @@ mod tests {
             1,
             "the durable dead-letter record survives"
         );
+    }
+
+    // ---- Consumer pause/resume (#771) ------------------------------------------------------------
+    //
+    // These tests drive delivery through the explicit-`now` poll argument (deterministic, exactly
+    // like the idle-eviction tests above) and anchor the pause window on the engine's ManualClock,
+    // which stays at 0 unless a test advances an Arc-shared clock explicitly. Times are plain
+    // nanoseconds on ONE monotonic scale; the shared test lease config is 30 ns visibility / 100 ns
+    // hard cap, and a pause of `p` ms gates delivery until `p * MS` nanoseconds.
+
+    #[test]
+    fn a_paused_group_delivers_nothing_and_auto_resumes_at_the_deadline() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        // Pause "g" for 10 ms, anchored at the engine clock (0): delivery gates until 10 * MS.
+        let resumes_at = e.pause_group_in("g", 10).unwrap();
+        assert_eq!(resumes_at, 10 * MS);
+        let before = e.committed_offset_in("g");
+        // A deliverable record exists, but every paused poll is Idle, right up to the deadline...
+        assert!(matches!(e.poll_in("g", 0).unwrap(), Poll::Idle));
+        assert!(matches!(e.poll_in("g", 10 * MS - 1).unwrap(), Poll::Idle));
+        assert_eq!(
+            e.committed_offset_in("g"),
+            before,
+            "the cursor is untouched"
+        );
+        assert_eq!(e.in_flight(), 0, "nothing was claimed while paused");
+        // ...and AT the deadline the pause auto-resumes: the very same poll path delivers.
+        let d = message(e.poll_in("g", 10 * MS).unwrap());
+        assert_eq!(d.deliveries, 1);
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+    }
+
+    #[test]
+    fn a_pause_stops_the_lease_clock_so_no_redelivery_fires_mid_pause() {
+        // Claimed at now=0, the lease would expire at 30 ns un-paused and the next poll would
+        // redeliver. Paused for 1 ms anchored at 0, NO poll can observe that expiry during the
+        // window, and on auto-resume the lease clock has shifted by the full paused span, so the
+        // message redelivers only after its REMAINING visibility elapses — the stop-the-clock
+        // contract.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let d1 = message(e.poll_in("g", 0).unwrap()); // lease deadline 30
+        e.pause_group_in("g", 1).unwrap(); // paused_at 0, until 1 * MS
+                                           // Far past the un-shifted deadline, still inside the window: Idle, NOT a redelivery.
+        assert!(matches!(e.poll_in("g", 500_000).unwrap(), Poll::Idle));
+        // After auto-resume the deadline is 30 + 1 * MS: just before it the lease is still in
+        // flight (Idle), so the pause manufactured no early redelivery...
+        assert!(matches!(e.poll_in("g", MS + 29).unwrap(), Poll::Idle));
+        // ...and at the shifted deadline it redelivers as attempt 2 under a fresh generation.
+        let d2 = message(e.poll_in("g", MS + 30).unwrap());
+        assert_eq!(
+            d2.deliveries, 2,
+            "redelivery only after the shifted deadline"
+        );
+        assert_ne!(d2.token.generation, d1.token.generation);
+    }
+
+    #[test]
+    fn acks_apply_mid_pause_and_an_explicit_resume_restores_delivery_immediately() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), std::sync::Arc::clone(&clock));
+        for payload in [b"a".as_slice(), b"b".as_slice()] {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
+        }
+        let d1 = message(e.poll_in("g", 0).unwrap()); // offset 0 in flight
+        e.pause_group_in("g", 1_000_000).unwrap(); // a "forever" window
+        clock.advance_monotonic_nanos(50);
+        // Mid-pause: delivery is gated even though a second record is deliverable...
+        assert!(matches!(e.poll_in("g", 50).unwrap(), Poll::Idle));
+        // ...but the ALREADY-delivered message still acks: a pause gates delivery, not completion.
+        assert_eq!(e.ack_in("g", &d1.token), AckResult::Acked);
+        // The explicit resume (pause_ms = 0) un-gates at the engine clock instant (50).
+        let resumed_at = e.pause_group_in("g", 0).unwrap();
+        assert_eq!(resumed_at, 50);
+        let d2 = message(e.poll_in("g", 51).unwrap());
+        assert_eq!(d2.deliveries, 1, "offset 1 delivers fresh after the resume");
+        assert_eq!(e.ack_in("g", &d2.token), AckResult::Acked);
+        // Nothing was lost or skipped: the group is fully caught up.
+        assert_eq!(e.committed_offset_in("g"), e.flushed_offset());
+    }
+
+    #[test]
+    fn a_mid_pause_rearm_moves_the_deadline_without_restarting_the_clock_accounting() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let d1 = message(e.poll_in("g", 0).unwrap()); // deadline 30
+        e.pause_group_in("g", 10).unwrap(); // paused_at 0, until 10 * MS
+                                            // Re-arm mid-pause to a SHORTER window (engine clock still 0): one continuous stopped
+                                            // span from the ORIGINAL pause instant, only the deadline moves.
+        let until = e.pause_group_in("g", 2).unwrap();
+        assert_eq!(until, 2 * MS);
+        assert!(matches!(e.poll_in("g", 2 * MS - 1).unwrap(), Poll::Idle));
+        // At the re-armed deadline the applied shift is exactly `until - paused_at` = 2 ms: the
+        // lease deadline is 30 + 2 * MS, so the first un-gated poll is Idle (in flight, not an
+        // instant redelivery), and the redelivery lands at the shifted deadline.
+        assert!(matches!(e.poll_in("g", 2 * MS).unwrap(), Poll::Idle));
+        let d2 = message(e.poll_in("g", 2 * MS + 30).unwrap());
+        assert_eq!(d2.deliveries, 2);
+        assert_ne!(d2.token.generation, d1.token.generation);
+    }
+
+    #[test]
+    fn pause_rejects_the_default_and_malformed_groups_and_never_gates_the_default() {
+        let mut e = open(config(10, 5));
+        // The default/empty group is refused (it is the wire's implicit unnamed group), and a
+        // malformed name never creates anything.
+        assert!(matches!(
+            e.pause_group_in("", 5),
+            Err(EngineError::InvalidGroupName)
+        ));
+        assert!(matches!(
+            e.pause_group_in("bad name", 5),
+            Err(EngineError::InvalidGroupName)
+        ));
+        // The default group still delivers, untouched by the rejected verbs.
+        produce(&mut e, b"a");
+        let d = message(e.poll(0).unwrap());
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+    }
+
+    #[test]
+    fn a_pause_can_precede_the_groups_first_consumer() {
+        // An operator pauses a group BEFORE any consumer exists: the verb creates it (validated,
+        // under the cap), and the pause is already in force at the first poll.
+        let mut e = open(config(10, 5));
+        e.pause_group_in("g", 10).unwrap();
+        produce(&mut e, b"a");
+        assert!(matches!(e.poll_in("g", 1).unwrap(), Poll::Idle));
+        let d = message(e.poll_in("g", 10 * MS).unwrap());
+        assert_eq!(d.deliveries, 1);
+    }
+
+    #[test]
+    fn a_paused_group_is_not_idle_evicted_until_its_window_elapses() {
+        // #277 interplay: a pause is an explicit operator hold, so the idle sweep never reclaims a
+        // group MID-pause — but once the window elapses (and is settled), the ordinary idle policy
+        // applies again, so an abandoned paused group cannot pin memory forever.
+        let mut e = open(config_with_idle_evict_ms(10));
+        produce(&mut e, b"a");
+        let d = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked); // caught up, lease-free
+        e.pause_group_in("g", 100).unwrap(); // paused until 100 ms
+                                             // Far past the 10 ms idle window but mid-pause: the sweep keeps it.
+        let _ = e.poll(50 * MS).unwrap();
+        assert!(
+            e.has_group("g"),
+            "a paused group is never evicted mid-pause"
+        );
+        // Once the window elapses the sweep settles it; it is then an ordinary idle, caught-up,
+        // lease-free named group and is reclaimed.
+        let _ = e.poll(200 * MS).unwrap();
+        assert!(
+            !e.has_group("g"),
+            "after the window the ordinary idle policy applies"
+        );
+    }
+
+    #[test]
+    fn a_paused_streaming_group_serves_an_empty_batch_until_resume() {
+        // The Tier-S gate: a paused streaming group's fetch is an EMPTY batch that resumes at the
+        // caller's OWN offset (nothing is skipped), and the deadline auto-resumes it.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), std::sync::Arc::clone(&clock));
+        for payload in [b"a".as_slice(), b"b".as_slice()] {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
+        }
+        e.set_streaming_in("s", true).unwrap();
+        let m = MemberId::new(1);
+        let full = e.stream_fetch_in("s", m, Offset::new(0), 16, None).unwrap();
+        assert_eq!(full.records.len(), 2, "the unpaused fetch serves the run");
+        e.pause_group_in("s", 10).unwrap();
+        let gated = e.stream_fetch_in("s", m, Offset::new(0), 16, None).unwrap();
+        assert!(
+            gated.records.is_empty(),
+            "a paused streaming fetch is empty"
+        );
+        assert_eq!(
+            gated.next_offset,
+            Offset::new(0),
+            "it resumes at the caller's own offset, skipping nothing"
+        );
+        clock.advance_monotonic_nanos(10 * MS);
+        let resumed = e.stream_fetch_in("s", m, Offset::new(0), 16, None).unwrap();
+        assert_eq!(resumed.records.len(), 2, "auto-resumed at the deadline");
+    }
+
+    #[test]
+    fn pause_group_in_stream_routes_the_default_gates_a_named_stream_and_rejects_unknown() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        // The default stream ("") routes byte-for-byte to the default-group verb.
+        e.pause_group_in_stream("", "g", 10).unwrap();
+        assert!(matches!(e.poll_in("g", 0).unwrap(), Poll::Idle));
+        // A never-declared named stream is a typed reject, never a silent create.
+        assert!(matches!(
+            e.pause_group_in_stream("nosuch", "g", 10),
+            Err(EngineError::UnknownStream { .. })
+        ));
+        // A DECLARED named stream's group pauses independently of the default stream's same-named
+        // group, and auto-resumes on its own deadline through the named poll path.
+        assert!(e.declare_stream("orders").unwrap());
+        e.produce_in_stream(
+            "orders",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"x",
+            },
+        )
+        .unwrap();
+        e.pause_group_in_stream("orders", "w", 10).unwrap();
+        assert!(matches!(
+            e.poll_in_stream("orders", "w", 1).unwrap(),
+            Poll::Idle
+        ));
+        let d = message(e.poll_in_stream("orders", "w", 10 * MS).unwrap());
+        assert_eq!(d.deliveries, 1, "the named group auto-resumed");
+    }
+
+    #[test]
+    fn holds_active_lease_in_sees_a_paused_lease_as_active_for_the_whole_window() {
+        // The per-consumer credit seam (#65) reads lease liveness OUTSIDE the gated delivery
+        // paths, so it must observe expiry through the pause lens: while the clock is stopped,
+        // nothing can have expired — otherwise a consumer's slot would be freed mid-pause and the
+        // credit accounting would disagree with the post-resume shifted deadlines.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), std::sync::Arc::clone(&clock));
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"a",
+        })
+        .unwrap();
+        let d = message(e.poll_in("g", 0).unwrap()); // deadline 30 on the engine clock
+        e.pause_group_in("g", 1).unwrap(); // until 1 * MS
+                                           // Far past the un-shifted deadline but inside the window: still ACTIVE.
+        clock.advance_monotonic_nanos(500_000);
+        assert!(
+            e.holds_active_lease_in("g", &d.token),
+            "active for the whole pause"
+        );
+        // Just past the window the pending shift is accounted (deadline effectively 30 + 1 ms):
+        // still active until the REMAINING visibility elapses...
+        clock.advance_monotonic_nanos(500_010); // now = 1 ms + 10 ns
+        assert!(e.holds_active_lease_in("g", &d.token));
+        // ...and expired exactly once it does.
+        clock.advance_monotonic_nanos(30); // now = 1 ms + 40 ns > 1 ms + 30 ns
+        assert!(!e.holds_active_lease_in("g", &d.token));
     }
 
     // ---- Ghost checkpoints and the retention protect floor (#432) ----

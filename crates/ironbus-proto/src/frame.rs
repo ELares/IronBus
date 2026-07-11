@@ -522,6 +522,19 @@ pub enum FrameType {
     /// tag; tags 1-50 are byte-for-byte unchanged. Framing/verify live in
     /// `ironbus_server::cluster::{serve, peer_auth}`.
     DataPlaneAuth,
+    /// Consumer PAUSE/RESUME of a work-group's delivery (#771, V2-M1): an operator suspends a
+    /// work-group's delivery for `pause_ms` milliseconds (`0` RESUMES a paused group immediately)
+    /// without dropping its leases, cursor, or subscriptions — the NATS-2.11 `PauseUntil`
+    /// counterpart, shipped as an explicit typed control rather than the deliberately dropped draft
+    /// `Flow.pause` field (refs #292; the real `Flow` (10) stays a bare u32 credit). The broker
+    /// gates the group's Tier-W poll and Tier-S fetch paths until the window elapses (auto-resume)
+    /// or a `pause_ms = 0` re-issue, with the in-flight lease clock STOPPED for the paused span.
+    /// Replied with a body-less [`FrameType::Ok`], or a typed [`FrameType::Err`] on a malformed
+    /// name / unknown stream. Body: a [`crate::message::PauseGroupBody`] (`body_version: u8`,
+    /// `field_len: u16`, then `stream_id` and `group`, each `u16`-length-prefixed, and a REQUIRED
+    /// `pause_ms: u64 LE`). A NEW append-only tag an old client never sends; tags 1-51 are
+    /// byte-for-byte unchanged.
+    PauseGroup,
 }
 
 impl FrameType {
@@ -580,6 +593,7 @@ impl FrameType {
             FrameType::TxnListen => 49,
             FrameType::RaftAuth => 50,
             FrameType::DataPlaneAuth => 51,
+            FrameType::PauseGroup => 52,
         }
     }
 
@@ -640,6 +654,7 @@ impl FrameType {
             49 => FrameType::TxnListen,
             50 => FrameType::RaftAuth,
             51 => FrameType::DataPlaneAuth,
+            52 => FrameType::PauseGroup,
             _ => return None,
         })
     }
@@ -772,7 +787,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 51] = [
+    const ALL_TYPES: [FrameType; 52] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -824,6 +839,7 @@ mod tests {
         FrameType::TxnListen,
         FrameType::RaftAuth,
         FrameType::DataPlaneAuth,
+        FrameType::PauseGroup,
     ];
 
     #[test]
@@ -893,6 +909,7 @@ mod tests {
         assert_eq!(FrameType::TxnListen.as_u8(), 49);
         assert_eq!(FrameType::RaftAuth.as_u8(), 50);
         assert_eq!(FrameType::DataPlaneAuth.as_u8(), 51);
+        assert_eq!(FrameType::PauseGroup.as_u8(), 52);
     }
 
     #[test]
@@ -914,8 +931,9 @@ mod tests {
         // dirty-tier CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs
         // TxnPrepare/TxnCommit/TxnRollback (#640, V2-M8); 47-49 are the back-check verbs
         // TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is the RaftAuth interim-peer-auth tag
-        // (#1067 Inc 2); 51 is the DataPlaneAuth interim data-plane peer-auth tag (#1067 Inc 3); 52 is now
-        // the next-free (still unknown) tag, so it frames but is not known.
+        // (#1067 Inc 2); 51 is the DataPlaneAuth interim data-plane peer-auth tag (#1067 Inc 3); 52 is
+        // the consumer PauseGroup verb (#771, V2-M1); 53 is now the next-free (still unknown) tag, so
+        // it frames but is not known.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -934,7 +952,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
         assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
         assert_eq!(FrameType::from_u8(51), Some(FrameType::DataPlaneAuth));
-        assert_eq!(FrameType::from_u8(52), None);
+        assert_eq!(FrameType::from_u8(52), Some(FrameType::PauseGroup));
+        assert_eq!(FrameType::from_u8(53), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -981,7 +1000,8 @@ mod tests {
         // CommittedHwQuery confirm (#739); 44-46 are the transactional half-message verbs (#640); 47-48
         // are the back-check verbs TxnCheck/TxnCheckResult/TxnListen (#640 part 2); 50 is the RaftAuth
         // interim-peer-auth tag (#1067 Inc 2); 51 is the DataPlaneAuth data-plane peer-auth tag
-        // (#1067 Inc 3); 52 is the next-free (still unknown) tag.
+        // (#1067 Inc 3); 52 is the consumer PauseGroup verb (#771); 53 is the next-free (still
+        // unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -1000,7 +1020,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
         assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
         assert_eq!(FrameType::from_u8(51), Some(FrameType::DataPlaneAuth));
-        assert_eq!(FrameType::from_u8(52), None);
+        assert_eq!(FrameType::from_u8(52), Some(FrameType::PauseGroup));
+        assert_eq!(FrameType::from_u8(53), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -1049,7 +1070,7 @@ mod tests {
         // ADDITIVE: tags 1-43 are byte-for-byte unchanged, and a non-transactional client never sends
         // them; 47-49 are the back-check verbs (#640 part 2), 50 is the RaftAuth peer-auth tag
         // (#1067 Inc 2), 51 is the DataPlaneAuth data-plane peer-auth tag (#1067 Inc 3), 52 is the
-        // next-free (still unknown) tag.
+        // consumer PauseGroup verb (#771), 53 is the next-free (still unknown) tag.
         assert_eq!(FrameType::TxnPrepare.as_u8(), 44);
         assert_eq!(FrameType::TxnCommit.as_u8(), 45);
         assert_eq!(FrameType::TxnRollback.as_u8(), 46);
@@ -1083,7 +1104,8 @@ mod tests {
         // ADDITIVE: tags 1-46 are byte-for-byte unchanged, and a client that never registers a
         // transaction-state listener never sees or sends them; 50 is the RaftAuth peer-auth tag
         // (#1067 Inc 2), 51 is the DataPlaneAuth data-plane peer-auth tag (#1067 Inc 3), 52 is the
-        // next-free (still unknown) tag, so it frames but is not a known type.
+        // consumer PauseGroup verb (#771), 53 is the next-free (still unknown) tag, so it frames
+        // but is not a known type.
         assert_eq!(FrameType::TxnCheck.as_u8(), 47);
         assert_eq!(FrameType::TxnCheckResult.as_u8(), 48);
         assert_eq!(FrameType::TxnListen.as_u8(), 49);
@@ -1092,7 +1114,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
         assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
         assert_eq!(FrameType::from_u8(51), Some(FrameType::DataPlaneAuth));
-        assert_eq!(FrameType::from_u8(52), None);
+        assert_eq!(FrameType::from_u8(52), Some(FrameType::PauseGroup));
+        assert_eq!(FrameType::from_u8(53), None);
         for ty in [
             FrameType::TxnCheck,
             FrameType::TxnCheckResult,
@@ -1170,7 +1193,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
         assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
         assert_eq!(FrameType::from_u8(51), Some(FrameType::DataPlaneAuth));
-        assert_eq!(FrameType::from_u8(52), None);
+        assert_eq!(FrameType::from_u8(52), Some(FrameType::PauseGroup));
+        assert_eq!(FrameType::from_u8(53), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -1221,7 +1245,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(49), Some(FrameType::TxnListen));
         assert_eq!(FrameType::from_u8(50), Some(FrameType::RaftAuth));
         assert_eq!(FrameType::from_u8(51), Some(FrameType::DataPlaneAuth));
-        assert_eq!(FrameType::from_u8(52), None);
+        assert_eq!(FrameType::from_u8(52), Some(FrameType::PauseGroup));
+        assert_eq!(FrameType::from_u8(53), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -1416,7 +1441,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 52u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 53u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
