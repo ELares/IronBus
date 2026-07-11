@@ -629,10 +629,18 @@ impl<F: Filesystem> OriginCursorStore<F> {
         .map_err(|e| GeoError::Cursor {
             what: e.to_string(),
         })?;
-        let (checkpoint, payload) = SlotCheckpoint::<F::File, GEO_CURSOR_PAYLOAD>::open(file)
+        let (checkpoint, state) = SlotCheckpoint::<F::File, GEO_CURSOR_PAYLOAD>::open(file)
             .map_err(|e| GeoError::Cursor {
                 what: e.to_string(),
             })?;
+        // Surface external damage (both slots nonzero-seq, both CRC-bad — impossible from a crash)
+        // loudly (#1142), then recover as empty: an origin cursor is at-least-once (a lost cursor
+        // re-applies from the origin's durable log), so warn+empty is the right degrade, never a
+        // broker-down. A torn single slot still recovers its valid sibling upstream.
+        let payload = crate::engine::observe_checkpoint_damage(
+            state,
+            ironbus_storage::checkpoint::CheckpointArtifact::GeoCursor,
+        );
         let cursors = match payload {
             Some(bytes) => decode_cursor_payload(&bytes)?,
             None => BTreeMap::new(),

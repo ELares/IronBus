@@ -14747,7 +14747,7 @@ mod tests {
             return None;
         }
         let (_, recovered) = Checkpoint::open(fs.open(&name).unwrap()).unwrap();
-        let payload = recovered?;
+        let payload = recovered.into_option()?;
         Some(
             AckCursor::decode_snapshot(&payload)
                 .unwrap()

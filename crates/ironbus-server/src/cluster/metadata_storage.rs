@@ -365,7 +365,15 @@ impl<F: Filesystem, C: Clock> MetadataLogStorage<F, C> {
                 fs.sync_dir().map_err(StorageError::Io)?; // the new file's dir entry must be durable
                 file
             };
-            let (checkpoint, recovered) = MetadataSnapshotCheckpoint::open(file)?;
+            let (checkpoint, state) = MetadataSnapshotCheckpoint::open(file)?;
+            // Surface external damage loudly (#1142), then recover as empty — the snapshot is never
+            // load-bearing on its own (a missing/damaged one falls back to a full-log replay), so
+            // warn+empty is the right degrade, never a broker-down. A torn single slot recovers its
+            // valid sibling upstream in the dual-slot open.
+            let recovered = crate::engine::observe_checkpoint_damage(
+                state,
+                ironbus_storage::checkpoint::CheckpointArtifact::MetadataSnapshot,
+            );
             if let Some(bytes) = recovered {
                 let snapshot = Snapshot::parse_from_bytes(&bytes)?;
                 install_snapshot_into_core(&mut core, &snapshot);

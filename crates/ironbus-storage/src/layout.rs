@@ -225,7 +225,12 @@ fn read_marker_version<F: Filesystem>(fs: &F) -> Option<u32> {
     }
     let file = fs.open(LAYOUT_MARKER_FILE).ok()?;
     let (_checkpoint, recovered) = Checkpoint::open(file).ok()?;
-    decode_marker(recovered.as_deref()?)
+    // A version-detection heuristic, NOT durable state: a `Damaged` marker (#1142) is treated as "no
+    // valid marker" (layout v1), exactly as a corrupt one always was — this must NEVER brick a valid
+    // data dir, so it stays behavior-preserving (empty), and the broker's durable checkpoints carry
+    // the damage surfacing instead.
+    let payload = recovered.into_option()?;
+    decode_marker(&payload)
 }
 
 /// Best-effort durable write of the v1 marker, creating `layout.meta` if absent. Returns an IO error
@@ -437,7 +442,7 @@ mod tests {
         // Now a real v1 marker is in place.
         let file = fs.open(LAYOUT_MARKER_FILE).unwrap();
         let (_, recovered) = Checkpoint::open(file).unwrap();
-        assert_eq!(decode_marker(recovered.as_deref().unwrap()), Some(1));
+        assert_eq!(decode_marker(&recovered.into_option().unwrap()), Some(1));
     }
 
     /// The marker round-trips its version and the encode/decode are inverses for v1.

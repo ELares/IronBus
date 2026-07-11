@@ -218,8 +218,11 @@ fn read_committed<F: Filesystem>(fs: &F, group: &str) -> Result<Option<u64>, Sto
     if !fs.exists(&name)? {
         return Ok(None);
     }
+    // An offline admin read (not the broker's live open), so it stays behavior-preserving: a
+    // `Damaged` classification (#1142) recovers as empty here, exactly like a torn slot, and the
+    // broker-open path is where damage is surfaced (warn + metric).
     let (_, recovered) = Checkpoint::open(fs.open(&name)?)?;
-    let Some(payload) = recovered else {
+    let Some(payload) = recovered.into_option() else {
         return Ok(None);
     };
     // The current format is the full snapshot; a payload too short to be a snapshot is the legacy
@@ -479,7 +482,10 @@ fn read_redrive_watermark<F: Filesystem>(fs: &F) -> Result<u64, StorageError> {
         return Ok(0);
     }
     let (_, recovered) = Checkpoint::open(fs.open(REDRIVE_CHECKPOINT)?)?;
-    let value = recovered
+    // Offline admin read: a `Damaged` classification (#1142) recovers as the zero watermark, exactly
+    // like a torn slot, so redrive resumes from the start (at-least-once-safe re-injection).
+    let payload = recovered.into_option();
+    let value = payload
         .as_deref()
         .and_then(|p| p.get(..8))
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
@@ -1539,7 +1545,7 @@ mod tests {
         // an AckCursor snapshot whose committed watermark is 4.
         let name = cursor_checkpoint_name("orders");
         let (_, recovered) = Checkpoint::open(fs.open(&name).unwrap()).unwrap();
-        let payload = recovered.expect("a cursor was written");
+        let payload = recovered.into_option().expect("a cursor was written");
         let cursor = AckCursor::decode_snapshot(&payload).expect("the broker codec decodes it");
         assert_eq!(cursor.committed(), Offset::new(4));
         assert!(
@@ -1665,7 +1671,7 @@ mod tests {
 
         let name = cursor_checkpoint_name("orders");
         let (_, recovered) = Checkpoint::open(fs.open(&name).unwrap()).unwrap();
-        let cursor = AckCursor::decode_snapshot(&recovered.unwrap()).unwrap();
+        let cursor = AckCursor::decode_snapshot(&recovered.into_option().unwrap()).unwrap();
         assert_eq!(cursor.committed(), Offset::new(3), "the latest write wins");
     }
 

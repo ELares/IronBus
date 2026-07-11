@@ -1166,6 +1166,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&recovery_data_loss_lines(recovery_data_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&recovery_event_lines(&counters.recovery));
+    body.push_str(&checkpoint_damage_lines());
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&edge_metric_lines(&edge, rss, disk_free));
     body.push_str(&connz_metric_lines(connz));
@@ -2132,6 +2133,32 @@ fn recovery_event_lines(recovery: &RecoveryCounters) -> String {
             s,
             "ironbus_corruption_repairs_total{{artifact=\"{}\"}} {repairs}",
             artifact.metric_label()
+        );
+    }
+    s
+}
+
+/// Renders the `ironbus_checkpoint_damaged_total{artifact}` counter (#1142): one labeled sample per
+/// [`CheckpointArtifact`], read from the process-wide monotonic damage store. A non-zero value means a
+/// dual-slot checkpoint opened with BOTH slots carrying a nonzero sequence yet BOTH failing their CRC
+/// — impossible from any crash (a write touches one slot), so provable EXTERNAL damage (bit rot / a
+/// lost extent) rather than the never-written `None` the pre-#1142 open collapsed it into. The broker
+/// recovers as empty (the load-bearing checkpoints keep their own downstream fail-closed guards), so
+/// this is the OBSERVABILITY signal an operator alerts on, not a startup failure. All series are
+/// always emitted (zero where undamaged) so the frozen taxonomy holds. Like
+/// `ironbus_corruption_repairs_total{artifact}`, it carries a label, so it is excluded from the
+/// unlabeled-`_total` resilience-taxonomy set by construction and pinned only in `FROZEN_METRIC_TYPES`.
+fn checkpoint_damage_lines() -> String {
+    let mut s = String::from(
+        "# HELP ironbus_checkpoint_damaged_total Dual-slot checkpoints opened with both slots carrying a nonzero sequence yet both failing CRC (provable EXTERNAL damage — impossible from a crash), by on-disk artifact. Recovered as empty (observable, non-fatal); NATS has no analogue.\n\
+         # TYPE ironbus_checkpoint_damaged_total counter\n",
+    );
+    for artifact in ironbus_storage::checkpoint::CheckpointArtifact::ALL {
+        let _ = writeln!(
+            s,
+            "ironbus_checkpoint_damaged_total{{artifact=\"{}\"}} {}",
+            artifact.metric_label(),
+            ironbus_storage::checkpoint::checkpoint_damaged_total(artifact),
         );
     }
     s
@@ -5460,6 +5487,41 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn metrics_render_the_checkpoint_damage_counter_for_every_artifact() {
+        // The externally-damaged-checkpoint surface (#1142) renders on /metrics: the labeled
+        // `ironbus_checkpoint_damaged_total{artifact}` counter with TYPE/HELP (so a strict parser and
+        // the frozen-taxonomy golden accept it), one series per CheckpointArtifact so the taxonomy is
+        // complete. The value is NOT pinned to 0 (the store is a process-global; other tests in this
+        // binary may have opened a damaged checkpoint), only structural presence.
+        let (addr, shutdown, handle, _engine) = start();
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        assert!(
+            m.contains("# TYPE ironbus_checkpoint_damaged_total counter"),
+            "{m}"
+        );
+        assert!(
+            m.contains("# HELP ironbus_checkpoint_damaged_total "),
+            "{m}"
+        );
+        for artifact in ironbus_storage::checkpoint::CheckpointArtifact::ALL {
+            let prefix = format!(
+                "ironbus_checkpoint_damaged_total{{artifact=\"{}\"}} ",
+                artifact.metric_label()
+            );
+            assert!(
+                m.lines().any(|l| l.starts_with(&prefix)
+                    && l[prefix.len()..].bytes().all(|b| b.is_ascii_digit())),
+                "missing/!numeric checkpoint-damage series for {}: {m}",
+                artifact.metric_label()
+            );
+        }
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     /// The COMPLETE, FROZEN set of resilience-counter metric names `/metrics` renders (#96). Every
     /// name here is an `ironbus_*_total` counter whose increment marks one resilience event the
     /// taxonomy guarantees is never silent (a shed, drop, skip, dead-letter, or reclamation). This
@@ -5763,6 +5825,11 @@ mod tests {
         ("ironbus_recovery_runs_total", "counter"),
         ("ironbus_torn_tail_repairs_total", "counter"),
         ("ironbus_corruption_repairs_total", "counter"),
+        // The externally-damaged-checkpoint counter (#1142): both dual-slots nonzero-seq yet both
+        // CRC-bad (provable external damage), by artifact. A LABELED `_total`, so — like
+        // `ironbus_corruption_repairs_total{artifact}` — it is pinned ONLY here and excluded from the
+        // unlabeled-`_total` resilience-taxonomy set by construction.
+        ("ironbus_checkpoint_damaged_total", "counter"),
         // Reconciled skip/loss gauges (the resilience watermarks; NOT `_total`).
         ("ironbus_records_skipped", "gauge"),
         ("ironbus_bytes_skipped", "gauge"),
