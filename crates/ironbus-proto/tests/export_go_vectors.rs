@@ -269,6 +269,7 @@ fn build_vectors() -> Vec<Vector> {
     );
 
     let full = ConnectBody {
+        wants_ephemeral_groups: false,
         requested_credit: Some(4096),
         requested_credit_bytes: Some(1 << 20),
         wants_gap_marker: true,
@@ -328,6 +329,7 @@ fn build_vectors() -> Vec<Vector> {
 
     // ---- Info (an advertising server, and the historical empty body) ----
     let info = InfoBody {
+        ephemeral_groups: false,
         credit: Some(CreditAdvert {
             negotiated: 2048,
             cap: 8192,
@@ -831,6 +833,7 @@ fn build_vectors() -> Vec<Vector> {
     let mut body = Vec::new();
     encode_sub_to(
         &SubToBody {
+            ephemeral: false,
             stream_id: b"orders",
             group: b"pickers",
             partition: None,

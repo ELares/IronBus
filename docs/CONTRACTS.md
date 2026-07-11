@@ -916,6 +916,66 @@ a NAMED stream additionally requires the negotiated streams capability (#588), w
 default-stream pause is not capability-gated (the tag itself is new; an old client never sends
 it).
 
+### Ephemeral consumer groups (#771, V2-M1)
+
+Source: `message.rs` (`SUBTO_FLAG_EPHEMERAL`, `CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS`,
+`INFO_FLAG2_EPHEMERAL_GROUPS`), `engine.rs` (`subscribe_ephemeral_in*`, the checkpoint-writer
+gates, the reap). NO new frame tag and NO on-disk format change: the mode rides EXISTING bodies
+as additive, capability-gated fields.
+
+An EPHEMERAL consumer group is a work-group that leaves NO durable artifacts and is REAPED in
+full the moment its last subscriber disconnects or unsubscribes — the NATS-ephemeral-consumer
+counterpart for a throwaway/monitoring reader that should never pin broker state.
+
+- **Wire.** The subscribe rides `SubTo` (tag 31): an appended `sub_flags: u8` whose bit 0
+  (`SUBTO_FLAG_EPHEMERAL`) marks the subscription ephemeral. The flags byte always FOLLOWS the
+  (possibly absent) `partition: u32` in the body's additive tail; the tail is disambiguated by
+  LENGTH (`0` = neither, `1` = flags, `4` = partition, `>= 5` = partition then flags), so every
+  historical body decodes bit-identically and a durable subscribe emits byte-for-byte the
+  pre-#771 bytes. The EMPTY stream id addresses the default stream (the plain-`Sub` body cannot
+  carry the flag; `SubTo` — and therefore the negotiated streams capability — is required).
+  Capability-gated BOTH ways, mirroring the #594 filter gate: the server honors the flag only on
+  a connection that advertised `CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS` (else a typed reject), and
+  the server confirms support via a new appended `Info` `flags2` byte
+  (`INFO_FLAG2_EPHEMERAL_GROUPS` — the historical `Info` flags byte is full), which a client MUST
+  require before sending the flag: an OLD server tolerates the appended byte and would otherwise
+  silently bind a DURABLE group. The default/empty group is refused
+  (`ERR_INVALID_GROUP_NAME`); a partition-addressed ephemeral subscribe is a typed reject this
+  slice.
+- **No durable artifacts.** Every checkpoint writer is suppressed for the group — the cursor
+  (`cursor-<hex>.ckpt`) and attempt-count (`attempts-<hex>.ckpt`) files are never written on ANY
+  cadence: the interval gate, the #547 redelivery-driven attempts trigger, the clean-disconnect
+  flush, the shutdown `checkpoint_all_groups`, and the #565 stream-eviction flush. The group's
+  whole lifecycle leaves the data directory's file set untouched. (Dead-lettering is unchanged:
+  a DLQ capture is MESSAGE data, deliberately durable, not group state.)
+- **Reap on last departure.** The engine removes the in-memory group (cursor, leases, modes),
+  releases its retention-floor entries (no ghost), frees its DLQ dedup slots, and —
+  belt-and-suspenders — deletes any stray `cursor-<hex>.ckpt`/`attempts-<hex>.ckpt` under the
+  name (none can exist via the suppressed writers; the delete covers state persisted by an
+  older, flag-ignorant server before a crash — which a NEW subscribe also fail-closed refuses,
+  `ERR_EPHEMERAL_GROUP_CONFLICT`). Reap and subscribe are serialized on the engine actor, so a
+  reap can never race a re-subscribe into a half-state.
+- **Never resurrected.** Recovery resumes groups from their durable checkpoints; an ephemeral
+  group has none, so after a restart the name simply does not exist.
+- **At-least-once WITHIN the subscription's lifetime only.** Leases, redelivery, `MaxDeliver`,
+  and dead-lettering behave exactly as a durable group's while subscribed; a reap (or crash)
+  discards the cursor, and a re-subscribe binds a FRESH group starting at the earliest retained
+  offset (a new group's cursor begins at 0, clamped up to the earliest retained record — there
+  is no other start-position policy today).
+- **Retention floor.** A CONNECTED ephemeral group pins the consumer-safe retention floor
+  exactly like any live reader (retention must not reap unread records out from under a live
+  consumer); a reaped one pins NOTHING — no live entry, no ghost, no checkpoint — so an
+  ephemeral consumer can never wedge retention after it is gone. This is deliberately asymmetric
+  with durable groups, whose checkpoints (and #432 ghosts) keep pinning while disconnected.
+- **Bounds and mode conflicts.** An ephemeral group counts against `max_groups` (per stream,
+  like any group; the reap frees the slot immediately). A name can be ephemeral or durable,
+  never both: an ephemeral subscribe onto a live durable group / a durable checkpoint / a ghost
+  floor entry, and a durable subscribe onto a live ephemeral group, are BOTH fail-closed
+  `ERR_EPHEMERAL_GROUP_CONFLICT`.
+- **Storage modes.** Named + default streams, in per-stream-log AND shared-WAL (#597) modes (the
+  writer gates and the reap resolve the same mode-aware filesystem the checkpoint writers use).
+  Partitioned consume is the one typed-reject carve-out this slice.
+
 ---
 
 ## Config models
@@ -1303,6 +1363,7 @@ the `AckStatus` byte, so the frozen wire is byte-for-byte unchanged. A later wir
 | `ERR_BROADCAST_GROUP_BUSY`        | a second subscriber, or an unsafe flip to broadcast on a group with competing in-flight state | `EngineError::BroadcastGroupBusy` |
 | `ERR_BROADCAST_GROUP_NOT_NAMED`   | a flip to broadcast named the default/empty group, which can never be broadcast | `EngineError::BroadcastGroupNotNamed` |
 | `ERR_TOO_MANY_GROUPS`             | a new named group exceeded the per-engine group cap | `EngineError::TooManyGroups` |
+| `ERR_EPHEMERAL_GROUP_CONFLICT`    | an ephemeral/durable mode conflict on a work-group name (#771): an ephemeral subscribe named a group that is live as durable or carries durable state (a checkpoint on disk, or a ghost retention-floor entry), or a durable subscribe named a group that is live as ephemeral | `EngineError::EphemeralGroupConflict` |
 | `ERR_INVALID_GROUP_NAME`          | a group name was empty, too long, or non-graphic ASCII | `EngineError::InvalidGroupName` |
 | `ERR_PRODUCER_FENCED`             | a produce presented a STALE producer epoch (a zombie session) | `AppendOutcome::Fenced` |
 | `ERR_AT_CAPACITY`                 | a produce was shed at the durable-log byte cap (drop-new) | at-capacity `EngineError::Storage` |

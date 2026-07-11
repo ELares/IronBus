@@ -58,6 +58,10 @@ pub enum ServerErrorCode {
     BroadcastGroupBusy,
     /// `ERR_BROADCAST_GROUP_NOT_NAMED`: a flip to broadcast named the default/empty group.
     BroadcastGroupNotNamed,
+    /// `ERR_EPHEMERAL_GROUP_CONFLICT`: an ephemeral/durable mode conflict on a work-group name
+    /// (#771) — an ephemeral subscribe named a group that is live as durable or carries durable
+    /// state, or a durable subscribe named a group that is live as ephemeral.
+    EphemeralGroupConflict,
     /// `ERR_TOO_MANY_GROUPS`: a new named work-group exceeded the per-engine group cap.
     TooManyGroups,
     /// `ERR_TOO_MANY_STREAMS`: a new named stream exceeded the per-engine resident-stream cap.
@@ -117,6 +121,7 @@ impl ServerErrorCode {
             "ERR_CUMULATIVE_ACK_OUT_OF_RANGE" => Self::CumulativeAckOutOfRange,
             "ERR_BROADCAST_GROUP_BUSY" => Self::BroadcastGroupBusy,
             "ERR_BROADCAST_GROUP_NOT_NAMED" => Self::BroadcastGroupNotNamed,
+            "ERR_EPHEMERAL_GROUP_CONFLICT" => Self::EphemeralGroupConflict,
             "ERR_TOO_MANY_GROUPS" => Self::TooManyGroups,
             "ERR_TOO_MANY_STREAMS" => Self::TooManyStreams,
             "ERR_INVALID_GROUP_NAME" => Self::InvalidGroupName,
@@ -153,6 +158,7 @@ impl ServerErrorCode {
             Self::CumulativeAckOutOfRange => "ERR_CUMULATIVE_ACK_OUT_OF_RANGE",
             Self::BroadcastGroupBusy => "ERR_BROADCAST_GROUP_BUSY",
             Self::BroadcastGroupNotNamed => "ERR_BROADCAST_GROUP_NOT_NAMED",
+            Self::EphemeralGroupConflict => "ERR_EPHEMERAL_GROUP_CONFLICT",
             Self::TooManyGroups => "ERR_TOO_MANY_GROUPS",
             Self::TooManyStreams => "ERR_TOO_MANY_STREAMS",
             Self::InvalidGroupName => "ERR_INVALID_GROUP_NAME",
@@ -297,6 +303,7 @@ mod tests {
             ServerErrorCode::CumulativeAckOutOfRange,
             ServerErrorCode::BroadcastGroupBusy,
             ServerErrorCode::BroadcastGroupNotNamed,
+            ServerErrorCode::EphemeralGroupConflict,
             ServerErrorCode::TooManyGroups,
             ServerErrorCode::TooManyStreams,
             ServerErrorCode::InvalidGroupName,

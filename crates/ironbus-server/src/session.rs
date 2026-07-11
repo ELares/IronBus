@@ -396,6 +396,21 @@ pub struct Session {
     /// body) the server FAIL-CLOSED rejects a filtered `SubSubject` with a typed error — an old client
     /// can never be silently placed in filtered mode and shown a subset of the stream. Default `false`.
     subject_filter_enabled: bool,
+    /// Whether this connection negotiated EPHEMERAL consumer groups (#771, V2-M1): set at `Connect`
+    /// time when the client advertised
+    /// [`ironbus_proto::message::CONNECT_FLAG2_WANTS_EPHEMERAL_GROUPS`], and echoed back via the
+    /// `Info` `flags2` confirmation ([`ironbus_proto::message::INFO_FLAG2_EPHEMERAL_GROUPS`]). When
+    /// `true`, a `SubTo` carrying the ephemeral subscribe flag is honored (the bound group keeps no
+    /// durable state and is reaped on last-subscriber departure). When `false` (an old client, one
+    /// that opts out, or the empty `Connect` body) the server FAIL-CLOSED rejects an ephemeral
+    /// `SubTo` with a typed error — a subscription is never silently made ephemeral. Default `false`.
+    ephemeral_enabled: bool,
+    /// Whether this connection's CURRENT registered subscription is an EPHEMERAL one (#771): set by
+    /// a successful ephemeral `SubTo`, cleared on any rebind/unsub. It exists so the repeated-
+    /// `Connect` re-negotiation (which resets the stream binding) can deregister an ephemeral
+    /// subscription FIRST — otherwise the reset would orphan the engine-side membership and the
+    /// group would never reap (the disconnect cleanup routes by the CURRENT stream binding).
+    ephemeral_subscription: bool,
     /// The NAMED stream this connection's consume path is bound to (#588, M2-I10), `""` (the default
     /// stream) until a `SubTo` binds a named one. A `SubTo` sets BOTH this and `subscription` (the
     /// work-group within the stream); a plain `Sub`/`Unsub` resets it to the default stream. The Flow
@@ -1017,7 +1032,7 @@ impl Session {
             }
             Some(FrameType::Sub) => {
                 self.require_scope(crate::auth::Scope::Subscribe, "Sub", out)?;
-                self.handle_sub(engine, body, out).map(|()| false)
+                self.handle_sub(engine, body, false, out).map(|()| false)
             }
             // The stream-addressed verbs (#588, M2-I10): each is GATED on the negotiated
             // `streams_enabled` capability (a client that did not advertise `understands_streams` gets
@@ -1140,6 +1155,10 @@ impl Session {
     ///
     /// A malformed (non-empty but unparseable) `Connect` body is a typed reject (`Err` reply), never a
     /// panic, and the connection stays open so the client can re-handshake.
+    // One cohesive handshake sequence (authenticate -> negotiate each capability -> advertise):
+    // every step reads the negotiation state the previous one wrote, so splitting it would scatter
+    // the one place the connection's capabilities are established.
+    #[allow(clippy::too_many_lines)]
     fn handle_connect<
         F: Filesystem + 'static,
         C: Clock + Clone + 'static,
@@ -1305,6 +1324,21 @@ impl Session {
         // The per-subject filtered-consume capability (#594): only a client that advertised this may
         // send a filtered `SubSubject`; otherwise a filtered subscribe is fail-closed rejected.
         self.subject_filter_enabled = req.wants_subject_filter;
+        // The ephemeral-groups capability (#771): only a client that advertised this may bind an
+        // ephemeral group; otherwise an ephemeral SubTo is fail-closed rejected. Confirmed back in
+        // the Info flags2 echo below so the client knows the server honors the mode (its guard
+        // against an OLD server that would silently bind a durable group).
+        self.ephemeral_enabled = req.wants_ephemeral_groups;
+        // A repeated Connect while an EPHEMERAL subscription is registered (#771): deregister it
+        // BEFORE the stream binding is reset below, or the engine-side membership would be orphaned
+        // under the old (stream, group) and the group would never reap (the disconnect cleanup
+        // routes by the CURRENT binding). The durable path is deliberately untouched: a durable
+        // registration survives a re-handshake exactly as before.
+        if self.ephemeral_subscription {
+            self.leave_current_subscription(engine)?;
+            self.subscription = GroupName::default();
+            self.ephemeral_subscription = false;
+        }
         // A repeated Connect re-negotiates idempotently: reset the active named stream to the default
         // so a re-handshake never leaves a stale named-stream binding from a prior negotiation.
         self.stream = GroupName::default();
@@ -1325,6 +1359,10 @@ impl Session {
         // Advertise the negotiated value plus the server cap, so the client adopts the negotiated
         // credit for its own flow control and learns the cap it can never exceed.
         let info = InfoBody {
+            // Confirm the ephemeral-groups capability the server activated for this connection
+            // (#771), the flags2 twin of the streaming/streams confirmations: AND-negotiated, so
+            // it is `true` only when the client advertised it (the server always supports it).
+            ephemeral_groups: self.ephemeral_enabled,
             credit: Some(CreditAdvert {
                 negotiated: negotiated_credit,
                 cap: cap_credit,
@@ -3377,6 +3415,7 @@ impl Session {
         &mut self,
         engine: &E,
         body: &[u8],
+        ephemeral: bool,
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
         if !self.connected {
@@ -3387,6 +3426,27 @@ impl Session {
             reply_err(out, "subscription name must be valid UTF-8");
             return Ok(());
         };
+        // An EPHEMERAL subscribe (#771, routed here by a default-stream `SubTo` carrying the flag;
+        // a plain `Sub` body cannot carry it) is gated on the negotiated capability, exactly like
+        // the #594 filter gate: a connection that did not advertise it is fail-closed rejected, so
+        // a subscription is never silently made ephemeral.
+        if ephemeral && !self.ephemeral_enabled {
+            reply_err(
+                out,
+                "ephemeral groups not negotiated (set wants_ephemeral_groups)",
+            );
+            return Ok(());
+        }
+        // The default/empty group can never be ephemeral (#771): it is the wire's implicit unnamed
+        // group, structurally always present, with no subscribe-scoped lifecycle to reap on.
+        if ephemeral && group.is_empty() {
+            reply_err_coded(
+                out,
+                crate::codes::ErrorCode::ERR_INVALID_GROUP_NAME.as_str(),
+                "the default/empty group cannot be ephemeral (name a group)",
+            );
+            return Ok(());
+        }
         // Register as an active subscriber of the NEW group FIRST (#288), so the BROADCAST
         // group-of-one cap is enforced BEFORE any of this connection's state is torn down. A
         // broadcast group already holding a different subscriber rejects here with
@@ -3401,7 +3461,17 @@ impl Session {
         let member = self.member_id;
         if !new_group.is_empty() {
             let sub = new_group.clone();
-            match engine.with(move |e| e.subscribe_in(&sub, member))? {
+            // An ephemeral subscribe registers through its own eager-create verb (#771): the group
+            // is created NOW, marked ephemeral, under the name/cap/conflict checks — unlike a
+            // durable SUB, which defers creation to the first FLOW — so no poll-side touch can
+            // ever create the name as a durable group first.
+            match engine.with(move |e| {
+                if ephemeral {
+                    e.subscribe_ephemeral_in(&sub, member)
+                } else {
+                    e.subscribe_in(&sub, member)
+                }
+            })? {
                 Ok(()) => {}
                 // The broadcast group-of-one cap rejected a second subscriber: surface the typed
                 // reason and leave this connection on its existing subscription (it was never left).
@@ -3418,10 +3488,20 @@ impl Session {
         // broadcast slot frees. Done AFTER the new registration succeeds so a rejected SUB never
         // tears down a working subscription.
         let old_group = self.subscription.clone();
+        let old_stream = self.stream.clone();
         self.leave_current_key_shared(engine)?;
-        if self.registered_subscription && *old_group != *new_group {
+        // Deregister the OLD subscription, ROUTED to its own stream (#771): an ephemeral
+        // named-stream subscription registers engine-side membership, so leaving it must reach
+        // that stream's group (and reap it if this was the last member). The comparison includes
+        // the stream: a same-name subscription on a DIFFERENT stream is a different group. The
+        // default-stream durable path is byte-for-byte the historical `unsubscribe_in`.
+        if self.registered_subscription && (!old_stream.is_empty() || *old_group != *new_group) {
             engine.with(move |e| {
-                e.unsubscribe_in(&old_group, member);
+                if old_stream.is_empty() {
+                    e.unsubscribe_in(&old_group, member);
+                } else {
+                    e.unsubscribe_in_stream(&old_stream, &old_group, member);
+                }
             })?;
         }
         // Switching subscriptions abandons this connection's in-flight leases in the
@@ -3430,6 +3510,8 @@ impl Session {
         // cap are validated by the engine on the first FLOW (#240), surfaced as an Err.
         self.subscription = GroupName::from(group);
         self.registered_subscription = !new_group.is_empty();
+        // Record whether THIS registration is ephemeral (#771), for the repeated-Connect dereg.
+        self.ephemeral_subscription = ephemeral && !new_group.is_empty();
         // A plain `Sub` binds the DEFAULT stream (#588): clear any named-stream binding a prior
         // `SubTo` set, so this connection's Flow/Ack route to the default stream byte-for-byte. (An old
         // client never sends `SubTo`, so `self.stream` is already default for it; this only matters for
@@ -4073,6 +4155,11 @@ impl Session {
     /// a prior `PubTo` declared it); an unknown stream is an `Err`. An EMPTY stream id targets the
     /// default stream and is equivalent to a plain `Sub`. GATED on the negotiated streams capability;
     /// fail-closed on a malformed body. Never panics.
+    // One cohesive rebind sequence (gates -> conflict checks -> register-new -> leave-old ->
+    // rebind -> mode re-application), where the ORDER between steps is the safety contract
+    // (register-before-deregister, leave-before-reassign); splitting it would scatter that order
+    // across helpers.
+    #[allow(clippy::too_many_lines)]
     fn handle_sub_to<
         F: Filesystem + Clone + 'static,
         C: Clock + Clone + 'static,
@@ -4101,9 +4188,20 @@ impl Session {
         // An EMPTY stream id is a default-stream subscribe: route through the EXISTING `handle_sub` so
         // a `SubTo("", group)` is byte-for-byte a plain `Sub` (it also clears any prior named binding).
         // A `Sub` body IS the raw group-name bytes (see `decode_sub`), so the decoded group slice is
-        // exactly the `Sub` body `handle_sub` expects.
+        // exactly the `Sub` body `handle_sub` expects. The ephemeral flag rides through (#771): a
+        // DEFAULT-stream ephemeral subscribe is exactly `SubTo("", group)` with the flag (the plain
+        // `Sub` body cannot carry it), and `handle_sub` applies the same capability gate.
         if decoded.stream_id.is_empty() {
-            return self.handle_sub(engine, decoded.group, out);
+            return self.handle_sub(engine, decoded.group, decoded.ephemeral, out);
+        }
+        // The EPHEMERAL capability gate (#771), before anything binds: fail-closed for a connection
+        // that did not advertise it, mirroring the #594 filter gate.
+        if decoded.ephemeral && !self.ephemeral_enabled {
+            reply_err(
+                out,
+                "ephemeral groups not negotiated (set wants_ephemeral_groups)",
+            );
+            return Ok(());
         }
         let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
             reply_err(out, "stream id must be valid UTF-8");
@@ -4131,6 +4229,16 @@ impl Session {
         // key_shared / Tier-S are deferred, so this is the plain competing bind; a whole-stream `SubTo`
         // (`partition = None`) falls through to the historical named-stream path below unchanged.
         if let Some(partition) = decoded.partition {
+            // Ephemeral + partition-addressed is a typed reject this slice (#771): the partition
+            // consumer state has its own checkpoint topology (#693) and no membership tracking, so
+            // supporting it is a follow-up, never a silent durable downgrade.
+            if decoded.ephemeral {
+                reply_err(
+                    out,
+                    "ephemeral groups are not supported on a partition-addressed subscribe",
+                );
+                return Ok(());
+            }
             let stream_q = stream.to_string();
             let in_range = engine.with(move |e| {
                 e.partition_count_of(&stream_q)
@@ -4143,33 +4251,86 @@ impl Session {
                 );
                 return Ok(());
             }
-            // Abandon any prior key_shared membership + default-stream registration + leases, exactly as
-            // the whole-stream rebind below, then bind the partition.
+            // Abandon any prior key_shared membership + registration + leases, exactly as the
+            // whole-stream rebind below, then bind the partition. The registration leave is
+            // stream-aware (#771): switching away from an EPHEMERAL subscription deregisters its
+            // engine-side membership (reaping the group if this was the last member) instead of
+            // orphaning it until disconnect.
             self.leave_current_key_shared(engine)?;
+            self.leave_current_subscription(engine)?;
             self.stream = GroupName::from(stream);
             self.subscription = GroupName::from(group);
             self.partition = Some(partition);
             self.registered_subscription = false;
+            self.ephemeral_subscription = false;
             self.joined_key_shared = false;
             self.leased.clear();
             reply(out, FrameType::Ok, &[]);
             return Ok(());
         }
+        // The durability-mode conflict gate (#771), fail-closed BOTH ways before anything rebinds:
+        // an EPHEMERAL SubTo registers through the engine's eager-create verb (which itself rejects
+        // a durable-state conflict), and a DURABLE SubTo onto a group that is live as ephemeral is
+        // rejected here — a durable consumer must never silently drain a group whose checkpoint
+        // writers are suppressed and which reaps out from under it.
+        let member = self.member_id;
+        let same_binding = *self.stream == *stream && *self.subscription == *group;
+        if decoded.ephemeral {
+            // Register the NEW ephemeral subscription FIRST (mirroring `handle_sub`'s register-
+            // before-deregister discipline), so a rejected subscribe leaves the connection's
+            // current subscription fully intact.
+            let stream_q = stream.to_string();
+            let group_q = group.to_string();
+            match engine
+                .with(move |e| e.subscribe_ephemeral_in_stream(&stream_q, &group_q, member))?
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    reply_err_coded(out, e.code().as_str(), &e.to_string());
+                    return Ok(());
+                }
+            }
+        } else {
+            let stream_q = stream.to_string();
+            let group_q = group.to_string();
+            if engine.with(move |e| e.is_ephemeral_in_stream(&stream_q, &group_q))? {
+                reply_err_coded(
+                    out,
+                    crate::codes::ErrorCode::ERR_EPHEMERAL_GROUP_CONFLICT.as_str(),
+                    &format!(
+                        "work-group {group:?} on stream {stream:?} is live as ephemeral: a                          durable subscribe cannot bind it"
+                    ),
+                );
+                return Ok(());
+            }
+        }
         // Leave any prior key_shared membership (of the OLD stream+group) BEFORE rebinding, so its keys
         // re-route to the remaining members (#64 follow-up). This reads `self.stream`/`self.subscription`,
         // so it must run before they are reassigned below; a no-op for a connection that had not joined.
         self.leave_current_key_shared(engine)?;
+        // Deregister the OLD subscription, stream-aware (#771), BEFORE the binding is reassigned —
+        // UNLESS this SubTo re-binds the very same (stream, group): the registration is idempotent
+        // membership, and a same-binding leave would remove the member just re-registered above
+        // (reaping a re-subscribed ephemeral group out from under it). Switching away from an
+        // ephemeral subscription deregisters its engine-side membership (reaping the group if this
+        // was the last member); the durable named path had no registration to leave (#676), so it
+        // is byte-for-byte unchanged.
+        if !same_binding {
+            self.leave_current_subscription(engine)?;
+        }
         // Switching to a named stream abandons this connection's default-stream leases (they redeliver
-        // there after the visibility timeout); the named subscription starts clean. The per-stream
-        // work-group is created lazily on the first named poll under the per-stream group cap (#676).
+        // there after the visibility timeout); the named subscription starts clean. A DURABLE
+        // per-stream work-group is created lazily on the first named poll under the per-stream group
+        // cap (#676); an EPHEMERAL one was just eagerly created above (#771).
         self.stream = GroupName::from(stream);
         self.subscription = GroupName::from(group);
         // A whole-stream SubTo consumes the stream as a whole (#693): clear any prior partition binding.
         self.partition = None;
-        // A named-stream consume does not register in the default-stream broadcast subscriber set (#676),
-        // so leave any such default-stream registration behind (a no-op for a connection that never had
-        // one) rather than stranding it. The key_shared membership below is per-(stream, group).
-        self.registered_subscription = false;
+        // A DURABLE named-stream consume does not register in the default-stream broadcast subscriber
+        // set (#676); an EPHEMERAL one registers per-stream membership (#771) that the leave path
+        // routes by `self.stream`.
+        self.registered_subscription = decoded.ephemeral;
+        self.ephemeral_subscription = decoded.ephemeral;
         self.leased.clear();
         // If the named group is configured key_shared (#64 follow-up), put THIS stream's group into that
         // mode and join as a member so this connection's keys route to it — the named twin of the default
@@ -4552,12 +4713,17 @@ impl Session {
                 reply_err_coded(out, e.code().as_str(), &e.to_string());
                 return Ok(());
             }
+            // Deregister the OLD subscription, stream-aware (#771), BEFORE rebinding: switching
+            // away from an EPHEMERAL subscription must release its engine-side membership (and
+            // reap the group if this was the last member) rather than orphan it until disconnect.
+            self.leave_current_subscription(engine)?;
             // Bind this connection's consume path to the resolved stream (`""` = default) + the group.
             self.stream = GroupName::from(resolved_stream.as_str());
             self.subscription = GroupName::from(group);
             // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
             self.partition = None;
             self.registered_subscription = false;
+            self.ephemeral_subscription = false;
             self.joined_key_shared = false;
             self.leased.clear();
             reply(out, FrameType::Ok, &[]);
@@ -4591,6 +4757,9 @@ impl Session {
                 return Ok(());
             }
         };
+        // Deregister the OLD subscription, stream-aware (#771), BEFORE rebinding — see the
+        // filtered arm above; an ephemeral subscription left behind must reap, not linger.
+        self.leave_current_subscription(engine)?;
         // Bind this connection's consume path to the resolved stream + the requested work-group, exactly
         // as a `SubTo` binds an explicit stream id (the resolved stream is already declared by its bind).
         self.stream = GroupName::from(stream.name());
@@ -4598,6 +4767,7 @@ impl Session {
         // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
         self.partition = None;
         self.registered_subscription = false;
+        self.ephemeral_subscription = false;
         self.joined_key_shared = false;
         self.leased.clear();
         reply(out, FrameType::Ok, &[]);
@@ -4625,6 +4795,10 @@ impl Session {
         // It is a no-op for the default group, for a group still holding leases (they redeliver or
         // expire first, then the natural idle sweep reclaims it), and when eviction is disabled.
         let leaving = std::mem::take(&mut self.subscription);
+        // #771: the `leave_current_subscription` above already deregistered an ephemeral
+        // subscription (routed by the then-current stream binding) and reaped the group if this
+        // was its last member; only the session-side flag remains to clear.
+        self.ephemeral_subscription = false;
         // Clear any named-stream binding (#588): after an Unsub the connection reverts to the default
         // stream, so a later Flow with no SubTo polls the default stream byte-for-byte. The named
         // stream's per-stream work-group is NOT registered in the default-stream key_shared/broadcast/
@@ -4696,9 +4870,19 @@ impl Session {
     ) -> Result<(), SessionError> {
         if self.registered_subscription {
             let group = self.subscription.clone();
+            let stream = self.stream.clone();
             let member = self.member_id;
             engine.with(move |e| {
-                e.unsubscribe_in(&group, member);
+                // Routed per-stream (#771), like `leave_current_key_shared`: an EPHEMERAL
+                // named-stream subscription registered membership on THAT stream's group (and the
+                // leave is what triggers its reap when this member was the last). Only ephemeral
+                // subscriptions register on a named stream today, so the default-stream arm is
+                // byte-for-byte the historical behavior.
+                if stream.is_empty() {
+                    e.unsubscribe_in(&group, member);
+                } else {
+                    e.unsubscribe_in_stream(&stream, &group, member);
+                }
             })?;
             self.registered_subscription = false;
         }
@@ -5826,6 +6010,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: true,
@@ -7196,6 +7381,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -7355,6 +7541,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -7478,6 +7665,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -8491,6 +8679,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -11298,6 +11487,7 @@ mod tests {
         let mut connect_body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit,
                 requested_credit_bytes,
                 wants_gap_marker: false,
@@ -13009,6 +13199,7 @@ mod tests {
         let mut connect_body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: Some(3),
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -13315,6 +13506,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -13436,6 +13628,7 @@ mod tests {
         let mut sub = Vec::new();
         ironbus_proto::message::encode_sub_to(
             &ironbus_proto::message::SubToBody {
+                ephemeral: false,
                 stream_id: b"orders",
                 group: b"w",
                 partition: Some(1),
@@ -13768,6 +13961,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: true,
@@ -15150,6 +15344,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_connect(
             &ironbus_proto::message::ConnectBody {
+                wants_ephemeral_groups: false,
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
@@ -15174,6 +15369,7 @@ mod tests {
         let mut body = Vec::new();
         ironbus_proto::message::encode_sub_to(
             &ironbus_proto::message::SubToBody {
+                ephemeral: false,
                 stream_id: stream,
                 group,
                 partition: None,
@@ -15420,5 +15616,366 @@ mod tests {
         drop(producer);
         drop(handle);
         actor.join().unwrap();
+    }
+
+    // ===================== EPHEMERAL CONSUMER GROUPS (#771, V2-M1) OVER THE WIRE ==============
+
+    /// A `Connect` body advertising the streams capability (#588) plus, optionally, the
+    /// ephemeral-groups capability (#771): the pair an ephemeral named-stream consumer sends.
+    fn ephemeral_connect_body(wants_ephemeral: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
+                understands_deliver_batch: false,
+                understands_streams: true,
+                understands_compressed_delivery: false,
+                wants_subject_filter: false,
+                wants_ephemeral_groups: wants_ephemeral,
+            },
+            &mut body,
+        );
+        body
+    }
+
+    /// A `SubTo` frame body with the ephemeral subscribe flag (#771).
+    fn ephemeral_sub_to(stream: &str, group: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_sub_to(
+            &ironbus_proto::message::SubToBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+                partition: None,
+                ephemeral: true,
+            },
+            &mut body,
+        )
+        .unwrap();
+        body
+    }
+
+    fn produce_named<C: Clock + Clone>(
+        e: &DirectEngine<InMemoryFs, C>,
+        stream: &str,
+        payload: &[u8],
+    ) {
+        e.engine_mut()
+            .produce_in_stream(
+                stream,
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn connect_confirms_the_ephemeral_groups_capability_only_when_advertised() {
+        let e = DirectEngine::new(engine());
+        // Advertised: the Info flags2 echo confirms it (AND-negotiation, server side always Ok).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &ephemeral_connect_body(true)),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Info);
+        let info = ironbus_proto::message::decode_info(&body).unwrap();
+        assert!(info.ephemeral_groups, "the server confirms the capability");
+        // Not advertised (the empty historical Connect): the echo stays clear, so a new client
+        // against this reply refuses to send an ephemeral SubTo.
+        let mut old = Session::new();
+        out.clear();
+        old.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Info);
+        assert!(
+            !ironbus_proto::message::decode_info(&body)
+                .unwrap()
+                .ephemeral_groups
+        );
+    }
+
+    #[test]
+    fn an_ephemeral_sub_to_without_the_negotiated_capability_is_fail_closed_rejected() {
+        let e = DirectEngine::new(engine());
+        produce_named(&e, "orders", b"o1");
+        // Streams-capable but NOT ephemeral-capable: the flag is refused, never silently honored
+        // (and never silently downgraded to a durable subscribe).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &ephemeral_connect_body(false)),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::SubTo, &ephemeral_sub_to("orders", "g")),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+        assert!(
+            String::from_utf8_lossy(&body).contains("wants_ephemeral_groups"),
+            "the reject names the missing capability"
+        );
+        assert!(
+            !e.engine_mut().is_ephemeral_in_stream("orders", "g"),
+            "nothing was bound"
+        );
+        // The DEFAULT-stream shape (SubTo with the empty stream id) is gated identically.
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::SubTo, &ephemeral_sub_to("", "g")),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, _) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+    }
+
+    #[test]
+    fn an_ephemeral_partition_addressed_subscribe_is_a_typed_reject() {
+        let e = DirectEngine::new(engine());
+        produce_named(&e, "orders", b"o1");
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &ephemeral_connect_body(true)),
+            &mut out,
+        )
+        .unwrap();
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_sub_to(
+            &ironbus_proto::message::SubToBody {
+                stream_id: b"orders",
+                group: b"g",
+                partition: Some(0),
+                ephemeral: true,
+            },
+            &mut body,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::SubTo, &body), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+        assert!(String::from_utf8_lossy(&body).contains("partition"));
+    }
+
+    #[test]
+    fn the_full_ephemeral_lifecycle_over_the_wire_consumes_then_reaps_on_unsub() {
+        let e = DirectEngine::new(engine());
+        produce_named(&e, "orders", b"o1");
+        produce_named(&e, "orders", b"o2");
+        let mut s = Session::with_member_id(MemberId::new(41));
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &ephemeral_connect_body(true)),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::SubTo, &ephemeral_sub_to("orders", "g")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert!(e.engine_mut().is_ephemeral_in_stream("orders", "g"));
+        // Consume both records through the ordinary Flow, ack over the wire.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &10u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let tokens = delivered_tokens(&out);
+        assert_eq!(
+            tokens.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![0, 1],
+            "an ephemeral group consumes exactly like a durable one"
+        );
+        for (offset, generation) in tokens {
+            let mut ack_body = Vec::new();
+            encode_ack(
+                &AckBody {
+                    offset,
+                    generation,
+                    op: AckOp::Ack,
+                    delay_ms: 0,
+                },
+                &mut ack_body,
+            );
+            out.clear();
+            s.process(&e, &frame(FrameType::Ack, &ack_body), &mut out)
+                .unwrap();
+        }
+        assert_eq!(
+            e.engine_mut().committed_offset_in_stream("orders", "g"),
+            Offset::new(2)
+        );
+        // Unsub: the last (only) member leaves, so the group reaps in full.
+        out.clear();
+        s.process(&e, &frame(FrameType::Unsub, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert!(
+            !e.engine_mut().is_ephemeral_in_stream("orders", "g"),
+            "the group reaped on the last unsubscribe"
+        );
+        // The name starts over: a later durable consumer sees the whole stream again.
+        let redelivered = e.engine_mut().poll_in_stream("orders", "g", 0).unwrap();
+        assert!(
+            matches!(&redelivered, Poll::Message(d) if d.offset.get() == 0),
+            "a fresh group after the reap starts at the earliest retained offset"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_reaps_the_ephemeral_group_via_the_connection_cleanup_pair() {
+        let e = DirectEngine::new(engine());
+        produce_named(&e, "orders", b"o1");
+        let mut s = Session::with_member_id(MemberId::new(42));
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &ephemeral_connect_body(true)),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::SubTo, &ephemeral_sub_to("orders", "g")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        // Deliver one record and DO NOT ack it: the disconnect must still reap (at-least-once is
+        // scoped to the subscription's lifetime).
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(delivered_tokens(&out).len(), 1);
+        // The exact cleanup pair `handle_connection` runs on EVERY exit path.
+        s.leave_current_key_shared(&e).unwrap();
+        s.leave_current_subscription(&e).unwrap();
+        assert!(
+            !e.engine_mut().is_ephemeral_in_stream("orders", "g"),
+            "the disconnect cleanup reaped the group, leases and all"
+        );
+    }
+
+    #[test]
+    fn a_default_stream_ephemeral_group_binds_via_the_empty_stream_id_and_reaps_on_unsub() {
+        let e = DirectEngine::new(engine());
+        produce(&e, b"a");
+        let mut s = Session::with_member_id(MemberId::new(43));
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &ephemeral_connect_body(true)),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::SubTo, &ephemeral_sub_to("", "g")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert!(e.engine_mut().is_ephemeral_in("g"));
+        assert_eq!(e.engine_mut().subscriber_count_in("g"), 1);
+        // Drain + ack on the default stream.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(delivered_tokens(&out).len(), 1);
+        out.clear();
+        s.process(&e, &frame(FrameType::Unsub, b""), &mut out)
+            .unwrap();
+        assert!(!e.engine_mut().is_ephemeral_in("g"), "reaped");
+        assert_eq!(e.engine_mut().subscriber_count_in("g"), 0);
+    }
+
+    #[test]
+    fn a_durable_sub_to_onto_a_live_ephemeral_group_is_a_coded_conflict() {
+        let e = DirectEngine::new(engine());
+        produce_named(&e, "orders", b"o1");
+        let mut holder = Session::with_member_id(MemberId::new(44));
+        let mut out = Vec::new();
+        holder
+            .process(
+                &e,
+                &frame(FrameType::Connect, &ephemeral_connect_body(true)),
+                &mut out,
+            )
+            .unwrap();
+        out.clear();
+        holder
+            .process(
+                &e,
+                &frame(FrameType::SubTo, &ephemeral_sub_to("orders", "g")),
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        // A second, DURABLE subscriber to the same (stream, group) is fail-closed refused with the
+        // stable machine-readable code.
+        let mut durable = Session::with_member_id(MemberId::new(45));
+        out.clear();
+        durable
+            .process(
+                &e,
+                &frame(FrameType::Connect, &streams_connect_body()),
+                &mut out,
+            )
+            .unwrap();
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_sub_to(
+            &ironbus_proto::message::SubToBody {
+                stream_id: b"orders",
+                group: b"g",
+                partition: None,
+                ephemeral: false,
+            },
+            &mut body,
+        )
+        .unwrap();
+        out.clear();
+        durable
+            .process(&e, &frame(FrameType::SubTo, &body), &mut out)
+            .unwrap();
+        let (ty, err_body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+        let decoded = ironbus_proto::err::decode_err_body(&err_body);
+        assert_eq!(
+            decoded.code,
+            Some(ironbus_proto::err::ServerErrorCode::EphemeralGroupConflict)
+        );
+        // The holder's subscription is untouched by the rejected attempt.
+        assert!(e.engine_mut().is_ephemeral_in_stream("orders", "g"));
     }
 }

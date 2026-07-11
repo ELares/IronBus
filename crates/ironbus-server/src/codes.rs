@@ -101,6 +101,11 @@ impl ErrorCode {
     /// [`EngineError::BroadcastGroupNotNamed`].
     pub const ERR_BROADCAST_GROUP_NOT_NAMED: ErrorCode = ErrorCode("ERR_BROADCAST_GROUP_NOT_NAMED");
 
+    /// An ephemeral/durable mode conflict on a work-group name (#771): an ephemeral subscribe named
+    /// a group that is live as durable or carries durable state, or a durable subscribe named a
+    /// group that is live as ephemeral. Maps [`EngineError::EphemeralGroupConflict`].
+    pub const ERR_EPHEMERAL_GROUP_CONFLICT: ErrorCode = ErrorCode("ERR_EPHEMERAL_GROUP_CONFLICT");
+
     /// A new named work-group exceeded the per-engine group cap (#240). Maps
     /// [`EngineError::TooManyGroups`].
     pub const ERR_TOO_MANY_GROUPS: ErrorCode = ErrorCode("ERR_TOO_MANY_GROUPS");
@@ -221,6 +226,7 @@ impl ErrorCode {
             EngineError::CumulativeAckOutOfRange { .. } => Self::ERR_CUMULATIVE_ACK_OUT_OF_RANGE,
             EngineError::BroadcastGroupBusy { .. } => Self::ERR_BROADCAST_GROUP_BUSY,
             EngineError::BroadcastGroupNotNamed { .. } => Self::ERR_BROADCAST_GROUP_NOT_NAMED,
+            EngineError::EphemeralGroupConflict { .. } => Self::ERR_EPHEMERAL_GROUP_CONFLICT,
             EngineError::TooManyGroups { .. } => Self::ERR_TOO_MANY_GROUPS,
             EngineError::TooManyStreams { .. } => Self::ERR_TOO_MANY_STREAMS,
             EngineError::InvalidGroupName => Self::ERR_INVALID_GROUP_NAME,
@@ -281,6 +287,7 @@ mod tests {
             ErrorCode::ERR_CUMULATIVE_ACK_OUT_OF_RANGE,
             ErrorCode::ERR_BROADCAST_GROUP_BUSY,
             ErrorCode::ERR_BROADCAST_GROUP_NOT_NAMED,
+            ErrorCode::ERR_EPHEMERAL_GROUP_CONFLICT,
             ErrorCode::ERR_TOO_MANY_GROUPS,
             ErrorCode::ERR_TOO_MANY_STREAMS,
             ErrorCode::ERR_INVALID_GROUP_NAME,
@@ -373,6 +380,12 @@ mod tests {
                     group: String::new(),
                 },
                 ErrorCode::ERR_BROADCAST_GROUP_NOT_NAMED,
+            ),
+            (
+                EngineError::EphemeralGroupConflict {
+                    group: "g".to_string(),
+                },
+                ErrorCode::ERR_EPHEMERAL_GROUP_CONFLICT,
             ),
             (
                 EngineError::TooManyGroups { max: 8 },
