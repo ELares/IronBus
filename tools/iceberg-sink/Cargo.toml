@@ -1,0 +1,75 @@
+# A STANDALONE, SEPARATE workspace (its own Cargo.lock), deliberately EXCLUDED from the root IronBus
+# workspace (see the root Cargo.toml `exclude` list, alongside `tools/loom-tests`). This is the hard
+# dependency-isolation constraint of #793: the Iceberg/Parquet SINK is an OPT-IN companion connector
+# binary, and its heavy analytics stack (Apache Arrow, Parquet, the `iceberg` metadata layer, Thrift,
+# Avro, tokio, opendal) must NEVER unify into the broker's dependency graph or its cargo-auditable
+# SBOM. Because Cargo resolves features PER-LOCKFILE, a root workspace member would fold Arrow/Parquet
+# onto the shared build graph even when cfg-gated out; a separate, excluded workspace with its OWN
+# lockfile is the only thing that guarantees `cargo build` / `cargo tree` of the broker stays
+# Arrow/Parquet/Thrift-free. The broker crates are UNTOUCHED by this connector.
+#
+# It depends on `ironbus-client` (a pure-Rust leaf: ironbus-client -> ironbus-core + ironbus-proto,
+# no heavy deps) by PATH to consume the bus over the wire, exactly as any external consumer would.
+# `ironbus-client`'s own `.workspace = true` inheritances resolve against the ROOT IronBus workspace
+# (found by walking up from its manifest), so the path dependency builds cleanly from here.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "ironbus-iceberg-sink"
+description = "IronBus -> Apache Iceberg/Parquet sink connector: materialize a topic as an open, analytics-queryable Iceberg table in object storage (standalone binary; the broker stays a pure message bus). #793 phase 1."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ELares/IronBus"
+authors = ["The IronBus Authors"]
+publish = false
+
+[[bin]]
+name = "ironbus-iceberg-sink"
+path = "src/main.rs"
+
+[lib]
+name = "ironbus_iceberg_sink"
+path = "src/lib.rs"
+
+[dependencies]
+# Consume the bus over the wire (path dep; a pure-Rust leaf that adds no heavy deps).
+ironbus-client = { path = "../../crates/ironbus-client", version = "0.1.0" }
+# The wire types the client speaks (ConsumeTier for the streaming handshake; PubBody in tests).
+ironbus-proto = { path = "../../crates/ironbus-proto", version = "0.1.0" }
+
+# The Iceberg metadata layer: spec-correct manifest (Avro) + manifest-list + TableMetadata writers,
+# so the emitted table is a valid Apache Iceberg v2 table by construction (see src/table.rs for why
+# this beats hand-rolling the Avro field-ids). Pinned to the arrow/parquet 57 line it uses so the
+# whole graph shares ONE arrow version.
+iceberg = "0.9.1"
+# Parquet data files, written directly with the Arrow writer (sync), matching iceberg's arrow 57.
+parquet = "57"
+arrow-array = "57"
+arrow-schema = "57"
+# iceberg's manifest/manifest-list writers are async (opendal FileIO); one runtime drives each commit.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# Unique commit ids -> unique data-file / manifest / manifest-list file names, and snapshot ids.
+uuid = { version = "1", features = ["v4"] }
+# Read the persisted TableMetadata (metadata.json) back on resume.
+serde_json = "1"
+# Ergonomic error plumbing in a binary.
+anyhow = "1"
+# The CLI surface.
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Mirror the root workspace lints so this standalone crate stays clippy-clean and unsafe-denied under
+# the same bar (it cannot inherit them across the workspace boundary). The crate-level `allow`s in
+# src/lib.rs cover the unavoidable numeric casts of a data-plumbing connector.
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

@@ -10,7 +10,13 @@ members = ["crates/*", "tools/*"]
 # shipped binary's cargo-auditable SBOM: a workspace member would unify `tracing-subscriber`'s
 # features into the single shared build node even when cfg-gated out of the compiled units, because
 # feature resolution is per-lockfile. The nightly loom job builds it from its own directory.
-exclude = ["tools/loom-tests"]
+#
+# `tools/iceberg-sink` (#793) is likewise its OWN, separate workspace with its OWN Cargo.lock,
+# EXCLUDED here for the SAME reason: it is the opt-in Iceberg/Parquet SINK connector, and its heavy
+# analytics stack (Apache Arrow, Parquet, the `iceberg` metadata layer, Thrift, Avro, tokio, opendal)
+# must NEVER unify into the broker's graph or its SBOM. The broker stays a pure message bus; the sink
+# path-depends on `ironbus-client` to consume over the wire, exactly like any external consumer.
+exclude = ["tools/loom-tests", "tools/iceberg-sink"]
 
 [workspace.package]
 version = "0.1.0"
