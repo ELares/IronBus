@@ -52,6 +52,24 @@ pub enum ReasonCode {
     /// after the wrong root cause. It IS data loss. Appended per the append-only rule (a new
     /// number, name, and label); it does NOT bump `schema_version`, exactly as code 6 did.
     UnresolvedDictId,
+    /// An at-rest-ENCRYPTED segment (#780) whose header `key_id` matches NO loaded key, so the
+    /// broker cannot decrypt its records at all. DISTINCT from a corrupt body (code 3): the bytes are
+    /// fine — the CRC over the ciphertext passes — the only problem is a MISSING key, so an operator
+    /// reading the loss report sees an actionable key-management gap ("load key X for segment S"), not
+    /// "your disk is corrupt". Routed through the #8 bounded-and-reported loss path (quarantined,
+    /// capped), never a silent skip and never a crash. Appended per the append-only rule (a new
+    /// number, name, and label); it does NOT bump `schema_version`.
+    UnknownKeyId,
+    /// An at-rest-ENCRYPTED record (#780) whose `key_id` matched a loaded key and whose CRC over the
+    /// ciphertext PASSED, but whose AEAD authentication tag FAILED to verify under that key. The bytes
+    /// are intact (the CRC vouched for them) yet do not authenticate: a wrong/rotated key bound to
+    /// that id, a key/id mismatch, or a forgery. DELIBERATELY DISTINCT from `CorruptRecordBody` (code
+    /// 3, bit-rot) — a wrong or rotated key must NEVER masquerade as ordinary corruption. Because the
+    /// CRC is verified BEFORE the AEAD, a tag failure here is genuine authenticity failure, not
+    /// bit-rot. Routed through the #8 bounded-and-reported loss path (quarantined, capped), never a
+    /// silent read of garbage plaintext and never a crash. Appended per the append-only rule; it does
+    /// NOT bump `schema_version`.
+    AeadTagMismatch,
 }
 
 impl ReasonCode {
@@ -68,12 +86,14 @@ impl ReasonCode {
             ReasonCode::SequenceGap => 5,
             ReasonCode::ScrubberSuspect => 6,
             ReasonCode::UnresolvedDictId => 7,
+            ReasonCode::UnknownKeyId => 8,
+            ReasonCode::AeadTagMismatch => 9,
         }
     }
 
     /// Every reason, in code order, so a consumer can enumerate them (for example to emit a
     /// metric series per reason). Appended to, never reordered.
-    pub const ALL: [ReasonCode; 7] = [
+    pub const ALL: [ReasonCode; 9] = [
         ReasonCode::TornTail,
         ReasonCode::CorruptRecordHeader,
         ReasonCode::CorruptRecordBody,
@@ -81,6 +101,8 @@ impl ReasonCode {
         ReasonCode::SequenceGap,
         ReasonCode::ScrubberSuspect,
         ReasonCode::UnresolvedDictId,
+        ReasonCode::UnknownKeyId,
+        ReasonCode::AeadTagMismatch,
     ];
 
     /// This reason's index into [`ReasonCode::ALL`] (and so into the per-reason arrays
@@ -108,6 +130,8 @@ impl ReasonCode {
             ReasonCode::SequenceGap => "sequence_gap",
             ReasonCode::ScrubberSuspect => "scrubber_suspect",
             ReasonCode::UnresolvedDictId => "unresolved_dict_id",
+            ReasonCode::UnknownKeyId => "unknown_key_id",
+            ReasonCode::AeadTagMismatch => "aead_tag_mismatch",
         }
     }
 
@@ -523,6 +547,8 @@ mod tests {
             ReasonCode::SequenceGap,
             ReasonCode::ScrubberSuspect,
             ReasonCode::UnresolvedDictId,
+            ReasonCode::UnknownKeyId,
+            ReasonCode::AeadTagMismatch,
         ];
         // Frozen numeric codes (a renumber would break a deployed metrics consumer).
         assert_eq!(ReasonCode::TornTail.code(), 1);
@@ -535,6 +561,9 @@ mod tests {
         // Appended for the absent-dictionary decompress loss (#357, #78); append-only, no
         // schema bump (the same move code 6 made).
         assert_eq!(ReasonCode::UnresolvedDictId.code(), 7);
+        // Appended for at-rest encryption (#780); append-only, no schema bump.
+        assert_eq!(ReasonCode::UnknownKeyId.code(), 8);
+        assert_eq!(ReasonCode::AeadTagMismatch.code(), 9);
         // No two reasons share a code.
         let mut seen = std::collections::BTreeSet::new();
         for r in all {
@@ -645,7 +674,7 @@ mod tests {
     fn golden_reason_code_vocabulary_is_frozen() {
         // (numeric code, metric label, serde JSON name), in code order. Append-only: a new reason
         // adds a row; an existing row never changes.
-        let frozen: [(u16, &str, &str); 7] = [
+        let frozen: [(u16, &str, &str); 9] = [
             (1, "torn_tail", "\"TornTail\""),
             (2, "corrupt_record_header", "\"CorruptRecordHeader\""),
             (3, "corrupt_record_body", "\"CorruptRecordBody\""),
@@ -653,6 +682,8 @@ mod tests {
             (5, "sequence_gap", "\"SequenceGap\""),
             (6, "scrubber_suspect", "\"ScrubberSuspect\""),
             (7, "unresolved_dict_id", "\"UnresolvedDictId\""),
+            (8, "unknown_key_id", "\"UnknownKeyId\""),
+            (9, "aead_tag_mismatch", "\"AeadTagMismatch\""),
         ];
         assert_eq!(
             ReasonCode::ALL.len(),
@@ -716,7 +747,7 @@ mod tests {
             .sum();
         assert_eq!(by_reason, r.total_bytes_skipped());
         // Labels are frozen and distinct, in code order.
-        assert_eq!(ReasonCode::ALL.len(), 7);
+        assert_eq!(ReasonCode::ALL.len(), 9);
         assert_eq!(ReasonCode::TornTail.metric_label(), "torn_tail");
         assert_eq!(
             ReasonCode::CorruptRecordHeader.metric_label(),
@@ -732,7 +763,7 @@ mod tests {
         );
         let labels: std::collections::BTreeSet<_> =
             ReasonCode::ALL.iter().map(|rc| rc.metric_label()).collect();
-        assert_eq!(labels.len(), 7, "labels are distinct");
+        assert_eq!(labels.len(), 9, "labels are distinct");
     }
 
     #[test]

@@ -134,6 +134,18 @@ impl RecordFlags {
     /// frame that sets both). Additive: a record without it is byte-for-byte the pre-tag layout, so a
     /// per-stream-log deployment (the default) never sets it and its bytes are unchanged.
     pub const HAS_STREAM_TAG: RecordFlags = RecordFlags(0b0001_0000);
+    /// The record body (`key ++ headers ++ payload`) is AEAD-encrypted at rest (#780): the on-disk
+    /// body is the ciphertext (same length as the plaintext) followed by the
+    /// [`crate::format::AEAD_TAG_LEN`]-byte authentication tag, and the `key_len`/`hdr_len`/`payload_len`
+    /// header fields describe the PLAINTEXT lengths. The tag is the only size delta and is counted in
+    /// `total_len` exactly as the optional xxh3 field is. Every record in an encrypted segment carries
+    /// this bit (per-segment uniformity), and the segment header carries the matching
+    /// [`crate::format::SEGMENT_FLAG_ENCRYPTED`] flag plus the AEAD suite and key-id. The #5 CRC32C is
+    /// computed over the on-disk CIPHERTEXT + tag, so corruption detection works WITHOUT the key. The
+    /// plaintext [`crate::codec::decode`] REFUSES a frame carrying this bit
+    /// ([`crate::codec::DecodeError::Encrypted`]) so ciphertext is never mis-read as plaintext; the
+    /// encrypted read path uses [`crate::codec::decode_encrypted`] and then AEAD-decrypts.
+    pub const ENCRYPTED: RecordFlags = RecordFlags(0b0010_0000);
 
     /// An empty flag set.
     pub const EMPTY: RecordFlags = RecordFlags(0);
@@ -145,7 +157,8 @@ impl RecordFlags {
             | Self::HAS_KEY.0
             | Self::HAS_XXH3.0
             | Self::HAS_SUBJECT.0
-            | Self::HAS_STREAM_TAG.0,
+            | Self::HAS_STREAM_TAG.0
+            | Self::ENCRYPTED.0,
     );
 
     /// Builds a flag set from its raw byte.
@@ -221,22 +234,27 @@ mod tests {
 
     #[test]
     fn flags_unknown_bits_detected_and_preserved() {
-        assert_eq!(RecordFlags::KNOWN.bits(), 0b1_1111);
-        // The xxh3, subject, and stream-tag presence bits are recognized flags, not unknown bits.
+        // KNOWN now includes the ENCRYPTED bit (bit 5, #780) alongside the prior five.
+        assert_eq!(RecordFlags::KNOWN.bits(), 0b11_1111);
+        // The xxh3, subject, stream-tag, and encrypted presence bits are recognized flags.
         assert!(RecordFlags::KNOWN.contains(RecordFlags::HAS_XXH3));
         assert!(RecordFlags::KNOWN.contains(RecordFlags::HAS_SUBJECT));
         assert!(RecordFlags::KNOWN.contains(RecordFlags::HAS_STREAM_TAG));
+        assert!(RecordFlags::KNOWN.contains(RecordFlags::ENCRYPTED));
         assert_eq!(RecordFlags::HAS_XXH3.unknown_bits(), RecordFlags::EMPTY);
         assert_eq!(RecordFlags::HAS_SUBJECT.unknown_bits(), RecordFlags::EMPTY);
         assert_eq!(
             RecordFlags::HAS_STREAM_TAG.unknown_bits(),
             RecordFlags::EMPTY
         );
-        // The stream-tag bit is bit 4, distinct from the subject bit (bit 3).
+        assert_eq!(RecordFlags::ENCRYPTED.unknown_bits(), RecordFlags::EMPTY);
+        // The stream-tag bit is bit 4, distinct from the subject bit (bit 3); the encrypted bit is
+        // bit 5, distinct from both.
         assert_eq!(RecordFlags::HAS_STREAM_TAG.bits(), 0b0001_0000);
+        assert_eq!(RecordFlags::ENCRYPTED.bits(), 0b0010_0000);
         // A known-only set has no unknown bits.
         assert_eq!(RecordFlags::KNOWN.unknown_bits(), RecordFlags::EMPTY);
-        // An unknown high bit is both preserved and reported.
+        // An unknown high bit is both preserved and reported (bit 7 is still unallocated).
         let future = RecordFlags::from_bits(0b1000_0010);
         assert_eq!(future.bits(), 0b1000_0010);
         assert_eq!(future.unknown_bits(), RecordFlags::from_bits(0b1000_0000));

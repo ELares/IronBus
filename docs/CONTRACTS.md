@@ -64,12 +64,14 @@ Source: `types.rs`. Unknown bits are preserved on read so a future writer can ad
 | `0b0000_0100` | `HAS_XXH3`   | the record carries the xxh3-64 field; DERIVED from the stored body reaching the threshold |
 | `0b0000_1000` | `HAS_SUBJECT` | the record carries a stored subject field (#594); DERIVED from a non-empty subject, never taken from the caller. See [Optional subject field](#optional-subject-field-on-disk-conditional) |
 | `0b0001_0000` | `HAS_STREAM_TAG` | the record carries a stored stream-tag field (#597, the shared-WAL demux key); DERIVED from a non-empty tag, never taken from the caller. MUTUALLY EXCLUSIVE with `HAS_SUBJECT` (both use the fixed post-header slot). See [Optional stream-tag field](#optional-stream-tag-field-on-disk-conditional) |
+| `0b0010_0000` | `ENCRYPTED` | the record body is AEAD-encrypted at rest (#780): the on-disk body is the ciphertext (same length as the plaintext body) followed by the 16-byte AEAD tag, `key_len`/`hdr_len`/`payload_len` describe the PLAINTEXT lengths, and the CRC32C (and xxh3) cover the ciphertext + tag. Every record in an encrypted segment carries it (the segment header carries the matching `SEGMENT_FLAG_ENCRYPTED` + `aead_suite` + `key_id`). Carries NO subject/stream-tag slot. The plaintext `decode` REFUSES it (`DecodeError::Encrypted`); the read path uses `decode_encrypted` then AEAD-decrypts |
 
-`KNOWN` is `0b0001_1111`. `decode` rejects a frame whose `HAS_KEY` disagrees with
+`KNOWN` is `0b0011_1111`. `decode` rejects a frame whose `HAS_KEY` disagrees with
 `key_len != 0`, whose `HAS_XXH3` disagrees with `body_len >= XXH3_PAYLOAD_THRESHOLD`, whose
 `HAS_SUBJECT` is set with a zero-length subject, whose `HAS_STREAM_TAG` is set with a zero-length
 tag, or which sets BOTH `HAS_SUBJECT` and `HAS_STREAM_TAG` (they share the post-header slot), as
-`BadLength`.
+`BadLength`; and the plaintext `decode` REFUSES an `ENCRYPTED` frame as `DecodeError::Encrypted`
+(the encrypted read path uses `decode_encrypted`), so ciphertext is never split as plaintext.
 
 ### Compressed payload descriptor (when `COMPRESSED` is set)
 
@@ -235,20 +237,23 @@ records between them use the record frame above.
 
 ### SegmentHeader (on-disk, 64 bytes)
 
-Frozen offsets (`segment_header_offsets`). Bytes `[44, 60)` are reserved (zero).
+Frozen offsets (`segment_header_offsets`). Bytes `[44, 60)` are reserved (zero on a plaintext
+segment); at-rest encryption (#780) uses the first 9 of them for `aead_suite` + `key_id`.
 
 | offset | field            | type     | notes |
 |--------|------------------|----------|-------|
 | `[0, 8)`   | `magic`          | bytes[8] | frozen `"IRONBUS\0"` |
-| `[8, 9)`   | `version`        | u8       | `FORMAT_VERSION` = 1, or `FORMAT_VERSION_COMPACTED` = 2 on a COMPACTED segment ONLY (#337, below); a v1 reader rejects any other value |
+| `[8, 9)`   | `version`        | u8       | `FORMAT_VERSION` = 1, or `FORMAT_VERSION_COMPACTED` = 2 on a COMPACTED segment ONLY (#337, below); a v1 reader rejects any other value. Encryption does NOT bump the version |
 | `[9, 10)`  | `checksum_algo`  | u8       | frozen `0x1` = CRC32C; a v1 reader rejects any other value |
-| `[10, 12)` | `flags`          | u16      | reserved in v1 (zero); preserved on read, not interpreted. Bit 0 (`SEGMENT_FLAG_COMPACTED` = `0x0001`, #337) marks a COMPACTED segment, which stamps `version` = 2 (below) |
+| `[10, 12)` | `flags`          | u16      | reserved in v1 (zero); preserved on read, not interpreted. Bit 0 (`SEGMENT_FLAG_COMPACTED` = `0x0001`, #337) marks a COMPACTED segment, which stamps `version` = 2 (below). Bit 1 (`SEGMENT_FLAG_ENCRYPTED` = `0x0002`, #780) marks an at-rest-ENCRYPTED segment (distinct bit; a segment may be both) |
 | `[12, 20)` | `segment_id`     | u64      | monotonic segment identifier |
 | `[20, 28)` | `base_seq`       | u64      | sequence of the first record in the segment |
 | `[28, 36)` | `base_offset`    | u64      | log offset of the first record in the segment |
 | `[36, 44)` | `created_unix_ms`| u64      | wall-clock creation time, milliseconds |
-| `[44, 60)` | reserved         | bytes[16]| zero |
-| `[60, 64)` | `header_crc`     | u32      | CRC32C over bytes `[0, 60)` |
+| `[44, 45)` | `aead_suite`     | u8       | at-rest AEAD suite (#780): `0` = none (plaintext), `1` = AES-256-GCM, `2` = ChaCha20-Poly1305. Non-zero only when `SEGMENT_FLAG_ENCRYPTED` is set; a reader REFUSES an unknown value |
+| `[45, 53)` | `key_id`         | u64      | at-rest key identifier (#780), NEVER the key. Zero on a plaintext segment |
+| `[53, 60)` | reserved         | bytes[7] | zero |
+| `[60, 64)` | `header_crc`     | u32      | CRC32C over bytes `[0, 60)` (covers `flags`, `aead_suite`, and `key_id` for free) |
 
 ### SegmentFooter (on-disk, 32 bytes)
 

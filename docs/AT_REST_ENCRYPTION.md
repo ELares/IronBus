@@ -1,13 +1,21 @@
 # IronBus optional at-rest AEAD encryption
 
-**Status: specified, not yet implemented; tracked by #108.** This document is the
-normative design for optional authenticated encryption of segment payloads at
-rest. None of it is wired into the binary today. The log and the dead-letter
-queue are plaintext on disk right now, exactly as [THREAT_MODEL.md](THREAT_MODEL.md)
-states (no auth, no TLS, no at-rest encryption), and the record flag bits
-defined today are `COMPRESSED`, `HAS_KEY`, and `HAS_XXH3` (the `KNOWN` set per
-[CONTRACTS.md](CONTRACTS.md)); no encryption bit is allocated yet (see
-[INVARIANTS.md](INVARIANTS.md), I7). This spec is the child of the security epic
+**Status: PHASE 1 IMPLEMENTED (#780); this document remains the normative design.**
+The cryptographic core and the on-disk format landed in #780: the pure-Rust AEAD
+provider (`ironbus_storage::crypto`, behind the opt-in `encryption` feature — AES-256-GCM
+/ ChaCha20-Poly1305 by CPU feature detection), the deterministic `segment_id ||
+record_counter` nonce, the `SEGMENT_FLAG_ENCRYPTED` header flag with the recorded
+`aead_suite` + `key_id`, the `ENCRYPTED` record flag and the ciphertext-plus-tag frame
+(CRC over the ciphertext), the `UnknownKeyId` / `AeadTagMismatch` reason codes, the key
+ring, and the fail-closed raw-key-file loader. Encryption is applied and read back
+end-to-end at the segment layer (`SegmentWriter::create_encrypted` /
+`SegmentReader::scan_decrypted`) and is **OFF by default and byte-identical when off**.
+Still tracked as follow-on: threading the key ring through the live broker `LogConfig`
+and EVERY read path (the zero-copy `raw_byte_range`/sendfile plane and verbatim
+replication have genuine ciphertext/nonce design decisions), the Argon2id-passphrase and
+TEE-sealed key sources, and re-encryption / compaction+encryption. The log and the
+dead-letter queue are plaintext on disk in a default deployment, exactly as
+[THREAT_MODEL.md](THREAT_MODEL.md) states. This spec is the child of the security epic
 #18 and the sibling of the auth spec ([AUTHENTICATION.md](AUTHENTICATION.md),
 #106), the TLS transport spec ([TRANSPORT.md](TRANSPORT.md), #107), and the
 secret-handling spec (#109).
@@ -456,12 +464,24 @@ co-located plaintext key protects against a stolen disk, not a stolen device.**
 
 ---
 
-## Specified, not implemented
+## Implementation status (phase 1, #780)
 
-Nothing in this document exists in the binary today. There is no AEAD crate in any
-`Cargo.toml`, no encryption record-flag bit defined (only `COMPRESSED`,
-`HAS_KEY`, `HAS_XXH3`), no `aead_suite` or `key_id` written to any segment header,
-no `UnknownKeyId` or `AeadTagMismatch` reason code, and no key loader. The segment
-header's reserved bytes and the record `flags` byte's reserved space are exactly
-that today: reserved and zero. This is the design these will implement, tracked by
-#108 under the security epic #18.
+Phase 1 landed the cryptographic core and the on-disk format:
+
+- **In the binary now** (opt-in `encryption` feature): the AEAD crates (`aes-gcm`,
+  `chacha20poly1305`, pure Rust, deny-clean) in `ironbus-storage`; the `ENCRYPTED` record
+  flag and the `SEGMENT_FLAG_ENCRYPTED` header flag; `aead_suite` (offset 44) and `key_id`
+  (`[45, 53)`) in the segment header; the ciphertext-plus-tag frame with the CRC over the
+  ciphertext (`codec::encode_encrypted` / `decode_encrypted`); the deterministic nonce; the
+  `UnknownKeyId` / `AeadTagMismatch` reason codes; the key ring; the fail-closed raw-key-file
+  loader; and `SegmentWriter::create_encrypted` / `SegmentReader::scan_decrypted`, proven
+  end-to-end at the segment layer (round-trip both suites, nonce uniqueness, wrong/unknown
+  key reported, CRC-over-ciphertext torn-tail without the key, rotation, default-off
+  byte-identity).
+- **Follow-on** (owning issues per #14/#109/#18): threading the key source through the live
+  broker `LogConfig` and every read path — the zero-copy `raw_byte_range`/sendfile plane
+  would otherwise ship ciphertext, and verbatim replication would create a
+  nonce/`segment_id` mismatch, so both need explicit design; the Argon2id-passphrase and
+  TEE-sealed key sources (only the raw key file ships in phase 1); re-encryption of history;
+  and compaction+encryption. A default deployment (no key configured) is byte-for-byte the
+  plaintext v1 format.

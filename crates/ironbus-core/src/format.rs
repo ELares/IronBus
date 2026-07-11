@@ -109,6 +109,49 @@ pub const SEGMENT_FOOTER_LEN: usize = 32;
 /// Version-1 readers must reject any other value.
 pub const CHECKSUM_ALGO_CRC32C: u8 = 0x1;
 
+// --- Optional at-rest AEAD encryption: the additive on-disk delta (#780, spec #108). ---
+//
+// At-rest encryption is OPTIONAL and OFF by default. When no key is configured, none of the fields
+// below are set and a segment is BYTE-FOR-BYTE the plaintext v1 layout. When a key IS configured,
+// the record body (`key ++ headers ++ payload`) is AEAD-encrypted IN PLACE within the existing
+// record frame: the on-disk body is the ciphertext (same length as the plaintext) followed by the
+// [`AEAD_TAG_LEN`]-byte authentication tag, flagged by [`RecordFlags::ENCRYPTED`] and counted in
+// `total_len` exactly as the optional xxh3 field is. The `key_len` / `hdr_len` / `payload_len`
+// header fields continue to describe the PLAINTEXT lengths; the tag is the only size delta. The #5
+// checksums are computed over the on-disk CIPHERTEXT + tag, so a torn tail or bit-rot is detected
+// WITHOUT the key. See `docs/AT_REST_ENCRYPTION.md`.
+
+/// Size in bytes of the AEAD authentication tag appended to an encrypted record's body (#780). Both
+/// AES-256-GCM and ChaCha20-Poly1305 produce a 128-bit tag. An encrypted record's on-disk body is
+/// `plaintext_len + AEAD_TAG_LEN` bytes; the tag is the ONLY size delta versus the plaintext frame,
+/// flagged by [`RecordFlags::ENCRYPTED`] and counted in `total_len` like the optional xxh3 field.
+pub const AEAD_TAG_LEN: usize = 16;
+
+/// The segment-header `flags` bit (at `[10, 12)`, inside the CRC-covered bytes `[0, 60)`) that marks
+/// a segment whose record bodies are AEAD-encrypted at rest (#780): `0x0002`. It is a DISTINCT bit
+/// from [`SEGMENT_FLAG_COMPACTED`] (`0x0001`): a segment may be BOTH compacted and encrypted. Unlike
+/// compaction, encryption does NOT bump the segment `version` — it reuses the reserved header bytes
+/// `[44, 60)` (already inside the frozen `header_crc` scope) for [`segment_header_offsets::AEAD_SUITE`]
+/// and [`segment_header_offsets::KEY_ID`], so an encrypted segment stays `version` 1 (or 2 if also
+/// compacted). A pre-encryption reader is fail-closed NOT by the version but by the 16-byte tag
+/// inflating each record beyond its declared plaintext lengths, which the codec rejects as
+/// `BadLength`. A reader that finds this bit CLEAR reads the body as plaintext exactly as today.
+pub const SEGMENT_FLAG_ENCRYPTED: u16 = 0x0002;
+
+/// AEAD suite id `0`: NONE. The segment is not encrypted; written whenever
+/// [`SEGMENT_FLAG_ENCRYPTED`] is clear, so a plaintext segment's reserved bytes stay zero and the
+/// header is byte-identical to the pre-encryption layout.
+pub const AEAD_SUITE_NONE: u8 = 0;
+
+/// AEAD suite id `1`: AES-256-GCM, selected at startup where the runtime reports a hardware AES
+/// implementation (aarch64 crypto extensions, x86 AES-NI). Recorded in the segment header so a read
+/// is unambiguous regardless of the reading host's own CPU (#780).
+pub const AEAD_SUITE_AES_256_GCM: u8 = 1;
+
+/// AEAD suite id `2`: ChaCha20-Poly1305, the portable constant-time fallback selected where hardware
+/// AES is not reported. Recorded in the segment header so a read is unambiguous (#780).
+pub const AEAD_SUITE_CHACHA20_POLY1305: u8 = 2;
+
 /// Default hard cap on a single record's total size: 16 MiB.
 pub const DEFAULT_MAX_RECORD_BYTES: u32 = 16 * 1024 * 1024;
 
@@ -169,7 +212,13 @@ pub mod header_offsets {
 
 /// Byte offsets of each field within the 64-byte segment header (little-endian). The
 /// header is 4 KiB-aligned at the start of a segment file. Bytes `[44, 60)` are
-/// reserved (zero) and `header_crc` covers `[0, 60)`.
+/// reserved (zero on a plaintext segment) and `header_crc` covers `[0, 60)`.
+///
+/// At-rest encryption (#780) uses the FIRST 9 of those reserved bytes for [`AEAD_SUITE`] (u8) and
+/// [`KEY_ID`] (u64); the remaining `[53, 60)` stay reserved-zero. Because `header_crc` already
+/// covers `[0, 60)`, the suite and key-id are integrity-protected for free, with no offset move and
+/// no new checksum. A plaintext segment (no [`SEGMENT_FLAG_ENCRYPTED`] bit) writes all of `[44, 60)`
+/// as zero, so its header is byte-for-byte the pre-encryption layout.
 pub mod segment_header_offsets {
     /// Offset of the 8-byte `magic` field (`SEGMENT_MAGIC`).
     pub const MAGIC: usize = 0;
@@ -187,6 +236,14 @@ pub mod segment_header_offsets {
     pub const BASE_OFFSET: usize = 28;
     /// Offset of the `created_unix_ms: u64` field.
     pub const CREATED_MS: usize = 36;
+    /// Offset of the `aead_suite: u8` field (#780), the first byte of the previously-reserved
+    /// `[44, 60)` region. Holds an [`super::AEAD_SUITE_AES_256_GCM`] / [`super::AEAD_SUITE_CHACHA20_POLY1305`]
+    /// value when [`super::SEGMENT_FLAG_ENCRYPTED`] is set, else [`super::AEAD_SUITE_NONE`] (zero).
+    pub const AEAD_SUITE: usize = 44;
+    /// Offset of the `key_id: u64` field (#780), at `[45, 53)`. A stable, fixed-width identifier for
+    /// the at-rest key (NEVER the key), zero on a plaintext segment. The remaining `[53, 60)` stay
+    /// reserved-zero.
+    pub const KEY_ID: usize = 45;
     /// Offset of the `header_crc: u32` field. The CRC covers bytes `[0, 60)`.
     pub const HEADER_CRC: usize = 60;
 }
@@ -336,6 +393,13 @@ mod tests {
         assert_eq!(hoff::BASE_SEQ, 20);
         assert_eq!(hoff::BASE_OFFSET, 28);
         assert_eq!(hoff::CREATED_MS, 36);
+        // The at-rest encryption fields (#780) live in the previously-reserved [44, 60) region,
+        // inside the frozen header CRC scope [0, 60): aead_suite (u8) at 44, key_id (u64) at [45, 53).
+        assert_eq!(hoff::AEAD_SUITE, 44);
+        assert_eq!(hoff::KEY_ID, 45);
+        // The suite byte and the 8-byte key_id fit entirely inside the CRC-covered reserved region
+        // (end at 53), leaving [53, 60) still reserved-zero before the header CRC at 60.
+        assert_eq!(hoff::KEY_ID + 8, 53);
         assert_eq!(hoff::HEADER_CRC, 60);
         assert_eq!(hoff::HEADER_CRC + 4, SEGMENT_HEADER_LEN);
         assert_eq!(SEGMENT_HEADER_CRC_RANGE, 0..60);
@@ -373,6 +437,23 @@ mod tests {
     fn record_size_limits() {
         assert_eq!(DEFAULT_MAX_RECORD_BYTES, 16 * 1024 * 1024);
         assert_eq!(MAX_RECORD_BYTES_CEILING, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn frozen_at_rest_encryption_values() {
+        // The at-rest encryption on-disk delta (#780, spec #108) is ADDITIVE and pinned. The tag is
+        // 128-bit; the segment flag is a DISTINCT bit from COMPACTED; the suite ids are frozen so a
+        // reader maps the recorded byte to the right primitive unambiguously.
+        assert_eq!(AEAD_TAG_LEN, 16);
+        assert_eq!(SEGMENT_FLAG_ENCRYPTED, 0x0002);
+        // The encryption flag never collides with the compaction flag (a segment may be both).
+        assert_eq!(SEGMENT_FLAG_ENCRYPTED & SEGMENT_FLAG_COMPACTED, 0);
+        assert_eq!(AEAD_SUITE_NONE, 0);
+        assert_eq!(AEAD_SUITE_AES_256_GCM, 1);
+        assert_eq!(AEAD_SUITE_CHACHA20_POLY1305, 2);
+        // The three suite ids are distinct.
+        assert_ne!(AEAD_SUITE_AES_256_GCM, AEAD_SUITE_CHACHA20_POLY1305);
+        assert_ne!(AEAD_SUITE_AES_256_GCM, AEAD_SUITE_NONE);
     }
 
     #[test]

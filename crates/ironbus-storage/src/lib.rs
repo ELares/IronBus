@@ -10,6 +10,15 @@ pub mod checkpoint;
 /// the on-disk image of any log that never enables offload (default-OFF, byte-identical).
 pub mod cold;
 pub mod compaction;
+/// Optional at-rest AEAD encryption of segment record payloads (#780, spec
+/// `docs/AT_REST_ENCRYPTION.md`), behind the OPT-IN pure-Rust `encryption` feature. The
+/// cryptographic core: suite selection (AES-256-GCM / ChaCha20-Poly1305 by CPU feature detection),
+/// the deterministic `segment_id || record_counter` nonce, encrypt/decrypt, the key ring, and the
+/// fail-closed raw-key-file loader. Absent from the default build (the on-disk FORMAT support lives in
+/// always-linked `ironbus-core`/`loss`, so a default build still detects and fail-closes on an
+/// encrypted segment).
+#[cfg(feature = "encryption")]
+pub mod crypto;
 /// The on-disk trained-dictionary sidecar store and resolver (`dicts/<dict_id>.zstd`), behind the
 /// OPT-IN `zstd` feature (#357, `docs/DICTIONARY_LIFECYCLE.md` §3-§4). Absent from the default build.
 #[cfg(feature = "zstd")]

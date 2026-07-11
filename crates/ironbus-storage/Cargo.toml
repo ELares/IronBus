@@ -16,6 +16,17 @@ default = []
 # OPT-IN zstd: forwards ironbus-core's `zstd` feature so the on-disk dictionary sidecar store
 # (`dicts/<dict_id>.zstd`) and the zstd codec compile in. NON-DEFAULT, off the default build (#357).
 zstd = ["ironbus-core/zstd"]
+# OPT-IN encryption (#780, ADR pending): links the PURE-RUST RustCrypto AEAD stack (aes-gcm +
+# chacha20poly1305, over the `aead` trait) that performs the at-rest encryption of segment record
+# payloads. NON-DEFAULT and excludable from `edge-min`, exactly like the `tls` feature — but UNLIKE
+# `tls` it pulls NO C-FFI (no `ring`/`aws-lc-sys`): the AEAD primitives are pure Rust, MIT/Apache-2.0,
+# already covered by the deny.toml license allow-list, so the default build AND this feature stay
+# `cargo deny check`-clean and the static musl binary stays reproducible. The on-disk FORMAT support
+# (the `ENCRYPTED` record flag, the `SEGMENT_FLAG_ENCRYPTED` header flag, `aead_suite`/`key_id`, the
+# `UnknownKeyId`/`AeadTagMismatch` reason codes, and the encrypted-frame codec) lives in
+# always-linked `ironbus-core`/`loss`, so even a DEFAULT (no-encryption) build DETECTS an encrypted
+# segment and fail-closes on it; only the AEAD primitives and the key loader are behind this feature.
+encryption = ["dep:aes-gcm", "dep:chacha20poly1305", "dep:zeroize"]
 
 [dependencies]
 # `arc-swap` backs the lock-free off-actor consume READ plane (#539): the writer swaps in an
@@ -38,6 +49,22 @@ ironbus-core = { path = "../ironbus-core", version = "0.1.0" }
 # stable, fixture-assertable artifact (#120). Kept derive-only so the static edge binary stays
 # small: the JSON format crate (`serde_json`) is a dev-dependency, not shipped in the binary.
 serde = { version = "1", features = ["derive"] }
+
+# At-rest AEAD encryption (#780), the OPT-IN `encryption` feature only. PURE RUST (RustCrypto), no
+# C-FFI, MIT OR Apache-2.0 — already on the deny.toml license allow-list and NOT on its `[bans]`
+# denylist (contrast the feature-scoped `aws-lc-sys`/`zstd-sys` C-FFI allowances the TLS/zstd features
+# need; this path needs none). Pinned to the 0.10 AEAD line, which shares the `generic-array` 0.14 /
+# `crypto-common` 0.1 / `subtle` 2 / `zeroize` 1.8 scaffolding already in the lock (from the server
+# auth crypto) and is comfortably MSRV-1.78-safe (the edition-2024 churn is in the 0.11+/aead-0.6
+# line, deliberately avoided). `default-features = false`: no `getrandom`/`std` provider is pulled —
+# the at-rest nonce is DETERMINISTIC (segment_id || record_counter), so NO RNG is linked. `aes-gcm`
+# selects AES-256-GCM where the runtime reports hardware AES; `chacha20poly1305` is the portable
+# constant-time fallback; the suite is chosen at startup and recorded in the segment header.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"], optional = true }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"], optional = true }
+# Zeroize the 32-byte key material on drop so a loaded key does not linger in freed heap. Pinned to
+# match the server's `=1.8.2` so the lock unifies to one `zeroize`.
+zeroize = { version = "1.8.2", default-features = false, optional = true }
 
 # The cross-platform segment-preallocation primitive (#330, `docs/PREALLOCATION.md`) needs the
 # per-OS reservation syscall (Linux `posix_fallocate`, macOS `fcntl(F_PREALLOCATE)`). `libc` is the

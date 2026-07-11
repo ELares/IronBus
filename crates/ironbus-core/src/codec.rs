@@ -17,10 +17,10 @@
 //! distinct, typed corruption error.
 
 use crate::format::{
-    header_offsets as off, FORMAT_VERSION, MAX_RECORD_BYTES_CEILING, RECORD_HEADER_CRC_RANGE,
-    RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_STREAM_TAG_CRC_LEN, RECORD_STREAM_TAG_LEN_PREFIX,
-    RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX, RECORD_TRAILER_LEN, RECORD_XXH3_LEN,
-    XXH3_PAYLOAD_THRESHOLD,
+    header_offsets as off, AEAD_TAG_LEN, FORMAT_VERSION, MAX_RECORD_BYTES_CEILING,
+    RECORD_HEADER_CRC_RANGE, RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_STREAM_TAG_CRC_LEN,
+    RECORD_STREAM_TAG_LEN_PREFIX, RECORD_SUBJECT_CRC_LEN, RECORD_SUBJECT_LEN_PREFIX,
+    RECORD_TRAILER_LEN, RECORD_XXH3_LEN, XXH3_PAYLOAD_THRESHOLD,
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{RecordFlags, Seq};
@@ -102,6 +102,32 @@ pub struct RecordView<'a> {
     pub payload: &'a [u8],
 }
 
+/// A borrowed view of a decoded AEAD-ENCRYPTED record frame (#780), the output of
+/// [`decode_encrypted`]. The frame's header CRC, body CRC (over the on-disk ciphertext + tag), and
+/// xxh3-64 (if present) have all been validated, so `ciphertext` and `tag` are never a window into a
+/// torn frame; only the AEAD decrypt (which needs the segment's key) remains. It owns no memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncryptedRecordView<'a> {
+    /// The record's sequence number.
+    pub seq: Seq,
+    /// Producer timestamp in milliseconds since the Unix epoch.
+    pub timestamp_ms: u64,
+    /// The stored record flags (always carries [`RecordFlags::ENCRYPTED`]).
+    pub flags: RecordFlags,
+    /// The PLAINTEXT key length; once decrypted, `plaintext[..key_len]` is the key.
+    pub key_len: u32,
+    /// The PLAINTEXT headers length; once decrypted, `plaintext[key_len..key_len + hdr_len]` is the
+    /// headers blob.
+    pub hdr_len: u32,
+    /// The PLAINTEXT payload length; once decrypted, `plaintext[key_len + hdr_len..]` is the payload.
+    pub payload_len: u32,
+    /// The on-disk ciphertext (its length equals `key_len + hdr_len + payload_len`). AEAD-decrypting
+    /// it under the segment's key and the deterministic nonce yields the plaintext body.
+    pub ciphertext: &'a [u8],
+    /// The 16-byte AEAD authentication tag.
+    pub tag: &'a [u8],
+}
+
 /// An error returned by [`encode`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -145,6 +171,12 @@ pub enum DecodeError {
     BadLength,
     /// The encoded total length exceeds the format ceiling of 1 GiB.
     TooLarge,
+    /// The frame carries the [`RecordFlags::ENCRYPTED`] bit (#780), so its body is AEAD ciphertext
+    /// plus a tag, NOT plaintext `key ++ headers ++ payload`. The plaintext [`decode`] REFUSES it so
+    /// ciphertext is never split and served as if it were plaintext; the encrypted read path uses
+    /// [`decode_encrypted`] and then AEAD-decrypts with the segment's key. This is a fail-closed
+    /// rejection, never a silent plaintext read.
+    Encrypted,
 }
 
 impl core::fmt::Display for EncodeError {
@@ -171,6 +203,12 @@ impl core::fmt::Display for DecodeError {
             DecodeError::BadStreamTagCrc => write!(f, "record stored-stream-tag CRC mismatch"),
             DecodeError::BadLength => write!(f, "record frame has inconsistent length fields"),
             DecodeError::TooLarge => write!(f, "record frame exceeds the maximum size"),
+            DecodeError::Encrypted => {
+                write!(
+                    f,
+                    "record frame is AEAD-encrypted; use decode_encrypted with the key"
+                )
+            }
         }
     }
 }
@@ -282,6 +320,111 @@ pub fn encode_precomputed(
     out: &mut Vec<u8>,
 ) -> Result<usize, EncodeError> {
     encode_impl(rec, b"", b"", Some(checksums), out)
+}
+
+/// Encodes an AEAD-ENCRYPTED record frame (#780, spec `docs/AT_REST_ENCRYPTION.md`).
+///
+/// `ciphertext` is the AEAD encryption of the record body `key ++ headers ++ payload`, whose
+/// PLAINTEXT component lengths are `key_len` / `hdr_len` / `payload_len` (summing to
+/// `ciphertext.len()`, since AES-256-GCM and ChaCha20-Poly1305 are length-preserving). `tag` is the
+/// 16-byte authentication tag. The on-disk body is `ciphertext ++ tag`; the record header carries the
+/// PLAINTEXT lengths and the [`RecordFlags::ENCRYPTED`] bit (plus `HAS_KEY` derived from `key_len`),
+/// and the #5 CRC32C (and the xxh3-64 for a large on-disk body) are computed over the CIPHERTEXT +
+/// tag — so a torn tail or bit-rot is detected WITHOUT the key. The frame is byte-shaped exactly like
+/// the plaintext frame plus the fixed 16-byte tag, so `total_len` stays the single source of truth
+/// for the frame length and the segment-rolling contract is unchanged.
+///
+/// The encryption itself (suite selection, the deterministic nonce, key handling) lives in the
+/// storage `crypto` module; this function only FRAMES the already-encrypted bytes and is crypto-free.
+/// Per-segment uniformity is the v1 rule: an encrypted record carries no subject or stream-tag field
+/// (those optional slots are mutually exclusive with the encrypted body in v1).
+///
+/// # Errors
+/// Returns [`EncodeError::TooLarge`] if the total framed size would exceed the 1 GiB format ceiling.
+///
+/// # Panics
+/// Debug builds assert `ciphertext.len() == key_len + hdr_len + payload_len`; a release build that is
+/// handed inconsistent lengths writes a frame that fails its own length self-check on read (never a
+/// silent accept).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_encrypted(
+    seq: Seq,
+    timestamp_ms: u64,
+    extra_flags: RecordFlags,
+    key_len: u32,
+    hdr_len: u32,
+    payload_len: u32,
+    ciphertext: &[u8],
+    tag: &[u8; AEAD_TAG_LEN],
+    out: &mut Vec<u8>,
+) -> Result<usize, EncodeError> {
+    debug_assert_eq!(
+        ciphertext.len() as u64,
+        u64::from(key_len) + u64::from(hdr_len) + u64::from(payload_len),
+        "encrypted ciphertext length must equal the sum of the plaintext component lengths (#780)"
+    );
+    // The on-disk body is the ciphertext followed by the fixed 16-byte tag. The xxh3-64 threshold is
+    // measured on the on-disk body (ciphertext + tag), the exact bytes both checksums cover.
+    let body_disk_len = ciphertext
+        .len()
+        .checked_add(AEAD_TAG_LEN)
+        .ok_or(EncodeError::TooLarge)?;
+    let has_xxh3 = body_disk_len >= XXH3_PAYLOAD_THRESHOLD as usize;
+    let xxh3_field = if has_xxh3 { RECORD_XXH3_LEN } else { 0 };
+    let total = RECORD_HEADER_LEN + body_disk_len + xxh3_field + RECORD_TRAILER_LEN;
+    let total_u32 = u32::try_from(total).map_err(|_| EncodeError::TooLarge)?;
+    if total_u32 > MAX_RECORD_BYTES_CEILING {
+        return Err(EncodeError::TooLarge);
+    }
+
+    // Flags: ENCRYPTED is mandatory; HAS_KEY is derived from the plaintext key length exactly as the
+    // plaintext path derives it; HAS_XXH3 is derived from the on-disk body size. The caller's
+    // `extra_flags` (e.g. COMPRESSED, when compression lands) are preserved, but the subject and
+    // stream-tag bits are never set on an encrypted record (v1 uniformity).
+    let mut flags = extra_flags.with(RecordFlags::ENCRYPTED);
+    flags = if key_len == 0 {
+        RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_KEY.bits())
+    } else {
+        flags.with(RecordFlags::HAS_KEY)
+    };
+    flags = if has_xxh3 {
+        flags.with(RecordFlags::HAS_XXH3)
+    } else {
+        RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_XXH3.bits())
+    };
+    // An encrypted record never carries a stored subject or stream tag in v1.
+    flags = RecordFlags::from_bits(
+        flags.bits() & !(RecordFlags::HAS_SUBJECT.bits() | RecordFlags::HAS_STREAM_TAG.bits()),
+    );
+
+    let mut header = [0u8; RECORD_HEADER_LEN];
+    header[off::MAGIC..off::MAGIC + 2].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    header[off::VERSION] = FORMAT_VERSION;
+    header[off::FLAGS] = flags.bits();
+    header[off::SEQ..off::SEQ + 8].copy_from_slice(&seq.get().to_le_bytes());
+    header[off::TIMESTAMP..off::TIMESTAMP + 8].copy_from_slice(&timestamp_ms.to_le_bytes());
+    header[off::KEY_LEN..off::KEY_LEN + 4].copy_from_slice(&key_len.to_le_bytes());
+    header[off::HDR_LEN..off::HDR_LEN + 4].copy_from_slice(&hdr_len.to_le_bytes());
+    header[off::PAYLOAD_LEN..off::PAYLOAD_LEN + 4].copy_from_slice(&payload_len.to_le_bytes());
+    let header_crc = crc32c::crc32c(&header[RECORD_HEADER_CRC_RANGE]);
+    header[off::HEADER_CRC..off::HEADER_CRC + 4].copy_from_slice(&header_crc.to_le_bytes());
+
+    out.reserve(total);
+    out.extend_from_slice(&header);
+    let body_start = out.len();
+    out.extend_from_slice(ciphertext);
+    out.extend_from_slice(tag);
+    // The #5 checksums cover the on-disk body (ciphertext + tag), so recovery detects a torn tail or
+    // bit-rot on the ciphertext WITHOUT the key.
+    let body = &out[body_start..body_start + body_disk_len];
+    let body_crc = crc32c::crc32c(body);
+    if has_xxh3 {
+        let xxh3 = xxh3_64(body);
+        out.extend_from_slice(&xxh3.to_le_bytes());
+    }
+    out.extend_from_slice(&body_crc.to_le_bytes());
+    out.extend_from_slice(&total_u32.to_le_bytes());
+    Ok(total)
 }
 
 /// The shared framing core behind [`encode`] and [`encode_precomputed`] (and their subject-storing
@@ -498,6 +641,18 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
         return Err(DecodeError::BadHeaderCrc);
     }
     let flags = RecordFlags::from_bits(header[off::FLAGS]);
+    // An ENCRYPTED frame (#780) has NO optional subject/stream-tag field (v1 uniformity); its on-disk
+    // body is ciphertext + the fixed 16-byte tag, so its length is sizable from the header ALONE (the
+    // plaintext lengths plus the tag), WITHOUT the key. Recovery relies on this to WALK an encrypted
+    // segment and CRC-check each frame key-free. A frame that sets ENCRYPTED together with a subject
+    // or stream-tag bit is malformed and rejected fail-closed.
+    let encrypted = flags.contains(RecordFlags::ENCRYPTED);
+    if encrypted
+        && (flags.contains(RecordFlags::HAS_SUBJECT) || flags.contains(RecordFlags::HAS_STREAM_TAG))
+    {
+        return Err(DecodeError::BadLength);
+    }
+    let aead_tag_field: u64 = if encrypted { AEAD_TAG_LEN as u64 } else { 0 };
     // The stream tag (#597) and subject (#594) share the fixed post-header slot and are mutually
     // exclusive; a frame that sets both bits is malformed. Reject it here so the header-only length
     // walk fail-closes on a contradictory frame exactly as `decode` does (never sizing an ambiguous
@@ -546,6 +701,7 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
         + stream_tag_field
         + subject_field
         + xxh3_field
+        + aead_tag_field
         + RECORD_TRAILER_LEN as u64;
     if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
         return Err(DecodeError::TooLarge);
@@ -597,6 +753,109 @@ pub fn decode_with_stream_tag(input: &[u8]) -> Result<(RecordView<'_>, &[u8], us
     Ok((view, tag, total))
 }
 
+/// Decodes one AEAD-ENCRYPTED record frame (#780) from the front of `input`, validating the frame's
+/// integrity WITHOUT the key: the header CRC, the body CRC32C over the on-disk ciphertext + tag, and
+/// the xxh3-64 (if present) are all checked here. On success it returns the borrowed
+/// [`EncryptedRecordView`] (the ciphertext, the 16-byte tag, and the plaintext component lengths) and
+/// the total frame length. The AEAD decrypt + tag verification — the only step that needs the
+/// segment's key — is performed by the storage `crypto` layer on the returned `ciphertext`/`tag`.
+///
+/// Because the CRC is over the ciphertext, recovery can call this to detect a torn tail or bit-rot on
+/// an encrypted segment with NO key, and only a frame that passes the CRC is ever handed to the AEAD
+/// (so a corrupt ciphertext is reported as `BadBodyCrc`, never masquerades as a key/tag failure).
+///
+/// # Errors
+/// Returns the same structural variants as [`decode`] ([`DecodeError::Truncated`],
+/// [`DecodeError::BadMagic`], [`DecodeError::UnsupportedVersion`], [`DecodeError::BadHeaderCrc`],
+/// [`DecodeError::BadBodyCrc`], [`DecodeError::BadXxh3`], [`DecodeError::BadLength`],
+/// [`DecodeError::TooLarge`]), plus [`DecodeError::BadLength`] if the [`RecordFlags::ENCRYPTED`] bit
+/// is NOT set (this decoder is only for encrypted frames) or if a subject/stream-tag bit is set (an
+/// encrypted record carries neither in v1).
+pub fn decode_encrypted(input: &[u8]) -> Result<(EncryptedRecordView<'_>, usize), DecodeError> {
+    if input.len() < RECORD_HEADER_LEN {
+        return Err(DecodeError::Truncated);
+    }
+    if read_u16(input, off::MAGIC) != RECORD_MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    let version = input[off::VERSION];
+    if version != FORMAT_VERSION {
+        return Err(DecodeError::UnsupportedVersion(version));
+    }
+    let stored_header_crc = read_u32(input, off::HEADER_CRC);
+    if crc32c::crc32c(&input[RECORD_HEADER_CRC_RANGE]) != stored_header_crc {
+        return Err(DecodeError::BadHeaderCrc);
+    }
+    let flags = RecordFlags::from_bits(input[off::FLAGS]);
+    // This decoder is ONLY for encrypted frames; a non-encrypted frame, or one that also claims a
+    // subject/stream-tag slot (which an encrypted record never carries in v1), is malformed here.
+    if !flags.contains(RecordFlags::ENCRYPTED)
+        || flags.contains(RecordFlags::HAS_SUBJECT)
+        || flags.contains(RecordFlags::HAS_STREAM_TAG)
+    {
+        return Err(DecodeError::BadLength);
+    }
+    let key_len_u32 = read_u32(input, off::KEY_LEN);
+    let hdr_len_u32 = read_u32(input, off::HDR_LEN);
+    let payload_len_u32 = read_u32(input, off::PAYLOAD_LEN);
+    // The on-disk body is `plaintext_len` ciphertext bytes plus the fixed 16-byte tag. Sum the
+    // attacker-controlled u32 lengths in u64 so the total cannot overflow usize on a 32-bit target
+    // before the ceiling bounds it (matching `decode`).
+    let plaintext_len64 =
+        u64::from(key_len_u32) + u64::from(hdr_len_u32) + u64::from(payload_len_u32);
+    let body_disk_len64 = plaintext_len64 + AEAD_TAG_LEN as u64;
+    let has_xxh3 = body_disk_len64 >= u64::from(XXH3_PAYLOAD_THRESHOLD);
+    // HAS_XXH3 is a derived, trusted (CRC-protected) bit: it must agree with the on-disk body size.
+    if flags.contains(RecordFlags::HAS_XXH3) != has_xxh3 {
+        return Err(DecodeError::BadLength);
+    }
+    let xxh3_field = if has_xxh3 { RECORD_XXH3_LEN as u64 } else { 0 };
+    let total64 =
+        RECORD_HEADER_LEN as u64 + body_disk_len64 + xxh3_field + RECORD_TRAILER_LEN as u64;
+    if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
+        return Err(DecodeError::TooLarge);
+    }
+    let total = usize::try_from(total64).map_err(|_| DecodeError::TooLarge)?;
+    if input.len() < total {
+        return Err(DecodeError::Truncated);
+    }
+    // HAS_KEY is a derived, frozen bit: it must agree with the plaintext key length.
+    if flags.contains(RecordFlags::HAS_KEY) != (key_len_u32 != 0) {
+        return Err(DecodeError::BadLength);
+    }
+    let body_disk_len = usize::try_from(body_disk_len64).map_err(|_| DecodeError::TooLarge)?;
+    let plaintext_len = usize::try_from(plaintext_len64).map_err(|_| DecodeError::TooLarge)?;
+    let body = &input[RECORD_HEADER_LEN..RECORD_HEADER_LEN + body_disk_len];
+    let xxh3_bytes = &input[RECORD_HEADER_LEN + body_disk_len..total - RECORD_TRAILER_LEN];
+    let trailer = &input[total - RECORD_TRAILER_LEN..total];
+    let stored_body_crc = read_u32(trailer, 0);
+    if u64::from(read_u32(trailer, 4)) != total64 {
+        return Err(DecodeError::BadLength);
+    }
+    // CRC32C over the on-disk ciphertext + tag is the key-free resync/bit-rot gate: verify it FIRST,
+    // so a corrupt ciphertext is `BadBodyCrc` and never reaches (or is blamed on) the AEAD.
+    if crc32c::crc32c(body) != stored_body_crc {
+        return Err(DecodeError::BadBodyCrc);
+    }
+    if has_xxh3 {
+        let stored_xxh3 = read_u64(xxh3_bytes, 0);
+        if xxh3_64(body) != stored_xxh3 {
+            return Err(DecodeError::BadXxh3);
+        }
+    }
+    let view = EncryptedRecordView {
+        seq: Seq::new(read_u64(input, off::SEQ)),
+        timestamp_ms: read_u64(input, off::TIMESTAMP),
+        flags,
+        key_len: key_len_u32,
+        hdr_len: hdr_len_u32,
+        payload_len: payload_len_u32,
+        ciphertext: &body[..plaintext_len],
+        tag: &body[plaintext_len..],
+    };
+    Ok((view, total))
+}
+
 /// The shared decoder behind [`decode`], [`decode_with_subject`], and [`decode_with_stream_tag`].
 /// Validates the whole frame (header CRC, stream-tag CRC if present, subject CRC if present, body CRC,
 /// xxh3 if present) and returns the view, the stored subject slice (empty when the record carries
@@ -627,6 +886,14 @@ fn decode_inner(input: &[u8]) -> Result<DecodedFrame<'_>, DecodeError> {
     // HAS_XXH3 sizes the optional xxh3 field, HAS_STREAM_TAG the optional stream-tag field, and
     // HAS_SUBJECT the optional subject field.
     let flags = RecordFlags::from_bits(input[off::FLAGS]);
+    // An ENCRYPTED frame (#780) carries AEAD ciphertext + tag, NOT plaintext key/headers/payload.
+    // The plaintext decoder REFUSES it fail-closed rather than splitting ciphertext and serving it as
+    // if it were plaintext (the anti-silent-garbage guarantee); the encrypted read path calls
+    // `decode_encrypted` and then AEAD-decrypts. The header CRC has already been verified above, so
+    // this bit is trusted.
+    if flags.contains(RecordFlags::ENCRYPTED) {
+        return Err(DecodeError::Encrypted);
+    }
     let has_stream_tag = flags.contains(RecordFlags::HAS_STREAM_TAG);
     let has_subject = flags.contains(RecordFlags::HAS_SUBJECT);
     // The stream tag (#597) and subject (#594) share the fixed post-header slot and are mutually
@@ -1443,6 +1710,177 @@ mod tests {
         assert_eq!(baseline, offloaded);
         let (_view, tag, _) = decode_with_stream_tag(&offloaded).unwrap();
         assert_eq!(tag, b"s-t-r");
+    }
+
+    // --- At-rest AEAD encryption framing (#780) ---
+
+    #[test]
+    fn encrypted_frame_round_trips_and_decoded_len_agrees() {
+        // A record body of plaintext lengths (2 + 3 + 7) is encrypted to ciphertext of the SAME total
+        // length (12) plus a 16-byte tag. encode_encrypted frames it; decode_encrypted recovers the
+        // ciphertext, tag, and plaintext lengths exactly, and decoded_len (header-only) agrees.
+        let ciphertext: Vec<u8> = (0..12u8).collect(); // 2 + 3 + 7
+        let tag = [0xABu8; AEAD_TAG_LEN];
+        let mut buf = Vec::new();
+        let n = encode_encrypted(
+            Seq::new(9),
+            1234,
+            RecordFlags::EMPTY,
+            2,
+            3,
+            7,
+            &ciphertext,
+            &tag,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(n, buf.len());
+        // Frame = header(36) + ciphertext(12) + tag(16) + trailer(8); no xxh3 (sub-threshold).
+        assert_eq!(
+            n,
+            RECORD_HEADER_LEN + 12 + AEAD_TAG_LEN + RECORD_TRAILER_LEN
+        );
+        let (view, consumed) = decode_encrypted(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(view.seq, Seq::new(9));
+        assert_eq!(view.timestamp_ms, 1234);
+        assert!(view.flags.contains(RecordFlags::ENCRYPTED));
+        assert!(view.flags.contains(RecordFlags::HAS_KEY)); // key_len = 2 != 0
+        assert_eq!((view.key_len, view.hdr_len, view.payload_len), (2, 3, 7));
+        assert_eq!(view.ciphertext, &ciphertext[..]);
+        assert_eq!(view.tag, &tag[..]);
+        // The header-only length walk sizes the encrypted frame WITHOUT the key (recovery relies on it).
+        assert_eq!(decoded_len(&buf[..RECORD_HEADER_LEN]).unwrap(), consumed);
+        assert_eq!(decoded_len(&buf).unwrap(), consumed);
+    }
+
+    #[test]
+    fn plaintext_decode_refuses_an_encrypted_frame() {
+        // The anti-silent-garbage guarantee: the plaintext decoder REFUSES an ENCRYPTED frame rather
+        // than splitting ciphertext as if it were key/headers/payload.
+        let ciphertext: Vec<u8> = (0..12u8).collect();
+        let tag = [0x11u8; AEAD_TAG_LEN];
+        let mut buf = Vec::new();
+        encode_encrypted(
+            Seq::new(1),
+            0,
+            RecordFlags::EMPTY,
+            0,
+            0,
+            12,
+            &ciphertext,
+            &tag,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(decode(&buf), Err(DecodeError::Encrypted));
+        assert_eq!(decode_with_subject(&buf), Err(DecodeError::Encrypted));
+        // A key_len=0 frame must clear HAS_KEY.
+        let (view, _) = decode_encrypted(&buf).unwrap();
+        assert!(!view.flags.contains(RecordFlags::HAS_KEY));
+    }
+
+    #[test]
+    fn crc_over_ciphertext_detects_corruption_without_the_key() {
+        // #5 CRC is over the on-disk CIPHERTEXT + tag, so flipping a ciphertext byte is caught as
+        // BadBodyCrc with NO key involved — the key-free torn-tail/bit-rot gate.
+        let ciphertext: Vec<u8> = vec![0x55u8; 40];
+        let tag = [0x22u8; AEAD_TAG_LEN];
+        let mut buf = Vec::new();
+        encode_encrypted(
+            Seq::new(2),
+            0,
+            RecordFlags::EMPTY,
+            0,
+            0,
+            40,
+            &ciphertext,
+            &tag,
+            &mut buf,
+        )
+        .unwrap();
+        // Flip a ciphertext byte (inside the body region, after the 36-byte header).
+        buf[RECORD_HEADER_LEN + 5] ^= 0xFF;
+        assert_eq!(decode_encrypted(&buf), Err(DecodeError::BadBodyCrc));
+        // Flipping a tag byte is ALSO a CRC change (the tag is inside the CRC-covered on-disk body),
+        // so it too is caught key-free before any AEAD step.
+        let mut buf2 = Vec::new();
+        encode_encrypted(
+            Seq::new(2),
+            0,
+            RecordFlags::EMPTY,
+            0,
+            0,
+            40,
+            &ciphertext,
+            &tag,
+            &mut buf2,
+        )
+        .unwrap();
+        buf2[RECORD_HEADER_LEN + 40 + 1] ^= 0xFF; // a tag byte
+        assert_eq!(decode_encrypted(&buf2), Err(DecodeError::BadBodyCrc));
+    }
+
+    #[test]
+    fn encrypted_frame_at_threshold_carries_xxh3() {
+        // A large on-disk body (ciphertext + tag >= 64 KiB) sets HAS_XXH3 and both checksums verify.
+        let ct_len = XXH3_PAYLOAD_THRESHOLD as usize; // + 16 tag >= threshold
+        let ct_len_u32 = XXH3_PAYLOAD_THRESHOLD;
+        let ciphertext = vec![0x5Au8; ct_len];
+        let tag = [0x33u8; AEAD_TAG_LEN];
+        let mut buf = Vec::new();
+        let n = encode_encrypted(
+            Seq::new(3),
+            0,
+            RecordFlags::EMPTY,
+            0,
+            0,
+            ct_len_u32,
+            &ciphertext,
+            &tag,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(
+            n,
+            RECORD_HEADER_LEN + ct_len + AEAD_TAG_LEN + RECORD_XXH3_LEN + RECORD_TRAILER_LEN
+        );
+        let (view, consumed) = decode_encrypted(&buf).unwrap();
+        assert_eq!(consumed, n);
+        assert!(view.flags.contains(RecordFlags::HAS_XXH3));
+        assert_eq!(view.ciphertext.len(), ct_len);
+        assert_eq!(decoded_len(&buf[..RECORD_HEADER_LEN]).unwrap(), consumed);
+    }
+
+    #[test]
+    fn decode_encrypted_rejects_a_plaintext_frame() {
+        // decode_encrypted is only for ENCRYPTED frames; a plaintext frame is BadLength there.
+        let buf = sample();
+        assert_eq!(decode_encrypted(&buf), Err(DecodeError::BadLength));
+    }
+
+    #[test]
+    fn encrypted_frame_truncation_is_detected() {
+        let ciphertext: Vec<u8> = vec![0x77u8; 20];
+        let tag = [0x44u8; AEAD_TAG_LEN];
+        let mut buf = Vec::new();
+        encode_encrypted(
+            Seq::new(4),
+            0,
+            RecordFlags::EMPTY,
+            0,
+            0,
+            20,
+            &ciphertext,
+            &tag,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_encrypted(&buf[..buf.len() - 1]),
+            Err(DecodeError::Truncated)
+        );
+        assert_eq!(decode_encrypted(&buf[..10]), Err(DecodeError::Truncated));
     }
 }
 

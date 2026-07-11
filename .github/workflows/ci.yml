@@ -53,9 +53,11 @@ jobs:
           # vendored-C build is validated on the Linux leg (the broker target), and forcing it onto
           # the Windows runner (NASM/MSVC) adds cross-platform C-build risk for no coverage gain — the
           # TLS 1.3 config is fully exercised on ubuntu. This keeps the existing zstd (vendored-C via
-          # cc) + otlp coverage. UPDATE this list if a new NON-tls feature is added.
+          # cc) + otlp coverage, plus the PURE-RUST at-rest `encryption` feature (#780; no C-FFI, so it
+          # is safe on the Windows/MSVC runner and gets cross-platform coverage here). UPDATE this list
+          # if a new NON-tls feature is added.
           - os: windows-latest
-            featureflags: "--features zstd,otlp"
+            featureflags: "--features zstd,otlp,ironbus-storage/encryption"
     runs-on: ${{ matrix.os }}
     # Bound the known LOAD-DEPENDENT hang (an intermittent raft_cluster deadlock that only
     # reproduces under the full parallel workspace run; passes in isolation) to a 30-minute
@@ -647,6 +649,62 @@ jobs:
             echo "ok: zstd-sys is present in the feature graph (opt-in active)"
           else
             echo "::error::zstd-sys missing from the feature graph"
+            exit 1
+          fi
+
+  encryption-feature:
+    name: opt-in at-rest encryption (build + test + pure-Rust deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: encryption-feature
+      - name: install musl tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      # The OPT-IN at-rest AEAD encryption (#780): build and TEST the feature in ISOLATION (only
+      # `ironbus-storage/encryption`, no other feature) so the crypto core (suite selection, the
+      # deterministic nonce, encrypt/decrypt, the key ring, the raw-key-file loader) and the
+      # segment-level encrypt/decrypt/recovery are covered per-PR, with the teeth tests (round-trip
+      # both suites, nonce uniqueness, wrong/unknown key reported, CRC-over-ciphertext, rotation,
+      # default-off byte-identity). The default build is unchanged; the Linux `--all-features` leg
+      # additionally exercises it alongside every other feature.
+      - name: build and test the opt-in encryption feature
+        run: |
+          set -euo pipefail
+          cargo build -p ironbus-storage --features encryption --locked
+          cargo test -p ironbus-storage --features encryption --locked
+      # cargo-deny under the feature: UNLIKE zstd/tls, the RustCrypto AEAD stack is PURE RUST with NO
+      # C-FFI, so this asserts the supply-chain gate stays clean (no new vendored-C, no new advisory)
+      # for the feature build, not just the default one.
+      - name: cargo-deny accepts the pure-Rust AEAD stack under all-features
+        uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-deny@0.19.8
+      - run: cargo deny check
+      # Assert the pure-Rust posture explicitly: the `--features encryption` graph must pull NONE of
+      # the banned C-FFI crypto (ring / aws-lc-sys) and no `*-sys` vendored-C crate — the whole point
+      # of choosing RustCrypto over a C provider for the at-rest path (#780).
+      - name: assert the encryption feature graph is pure Rust (no C-FFI crypto)
+        run: |
+          set -euo pipefail
+          graph="$(cargo tree -p ironbus-storage --features encryption -e normal,build --target x86_64-unknown-linux-musl --prefix none --locked)"
+          if echo "$graph" | grep -qiE '(^| )(ring|aws-lc-sys|aws-lc-rs)( |$|v)'; then
+            echo "::error::the --features encryption graph pulled a banned C-FFI crypto crate (ring/aws-lc-sys); the at-rest AEAD path must stay pure-Rust RustCrypto (#780)"
+            exit 1
+          fi
+          # The RustCrypto AEAD primitives must be present (the feature is actually active).
+          if echo "$graph" | grep -qi 'aes-gcm' && echo "$graph" | grep -qi 'chacha20poly1305'; then
+            echo "ok: the encryption feature graph is pure-Rust RustCrypto AEAD (aes-gcm + chacha20poly1305), no C-FFI crypto"
+          else
+            echo "::error::aes-gcm/chacha20poly1305 missing from the --features encryption graph"
             exit 1
           fi
 

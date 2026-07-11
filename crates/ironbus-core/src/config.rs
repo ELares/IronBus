@@ -458,7 +458,14 @@ pub const KEY_TABLE: &[KeySpec] = &[
 /// reject-unknown rule applies only to keys under the WIRED sections in [`KEY_TABLE`].
 #[must_use]
 pub fn is_reserved_section(section: &str) -> bool {
-    matches!(section, "observability" | "auth" | "compression")
+    // `[encryption]` (#780) is the reserved landing section for at-rest AEAD encryption config (the
+    // key source: `encryption.key_file` etc). The functional raw-key-file loader ships in
+    // `ironbus_storage::crypto::load_key_file`; the full typed key-config schema is owned by #14/#109,
+    // so the section is tolerated-but-ignored here until those keys are wired into `KEY_TABLE`.
+    matches!(
+        section,
+        "observability" | "auth" | "compression" | "encryption"
+    )
 }
 
 /// Looks up a fully-qualified dotted key in [`KEY_TABLE`], returning its [`KeySpec`].
