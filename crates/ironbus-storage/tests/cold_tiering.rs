@@ -98,7 +98,10 @@ fn offload_removes_local_records_remote_and_uploads_then_reads_transparently() {
 
     let offloaded = log.offload_cold_segments().unwrap();
     assert!(offloaded > 0, "at least one cold segment should offload");
-    assert_eq!(log.cold_offloaded_count(), usize::try_from(offloaded).unwrap());
+    assert_eq!(
+        log.cold_offloaded_count(),
+        usize::try_from(offloaded).unwrap()
+    );
 
     // Segment 0 (the oldest) is offloaded: local file GONE, manifest REMOTE, object PRESENT.
     assert!(log.is_segment_remote(0));
