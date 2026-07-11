@@ -58,6 +58,7 @@
 use ironbus_core::compress::{
     decompress_payload, DecompressError, NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES,
 };
+use ironbus_core::request_reply::{self, CorrelationId};
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
@@ -157,6 +158,24 @@ pub enum ClientError {
     LocalTransaction(String),
     /// The connection closed before a complete response arrived.
     Closed,
+    /// A [`Client::request`] / [`Client::request_many`] (#764, V2-M4-I5) reached its deadline before
+    /// the first reply (or, for scatter-gather, the requested count) arrived. Carries how many
+    /// correlated replies DID arrive before the timeout — `0` for a plain `request` that got nothing,
+    /// or a partial count for `request_many`. The request itself was published durably; this reports
+    /// only that no (or too few) responders answered in time. Distinct from [`ClientError::NoResponders`]:
+    /// there the subject had ZERO registered responders and the call fast-failed instead of waiting.
+    RequestTimeout {
+        /// The number of correlated replies that arrived before the deadline (`0` for `request`).
+        received: usize,
+    },
+    /// A [`Client::request`] / [`Client::request_many`] (#764) was sent to a subject with NO
+    /// registered responder, so it fast-failed instead of hanging to the deadline. IronBus detects
+    /// this through its fail-closed single-home routing: a request subject that no responder has
+    /// registered (via [`Client::register_responder`]) is UNBOUND, so the request publish resolves to
+    /// zero streams — surfaced here rather than as the raw
+    /// [`ServerErrorCode::NoStreamForSubject`]. (Current-interest liveness — a subject that once had a
+    /// responder that has since disconnected — is a follow-up; that case times out.)
+    NoResponders,
     /// A client-side TLS configuration or handshake failure (#957, `--features tls`): a bad trust
     /// anchor / client certificate, an invalid server name, or the broker's certificate failing
     /// verification. (A verification failure at the handshake itself surfaces as [`ClientError::Io`].)
@@ -231,6 +250,15 @@ impl core::fmt::Display for ClientError {
                 )
             }
             ClientError::Closed => write!(f, "connection closed mid-response"),
+            ClientError::RequestTimeout { received } => write!(
+                f,
+                "request/reply timed out ({received} correlated repl{} received before the deadline)",
+                if *received == 1 { "y" } else { "ies" }
+            ),
+            ClientError::NoResponders => write!(
+                f,
+                "request/reply: no responder is registered for the request subject (fast-fail)"
+            ),
             #[cfg(feature = "tls")]
             ClientError::Tls(why) => write!(f, "client TLS error: {why}"),
             ClientError::Decompress { source, offset, .. } => {
@@ -664,6 +692,99 @@ pub struct Fetch {
     /// empty.
     pub gaps: Vec<Gap>,
 }
+
+/// One correlated reply returned by [`Client::request`] / [`Client::request_many`] (#764, V2-M4-I5):
+/// a responder's answer whose `ib-corr-id` header matched the request's correlation id. Carries the
+/// reply payload plus its raw header blob (the `ib-corr-id` line and any responder-set headers, e.g.
+/// a `traceparent`), so a caller can inspect responder metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reply {
+    /// The reply payload the responder published.
+    pub payload: Vec<u8>,
+    /// The reply's full header blob (includes the echoed `ib-corr-id`).
+    pub headers: Vec<u8>,
+}
+
+/// One request delivered to a responder by [`Client::serve_requests`] (#764): the request payload,
+/// the ephemeral reply subject to publish the answer on, and the correlation id to echo. The
+/// [`Client::serve_requests`] runtime reads these off the request record's headers; a caller writing
+/// its own responder loop reads them with [`ironbus_core::request_reply::request_headers_from`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestMessage {
+    /// The request payload the requester sent.
+    pub payload: Vec<u8>,
+    /// The ephemeral reply subject (`_INBOX.<id>`) to publish the reply on.
+    pub reply_to: String,
+    /// The correlation id to echo on the reply so the requester can match it.
+    pub correlation_id: CorrelationId,
+}
+
+/// Mints a fresh 16-byte correlation id for a request (#764). Not cryptographic: a `SplitMix64`
+/// stream seeded from the wall clock plus a process-global monotonic counter, which is ample to make
+/// a collision across concurrent in-flight requests (each draws two 64-bit words) negligible without
+/// pulling a `rand`/`getrandom` dependency into the client. The counter guarantees two ids minted in
+/// the same clock tick still differ.
+fn fresh_correlation_id() -> CorrelationId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // Fold the 128-bit nanos into the low 64 bits by masking (never a truncating cast); the high bits
+    // of a wall-clock nanos value carry no entropy the counter/finalizer does not already spread.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0u64, |d| {
+            u64::try_from(d.as_nanos() & u128::from(u64::MAX)).unwrap_or(0)
+        });
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Two independent SplitMix64 draws from distinct seeds fill the 16 bytes.
+    let hi = splitmix64(nanos ^ n.rotate_left(32));
+    let lo = splitmix64(nanos.rotate_left(17).wrapping_add(0x9E37_79B9_7F4A_7C15) ^ n);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&hi.to_le_bytes());
+    id[8..].copy_from_slice(&lo.to_le_bytes());
+    id
+}
+
+/// The `SplitMix64` finalizer/step (public-domain, by Sebastiano Vigna): a fast, well-distributed
+/// scramble of a 64-bit state used only to spread the correlation-id seed bits (never for security).
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Milliseconds since the Unix epoch, for the producer timestamp on a request/reply publish.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The deterministic stream name a responder binds a request `subject` to (#764). Prefixed `_rpc_`
+/// (so it can never collide with the reserved [`request_reply::INBOX_STREAM`]) and with every
+/// non-`[A-Za-z0-9_-]` byte mapped to `_`, so any literal subject yields a valid, stable stream name
+/// that all responders on that subject agree on (idempotent bind).
+fn responder_stream_name(subject: &str) -> String {
+    let mut s = String::with_capacity(subject.len() + 5);
+    s.push_str("_rpc_");
+    for c in subject.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            s.push(c);
+        } else {
+            s.push('_');
+        }
+    }
+    s
+}
+
+/// The per-poll fetch batch size for the request/reply inbox and responder loops.
+const REQUEST_REPLY_FETCH_BATCH: u32 = 64;
+
+/// The idle back-off between empty polls while awaiting a reply / a request, so the blocking wait is
+/// not a busy loop (the deadline is still checked each iteration for prompt timeout).
+const REQUEST_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// The outcome of a [`Client::produce`] / [`Client::produce_dedup`] call: the assigned (or, on a
 /// dedup hit, the ORIGINAL) durable offset, plus whether the broker treated this publish as a
@@ -1319,6 +1440,12 @@ pub struct Client {
     /// yields a transaction id unique across this producer's transactions; the producer may also supply
     /// its own id via [`Client::prepare_with_id`]. Starts at 0; bumped per `prepare`.
     next_txn_seq: u64,
+    /// Whether this connection has already (idempotently) bound the reserved reply-inbox pattern
+    /// [`ironbus_core::request_reply::INBOX_PATTERN`] to [`ironbus_core::request_reply::INBOX_STREAM`]
+    /// for request/reply (#764). The first [`Client::request`] / [`Client::request_many`] binds it and
+    /// sets this, so subsequent requests skip the redundant `BindSubject` round-trip. Reset to `false`
+    /// only on connect.
+    inbox_bound: bool,
 }
 
 impl Client {
@@ -1369,6 +1496,7 @@ impl Client {
             negotiated_default_tier: None,
             confirm_cache: Vec::new(),
             next_txn_seq: 0,
+            inbox_bound: false,
         };
         // The #292 handshake: send a versioned Connect body carrying any requested credit (an
         // all-absent body when the caller requested nothing, which the server reads as "use my
@@ -3658,6 +3786,275 @@ impl Client {
             (FrameType::Err, body) => Err(ClientError::Server(ServerError::from_wire(&body))),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
+    }
+
+    // ---- request/reply (RPC) over subjects (#764, V2-M4-I5) ----
+    //
+    // A THIN pattern composed from the primitives above — subjects (#585), competing work-groups
+    // (#588), and ephemeral consumer groups (#771/#1148) — plus the header-carried correlation id +
+    // reply-subject ([`ironbus_core::request_reply`], no new wire tag). The requester allocates an
+    // ephemeral reply INBOX (a per-request `_INBOX.<id>` subject routed by the reserved `_INBOX.>`
+    // binding onto one shared, ephemeral-consumed log), publishes the request with the reply-subject
+    // and correlation id in the headers, and awaits the first (or up to N) replies whose echoed
+    // correlation id matches. Responders register against the request subject + a queue group and
+    // publish their answer to the reply subject with the same id.
+
+    /// Idempotently binds the reserved reply-inbox pattern
+    /// ([`request_reply::INBOX_PATTERN`]) to [`request_reply::INBOX_STREAM`] so a reply published to a
+    /// `_INBOX.<id>` subject routes to the shared inbox log, caching the result so later requests skip
+    /// the round-trip. Declares the inbox stream on first bind (declare-on-bind). On an auth-enabled
+    /// broker this needs the `admin` scope (like any [`Client::bind_subject`]).
+    fn ensure_inbox_bound(&mut self) -> Result<(), ClientError> {
+        if self.inbox_bound {
+            return Ok(());
+        }
+        self.bind_subject(request_reply::INBOX_STREAM, request_reply::INBOX_PATTERN)?;
+        self.inbox_bound = true;
+        Ok(())
+    }
+
+    /// Sends an RPC REQUEST and returns the FIRST correlated reply (first-wins), or a typed timeout /
+    /// no-responder error (#764, V2-M4-I5). Composes the subjects + ephemeral-group primitives: this
+    /// call subscribes an ephemeral reply inbox, publishes `payload` on `subject` with a reply-subject
+    /// and a fresh correlation id stamped into the message headers, awaits the first delivered reply
+    /// whose echoed `ib-corr-id` matches (ignoring any reply for another request), then reaps the
+    /// inbox (its ephemeral group leaves NO durable artifact).
+    ///
+    /// A request to a `subject` that NO responder has registered
+    /// ([`Client::register_responder`]) fast-fails [`ClientError::NoResponders`] (the subject is
+    /// unbound under the fail-closed routing) instead of hanging to `timeout`; a registered subject
+    /// whose responders do not answer within `timeout` returns [`ClientError::RequestTimeout`].
+    ///
+    /// Requires the stream-addressing ([`ClientConfig::understands_streams`]) and ephemeral-groups
+    /// ([`ClientConfig::request_ephemeral_groups`]) capabilities, both confirmed by the server.
+    ///
+    /// # Errors
+    /// [`ClientError::NoResponders`] (no responder registered), [`ClientError::RequestTimeout`] (no
+    /// reply in time), [`ClientError::CapabilityNotNegotiated`] (a required capability was not
+    /// negotiated), [`ClientError::Server`] on a broker reject, or a frame/connection error.
+    pub fn request(
+        &mut self,
+        subject: &str,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Reply, ClientError> {
+        let replies = self.request_gather(subject, payload, 1, timeout)?;
+        replies
+            .into_iter()
+            .next()
+            .ok_or(ClientError::RequestTimeout { received: 0 })
+    }
+
+    /// Sends an RPC REQUEST and gathers up to `expected` correlated replies (scatter-gather / fan-in),
+    /// returning at `timeout` with whatever arrived (#764, V2-M4-I5). Every distinct responder that
+    /// answers publishes to the same reply subject with the same correlation id; this collects up to
+    /// `min(expected, responders_that_replied)` replies, or fewer at the deadline. Unlike
+    /// [`Client::request`], a partial (even empty) result at the deadline is `Ok`, not a timeout error
+    /// — the caller decides whether a partial fan-in is sufficient. A subject with zero registered
+    /// responders still fast-fails [`ClientError::NoResponders`].
+    ///
+    /// Requires the same capabilities as [`Client::request`].
+    ///
+    /// # Errors
+    /// [`ClientError::NoResponders`], [`ClientError::CapabilityNotNegotiated`],
+    /// [`ClientError::Server`] on a broker reject, or a frame/connection error. Note a timeout with a
+    /// partial (or empty) fan-in is `Ok`, NOT an error.
+    pub fn request_many(
+        &mut self,
+        subject: &str,
+        payload: &[u8],
+        expected: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Reply>, ClientError> {
+        self.request_gather(subject, payload, expected.max(1), timeout)
+    }
+
+    /// The shared requester core behind [`Client::request`] (first-wins, `want = 1`) and
+    /// [`Client::request_many`] (scatter-gather, `want = expected`): subscribe an ephemeral inbox,
+    /// publish the correlated request, gather up to `want` matching replies or stop at `timeout`, reap
+    /// the inbox. Returns the gathered replies (possibly fewer than `want`, possibly empty).
+    fn request_gather(
+        &mut self,
+        subject: &str,
+        payload: &[u8],
+        want: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Reply>, ClientError> {
+        if !self.streams_enabled {
+            return Err(ClientError::CapabilityNotNegotiated(
+                "stream addressing (request/reply, #764)",
+            ));
+        }
+        if !self.ephemeral_groups_enabled {
+            return Err(ClientError::CapabilityNotNegotiated(
+                "ephemeral reply inbox (request/reply, #764)",
+            ));
+        }
+        self.ensure_inbox_bound()?;
+
+        let corr = fresh_correlation_id();
+        let inbox = request_reply::inbox_subject(&corr);
+        // A UNIQUE ephemeral group per request over the shared inbox log, so concurrent requesters
+        // never share a cursor or steal each other's replies. Ephemeral = no durable checkpoint, reaped
+        // on unsubscribe/disconnect (#771), so no per-request durable footprint is left behind.
+        let group = format!("_rpc.{}", request_reply::format_correlation_id(&corr));
+        self.subscribe_ephemeral(request_reply::INBOX_STREAM, &group)?;
+
+        // Publish the request with the reply-subject + correlation id in the headers (no new wire).
+        let headers = request_reply::encode_request_headers(inbox.as_bytes(), &corr, b"");
+        let req_body = PubBody {
+            flags: 0,
+            timestamp_ms: now_ms(),
+            key: b"",
+            headers: &headers,
+            dedup: None,
+            fire_and_forget: false,
+            payload,
+        };
+        if let Err(e) = self.publish_subject(subject, &req_body) {
+            // Reap the ephemeral inbox we just bound before surfacing the error.
+            let _ = self.unsubscribe();
+            return match e {
+                // Fail-closed routing: an unregistered request subject is unbound → no responders.
+                ClientError::Server(ref se)
+                    if se.code() == Some(ServerErrorCode::NoStreamForSubject) =>
+                {
+                    Err(ClientError::NoResponders)
+                }
+                other => Err(other),
+            };
+        }
+
+        // Gather replies whose echoed correlation id matches, up to `want` or until the deadline.
+        let deadline = std::time::Instant::now() + timeout;
+        let mut replies: Vec<Reply> = Vec::new();
+        'gather: while replies.len() < want {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let batch = match self.fetch(REQUEST_REPLY_FETCH_BATCH) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = self.unsubscribe();
+                    return Err(e);
+                }
+            };
+            if batch.messages.is_empty() {
+                // Idle poll: brief sleep so the wait is not a busy loop, then re-check the deadline.
+                std::thread::sleep(REQUEST_REPLY_POLL_INTERVAL);
+                continue;
+            }
+            for m in &batch.messages {
+                // Ack every delivered inbox record to advance this ephemeral group's cursor; the ack
+                // is per-group, so it never affects another requester's independent inbox group.
+                let _ = self.ack(m.offset, m.generation);
+                if request_reply::correlation_id_from_headers(&m.headers) == Some(corr) {
+                    replies.push(Reply {
+                        payload: m.payload.clone(),
+                        headers: m.headers.clone(),
+                    });
+                    if replies.len() >= want {
+                        break 'gather;
+                    }
+                }
+                // A record for a DIFFERENT correlation id (another request's reply, or junk) is
+                // ignored — the correlation-id match is the demultiplexer.
+            }
+        }
+
+        // Reap the ephemeral reply inbox: unsubscribe drops the last member, so the broker removes the
+        // group in full (no cursor/attempts checkpoint, no stray files) — the inbox is gone after the
+        // request completes.
+        let _ = self.unsubscribe();
+        Ok(replies)
+    }
+
+    /// Registers this connection as a RESPONDER for `subject` under the queue `group` (#764, V2-M4-I5):
+    /// binds `subject` so requests route (and so a request to an unregistered subject fast-fails
+    /// [`ClientError::NoResponders`]), then subscribes this connection's consume path to that subject's
+    /// competing work-`group`. Responders sharing a `group` LOAD-BALANCE requests (exactly one answers
+    /// each request); responders on DISTINCT groups each receive every request (the scatter-gather
+    /// fan-out). Drive delivery with [`Client::serve_requests`] (or a hand-rolled fetch/reply loop).
+    ///
+    /// The request subject must be a LITERAL (no wildcards; the single-home subscribe rejects a
+    /// wildcard). Requires the stream-addressing capability; on an auth-enabled broker the bind needs
+    /// the `admin` scope.
+    ///
+    /// # Errors
+    /// [`ClientError::CapabilityNotNegotiated`], [`ClientError::Server`] on a broker reject (e.g. a
+    /// missing `admin` scope, an ambiguous/wildcard subject), or a frame/connection error.
+    pub fn register_responder(&mut self, subject: &str, group: &str) -> Result<(), ClientError> {
+        if !self.streams_enabled {
+            return Err(ClientError::CapabilityNotNegotiated(
+                "stream addressing (request/reply responder, #764)",
+            ));
+        }
+        // Bind the literal request subject to a deterministic stream so every responder on the same
+        // subject agrees (idempotent bind) and the requester's publish resolves single-home.
+        let stream = responder_stream_name(subject);
+        self.bind_subject(&stream, subject)?;
+        self.subscribe_subject(subject, group)?;
+        Ok(())
+    }
+
+    /// Serves up to `max` requests as a responder, replying to each with `handler` (#764, V2-M4-I5).
+    /// Must be called after [`Client::register_responder`]. Each delivered request record: reads the
+    /// reply-subject + correlation id off its headers, runs `handler(request_payload) -> reply_payload`,
+    /// publishes the reply to the reply-subject with the SAME correlation id echoed, and acks the
+    /// request. Returns after `max` requests are served OR after `idle_budget` elapses with no request
+    /// arriving (whichever first); returns the count served. A delivered record with no request headers
+    /// (not an RPC request) is acked and skipped.
+    ///
+    /// This is a convenience runtime for a single-threaded responder / tests; a caller wanting full
+    /// control can hand-roll the same loop with [`Client::fetch`],
+    /// [`request_reply::request_headers_from`], [`Client::publish_subject`], and [`Client::ack`].
+    ///
+    /// # Errors
+    /// [`ClientError::Server`] on a broker reject (e.g. the reply publish), or a frame/connection
+    /// error.
+    pub fn serve_requests(
+        &mut self,
+        max: usize,
+        idle_budget: Duration,
+        mut handler: impl FnMut(&[u8]) -> Vec<u8>,
+    ) -> Result<usize, ClientError> {
+        let mut served = 0usize;
+        let mut idle_deadline = std::time::Instant::now() + idle_budget;
+        while served < max {
+            let batch = self.fetch(REQUEST_REPLY_FETCH_BATCH)?;
+            if batch.messages.is_empty() {
+                if std::time::Instant::now() >= idle_deadline {
+                    break;
+                }
+                std::thread::sleep(REQUEST_REPLY_POLL_INTERVAL);
+                continue;
+            }
+            for m in &batch.messages {
+                if let Some(req) = request_reply::request_headers_from(&m.headers) {
+                    let reply_to = String::from_utf8_lossy(req.reply_to).into_owned();
+                    let corr = req.correlation_id;
+                    let reply_payload = handler(&m.payload);
+                    let reply_headers = request_reply::encode_reply_headers(&corr, b"");
+                    let reply_body = PubBody {
+                        flags: 0,
+                        timestamp_ms: now_ms(),
+                        key: b"",
+                        headers: &reply_headers,
+                        dedup: None,
+                        fire_and_forget: false,
+                        payload: &reply_payload,
+                    };
+                    self.publish_subject(&reply_to, &reply_body)?;
+                    served += 1;
+                }
+                let _ = self.ack(m.offset, m.generation);
+                idle_deadline = std::time::Instant::now() + idle_budget;
+                if served >= max {
+                    break;
+                }
+            }
+        }
+        Ok(served)
     }
 
     fn send(&mut self, frame_type: FrameType, body: &[u8]) -> Result<(), ClientError> {
@@ -9392,6 +9789,339 @@ toYtkjmdU2eQ2pK/3gM=
             vec![0, 1, 2],
             "the re-subscribe sees the whole retained log again (nothing durable survived)"
         );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    // ---- request/reply (RPC) over subjects (#764, V2-M4-I5) ----
+
+    /// The requester/responder capability set: stream addressing (subjects) + ephemeral groups (the
+    /// reply inbox). The no-auth test broker grants every scope, so `bind_subject` (needed by the
+    /// responder registration and the inbox binding) works.
+    fn rr_config() -> ClientConfig {
+        ClientConfig {
+            understands_streams: true,
+            request_ephemeral_groups: true,
+            ..ClientConfig::default()
+        }
+    }
+
+    /// Acceptance #1 (positive): a request to a subject with one responder returns that responder's
+    /// correlated reply within the timeout. End-to-end over the real broker: an echo responder on its
+    /// own thread + the requester on the main thread.
+    #[test]
+    fn request_reply_echo_returns_the_correlated_reply() {
+        let (addr, shutdown, handle) = start_server();
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            let mut r = Client::connect_with(addr, &rr_config()).unwrap();
+            r.register_responder("rpc.echo", "workers").unwrap();
+            registered_tx.send(()).unwrap();
+            // Echo the request payload with a suffix, so the reply is verifiably the responder's.
+            r.serve_requests(1, Duration::from_secs(5), |req| {
+                let mut v = req.to_vec();
+                v.extend_from_slice(b"-echo");
+                v
+            })
+            .unwrap();
+        });
+        // Only publish once the responder has BOUND the subject (else the request fast-fails).
+        registered_rx.recv().unwrap();
+
+        let mut req = Client::connect_with(addr, &rr_config()).unwrap();
+        let reply = req
+            .request("rpc.echo", b"ping", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(reply.payload, b"ping-echo");
+        // The reply carries the echoed correlation id header (it is what matched).
+        assert!(request_reply::correlation_id_from_headers(&reply.headers).is_some());
+
+        responder.join().unwrap();
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// Acceptance #1 (negative): a request to a subject with ZERO registered responders FAST-FAILS
+    /// with a no-responders error rather than hanging to the (long) deadline.
+    #[test]
+    fn request_to_an_unregistered_subject_fast_fails_no_responders() {
+        let (addr, shutdown, handle) = start_server();
+        let mut req = Client::connect_with(addr, &rr_config()).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = req
+            .request("rpc.nobody", b"x", Duration::from_secs(30))
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::NoResponders),
+            "expected NoResponders, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must fast-fail, not hang to the 30s deadline"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// A registered-but-SILENT responder (the subject is bound, so the publish routes, but nobody
+    /// answers) makes the request return a typed [`ClientError::RequestTimeout`] at the deadline —
+    /// distinct from the fast-fail [`ClientError::NoResponders`] path.
+    #[test]
+    fn request_times_out_when_the_responder_is_silent() {
+        let (addr, shutdown, handle) = start_server();
+        // A helper that REGISTERS (binds the subject + subscribes) but never serves; kept alive so the
+        // subject stays bound for the requester's publish.
+        let mut silent = Client::connect_with(addr, &rr_config()).unwrap();
+        silent.register_responder("rpc.silent", "workers").unwrap();
+
+        let mut req = Client::connect_with(addr, &rr_config()).unwrap();
+        let err = req
+            .request("rpc.silent", b"x", Duration::from_millis(400))
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::RequestTimeout { received: 0 }),
+            "expected RequestTimeout, got {err:?}"
+        );
+
+        drop(silent);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// Acceptance #2/#3: with TWO responders in ONE queue group and K requests, each request is
+    /// answered by EXACTLY ONE responder (competing / load-balanced), so the total handled across the
+    /// pool equals K — NOT 2K (which a fan-out would give). First-wins returns that one reply.
+    #[test]
+    fn queue_group_load_balances_each_request_to_exactly_one_responder() {
+        const K: usize = 6;
+        let (addr, shutdown, handle) = start_server();
+        let (reg_tx, reg_rx) = std::sync::mpsc::channel();
+
+        let mut responders = Vec::new();
+        for _ in 0..2 {
+            let reg_tx = reg_tx.clone();
+            responders.push(std::thread::spawn(move || {
+                let mut r = Client::connect_with(addr, &rr_config()).unwrap();
+                // SAME group name = competing consumers over the one request stream.
+                r.register_responder("rpc.lb", "workers").unwrap();
+                reg_tx.send(()).unwrap();
+                // Serve up to K (whatever this member wins); idle out after requests stop.
+                r.serve_requests(K, Duration::from_secs(2), |req| {
+                    let mut v = req.to_vec();
+                    v.extend_from_slice(b"-ok");
+                    v
+                })
+                .unwrap()
+            }));
+        }
+        reg_rx.recv().unwrap();
+        reg_rx.recv().unwrap();
+
+        let mut req = Client::connect_with(addr, &rr_config()).unwrap();
+        for _ in 0..K {
+            let reply = req.request("rpc.lb", b"q", Duration::from_secs(5)).unwrap();
+            assert_eq!(reply.payload, b"q-ok", "exactly one correlated reply");
+        }
+
+        let total: usize = responders.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(
+            total, K,
+            "each of the {K} requests was handled by exactly one responder (competing, not fan-out)"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// Acceptance #4: SCATTER-GATHER. N responders each in their OWN group (so each receives every
+    /// request) all answer one request; `request_many` fans in exactly N distinct replies, correlated
+    /// with no cross-talk.
+    #[test]
+    fn scatter_gather_fans_in_a_reply_from_every_responder() {
+        const N: usize = 3;
+        let (addr, shutdown, handle) = start_server();
+        let (reg_tx, reg_rx) = std::sync::mpsc::channel();
+
+        let mut responders = Vec::new();
+        for i in 0..N {
+            let reg_tx = reg_tx.clone();
+            responders.push(std::thread::spawn(move || {
+                let mut r = Client::connect_with(addr, &rr_config()).unwrap();
+                // DISTINCT group per responder = independent copies of every request (fan-out).
+                r.register_responder("rpc.fanout", &format!("grp-{i}"))
+                    .unwrap();
+                reg_tx.send(()).unwrap();
+                r.serve_requests(1, Duration::from_secs(3), move |req| {
+                    let mut v = req.to_vec();
+                    v.extend_from_slice(format!("-r{i}").as_bytes());
+                    v
+                })
+                .unwrap();
+            }));
+        }
+        for _ in 0..N {
+            reg_rx.recv().unwrap();
+        }
+
+        let mut req = Client::connect_with(addr, &rr_config()).unwrap();
+        let replies = req
+            .request_many("rpc.fanout", b"q", N, Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            replies.len(),
+            N,
+            "fan-in one reply from each of {N} responders"
+        );
+
+        // Every responder's distinct suffix appears exactly once (no cross-talk / no duplication).
+        let mut got: Vec<Vec<u8>> = replies.iter().map(|r| r.payload.clone()).collect();
+        got.sort();
+        let mut want: Vec<Vec<u8>> = (0..N).map(|i| format!("q-r{i}").into_bytes()).collect();
+        want.sort();
+        assert_eq!(got, want);
+
+        for h in responders {
+            h.join().unwrap();
+        }
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// Acceptance #4 (correlation): a reply carrying a NON-matching correlation id is IGNORED. A good
+    /// responder and a "buggy" responder (replies with the wrong id) both answer; `request` (first-wins)
+    /// returns only the good reply, never the mismatched one.
+    #[test]
+    fn a_reply_with_a_mismatched_correlation_id_is_ignored() {
+        let (addr, shutdown, handle) = start_server();
+        let (reg_tx, reg_rx) = std::sync::mpsc::channel();
+
+        // GOOD responder: echoes with the correct (echoed) correlation id.
+        let good_tx = reg_tx.clone();
+        let good = std::thread::spawn(move || {
+            let mut r = Client::connect_with(addr, &rr_config()).unwrap();
+            r.register_responder("rpc.mismatch", "good").unwrap();
+            good_tx.send(()).unwrap();
+            r.serve_requests(1, Duration::from_secs(3), |_req| b"GOOD".to_vec())
+                .unwrap();
+        });
+
+        // BUGGY responder (distinct group, so it also receives the request): replies to the correct
+        // reply subject but stamps a WRONG correlation id, which the requester must ignore.
+        let bad_tx = reg_tx.clone();
+        let bad = std::thread::spawn(move || {
+            let mut r = Client::connect_with(addr, &rr_config()).unwrap();
+            r.register_responder("rpc.mismatch", "bad").unwrap();
+            bad_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            'serve: loop {
+                let batch = r.fetch(64).unwrap();
+                if batch.messages.is_empty() {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                for m in &batch.messages {
+                    if let Some(rq) = request_reply::request_headers_from(&m.headers) {
+                        let reply_to = String::from_utf8_lossy(rq.reply_to).into_owned();
+                        // A correlation id that is (almost surely) NOT the request's random id.
+                        let wrong = [0xAAu8; request_reply::CORRELATION_ID_LEN];
+                        let headers = request_reply::encode_reply_headers(&wrong, b"");
+                        let body = PubBody {
+                            flags: 0,
+                            timestamp_ms: 0,
+                            key: b"",
+                            headers: &headers,
+                            dedup: None,
+                            fire_and_forget: false,
+                            payload: b"WRONG",
+                        };
+                        r.publish_subject(&reply_to, &body).unwrap();
+                        let _ = r.ack(m.offset, m.generation);
+                        break 'serve;
+                    }
+                    let _ = r.ack(m.offset, m.generation);
+                }
+            }
+        });
+
+        reg_rx.recv().unwrap();
+        reg_rx.recv().unwrap();
+
+        let mut req = Client::connect_with(addr, &rr_config()).unwrap();
+        let reply = req
+            .request("rpc.mismatch", b"q", Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            reply.payload, b"GOOD",
+            "the mismatched-correlation reply must be ignored"
+        );
+
+        good.join().unwrap();
+        bad.join().unwrap();
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// The reply inbox is EPHEMERAL and leaves no durable per-request state: after several requests, a
+    /// FRESH ephemeral consumer of the shared inbox log starts at the earliest offset and sees every
+    /// reply — none of the per-request inbox groups persisted a durable cursor (the #771 ephemeral
+    /// contract, exercised through request/reply). The inbox log itself retains the replies (it is one
+    /// shared stream), but no per-request group survives.
+    #[test]
+    fn the_reply_inbox_is_ephemeral_and_leaves_no_durable_per_request_state() {
+        const K: usize = 4;
+        let (addr, shutdown, handle) = start_server();
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            let mut r = Client::connect_with(addr, &rr_config()).unwrap();
+            r.register_responder("rpc.eph", "workers").unwrap();
+            registered_tx.send(()).unwrap();
+            r.serve_requests(K, Duration::from_secs(5), <[u8]>::to_vec)
+                .unwrap();
+        });
+        registered_rx.recv().unwrap();
+
+        let mut req = Client::connect_with(addr, &rr_config()).unwrap();
+        for n in 0..K {
+            let reply = req
+                .request(
+                    "rpc.eph",
+                    format!("m{n}").as_bytes(),
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+            assert_eq!(reply.payload, format!("m{n}").into_bytes());
+        }
+        responder.join().unwrap();
+
+        // A brand-new ephemeral consumer of the inbox log sees ALL K replies from offset 0: the
+        // per-request inbox groups were reaped, leaving no durable cursor that would hide records.
+        let mut reader = Client::connect_with(addr, &rr_config()).unwrap();
+        reader
+            .subscribe_ephemeral(request_reply::INBOX_STREAM, "audit")
+            .unwrap();
+        let mut seen = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while seen < K && std::time::Instant::now() < deadline {
+            let batch = reader.fetch(64).unwrap();
+            for m in &batch.messages {
+                assert!(request_reply::correlation_id_from_headers(&m.headers).is_some());
+                let _ = reader.ack(m.offset, m.generation);
+                seen += 1;
+            }
+            if batch.messages.is_empty() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(
+            seen, K,
+            "a fresh ephemeral reader sees every retained reply (no per-request durable cursor survived)"
+        );
+
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
