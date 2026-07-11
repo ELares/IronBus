@@ -150,6 +150,7 @@ fn key_to_env_name(key: &str) -> Option<&'static str> {
         "storage.segment_size" => "IRONBUS_MAX_SEGMENT_BYTES",
         "storage.data_dir" => "IRONBUS_DATA_DIR",
         "storage.max_total_bytes" => "IRONBUS_MAX_TOTAL_BYTES",
+        "storage.tindex_stride_records" => "IRONBUS_TINDEX_STRIDE_RECORDS",
         "storage.io_mode" => "IRONBUS_IO_MODE",
         "durability.level" => "IRONBUS_DURABILITY_LEVEL",
         "durability.flush_interval_ms" => "IRONBUS_FLUSH_INTERVAL_MS",

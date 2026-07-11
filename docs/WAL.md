@@ -430,6 +430,7 @@ All of these are `ironbus serve` flags (`crates/ironbus-cli/src/main.rs`), mappe
 | --- | --- | --- | --- |
 | `--max-segment-bytes` | `LogConfig::max_segment_bytes` | 64 MiB | Soft roll cap on the active segment. Rejected below `MIN_MAX_SEGMENT_BYTES`. |
 | `--max-total-bytes` | `LogConfig::max_total_bytes` | 0 (unlimited) | Hard cap on total durable record bytes. At/over it, a produce is shed with `AtCapacity`. |
+| `--tindex-stride-records` | `LogConfig::tindex_stride_records` | 1024 | Seek-by-time `.tindex` density (#772): one sparse timestamp anchor per this many records. A memory/latency trade over the seek accelerator; never affects correctness, durability, or the segment bytes. |
 | `--max-retained-bytes` | `EngineConfig::max_retained_bytes` | 0 (off) | Size retention bound: reap fully-consumed sealed segments while over this. |
 | `--max-age-ms` | `EngineConfig::max_age_ms` | 0 (off) | Age retention bound (ms): reap a sealed segment once all its records are older than this. |
 | `--max-messages` | `EngineConfig::max_messages` | 0 (off) | Count retention bound: reap while total record count exceeds this. |
@@ -448,11 +449,19 @@ Each item below is described in #135 (or the README) but was verified ABSENT in 
 source as of this document. They belong to the seal-then-retire *plan*, not the shipped
 code.
 
-- **Index sidecars (`.index`, `.tindex`).** #135's seal path "finalizes and fsyncs the
-  derived `.index` and `.tindex` sidecars." No such files are created or read anywhere.
-  Reads scan segment files directly (`SegmentReader::scan`); the offset index is derived
-  in memory (the sorted `SegmentSlot` list plus a binary search), not persisted. The
-  README's "derived offset / time index" is in-memory and rebuilt on startup.
+- **The offset `.index` sidecar** is still in-memory only: the offset seek index is the
+  resident sparse `SegmentIndex` (#537), rebuilt from the durable frames on reopen, not a
+  persisted `.index` file.
+- **The `.tindex` time index sidecar is now BUILT (#772).** The seal path finalizes and
+  fsyncs a derived `seg-<id>.tindex` beside each sealed segment: a sparse
+  `(offset, exclusive prefix-max timestamp)` anchor list (one anchor per
+  `LogConfig::tindex_stride_records` records, default 1024) that resolves a wall-clock
+  seek to a starting offset in `O(log n)`. It is a DERIVED, REBUILDABLE accelerator — the
+  segment records are the source of truth, so a missing, torn, or corrupt `.tindex` is
+  rebuilt from a segment scan (`SegmentReader::time_anchors`), never failing a log open
+  and never gating durability, and it is a SEPARATE file so it never perturbs the segment
+  `.log` bytes. The build/seek/format live in `crates/ironbus-storage/src/tindex.rs` and
+  `log.rs`; the wire seek is the additive `start_time_ms`/`end_time_ms` on `StreamFetch`.
 - **A `current` pointer file.** #135's seal "advances the `current` pointer atomically
   (write-temp, rename, fsync parent dir)." There is no pointer file; the active segment
   is simply the highest-id `seg-*.log` in the directory.

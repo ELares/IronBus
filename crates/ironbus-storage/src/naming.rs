@@ -15,6 +15,8 @@ use std::io;
 const PREFIX: &str = "seg-";
 /// The fixed suffix of a segment file name.
 const SUFFIX: &str = ".log";
+/// The fixed suffix of a segment's `.tindex` (timestamp -> offset) index sidecar (#772).
+const TINDEX_SUFFIX: &str = ".tindex";
 /// The width of the hex id field: a `u64` is exactly 16 hex digits.
 const ID_HEX_LEN: usize = 16;
 
@@ -24,6 +26,16 @@ const ID_HEX_LEN: usize = 16;
 #[must_use]
 pub fn segment_file_name(segment_id: u64) -> String {
     format!("{PREFIX}{segment_id:016x}{SUFFIX}")
+}
+
+/// The on-disk file name for a SEALED segment's `.tindex` timestamp-index sidecar (#772):
+/// `seg-<id:016x>.tindex`, beside its `seg-<id:016x>.log`. It shares the segment's `seg-<id>`
+/// stem (so the two are visibly paired) but carries the `.tindex` suffix, so [`segment_ids`] —
+/// which matches only `.log` — never mistakes a sidecar for a segment, and a stale sidecar is a
+/// harmless derived file that recovery's flat `.log` walk ignores.
+#[must_use]
+pub fn segment_tindex_name(segment_id: u64) -> String {
+    format!("{PREFIX}{segment_id:016x}{TINDEX_SUFFIX}")
 }
 
 /// The on-disk file name of the default work-group's durable cursor checkpoint (`cursor.ckpt`).
@@ -283,6 +295,20 @@ mod tests {
         assert_eq!(segment_file_name(1), "seg-0000000000000001.log");
         assert_eq!(segment_file_name(255), "seg-00000000000000ff.log");
         assert_eq!(segment_file_name(u64::MAX), "seg-ffffffffffffffff.log");
+    }
+
+    #[test]
+    fn tindex_names_pair_with_the_segment_but_are_not_segments() {
+        // The `.tindex` sidecar shares the `seg-<id>` stem so the pair is visible, but its `.tindex`
+        // suffix keeps it out of segment enumeration (#772).
+        assert_eq!(segment_tindex_name(1), "seg-0000000000000001.tindex");
+        assert_eq!(segment_tindex_name(255), "seg-00000000000000ff.tindex");
+        // A `.tindex` file is NEVER parsed as a segment (segment enumeration matches only `.log`).
+        assert_eq!(parse_segment_file_name(&segment_tindex_name(7)), None);
+        let fs = InMemoryFs::new();
+        fs.create_new(&segment_file_name(7)).unwrap();
+        fs.create_new(&segment_tindex_name(7)).unwrap();
+        assert_eq!(segment_ids(&fs).unwrap(), vec![7]); // the sidecar is skipped
     }
 
     #[test]

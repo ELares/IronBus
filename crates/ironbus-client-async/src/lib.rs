@@ -1573,6 +1573,8 @@ impl AsyncClient {
         start_offset: u64,
         max_records: u32,
         max_bytes: u64,
+        start_time_ms: Option<u64>,
+        end_time_ms: Option<u64>,
     ) -> Result<usize, ClientError> {
         let max_records = match self.negotiated_credit {
             Some(credit) => max_records.min(credit),
@@ -1584,6 +1586,8 @@ impl AsyncClient {
                 start_offset,
                 max_records,
                 max_bytes,
+                start_time_ms,
+                end_time_ms,
             },
             &mut body,
         );
@@ -1634,7 +1638,32 @@ impl AsyncClient {
         max_bytes: u64,
     ) -> Result<Fetch, ClientError> {
         let limit = self
-            .send_stream_fetch(start_offset, max_records, max_bytes)
+            .send_stream_fetch(start_offset, max_records, max_bytes, None, None)
+            .await?;
+        self.read_stream_fetch_response(limit).await
+    }
+
+    /// STREAMING (Tier-S) SEEK-BY-TIME fetch (#772): the async wall-clock twin of
+    /// [`AsyncClient::stream_fetch`]. Delivery begins at the FIRST record whose producer timestamp is
+    /// at or after `start_time_ms` (milliseconds since the Unix epoch), resolved off the broker's
+    /// sparse per-segment `.tindex`, and is OPTIONALLY bounded above by `end_time_ms` (exclusive) for
+    /// a `[start, end)` time-window replay — NATS `JetStream` `DeliverByStartTime` / Kafka
+    /// `offsetsForTimes` parity. Offset-authoritative and exact versus a full scan even for
+    /// non-monotonic producer timestamps; an old `start_time_ms` clamps to the earliest retained
+    /// offset, a future one starts at the tail. Settle by offset via [`AsyncClient::stream_commit`].
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error (the group is not streaming, or the
+    /// connection did not negotiate Tier-S), or a server that streams more frames than the cap.
+    pub async fn stream_fetch_by_time(
+        &mut self,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+        max_records: u32,
+        max_bytes: u64,
+    ) -> Result<Fetch, ClientError> {
+        let limit = self
+            .send_stream_fetch(0, max_records, max_bytes, Some(start_time_ms), end_time_ms)
             .await?;
         self.read_stream_fetch_response(limit).await
     }
@@ -2070,6 +2099,8 @@ impl AsyncStreamingConsumer<'_> {
                     self.next_offset,
                     self.window_records(),
                     self.config.max_bytes,
+                    None,
+                    None,
                 )
                 .await?;
             self.prefetch = Some(limit);

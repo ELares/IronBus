@@ -220,6 +220,11 @@ const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// default): the spill-by-default behavior is unchanged until an operator opts in to the shed.
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 0;
 
+/// The default seek-by-time `.tindex` density for `serve` (#772): one sparse timestamp anchor per
+/// this many records, taken from the storage default so the two cannot drift. A pure memory/latency
+/// trade over the seek accelerator; changing it never affects correctness or durability.
+const DEFAULT_TINDEX_STRIDE_RECORDS: u32 = LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS;
+
 /// The default consumer-safe size-retention bound for `serve` (0 = unlimited, retention OFF,
 /// matching the engine default): the broker never reaps old sealed segments until an operator
 /// opts in, so existing behavior is unchanged.
@@ -2445,6 +2450,7 @@ struct ServeFlags {
     consumer_credit_bytes: Option<u64>,
     max_segment_bytes: Option<u64>,
     max_total_bytes: Option<u64>,
+    tindex_stride_records: Option<u32>,
     max_retained_bytes: Option<u64>,
     max_age_ms: Option<u64>,
     max_messages: Option<u64>,
@@ -2786,6 +2792,10 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--max-total-bytes" => {
                 f.max_total_bytes = Some(take_number("--max-total-bytes", args, &mut i)?);
+            }
+            "--tindex-stride-records" => {
+                f.tindex_stride_records =
+                    Some(take_number("--tindex-stride-records", args, &mut i)?);
             }
             "--max-retained-bytes" => {
                 f.max_retained_bytes = Some(take_number("--max-retained-bytes", args, &mut i)?);
@@ -3453,6 +3463,12 @@ fn parse_serve_flags_with_env_and_reader(
                 f.max_total_bytes,
                 env,
                 DEFAULT_MAX_TOTAL_BYTES,
+            )?,
+            tindex_stride_records: resolve_number(
+                "--tindex-stride-records",
+                f.tindex_stride_records,
+                env,
+                DEFAULT_TINDEX_STRIDE_RECORDS,
             )?,
             max_retained_bytes: resolve_number(
                 "--max-retained-bytes",
@@ -5279,6 +5295,11 @@ struct ServeConfig {
     /// Hard durable-log total byte cap, the drop-new shed backstop (#10). `0` means unlimited
     /// (the cap is off), which is the default and preserves the spill-by-default behavior.
     max_total_bytes: u64,
+    /// The seek-by-time `.tindex` density (#772): one sparse timestamp anchor per this many records.
+    /// A pure memory/latency trade over the seek-by-time accelerator — smaller scans fewer records
+    /// per seek at a larger sidecar, larger the reverse — that never affects correctness, durability,
+    /// or the segment bytes. Clamped up to 1 by the storage builder.
+    tindex_stride_records: u32,
     /// Consumer-safe size-retention bound (#13, #80): the broker reaps old fully-consumed sealed
     /// segments while the durable log is over this many RECORD bytes. `0` means unlimited
     /// (retention off), the default, so existing behavior is unchanged.
@@ -5604,6 +5625,7 @@ impl ServeConfig {
             consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            tindex_stride_records: DEFAULT_TINDEX_STRIDE_RECORDS,
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
@@ -10268,7 +10290,8 @@ fn open_engine_with<F: Filesystem + Clone>(
             // layers on the durable-log total byte cap (the drop-new shed; `0` = unlimited).
             log: LogConfig::new(config.max_segment_bytes)
                 .map_err(|e| CliError::Internal(format!("log config: {e}")))?
-                .with_max_total_bytes(config.max_total_bytes),
+                .with_max_total_bytes(config.max_total_bytes)
+                .with_tindex_stride_records(config.tindex_stride_records),
             lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
             max_in_flight: config.max_in_flight,
@@ -14015,6 +14038,7 @@ mod tests {
             consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            tindex_stride_records: DEFAULT_TINDEX_STRIDE_RECORDS,
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
@@ -17686,6 +17710,7 @@ mod tests {
             consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            tindex_stride_records: DEFAULT_TINDEX_STRIDE_RECORDS,
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,

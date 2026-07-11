@@ -2301,16 +2301,22 @@ pub const STREAM_FETCH_BODY_VERSION: u8 = 1;
 /// which removes exactly the per-record cost that makes single-consumer durable consume lose to NATS.
 ///
 /// Layout (version+length framed, forward-compatible, mirroring [`FetchBody`]): `body_version: u8`
-/// ([`STREAM_FETCH_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block that
-/// follows), then the v1 block: `start_offset: u64 LE`, `max_records: u32 LE`, `max_bytes: u64 LE`.
-/// Bytes past `field_len` (a future version's appended fields) are TOLERATED and ignored by a v1
-/// reader.
+/// ([`STREAM_FETCH_BODY_VERSION`]), `field_len: u16` (the length of the known-field block that
+/// follows), then the v1 block: `start_offset: u64 LE`, `max_records: u32 LE`, `max_bytes: u64 LE`,
+/// OPTIONALLY followed by the additive seek-by-time block (#772): `start_time_ms: u64 LE`,
+/// `end_time_ms: u64 LE`. The time block is present iff `field_len` exceeds the v1 length; when a
+/// fetch carries NO time bound the encoder appends nothing, so an offset-only `StreamFetch` is
+/// BYTE-IDENTICAL to before this feature. Within the block a time of `0` is the "unset" sentinel
+/// (epoch-0 is not a meaningful seek target — a start seek to time 0 is the earliest offset, an end
+/// bound of 0 is no upper bound), so each of `start_time_ms`/`end_time_ms` maps `0 <-> None`. Bytes
+/// past `field_len` (a future version's appended fields) are TOLERATED and ignored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreamFetchBody {
     /// The consumer-managed offset to begin the contiguous read at (inclusive). The consumer owns this
     /// position: it is normally the consumer's last committed offset, so a reconnect resumes exactly
     /// where it left off. The broker reads forward from here off the durable prefix, bounded by the
-    /// flushed frontier (no un-flushed record is ever served).
+    /// flushed frontier (no un-flushed record is ever served). IGNORED when `start_time_ms` is set
+    /// (seek-by-time takes precedence and resolves its own start offset, #772).
     pub start_offset: u64,
     /// The maximum number of records to deliver in this batch. The server delivers at most this many
     /// (the durable prefix's available records and the byte cap also bind). A value of `0` requests
@@ -2321,30 +2327,60 @@ pub struct StreamFetchBody {
     /// the next record would exceed this, EXCEPT the floor-of-one (a batch always delivers at least one
     /// ready record so a single over-cap record never wedges the consumer).
     pub max_bytes: u64,
+    /// OPTIONAL SEEK-BY-TIME start (#772): when `Some(t)`, delivery begins at the FIRST offset whose
+    /// producer timestamp is `>= t` (milliseconds since the Unix epoch), resolved off the sparse
+    /// per-segment `.tindex`, and `start_offset` is IGNORED (seek-by-time takes precedence). The
+    /// resolution is offset-authoritative and exact versus a full scan even for non-monotonic
+    /// producer timestamps; a `t` older than the earliest retained record clamps to the earliest
+    /// offset, and a `t` newer than every record starts at the tail. `None` uses `start_offset`.
+    pub start_time_ms: Option<u64>,
+    /// OPTIONAL EXCLUSIVE end-time bound (#772): when `Some(t)`, delivery stops before the first
+    /// record whose producer timestamp is `> t`, so the read is bounded to `[start, end)` by time —
+    /// a time-window replay. `None` is unbounded above. Combined with `start_time_ms` this yields a
+    /// `[start_time, end_time]` window (under monotonic producer timestamps it equals filtering a
+    /// full scan by time; the honest non-monotonic caveat is documented on the storage seek).
+    pub end_time_ms: Option<u64>,
 }
 
 /// The number of bytes in the `StreamFetch` v1 known-field block: `start_offset: u64` +
 /// `max_records: u32` + `max_bytes: u64`.
 const STREAM_FETCH_V1_FIELD_LEN: u16 = 8 + 4 + 8;
 
-/// Encodes a `StreamFetch` body onto the end of `out` (#544): the version byte, the v1 field-block
-/// length, then the v1 block.
+/// The number of bytes the additive seek-by-time block appends (#772): `start_time_ms: u64` +
+/// `end_time_ms: u64`. Present in the framed block ONLY when a fetch carries a time bound.
+const STREAM_FETCH_TIME_FIELD_LEN: u16 = 8 + 8;
+
+/// Encodes a `StreamFetch` body onto the end of `out` (#544): the version byte, the field-block
+/// length, then the v1 block. The additive seek-by-time block (#772) is appended ONLY when the fetch
+/// carries a start or end time, so an offset-only fetch is byte-identical to the pre-#772 encoding.
 pub fn encode_stream_fetch(req: &StreamFetchBody, out: &mut Vec<u8>) {
+    let has_time = req.start_time_ms.is_some() || req.end_time_ms.is_some();
+    let field_len = if has_time {
+        STREAM_FETCH_V1_FIELD_LEN + STREAM_FETCH_TIME_FIELD_LEN
+    } else {
+        STREAM_FETCH_V1_FIELD_LEN
+    };
     out.push(STREAM_FETCH_BODY_VERSION);
-    out.extend_from_slice(&STREAM_FETCH_V1_FIELD_LEN.to_le_bytes());
+    out.extend_from_slice(&field_len.to_le_bytes());
     out.extend_from_slice(&req.start_offset.to_le_bytes());
     out.extend_from_slice(&req.max_records.to_le_bytes());
     out.extend_from_slice(&req.max_bytes.to_le_bytes());
+    if has_time {
+        // `0` is the "unset" sentinel for each bound (epoch-0 is not a meaningful seek target).
+        out.extend_from_slice(&req.start_time_ms.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&req.end_time_ms.unwrap_or(0).to_le_bytes());
+    }
 }
 
-/// Decodes a `StreamFetch` body (#544), cap-before-alloc and panic-free.
+/// Decodes a `StreamFetch` body (#544, seek-by-time #772), cap-before-alloc and panic-free.
 ///
 /// The body MUST carry the version byte and the `u16` field-length; the v1 known fields are read from
-/// the front of the declared block and any trailing bytes (a future version's appended fields) are
-/// tolerated and ignored. A body too short to hold the `field_len` it declares is a typed
-/// [`BodyError`], never a panic or an over-read (the `field_len` is bounded against the actual body by
-/// [`Reader::take`] BEFORE any read). An EMPTY body is NOT a valid `StreamFetch` (the frame type is
-/// new, with no historical empty case), so it is a typed [`BodyError::Truncated`].
+/// the front of the declared block, then the OPTIONAL seek-by-time block if the block is long enough
+/// to hold it, and any trailing bytes (a future version's appended fields) are tolerated and ignored.
+/// A body too short to hold the `field_len` it declares is a typed [`BodyError`], never a panic or an
+/// over-read (the `field_len` is bounded against the actual body by [`Reader::take`] BEFORE any read).
+/// An EMPTY body is NOT a valid `StreamFetch` (the frame type is new, with no historical empty case),
+/// so it is a typed [`BodyError::Truncated`]. Each time field maps its `0` sentinel to `None`.
 ///
 /// # Errors
 /// Returns [`BodyError::Truncated`] if the body is too short for the version/length header or the
@@ -2363,10 +2399,17 @@ pub fn decode_stream_fetch(body: &[u8]) -> Result<StreamFetchBody, BodyError> {
     let start_offset = fr.u64().unwrap_or(0);
     let max_records = fr.u32().unwrap_or(0);
     let max_bytes = fr.u64().unwrap_or(0);
+    // The additive seek-by-time block (#772) is present iff the declared block extends past the v1
+    // fields. Each field's `0` sentinel decodes to `None`; a partial/absent block defaults to `None`.
+    let start_time_raw = fr.u64().unwrap_or(0);
+    let end_time_raw = fr.u64().unwrap_or(0);
+    let sentinel = |t: u64| (t != 0).then_some(t);
     Ok(StreamFetchBody {
         start_offset,
         max_records,
         max_bytes,
+        start_time_ms: sentinel(start_time_raw),
+        end_time_ms: sentinel(end_time_raw),
     })
 }
 
@@ -4187,10 +4230,64 @@ mod tests {
             start_offset: 0x0102_0304_0506_0708,
             max_records: 256,
             max_bytes: 1 << 20,
+            ..StreamFetchBody::default()
         };
         let mut buf = Vec::new();
         encode_stream_fetch(&req, &mut buf);
         assert_eq!(decode_stream_fetch(&buf).unwrap(), req);
+    }
+
+    #[test]
+    fn stream_fetch_seek_by_time_round_trips_and_is_additive() {
+        // #772: an offset-only fetch is BYTE-IDENTICAL to the pre-seek-by-time encoding (the time
+        // block is appended only when a bound is present), so a default consume is unchanged on the
+        // wire.
+        let offset_only = StreamFetchBody {
+            start_offset: 99,
+            max_records: 8,
+            max_bytes: 0,
+            ..StreamFetchBody::default()
+        };
+        let mut a = Vec::new();
+        encode_stream_fetch(&offset_only, &mut a);
+        // The v1 wire image: version(1) + field_len(2)=20 + 20 bytes of v1 fields = 23 bytes, no time.
+        assert_eq!(a.len(), 1 + 2 + STREAM_FETCH_V1_FIELD_LEN as usize);
+        assert_eq!(decode_stream_fetch(&a).unwrap(), offset_only);
+
+        // A start-only, an end-only, and a both-bounds fetch each round-trip, and each maps its `0`
+        // sentinel to `None`.
+        for req in [
+            StreamFetchBody {
+                start_offset: 0,
+                max_records: 10,
+                max_bytes: 4096,
+                start_time_ms: Some(1_700_000_000_000),
+                end_time_ms: None,
+            },
+            StreamFetchBody {
+                start_offset: 5,
+                max_records: 10,
+                max_bytes: 0,
+                start_time_ms: None,
+                end_time_ms: Some(1_700_000_050_000),
+            },
+            StreamFetchBody {
+                start_offset: 0,
+                max_records: 3,
+                max_bytes: 0,
+                start_time_ms: Some(1),
+                end_time_ms: Some(u64::MAX),
+            },
+        ] {
+            let mut buf = Vec::new();
+            encode_stream_fetch(&req, &mut buf);
+            // The time block adds exactly 16 bytes.
+            assert_eq!(
+                buf.len(),
+                1 + 2 + (STREAM_FETCH_V1_FIELD_LEN + STREAM_FETCH_TIME_FIELD_LEN) as usize
+            );
+            assert_eq!(decode_stream_fetch(&buf).unwrap(), req);
+        }
     }
 
     #[test]
@@ -4211,6 +4308,7 @@ mod tests {
                 start_offset: 1,
                 max_records: 1,
                 max_bytes: 0,
+                ..StreamFetchBody::default()
             },
             &mut wrong,
         );
@@ -4231,6 +4329,7 @@ mod tests {
             start_offset: 42,
             max_records: 7,
             max_bytes: 4096,
+            ..StreamFetchBody::default()
         };
         let mut buf = Vec::new();
         encode_stream_fetch(&req, &mut buf);

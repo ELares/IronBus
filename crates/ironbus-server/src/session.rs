@@ -2892,7 +2892,7 @@ impl Session {
         let ceiling_bytes = self.credit_ceiling_bytes(engine)?;
         // The number of records to serve: the client's request clamped to the per-consumer credit
         // window. A request of 0 (or a 0 window) serves nothing and replies an empty batch.
-        let want = req.max_records.min(window) as usize;
+        let mut want = req.max_records.min(window) as usize;
         // COUNT-BOUND keep-up: the consumer asked for at least the whole window, so the window (not
         // `max_records`) capped this fetch. If it then returns a FULL window's worth, the consumer is
         // keeping up and could pull more per RTT, so the auto-tune grows toward the ceiling.
@@ -2904,7 +2904,7 @@ impl Session {
             0 => None,
             cap => Some(usize::try_from(cap).unwrap_or(usize::MAX)),
         };
-        let start = Offset::new(req.start_offset);
+        let mut start = Offset::new(req.start_offset);
         let group = self.subscription.clone();
         let member = self.member_id;
         // The NAMED stream this streaming fetch targets (#681 follow-up), `""` for the DEFAULT stream. A
@@ -2912,6 +2912,45 @@ impl Session {
         // engine's `*_in_stream` twins (threaded into the serve helpers below); the default stream is
         // byte-for-byte unchanged.
         let stream = self.stream.clone();
+        // SEEK-BY-TIME (#772): when the fetch carries a start and/or end time, resolve them to log
+        // offsets off the sparse `.tindex` BEFORE the read. `start_time` (when present) takes
+        // PRECEDENCE over `start_offset` — it resolves its OWN start offset — and `end_time` resolves
+        // to an EXCLUSIVE end-offset bound. A time-bounded fetch resolves on the LOCAL/leader engine
+        // (not the follower read plane), and when an end bound is present it is served per-record so
+        // the end offset is enforced exactly (the raw batch path stays byte-identical for offset-only
+        // fetches). An offset-only fetch skips all of this and is unchanged on the wire.
+        let has_time = req.start_time_ms.is_some() || req.end_time_ms.is_some();
+        let mut end_offset: Option<Offset> = None;
+        if has_time {
+            let (st, et) = (req.start_time_ms, req.end_time_ms);
+            let (s, g) = (stream.clone(), group.clone());
+            match engine.with(move |e| e.stream_resolve_time_in_stream(&s, &g, st, et))? {
+                Ok((resolved_start, resolved_end)) => {
+                    if let Some(rs) = resolved_start {
+                        start = rs;
+                    }
+                    end_offset = resolved_end;
+                }
+                Err(e) if e.is_fatal() => {
+                    reply_err(out, "fatal storage error");
+                    return Err(SessionError::EngineFatal(e));
+                }
+                Err(e) => {
+                    // A wrong-mode / unknown-stream reject is a client-visible recoverable error
+                    // (the Err frame is the terminator); keep the connection open, send no FlowEnd.
+                    reply_err_coded(out, e.code().as_str(), &e.to_string());
+                    return Ok(());
+                }
+            }
+            // Bound the window by the exclusive end offset: deliver at most the records in
+            // `[start, end)`. The per-record path additionally enforces the bound per record (exact
+            // for a compacted/sparse segment), so the count cap plus the guard match a full-scan
+            // filter by time.
+            if let Some(end) = end_offset {
+                let span = end.get().saturating_sub(start.get());
+                want = want.min(usize::try_from(span).unwrap_or(usize::MAX));
+            }
+        }
         // CLUSTER FOLLOWER-READ over the wire (#735, half B): if this node FOLLOWS the partition, serve the
         // Tier-S streaming fetch from its OWN follower read plane via the #723 read-consistency tiers —
         // fail-closed by the SAFE committed watermark `min(own_flushed, known_committed_hw)`, so a follower
@@ -2928,7 +2967,7 @@ impl Session {
         // DEFAULT stream / DEFAULT_PARTITION concern), so only the default stream consults it — a named
         // streaming fetch falls straight through to the local (leader/local-engine) serve below, keyed by
         // (stream_id, group).
-        if self.stream.is_empty() {
+        if self.stream.is_empty() && !has_time {
             if let Some(outcome) = engine.cluster_follower_consume(
                 crate::cluster::client_ack::DEFAULT_PARTITION,
                 ReadTier::FollowerCommitted,
@@ -2957,7 +2996,11 @@ impl Session {
         // back how many records were delivered (`None` = a recoverable reject already replied as an Err,
         // which is the response terminator, so there is no keep-up and no FlowEnd to add).
         let capable = self.compressed_delivery_enabled;
-        let delivered = if self.deliver_batch_enabled {
+        // A time-bounded fetch with an EXCLUSIVE end offset is served PER-RECORD so the end bound is
+        // enforced exactly per record (including over a compacted/sparse segment); the raw DeliverBatch
+        // path is kept only for the unbounded (offset-only or start-time-only) case, so it stays
+        // byte-identical (#772).
+        let delivered = if self.deliver_batch_enabled && end_offset.is_none() {
             // The RAW DeliverBatch path ships the on-disk frame bytes VERBATIM (including any stored
             // COMPRESSED records), which is sound WITHOUT a compressed-delivery gate: decoding a raw
             // batch means decoding the on-disk record layout, so a DeliverBatch-capable consumer is
@@ -2968,7 +3011,7 @@ impl Session {
             )?
         } else {
             Self::serve_stream_fetch_per_record(
-                engine, &stream, &group, member, start, want, max_bytes, capable, out,
+                engine, &stream, &group, member, start, want, max_bytes, capable, end_offset, out,
             )?
         };
         let Some(delivered) = delivered else {
@@ -3109,6 +3152,7 @@ impl Session {
         want: usize,
         max_bytes: Option<usize>,
         capable: bool,
+        end_offset: Option<Offset>,
         out: &mut Vec<u8>,
     ) -> Result<Option<u32>, SessionError> {
         let group = group.clone();
@@ -3129,6 +3173,13 @@ impl Session {
                 // cleared and reused each iteration instead of a fresh `Vec` per delivered record.
                 let mut frame_body = Vec::with_capacity(DELIVER_FRAME_SCRATCH_CAP);
                 for record in &records {
+                    // SEEK-BY-TIME exclusive end bound (#772): stop before the first record at or past
+                    // the resolved end offset, so a `[start_time, end_time]` replay delivers exactly
+                    // the records in the time window (exact even over a compacted/sparse segment where
+                    // the count cap alone would over-read). No-op when there is no end bound.
+                    if end_offset.is_some_and(|end| record.offset.get() >= end.get()) {
+                        break;
+                    }
                     // Compressed-delivery gate (#1066): a non-capable consumer gets a stored-COMPRESSED
                     // record decompressed (COMPRESSED bit cleared); a capable consumer and every
                     // uncompressed record pass through verbatim. `None` stops the batch here.
@@ -7798,6 +7849,7 @@ mod tests {
                 start_offset: start,
                 max_records,
                 max_bytes,
+                ..Default::default()
             },
             &mut b,
         );
@@ -8275,6 +8327,7 @@ mod tests {
                     start_offset: 0,
                     max_records: 100,
                     max_bytes: 0,
+                    ..Default::default()
                 },
                 &mut b,
             );
@@ -8373,6 +8426,7 @@ mod tests {
                     start_offset: start,
                     max_records: max,
                     max_bytes: 0,
+                    ..Default::default()
                 },
                 &mut b,
             );
@@ -8414,6 +8468,7 @@ mod tests {
                 start_offset: 0,
                 max_records: 100,
                 max_bytes: 0,
+                ..Default::default()
             },
             &mut req,
         );
@@ -8501,6 +8556,7 @@ mod tests {
                 start_offset: 0,
                 max_records: 100,
                 max_bytes: 0,
+                ..Default::default()
             },
             &mut req,
         );
@@ -8592,6 +8648,7 @@ mod tests {
                 start_offset: 0,
                 max_records: 100,
                 max_bytes: 0,
+                ..Default::default()
             },
             &mut req,
         );

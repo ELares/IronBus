@@ -317,6 +317,40 @@ contiguous trailing write, so they become durable together. Nothing in the heade
 `[44, 60)` is touched (it stays owned by at-rest encryption), so a compacted-AND-encrypted segment
 has room for both.
 
+### `.tindex` timestamp-index sidecar (on-disk, #772)
+
+A DERIVED, REBUILDABLE accelerator written beside each SEALED segment as
+`seg-<id:016x>.tindex` (`crates/ironbus-storage/src/tindex.rs`, `crate::naming::
+segment_tindex_name`). It is NOT part of the segment `.log` byte contract and NOT a
+durability dependency: the segment records are authoritative, so a missing, torn, or
+corrupt `.tindex` is rebuilt from a segment scan and never fails a log open. Because it is
+a separate file, it never perturbs the segment `.log` byte image, and segment enumeration
+(which matches only `.log`) never mistakes it for a segment.
+
+Layout: a fixed 40-byte header, then `entry_count` 16-byte anchors, then a trailing CRC32C
+over every preceding byte. All little-endian.
+
+| offset | field | type | notes |
+|---|---|---|---|
+| `[0, 4)`   | `magic`        | `[u8;4]` | `b"TIDX"` |
+| `[4, 5)`   | `version`      | u8  | `1` (`TINDEX_VERSION`); an unrecognized version is treated as absent and rebuilt |
+| `[5, 6)`   | `checksum_algo`| u8  | `0x1` (CRC32C), matching the segment footer |
+| `[6, 8)`   | `reserved`     | u16 | zero |
+| `[8, 16)`  | `segment_id`   | u64 | cross-checked against the segment header/slot on load; a mismatch rebuilds |
+| `[16, 24)` | `base_offset`  | u64 | the segment's base offset (the first anchor's offset) |
+| `[24, 32)` | `record_count` | u64 | the sealed segment's record count (a staleness cross-check) |
+| `[32, 36)` | `stride`       | u32 | the record stride the anchors were built at (informational) |
+| `[36, 40)` | `entry_count`  | u32 | the number of anchor entries that follow |
+| `[40, 40 + 16*N)` | `anchors` | `[(u64, u64); N]` | `(offset, exclusive prefix-max timestamp)` per anchor, ascending by offset, prefix-max NON-DECREASING; one anchor per `stride` records |
+| `[40 + 16*N, +4)` | `crc` | u32 | CRC32C over all preceding bytes |
+
+The exclusive prefix-max (the max producer timestamp across every record STRICTLY BEFORE
+the anchor's offset) is what makes a seek exact versus a full scan even for NON-MONOTONIC
+producer timestamps: the anchor is a true lower bound, so a binary search plus a bounded
+forward scan lands on the same offset a full scan would. `decode` rejects (and the caller
+rebuilds) on any bad magic/version/CRC or structural violation, so a corrupt sidecar is
+never trusted.
+
 ---
 
 ## On-disk checkpoint models
@@ -632,7 +666,7 @@ numbers, planes, and purposes:
 |-----|-----------|-------------------|---------|
 | 22  | `ProduceConfirm` | server to client | Level-2 consumed-confirmation for an opted-in produce: `offset` (8B LE) + one-byte status (0 consumed, 1 timed-out, 2 dead-lettered) (#494, #497) |
 | 23  | `Fetch` | client to server | batched work-group pull; answered with the existing `Deliver`/advisory frames terminated by one `FlowEnd` (#464) |
-| 24  | `StreamFetch` | client to server | Tier-S offset-addressed window fetch (`start_offset` + caps) (#543) |
+| 24  | `StreamFetch` | client to server | Tier-S window fetch: `start_offset` + caps, plus the ADDITIVE optional `start_time_ms`/`end_time_ms` seek-by-time block appended inside `field_len` only when a time bound is present, so an offset-only fetch is byte-identical (#543, #772) |
 | 25  | `StreamCommit` | client to server | Tier-S cumulative cursor commit for a streaming group (#550) |
 | 26  | `DeliverBatch` | server to client | one contiguous Tier-S run as raw on-disk frame bytes; capability-gated (an old client always gets per-record `Deliver`s) (#541) |
 | 27  | `Raft` | peer only | embedded metadata-Raft message envelope; a client never sends or receives it (#578) |
@@ -1475,11 +1509,11 @@ this one suite.
 These models appear in the #137 draft (or the README/diagram) but are not present in the
 code today. They are aspirational and MUST NOT be treated as a current byte contract.
 
-- **OffsetIndexEntry / `.index` sidecar** and **TimeIndexEntry / `.tindex` sidecar.** The
-  draft's derived 8-byte offset index and 12-byte time index do not exist; there is no
-  index sidecar in the storage layer. The README still describes a "derived offset / time
-  index" as part of the model, but the offset index is rebuilt-on-read at the engine level
-  rather than persisted as a sidecar file.
+- **OffsetIndexEntry / `.index` sidecar.** The draft's derived 8-byte offset index is not
+  persisted; the offset seek index is the resident sparse `SegmentIndex` (#537), rebuilt
+  from the durable frames on reopen rather than written as a `.index` file. (The
+  `.tindex` TIME index sidecar, by contrast, IS now built — see `### .tindex
+  timestamp-index sidecar` above, #772.)
 - **CurrentPointer / `current` file.** The draft's minimal `active_segment_id,
   active_base_offset, last_flushed_offset, crc` pointer is not implemented; recovery scans
   the directory and per-segment checksums directly.
