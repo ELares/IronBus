@@ -3459,6 +3459,27 @@ impl NamedStream {
     }
 }
 
+/// The live state of one EPHEMERAL subscription intent (#771, V2-M1): the member set, plus — when
+/// a #565 open-set LRU eviction has dropped the group's in-memory state WHILE the intent is live —
+/// the PARKED committed offset, the in-memory "ephemeral ghost". The park is what closes the
+/// eviction x retention window: the group's checkpoint writes are deliberately suppressed (zero
+/// durable artifacts), so when `evict_named_stream` drops the stream's consumer state wholesale,
+/// NOTHING durable records the connected consumer's position — the parked offset stands in,
+/// pinning [`Engine::min_committed_offset_named`] exactly where the live cursor did, so a reap
+/// (produce / reopen / reload triggered) can never unlink records the still-connected subscriber
+/// has not seen. It also seeds the re-created group's cursor on the next poll (position survives a
+/// stream eviction within the subscription's lifetime — no spurious redelivery, no spurious
+/// `Truncated`). `None` while the group is live (the live cursor pins); taken (cleared) at
+/// re-creation; the whole entry — park included — is released by the last-member reap.
+#[derive(Debug, Default)]
+struct EphemeralSub {
+    /// The members (connections) currently holding this ephemeral subscription.
+    members: std::collections::BTreeSet<MemberId>,
+    /// The committed offset parked by a #565 stream eviction while the intent is live, or `None`
+    /// while the group is resident. Never durable, by definition.
+    parked_committed: Option<u64>,
+}
+
 pub struct Engine<F: Filesystem, C: Clock> {
     log: Log<F, C>,
     /// The per-NAMED-stream LOG substrate (#676, V2-M2-I2b): a [`StreamSet`] over the SAME data
@@ -3632,7 +3653,7 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// (belt-and-suspenders — the suppressed writers mean none should exist). Bounded by the
     /// `max_groups` cap times the live streams (each entry required a successful capped subscribe).
     /// In-memory only, by definition: an ephemeral group never survives a restart.
-    ephemeral_subs: BTreeMap<(StreamId, String), std::collections::BTreeSet<MemberId>>,
+    ephemeral_subs: BTreeMap<(StreamId, String), EphemeralSub>,
     counters: Counters,
     /// The count of durable SHARED-WAL records whose stored stream tag was absent or invalid at the
     /// LAST open's demux scan (#1130): deep corruption (or a foreign writer) that passed the frame
@@ -7934,8 +7955,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             if max_groups != 0 && named.groups.len() >= max_groups {
                 return Err(EngineError::TooManyGroups { max: max_groups });
             }
-            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above).
-            let mut fresh = WorkGroup::new(lease_config, now);
+            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above),
+            // RESUMING from any offset a #565 stream eviction PARKED for it
+            // (`EphemeralSub::parked_committed`): the subscription's position — and its retention
+            // pin, which the live cursor takes over from the park the moment the group is resident
+            // — survive the eviction. The take happens HERE, only when the group is actually
+            // created (the cap-reject path above must never clear the park and lose the pin);
+            // `ephemeral_subs` is a disjoint field from the `named` borrow. A durable creation
+            // (no intent) has no entry and takes nothing.
+            let parked = self
+                .ephemeral_subs
+                .get_mut(&(id.clone(), group.to_string()))
+                .and_then(|sub| sub.parked_committed.take());
+            let mut fresh = match parked {
+                Some(committed) => {
+                    WorkGroup::resume(AckCursor::resume(Offset::new(committed)), lease_config, now)
+                }
+                None => WorkGroup::new(lease_config, now),
+            };
             fresh.ephemeral = ephemeral_intent;
             named.groups.insert(group.to_string(), fresh);
         }
@@ -9035,6 +9072,27 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 .map_or(0, |g| g.cursor.committed().get());
             self.write_named_group_checkpoint(id, group, committed)?;
             self.write_named_group_attempts(id, group)?;
+        }
+        // 2.5) PARK each live EPHEMERAL group's committed offset in the intent registry (#771)
+        //    before the in-memory state is dropped — the in-memory "ephemeral ghost". The step-2
+        //    checkpoint writes above are deliberately SUPPRESSED for an ephemeral group (zero
+        //    durable artifacts), so without this nothing would record the CONNECTED consumer's
+        //    position: the next retention pass (a produce, a reopen, a config reload) would compute
+        //    `min_committed_offset_named` WITHOUT it and could unlink records the live subscriber
+        //    has not seen — silent loss for a live reader. The parked offset keeps pinning the
+        //    floor exactly where the live cursor did, until the group is re-created (the next poll
+        //    RESUMES from it and the live cursor takes over) or the last member departs (the reap
+        //    releases the whole entry). In-memory only, so the zero-durable-artifact contract is
+        //    untouched; a group with no live intent (already reaped mid-eviction) parks nothing.
+        if let Some(ns) = self.named_streams.get(id) {
+            for (name, g) in &ns.groups {
+                if !g.ephemeral {
+                    continue;
+                }
+                if let Some(sub) = self.ephemeral_subs.get_mut(&(id.clone(), name.clone())) {
+                    sub.parked_committed = Some(g.cursor.committed().get());
+                }
+            }
         }
         // 3) Drop the in-memory consumer state + DLQ handle (both are reconstructable from disk).
         self.named_streams.remove(id);
@@ -10623,8 +10681,29 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .streams
             .get(id)
             .map_or(0, |log| log.flushed_offset().get());
+        // PARKED ephemeral offsets also pin (#771), the in-memory twin of the durable ghost below:
+        // a #565 LRU eviction dropped a live ephemeral subscription's group state (its checkpoint
+        // writes are suppressed by design), so its position survives ONLY here. `parked_committed`
+        // is `Some` exactly while the group is intent-live but not resident (taken at re-creation,
+        // released with the entry at the last-member reap), so a reaped-forever ephemeral consumer
+        // can never wedge this floor. It MUST be read BEFORE the absent-`named_streams` early
+        // return: the eviction removes the whole `NamedStream` entry, and a stream reopened by a
+        // produce (no durable groups) stays absent from the map — exactly the states in which the
+        // park is the ONLY thing standing between the reap and the connected consumer's unread
+        // records. The default stream needs no twin: its groups are never dropped while their
+        // intent is live (the #277 sweep refuses ephemeral groups and the default stream is never
+        // LRU-evicted), so a parked default-stream offset cannot exist.
+        let parked = self
+            .ephemeral_subs
+            .iter()
+            .filter(|((sid, _), _)| sid == id)
+            .filter_map(|(_, sub)| sub.parked_committed);
         let Some(ns) = self.named_streams.get(id) else {
-            return head;
+            // No resident consumer state: only a parked ephemeral position (if any) can pin; with
+            // none, the floor is the head (a produce-only stream reaps freely, the #566 contract).
+            // A parked offset is never above the head it was parked under (and the head only
+            // grows), so the min stays a valid floor.
+            return parked.min().unwrap_or(head);
         };
         let live = ns
             .groups
@@ -10636,7 +10715,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .iter()
             .filter(|(name, _)| !ns.groups.contains_key(name.as_str()))
             .map(|(_, &committed)| committed);
-        live.chain(ghosts).min().unwrap_or(head)
+        live.chain(ghosts).chain(parked).min().unwrap_or(head)
     }
 
     /// Evicts (reclaims the in-memory state of) every NAMED work-group that has been IDLE past the
@@ -11861,6 +11940,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.ephemeral_subs
                 .entry((StreamId::default_stream(), group.to_string()))
                 .or_default()
+                .members
                 .insert(member);
             return Ok(());
         }
@@ -11900,6 +11980,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.ephemeral_subs
             .entry((StreamId::default_stream(), group.to_string()))
             .or_default()
+            .members
             .insert(member);
         Ok(())
     }
@@ -11949,6 +12030,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.ephemeral_subs
                 .entry((id, group.to_string()))
                 .or_default()
+                .members
                 .insert(member);
             return Ok(());
         }
@@ -11986,6 +12068,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.ephemeral_subs
             .entry((id, group.to_string()))
             .or_default()
+            .members
             .insert(member);
         Ok(())
     }
@@ -12027,13 +12110,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return;
         }
         let key = (id.clone(), group.to_string());
-        let Some(set) = self.ephemeral_subs.get_mut(&key) else {
+        let Some(sub) = self.ephemeral_subs.get_mut(&key) else {
             return;
         };
-        set.remove(&member);
-        if !set.is_empty() {
+        sub.members.remove(&member);
+        if !sub.members.is_empty() {
             return;
         }
+        // The last member left: the whole entry — any parked eviction-ghost offset included — is
+        // released, so the retention floor frees the moment the reap runs.
         self.ephemeral_subs.remove(&key);
         if id.is_default() {
             self.reap_ephemeral_group(group);
@@ -12873,14 +12958,32 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let ephemeral_intent = self.ephemeral_intent(&id, group);
         let named = self
             .named_streams
-            .entry(id)
+            // `id` stays alive past the entry borrow (#771): the intent-aware creation below reads
+            // (and clears) the parked eviction-ghost offset keyed by it.
+            .entry(id.clone())
             .or_insert_with(NamedStream::new);
         if !named.groups.contains_key(group) {
             if max_groups != 0 && named.groups.len() >= max_groups {
                 return Err(EngineError::TooManyGroups { max: max_groups });
             }
-            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above).
-            let mut fresh = WorkGroup::new(lease_config, now);
+            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above),
+            // RESUMING from any offset a #565 stream eviction PARKED for it
+            // (`EphemeralSub::parked_committed`): the subscription's position — and its retention
+            // pin, which the live cursor takes over from the park the moment the group is resident
+            // — survive the eviction. The take happens HERE, only when the group is actually
+            // created (the cap-reject path above must never clear the park and lose the pin);
+            // `ephemeral_subs` is a disjoint field from the `named` borrow. A durable creation
+            // (no intent) has no entry and takes nothing.
+            let parked = self
+                .ephemeral_subs
+                .get_mut(&(id.clone(), group.to_string()))
+                .and_then(|sub| sub.parked_committed.take());
+            let mut fresh = match parked {
+                Some(committed) => {
+                    WorkGroup::resume(AckCursor::resume(Offset::new(committed)), lease_config, now)
+                }
+                None => WorkGroup::new(lease_config, now),
+            };
             fresh.ephemeral = ephemeral_intent;
             named.groups.insert(group.to_string(), fresh);
         }
@@ -12950,14 +13053,32 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let ephemeral_intent = self.ephemeral_intent(&id, group);
         let named = self
             .named_streams
-            .entry(id)
+            // `id` stays alive past the entry borrow (#771): the intent-aware creation below reads
+            // (and clears) the parked eviction-ghost offset keyed by it.
+            .entry(id.clone())
             .or_insert_with(NamedStream::new);
         if !named.groups.contains_key(group) {
             if max_groups != 0 && named.groups.len() >= max_groups {
                 return Err(EngineError::TooManyGroups { max: max_groups });
             }
-            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above).
-            let mut fresh = WorkGroup::new(lease_config, now);
+            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above),
+            // RESUMING from any offset a #565 stream eviction PARKED for it
+            // (`EphemeralSub::parked_committed`): the subscription's position — and its retention
+            // pin, which the live cursor takes over from the park the moment the group is resident
+            // — survive the eviction. The take happens HERE, only when the group is actually
+            // created (the cap-reject path above must never clear the park and lose the pin);
+            // `ephemeral_subs` is a disjoint field from the `named` borrow. A durable creation
+            // (no intent) has no entry and takes nothing.
+            let parked = self
+                .ephemeral_subs
+                .get_mut(&(id.clone(), group.to_string()))
+                .and_then(|sub| sub.parked_committed.take());
+            let mut fresh = match parked {
+                Some(committed) => {
+                    WorkGroup::resume(AckCursor::resume(Offset::new(committed)), lease_config, now)
+                }
+                None => WorkGroup::new(lease_config, now),
+            };
             fresh.ephemeral = ephemeral_intent;
             named.groups.insert(group.to_string(), fresh);
         }
@@ -13096,14 +13217,32 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let ephemeral_intent = self.ephemeral_intent(&id, group);
         let named = self
             .named_streams
-            .entry(id)
+            // `id` stays alive past the entry borrow (#771): the intent-aware creation below reads
+            // (and clears) the parked eviction-ghost offset keyed by it.
+            .entry(id.clone())
             .or_insert_with(NamedStream::new);
         if !named.groups.contains_key(group) {
             if max_groups != 0 && named.groups.len() >= max_groups {
                 return Err(EngineError::TooManyGroups { max: max_groups });
             }
-            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above).
-            let mut fresh = WorkGroup::new(lease_config, now);
+            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above),
+            // RESUMING from any offset a #565 stream eviction PARKED for it
+            // (`EphemeralSub::parked_committed`): the subscription's position — and its retention
+            // pin, which the live cursor takes over from the park the moment the group is resident
+            // — survive the eviction. The take happens HERE, only when the group is actually
+            // created (the cap-reject path above must never clear the park and lose the pin);
+            // `ephemeral_subs` is a disjoint field from the `named` borrow. A durable creation
+            // (no intent) has no entry and takes nothing.
+            let parked = self
+                .ephemeral_subs
+                .get_mut(&(id.clone(), group.to_string()))
+                .and_then(|sub| sub.parked_committed.take());
+            let mut fresh = match parked {
+                Some(committed) => {
+                    WorkGroup::resume(AckCursor::resume(Offset::new(committed)), lease_config, now)
+                }
+                None => WorkGroup::new(lease_config, now),
+            };
             fresh.ephemeral = ephemeral_intent;
             named.groups.insert(group.to_string(), fresh);
         }
@@ -13184,14 +13323,32 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let ephemeral_intent = self.ephemeral_intent(&id, group);
         let named = self
             .named_streams
-            .entry(id)
+            // `id` stays alive past the entry borrow (#771): the intent-aware creation below reads
+            // (and clears) the parked eviction-ghost offset keyed by it.
+            .entry(id.clone())
             .or_insert_with(NamedStream::new);
         if !named.groups.contains_key(group) {
             if max_groups != 0 && named.groups.len() >= max_groups {
                 return Err(EngineError::TooManyGroups { max: max_groups });
             }
-            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above).
-            let mut fresh = WorkGroup::new(lease_config, now);
+            // #771: honor a live ephemeral intent on (re-)creation (see the intent read above),
+            // RESUMING from any offset a #565 stream eviction PARKED for it
+            // (`EphemeralSub::parked_committed`): the subscription's position — and its retention
+            // pin, which the live cursor takes over from the park the moment the group is resident
+            // — survive the eviction. The take happens HERE, only when the group is actually
+            // created (the cap-reject path above must never clear the park and lose the pin);
+            // `ephemeral_subs` is a disjoint field from the `named` borrow. A durable creation
+            // (no intent) has no entry and takes nothing.
+            let parked = self
+                .ephemeral_subs
+                .get_mut(&(id.clone(), group.to_string()))
+                .and_then(|sub| sub.parked_committed.take());
+            let mut fresh = match parked {
+                Some(committed) => {
+                    WorkGroup::resume(AckCursor::resume(Offset::new(committed)), lease_config, now)
+                }
+                None => WorkGroup::new(lease_config, now),
+            };
             fresh.ephemeral = ephemeral_intent;
             named.groups.insert(group.to_string(), fresh);
         }
@@ -30018,9 +30175,10 @@ mod tests {
             !before.iter().any(|f| *f == group_checkpoint_name("eph")),
             "the eviction flush wrote nothing for the ephemeral group"
         );
-        // The next poll reopens the stream and re-creates the group: it MUST come back ephemeral.
+        // The next poll reopens the stream and re-creates the group: it MUST come back ephemeral,
+        // RESUMED from the parked eviction-ghost offset (0 here — nothing was consumed yet).
         let d = message(e.poll_in_stream("alpha", "eph", 0).unwrap());
-        assert_eq!(d.offset.get(), 0, "position is connection-lifetime state");
+        assert_eq!(d.offset.get(), 0, "resumed at the parked position");
         assert_eq!(e.ack_in_stream("alpha", "eph", &d.token), AckResult::Acked);
         assert!(
             e.is_ephemeral_in_stream("alpha", "eph"),
@@ -30055,6 +30213,99 @@ mod tests {
         assert!(
             !e.log.filesystem().exists(&planted).unwrap(),
             "the reap deletes the stray file"
+        );
+    }
+
+    #[test]
+    fn a_live_ephemeral_consumer_keeps_pinning_retention_across_a_stream_lru_eviction() {
+        // [B1] The #565 x #566 x #771 window: a live ephemeral consumer BEHIND the head pins the
+        // retention floor through its LIVE cursor only (its checkpoint writes are suppressed by
+        // design — zero durable artifacts). A #565 LRU eviction drops that cursor with the
+        // stream's whole consumer state, so WITHOUT the parked eviction-ghost
+        // (`EphemeralSub::parked_committed`) the next retention pass — a produce, the reopen
+        // reap, or a config reload — would compute `min_committed_offset_named` without it and
+        // unlink records the still-CONNECTED subscriber has never seen: silent loss for a live
+        // reader, contradicting the documented "a connected ephemeral group pins the floor
+        // exactly like any live reader". (Mutation-verified: disabling the park fails the
+        // floor assertion below with the floor at the head.)
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "A", &[0xab; 16]);
+        let one = probe.streams.get(&sid("A")).unwrap().durable_record_bytes();
+
+        // Retention bound: 4 records' worth; hot-set cap: ONE resident stream.
+        let mut e = open(config_named_retention_lru(4 * one, 1));
+        let m = MemberId::new(11);
+        // Declare A with its first record, subscribe (the group pins at 0 — a consume never
+        // creates a stream, so the declare must precede it), THEN grow the log far past the
+        // bound: the live ephemeral cursor is what holds every unconsumed record.
+        produce_named(&mut e, "A", &[0xab; 16]);
+        e.subscribe_ephemeral_in_stream("A", "eph", m).unwrap();
+        for _ in 0..23 {
+            produce_named(&mut e, "A", &[0xab; 16]);
+        }
+        // Consume + ack the first 3 only: cursor k = 3, far below the head (24).
+        let mut now = 0u64;
+        for expect in 0..3u64 {
+            let d = message(e.poll_in_stream("A", "eph", now).unwrap());
+            assert_eq!(d.offset.get(), expect);
+            assert_eq!(e.ack_in_stream("A", "eph", &d.token), AckResult::Acked);
+            now += 1;
+        }
+        // Force A's eviction: opening B exceeds max_open_streams = 1. The eviction flush writes
+        // NOTHING for the ephemeral group (zero artifacts) but PARKS its committed offset in the
+        // intent registry.
+        produce_named(&mut e, "B", &[0xcd; 16]);
+        assert!(
+            !e.is_named_stream_resident("A"),
+            "A was evicted by the hot-set LRU"
+        );
+        assert!(
+            !stream_files(&e, "A")
+                .iter()
+                .any(|f| *f == group_checkpoint_name("eph")),
+            "the eviction flush left no durable artifact for the ephemeral group"
+        );
+        assert_eq!(
+            e.min_committed_offset_named(&sid("A")),
+            3,
+            "the parked eviction-ghost pins the floor at the evicted cursor"
+        );
+        // Trigger retention passes with A's bound (4 records) tripped hard: producing to A
+        // reopens it (the reopen reap) and each produce runs the per-stream reap. The parked
+        // offset must floor them all.
+        for _ in 0..6 {
+            produce_named(&mut e, "A", &[0xab; 16]);
+        }
+        let earliest = e.streams.get(&sid("A")).unwrap().earliest_offset().get();
+        assert!(
+            earliest <= 3,
+            "records k..head survived every reap while the intent is live (earliest = \
+             {earliest}, k = 3)"
+        );
+        // The consumer's next poll RESUMES at k: the stream is already resident, the group is
+        // re-created from the parked offset — no spurious redelivery of 0..3, and no Truncated
+        // (nothing it needs was reaped).
+        let d = message(e.poll_in_stream("A", "eph", now).unwrap());
+        assert_eq!(d.offset.get(), 3, "resumed exactly at the parked position");
+        assert!(e.is_ephemeral_in_stream("A", "eph"), "still ephemeral");
+        assert_eq!(
+            e.counters().truncations,
+            0,
+            "a pinned live consumer is never truncated by the eviction window"
+        );
+        assert_eq!(e.ack_in_stream("A", "eph", &d.token), AckResult::Acked);
+        // The last member departs: the reap releases the intent (parked offset included), the
+        // floor frees, and the next retention pass reclaims the backlog.
+        e.unsubscribe_in_stream("A", "eph", m);
+        assert!(e.ephemeral_subs.is_empty(), "intent + park released");
+        for _ in 0..2 {
+            produce_named(&mut e, "A", &[0xab; 16]);
+        }
+        let earliest = e.streams.get(&sid("A")).unwrap().earliest_offset().get();
+        assert!(
+            earliest > 3,
+            "with the intent gone the floor released and reaping proceeded (earliest = \
+             {earliest})"
         );
     }
 }

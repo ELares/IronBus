@@ -947,7 +947,11 @@ counterpart for a throwaway/monitoring reader that should never pin broker state
   cadence: the interval gate, the #547 redelivery-driven attempts trigger, the clean-disconnect
   flush, the shutdown `checkpoint_all_groups`, and the #565 stream-eviction flush. The group's
   whole lifecycle leaves the data directory's file set untouched. (Dead-lettering is unchanged:
-  a DLQ capture is MESSAGE data, deliberately durable, not group state.)
+  a DLQ capture is MESSAGE data, deliberately durable, not group state. One churn vector to know:
+  the per-group DLQ exact-offset dedup set is in-memory per group incarnation, so an ephemeral
+  group that repeatedly reaps and re-subscribes in one long-lived process can dead-letter the
+  SAME poison once per incarnation — bounded per-incarnation, at-least-once-legal duplicates in
+  the DLQ, never a lost capture.)
 - **Reap on last departure.** The engine removes the in-memory group (cursor, leases, modes),
   releases its retention-floor entries (no ghost), frees its DLQ dedup slots, and —
   belt-and-suspenders — deletes any stray `cursor-<hex>.ckpt`/`attempts-<hex>.ckpt` under the
@@ -967,6 +971,12 @@ counterpart for a throwaway/monitoring reader that should never pin broker state
   consumer); a reaped one pins NOTHING — no live entry, no ghost, no checkpoint — so an
   ephemeral consumer can never wedge retention after it is gone. This is deliberately asymmetric
   with durable groups, whose checkpoints (and #432 ghosts) keep pinning while disconnected.
+  The pin also survives a #565 open-set LRU eviction of the stream: the eviction PARKS the
+  ephemeral group's committed offset in the in-memory intent registry (the "ephemeral ghost" —
+  its checkpoint writes are suppressed, so nothing durable could stand in), the floor reads the
+  parked offset until the group is re-created, and the next poll RESUMES the group from it (no
+  spurious redelivery, no spurious `Truncated`). The park is taken at re-creation and released
+  with the intent at the last-member reap, so the no-wedge property holds throughout.
 - **Bounds and mode conflicts.** An ephemeral group counts against `max_groups` (per stream,
   like any group; the reap frees the slot immediately). A name can be ephemeral or durable,
   never both: an ephemeral subscribe onto a live durable group / a durable checkpoint / a ghost
