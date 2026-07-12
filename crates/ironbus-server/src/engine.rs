@@ -1288,6 +1288,78 @@ pub struct StreamRawBatch {
     pub next_offset: Offset,
 }
 
+/// A live, spliceable file descriptor source for the Linux `sendfile(2)` zero-copy Tier-S consume path
+/// (#1034 / #658): a type-ERASED holder that keeps the segment reader (and thus its fd) OPEN for the
+/// whole splice, exposing only the raw descriptor the `sendfile` loop reads from. Erasing the concrete
+/// [`ironbus_storage::log::FdRun`] behind this trait keeps the filesystem type parameter out of the
+/// session/server writer types — a `Box<dyn SpliceSource>` crosses the sans-IO boundary carrying just the
+/// fd plus the byte range (in the [`StreamFdBatch::Fd`] fields). The `Send` supertrait lets the holder
+/// return from the append actor ([`crate::actor::EngineAccess::with`]) back to the connection thread that
+/// performs the splice.
+///
+/// Linux-only: the whole zero-copy WIRING is gated on `target_os = "linux"` (the `sendfile` syscall);
+/// every other target takes the copy path and never constructs one of these. The underlying storage fd
+/// primitives are `cfg(unix)`, so they still compile (and are unit-tested) on macOS — only the wiring is
+/// Linux-gated.
+#[cfg(target_os = "linux")]
+pub trait SpliceSource: Send {
+    /// The raw descriptor to `sendfile(2)` from. Valid for as long as `self` is alive (the holder owns
+    /// the segment reader that owns the fd), so the caller MUST keep the `Box<dyn SpliceSource>` alive
+    /// across the ENTIRE splice — the kernel reads the fd for the whole `sendfile` loop.
+    fn splice_raw_fd(&self) -> std::os::fd::RawFd;
+}
+
+#[cfg(target_os = "linux")]
+impl<Fl> SpliceSource for ironbus_storage::log::FdRun<Fl>
+where
+    Fl: ironbus_storage::io::RandomAccessFile + 'static,
+{
+    fn splice_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        // `run()` re-borrows the (still-open) splice fd from the reader this `FdRun` OWNS; the returned
+        // `RawFd` is valid exactly while `self` lives, which the `SpliceDirective` holding this box
+        // guarantees across the whole `sendfile` loop (the retire-race fd-lifetime guarantee: a fresh
+        // owned reader, so a concurrent compaction retire cannot close it — the fd stays open until the
+        // box drops, after the splice completes).
+        self.run().fd.as_raw_fd()
+    }
+}
+
+/// The result of [`Engine::stream_fetch_fd_in_stream`] (#1034 / #658): EITHER an fd run to `sendfile(2)`
+/// splice, OR a materialized copy-path batch when the zero-copy path was not available for the window
+/// (at-rest encryption, a compacted/remote slot, a no-fd backend, or a not-yet-indexed active tail — the
+/// SAME fail-closed reroutes [`ironbus_storage::log::Log::read_range_fd_range`] applies). The `Fd` variant
+/// is type-ERASED (its holder is a `Box<dyn SpliceSource>`), so the filesystem type never enters the
+/// session/server writer types; the `Copy` variant carries the ordinary [`StreamRawBatch`] so the caller
+/// serves it byte-for-byte as [`Engine::stream_fetch_raw_in_stream`] would.
+#[cfg(target_os = "linux")]
+pub enum StreamFdBatch {
+    /// The zero-copy path: splice `[file_offset, file_offset + len)` from `holder`'s fd as the
+    /// `DeliverBatch` body (`record_count` whole frames from `first_offset`), THEN deliver `tail`
+    /// per-record. `next_offset` is the consumer's resume point across both.
+    Fd {
+        /// Keeps the segment fd open for the whole splice; exposes the raw descriptor via
+        /// [`SpliceSource::splice_raw_fd`].
+        holder: Box<dyn SpliceSource>,
+        /// The absolute byte offset in the segment file where the spliced run's first frame begins.
+        file_offset: u64,
+        /// The spliced run's on-disk byte length: exactly `record_count` whole frames, verbatim.
+        len: usize,
+        /// The log offset of the FIRST frame in the spliced range.
+        first_offset: Offset,
+        /// How many complete frames the spliced range carries.
+        record_count: u64,
+        /// The ACTIVE-tail remainder past the sealed prefix, delivered as ordinary per-record `Deliver`s
+        /// (the raw fd read serves only the sealed, flushed prefix), contiguous with the splice.
+        tail: Vec<OwnedRecord>,
+        /// The consumer's resume offset: one past the last record across BOTH the splice and the tail.
+        next_offset: Offset,
+    },
+    /// The copy path: the zero-copy path was unavailable for this window; serve this materialized batch
+    /// exactly as [`Engine::stream_fetch_raw_in_stream`] does (byte-identical wire).
+    Copy(StreamRawBatch),
+}
+
 /// The outcome of [`Engine::progress`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProgressResult {
@@ -14856,6 +14928,229 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             tail,
             next_offset,
         })
+    }
+
+    /// The Linux `sendfile(2)` zero-copy sibling of [`Engine::stream_fetch_raw_in`] (#1034 / #658):
+    /// serves the contiguous SEALED prefix as an FD RUN — a borrowed segment descriptor plus the on-disk
+    /// byte range to splice — instead of the run's bytes in userspace, so the broker never reads the
+    /// record bodies into RAM (the kernel splices them straight from the page cache to the socket). The
+    /// group-mode guard, activity refresh, PAUSE gate, ACTIVE-tail materialization, and `delivered`
+    /// counter accounting are IDENTICAL to `stream_fetch_raw_in`, so the two are interchangeable on the
+    /// wire from the engine's view.
+    ///
+    /// FAIL-CLOSES to the copy path (a materialized [`StreamRawBatch`] in [`StreamFdBatch::Copy`]) whenever
+    /// the fd path is not available for the window — at-rest encryption, a compacted (v2 sparse) or remote
+    /// (offloaded) slot, a no-fd backend (memory / `O_DIRECT`), or a not-yet-indexed active tail — reusing
+    /// the exact fail-closed reroutes [`ironbus_storage::log::Log::read_range_fd_range`] already applies. On
+    /// the fd path the returned [`StreamFdBatch::Fd`] holds the segment reader ALIVE (via its
+    /// `Box<dyn SpliceSource>` holder) so a concurrent compaction retire cannot close the fd mid-splice.
+    ///
+    /// # Errors
+    /// [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming group (the same wrong-mode
+    /// guard as `stream_fetch_raw_in`), or a storage error reading the durable prefix.
+    #[cfg(target_os = "linux")]
+    pub fn stream_fetch_fd_in(
+        &mut self,
+        group: &str,
+        _member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamFdBatch, EngineError>
+    where
+        <F as Filesystem>::File: 'static,
+    {
+        // The wrong-mode guard, activity refresh, and PAUSE gate are IDENTICAL to `stream_fetch_raw_in`.
+        if !self.is_streaming_in(group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        let now = self.log.now_monotonic();
+        if let Some(g) = self.groups.get_mut(group) {
+            g.last_activity = now;
+            g.touched = true;
+            if g.pause_active(now) {
+                return Ok(StreamFdBatch::Copy(StreamRawBatch {
+                    raw: RawByteRun {
+                        bytes: bytes::Bytes::new(),
+                        first_offset: start_offset,
+                        record_count: 0,
+                        next_offset: start_offset,
+                    },
+                    tail: Vec::new(),
+                    next_offset: start_offset,
+                }));
+            }
+        }
+        // Try the zero-copy fd path first. `read_range_fd_range` fail-closes (returns `None`) for every
+        // case the copy path must handle, so a `Some` here is a genuine spliceable sealed run.
+        let (fd_run, tail_from) =
+            self.log
+                .read_range_fd_range(start_offset, max_records, max_bytes)?;
+        if let Some(fd_run) = fd_run {
+            // ACTIVE-tail remainder, bounded exactly as `stream_fetch_raw_in` bounds it.
+            let fd_count = usize::try_from(fd_run.record_count()).unwrap_or(usize::MAX);
+            let tail = match tail_from {
+                Some(from) if fd_count < max_records => {
+                    self.log
+                        .read_range(from, max_records - fd_count, max_bytes)?
+                }
+                _ => Vec::new(),
+            };
+            let next_offset = tail.last().map_or(fd_run.next_offset(), |r| {
+                r.offset.checked_next().unwrap_or(r.offset)
+            });
+            let total = fd_run.record_count().saturating_add(tail.len() as u64);
+            let file_offset = fd_run.file_offset();
+            let len = fd_run.len();
+            let first_offset = fd_run.first_offset();
+            let record_count = fd_run.record_count();
+            // `self.log` borrow ended above (the tail read was its last use); bump the counter now.
+            self.counters.delivered = self.counters.delivered.saturating_add(total);
+            return Ok(StreamFdBatch::Fd {
+                holder: Box::new(fd_run),
+                file_offset,
+                len,
+                first_offset,
+                record_count,
+                tail,
+                next_offset,
+            });
+        }
+        // Copy fallback: byte-for-byte the body of `stream_fetch_raw_in` post-guard.
+        let (raw, tail_from) = self
+            .log
+            .read_range_raw(start_offset, max_records, max_bytes)?;
+        let raw_count = usize::try_from(raw.record_count).unwrap_or(usize::MAX);
+        let tail = match tail_from {
+            Some(from) if raw_count < max_records => {
+                self.log
+                    .read_range(from, max_records - raw_count, max_bytes)?
+            }
+            _ => Vec::new(),
+        };
+        let next_offset = tail.last().map_or(raw.next_offset, |r| {
+            r.offset.checked_next().unwrap_or(r.offset)
+        });
+        let total = raw.record_count.saturating_add(tail.len() as u64);
+        self.counters.delivered = self.counters.delivered.saturating_add(total);
+        Ok(StreamFdBatch::Copy(StreamRawBatch {
+            raw,
+            tail,
+            next_offset,
+        }))
+    }
+
+    /// The NAMED-stream twin of [`Engine::stream_fetch_fd_in`] (#1034 / #658): the `sendfile(2)` zero-copy
+    /// sibling of [`Engine::stream_fetch_raw_in_stream`]. Routes a named stream to its OWN per-stream log's
+    /// [`ironbus_storage::log::Log::read_range_fd_range`], with the IDENTICAL existence + wrong-mode guard,
+    /// activity refresh, PAUSE gate, and `delivered` accounting as `stream_fetch_raw_in_stream`. The default
+    /// stream (`""`) routes to [`Engine::stream_fetch_fd_in`] BYTE-FOR-BYTE. FAIL-CLOSES to
+    /// [`StreamFdBatch::Copy`] for every non-spliceable window, exactly as `stream_fetch_fd_in`.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed name, [`EngineError::UnknownStream`] for a
+    /// never-declared stream, [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming group
+    /// of `stream`, or a storage error reading the durable prefix.
+    #[cfg(target_os = "linux")]
+    pub fn stream_fetch_fd_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamFdBatch, EngineError>
+    where
+        <F as Filesystem>::File: 'static,
+    {
+        if stream.is_empty() {
+            return self.stream_fetch_fd_in(group, member, start_offset, max_records, max_bytes);
+        }
+        let id = StreamId::named(stream)?;
+        // Mode-aware existence (#597), identical to `stream_fetch_raw_in_stream`.
+        let resident = if self.shared_wal.is_some() {
+            self.known_named_streams.contains(&id)
+        } else {
+            self.streams.get(&id).is_some()
+        };
+        if !resident {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        }
+        if !self.is_streaming_in_stream(stream, group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        if let Some(g) = self.named_group_mut(&id, group) {
+            g.last_activity = now;
+            g.touched = true;
+            if g.pause_active(now) {
+                return Ok(StreamFdBatch::Copy(StreamRawBatch {
+                    raw: RawByteRun {
+                        bytes: bytes::Bytes::new(),
+                        first_offset: start_offset,
+                        record_count: 0,
+                        next_offset: start_offset,
+                    },
+                    tail: Vec::new(),
+                    next_offset: start_offset,
+                }));
+            }
+        }
+        let Some(log) = self.streams.get(&id) else {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        };
+        let (fd_run, tail_from) = log.read_range_fd_range(start_offset, max_records, max_bytes)?;
+        if let Some(fd_run) = fd_run {
+            let fd_count = usize::try_from(fd_run.record_count()).unwrap_or(usize::MAX);
+            let tail = match tail_from {
+                Some(from) if fd_count < max_records => {
+                    log.read_range(from, max_records - fd_count, max_bytes)?
+                }
+                _ => Vec::new(),
+            };
+            let next_offset = tail.last().map_or(fd_run.next_offset(), |r| {
+                r.offset.checked_next().unwrap_or(r.offset)
+            });
+            let total = fd_run.record_count().saturating_add(tail.len() as u64);
+            let file_offset = fd_run.file_offset();
+            let len = fd_run.len();
+            let first_offset = fd_run.first_offset();
+            let record_count = fd_run.record_count();
+            // `log` borrow (of `self.streams`) ended above; bump the counter now.
+            self.counters.delivered = self.counters.delivered.saturating_add(total);
+            return Ok(StreamFdBatch::Fd {
+                holder: Box::new(fd_run),
+                file_offset,
+                len,
+                first_offset,
+                record_count,
+                tail,
+                next_offset,
+            });
+        }
+        let (raw, tail_from) = log.read_range_raw(start_offset, max_records, max_bytes)?;
+        let raw_count = usize::try_from(raw.record_count).unwrap_or(usize::MAX);
+        let tail = match tail_from {
+            Some(from) if raw_count < max_records => {
+                log.read_range(from, max_records - raw_count, max_bytes)?
+            }
+            _ => Vec::new(),
+        };
+        let next_offset = tail.last().map_or(raw.next_offset, |r| {
+            r.offset.checked_next().unwrap_or(r.offset)
+        });
+        let total = raw.record_count.saturating_add(tail.len() as u64);
+        self.counters.delivered = self.counters.delivered.saturating_add(total);
+        Ok(StreamFdBatch::Copy(StreamRawBatch {
+            raw,
+            tail,
+            next_offset,
+        }))
     }
 
     /// Commits a Tier-S STREAMING group's cursor up to the EXCLUSIVE offset `up_to` (#544, M1-I7): the
