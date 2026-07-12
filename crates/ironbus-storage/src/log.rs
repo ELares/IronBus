@@ -24,7 +24,8 @@ use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::{BodyChecksums, RecordView};
 use ironbus_core::format::{
-    RECORD_HEADER_LEN, RECORD_TRAILER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
+    RECORD_HEADER_LEN, RECORD_TRAILER_LEN, SEGMENT_FLAG_ENCRYPTED, SEGMENT_FOOTER_LEN,
+    SEGMENT_HEADER_LEN,
 };
 use ironbus_core::segment::SegmentHeader;
 use ironbus_core::types::{Offset, RecordFlags, Seq};
@@ -748,6 +749,86 @@ impl<F: Filesystem> std::fmt::Debug for SealedReaderCache<F> {
 
 /// A single durable, ordered log backed by one data directory of segment files.
 ///
+/// The at-rest AEAD encryption context threaded LIVE through a [`Log`] (#780 phase 2). It bundles the
+/// write-side [`SegmentCrypto`](crate::crypto::SegmentCrypto) — a configured key means NEW active
+/// segments are created encrypted and every append (including after a crash/resume) AEAD-encrypts in
+/// place — and the read-side [`KeyRing`](crate::crypto::KeyRing) for decrypt-on-read and recovery of an
+/// encrypted broker.
+///
+/// It is ALWAYS a field of [`Log`] (a zero-sized, `None`-equivalent value in a build without the
+/// `encryption` feature, and the DEFAULT everywhere no key is configured), so the plaintext behavior is
+/// byte-for-byte unchanged: [`Log::open`] threads [`AtRestCrypto::default`], and only the opt-in
+/// [`Log::open_encrypted`] populates it. Riding on the `Log` (rather than only on the `Copy`
+/// `LogConfig`) is deliberate and safety-critical: every segment create / resume / read site inside the
+/// log is a `self`-method, so once the log carries the context, no code path can construct a segment
+/// that has the log's config but NOT its crypto — the structural guard against a resume-without-crypto
+/// plaintext leak.
+#[derive(Clone, Default, Debug)]
+pub struct AtRestCrypto {
+    /// The write-side context. When `Some`, a new active segment is created via
+    /// [`SegmentWriter::create_encrypted`] and every append AEAD-encrypts under the deterministic
+    /// `segment_id || record_ordinal` nonce; `None` is today's plaintext write path.
+    #[cfg(feature = "encryption")]
+    crypto: Option<Arc<crate::crypto::SegmentCrypto>>,
+    /// The read-side key ring. When `Some`, an encrypted segment is read via
+    /// [`SegmentReader::open_with_keyring`] + `scan_decrypted` (decrypt-on-read); a missing key / tag
+    /// mismatch is the reported [`StorageError::Decrypt`] class, never a crash or garbage.
+    #[cfg(feature = "encryption")]
+    keyring: Option<Arc<crate::crypto::KeyRing>>,
+}
+
+impl AtRestCrypto {
+    /// Builds the at-rest context from a write key (`crypto`, `Some` => new segments encrypt) and a
+    /// read key ring (`keyring`, `Some` => encrypted segments decrypt on read). Behind the `encryption`
+    /// feature; the plaintext path uses [`AtRestCrypto::default`].
+    #[cfg(feature = "encryption")]
+    #[must_use]
+    pub fn new(
+        crypto: Option<Arc<crate::crypto::SegmentCrypto>>,
+        keyring: Option<Arc<crate::crypto::KeyRing>>,
+    ) -> AtRestCrypto {
+        AtRestCrypto { crypto, keyring }
+    }
+
+    /// Whether an at-rest WRITE key is configured, so new segments are created encrypted and appends
+    /// encrypt. Always `false` in a build without the `encryption` feature.
+    #[must_use]
+    #[allow(clippy::unused_self)] // uses `self` only under the `encryption` feature
+    fn writes_encrypted(&self) -> bool {
+        #[cfg(feature = "encryption")]
+        {
+            self.crypto.is_some()
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            false
+        }
+    }
+
+    /// Whether a read key ring is loaded (so an encrypted segment can be decrypted on read). Always
+    /// `false` without the `encryption` feature.
+    #[must_use]
+    #[allow(clippy::unused_self)] // uses `self` only under the `encryption` feature
+    fn reads_encrypted(&self) -> bool {
+        #[cfg(feature = "encryption")]
+        {
+            self.keyring.is_some()
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            false
+        }
+    }
+
+    /// Whether this log participates in at-rest encryption at all (a write key and/or a read ring): its
+    /// segments are ciphertext, so reads route through the decrypt path and the zero-copy raw plane is
+    /// refused. Always `false` without the `encryption` feature.
+    #[must_use]
+    fn is_encrypted(&self) -> bool {
+        self.writes_encrypted() || self.reads_encrypted()
+    }
+}
+
 /// One active segment receives appends; sealed predecessors hold the older records.
 /// Offsets and sequence numbers are monotonic and never reused. The log is
 /// single-writer: one owner appends. The concurrent append actor and lock-free readers
@@ -757,6 +838,11 @@ pub struct Log<F: Filesystem, C: Clock> {
     fs: F,
     clock: C,
     config: LogConfig,
+    /// The LIVE at-rest AEAD encryption context (#780 phase 2): the write key that encrypts new/resumed
+    /// active segments and the read ring that decrypts on read. [`AtRestCrypto::default`] (no key) is
+    /// the plaintext default, byte-for-byte unchanged. Always present so every internal segment
+    /// create/resume/read site consults it — the structural no-plaintext-leak guard.
+    at_rest: AtRestCrypto,
     /// The active segment writer. `None` only after a fatal error froze the writer.
     active: Option<SegmentWriter<F::File>>,
     active_id: u64,
@@ -1237,6 +1323,55 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// # Errors
     /// Returns [`StorageError`] on an IO error or a structurally invalid segment.
     pub fn open(fs: F, clock: C, config: LogConfig) -> Result<Log<F, C>, StorageError> {
+        // The plaintext path: no at-rest crypto. Byte-for-byte the historical open.
+        Self::open_inner(fs, clock, config, AtRestCrypto::default())
+    }
+
+    /// Opens the log with LIVE at-rest AEAD encryption (#780 phase 2): a configured `crypto` means NEW
+    /// active segments are created encrypted and every append (including after a crash/resume)
+    /// AEAD-encrypts in place; a configured `keyring` decrypts encrypted segments on read and recovery.
+    /// Passing `AtRestCrypto::default()` is byte-for-byte [`Log::open`].
+    ///
+    /// FAIL-CLOSED cross-checks at open guard the catastrophic misconfigurations: if the recovered
+    /// active segment is encrypted but no write key is configured, or is plaintext but a key IS
+    /// configured, the open is refused with a typed [`StorageError`] rather than silently leaking
+    /// plaintext into ciphertext or producing a mixed segment.
+    ///
+    /// # Errors
+    /// As [`Log::open`], plus [`StorageError::EncryptedSegmentNoKey`] /
+    /// [`StorageError::PlaintextSegmentWithKey`] on an at-rest config that does not match the recovered
+    /// active segment.
+    #[cfg(feature = "encryption")]
+    pub fn open_encrypted(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+        crypto: Option<Arc<crate::crypto::SegmentCrypto>>,
+        keyring: Option<Arc<crate::crypto::KeyRing>>,
+    ) -> Result<Log<F, C>, StorageError> {
+        Self::open_inner(fs, clock, config, AtRestCrypto::new(crypto, keyring))
+    }
+
+    /// Opens a log with a pre-built [`AtRestCrypto`] context — the seam [`crate::streamset::StreamSet`]
+    /// uses to open EVERY stream's log with the SAME at-rest crypto (#780 phase 2), so a named stream
+    /// is encrypted exactly like the default stream. `AtRestCrypto::default()` is the plaintext path.
+    pub(crate) fn open_with_at_rest(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+        at_rest: AtRestCrypto,
+    ) -> Result<Log<F, C>, StorageError> {
+        Self::open_inner(fs, clock, config, at_rest)
+    }
+
+    /// Opens the log with the given at-rest context (`AtRestCrypto::default()` for the plaintext path).
+    /// The shared body behind [`Log::open`] and [`Log::open_encrypted`].
+    fn open_inner(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+        at_rest: AtRestCrypto,
+    ) -> Result<Log<F, C>, StorageError> {
         // Check (and, on a pre-marker dir, durably write) the data-directory LAYOUT version marker
         // BEFORE any recovery, so a FUTURE layout is refused fail-closed before its unknown-shaped
         // contents are interpreted (#562). An absent or torn/corrupt marker recovers as layout v1
@@ -1304,6 +1439,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     fs,
                     clock,
                     config,
+                    // Set the at-rest context BEFORE `start_segment` below, so a FRESH encrypted log's
+                    // segment 0 is created encrypted (`start_segment` reads `self.at_rest`).
+                    at_rest,
                     active: None,
                     active_id: FIRST_SEGMENT_ID,
                     next_offset: Offset::ZERO,
@@ -1364,9 +1502,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 // existing v1 recovery runs UNCHANGED, so a non-compacted log's recovery is
                 // byte-for-byte the same code path it always was.
                 if crate::compaction::directory_has_compacted_segment(&fs)? {
-                    Self::recover_with_compaction(fs, clock, config, &ids)?
+                    Self::recover_with_compaction(fs, clock, config, at_rest, &ids)?
                 } else {
-                    Self::recover(fs, clock, config, &ids, last_id)?
+                    Self::recover(fs, clock, config, at_rest, &ids, last_id)?
                 }
             }
         };
@@ -1393,7 +1531,67 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // those ids. Absent manifest => nothing happens (the default-OFF, byte-identical path).
         log.cold_manifest = cold_manifest;
         log.splice_cold_prefix()?;
+        // At-rest encryption (#780 phase 2): re-attach the write-side crypto to a RESUMED encrypted
+        // active segment (THE critical fix — else post-recovery appends land PLAINTEXT into an
+        // encrypted segment), and fail CLOSED on an at-rest config that does not match the recovered
+        // active segment. This single call covers EVERY open/recover path (fresh, resume, roll-forward,
+        // compaction-aware), so no reopen path can leave the active writer without its crypto.
+        log.finalize_at_rest()?;
         Ok(log)
+    }
+
+    /// Whether this log is at-rest AEAD encrypted (#780 phase 2): a write key and/or a read ring is
+    /// configured, so its segments are ciphertext, reads route through the decrypt-on-read path, and the
+    /// zero-copy raw plane is refused (it must never ship ciphertext to a plaintext consumer). Always
+    /// `false` in a build without the `encryption` feature or when no key is configured.
+    #[must_use]
+    pub fn is_at_rest_encrypted(&self) -> bool {
+        self.at_rest.is_encrypted()
+    }
+
+    /// Re-attaches the write-side crypto to a RESUMED encrypted active segment, and fail-closes on an
+    /// at-rest config that does not match the recovered active segment (#780 phase 2). Called ONCE at
+    /// the end of every open/recover path (fresh, resume, roll-forward, compaction-aware), so it is the
+    /// single auditable guard that no reopen path leaves the active writer without its crypto.
+    ///
+    /// The (encrypted-on-disk, key-configured) matrix:
+    /// - `(true, true)`: re-attach the write crypto if the resumed writer does not already carry it —
+    ///   THE critical fix (a resumed writer starts with no crypto, so the first post-recovery append
+    ///   would otherwise land PLAINTEXT into the encrypted segment). A freshly-created encrypted segment
+    ///   already carries its crypto, so this is a no-op there.
+    /// - `(true, false)`: encrypted on disk but NO write key — refuse (`EncryptedSegmentNoKey`). This is
+    ///   the ALWAYS-COMPILED guard, so a default (no-`encryption`) build refuses to open an encrypted
+    ///   log rather than corrupt it.
+    /// - `(false, true)`: plaintext on disk but a write key IS configured — refuse
+    ///   (`PlaintextSegmentWithKey`); re-encrypting a plaintext log is a phase-3 migration.
+    /// - `(false, false)`: the plaintext default, unchanged.
+    fn finalize_at_rest(&mut self) -> Result<(), StorageError> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(());
+        };
+        let segment_id = active.header().segment_id;
+        let encrypted = active.header().is_encrypted();
+        let key_configured = self.at_rest.writes_encrypted();
+        match (encrypted, key_configured) {
+            (true, true) =>
+            {
+                #[cfg(feature = "encryption")]
+                if !active.has_crypto() {
+                    if let Some(crypto) = self.at_rest.crypto.clone() {
+                        let writer = self
+                            .active
+                            .take()
+                            .expect("active is Some (checked above)")
+                            .with_crypto(crypto);
+                        self.active = Some(writer);
+                    }
+                }
+            }
+            (true, false) => return Err(StorageError::EncryptedSegmentNoKey { segment_id }),
+            (false, true) => return Err(StorageError::PlaintextSegmentWithKey { segment_id }),
+            (false, false) => {}
+        }
+        Ok(())
     }
 
     /// #868: if the HIGHEST-id segment is an EMPTY unsealed tail left by a crash during
@@ -1667,6 +1865,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         fs: F,
         clock: C,
         config: LogConfig,
+        at_rest: AtRestCrypto,
         ids: &[u64],
         last_id: u64,
     ) -> Result<Log<F, C>, StorageError> {
@@ -1697,6 +1896,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             fs,
             clock,
             config,
+            at_rest,
             active: None,
             active_id: last_id,
             next_offset,
@@ -1906,6 +2106,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         fs: F,
         clock: C,
         config: LogConfig,
+        at_rest: AtRestCrypto,
         ids: &[u64],
     ) -> Result<Log<F, C>, StorageError> {
         // Step 1: classify every segment. The per-segment scan+CRC MAP runs across the same bounded
@@ -2108,6 +2309,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             fs,
             clock,
             config,
+            at_rest,
             keep_ordinary,
             keep_compacted,
             corrupt_losses,
@@ -2127,6 +2329,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         fs: F,
         clock: C,
         config: LogConfig,
+        at_rest: AtRestCrypto,
         ordinaries: Vec<OrdinaryCandidate>,
         compacteds: Vec<CompactedCandidate>,
         corrupt_losses: Vec<LossEvent>,
@@ -2246,6 +2449,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             fs,
             clock,
             config,
+            at_rest,
             active: None,
             active_id: active.as_ref().map_or(0, |a| a.id),
             next_offset,
@@ -2391,12 +2595,23 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         base_seq: Seq,
         base_offset: Offset,
     ) -> Result<(), StorageError> {
+        // At-rest encryption (#780 phase 2): a FRESH active segment is created ENCRYPTED whenever an
+        // at-rest write key is configured, so its header carries the `SEGMENT_FLAG_ENCRYPTED` flag (set
+        // here so the IN-MEMORY header matches the on-disk `encode_encrypted` header) and every append
+        // AEAD-encrypts under the deterministic `segment_id || record_ordinal` nonce. `segment_id` is
+        // fresh and never recycled (ADR-0002) and the per-segment ordinal starts at 0, so the nonce is
+        // unique across the log's life. `flags == 0` (plaintext) is the byte-identical default.
+        let flags = if self.at_rest.writes_encrypted() {
+            SEGMENT_FLAG_ENCRYPTED
+        } else {
+            0
+        };
         let header = SegmentHeader {
             segment_id: id,
             base_seq,
             base_offset,
             created_unix_ms: self.clock.now_unix_millis(),
-            flags: 0,
+            flags,
         };
         let file = self.fs.create_new(&segment_file_name(id))?;
         // Preallocate the new active segment to the full roll size BEFORE the first append: the
@@ -2417,6 +2632,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // doc's ENOSPC-to-`AtCapacity` routing is a forward refinement, not required for
         // correctness).
         let _ = file.preallocate(self.config.max_segment_bytes);
+        // Create encrypted when a write key is configured (writes the `encode_encrypted` header +
+        // attaches the write crypto), else the plaintext create. `create_encrypted` needs the `Arc`, so
+        // clone the write context (cheap `Arc` bump).
+        #[cfg(feature = "encryption")]
+        let mut writer = if let Some(crypto) = self.at_rest.crypto.clone() {
+            SegmentWriter::create_encrypted(file, header, crypto)?
+        } else {
+            SegmentWriter::create(file, header)?
+        };
+        #[cfg(not(feature = "encryption"))]
         let mut writer = SegmentWriter::create(file, header)?;
         writer.sync()?; // the header is durable...
         self.fs.sync_dir()?; // ...and so is its directory entry.
@@ -2598,12 +2823,20 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         base_offset: Offset,
     ) -> Result<(), StorageError> {
         let _ = self.fs.remove(&segment_file_name(id));
+        // At-rest encryption (#780 phase 2): a segment created on a ROLL is encrypted whenever a write
+        // key is configured, exactly as `start_segment` does for the first segment — so EVERY new active
+        // segment of an encrypted log is uniformly encrypted, never a plaintext leak on a roll.
+        let flags = if self.at_rest.writes_encrypted() {
+            SEGMENT_FLAG_ENCRYPTED
+        } else {
+            0
+        };
         let header = SegmentHeader {
             segment_id: id,
             base_seq,
             base_offset,
             created_unix_ms: self.clock.now_unix_millis(),
-            flags: 0,
+            flags,
         };
         // Create phase — a failure is transient: DEFER (the predecessor is durably sealed, no loss).
         let defer = |this: &mut Self, e: StorageError| -> StorageError {
@@ -2620,7 +2853,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             Err(e) => return Err(defer(self, StorageError::Io(e))),
         };
         let _ = file.preallocate(self.config.max_segment_bytes);
-        let mut writer = match SegmentWriter::create(file, header) {
+        #[cfg(feature = "encryption")]
+        let created = if let Some(crypto) = self.at_rest.crypto.clone() {
+            SegmentWriter::create_encrypted(file, header, crypto)
+        } else {
+            SegmentWriter::create(file, header)
+        };
+        #[cfg(not(feature = "encryption"))]
+        let created = SegmentWriter::create(file, header);
+        let mut writer = match created {
             Ok(w) => w,
             Err(e) => return Err(defer(self, e)),
         };
@@ -3096,6 +3337,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 (offset, pos_before)
             }
             AppendSource::Verbatim { frame, view } => {
+                // At-rest encryption FAIL-CLOSED (#780 phase 2, the deferred cluster hazard): a verbatim
+                // frame is the leader's ciphertext, bound to the LEADER's `(segment_id, record_ordinal)`
+                // nonce. Copying it into this follower's independently numbered segment would make it
+                // undecryptable (or, if ids aligned, reuse a nonce). Clustered at-rest encryption is
+                // phase 3; refuse verbatim replication while encryption is enabled rather than ever
+                // write a mis-nonced encrypted frame. This is at the exact seam (every replicated frame
+                // passes here), so a single-node encrypted broker is safe and a mis-enabled cluster
+                // fails loudly instead of silently corrupting.
+                if self.at_rest.writes_encrypted() {
+                    return Err(StorageError::EncryptedReplicationUnsupported);
+                }
                 // Byte-identity invariant: the follower assigns `seq` positionally, and the copied
                 // frame carries the leader's embedded (already-CRC'd) `seq`. They MUST match, or the
                 // verbatim bytes would diverge from what the encode path produces. The caller
@@ -3853,18 +4105,30 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             self.ensure_segment_local(id)?;
         }
         if id == self.active_id {
-            return Ok(std::sync::Arc::new(SegmentReader::open(
-                self.fs.open(&segment_file_name(id))?,
-            )?));
+            return Ok(std::sync::Arc::new(
+                self.open_reader(self.fs.open(&segment_file_name(id))?)?,
+            ));
         }
         if let Some(reader) = self.sealed_readers.get(id) {
             return Ok(reader);
         }
-        let reader =
-            std::sync::Arc::new(SegmentReader::open(self.fs.open(&segment_file_name(id))?)?);
+        let reader = std::sync::Arc::new(self.open_reader(self.fs.open(&segment_file_name(id))?)?);
         self.sealed_readers
             .insert(id, std::sync::Arc::clone(&reader));
         Ok(reader)
+    }
+
+    /// Opens a [`SegmentReader`] over `file`, attaching the at-rest READ keyring when one is configured
+    /// (#780 phase 2) so `scan_range`'s decrypt loop can decrypt an encrypted segment on read. A
+    /// plaintext log (no keyring) opens the reader exactly as before, byte-identically; a plaintext
+    /// segment ignores the ring (its header carries no AEAD params, so the plaintext decode path runs).
+    #[allow(clippy::unused_self)] // uses `self.at_rest` only under the `encryption` feature
+    fn open_reader(&self, file: F::File) -> Result<SegmentReader<F::File>, StorageError> {
+        #[cfg(feature = "encryption")]
+        if let Some(ring) = self.at_rest.keyring.clone() {
+            return SegmentReader::open_with_keyring(file, ring);
+        }
+        SegmentReader::open(file)
     }
 
     /// Reads ONE segment's contribution to a [`Log::read_range`] in a single forward pass, pushing
@@ -3938,7 +4202,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // ACTIVE segment's scan is bounded at the writer's `write_pos`: its preallocated logical
             // extension makes the FILE roll-size long, and an unbounded fallback would eagerly
             // allocate and read the whole zero tail (up to 64 MiB of zeros for the same records).
-            let mut reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+            // `open_reader` attaches the at-rest keyring (#780), so `scan()` DECRYPTS an encrypted
+            // segment on this fallback path (a resumed active segment whose seek index is not yet
+            // seeded lands here); a plaintext log opens the reader byte-identically.
+            let mut reader = self.open_reader(self.fs.open(&segment_file_name(slot.id))?)?;
             if slot.id == self.active_id {
                 if let Some(writer) = self.active.as_ref() {
                     reader = reader.with_data_end(writer.write_pos());
@@ -4043,6 +4310,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if max_records == 0 || start_v >= flushed {
             // Nothing to serve raw, and nothing remains below the flushed head from `start`.
             return Ok((empty, None));
+        }
+        // At-rest encryption FAIL-CLOSED for the zero-copy plane (#780 phase 2): the raw path hands the
+        // on-disk record region back VERBATIM, which for an encrypted segment is CIPHERTEXT — it must
+        // NEVER be delivered to a consumer expecting plaintext. Reroute the WHOLE range to the
+        // materialize path (`read_range`, which DECRYPTS on read) by returning an empty raw run plus a
+        // `Some(start)` "continue via materialize" signal — the exact fallback the compacted/unindexed
+        // cases already use, so every caller (the engine's `raw + tail_from` consume path) transparently
+        // serves decrypted plaintext and no ciphertext ever leaves the zero-copy plane.
+        if self.at_rest.is_encrypted() {
+            return Ok((empty, Some(start)));
         }
         let oldest = self
             .segments
@@ -4293,6 +4570,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     pub fn offload_cold_segments(&mut self) -> Result<u64, StorageError> {
         if !self.cold_config.enabled || self.cold_store.is_none() {
             return Ok(0);
+        }
+        // At-rest encryption FAIL-CLOSED (#780 phase 2): offload/restore of encrypted segments needs its
+        // own re-verification path (phase 3). Only reached when offload is ENABLED on an encrypted log.
+        if self.at_rest.is_encrypted() {
+            return Err(StorageError::EncryptedMaintenanceUnsupported);
         }
         let active_present = self.active.is_some();
         let sealed_count = if active_present {
@@ -4944,6 +5226,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.sealed_record_bytes = sealed_record_bytes;
         self.total_record_count = total_record_count;
         self.unsynced_record_bytes = 0;
+        // At-rest encryption (#780 phase 2): the writer was RESUMED over the truncated bytes with no
+        // crypto, so re-attach it (and enforce the encrypted/key matrix), exactly as `open`'s recovery
+        // does — no reopen/resume path may leave the active writer without its crypto. Truncation is a
+        // replication (follower-divergence) path, which encryption fail-closes at `append_verbatim`, so
+        // this is defense-in-depth: a truncated encrypted active segment stays correctly keyed.
+        self.finalize_at_rest()?;
         // The kept active segment's resident seek index must be rebuilt from the truncated bytes, so
         // evict any stale one (a later read rebuilds it). The dropped segments' indexes were evicted.
         self.evict_segment_index(last_id);
@@ -4981,6 +5269,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     ) -> Result<crate::compaction::CompactionOutcome, StorageError> {
         if !config.enabled {
             return Ok(crate::compaction::CompactionOutcome::default());
+        }
+        // At-rest encryption FAIL-CLOSED (#780 phase 2): compaction reads survivors and RE-FRAMES them,
+        // which under encryption requires decrypt-then-re-encrypt under fresh nonces — deferred to phase
+        // 3. Only reached when compaction is ENABLED on an encrypted log (the default-off path returned
+        // above), so a plaintext or a non-compacting encrypted broker is unaffected.
+        if self.at_rest.is_encrypted() {
+            return Err(StorageError::EncryptedMaintenanceUnsupported);
         }
         // Finish any transient-fault-deferred roll first (#867) so compaction sees a fully installed
         // active segment.
@@ -5780,6 +6075,12 @@ impl<F: Filesystem + Clone, C: Clock> Log<F, C> {
     /// Propagates an IO error from building the initial sealed snapshot (reading the sealed segments'
     /// sparse seek anchors). After it returns Ok the plane is cached and never rebuilt.
     pub fn read_plane(&self) -> Result<ReadPlane<F>, StorageError> {
+        // At-rest encryption FAIL-CLOSED (#780 phase 2): the off-actor plane serves RAW (ciphertext)
+        // frames, so it is refused for an encrypted log — its consumers are served through the actor's
+        // decrypt-on-read path instead. Threading decrypt into the off-actor snapshot is phase 3.
+        if self.at_rest.is_encrypted() {
+            return Err(StorageError::EncryptedZeroCopyUnsupported);
+        }
         if let Some(plane) = self.read_plane.borrow().as_ref() {
             return Ok(plane.clone());
         }
@@ -11781,6 +12082,380 @@ mod tests {
                 "the lowest failing index wins, deterministically"
             ),
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    // ============================================================================================
+    // At-rest AEAD encryption LIVE wiring (#780 phase 2). These prove the crypto-critical
+    // properties end-to-end on the `Log`: segments on disk are CIPHERTEXT, consume returns
+    // PLAINTEXT, a resume RE-ATTACHES the crypto (no plaintext leak on ANY reopen path), the
+    // zero-copy plane never ships ciphertext, verbatim replication fails closed, recovery of an
+    // encrypted broker reads everything, a wrong/missing key is REPORTED (never garbage), the nonce
+    // ordinal continues across a restart, and the default (no key) is byte-identical.
+    // ============================================================================================
+    #[cfg(feature = "encryption")]
+    mod at_rest {
+        use super::*;
+        use crate::crypto::{AeadKey, AeadSuite, DecryptError, KeyRing, SegmentCrypto};
+        use ironbus_core::codec;
+
+        // A FIXED suite so the test is deterministic across hosts: the writer records the suite in the
+        // header, so a read uses it regardless of the running CPU's hardware-AES support.
+        const SUITE: AeadSuite = AeadSuite::ChaCha20Poly1305;
+        const KEY_ID: u64 = 1;
+
+        fn key(seed: u8) -> AeadKey {
+            AeadKey::from_bytes([seed; crate::crypto::KEY_LEN])
+        }
+        fn write_crypto(key_id: u64, seed: u8) -> Arc<SegmentCrypto> {
+            Arc::new(SegmentCrypto::new(SUITE, key_id, key(seed)))
+        }
+        fn ring(entries: &[(u64, u8)]) -> Arc<KeyRing> {
+            let mut r = KeyRing::new();
+            for &(id, seed) in entries {
+                r.insert(id, key(seed));
+            }
+            Arc::new(r)
+        }
+        // The standard single-node encrypted open: write key + a ring that can read it back.
+        fn open_enc(fs: InMemoryFs, config: LogConfig) -> Log<InMemoryFs, ManualClock> {
+            Log::open_encrypted(
+                fs,
+                ManualClock::new(),
+                config,
+                Some(write_crypto(KEY_ID, 0xA1)),
+                Some(ring(&[(KEY_ID, 0xA1)])),
+            )
+            .unwrap()
+        }
+        fn payload_rec<'a>(k: &'a [u8], p: &'a [u8]) -> Append<'a> {
+            Append {
+                timestamp_ms: 7,
+                flags: RecordFlags::EMPTY,
+                key: k,
+                headers: b"",
+                payload: p,
+            }
+        }
+        // The raw on-disk bytes of segment `id` (records + any preallocated/footer tail).
+        fn seg_bytes(log: &Log<InMemoryFs, ManualClock>, id: u64) -> Vec<u8> {
+            let f = log.filesystem().open(&segment_file_name(id)).unwrap();
+            let len = usize::try_from(f.len().unwrap()).unwrap();
+            let mut buf = vec![0u8; len];
+            f.read_exact_at(&mut buf, 0).unwrap();
+            buf
+        }
+        fn contains(hay: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+        }
+        // The number of leading ENCRYPTED record frames in a segment image (stops at the footer, a
+        // zero tail, or — the leak we guard against — a PLAINTEXT frame, which `decode_encrypted`
+        // refuses).
+        fn count_encrypted_frames(seg: &[u8]) -> usize {
+            let mut pos = SEGMENT_HEADER_LEN;
+            let mut n = 0;
+            while pos < seg.len() {
+                match codec::decode_encrypted(&seg[pos..]) {
+                    Ok((_, consumed)) => {
+                        n += 1;
+                        pos += consumed;
+                    }
+                    Err(_) => break,
+                }
+            }
+            n
+        }
+        // A big cap so a handful of records stay in ONE active segment 0.
+        fn big_cfg() -> LogConfig {
+            LogConfig {
+                max_segment_bytes: 1 << 20,
+                max_total_bytes: 0,
+                ..LogConfig::default()
+            }
+        }
+
+        #[test]
+        fn default_off_open_encrypted_is_byte_identical_to_plaintext() {
+            let recs: [&[u8]; 3] = [b"alpha", b"bravo", b"charlie"];
+            let fs_p = InMemoryFs::new();
+            let mut lp = Log::open(fs_p, ManualClock::new(), big_cfg()).unwrap();
+            for r in recs {
+                lp.append(&payload_rec(b"", r)).unwrap();
+            }
+            lp.sync().unwrap();
+            let bytes_p = seg_bytes(&lp, 0);
+
+            // `open_encrypted(None, None)` is the plaintext default — byte-for-byte `open()`.
+            let fs_e = InMemoryFs::new();
+            let mut le =
+                Log::open_encrypted(fs_e, ManualClock::new(), big_cfg(), None, None).unwrap();
+            assert!(!le.is_at_rest_encrypted());
+            for r in recs {
+                le.append(&payload_rec(b"", r)).unwrap();
+            }
+            le.sync().unwrap();
+            assert_eq!(
+                bytes_p,
+                seg_bytes(&le, 0),
+                "open_encrypted(None,None) must be byte-identical to open()"
+            );
+            // ...and it is genuine plaintext: the record bytes are on disk in the clear.
+            assert!(contains(&bytes_p, b"charlie"));
+        }
+
+        #[test]
+        fn segments_are_ciphertext_on_disk_and_consume_returns_plaintext() {
+            const MARK: &[u8] = b"TOP-SECRET-PLAINTEXT-MARKER";
+            let fs = InMemoryFs::new();
+            let mut log = open_enc(fs, big_cfg());
+            assert!(log.is_at_rest_encrypted());
+            for i in 0..5u8 {
+                let p = [MARK, &[b'-', i]].concat();
+                log.append(&payload_rec(b"k", &p)).unwrap();
+            }
+            log.sync().unwrap();
+
+            // On disk: CIPHERTEXT — the plaintext marker never appears.
+            let bytes = seg_bytes(&log, 0);
+            assert!(
+                !contains(&bytes, MARK),
+                "the plaintext marker must NOT appear anywhere in an encrypted segment"
+            );
+            assert_eq!(count_encrypted_frames(&bytes), 5);
+
+            // Consume: DECRYPTED plaintext records, in order, with the storage-internal ENCRYPTED bit
+            // cleared on the materialized record.
+            let out = log.read_from(Offset::ZERO, 100).unwrap();
+            assert_eq!(out.len(), 5);
+            for (i, r) in out.iter().enumerate() {
+                let want = [MARK, &[b'-', u8::try_from(i).unwrap()]].concat();
+                assert_eq!(&r.payload[..], &want[..]);
+                assert_eq!(&r.key[..], b"k");
+                assert!(!r.flags.contains(RecordFlags::ENCRYPTED));
+            }
+
+            // Control: a plaintext log with the same marker HAS it on disk.
+            let fs2 = InMemoryFs::new();
+            let mut lp = Log::open(fs2, ManualClock::new(), big_cfg()).unwrap();
+            lp.append(&payload_rec(b"k", MARK)).unwrap();
+            lp.sync().unwrap();
+            assert!(contains(&seg_bytes(&lp, 0), MARK));
+        }
+
+        #[test]
+        fn resume_reattaches_crypto_no_plaintext_leak_on_reopen() {
+            const A: &[u8] = b"BEFORE-CRASH-SECRET";
+            const B: &[u8] = b"AFTER-CRASH-SECRET";
+            let fs = InMemoryFs::new();
+            // Write two records, sync, then "crash" (drop WITHOUT sealing).
+            {
+                let mut log = open_enc(fs.clone(), big_cfg());
+                log.append(&payload_rec(b"", A)).unwrap();
+                log.append(&payload_rec(b"", A)).unwrap();
+                log.sync().unwrap();
+            }
+            // Reopen (recovery RESUMES the encrypted active segment) and append after the crash.
+            let mut log = open_enc(fs, big_cfg());
+            assert!(log.is_at_rest_encrypted());
+            log.append(&payload_rec(b"", B)).unwrap();
+            log.sync().unwrap();
+
+            // THE critical assertion: the POST-crash record is CIPHERTEXT. If resume had failed to
+            // re-attach the write crypto, B would be a PLAINTEXT frame in the encrypted segment.
+            let bytes = seg_bytes(&log, 0);
+            assert!(!contains(&bytes, A), "pre-crash record must be ciphertext");
+            assert!(
+                !contains(&bytes, B),
+                "POST-crash record must be ciphertext — resume must re-attach the write crypto"
+            );
+            // Structural proof: all three frames are ENCRYPTED (a plaintext B would break the walk at 2).
+            assert_eq!(count_encrypted_frames(&bytes), 3);
+            // And all three read back as decrypted plaintext, in order.
+            let out = log.read_from(Offset::ZERO, 100).unwrap();
+            let got: Vec<&[u8]> = out.iter().map(|r| &r.payload[..]).collect();
+            assert_eq!(got, vec![A, A, B]);
+        }
+
+        #[test]
+        fn reopening_an_encrypted_log_without_a_key_fails_closed() {
+            let fs = InMemoryFs::new();
+            {
+                let mut log = open_enc(fs.clone(), big_cfg());
+                log.append(&payload_rec(b"", b"secret")).unwrap();
+                log.sync().unwrap();
+            }
+            // A keyless open must REFUSE — never resume with plaintext appends into an encrypted
+            // segment. This is the always-compiled guard a default build also enforces.
+            let err = Log::open(fs, ManualClock::new(), big_cfg()).unwrap_err();
+            assert!(
+                matches!(err, StorageError::EncryptedSegmentNoKey { .. }),
+                "got {err:?}"
+            );
+        }
+
+        #[test]
+        fn reopening_a_plaintext_log_with_a_key_fails_closed() {
+            let fs = InMemoryFs::new();
+            {
+                let mut log = Log::open(fs.clone(), ManualClock::new(), big_cfg()).unwrap();
+                log.append(&payload_rec(b"", b"cleartext")).unwrap();
+                log.sync().unwrap();
+            }
+            // Encrypting into a plaintext segment would make a MIXED segment; refuse (migration is
+            // phase 3).
+            let err = Log::open_encrypted(
+                fs,
+                ManualClock::new(),
+                big_cfg(),
+                Some(write_crypto(KEY_ID, 0xA1)),
+                Some(ring(&[(KEY_ID, 0xA1)])),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, StorageError::PlaintextSegmentWithKey { .. }),
+                "got {err:?}"
+            );
+        }
+
+        #[test]
+        fn zero_copy_reroutes_to_decrypt_and_never_ships_ciphertext() {
+            let fs = InMemoryFs::new();
+            let mut log = open_enc(fs, big_cfg());
+            for _ in 0..4 {
+                log.append(&payload_rec(b"", b"ZC-SECRET")).unwrap();
+            }
+            log.sync().unwrap();
+
+            // The zero-copy raw path serves NO bytes for an encrypted segment; it signals the caller to
+            // fall back to the materialize (decrypt) path.
+            let (raw, tail_from) = log.read_range_raw(Offset::ZERO, 10, None).unwrap();
+            assert_eq!(raw.record_count, 0);
+            assert!(
+                raw.bytes.is_empty(),
+                "the zero-copy plane must ship NO bytes for an encrypted segment"
+            );
+            assert_eq!(tail_from, Some(Offset::ZERO));
+
+            // That fallback yields decrypted plaintext.
+            let out = log.read_range(Offset::ZERO, 10, None).unwrap();
+            assert_eq!(out.len(), 4);
+            assert_eq!(&out[0].payload[..], b"ZC-SECRET");
+
+            // The off-actor plane is refused outright.
+            assert!(matches!(
+                log.read_plane().unwrap_err(),
+                StorageError::EncryptedZeroCopyUnsupported
+            ));
+        }
+
+        #[test]
+        fn append_verbatim_is_fail_closed_under_encryption() {
+            let fs = InMemoryFs::new();
+            let mut log = open_enc(fs, big_cfg());
+            let view = RecordView {
+                seq: Seq::new(0),
+                timestamp_ms: 1,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"leader-frame",
+            };
+            // The guard fires at the seam before the frame is touched (a dummy frame is fine).
+            let frame = [0u8; 80];
+            let err = log.append_frame_verbatim(&frame, &view).unwrap_err();
+            assert!(
+                matches!(err, StorageError::EncryptedReplicationUnsupported),
+                "got {err:?}"
+            );
+        }
+
+        #[test]
+        fn recovery_of_an_encrypted_broker_reads_all_across_segments() {
+            // A small cap so records roll across several segments (sealing earlier ones).
+            let cfg = LogConfig {
+                max_segment_bytes: 160,
+                max_total_bytes: 0,
+                ..LogConfig::default()
+            };
+            let fs = InMemoryFs::new();
+            let n = 12u8;
+            {
+                let mut log = open_enc(fs.clone(), cfg);
+                for i in 0..n {
+                    log.append(&payload_rec(b"", &[b'r', i])).unwrap();
+                }
+                log.sync().unwrap();
+                assert!(
+                    log.active_segment_id() > 0,
+                    "expected the log to have rolled (sealed earlier encrypted segments)"
+                );
+            }
+            // Reopen: recovery of the sealed + active encrypted segments; read everything back.
+            let log = open_enc(fs, cfg);
+            let out = log.read_from(Offset::ZERO, 100).unwrap();
+            assert_eq!(u8::try_from(out.len()).unwrap(), n);
+            for (i, r) in out.iter().enumerate() {
+                assert_eq!(&r.payload[..], &[b'r', u8::try_from(i).unwrap()][..]);
+            }
+        }
+
+        #[test]
+        fn wrong_or_missing_key_is_reported_never_garbage() {
+            let fs = InMemoryFs::new();
+            {
+                let mut log = open_enc(fs.clone(), big_cfg());
+                log.append(&payload_rec(b"", b"needs-key")).unwrap();
+                log.sync().unwrap();
+            }
+            // RIGHT key-id, WRONG key bytes: open succeeds (open never decrypts); the READ is a
+            // reported TagMismatch — never garbage, never a crash.
+            let wrong = Log::open_encrypted(
+                fs.clone(),
+                ManualClock::new(),
+                big_cfg(),
+                Some(write_crypto(KEY_ID, 0xA1)),
+                Some(ring(&[(KEY_ID, 0xFF)])),
+            )
+            .unwrap();
+            match wrong.read_from(Offset::ZERO, 10) {
+                Err(StorageError::Decrypt(DecryptError::TagMismatch)) => {}
+                other => panic!("expected a reported TagMismatch, got {other:?}"),
+            }
+            // Keyring MISSING the segment's key-id: reported UnknownKeyId(1).
+            let missing = Log::open_encrypted(
+                fs,
+                ManualClock::new(),
+                big_cfg(),
+                Some(write_crypto(KEY_ID, 0xA1)),
+                Some(ring(&[(2, 0xB2)])),
+            )
+            .unwrap();
+            match missing.read_from(Offset::ZERO, 10) {
+                Err(StorageError::Decrypt(DecryptError::UnknownKeyId(1))) => {}
+                other => panic!("expected a reported UnknownKeyId(1), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn nonce_ordinal_continues_across_a_restart() {
+            // If resume reset the per-segment record counter, the post-restart record would be
+            // encrypted under a REUSED nonce `(segment_id, 0)`. The reader derives the ordinal from the
+            // OFFSET (`offset - base_offset`), so it would decrypt that record at ordinal 2 and FAIL the
+            // tag. A clean read of all three across the restart proves the writer continued the counter,
+            // so every record has a unique nonce end-to-end.
+            let fs = InMemoryFs::new();
+            {
+                let mut log = open_enc(fs.clone(), big_cfg());
+                log.append(&payload_rec(b"", b"n0")).unwrap();
+                log.append(&payload_rec(b"", b"n1")).unwrap();
+                log.sync().unwrap();
+            }
+            let mut log = open_enc(fs, big_cfg());
+            log.append(&payload_rec(b"", b"n2")).unwrap();
+            log.sync().unwrap();
+            let out = log.read_from(Offset::ZERO, 10).unwrap();
+            let got: Vec<&[u8]> = out.iter().map(|r| &r.payload[..]).collect();
+            assert_eq!(got, vec![&b"n0"[..], &b"n1"[..], &b"n2"[..]]);
         }
     }
 }

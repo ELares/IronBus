@@ -108,7 +108,8 @@
 use crate::fs::Filesystem;
 use crate::layout::STREAMS_SUBDIR;
 use crate::log::{
-    par_recover_open, par_sync_data_only, Append, Log, LogConfig, RECOVERY_OPEN_MAX_WORKERS,
+    par_recover_open, par_sync_data_only, Append, AtRestCrypto, Log, LogConfig,
+    RECOVERY_OPEN_MAX_WORKERS,
 };
 use crate::loss::LossReport;
 use crate::naming::{
@@ -281,6 +282,12 @@ pub struct StreamSet<F: Filesystem, C: Clock> {
     /// budget, daily write budget). Per-stream config overrides are a future concern (per-stream
     /// retention is M2-I5); here one config governs all streams, matching the single-log broker.
     config: LogConfig,
+    /// The at-rest AEAD encryption context (#780 phase 2) applied to EVERY stream's [`Log`] — the
+    /// default stream AND every named stream — so a named stream is encrypted exactly like the default
+    /// one, using the SAME key. [`AtRestCrypto::default`] (no key) is the plaintext default, byte-for-
+    /// byte unchanged. Held so [`StreamSet::declare`] can open a fresh named stream encrypted without
+    /// the caller re-supplying the key.
+    at_rest: AtRestCrypto,
     /// The access-ordered list of OPEN NAMED streams for the `max_open_streams` hot-set LRU (M2-I4,
     /// #565): the FRONT is the least-recently-used named stream (the next eviction victim) and the
     /// BACK is the most-recently-used. The DEFAULT stream `""` is NEVER a member (it is the root log
@@ -341,14 +348,45 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         clock: C,
         config: LogConfig,
     ) -> Result<OpenedStreamSet<F, C>, StorageError> {
+        Self::open_inner(fs, clock, config, AtRestCrypto::default())
+    }
+
+    /// Opens (recovering, or creating fresh) the whole stream set with LIVE at-rest AEAD encryption
+    /// (#780 phase 2): a configured `crypto`/`keyring` encrypts (and decrypts on read) EVERY stream's
+    /// log — the default stream and every named stream — with the SAME key. Passing
+    /// `AtRestCrypto::default()` is byte-for-byte [`StreamSet::open`].
+    ///
+    /// # Errors
+    /// As [`StreamSet::open`], plus the fail-closed at-rest guards of [`Log::open_encrypted`] on a
+    /// per-stream config mismatch.
+    #[cfg(feature = "encryption")]
+    pub fn open_encrypted(
+        fs: &F,
+        clock: C,
+        config: LogConfig,
+        crypto: Option<std::sync::Arc<crate::crypto::SegmentCrypto>>,
+        keyring: Option<std::sync::Arc<crate::crypto::KeyRing>>,
+    ) -> Result<OpenedStreamSet<F, C>, StorageError> {
+        Self::open_inner(fs, clock, config, AtRestCrypto::new(crypto, keyring))
+    }
+
+    /// The shared body behind [`StreamSet::open`] and [`StreamSet::open_encrypted`]: opens every
+    /// stream's log with the SAME at-rest context.
+    fn open_inner(
+        fs: &F,
+        clock: C,
+        config: LogConfig,
+        at_rest: AtRestCrypto,
+    ) -> Result<OpenedStreamSet<F, C>, StorageError> {
         let mut streams = BTreeMap::new();
         let mut recoveries = BTreeMap::new();
 
         // 1) The DEFAULT stream "" = today's ROOT log, opened at the data-dir root. This is the
         //    EXISTING single-log open: it performs the #670 layout-marker check and the
-        //    longest-valid-prefix recovery over the root segments, byte for byte as before. The
-        //    StreamSet adds NOTHING to this path, so a deployment with no named stream is unchanged.
-        let root = Log::open(fs.clone(), clock.clone(), config)?;
+        //    longest-valid-prefix recovery over the root segments, byte for byte as before (when no key
+        //    is configured). The StreamSet adds NOTHING to this path, so a deployment with no named
+        //    stream is unchanged.
+        let root = Log::open_with_at_rest(fs.clone(), clock.clone(), config, at_rest.clone())?;
         recoveries.insert(StreamId::default_stream(), recovery_of(&root));
         streams.insert(StreamId::default_stream(), root);
 
@@ -373,11 +411,14 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
             // segment here cannot touch the root log or a sibling. Results are index-aligned to
             // `named`; the fold below inserts them into the BTreeMap in key order, so the recovered
             // map + summaries are byte-for-byte the serial-open result.
+            let at_rest_ref = &at_rest;
             let opened = par_recover_open(&named, RECOVERY_OPEN_MAX_WORKERS, |(_, dir)| {
-                let log = Log::open(
+                // A named stream is opened with the SAME at-rest crypto as the default stream (#780).
+                let log = Log::open_with_at_rest(
                     streams_fs.subdir(dir).map_err(StorageError::Io)?,
                     clock.clone(),
                     config,
+                    at_rest_ref.clone(),
                 )?;
                 let recovery = recovery_of(&log);
                 Ok::<_, StorageError>((recovery, log))
@@ -407,6 +448,7 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
                 streams,
                 clock,
                 config,
+                at_rest,
                 lru,
             },
             recoveries,
@@ -437,12 +479,16 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
         C: Clone,
     {
         let mut streams = BTreeMap::new();
+        // The inert `""` re-open uses today's plaintext path: the shared-WAL substrate this backs is
+        // fail-closed under at-rest encryption (a mixed shared-WAL + encryption mode is phase 3), so a
+        // default-only stream set carries no at-rest key.
         let root = Log::open(fs.clone(), clock.clone(), config)?;
         streams.insert(StreamId::default_stream(), root);
         Ok(StreamSet {
             streams,
             clock,
             config,
+            at_rest: AtRestCrypto::default(),
             lru: Vec::new(),
         })
     }
@@ -485,7 +531,15 @@ impl<F: Filesystem, C: Clock + Clone> StreamSet<F, C> {
         let this_stream_dir = subtree
             .subdir(&stream_subdir_name(id.name()))
             .map_err(StorageError::Io)?;
-        let log = Log::open(this_stream_dir, self.clock.clone(), self.config)?;
+        // A named stream's log is opened (and, on the LRU reopen path, recovered) with the SAME at-rest
+        // crypto as the default stream (#780), so a lazily-declared/reopened named stream is encrypted
+        // exactly like every other stream — no plaintext leak on a fresh or reopened named stream.
+        let log = Log::open_with_at_rest(
+            this_stream_dir,
+            self.clock.clone(),
+            self.config,
+            self.at_rest.clone(),
+        )?;
         self.streams.insert(id.clone(), log);
         // A newly-opened (or reopened) named stream is the most-recently-used by definition: push it to
         // the MRU end of the hot-set LRU so it is the LAST to be evicted (#565). `declare` returns early
@@ -1759,6 +1813,97 @@ mod tests {
             assert_eq!(&*read[1].payload, b"a1");
             // Reopen re-tracked it at the MRU end (it is the only named stream, so it is the victim).
             assert_eq!(set.lru_victim(), Some(a.clone()));
+        }
+    }
+
+    // At-rest AEAD encryption of a StreamSet (#780 phase 2): the SAME key encrypts the default stream
+    // AND every named stream (single-node). Behind the `encryption` feature.
+    #[cfg(feature = "encryption")]
+    mod at_rest {
+        use super::*;
+        use crate::crypto::{AeadKey, AeadSuite, KeyRing, SegmentCrypto};
+        use std::sync::Arc;
+
+        const SUITE: AeadSuite = AeadSuite::ChaCha20Poly1305;
+        const KEY_ID: u64 = 1;
+
+        fn ekey(seed: u8) -> AeadKey {
+            AeadKey::from_bytes([seed; crate::crypto::KEY_LEN])
+        }
+        fn open_enc(fs: &InMemoryFs) -> StreamSet<InMemoryFs, ManualClock> {
+            let crypto = Arc::new(SegmentCrypto::new(SUITE, KEY_ID, ekey(0xA1)));
+            let mut ring = KeyRing::new();
+            ring.insert(KEY_ID, ekey(0xA1));
+            StreamSet::open_encrypted(
+                fs,
+                ManualClock::new(),
+                cfg(),
+                Some(crypto),
+                Some(Arc::new(ring)),
+            )
+            .unwrap()
+            .0
+        }
+        fn contains(hay: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+        }
+
+        #[test]
+        fn default_and_named_streams_are_encrypted_on_disk_and_read_back_plaintext() {
+            const MARK_D: &[u8] = b"DEFAULT-STREAM-SECRET";
+            const MARK_N: &[u8] = b"NAMED-STREAM-SECRET";
+            let fs = InMemoryFs::new();
+            let orders = StreamId::named("orders").unwrap();
+            {
+                let mut set = open_enc(&fs);
+                let def = StreamId::default_stream();
+                set.append_to(&def, &rec(MARK_D)).unwrap();
+                assert!(set.declare(&orders).unwrap());
+                set.append_to(&orders, &rec(MARK_N)).unwrap();
+                set.sync_stream(&def).unwrap();
+                set.sync_stream(&orders).unwrap();
+
+                // Consume: both streams read back DECRYPTED plaintext.
+                assert_eq!(
+                    &set.read_range(&def, Offset::ZERO, 10, None).unwrap()[0].payload[..],
+                    MARK_D
+                );
+                assert_eq!(
+                    &set.read_range(&orders, Offset::ZERO, 10, None).unwrap()[0].payload[..],
+                    MARK_N
+                );
+            }
+
+            // On disk: BOTH the default (root) segment AND the named-stream segment are CIPHERTEXT.
+            let root_seg = fs.open(&segment_file_name(0)).unwrap().snapshot();
+            assert!(
+                !contains(&root_seg, MARK_D),
+                "the default stream segment must be ciphertext"
+            );
+            let named_fs = fs
+                .subdir(STREAMS_SUBDIR)
+                .unwrap()
+                .subdir(&stream_subdir_name(orders.name()))
+                .unwrap();
+            let named_seg = named_fs.open(&segment_file_name(0)).unwrap().snapshot();
+            assert!(
+                !contains(&named_seg, MARK_N),
+                "the named stream segment must be ciphertext"
+            );
+
+            // Reopen: recovery of BOTH encrypted streams, then read everything back as plaintext.
+            let set2 = open_enc(&fs);
+            assert_eq!(
+                &set2
+                    .read_range(&StreamId::default_stream(), Offset::ZERO, 10, None)
+                    .unwrap()[0]
+                    .payload[..],
+                MARK_D
+            );
+            assert_eq!(
+                &set2.read_range(&orders, Offset::ZERO, 10, None).unwrap()[0].payload[..],
+                MARK_N
+            );
         }
     }
 }
