@@ -5671,18 +5671,21 @@ struct ServeConfig {
     /// default (byte-for-byte historical). When `Some`, `open_engine_with` loads the 32-byte key (the
     /// phase-1 fail-closed owner-only loader) and opens the engine's storage encrypted via
     /// `Engine::open_encrypted`. Resolved from `--encryption-key-file` / `IRONBUS_ENCRYPTION_KEY_FILE` /
-    /// `[encryption] key_file`; only ever `Some` on an `encryption`-feature build.
+    /// `[encryption] key_file`; only ever `Some` on an `encryption`-feature build. The serve path that
+    /// reads it (`open_engine_with` / `open_memory_engine`) is `cfg(unix)`, so on a non-Unix build it is
+    /// intentionally dead (the broker cannot serve there anyway — v1 serve is Unix-only).
+    #[cfg_attr(not(all(unix, feature = "encryption")), allow(dead_code))]
     encryption_key_file: Option<String>,
     /// The resolved at-rest KEY-ID (#780 phase 3): the non-zero u64 recorded in each encrypted segment
-    /// header. `Some` iff `encryption_key_file` is `Some` (validated at resolve). Only READ on an
-    /// `encryption`-feature build (by `load_encryption_context`); on the default build it is always
-    /// `None` (`resolve_encryption` refuses any at-rest config), so it is intentionally dead there.
-    #[cfg_attr(not(feature = "encryption"), allow(dead_code))]
+    /// header. `Some` iff `encryption_key_file` is `Some` (validated at resolve). Only READ on a Unix
+    /// `encryption`-feature build (by `load_encryption_context`); otherwise it is always `None`
+    /// (`resolve_encryption` refuses any at-rest config off an `encryption` build), so it is dead there.
+    #[cfg_attr(not(all(unix, feature = "encryption")), allow(dead_code))]
     encryption_key_id: Option<u64>,
     /// The resolved at-rest AEAD SUITE (#780 phase 3): `auto` (CPU detect), `aes-256-gcm`, or
-    /// `chacha20-poly1305`. `None` (with a key file set) means `auto`. Only READ on an
-    /// `encryption`-feature build; intentionally dead on the default build (always `None`).
-    #[cfg_attr(not(feature = "encryption"), allow(dead_code))]
+    /// `chacha20-poly1305`. `None` (with a key file set) means `auto`. Only READ on a Unix
+    /// `encryption`-feature build; intentionally dead otherwise (always `None`).
+    #[cfg_attr(not(all(unix, feature = "encryption")), allow(dead_code))]
     encryption_suite: Option<String>,
 }
 
