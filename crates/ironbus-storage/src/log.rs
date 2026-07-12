@@ -121,6 +121,18 @@ pub struct LogConfig {
     /// sealed AFTER the change; older sidecars keep their built-in density until rebuilt or reaped.
     /// [`LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS`] (1024) is the safe default.
     pub tindex_stride_records: u32,
+
+    /// Verify-once opt-out (#540, M1-I4): when `false` (the default), the consume read fast-path SKIPS
+    /// the redundant per-read body CRC32C recompute for a VERIFIED-RESIDENT segment — one whose body
+    /// integrity was already proven this process (self-written, or CRC-validated on load/recovery/
+    /// cold-restore) and that has stayed continuously resident since. The frame's stored `body_crc` is
+    /// untouched on disk, so a client still verifies the body end-to-end; only the server-side recompute
+    /// of already-trusted bytes is elided. When `true`, the body CRC is recomputed on EVERY read
+    /// (the pre-#540 always-verify behavior), for an operator who wants belt-and-suspenders re-validation
+    /// at the cost of read CPU. It NEVER affects an encrypted segment (whose AEAD tag is always verified)
+    /// or recovery/restore (which always fully validate). A pure CPU/robustness trade; it changes
+    /// nothing on disk, so a log is byte-identical either way.
+    pub verify_always: bool,
 }
 
 impl LogConfig {
@@ -173,6 +185,9 @@ impl LogConfig {
             // The daily physical write budget is OFF by default; an operator opts in (#118).
             daily_physical_write_budget_bytes: 0,
             tindex_stride_records: LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS,
+            // Verify-once is the default (#540): the read fast-path skips the redundant body-CRC
+            // recompute for a verified-resident segment; an operator opts IN to always-verify.
+            verify_always: false,
         })
     }
 
@@ -216,6 +231,16 @@ impl LogConfig {
     #[must_use]
     pub fn with_tindex_stride_records(mut self, stride: u32) -> LogConfig {
         self.tindex_stride_records = stride.max(1);
+        self
+    }
+
+    /// Sets the verify-once opt-out ([`LogConfig::verify_always`]) and returns the updated config
+    /// (#540). `false` (the default) enables the read fast-path's body-CRC skip for a verified-resident
+    /// segment; `true` forces a body-CRC recompute on every read. A pure CPU/robustness trade that
+    /// changes nothing on disk and never affects an encrypted segment's AEAD verification.
+    #[must_use]
+    pub fn with_verify_always(mut self, verify_always: bool) -> LogConfig {
+        self.verify_always = verify_always;
         self
     }
 }
@@ -262,6 +287,9 @@ impl Default for LogConfig {
             daily_physical_write_budget_bytes: 0,
             // The safe default seek-by-time index density (#772): one anchor per 1024 records.
             tindex_stride_records: LogConfig::DEFAULT_TINDEX_STRIDE_RECORDS,
+            // Verify-once by default (#540): the read fast-path skips the redundant body-CRC recompute
+            // for a verified-resident segment. An operator opts in to always-verify.
+            verify_always: false,
         }
     }
 }
@@ -1000,6 +1028,23 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// on every read. The active segment is never cached (it grows); evicted in lockstep with the seek
     /// index by [`Log::evict_segment_index`] at retirement.
     sealed_readers: SealedReaderCache<F>,
+    /// Verify-once resident set (#540, M1-I4): the ids of SEALED segments whose body integrity has been
+    /// PROVEN this process AND that have stayed continuously resident since — so the consume read
+    /// fast-path may skip the redundant per-read body-CRC recompute for them. An id is INSERTED when the
+    /// proof is established: a self-write seal (this process wrote every frame with a fresh CRC), a clean
+    /// recovery scan on load (`scan_recovery` CRC-validated the chain), or a cold-restore
+    /// (`verify_fetched_segment` CRC'd the whole fetched file). It is REMOVED at the single retirement
+    /// chokepoint [`Log::evict_segment_index`] (reap/compaction-install/offload), so a retired or
+    /// offloaded segment is NOT trusted until re-verified (a cold RELOAD re-verifies via
+    /// `verify_fetched_segment` and re-inserts). A reader-cache fd shed (cap pressure) does NOT clear an
+    /// id — it is not a "bytes left memory" event (same local file, ids never recycle, ADR 0002), so a
+    /// re-opened reader is re-stamped verified from this set, preserving the fd-cache's "dropping a
+    /// reader changes nothing a reader observes" invariant. Interior mutability: the read path is `&self`
+    /// (like `sealed_readers`), single-writer, never aliased across threads. The ACTIVE segment id is
+    /// never in this set (it grows). Holds only derived trust: a wrong membership never crashes, but a
+    /// SPURIOUS insert would serve corrupt data silently, so it is only ever inserted at the three
+    /// whole-segment-verified points above.
+    verified_segments: std::cell::RefCell<std::collections::HashSet<u64>>,
     /// The lock-free, off-actor consume READ plane (#539): the shared atomic flushed frontier plus
     /// the arc-swapped immutable snapshot of the SEALED segments + their seek anchors, which any
     /// number of reader threads observe with NO lock and NO append-actor round-trip. The single
@@ -1478,6 +1523,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // skips a would-be-incomplete `.tindex` and a later seek rebuilds from frames.
                     active_time_anchors_complete: false,
                     sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
+                    // A fresh (empty) log has no sealed segment yet, so the verify-once resident set
+                    // (#540) starts empty; a self-write seal inserts each sealed id.
+                    verified_segments: std::cell::RefCell::new(std::collections::HashSet::new()),
                     // The off-actor read plane (#539) is built lazily on the first consumer
                     // `read_plane()` call; a never-read log pays nothing.
                     read_plane: std::cell::RefCell::new(None),
@@ -1939,6 +1987,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             active_time_anchor_base: 0,
             active_time_anchors_complete: false,
             sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
+            // Verify-once resident set (#540): seeded below for a recovered chain's sealed segments,
+            // maintained on seal/restore/evict thereafter.
+            verified_segments: std::cell::RefCell::new(std::collections::HashSet::new()),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
             pending_roll: None,
@@ -2042,7 +2093,29 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // this covers the no-event paths (a roll-forward pushes nothing) so every recovery exit
         // is cap-checked exactly once against its final report.
         log.enforce_loss_caps(durable_bytes)?;
+
+        // Verify-once (#540): every SEALED segment in the recovered chain was CRC-validated by
+        // `scan_recover_chain`'s `scan_recovery` above, so mark them verified-resident — the "verify once
+        // on load" seeding point.
+        log.mark_sealed_prefix_verified();
         Ok(log)
+    }
+
+    /// Verify-once (#540): mark every SEALED segment in the current chain verified-resident. Used to
+    /// SEED the resident set after recovery ("verify once on load"), matching exactly the sealed PREFIX
+    /// that [`Log::build_sealed_descriptor`] publishes (all slots but the active tail, when one is
+    /// present), so the set stays in lockstep with the read plane. The active segment (still growing) is
+    /// never marked; a later self-write seal inserts it when it seals.
+    fn mark_sealed_prefix_verified(&self) {
+        let sealed_prefix = if self.active.is_some() {
+            self.segments.len().saturating_sub(1)
+        } else {
+            self.segments.len()
+        };
+        let mut verified = self.verified_segments.borrow_mut();
+        for slot in &self.segments[..sealed_prefix] {
+            verified.insert(slot.id);
+        }
     }
 
     /// I3: fail closed if recovery would drop more than the bounded-loss caps allow (#120),
@@ -2480,6 +2553,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             active_time_anchor_base: 0,
             active_time_anchors_complete: false,
             sealed_readers: SealedReaderCache::new(DEFAULT_SEALED_READER_CACHE_CAP),
+            // Verify-once resident set (#540): seeded below for a recovered chain's sealed segments,
+            // maintained on seal/restore/evict thereafter.
+            verified_segments: std::cell::RefCell::new(std::collections::HashSet::new()),
             // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
             read_plane: std::cell::RefCell::new(None),
             pending_roll: None,
@@ -2755,6 +2831,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if let Some(idx) = self.segment_indexes.borrow_mut().get_mut(&self.active_id) {
             idx.flushed_end = idx.valid_end;
         }
+        // Verify-once (#540): this segment was just written and durably SEALED by THIS process — every
+        // frame carries a body CRC we computed on append and the bytes never round-tripped through a
+        // disk read — so mark it verified-resident. From here a consume read of the just-sealed
+        // predecessor skips the redundant per-read body-CRC recompute. Keyed by the OLD active id,
+        // BEFORE `create_or_defer_segment` repoints `active_id` to the new (empty, unverified) segment.
+        self.verified_segments.borrow_mut().insert(self.active_id);
         // NOTE (#772): the `.tindex` timestamp sidecar is DELIBERATELY NOT written here on the roll.
         // Writing a derived sidecar on the produce/roll hot path would add fsync + directory IO that
         // perturbs the byte-identity, determinism, and fault-injection (op-counting) conformance
@@ -4112,7 +4194,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if let Some(reader) = self.sealed_readers.get(id) {
             return Ok(reader);
         }
-        let reader = std::sync::Arc::new(self.open_reader(self.fs.open(&segment_file_name(id))?)?);
+        // Verify-once (#540): stamp the fresh reader verified-resident IFF this sealed id is in the
+        // verified set (self-written/recovered/restored + not evicted since), so the consume read
+        // fast-path may skip the redundant per-read body-CRC recompute. A fresh reader for a NOT-yet- or
+        // NO-LONGER-verified id stays unverified and fully re-validates — the fail-closed default that
+        // makes a reloaded segment re-verify. A reader-cache shed re-derives this on re-open, so a shed
+        // (fd-pressure) still observes the same records; only an evict (retirement) clears the trust.
+        let verified = self.verified_segments.borrow().contains(&id);
+        let reader = std::sync::Arc::new(
+            self.open_reader(self.fs.open(&segment_file_name(id))?)?
+                .with_verified_resident(verified),
+        );
         self.sealed_readers
             .insert(id, std::sync::Arc::clone(&reader));
         Ok(reader)
@@ -4122,13 +4214,20 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// (#780 phase 2) so `scan_range`'s decrypt loop can decrypt an encrypted segment on read. A
     /// plaintext log (no keyring) opens the reader exactly as before, byte-identically; a plaintext
     /// segment ignores the ring (its header carries no AEAD params, so the plaintext decode path runs).
-    #[allow(clippy::unused_self)] // uses `self.at_rest` only under the `encryption` feature
     fn open_reader(&self, file: F::File) -> Result<SegmentReader<F::File>, StorageError> {
         #[cfg(feature = "encryption")]
-        if let Some(ring) = self.at_rest.keyring.clone() {
-            return SegmentReader::open_with_keyring(file, ring);
-        }
-        SegmentReader::open(file)
+        let reader = if let Some(ring) = self.at_rest.keyring.clone() {
+            SegmentReader::open_with_keyring(file, ring)?
+        } else {
+            SegmentReader::open(file)?
+        };
+        #[cfg(not(feature = "encryption"))]
+        let reader = SegmentReader::open(file)?;
+        // Verify-once (#540): thread the verify-always opt-out (`LogConfig::verify_always`) into every
+        // reader this log opens, so the read fast-path honors the operator's choice. The verified-resident
+        // stamp itself is applied per-id by `sealed_reader_for` (an active/uncached reader stays
+        // unverified and always full-CRCs).
+        Ok(reader.with_verify_always(self.config.verify_always))
     }
 
     /// Reads ONE segment's contribution to a [`Log::read_range`] in a single forward pass, pushing
@@ -4716,6 +4815,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(StorageError::Io(e)),
         }
+        // Verify-once (#540): the restored bytes were just CRC-validated whole by `verify_fetched_segment`
+        // (length + CRC32C + a structural scan) BEFORE being written to local disk, so the RELOADED
+        // segment is trusted again — re-mark it verified-resident. This is the "reload re-verifies" side
+        // of the state machine: the id was CLEARED on offload (`evict_segment_index`), so it is not
+        // trusted until this fresh whole-file verify re-establishes it.
+        self.verified_segments.borrow_mut().insert(id);
         Ok(())
     }
 
@@ -5667,6 +5772,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // Drop the cached open reader (and its fd) for the retired segment in lockstep (#808), so a
         // reaped/compacted-away segment's fd is released, not leaked.
         self.sealed_readers.evict(id);
+        // Verify-once (#540): CLEAR the verified-resident mark for the retired/offloaded/compacted-away
+        // segment — the single evict chokepoint for the resident set. A segment that later RELOADS
+        // (cold restore) is NOT trusted until `ensure_segment_local` re-verifies and re-inserts it, and
+        // a compaction-installed successor took a fresh id that is verified only via its own seal. This
+        // is the "clear on evict; re-verify on reload" edge that keeps a rotted reloaded byte catchable.
+        self.verified_segments.borrow_mut().remove(&id);
     }
 
     /// Rebuilds a sealed segment's sparse `.tindex` anchors from a validating scan of its durable
@@ -5973,6 +6084,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     remote: true,
                     anchors: Vec::new(),
                     valid_end: 0,
+                    // A REMOTE slot is served through the actor (restore-on-access), never off-actor, so
+                    // it is never a verify-once fast-path candidate here (#540).
+                    verified: false,
                 });
                 continue;
             }
@@ -5990,6 +6104,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     remote: false,
                     anchors: Vec::new(),
                     valid_end: 0,
+                    // A COMPACTED slot is served through the actor's v2 scan, never off-actor, so it is
+                    // never a verify-once fast-path candidate here (#540).
+                    verified: false,
                 });
                 continue;
             }
@@ -6011,6 +6128,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 remote: false,
                 anchors,
                 valid_end,
+                // Verify-once (#540): carry the resident-trust bit from the `Log`'s verified set into the
+                // immutable snapshot, so an off-actor reader for this dense sealed slot may skip the
+                // per-read body-CRC recompute. A fresh snapshot each seal/reap keeps it in lockstep.
+                verified: self.verified_segments.borrow().contains(&slot.id),
             });
         }
         Ok((sealed, oldest, sealed_end))
@@ -6047,8 +6168,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             Ok((sealed, oldest, sealed_end)) => {
                 if let Some(plane) = self.read_plane.borrow().as_ref() {
                     // The Arc<F> the plane already holds is reused for the new snapshot (the
-                    // filesystem handle is the same directory); rebuild only the segment view.
-                    plane.republish_sealed(sealed, oldest, sealed_end);
+                    // filesystem handle is the same directory); rebuild only the segment view. Carry the
+                    // verify-once opt-out (#540) into the new snapshot.
+                    plane.republish_sealed(sealed, oldest, sealed_end, self.config.verify_always);
                     plane.publish_flushed(self.flushed_offset.get());
                 }
             }
@@ -6094,6 +6216,7 @@ impl<F: Filesystem + Clone, C: Clock> Log<F, C> {
             sealed,
             oldest,
             sealed_end,
+            self.config.verify_always,
         );
         *self.read_plane.borrow_mut() = Some(plane.clone());
         Ok(plane)
@@ -6168,6 +6291,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// assert the same evict-on-retirement contract for the reader cache.
     fn has_sealed_reader(&self, id: u64) -> bool {
         self.sealed_readers.get(id).is_some()
+    }
+
+    /// Whether segment `id` is currently VERIFIED-RESIDENT in the verify-once resident set (#540). Lets a
+    /// test assert the set/reload state machine (marked on self-write seal / recovery / cold restore,
+    /// cleared on evict) without exposing the private field.
+    #[cfg(test)]
+    fn is_verified_resident_segment(&self, id: u64) -> bool {
+        self.verified_segments.borrow().contains(&id)
     }
 
     /// The number of resident seek indexes currently cached, so a test can assert the resident set
@@ -6845,6 +6976,99 @@ mod tests {
         assert_eq!(log.next_offset(), Offset::new(7));
         assert_eq!(log.next_seq(), Seq::new(7));
         assert_eq!(log.append(&rec(b"next")).unwrap(), Offset::new(7));
+    }
+
+    // #540 verify-once state machine: a segment SEALED by this process (self-written) is marked
+    // verified-resident, while the still-growing ACTIVE segment never is.
+    #[test]
+    fn verify_once_marks_a_self_written_sealed_segment_but_not_the_active_one() {
+        let mut log = open_mem(small_config());
+        for i in 0..8u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        let active = log.active_segment_id();
+        assert!(
+            active >= 1,
+            "cap 128 with 20-byte records rolls at least once"
+        );
+        // Every sealed predecessor was written by THIS process and is verified-resident.
+        for id in 0..active {
+            assert!(
+                log.is_verified_resident_segment(id),
+                "self-written sealed segment {id} is verified-resident"
+            );
+        }
+        // The active (growing) segment is NEVER marked — its tail is still mutating.
+        assert!(
+            !log.is_verified_resident_segment(active),
+            "the active segment is never verified-resident while it grows"
+        );
+        // A verified sealed segment still serves correct records on the read fast-path (the skip must
+        // not corrupt a correct read).
+        let got = log.read_from(Offset::new(0), 2).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].offset, Offset::new(0));
+        assert_eq!(got[0].payload.as_ref(), &[0u8; 20]);
+    }
+
+    // #540: recovery is the "verify once on load" point — `scan_recovery` CRC-validated the whole chain,
+    // so every recovered SEALED segment is marked verified-resident, and the resumed active is not.
+    #[test]
+    fn verify_once_recovery_marks_recovered_sealed_segments() {
+        let mut log = open_mem(small_config());
+        for i in 0..7u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+
+        let log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        let active = log.active_segment_id();
+        for id in 0..active {
+            assert!(
+                log.is_verified_resident_segment(id),
+                "recovered sealed segment {id} is verified-once on load"
+            );
+        }
+        assert!(
+            !log.is_verified_resident_segment(active),
+            "the resumed active segment is not verified-resident"
+        );
+    }
+
+    // #540: eviction (the retirement chokepoint) CLEARS the verified-resident mark, and a subsequently
+    // RE-OPENED reader for that id is UNVERIFIED — the "reload re-verifies" edge that keeps a rotted
+    // reloaded byte catchable. A reader-cache shed alone would not clear it, but a real evict does.
+    #[test]
+    fn verify_once_eviction_clears_the_mark_so_a_reload_re_verifies() {
+        let mut log = open_mem(small_config());
+        for i in 0..8u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.is_verified_resident_segment(0));
+        // Touch segment 0 so a verified reader is cached, proving the flag rode onto the reader.
+        let reader = log.sealed_reader_for(0).unwrap();
+        assert!(
+            reader.is_verified_resident(),
+            "the cached reader for a verified segment is verified-resident"
+        );
+        drop(reader);
+
+        // Evict (retire) segment 0: the single chokepoint that reap/compaction/offload funnel through.
+        log.evict_segment_index(0);
+        assert!(
+            !log.is_verified_resident_segment(0),
+            "eviction clears the verified-resident mark"
+        );
+        // A freshly RE-OPENED reader for the evicted id is UNVERIFIED, so it re-verifies (full body CRC)
+        // — a reloaded segment is not trusted until re-verified.
+        let reopened = log.sealed_reader_for(0).unwrap();
+        assert!(
+            !reopened.is_verified_resident(),
+            "a reloaded segment's fresh reader re-verifies until re-marked"
+        );
     }
 
     #[test]

@@ -4393,6 +4393,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The DLQ inherits the main log's seek-by-time index density (#772); it is a pure
             // accelerator, harmless if never seeked by time.
             tindex_stride_records: config.log.tindex_stride_records,
+            // Inherit the main log's verify-once opt-out (#540): if the operator opts into
+            // always-verify, the DLQ's read path honors it too.
+            verify_always: config.log.verify_always,
         };
         // The dead-letter TARGET subdirs (#551): the configured dead-letter EXCHANGE's ordered
         // target list, or the single default fixed `dlq/` (byte-identical to today) when none is
@@ -4569,6 +4572,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             daily_physical_write_budget_bytes: 0,
             // Inherit the main log's seek-by-time index density (#772); a pure, harmless accelerator.
             tindex_stride_records: config.log.tindex_stride_records,
+            // Inherit the main log's verify-once opt-out (#540).
+            verify_always: config.log.verify_always,
         };
         let txn = if Self::txn_dir_exists(&log) {
             Some(TxnStore::open(

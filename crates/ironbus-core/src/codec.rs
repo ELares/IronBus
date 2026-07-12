@@ -723,7 +723,7 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
 /// [`DecodeError::Truncated`] means more bytes may complete the frame; the other
 /// variants mean the frame is corrupt and must be skipped by recovery.
 pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
-    let (view, _subject, _tag, total) = decode_inner(input)?;
+    let (view, _subject, _tag, total) = decode_inner(input, true)?;
     Ok((view, total))
 }
 
@@ -736,7 +736,37 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
 /// # Errors
 /// Same as [`decode`], plus [`DecodeError::BadSubjectCrc`] if the stored subject's own CRC fails.
 pub fn decode_with_subject(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
-    let (view, subject, _tag, total) = decode_inner(input)?;
+    let (view, subject, _tag, total) = decode_inner(input, true)?;
+    Ok((view, subject, total))
+}
+
+/// Decodes one record frame like [`decode_with_subject`] but SKIPS the redundant body CRC32C (and
+/// xxh3-64) recompute, for the verify-once read fast-path (#540, M1-I4): the storage layer calls this
+/// ONLY for a segment whose body integrity was ALREADY proven this process and that has stayed
+/// continuously resident since (self-written and never round-tripped through a disk read, or
+/// CRC-validated on load/recovery/cold-restore and not evicted since), so re-CRC-ing the same trusted
+/// bytes on every read is pure wasted CPU.
+///
+/// This does NOT weaken the end-to-end guarantee. Every OTHER integrity check still runs — magic,
+/// version, header CRC32C, the stream-tag CRC, the subject CRC, and the `total_len` structural check —
+/// and the frame's stored `body_crc` is UNCHANGED on disk, so a client still verifies the body
+/// end-to-end from the same field. Only the SERVER-side per-read recompute of that field is skipped.
+///
+/// SAFETY CONTRACT: a wrong skip serves corrupt bytes silently. The caller MUST have established the
+/// verified-resident predicate; the DEFAULT read path, ALL recovery, and EVERY encrypted frame
+/// (whose AEAD tag is always verified) use the full [`decode_with_subject`] instead. There is
+/// deliberately NO trusted variant of [`decode_encrypted`] — an encrypted read always AEAD-verifies.
+///
+/// # Errors
+/// Same STRUCTURAL variants as [`decode_with_subject`] ([`DecodeError::Truncated`],
+/// [`DecodeError::BadMagic`], [`DecodeError::UnsupportedVersion`], [`DecodeError::BadHeaderCrc`],
+/// [`DecodeError::BadStreamTagCrc`], [`DecodeError::BadSubjectCrc`], [`DecodeError::BadLength`],
+/// [`DecodeError::TooLarge`], [`DecodeError::Encrypted`]); it NEVER returns [`DecodeError::BadBodyCrc`]
+/// or [`DecodeError::BadXxh3`] because those checks are intentionally skipped.
+pub fn decode_with_subject_trusted(
+    input: &[u8],
+) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
+    let (view, subject, _tag, total) = decode_inner(input, false)?;
     Ok((view, subject, total))
 }
 
@@ -749,7 +779,7 @@ pub fn decode_with_subject(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize
 /// # Errors
 /// Same as [`decode`], plus [`DecodeError::BadStreamTagCrc`] if the stored tag's own CRC fails.
 pub fn decode_with_stream_tag(input: &[u8]) -> Result<(RecordView<'_>, &[u8], usize), DecodeError> {
-    let (view, _subject, tag, total) = decode_inner(input)?;
+    let (view, _subject, tag, total) = decode_inner(input, true)?;
     Ok((view, tag, total))
 }
 
@@ -856,14 +886,21 @@ pub fn decode_encrypted(input: &[u8]) -> Result<(EncryptedRecordView<'_>, usize)
     Ok((view, total))
 }
 
-/// The shared decoder behind [`decode`], [`decode_with_subject`], and [`decode_with_stream_tag`].
-/// Validates the whole frame (header CRC, stream-tag CRC if present, subject CRC if present, body CRC,
-/// xxh3 if present) and returns the view, the stored subject slice (empty when the record carries
-/// none), the stored stream-tag slice (empty when the record carries none), and the consumed byte
-/// count. The stream tag and subject are mutually exclusive, so at most one of the two returned slices
-/// is non-empty.
+/// The shared decoder behind [`decode`], [`decode_with_subject`], [`decode_with_subject_trusted`], and
+/// [`decode_with_stream_tag`]. Validates the whole frame (header CRC, stream-tag CRC if present,
+/// subject CRC if present, and — when `verify_body` — the body CRC32C plus the xxh3-64 if present) and
+/// returns the view, the stored subject slice (empty when the record carries none), the stored
+/// stream-tag slice (empty when the record carries none), and the consumed byte count. The stream tag
+/// and subject are mutually exclusive, so at most one of the two returned slices is non-empty.
+///
+/// `verify_body` gates ONLY the body checksums (the CRC32C over `key ++ headers ++ payload` and its
+/// xxh3-64 companion): `true` for every ordinary/untrusted decode (the recompute the readers have
+/// always done), `false` for the verify-once trusted read fast-path (#540) where the body was proven
+/// once while the segment is verified-resident. All the STRUCTURAL and framing checks (magic, version,
+/// header CRC, tag/subject CRC, and the `total_len` trailer check) ALWAYS run, so `verify_body == false`
+/// never admits a mis-framed frame — it only trusts the already-verified body bytes.
 #[allow(clippy::too_many_lines)]
-fn decode_inner(input: &[u8]) -> Result<DecodedFrame<'_>, DecodeError> {
+fn decode_inner(input: &[u8], verify_body: bool) -> Result<DecodedFrame<'_>, DecodeError> {
     if input.len() < RECORD_HEADER_LEN {
         return Err(DecodeError::Truncated);
     }
@@ -1031,20 +1068,32 @@ fn decode_inner(input: &[u8]) -> Result<DecodedFrame<'_>, DecodeError> {
     let body = &input[body_start..body_start + body_len];
     let xxh3_bytes = &input[body_start + body_len..body_start + body_len + xxh3_field];
     let trailer = &input[total - RECORD_TRAILER_LEN..total];
-    let stored_body_crc = read_u32(trailer, 0);
+    // The `total_len` trailer check is a STRUCTURAL/framing check (it validates the frame's own claimed
+    // length against the size derived from the header lengths), so it ALWAYS runs — even on the trusted
+    // read fast-path — because a mis-framed frame must never be admitted regardless of body trust.
     if u64::from(read_u32(trailer, 4)) != total64 {
         return Err(DecodeError::BadLength);
     }
-    // CRC32C is the resync-gating checksum: verify it first. Only a body that passes
-    // CRC32C is then checked against the independent xxh3-64, so a corruption the CRC
-    // catches is always reported as BadBodyCrc, never BadXxh3.
-    if crc32c::crc32c(body) != stored_body_crc {
-        return Err(DecodeError::BadBodyCrc);
-    }
-    if flags.contains(RecordFlags::HAS_XXH3) {
-        let stored_xxh3 = read_u64(xxh3_bytes, 0);
-        if xxh3_64(body) != stored_xxh3 {
-            return Err(DecodeError::BadXxh3);
+    // Verify-once (#540): the body CRC32C (and its xxh3-64 companion) are the ONLY checks gated by
+    // `verify_body`. They are skipped ONLY on the verify-once trusted read fast-path
+    // ([`decode_with_subject_trusted`]), where the storage layer has proven this body's integrity while
+    // the segment is verified-resident and re-CRC-ing the same trusted bytes on every read is wasted
+    // CPU. The stored `body_crc` field is untouched on disk (a client still verifies end-to-end); only
+    // the server-side per-read recompute is elided. Every default/recovery/encrypted decode passes
+    // `verify_body == true` and recomputes as before.
+    if verify_body {
+        let stored_body_crc = read_u32(trailer, 0);
+        // CRC32C is the resync-gating checksum: verify it first. Only a body that passes
+        // CRC32C is then checked against the independent xxh3-64, so a corruption the CRC
+        // catches is always reported as BadBodyCrc, never BadXxh3.
+        if crc32c::crc32c(body) != stored_body_crc {
+            return Err(DecodeError::BadBodyCrc);
+        }
+        if flags.contains(RecordFlags::HAS_XXH3) {
+            let stored_xxh3 = read_u64(xxh3_bytes, 0);
+            if xxh3_64(body) != stored_xxh3 {
+                return Err(DecodeError::BadXxh3);
+            }
         }
     }
 
@@ -1881,6 +1930,86 @@ mod tests {
             Err(DecodeError::Truncated)
         );
         assert_eq!(decode_encrypted(&buf[..10]), Err(DecodeError::Truncated));
+    }
+
+    // #540 verify-once: the trusted decoder SKIPS the body CRC, so a body byte corrupted in memory is
+    // served without error, while the ordinary decoder catches the SAME corruption as `BadBodyCrc`.
+    // This is the load-bearing proof that the fast-path elides exactly the body recompute.
+    #[test]
+    fn trusted_decode_skips_a_corrupt_body_that_full_decode_catches() {
+        let mut buf = sample();
+        // Flip a byte inside the record body (past the 32-byte header, well before the trailer).
+        let body_byte = RECORD_HEADER_LEN + 3;
+        buf[body_byte] ^= 0x01;
+
+        // The ordinary read path recomputes the body CRC and rejects the corruption.
+        assert_eq!(decode_with_subject(&buf), Err(DecodeError::BadBodyCrc));
+        assert_eq!(decode(&buf), Err(DecodeError::BadBodyCrc));
+
+        // The verify-once trusted path skips the body CRC: it returns the frame (with the corrupted
+        // payload byte) and consumes the whole frame, proving the recompute was elided.
+        let (view, subject, consumed) =
+            decode_with_subject_trusted(&buf).expect("trusted decode skips the body CRC");
+        assert_eq!(consumed, buf.len());
+        assert!(subject.is_empty());
+        // The corrupted payload is served verbatim (the whole point of the skip): the last payload
+        // byte differs from the pristine `hello`.
+        assert_eq!(view.key, b"k");
+        assert_eq!(view.headers, b"h");
+        assert_ne!(view.payload, b"hello");
+    }
+
+    // #540: skipping the body CRC must NOT weaken any STRUCTURAL/framing check. A corrupt header CRC
+    // and a corrupt `total_len` trailer are both still caught on the trusted path.
+    #[test]
+    fn trusted_decode_still_enforces_structural_integrity() {
+        // (a) Header corruption: flip a byte inside the CRC-protected header (the seq field at off 4).
+        let mut hdr_bad = sample();
+        hdr_bad[off::SEQ] ^= 0x01;
+        assert_eq!(
+            decode_with_subject_trusted(&hdr_bad),
+            Err(DecodeError::BadHeaderCrc),
+            "trusted decode still verifies the header CRC"
+        );
+
+        // (b) Framing corruption: flip a byte in the `total_len` trailer (the last 4 bytes). The
+        // total-len structural check runs regardless of body trust.
+        let mut len_bad = sample();
+        let n = len_bad.len();
+        len_bad[n - 1] ^= 0x01;
+        assert_eq!(
+            decode_with_subject_trusted(&len_bad),
+            Err(DecodeError::BadLength),
+            "trusted decode still enforces the total_len framing check"
+        );
+
+        // (c) An ENCRYPTED frame is refused by the (plaintext) trusted decoder exactly as by `decode`,
+        // so the trusted fast-path can never be pointed at ciphertext.
+        let mut enc = sample();
+        enc[off::FLAGS] |= RecordFlags::ENCRYPTED.bits();
+        // Re-seal the header CRC so we reach the flags gate rather than the header-CRC gate.
+        let crc = crc32c::crc32c(&enc[RECORD_HEADER_CRC_RANGE]);
+        enc[off::HEADER_CRC..off::HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            decode_with_subject_trusted(&enc),
+            Err(DecodeError::Encrypted),
+            "the plaintext trusted decoder refuses an encrypted frame"
+        );
+    }
+
+    // #540: on a CLEAN frame the trusted and full decoders return an identical view — the skip changes
+    // nothing observable when the bytes are intact.
+    #[test]
+    fn trusted_decode_matches_full_decode_on_a_clean_frame() {
+        let buf = sample();
+        let (full, full_sub, full_n) = decode_with_subject(&buf).unwrap();
+        let (trusted, trusted_sub, trusted_n) = decode_with_subject_trusted(&buf).unwrap();
+        assert_eq!(full_n, trusted_n);
+        assert_eq!(full_sub, trusted_sub);
+        assert_eq!(full.key, trusted.key);
+        assert_eq!(full.headers, trusted.headers);
+        assert_eq!(full.payload, trusted.payload);
+        assert_eq!(full.seq, trusted.seq);
     }
 }
 

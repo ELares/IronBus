@@ -1595,6 +1595,21 @@ pub struct SegmentReader<F: RandomAccessFile> {
     file: F,
     header: SegmentHeader,
     file_len: u64,
+    /// Verify-once (#540, M1-I4): `true` when this reader's segment is VERIFIED-RESIDENT — its body
+    /// integrity was ALREADY proven this process (self-written and never round-tripped through a disk
+    /// read, or CRC-validated on load/recovery/cold-restore) AND it has stayed continuously resident
+    /// since — so the consume read fast-path ([`SegmentReader::scan_range`]) may skip the redundant
+    /// per-read body CRC32C recompute for a PLAINTEXT segment. `false` (the default from
+    /// [`SegmentReader::open`]) means every read fully re-validates, so an untrusted, recovered-but-not-
+    /// yet-marked, or freshly-RELOADED (a fresh reader after evict) segment always catches corruption.
+    /// The flag lives on the reader, so dropping the reader on evict/reload clears it for free; a fresh
+    /// reader re-derives it from the resident set. It NEVER affects an encrypted read (whose AEAD tag is
+    /// always verified) — those take `scan_range`'s decrypt branch, which ignores this flag.
+    verified_resident: bool,
+    /// Verify-always opt-out (#540, tunability): when `true` (from [`LogConfig::verify_always`]), the
+    /// body CRC is recomputed on EVERY read even for a verified-resident segment, restoring the
+    /// pre-#540 always-verify behavior for the paranoid. Default `false` (verify-once).
+    verify_always: bool,
     /// The at-rest AEAD parameters `(aead_suite_id, key_id)` read from the header at open, or `None`
     /// for a plaintext segment (#780). Behind the `encryption` feature.
     #[cfg(feature = "encryption")]
@@ -1629,6 +1644,11 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             file,
             header,
             file_len,
+            // A freshly-opened reader is UNVERIFIED: it always fully re-validates until a caller that has
+            // established the verified-resident predicate stamps it via `with_verified_resident`. This
+            // fail-closed default is what makes a RELOADED segment (a fresh reader after evict) re-verify.
+            verified_resident: false,
+            verify_always: false,
             #[cfg(feature = "encryption")]
             aead,
             #[cfg(feature = "encryption")]
@@ -1640,6 +1660,40 @@ impl<F: RandomAccessFile> SegmentReader<F> {
     #[must_use]
     pub fn header(&self) -> &SegmentHeader {
         &self.header
+    }
+
+    /// Marks this reader VERIFIED-RESIDENT (#540): the consume read fast-path may skip the redundant
+    /// per-read body CRC recompute for a PLAINTEXT segment. The caller MUST have established the
+    /// predicate (self-written this process, or CRC-validated on load/recovery/cold-restore, and
+    /// continuously resident since); see [`SegmentReader::verified_resident`]. Chained at reader
+    /// construction, before the reader is shared as an `Arc`. A wrong stamp serves corrupt data
+    /// silently, so this is called ONLY from the resident-reader open sites for a known-verified id.
+    #[must_use]
+    pub fn with_verified_resident(mut self, verified: bool) -> SegmentReader<F> {
+        self.verified_resident = verified;
+        self
+    }
+
+    /// Sets the verify-always opt-out (#540, [`LogConfig::verify_always`]): when `true`, the body CRC is
+    /// recomputed on EVERY read even for a verified-resident segment. Chained at reader construction.
+    #[must_use]
+    pub fn with_verify_always(mut self, verify_always: bool) -> SegmentReader<F> {
+        self.verify_always = verify_always;
+        self
+    }
+
+    /// Whether this reader is currently verified-resident (#540). For tests and the read-plane wiring.
+    #[must_use]
+    pub fn is_verified_resident(&self) -> bool {
+        self.verified_resident
+    }
+
+    /// Whether the consume read fast-path may SKIP the per-read body CRC recompute for this segment
+    /// (#540): only when the reader is verified-resident AND the verify-always opt-out is off. The
+    /// encrypted read path never consults this — it always AEAD-verifies.
+    #[must_use]
+    fn skip_body_crc(&self) -> bool {
+        self.verified_resident && !self.verify_always
     }
 
     /// Opens a segment WITH a loaded key ring so [`SegmentReader::scan_decrypted`] can decrypt an
@@ -2426,13 +2480,29 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         if let Some((suite, key_id)) = self.aead_read_params()? {
             return self.scan_range_decrypted(&body, start_offset, max, max_bytes, suite, key_id);
         }
+        // Verify-once (#540): when this segment is VERIFIED-RESIDENT (its body integrity was already
+        // proven this process and it has stayed resident since) and the verify-always opt-out is off,
+        // the consume read fast-path DECODES WITH THE BODY CRC SKIPPED. Every structural/framing check
+        // still runs, and the stored `body_crc` is untouched on disk (a client verifies end-to-end); we
+        // only elide the redundant server-side recompute of already-trusted bytes. An unverified,
+        // freshly-reloaded, or opt-out reader takes the full-CRC branch and still catches corruption.
+        // NOTE: this is the PLAINTEXT loop only — an encrypted segment returned above via
+        // `scan_range_decrypted`, which always AEAD-verifies and never consults `skip_body_crc`.
+        let skip_body_crc = self.skip_body_crc();
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
         let mut byte_total = 0usize;
         let mut next_offset = start_offset.get();
         while cursor < body.len() && records.len() < max {
-            // The SAME CRC-gated decode `scan_body` uses: a torn or corrupt frame ends the prefix.
-            let Ok((view, subject, consumed)) = codec::decode_with_subject(&body[cursor..]) else {
+            // The SAME CRC-gated decode `scan_body` uses (or its body-CRC-skipping trusted sibling on
+            // the verify-once fast-path): a torn or corrupt frame ends the prefix. Both variants run
+            // every structural check, so a mis-framed frame is still rejected here identically.
+            let decoded = if skip_body_crc {
+                codec::decode_with_subject_trusted(&body[cursor..])
+            } else {
+                codec::decode_with_subject(&body[cursor..])
+            };
+            let Ok((view, subject, consumed)) = decoded else {
                 break;
             };
             // Byte cap: stop BEFORE a record that would push the accumulated encoded frame bytes
@@ -3823,6 +3893,134 @@ mod tests {
         assert!(got.is_empty(), "a corrupt seeked frame is never returned");
     }
 
+    /// Builds a two-record segment, then corrupts the SECOND record's body byte in place and returns
+    /// the file, the second record's frame position, and the valid end — the exact fixture the #540
+    /// verify-once tests read through a verified vs unverified reader.
+    fn segment_with_corrupt_second_body() -> (Arc<InMemoryFile>, u64, u64) {
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"first")).unwrap();
+        let second_pos = w.write_pos();
+        w.append(&rec(1, b"second")).unwrap();
+        let valid_end = w.write_pos();
+        w.sync().unwrap();
+        // Corrupt the SECOND record's body in place; the frame's stored body_crc field is UNTOUCHED, so
+        // a client that recomputes the CRC still detects the corruption end-to-end.
+        let mut bytes = file.snapshot();
+        let body_byte = usize::try_from(second_pos + RECORD_HEADER_LEN as u64 + 1).unwrap();
+        bytes[body_byte] ^= 0x01;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        (file, second_pos, valid_end)
+    }
+
+    /// #540 verify-once, the load-bearing storage proof: a VERIFIED-RESIDENT reader SKIPS the per-read
+    /// body CRC, so it SERVES a body that was corrupted in memory (the frame's own CRC field is intact,
+    /// so a downstream client still catches it); an UNVERIFIED reader over the SAME bytes still catches
+    /// it and ends the prefix; and the verify-always opt-out re-verifies even a verified-resident
+    /// reader. This is the corrupt-in-memory-byte proof the issue asks for.
+    #[test]
+    fn verified_resident_scan_range_skips_body_crc_but_unverified_and_opt_out_still_catch_it() {
+        let (file, second_pos, valid_end) = segment_with_corrupt_second_body();
+
+        // (1) UNVERIFIED (the default, e.g. a freshly-RELOADED reader after evict): the body CRC is
+        // recomputed, the corruption is caught, and the seeked prefix ends before the bad frame.
+        let unverified = SegmentReader::open(Arc::clone(&file)).unwrap();
+        assert!(!unverified.is_verified_resident());
+        let got = unverified
+            .scan_from(second_pos, Offset::new(1), valid_end, 10)
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "an unverified reader re-verifies and rejects the corrupt frame"
+        );
+
+        // (2) VERIFIED-RESIDENT (self-written / verified-on-load, resident since): the body CRC is
+        // SKIPPED, so the corrupted second record is served verbatim (payload no longer equals
+        // `second`) — proving the recompute was elided on the trusted fast-path.
+        let verified = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .with_verified_resident(true);
+        assert!(verified.is_verified_resident());
+        let got = verified
+            .scan_from(second_pos, Offset::new(1), valid_end, 10)
+            .unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "the verified reader skips the CRC and serves it"
+        );
+        assert_eq!(got[0].offset, Offset::new(1));
+        assert_ne!(
+            got[0].payload.as_ref(),
+            b"second",
+            "the corrupted body was served without a CRC check"
+        );
+
+        // (3) verify-always opt-out: even a verified-resident reader recomputes on every read, so the
+        // corruption is caught again — the tunable escape hatch for the paranoid.
+        let paranoid = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .with_verified_resident(true)
+            .with_verify_always(true);
+        let got = paranoid
+            .scan_from(second_pos, Offset::new(1), valid_end, 10)
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "verify-always re-verifies every read even when verified-resident"
+        );
+    }
+
+    /// #540: skipping the body CRC must NOT weaken structural integrity. A corrupt record HEADER (whose
+    /// own CRC is always checked) still ends the prefix even for a verified-resident reader, and a
+    /// verified read of an INTACT segment returns exactly what a full read returns.
+    #[test]
+    fn verified_resident_still_enforces_header_crc_and_is_identical_on_intact_bytes() {
+        // A corrupt second-record HEADER byte (seq field, inside the header-CRC range) is caught even
+        // when verified-resident: the header CRC is not part of the verify-once skip.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"first")).unwrap();
+        let second_pos = w.write_pos();
+        w.append(&rec(1, b"second")).unwrap();
+        let valid_end = w.write_pos();
+        w.sync().unwrap();
+        let mut bytes = file.snapshot();
+        // Byte offset 4 within the frame header is the seq field, inside the 0..32 header-CRC range.
+        let header_byte = usize::try_from(second_pos + 4).unwrap();
+        bytes[header_byte] ^= 0x01;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        let verified = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .with_verified_resident(true);
+        let got = verified
+            .scan_from(second_pos, Offset::new(1), valid_end, 10)
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "a corrupt header ends the prefix even for a verified-resident reader"
+        );
+
+        // On INTACT bytes a verified read is byte-identical to a full read (the skip changes nothing).
+        let clean = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&clean), header()).unwrap();
+        for i in 0..5u64 {
+            w.append(&rec(i, &[u8::try_from(i).unwrap(); 9])).unwrap();
+        }
+        let clean_end = w.write_pos();
+        w.sync().unwrap();
+        let full = SegmentReader::open(Arc::clone(&clean)).unwrap();
+        let full_recs = full.scan_from(SEGMENT_HEADER_LEN as u64, Offset::new(0), clean_end, 10);
+        let verified = SegmentReader::open(Arc::clone(&clean))
+            .unwrap()
+            .with_verified_resident(true);
+        let verified_recs =
+            verified.scan_from(SEGMENT_HEADER_LEN as u64, Offset::new(0), clean_end, 10);
+        assert_eq!(full_recs.unwrap(), verified_recs.unwrap());
+    }
+
     #[test]
     fn scan_from_respects_max_and_empty_bounds() {
         let file = Arc::new(InMemoryFile::new());
@@ -4836,6 +5034,72 @@ mod tests {
                     // The materialized record is plaintext downstream (ENCRYPTED bit cleared).
                     assert!(!recs[i].flags.contains(RecordFlags::ENCRYPTED));
                 }
+            }
+        }
+
+        // #540 + #780: verify-once must NEVER skip an encrypted segment's integrity. An encrypted read
+        // takes the decrypt branch of `scan_range`, which always verifies the CRC over the on-disk
+        // ciphertext + tag AND AEAD-verifies the tag — it does NOT consult the verify-once skip. So even
+        // a reader explicitly marked verified-resident (a) still decrypts correctly and (b) still catches
+        // a corrupted ciphertext/tag, identically to an unverified reader.
+        #[test]
+        fn verify_once_never_skips_encrypted_integrity() {
+            let file = Arc::new(InMemoryFile::new());
+            let mut w = SegmentWriter::create_encrypted(
+                Arc::clone(&file),
+                enc_header(2, 0),
+                crypto(AeadSuite::Aes256Gcm, 7, 0xCD),
+            )
+            .unwrap();
+            w.append(&rec(0, b"first")).unwrap();
+            let second_pos = w.write_pos();
+            w.append(&rec(1, b"second")).unwrap();
+            let valid_end = w.write_pos();
+            w.seal().unwrap();
+
+            let mut ring = KeyRing::new();
+            ring.insert(7, key(0xCD));
+            let ring = Arc::new(ring);
+
+            // (a) A VERIFIED-RESIDENT encrypted reader STILL decrypts correctly on the consume fast-path
+            // (`scan_range`): the AEAD ran; the flag did not bypass it.
+            let clean = SegmentReader::open_with_keyring(Arc::clone(&file), Arc::clone(&ring))
+                .unwrap()
+                .with_verified_resident(true);
+            let recs = clean
+                .scan_range(
+                    SEGMENT_HEADER_LEN as u64,
+                    Offset::new(0),
+                    valid_end,
+                    10,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(recs.len(), 2);
+            assert_eq!(recs[0].payload.as_ref(), b"first");
+            assert_eq!(recs[1].payload.as_ref(), b"second");
+
+            // (b) Corrupt the SECOND encrypted record's on-disk body (ciphertext + tag). Even a
+            // VERIFIED-RESIDENT reader catches it on `scan_range` — the encrypted path always verifies
+            // (CRC over ciphertext+tag, then AEAD), so the corrupt frame is never served as garbage.
+            let mut bytes = file.snapshot();
+            let body_byte = usize::try_from(second_pos + RECORD_HEADER_LEN as u64 + 1).unwrap();
+            bytes[body_byte] ^= 0x01;
+            file.set_len(0).unwrap();
+            file.write_all_at(&bytes, 0).unwrap();
+            let verified = SegmentReader::open_with_keyring(Arc::clone(&file), Arc::clone(&ring))
+                .unwrap()
+                .with_verified_resident(true);
+            let got = verified.scan_range(second_pos, Offset::new(1), valid_end, 10, None);
+            match got {
+                // The CRC over the ciphertext + tag caught it: the prefix ends, nothing is served.
+                Ok(v) => assert!(
+                    v.is_empty(),
+                    "a verified-resident reader must NOT serve a corrupt encrypted frame"
+                ),
+                // Or the AEAD tag verify caught it: a reported decrypt error, never silent garbage.
+                Err(StorageError::Decrypt(_)) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
             }
         }
 

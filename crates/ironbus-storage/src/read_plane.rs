@@ -173,6 +173,14 @@ pub(crate) struct SealedSegment {
     /// read-forward upper bound, so a seek never materializes the trailing footer as a record. For a
     /// sealed segment the whole region is durable, so this is the segment's full `valid_end`.
     pub(crate) valid_end: u64,
+    /// Verify-once (#540): `true` when this segment is VERIFIED-RESIDENT in the `Log` (self-written,
+    /// recovered clean, or cold-restored, and not evicted since), so the off-actor read fast-path may
+    /// skip the redundant per-read body-CRC recompute for it. Cloned by value from the `Log`'s resident
+    /// set when the snapshot is built (`build_sealed_descriptor`); a fresh snapshot on every seal/reap
+    /// re-derives it, so it stays in lockstep with the through-actor set. `false` for a remote/compacted
+    /// slot (this plane does not serve those). A reader opened for a `verified: false` slot fully
+    /// re-validates — the fail-closed default.
+    pub(crate) verified: bool,
 }
 
 impl SealedSegment {
@@ -247,6 +255,10 @@ pub(crate) struct SealedSnapshot<F: Filesystem> {
     /// The first offset NOT covered by any sealed segment (the active segment's base): a read at or
     /// above it is entirely in the active tail and falls back to the actor.
     sealed_end: u64,
+    /// Verify-once opt-out (#540, [`LogConfig::verify_always`]), captured from the `Log`'s config when
+    /// the snapshot is published. When `true`, an off-actor reader recomputes the body CRC on every
+    /// read even for a verified-resident segment. Default `false` (verify-once).
+    verify_always: bool,
 }
 
 /// The outcome of a [`SealedSnapshot::read_range`]: the records served from the sealed prefix, plus
@@ -295,6 +307,7 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         segments: Vec<SealedSegment>,
         oldest: u64,
         sealed_end: u64,
+        verify_always: bool,
     ) -> SealedSnapshot<F> {
         let readers = SlotReaders::empty(segments.len());
         SealedSnapshot {
@@ -303,6 +316,7 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
             readers,
             oldest,
             sealed_end,
+            verify_always,
         }
     }
 
@@ -319,9 +333,17 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
         if let Some(reader) = self.readers.slots[i].get() {
             return Ok(Arc::clone(reader));
         }
-        let opened = Arc::new(SegmentReader::open(
-            self.fs.open(&segment_file_name(slot.id))?,
-        )?);
+        // Verify-once (#540): stamp the fresh reader verified-resident from the slot descriptor (cloned
+        // from the `Log`'s resident set when this snapshot was built) and thread the verify-always
+        // opt-out, so the off-actor read fast-path skips the redundant per-read body-CRC recompute for a
+        // trusted, resident, plaintext segment. A `verified: false` slot (or the opt-out) fully
+        // re-validates. The whole snapshot (and thus this trust) is rebuilt on every seal/reap, so an
+        // evicted/offloaded segment is never served as verified from a stale snapshot.
+        let opened = Arc::new(
+            SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
+                .with_verified_resident(slot.verified)
+                .with_verify_always(self.verify_always),
+        );
         // Cache only while under the per-generation cap (the resident-fd bound). Past it, return the fresh
         // open UNCACHED — a per-read open exactly as before #808 — so a cold full backfill can't pin one
         // fd per sealed segment. `opened < cap` is a soft check (concurrent openers may exceed it by the
@@ -700,11 +722,16 @@ impl<F: crate::fs::Filesystem> ReadPlane<F> {
         segments: Vec<SealedSegment>,
         oldest: u64,
         sealed_end: u64,
+        verify_always: bool,
     ) -> ReadPlane<F> {
         ReadPlane {
             flushed: Arc::new(AtomicU64::new(flushed)),
             sealed: Arc::new(ArcSwap::from_pointee(SealedSnapshot::new(
-                fs, segments, oldest, sealed_end,
+                fs,
+                segments,
+                oldest,
+                sealed_end,
+                verify_always,
             ))),
         }
     }
@@ -718,10 +745,15 @@ impl<F: crate::fs::Filesystem> ReadPlane<F> {
         segments: Vec<SealedSegment>,
         oldest: u64,
         sealed_end: u64,
+        verify_always: bool,
     ) {
         let fs = Arc::clone(&self.sealed.load().fs);
         self.sealed.store(Arc::new(SealedSnapshot::new(
-            fs, segments, oldest, sealed_end,
+            fs,
+            segments,
+            oldest,
+            sealed_end,
+            verify_always,
         )));
     }
 
@@ -1201,9 +1233,9 @@ mod tests {
         // A reader that observes frontier F must see sealed_end >= F. We assert the publish helper
         // upholds it: store the snapshot (sealed_end = N) THEN the frontier (F = N).
         let fs = Arc::new(InMemoryFs::new());
-        let plane: ReadPlane<InMemoryFs> = ReadPlane::new(fs, 0, Vec::new(), 0, 0);
+        let plane: ReadPlane<InMemoryFs> = ReadPlane::new(fs, 0, Vec::new(), 0, 0, false);
         // The writer's publish order: snapshot (sealed_end = 64) FIRST, then frontier (64).
-        plane.republish_sealed(Vec::new(), 0, 64);
+        plane.republish_sealed(Vec::new(), 0, 64, false);
         plane.publish_flushed(64);
         // The reader's observe order: frontier first, then snapshot.
         let f = plane.flushed();
