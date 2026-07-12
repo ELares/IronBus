@@ -142,10 +142,13 @@ use ironbus_core::delivery::DeliveryConfig;
 use ironbus_core::lease::LeaseConfig;
 #[cfg(unix)]
 use ironbus_core::types::RecordFlags;
+// `AppendShards` + `resolve_append_shards` (#811) are platform-neutral PURE logic (no Unix
+// dependency): the `--append-shards` flag is parsed and validated on EVERY platform inside the
+// cross-platform serve-flags parser, exactly like `DurabilityLevelArg`/`StorageModeArg`. Only the
+// actual actor SPAWN (`spawn_actor_with_gather`, `DEFAULT_CHANNEL_BOUND`) is Unix-only.
+use ironbus_server::actor::{resolve_append_shards, AppendShards};
 #[cfg(unix)]
-use ironbus_server::actor::{
-    resolve_append_shards, spawn_actor_with_gather, AppendShards, DEFAULT_CHANNEL_BOUND,
-};
+use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
 #[cfg(unix)]
 use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConfig};
 #[cfg(unix)]
@@ -530,10 +533,10 @@ impl StorageModeArg {
         }
     }
 
-    /// The engine-side [`ironbus_storage::shared_wal::StorageMode`] this flag selects. Unix-gated
-    /// like its only caller (`open_engine_with`, the broker's engine-open path): on non-Unix the
-    /// serve path does not build, so this mapping would be dead code there.
-    #[cfg(unix)]
+    /// The engine-side [`ironbus_storage::shared_wal::StorageMode`] this flag selects. Platform-neutral
+    /// (like `as_str`): the cross-platform serve-flags parser calls it to resolve the append-shard
+    /// count against the storage mode (#811, the shared-WAL-cannot-shard guard), and the Unix
+    /// engine-open path (`open_engine_with`) calls it too — so it is used on every platform.
     fn to_engine(self) -> ironbus_storage::shared_wal::StorageMode {
         match self {
             StorageModeArg::PerStream => ironbus_storage::shared_wal::StorageMode::PerStreamLogs,

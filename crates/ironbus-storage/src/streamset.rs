@@ -348,7 +348,9 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         clock: C,
         config: LogConfig,
     ) -> Result<OpenedStreamSet<F, C>, StorageError> {
-        Self::open_inner(fs, clock, config, AtRestCrypto::default())
+        // The unfiltered open = every named stream on disk (`|_| true`), which is exactly the
+        // single-shard broker's set. Byte-for-byte the historical single-log/StreamSet open.
+        Self::open_inner(fs, clock, config, AtRestCrypto::default(), |_| true)
     }
 
     /// Opens (recovering, or creating fresh) the whole stream set with LIVE at-rest AEAD encryption
@@ -367,7 +369,13 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         crypto: Option<std::sync::Arc<crate::crypto::SegmentCrypto>>,
         keyring: Option<std::sync::Arc<crate::crypto::KeyRing>>,
     ) -> Result<OpenedStreamSet<F, C>, StorageError> {
-        Self::open_inner(fs, clock, config, AtRestCrypto::new(crypto, keyring))
+        Self::open_inner(
+            fs,
+            clock,
+            config,
+            AtRestCrypto::new(crypto, keyring),
+            |_| true,
+        )
     }
 
     /// Opens the whole stream set with a pre-built [`AtRestCrypto`] context (#780 phase 3, the serve
@@ -386,16 +394,60 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         config: LogConfig,
         at_rest: AtRestCrypto,
     ) -> Result<OpenedStreamSet<F, C>, StorageError> {
-        Self::open_inner(fs, clock, config, at_rest)
+        Self::open_inner(fs, clock, config, at_rest, |_| true)
     }
 
-    /// The shared body behind [`StreamSet::open`] and [`StreamSet::open_encrypted`]: opens every
-    /// stream's log with the SAME at-rest context.
-    fn open_inner(
+    /// Opens ONE APPEND SHARD's slice of the stream set (#811, C7 — the recovery partition): the
+    /// DEFAULT stream `""` root log PLUS only those NAMED streams under `streams/<hex(name)>/` for
+    /// which `should_open(name)` is `true`. A shard passes `|name| shard_of(name, K) == shard_index`,
+    /// so each shard recovers ONLY the named streams it owns, in parallel, with per-stream isolation
+    /// fully preserved — a torn segment in one shard's stream cannot touch a stream a sibling shard
+    /// owns. The union of every shard's `should_open` subset is the whole on-disk named set, so no
+    /// stream is dropped and none is double-opened (`shard_of` is a total function into `0..K`).
+    ///
+    /// This is the storage primitive behind the append-actor sharding recovery plumbing; it is
+    /// deliberately AGNOSTIC to `shard_of` (which lives in the server crate), taking a plain name
+    /// predicate so the storage layer never depends on the routing hash. `shard_of` is recomputed at
+    /// every open and NEVER persisted, so the hash algorithm can change freely between runs — only its
+    /// stability WITHIN one boot matters, which a pure function of the name trivially gives.
+    ///
+    /// ## Inert at K = 1
+    /// With one append shard (the default and, until the owner-gated C8 flip, the only runtime mode)
+    /// the predicate is `|_| true` (shard 0 owns every stream), so this opens the FULL set exactly as
+    /// [`StreamSet::open_with_at_rest`] — byte-for-byte. The filter is applied to the cheap, already
+    /// sorted serial enumeration BEFORE the parallel per-stream open, so at K = 1 the parallel open
+    /// receives the identical stream list and produces the identical recovered map, summaries, and LRU.
+    ///
+    /// ## Coordinator-owned root + globals (scope)
+    /// The DEFAULT `""` root log is opened here unconditionally because at K = 1 the sole shard IS the
+    /// coordinator (shard 0). The K > 1 topology where a LEAN shard (index > 0) skips the root log and
+    /// the global checkpoints (producer-seq / counters / bindings / txn) — leaving those to the
+    /// coordinator so they open ONCE — is the owner-gated C6/C8 flip and is NOT done here.
+    ///
+    /// # Errors
+    /// As [`StreamSet::open_with_at_rest`]: a [`StorageError`] from opening/recovering any stream in
+    /// this shard's subset (including the fail-closed layout-version check on the root) or from
+    /// enumerating `streams/`.
+    pub fn open_with_at_rest_for_shard<P: Fn(&str) -> bool>(
         fs: &F,
         clock: C,
         config: LogConfig,
         at_rest: AtRestCrypto,
+        should_open: P,
+    ) -> Result<OpenedStreamSet<F, C>, StorageError> {
+        Self::open_inner(fs, clock, config, at_rest, should_open)
+    }
+
+    /// The shared body behind [`StreamSet::open`], [`StreamSet::open_encrypted`], and
+    /// [`StreamSet::open_with_at_rest_for_shard`]: opens the root default stream plus every NAMED
+    /// stream for which `should_open(name)` holds, all with the SAME at-rest context. The unsharded
+    /// opens pass `|_| true` (open every named stream), byte-for-byte the historical behavior.
+    fn open_inner<P: Fn(&str) -> bool>(
+        fs: &F,
+        clock: C,
+        config: LogConfig,
+        at_rest: AtRestCrypto,
+        should_open: P,
     ) -> Result<OpenedStreamSet<F, C>, StorageError> {
         let mut streams = BTreeMap::new();
         let mut recoveries = BTreeMap::new();
@@ -419,11 +471,19 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
             // any stray/foreign directory (not a canonical hex stream name) exactly as before — it
             // never opens as a stream and never shadows a real one. `list_subdirs` is already sorted,
             // so `named` is in a deterministic order.
+            //
+            // #811 C7 recovery partition: retain ONLY the named streams THIS shard owns
+            // (`should_open(name)`). The filter runs on the cheap serial enumeration, BEFORE the
+            // parallel per-stream open below, so per-stream isolation and the deterministic order are
+            // untouched; a shard opens (and recovers) exactly its `shard_of` subset and no sibling's
+            // stream. At K = 1 `should_open` is `|_| true`, so `named` is the full sorted list and the
+            // parallel open, recovered map, summaries, and LRU are byte-for-byte the historical set.
             let named: Vec<(StreamId, String)> = streams_fs
                 .list_subdirs()
                 .map_err(StorageError::Io)?
                 .into_iter()
                 .filter_map(|dir| parse_stream_subdir_name(&dir).map(|name| (StreamId(name), dir)))
+                .filter(|(id, _)| should_open(id.name()))
                 .collect();
             // Open every named stream's INDEPENDENT log at streams/<dir>/ in PARALLEL across a
             // bounded worker set (#822). Each open recovers over its own durable bytes alone: a torn
@@ -1746,6 +1806,150 @@ mod tests {
             assert_eq!(read.len(), read_b.len());
             assert_eq!(&*read[i].payload, &*read_b[i].payload);
         }
+    }
+
+    // ============= #811 C7: the append-shard RECOVERY PARTITION (inert at K = 1) =============
+    //
+    // `open_with_at_rest_for_shard` opens ONLY the named streams a shard owns. These tests prove the
+    // partition is exact (each shard opens precisely its predicate subset, per-stream isolation
+    // preserved), LOSSLESS (the union of every shard's subset is the whole on-disk set and the total
+    // recovered record count equals the pre-crash total), and byte-for-byte the unsharded open at
+    // K = 1. `shard_of` lives in the server crate; the storage primitive takes a bare name predicate,
+    // so the test mirrors the server's hash locally (same `DefaultHasher`, same `""`/K<=1 pins) to
+    // drive a realistic, TOTAL partition into `0..K`.
+
+    /// The storage twin of the server's `shard_of` (a NAMED stream hashes its name bytes with the same
+    /// `DefaultHasher`, and K <= 1 pins to shard 0), used ONLY to drive a realistic total partition in
+    /// these tests — the storage crate itself never knows the routing hash.
+    fn shard_of_name(name: &str, shards: usize) -> usize {
+        use core::hash::{Hash, Hasher};
+        if shards <= 1 || name.is_empty() {
+            return 0;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        name.as_bytes().hash(&mut h);
+        usize::try_from(h.finish() % shards as u64).unwrap_or(0)
+    }
+
+    /// THE RECOVERY-PARTITION TEST. A data dir holding the default stream plus 12 named streams (each
+    /// with a distinct record count) is recovered SHARD BY SHARD for K in {1, 2, 4}: each shard opens
+    /// exactly its `shard_of` subset, holds each of its streams' OWN records (isolation), and the
+    /// shards together recover every stream exactly once and every record exactly once (the union is
+    /// the whole pre-crash set). At K = 1 the single shard's set is byte-for-byte the unsharded open.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one cohesive K in {1,2,4} partition sweep; splitting hurts clarity
+    fn each_shard_recovers_exactly_its_shard_of_subset_union_is_lossless() {
+        let fs = InMemoryFs::new();
+        let def = StreamId::default_stream();
+        // 12 named streams, stream i carrying i + 1 records tagged with its index, so a mis-partitioned
+        // (wrong-shard) or mis-assembled recovery surfaces as a wrong record count or wrong bytes.
+        let ids: Vec<StreamId> = (0..12)
+            .map(|i| StreamId::named(&format!("s{i:02}")).unwrap())
+            .collect();
+        let expected_records: BTreeMap<StreamId, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i + 1))
+            .collect();
+        let total_named_records: usize = expected_records.values().sum();
+        {
+            let (mut set, _) = open(&fs);
+            for id in &ids {
+                set.declare(id).unwrap();
+            }
+            set.append_to(&def, &rec(b"default")).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                for r in 0..=i {
+                    set.append_to(id, &rec(format!("{}-r{r}", id.name()).as_bytes()))
+                        .unwrap();
+                }
+            }
+            set.sync_all().unwrap();
+        }
+
+        // The unsharded (K = 1) baseline set: the whole named set, default-first, deterministic.
+        let (baseline, _) = open(&fs);
+        let baseline_ids = baseline.stream_ids();
+
+        for k in [1usize, 2, 4] {
+            let mut union_named: BTreeMap<StreamId, usize> = BTreeMap::new();
+            let mut recovered_named_records = 0usize;
+
+            for idx in 0..k {
+                let (shard, recoveries) = StreamSet::open_with_at_rest_for_shard(
+                    &fs,
+                    ManualClock::new(),
+                    cfg(),
+                    AtRestCrypto::default(),
+                    |name| shard_of_name(name, k) == idx,
+                )
+                .unwrap();
+
+                // Every shard opens the default `""` root (coordinator-owned; unconditional).
+                assert!(
+                    shard.is_open(&def),
+                    "K={k} shard {idx} opens the default root"
+                );
+                assert!(recoveries[&def].loss_report.is_empty());
+
+                for id in shard.stream_ids() {
+                    if id.is_default() {
+                        continue;
+                    }
+                    // (a) EXACT partition: a named stream this shard opened MUST hash to this shard.
+                    assert_eq!(
+                        shard_of_name(id.name(), k),
+                        idx,
+                        "K={k} shard {idx} opened {} which is NOT in its shard_of subset",
+                        id.name()
+                    );
+                    // (b) ISOLATION: the stream holds exactly its OWN records, recovered clean.
+                    assert!(
+                        recoveries[&id].loss_report.is_empty(),
+                        "{} clean",
+                        id.name()
+                    );
+                    let read = shard.read_range(&id, Offset::ZERO, 1000, None).unwrap();
+                    let want = expected_records[&id];
+                    assert_eq!(
+                        read.len(),
+                        want,
+                        "{} recovered its own record count",
+                        id.name()
+                    );
+                    assert_eq!(&*read[0].payload, format!("{}-r0", id.name()).as_bytes());
+                    recovered_named_records += read.len();
+                    // (c) No double-open across shards.
+                    assert!(
+                        union_named.insert(id.clone(), read.len()).is_none(),
+                        "K={k}: {} was opened by more than one shard",
+                        id.name()
+                    );
+                }
+            }
+
+            // (d) LOSSLESS union: every named stream recovered exactly once, every record once.
+            assert_eq!(
+                union_named.keys().cloned().collect::<Vec<_>>(),
+                ids,
+                "K={k}: the union of the shard subsets is the whole named set"
+            );
+            assert_eq!(
+                recovered_named_records, total_named_records,
+                "K={k}: total recovered records equals the pre-crash total"
+            );
+        }
+
+        // (e) BYTE-FOR-BYTE at K = 1: the single shard's set equals the unsharded open exactly.
+        let (single_shard, _) = StreamSet::open_with_at_rest_for_shard(
+            &fs,
+            ManualClock::new(),
+            cfg(),
+            AtRestCrypto::default(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(single_shard.stream_ids(), baseline_ids);
     }
 
     // ======================= M2-I4 (#565): the max_open_streams hot-set LRU =======================
