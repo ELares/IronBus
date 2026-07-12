@@ -1,19 +1,22 @@
 # IronBus optional at-rest AEAD encryption
 
-**Status: PHASE 1 IMPLEMENTED (#780); this document remains the normative design.**
-The cryptographic core and the on-disk format landed in #780: the pure-Rust AEAD
-provider (`ironbus_storage::crypto`, behind the opt-in `encryption` feature — AES-256-GCM
-/ ChaCha20-Poly1305 by CPU feature detection), the deterministic `segment_id ||
-record_counter` nonce, the `SEGMENT_FLAG_ENCRYPTED` header flag with the recorded
-`aead_suite` + `key_id`, the `ENCRYPTED` record flag and the ciphertext-plus-tag frame
-(CRC over the ciphertext), the `UnknownKeyId` / `AeadTagMismatch` reason codes, the key
-ring, and the fail-closed raw-key-file loader. Encryption is applied and read back
-end-to-end at the segment layer (`SegmentWriter::create_encrypted` /
-`SegmentReader::scan_decrypted`) and is **OFF by default and byte-identical when off**.
-Still tracked as follow-on: threading the key ring through the live broker `LogConfig`
-and EVERY read path (the zero-copy `raw_byte_range`/sendfile plane and verbatim
-replication have genuine ciphertext/nonce design decisions), the Argon2id-passphrase and
-TEE-sealed key sources, and re-encryption / compaction+encryption. The log and the
+**Status: PHASE 2 IMPLEMENTED — SINGLE-NODE LIVE WIRING (#780); this document remains the
+normative design.** Phase 1 landed the cryptographic core and the on-disk format; phase 2
+wires that core through the LIVE `Log`/`StreamSet` so a configured key actually encrypts a
+running broker's segments (SINGLE-NODE), and DECRYPTS them on read. A configured key means
+every NEW active segment (fresh, rolled, or resumed after a crash) is created encrypted and
+every append AEAD-encrypts in place; reads and recovery decrypt transparently. The critical
+resume fix ships: recovery re-attaches the write crypto to a resumed encrypted active
+segment, so a post-crash append can never land PLAINTEXT into an encrypted segment. The
+zero-copy read plane is fail-closed for encrypted logs (it would ship ciphertext) — reads
+route through the actor's decrypt path. Clustered/replicated at-rest encryption is
+FAIL-CLOSED and DEFERRED to phase 3: verbatim replication under encryption is refused
+(the leader-nonce hazard), as are compaction/offload of an encrypted log. It remains
+**OFF by default and byte-identical when off**. Still tracked as follow-on: the CLI→engine
+serve-path hookup that loads the `[encryption]` config key and opens the engine's storage
+via `Log::open_encrypted`/`StreamSet::open_encrypted` (the storage seam ships here); the
+Argon2id-passphrase and TEE-sealed key sources; and clustered encryption / re-encryption /
+compaction+encryption (phase 3). The log and the
 dead-letter queue are plaintext on disk in a default deployment, exactly as
 [THREAT_MODEL.md](THREAT_MODEL.md) states. This spec is the child of the security epic
 #18 and the sibling of the auth spec ([AUTHENTICATION.md](AUTHENTICATION.md),
@@ -485,3 +488,48 @@ Phase 1 landed the cryptographic core and the on-disk format:
   TEE-sealed key sources (only the raw key file ships in phase 1); re-encryption of history;
   and compaction+encryption. A default deployment (no key configured) is byte-for-byte the
   plaintext v1 format.
+
+## Implementation status (phase 2 — single-node live wiring, #780)
+
+Phase 2 wires the phase-1 core through the LIVE storage layer (`ironbus-storage`,
+behind the `encryption` feature), SINGLE-NODE. Clustered/replicated encryption is
+fail-closed and deferred to phase 3.
+
+- **The at-rest context rides on the live `Log`.** `AtRestCrypto` (a write-side
+  `SegmentCrypto` + a read-side `KeyRing`) is a field of `Log`, threaded via
+  `Log::open_encrypted` (and `Log::open` = the plaintext default, byte-identical). Riding on
+  the `Log` — not only on the `Copy` `LogConfig` — is deliberate: every segment
+  create/resume/read site is a `self`-method, so no code path can build a segment that has
+  the log's config but not its crypto. `StreamSet::open_encrypted` threads the SAME key to
+  the default stream and every named stream, so single-node named streams are encrypted too.
+- **Write path.** A NEW active segment — fresh (`start_segment`), rolled
+  (`create_or_defer_segment`), or resumed after a crash — is created via
+  `SegmentWriter::create_encrypted` when a key is configured; every append AEAD-encrypts in
+  place under the deterministic `segment_id || record_ordinal` nonce.
+- **The resume fix (the critical one).** On recovery, `finalize_at_rest` re-attaches the
+  write crypto to a RESUMED encrypted active segment (`SegmentWriter::with_crypto`), so a
+  post-crash append cannot land plaintext into an encrypted segment. It also FAILS CLOSED on
+  a mismatch: an encrypted active segment with no key (`EncryptedSegmentNoKey` — the
+  always-compiled guard a default build enforces), or a plaintext active segment with a key
+  (`PlaintextSegmentWithKey`; re-encryption is phase 3). Recovery of an encrypted broker
+  validates encrypted frame FRAMING (CRC over the ciphertext) key-free via
+  `decode_encrypted`, so the valid prefix is found without decrypting.
+- **Read path (decrypt-on-read).** The consume read path (`read_range`/`read_from` →
+  `scan_range`/`scan_body`) decrypts each frame under the segment header's suite/key-id and
+  the `offset - base_offset` ordinal — the same counter the writer used, so the nonce
+  reproduces across restarts. A missing key / tag mismatch is the reported
+  `StorageError::Decrypt` (`UnknownKeyId` / `TagMismatch`), never a crash or garbage.
+- **Zero-copy plane fail-closed.** `Log::read_range_raw` reroutes an encrypted segment to the
+  decrypt materialize path (empty raw run + a `Some(start)` fallback signal), so ciphertext
+  is NEVER shipped to a consumer; `Log::read_plane` (the off-actor plane) is refused
+  (`EncryptedZeroCopyUnsupported`).
+- **Replication fail-closed.** `Log::append_frame_verbatim` under encryption is refused
+  (`EncryptedReplicationUnsupported`) at the exact seam — the leader-nonce hazard — and
+  compaction/offload of an encrypted log is refused (`EncryptedMaintenanceUnsupported`).
+- **Deferred to phase 3:** the CLI→engine serve-path hookup (loading the `[encryption]`
+  config key and opening the engine's storage encrypted — the storage seam
+  `Log::open_encrypted`/`StreamSet::open_encrypted` ships here); clustered/replicated
+  encryption; re-encryption/migration of a plaintext↔encrypted log; and
+  compaction/offload of an encrypted log.
+
+A default deployment (no key configured) is byte-for-byte the plaintext v1 format.

@@ -233,6 +233,45 @@ pub enum StorageError {
     /// garbage plaintext. Behind the `encryption` feature.
     #[cfg(feature = "encryption")]
     Decrypt(crate::crypto::DecryptError),
+    /// The active segment recovered from disk is AEAD-ENCRYPTED, but the log was opened with NO at-rest
+    /// key (#780 phase 2): resuming it would append PLAINTEXT into an encrypted segment (a
+    /// confidentiality leak) and no read could decrypt it. Fail CLOSED rather than silently mix
+    /// plaintext into ciphertext. This is the ALWAYS-COMPILED guard that makes a default
+    /// (no-`encryption`) build refuse to open an encrypted log outright, and a keyless
+    /// `encryption`-build open likewise refuse it.
+    EncryptedSegmentNoKey {
+        /// The encrypted active segment's id.
+        segment_id: u64,
+    },
+    /// The active segment recovered from disk is PLAINTEXT, but an at-rest write key IS configured
+    /// (#780 phase 2): appending encrypted records into a plaintext segment would make it a MIXED
+    /// (part-plaintext, part-ciphertext) segment. Re-encrypting an existing plaintext log is a phase-3
+    /// migration; phase 2 fails CLOSED here so a mixed segment is never produced.
+    PlaintextSegmentWithKey {
+        /// The plaintext active segment's id.
+        segment_id: u64,
+    },
+    /// Verbatim replication of a leader's frame into a follower segment is REFUSED while at-rest
+    /// encryption is enabled (#780 phase 2, the deferred cluster hazard): the leader's ciphertext is
+    /// bound to the leader's `(segment_id, record_ordinal)` nonce, which the follower's independently
+    /// numbered segment does not reproduce, so a verbatim copy would be undecryptable — or, if the ids
+    /// happened to align, a nonce reuse. Clustered/replicated at-rest encryption is deferred to phase 3;
+    /// a single-node encrypted broker never replicates, so this only fires on a misconfiguration.
+    EncryptedReplicationUnsupported,
+    /// The off-actor, zero-copy consume READ plane ([`crate::read_plane::ReadPlane`]) is UNAVAILABLE for
+    /// an at-rest-encrypted log (#780 phase 2): that plane hands consumers RAW on-disk frames (which are
+    /// ciphertext) off the append actor, but at-rest decryption is a decrypt-on-read step on the ACTOR
+    /// path ([`crate::log::Log::read_range`]). An encrypted broker serves consumers through the actor's
+    /// decrypt path instead; wiring decrypt into the off-actor plane is phase 3. Fail CLOSED rather than
+    /// publish a snapshot that could hand a consumer ciphertext.
+    EncryptedZeroCopyUnsupported,
+    /// A background MAINTENANCE pass (key-compaction or cold-storage offload) of an at-rest-encrypted
+    /// log is deferred to phase 3 (#780): the compaction cleaner reads survivors and RE-FRAMES them
+    /// (which under encryption means decrypt-then-re-encrypt under fresh nonces), and offload/restore of
+    /// encrypted segments needs its own re-verification path. Fail CLOSED rather than run an untested
+    /// encrypted maintenance pass that could drop or mis-key data. Only fires when the operator has
+    /// ENABLED compaction/offload on an encrypted log; the default (both off) is unaffected.
+    EncryptedMaintenanceUnsupported,
 }
 
 impl core::fmt::Display for StorageError {
@@ -345,6 +384,31 @@ impl core::fmt::Display for StorageError {
             ),
             #[cfg(feature = "encryption")]
             StorageError::Decrypt(e) => write!(f, "at-rest decryption failed: {e}"),
+            StorageError::EncryptedSegmentNoKey { segment_id } => write!(
+                f,
+                "active segment {segment_id} is at-rest encrypted but no at-rest key is configured; \
+                 refusing to open (resuming would leak plaintext into an encrypted segment)"
+            ),
+            StorageError::PlaintextSegmentWithKey { segment_id } => write!(
+                f,
+                "active segment {segment_id} is plaintext but an at-rest key is configured; refusing \
+                 to open (encrypting into it would make a mixed segment; re-encryption is phase 3)"
+            ),
+            StorageError::EncryptedReplicationUnsupported => write!(
+                f,
+                "verbatim replication is refused while at-rest encryption is enabled (the leader-nonce \
+                 hazard); clustered at-rest encryption is deferred to phase 3"
+            ),
+            StorageError::EncryptedZeroCopyUnsupported => write!(
+                f,
+                "the off-actor zero-copy read plane is unavailable for an at-rest-encrypted log; reads \
+                 go through the actor's decrypt path (wiring decrypt into the plane is phase 3)"
+            ),
+            StorageError::EncryptedMaintenanceUnsupported => write!(
+                f,
+                "compaction/offload of an at-rest-encrypted log is deferred to phase 3; disable \
+                 compaction and cold-storage offload on an encrypted broker"
+            ),
         }
     }
 }
@@ -978,6 +1042,30 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     #[must_use]
     pub fn record_count(&self) -> u32 {
         self.record_count
+    }
+
+    /// This writer's segment header (its `segment_id`, base offset/seq, and flags). The
+    /// [`SegmentHeader::is_encrypted`] bit tells the log whether a resumed active segment is at-rest
+    /// encrypted, so it can re-attach the write-side crypto after recovery (#780).
+    #[must_use]
+    pub fn header(&self) -> &SegmentHeader {
+        &self.header
+    }
+
+    /// Whether an at-rest write-encryption context is attached (#780). `true` means every appended
+    /// record body is AEAD-encrypted in place. Always `false` in a build without the `encryption`
+    /// feature. The log uses this to assert, after a resume, that an encrypted active segment actually
+    /// carries its crypto before it accepts the first post-recovery append.
+    #[must_use]
+    pub fn has_crypto(&self) -> bool {
+        #[cfg(feature = "encryption")]
+        {
+            self.crypto.is_some()
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            false
+        }
     }
 
     /// The maximum producer timestamp (milliseconds since the Unix epoch) across every record
@@ -1831,7 +1919,35 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let mut records = Vec::new();
         let mut cursor = 0usize;
         let mut clean = true;
+        // At-rest encryption (#780 phase 2): an ENCRYPTED segment DECRYPTS each frame here, so the
+        // buffered scan (and its `read_slot_into` full-scan fallback, e.g. a resumed active segment
+        // whose seek index is not yet seeded) serves PLAINTEXT records. Resolved once — encryption is
+        // uniform per segment.
+        #[cfg(feature = "encryption")]
+        let enc = self.aead_read_params()?;
         while cursor < body.len() {
+            #[cfg(feature = "encryption")]
+            if let Some((suite, key_id)) = enc {
+                let ordinal =
+                    u32::try_from(records.len()).map_err(|_| StorageError::SegmentFull)?;
+                let offset = Offset::new(
+                    self.header
+                        .base_offset
+                        .get()
+                        .saturating_add(records.len() as u64),
+                );
+                let Some((rec, consumed)) =
+                    self.decrypt_frame(&body[cursor..], offset, ordinal, suite, key_id)?
+                else {
+                    // A torn/corrupt frame ends the valid prefix (a key/tag failure already returned an
+                    // error); a decrypt-mismatch is never mistaken for a torn tail.
+                    clean = false;
+                    break;
+                };
+                records.push(rec);
+                cursor += consumed;
+                continue;
+            }
             // A torn or corrupt frame ends the valid prefix; recovery skips the rest.
             // The bounded-loss report is produced by a later layer.
             let Ok((view, subject, consumed)) = codec::decode_with_subject(&body[cursor..]) else {
@@ -2299,6 +2415,17 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         // not O(records) allocations + O(bytes) copied. The buffer outlives the returned records.
         // Read straight into fresh (unzeroed) capacity: the read fully overwrites it (#813 / #815).
         let body = self.read_into_fresh(len, start_byte)?;
+        // At-rest encryption (#780 phase 2): an ENCRYPTED segment DECRYPTS each frame on read here, so
+        // the WHOLE consume read path (`read_range` -> `read_slot_into` -> seek -> `scan_range`) serves
+        // PLAINTEXT records over an encrypted log transparently, reusing the seek index and the
+        // active-segment `read_end` bound. The plaintext `codec::decode_with_subject` below would REFUSE
+        // an encrypted frame, so the encrypted case takes its own decrypt loop. A missing key / tag
+        // mismatch is the reported `StorageError::Decrypt`, never garbage; a torn/corrupt frame ends the
+        // prefix exactly as the plaintext path.
+        #[cfg(feature = "encryption")]
+        if let Some((suite, key_id)) = self.aead_read_params()? {
+            return self.scan_range_decrypted(&body, start_offset, max, max_bytes, suite, key_id);
+        }
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
         let mut byte_total = 0usize;
@@ -2328,6 +2455,133 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             cursor += consumed;
         }
         Ok(records)
+    }
+
+    /// The at-rest-ENCRYPTED sibling of the [`SegmentReader::scan_range`] decode loop (#780 phase 2):
+    /// walks the same body buffer frame by frame with [`codec::decode_encrypted`] (which validates the
+    /// frame's header/body CRC over the on-disk ciphertext + tag), AEAD-decrypts each record under the
+    /// segment's suite/key-id and the deterministic `segment_id || record_ordinal` nonce, and
+    /// materializes a PLAINTEXT [`OwnedRecord`]. The record's per-segment ordinal is `offset -
+    /// base_offset` (a dense v1 segment), which is exactly the counter the writer encrypted under, so
+    /// the nonce reproduces on read across any restart. Same `max` / `max_bytes` bounds and same
+    /// torn/corrupt-tail stop as the plaintext loop; a missing key / tag failure is the reported
+    /// [`StorageError::Decrypt`], never a silent skip or garbage plaintext.
+    #[cfg(feature = "encryption")]
+    fn scan_range_decrypted(
+        &self,
+        body: &Bytes,
+        start_offset: Offset,
+        max: usize,
+        max_bytes: Option<usize>,
+        suite: crate::crypto::AeadSuite,
+        key_id: u64,
+    ) -> Result<Vec<OwnedRecord>, StorageError> {
+        let base_offset = self.header.base_offset.get();
+        let mut records = Vec::with_capacity(max.min(64));
+        let mut cursor = 0usize;
+        let mut byte_total = 0usize;
+        let mut next_offset = start_offset.get();
+        while cursor < body.len() && records.len() < max {
+            // A dense v1 record's per-segment ordinal (the counter the writer encrypted under) is its
+            // `offset - base_offset`, so the nonce reproduces on read across any restart.
+            let ordinal = u32::try_from(next_offset.saturating_sub(base_offset))
+                .map_err(|_| StorageError::SegmentFull)?;
+            // A torn/corrupt frame ends the prefix (`Ok(None)`, exactly as the plaintext loop breaks); a
+            // key/tag failure is the reported `StorageError::Decrypt`.
+            let Some((rec, consumed)) = self.decrypt_frame(
+                &body[cursor..],
+                Offset::new(next_offset),
+                ordinal,
+                suite,
+                key_id,
+            )?
+            else {
+                break;
+            };
+            if let Some(cap) = max_bytes {
+                if !records.is_empty() && byte_total.saturating_add(consumed) > cap {
+                    break;
+                }
+            }
+            byte_total = byte_total.saturating_add(consumed);
+            records.push(rec);
+            next_offset = next_offset.saturating_add(1);
+            cursor += consumed;
+        }
+        Ok(records)
+    }
+
+    /// The at-rest suite + key-id for this segment if it is ENCRYPTED (and the suite is supported),
+    /// else `None` for a plaintext segment (#780 phase 2). An UNSUPPORTED (unknown future) suite id is
+    /// the reported [`StorageError::Decrypt`] `UnsupportedSuite`, refused fail-closed like an unknown
+    /// checksum algorithm — never guessed.
+    #[cfg(feature = "encryption")]
+    fn aead_read_params(&self) -> Result<Option<(crate::crypto::AeadSuite, u64)>, StorageError> {
+        match self.aead {
+            None => Ok(None),
+            Some((suite_id, key_id)) => {
+                let suite = crate::crypto::AeadSuite::from_id(suite_id).ok_or(
+                    StorageError::Decrypt(crate::crypto::DecryptError::UnsupportedSuite(suite_id)),
+                )?;
+                Ok(Some((suite, key_id)))
+            }
+        }
+    }
+
+    /// Decrypts ONE at-rest-encrypted frame at the front of `frame` for log `offset` / per-segment
+    /// `ordinal` (#780 phase 2), materializing a PLAINTEXT [`OwnedRecord`] and returning it with the
+    /// frame's byte length. Returns `Ok(None)` when the frame is torn or corrupt (the CRC-gated
+    /// [`codec::decode_encrypted`] refused it) — the "end the valid prefix" signal the plaintext decode
+    /// loops use. A CRC-valid frame that fails to DECRYPT (no keyring, unknown key-id, or tag mismatch)
+    /// is the REPORTED [`StorageError::Decrypt`], never a silent skip or garbage plaintext. The shared
+    /// per-frame decrypt behind [`SegmentReader::scan_range`] and [`SegmentReader::scan_body`].
+    #[cfg(feature = "encryption")]
+    fn decrypt_frame(
+        &self,
+        frame: &[u8],
+        offset: Offset,
+        ordinal: u32,
+        suite: crate::crypto::AeadSuite,
+        key_id: u64,
+    ) -> Result<Option<(OwnedRecord, usize)>, StorageError> {
+        use ironbus_core::codec;
+        let Ok((view, consumed)) = codec::decode_encrypted(frame) else {
+            return Ok(None);
+        };
+        // No keyring at all is the SAME reported UnknownKeyId class as an unloaded key-id — never a
+        // silent read of ciphertext, never a plaintext read of an encrypted frame.
+        let Some(ring) = self.keyring.as_ref() else {
+            return Err(StorageError::Decrypt(
+                crate::crypto::DecryptError::UnknownKeyId(key_id),
+            ));
+        };
+        let plaintext = ring
+            .decrypt_record(
+                suite,
+                key_id,
+                self.header.segment_id,
+                ordinal,
+                view.ciphertext,
+                view.tag,
+            )
+            .map_err(StorageError::Decrypt)?;
+        let key_len = view.key_len as usize;
+        let hdr_len = view.hdr_len as usize;
+        let plain = Bytes::from(plaintext);
+        let rec = OwnedRecord {
+            offset,
+            seq: view.seq,
+            timestamp_ms: view.timestamp_ms,
+            // The ENCRYPTED bit is a storage-internal on-disk concern; the materialized record is
+            // plaintext, so clear it (mirrors `scan_decrypted`).
+            flags: RecordFlags::from_bits(view.flags.bits() & !RecordFlags::ENCRYPTED.bits()),
+            key: plain.slice(0..key_len),
+            headers: plain.slice(key_len..key_len + hdr_len),
+            payload: plain.slice(key_len + hdr_len..),
+            subject: Bytes::new(),
+            stream_tag: Bytes::new(),
+        };
+        Ok(Some((rec, consumed)))
     }
 
     /// Reads a CONTIGUOUS run of up to `max` DENSE (v1) frames starting at the file byte position
@@ -2890,7 +3144,22 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             // validate it out of the window slice.
             self.fill_window(&mut win, &mut win_start, pos, total as u64, remaining)?;
             rel = usize::try_from(pos - win_start).map_err(|_| StorageError::SegmentFull)?;
-            let Ok((view, consumed)) = codec::decode(&win[rel..rel + total]) else {
+            // On an at-rest-ENCRYPTED segment (#780) the plaintext `codec::decode` REFUSES the frame
+            // (`DecodeError::Encrypted`), so recovery validates the frame's header/body CRC (over the
+            // on-disk ciphertext + tag) and reads its `seq`/`timestamp_ms` via `decode_encrypted` —
+            // WITHOUT the key. Recovery needs only the FRAMING to find the durable valid prefix and
+            // resume the writer; the AEAD decrypt (which needs the key) is a read-time concern. Without
+            // this dispatch an encrypted active segment would recover as a CORRUPT TAIL at its FIRST
+            // record and silently truncate every acked record. Both decoders return `(seq, ts, len)`
+            // after the same CRC gate, so the torn/corrupt-tail behavior is identical.
+            let decoded = if self.header.is_encrypted() {
+                codec::decode_encrypted(&win[rel..rel + total])
+                    .map(|(v, consumed)| (v.seq, v.timestamp_ms, consumed))
+            } else {
+                codec::decode(&win[rel..rel + total])
+                    .map(|(v, consumed)| (v.seq, v.timestamp_ms, consumed))
+            };
+            let Ok((seq, timestamp_ms, consumed)) = decoded else {
                 // The header was intact but the body or trailer failed: a corrupt body.
                 tail_reason = Some(ReasonCode::CorruptRecordBody);
                 break;
@@ -2903,18 +3172,18 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 .get()
                 .checked_add(count)
                 .ok_or(StorageError::SegmentFull)?;
-            if view.seq.get() != expected {
+            if seq.get() != expected {
                 return Err(StorageError::RecoveredSequenceMismatch {
                     index: usize::try_from(count).map_err(|_| StorageError::SegmentFull)?,
                     expected,
-                    found: view.seq.get(),
+                    found: seq.get(),
                 });
             }
-            last_seq = view.seq;
+            last_seq = seq;
             // Accumulate the MAX timestamp across the valid prefix (not the last): producer
             // timestamps are not monotonic, so recovery must reconstruct the same max the writer
             // tracked, for the age-retention reaper.
-            max_timestamp_ms = max_timestamp_ms.max(view.timestamp_ms);
+            max_timestamp_ms = max_timestamp_ms.max(timestamp_ms);
             count += 1;
             pos += consumed as u64;
         }
