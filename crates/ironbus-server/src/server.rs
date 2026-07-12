@@ -864,7 +864,13 @@ where
                 if session.has_parked() {
                     out.clear();
                     let _ = session.flush_all_parked_blocking(engine, &mut out);
-                    let _ = stream.write_all(&out);
+                    // Route the EOF drain through `write_response` so the invariant "a `DeliverBatch`
+                    // header queued in `out` ALWAYS gets its spliced body" (#1034) holds STRUCTURALLY on
+                    // EVERY write path, not just the two `process`-pass sites above. This drain only ever
+                    // emits produce-ack frames (never a batch), so `take_splices` is empty here and this
+                    // is byte-for-byte today's `write_all(&out)`; routing keeps it correct-by-construction
+                    // if a future refactor ever enqueues a splice directive on the parked/EOF path.
+                    let _ = write_response(stream, &out, session);
                 }
                 return Ok(());
             }
@@ -931,12 +937,17 @@ where
             // this and instead closes the connection via the arm below.
             Err(ref e) if want_nonblocking && e.kind() == std::io::ErrorKind::WouldBlock => {
                 out.clear();
+                // Both drain-write sites route through `write_response` for the same structural
+                // splice-safety invariant as the EOF path above (#1034): `drain_one_parked_blocking` only
+                // emits produce-ack frames, so `take_splices` is empty and the wire bytes are identical to
+                // `write_all(&out)` today, but a queued `DeliverBatch` header could never silently ship
+                // without its spliced body on this path either.
                 if session.drain_one_parked_blocking(engine, &mut out).is_err() {
-                    let _ = stream.write_all(&out);
+                    let _ = write_response(stream, &out, session);
                     return Ok(());
                 }
                 if !out.is_empty() {
-                    stream.write_all(&out)?;
+                    write_response(stream, &out, session)?;
                 }
             }
             // A real IO error, or a BLOCKING-mode read timeout (the slowloris defense with nothing
