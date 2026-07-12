@@ -1610,6 +1610,20 @@ pub struct SegmentReader<F: RandomAccessFile> {
     /// body CRC is recomputed on EVERY read even for a verified-resident segment, restoring the
     /// pre-#540 always-verify behavior for the paranoid. Default `false` (verify-once).
     verify_always: bool,
+    /// SAFETY ARMING for the body-CRC skip (#540). The skip removes the server's body-CRC recompute, so
+    /// it is sound ONLY when the delivered record still has an end-to-end integrity backstop — i.e. the
+    /// consumer re-verifies the body CRC itself. That holds for the raw `DeliverBatch` path (the client
+    /// re-decodes the stored frame, CRC and all) but NOT for the per-record materialized `Deliver` path,
+    /// whose wire frame (`DeliverBody`) carries NO crc field, so a default consumer has no way to catch a
+    /// server-skipped rot (`scan_range` `pread`s every read, so a page-cache-evicted disk byte can rot
+    /// and be re-read un-verified). Until the per-record `Deliver` frame carries the stored `body_crc`
+    /// for the client to verify (the tracked follow-on), this stays `false` at EVERY production reader-open
+    /// site, so the server body-CRC recompute is NEVER skipped on a no-backstop path and the end-to-end
+    /// guarantee is preserved. Only the #540 unit tests arm it (via
+    /// [`SegmentReader::with_crc_skip_armed`]) to exercise the trusted-decode fast-path in isolation.
+    /// `verified_resident` + `verify_always` (the state machine + opt-out) stay live and TESTED so the
+    /// follow-on only has to arm this bit once the wire backstop exists.
+    crc_skip_armed: bool,
     /// The at-rest AEAD parameters `(aead_suite_id, key_id)` read from the header at open, or `None`
     /// for a plaintext segment (#780). Behind the `encryption` feature.
     #[cfg(feature = "encryption")]
@@ -1649,6 +1663,10 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             // fail-closed default is what makes a RELOADED segment (a fresh reader after evict) re-verify.
             verified_resident: false,
             verify_always: false,
+            // DISARMED by default: the body-CRC skip never fires unless a caller with a proven
+            // end-to-end backstop arms it. No production path arms it yet (see the field doc), so the
+            // server body-CRC recompute is always performed on the live per-record delivery path.
+            crc_skip_armed: false,
             #[cfg(feature = "encryption")]
             aead,
             #[cfg(feature = "encryption")]
@@ -1688,12 +1706,27 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         self.verified_resident
     }
 
+    /// ARMS the body-CRC skip (#540) — see [`SegmentReader::crc_skip_armed`]. This is the safety gate
+    /// that keeps verify-once from skipping the server body-CRC on a path where the consumer has no
+    /// end-to-end backstop. No PRODUCTION reader-open site calls this: it stays disarmed until the
+    /// per-record `Deliver` frame carries the stored `body_crc` for the client to re-verify (the tracked
+    /// follow-on). Only the #540 unit tests arm it, to exercise the trusted-decode fast-path in
+    /// isolation. Arming it in production WITHOUT that wire backstop would reintroduce the
+    /// silent-corruption hole, so this is intentionally not wired live.
+    #[must_use]
+    pub fn with_crc_skip_armed(mut self, armed: bool) -> SegmentReader<F> {
+        self.crc_skip_armed = armed;
+        self
+    }
+
     /// Whether the consume read fast-path may SKIP the per-read body CRC recompute for this segment
-    /// (#540): only when the reader is verified-resident AND the verify-always opt-out is off. The
-    /// encrypted read path never consults this — it always AEAD-verifies.
+    /// (#540): only when the skip is ARMED (a proven end-to-end backstop exists — see
+    /// [`SegmentReader::crc_skip_armed`]), the reader is verified-resident, AND the verify-always opt-out
+    /// is off. Disarmed in production, so the server always recomputes the body CRC on the live
+    /// per-record delivery path. The encrypted read path never consults this — it always AEAD-verifies.
     #[must_use]
     fn skip_body_crc(&self) -> bool {
-        self.verified_resident && !self.verify_always
+        self.crc_skip_armed && self.verified_resident && !self.verify_always
     }
 
     /// Opens a segment WITH a loaded key ring so [`SegmentReader::scan_decrypted`] can decrypt an
@@ -2480,13 +2513,17 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         if let Some((suite, key_id)) = self.aead_read_params()? {
             return self.scan_range_decrypted(&body, start_offset, max, max_bytes, suite, key_id);
         }
-        // Verify-once (#540): when this segment is VERIFIED-RESIDENT (its body integrity was already
-        // proven this process and it has stayed resident since) and the verify-always opt-out is off,
-        // the consume read fast-path DECODES WITH THE BODY CRC SKIPPED. Every structural/framing check
-        // still runs, and the stored `body_crc` is untouched on disk (a client verifies end-to-end); we
-        // only elide the redundant server-side recompute of already-trusted bytes. An unverified,
-        // freshly-reloaded, or opt-out reader takes the full-CRC branch and still catches corruption.
-        // NOTE: this is the PLAINTEXT loop only — an encrypted segment returned above via
+        // Verify-once (#540): when the body-CRC skip is ARMED (a proven end-to-end backstop exists),
+        // this segment is VERIFIED-RESIDENT, and the verify-always opt-out is off, the consume read
+        // fast-path DECODES WITH THE BODY CRC SKIPPED. Every structural/framing check still runs, and the
+        // stored `body_crc` is untouched on disk; we only elide the redundant server-side recompute.
+        // IMPORTANT: the skip is DISARMED on every production read path (`crc_skip_armed == false`),
+        // because the per-record `Deliver` wire frame does not yet carry the body_crc for a client to
+        // re-verify — so skipping the server recompute would leave a default consumer with NO integrity
+        // backstop (`read_into_fresh` `pread`s every read, so a page-cache-evicted disk byte can rot and
+        // be re-read). So in production `skip_body_crc` is always `false` and the full-CRC branch runs;
+        // only the #540 unit tests arm it to exercise the trusted decode. See `SegmentReader::
+        // crc_skip_armed`. This is the PLAINTEXT loop only — an encrypted segment returned above via
         // `scan_range_decrypted`, which always AEAD-verifies and never consults `skip_body_crc`.
         let skip_body_crc = self.skip_body_crc();
         let mut records = Vec::with_capacity(max.min(64));
@@ -3935,12 +3972,14 @@ mod tests {
             "an unverified reader re-verifies and rejects the corrupt frame"
         );
 
-        // (2) VERIFIED-RESIDENT (self-written / verified-on-load, resident since): the body CRC is
-        // SKIPPED, so the corrupted second record is served verbatim (payload no longer equals
-        // `second`) — proving the recompute was elided on the trusted fast-path.
+        // (2) VERIFIED-RESIDENT + ARMED (self-written / verified-on-load, resident since, with the skip
+        // armed as it would be once a client backstop exists): the body CRC is SKIPPED, so the corrupted
+        // second record is served verbatim (payload no longer equals `second`) — proving the recompute
+        // was elided on the trusted fast-path.
         let verified = SegmentReader::open(Arc::clone(&file))
             .unwrap()
-            .with_verified_resident(true);
+            .with_verified_resident(true)
+            .with_crc_skip_armed(true);
         assert!(verified.is_verified_resident());
         let got = verified
             .scan_from(second_pos, Offset::new(1), valid_end, 10)
@@ -3957,11 +3996,12 @@ mod tests {
             "the corrupted body was served without a CRC check"
         );
 
-        // (3) verify-always opt-out: even a verified-resident reader recomputes on every read, so the
-        // corruption is caught again — the tunable escape hatch for the paranoid.
+        // (3) verify-always opt-out: even an ARMED, verified-resident reader recomputes on every read, so
+        // the corruption is caught again — the tunable escape hatch for the paranoid overrides the skip.
         let paranoid = SegmentReader::open(Arc::clone(&file))
             .unwrap()
             .with_verified_resident(true)
+            .with_crc_skip_armed(true)
             .with_verify_always(true);
         let got = paranoid
             .scan_from(second_pos, Offset::new(1), valid_end, 10)
@@ -3994,13 +4034,14 @@ mod tests {
         file.write_all_at(&bytes, 0).unwrap();
         let verified = SegmentReader::open(Arc::clone(&file))
             .unwrap()
-            .with_verified_resident(true);
+            .with_verified_resident(true)
+            .with_crc_skip_armed(true);
         let got = verified
             .scan_from(second_pos, Offset::new(1), valid_end, 10)
             .unwrap();
         assert!(
             got.is_empty(),
-            "a corrupt header ends the prefix even for a verified-resident reader"
+            "a corrupt header ends the prefix even for an armed verified-resident reader"
         );
 
         // On INTACT bytes a verified read is byte-identical to a full read (the skip changes nothing).
@@ -4015,7 +4056,8 @@ mod tests {
         let full_recs = full.scan_from(SEGMENT_HEADER_LEN as u64, Offset::new(0), clean_end, 10);
         let verified = SegmentReader::open(Arc::clone(&clean))
             .unwrap()
-            .with_verified_resident(true);
+            .with_verified_resident(true)
+            .with_crc_skip_armed(true);
         let verified_recs =
             verified.scan_from(SEGMENT_HEADER_LEN as u64, Offset::new(0), clean_end, 10);
         assert_eq!(full_recs.unwrap(), verified_recs.unwrap());
@@ -5061,11 +5103,13 @@ mod tests {
             ring.insert(7, key(0xCD));
             let ring = Arc::new(ring);
 
-            // (a) A VERIFIED-RESIDENT encrypted reader STILL decrypts correctly on the consume fast-path
-            // (`scan_range`): the AEAD ran; the flag did not bypass it.
+            // (a) A VERIFIED-RESIDENT + ARMED encrypted reader STILL decrypts correctly on the consume
+            // fast-path (`scan_range`): even with the plaintext skip armed, the encrypted branch runs the
+            // AEAD and ignores the flag.
             let clean = SegmentReader::open_with_keyring(Arc::clone(&file), Arc::clone(&ring))
                 .unwrap()
-                .with_verified_resident(true);
+                .with_verified_resident(true)
+                .with_crc_skip_armed(true);
             let recs = clean
                 .scan_range(
                     SEGMENT_HEADER_LEN as u64,
@@ -5089,7 +5133,8 @@ mod tests {
             file.write_all_at(&bytes, 0).unwrap();
             let verified = SegmentReader::open_with_keyring(Arc::clone(&file), Arc::clone(&ring))
                 .unwrap()
-                .with_verified_resident(true);
+                .with_verified_resident(true)
+                .with_crc_skip_armed(true);
             let got = verified.scan_range(second_pos, Offset::new(1), valid_end, 10, None);
             match got {
                 // The CRC over the ciphertext + tag caught it: the prefix ends, nothing is served.

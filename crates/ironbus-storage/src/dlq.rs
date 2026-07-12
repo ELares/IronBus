@@ -698,6 +698,13 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
         // overwrites it, so clear the original HAS_KEY bit and let the log re-derive it from the
         // (preserved) key. The other flags (e.g. COMPRESSED) are carried through unchanged.
         let flags = RecordFlags::from_bits(source.flags.bits() & !RecordFlags::HAS_KEY.bits());
+        // Verify-once (#540) INVARIANT: this re-encode computes a FRESH body CRC over `source`'s bytes.
+        // That is sound only because `source` was materialized by a read that VERIFIED its body CRC — the
+        // verify-once skip is DISARMED on every production read path (see `SegmentReader::crc_skip_armed`),
+        // so a dead-lettered record's bytes are always CRC-checked before this point. The follow-on that
+        // ARMS the skip (per-record `Deliver` body_crc) MUST NOT dead-letter a skip-read record without
+        // first re-verifying (or preserving) its original body CRC here; otherwise this would persist a
+        // fresh CRC over possibly-rotted bytes = permanent undetectable DLQ corruption.
         let offset = self.log.append(&Append {
             timestamp_ms: source.timestamp_ms,
             flags,
