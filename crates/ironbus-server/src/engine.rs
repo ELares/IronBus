@@ -13220,6 +13220,59 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.poll_in_member(group, member, now)
     }
 
+    /// Reseals the fencing generation of the live leases at the contiguous range `[first, first+count)`
+    /// in `group` to ONE shared `generation` (#546, batched + zero-copy Tier-W delivery). Every record
+    /// in one `DeliverBatch` frame shares a single generation so the reused batch frame — which carries
+    /// exactly one `generation` field and reconstructs each offset POSITIONALLY (`first + i`) — can
+    /// deliver them: the session claims a contiguous run through the ordinary per-record
+    /// [`poll_now_in_member`](Engine::poll_now_in_member) drain (so EVERY per-message semantic — TTL,
+    /// delayed delivery, per-subject filter, `key_shared` routing, retry-throttle, `MaxDeliver`/DLQ — is
+    /// preserved verbatim), each record leased under its own distinct generation, then reseals the run
+    /// to the run's FIRST generation here before framing.
+    ///
+    /// SOUND because fencing is per-offset: see [`LeaseTable::reseal_to`]. `next_generation` already
+    /// sits above the resealed value, so a later redelivery of any offset in the run fences the stale
+    /// shared-generation ack; ack/nack/visibility-timeout/redelivery therefore act on each record
+    /// INDIVIDUALLY exactly as with distinct generations. DEFAULT-group only (the batched Tier-W path is
+    /// scoped to the root stream); a never-created group is a silent no-op (nothing to reseal).
+    pub fn reseal_batch_in(&mut self, group: &str, first: Offset, count: u32, generation: u64) {
+        if let Some(g) = self.groups.get_mut(group) {
+            let base = first.get();
+            for i in 0..u64::from(count) {
+                g.leases
+                    .reseal_to(Offset::new(base.saturating_add(i)), generation);
+            }
+        }
+    }
+
+    /// The ZERO-COPY raw on-disk frame bytes for a contiguous Tier-W batch run `[first, first+count)`
+    /// (#546, reusing the #542 `read_range_raw` plane): the SEALED, flushed prefix of the run as ONE
+    /// [`RawByteRun`] (a refcount slice of the segment's resident buffer, no per-record decode or
+    /// re-encode), which the session frames as one `DeliverBatch`. Any ACTIVE-tail (or next-segment)
+    /// remainder the single-segment raw read does not cover is reported by `record_count < count`; the
+    /// session ships that remainder as ordinary per-record `Deliver`s from the records it already
+    /// decoded during the claim drain, so the run is always delivered in full and in order.
+    ///
+    /// At-rest ENCRYPTION is fail-closed for free (#780 phase 2 / #1164): `read_range_raw` reroutes an
+    /// encrypted log to an EMPTY raw run (it must never ship ciphertext off the zero-copy plane), so
+    /// `record_count` is `0` and the WHOLE batch falls to the session's per-record tail, which is served
+    /// through the actor's DECRYPT-on-read path — plaintext only, never a ciphertext byte on the wire.
+    ///
+    /// # Errors
+    /// A storage error from the raw read (e.g. an out-of-range start); the caller degrades to shipping
+    /// the whole run per-record from the decoded records, so a raw-read failure never drops a record.
+    pub fn work_batch_raw_in(
+        &self,
+        first: Offset,
+        count: usize,
+    ) -> Result<RawByteRun, EngineError> {
+        // `max_bytes: None` — the run was already bounded to `count` records within this consumer's
+        // byte budget during the claim drain, so `count` is the hard bound; the raw read never exceeds
+        // it (`want == count`), and any remainder past a single sealed segment ships per-record.
+        let (raw, _tail_from) = self.log.read_range_raw(first, count, None)?;
+        Ok(raw)
+    }
+
     /// The name of the ONE designated group whose ack confirms a Level-2 produce (#497). Defaults to
     /// the default/unnamed group; see [`Engine::set_confirm_group`].
     #[must_use]

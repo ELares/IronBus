@@ -351,6 +351,30 @@ impl LeaseTable {
         }
     }
 
+    /// Overwrites the fencing generation of the live lease at `offset` to `generation`, returning
+    /// whether a live lease was present to reseal (#546, batched Tier-W delivery). Every record in one
+    /// zero-copy `DeliverBatch` shares ONE generation so the reused batch frame (a single `generation`
+    /// field, positional offsets) can carry them all: each record is first [`claim`]ed under its own
+    /// distinct generation, then the whole contiguous run is resealed to the run's first generation.
+    ///
+    /// This is SOUND because fencing is PER-OFFSET — the lease map is keyed by offset and an ack's
+    /// token is `(offset, generation)`, so a generation shared across DISTINCT offsets never collides
+    /// (the offset disambiguates). Distinctness is only required ACROSS REDELIVERIES OF THE SAME OFFSET,
+    /// and that still holds: `next_generation` already sits strictly ABOVE every value in the resealed
+    /// run (each was drawn by [`claim`] below it), so any future redelivery of a resealed offset draws a
+    /// strictly-greater generation and FENCES the stale shared-generation ack. At-least-once and
+    /// no-double-ack are therefore preserved per record exactly as with distinct generations. A no-op
+    /// (returns `false`) if `offset` holds no live lease — e.g. it was concurrently acked or freed; the
+    /// batch caller reseals offsets it JUST claimed under the same lock, so the live case is the norm.
+    pub fn reseal_to(&mut self, offset: Offset, generation: u64) -> bool {
+        if let Some(lease) = self.leases.get_mut(&offset.get()) {
+            lease.generation = generation;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Whether `offset` could be claimed at monotonic time `now`: it is free (no lease) or its
     /// current lease has expired (`now` is at or past the deadline), so the next [`claim`] would
     /// grant it rather than return [`Claim::InFlight`]. A non-mutating peek, unlike [`claim`]: the
@@ -578,6 +602,67 @@ mod tests {
             }
             other => panic!("expected Granted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reseal_to_shares_one_generation_yet_keeps_per_offset_fencing() {
+        // #546 batched Tier-W: a contiguous run is claimed under DISTINCT generations, then resealed to
+        // ONE shared generation so the reused `DeliverBatch` frame (a single generation, positional
+        // offsets) can carry them. This must stay SOUND: (a) an ack of ANY offset under the shared
+        // generation succeeds, (b) fencing is still PER-OFFSET — a redelivery of one offset draws a fresh
+        // generation that fences the stale shared-generation ack, and the OTHER offsets are untouched.
+        let mut t = LeaseTable::new(cfg());
+        let a = token(t.claim(off(0), 0));
+        let b = token(t.claim(off(1), 0));
+        let c = token(t.claim(off(2), 0));
+        assert!(
+            a.generation != b.generation && b.generation != c.generation,
+            "distinct at claim"
+        );
+        // Reseal the whole run to the FIRST claim's generation.
+        let shared = a.generation;
+        assert!(t.reseal_to(off(0), shared));
+        assert!(t.reseal_to(off(1), shared));
+        assert!(t.reseal_to(off(2), shared));
+        // Every offset now acks under the shared generation (a batch is N independent leases).
+        let shared_tok = |o| LeaseToken {
+            offset: off(o),
+            generation: shared,
+        };
+        assert_eq!(
+            t.ack(&shared_tok(1)),
+            AckOutcome::Acked,
+            "offset 1 acks under the shared gen"
+        );
+        // Acking offset 1 did NOT touch 0 or 2: they are still leased under the shared generation.
+        assert!(t.holds_active(&shared_tok(0), 0));
+        assert!(t.holds_active(&shared_tok(2), 0));
+        // Ack offset 0 too, leaving only offset 2 in flight.
+        assert_eq!(
+            t.ack(&shared_tok(0)),
+            AckOutcome::Acked,
+            "offset 0 acks under the shared gen"
+        );
+        // Offset 2's lease expires and is redelivered: the redelivery draws a generation ABOVE the
+        // shared one, so the stale shared-generation ack of offset 2 is now FENCED — no double-commit.
+        assert_eq!(t.expired(30), vec![off(2)]);
+        let c2 = token(t.claim(off(2), 30));
+        assert!(
+            c2.generation > shared,
+            "the redelivery generation is strictly above the shared one"
+        );
+        assert_eq!(
+            t.ack(&shared_tok(2)),
+            AckOutcome::Fenced,
+            "the stale shared-gen ack is fenced"
+        );
+        assert_eq!(
+            t.ack(&c2),
+            AckOutcome::Acked,
+            "only the fresh token commits the redelivery"
+        );
+        // Reseal is a no-op for an offset with no live lease (returns false).
+        assert!(!t.reseal_to(off(99), shared));
     }
 
     #[test]

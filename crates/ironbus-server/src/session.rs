@@ -54,6 +54,7 @@ use ironbus_proto::message::{
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
+use ironbus_storage::segment::OwnedRecord;
 use ironbus_storage::streamset::StreamId;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -145,6 +146,57 @@ struct Lease {
     generation: u64,
     /// The message's byte size (key + headers + payload), for the per-consumer byte budget (#275).
     bytes: u64,
+}
+
+/// A CONTIGUOUS run of leased Tier-W records staged for ONE zero-copy `DeliverBatch` (#546, M1-I8).
+///
+/// The batched Tier-W delivery path drains records through the SAME per-record
+/// [`Engine::poll_now_in_member`] the unbatched path uses — so every lease, ack/nack, visibility
+/// timeout, redelivery, `MaxDeliver`/DLQ, and `key_shared` routing is byte-for-byte preserved — and
+/// stages each `Poll::Message` here instead of framing a `Deliver` immediately. A run only ever holds
+/// records with CONTIGUOUS offsets (`first_offset + i`), so the batch frame can carry them positionally;
+/// a non-contiguous delivery (a `key_shared` skip, a competing peer's interleave, an acked hole) flushes
+/// the current run and starts a fresh one. On flush a run of >= 2 records is resealed to ONE shared lease
+/// generation and shipped as a single `DeliverBatch` (its sealed prefix zero-copy); a length-1 run ships
+/// as a single per-record `Deliver`, byte-for-byte the unbatched path. The staged records are ALSO
+/// already recorded in `Session::leased` (so the byte budget and in-flight accounting are unchanged
+/// while staging); flushing only reseals their generation and frames them.
+struct StagedRun {
+    /// The log offset of the FIRST staged record; the i-th staged record has offset `first_offset + i`.
+    first_offset: u64,
+    /// The lease generation the whole run is resealed to on flush — the FIRST staged record's own
+    /// claim generation (every later record's distinct generation is overwritten to this).
+    shared_generation: u64,
+    /// The decoded records in offset order, held for the per-record tail / length-1 emit (the sealed
+    /// prefix ships zero-copy from `read_range_raw`, so those decoded copies are simply dropped).
+    records: Vec<OwnedRecord>,
+}
+
+impl StagedRun {
+    fn new() -> StagedRun {
+        StagedRun {
+            first_offset: 0,
+            shared_generation: 0,
+            records: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// The offset the NEXT record must carry to extend this run (one past the last staged record).
+    fn next_offset(&self) -> u64 {
+        self.first_offset.saturating_add(self.records.len() as u64)
+    }
+
+    /// Begins a fresh run anchored at `offset` under `generation` (the caller flushed any prior run
+    /// first). Reuses the record `Vec`'s capacity (it was cleared on the prior flush).
+    fn begin(&mut self, offset: u64, generation: u64) {
+        self.first_offset = offset;
+        self.shared_generation = generation;
+        self.records.clear();
+    }
 }
 
 /// Per-connection session state over a shared [`Engine`].
@@ -2633,6 +2685,135 @@ impl Session {
     /// budget (per-consumer isolation). The advisory frames (dead-letter, truncation) still count
     /// against the REQUESTED credit (they bound the total frames a batch streams) but do NOT occupy
     /// an in-flight slot or any bytes, since they commit past or reset rather than lease.
+    /// Whether THIS Flow/Fetch drain takes the batched + zero-copy Tier-W path (#546, M1-I8): the
+    /// consumer negotiated `DeliverBatch` AND it is a ROOT-stream, non-partition, non-priority consume.
+    /// Named/tenant streams, partition-addressed consumers, and priority-bound consumers keep the
+    /// unbatched per-record path (their raw read routing / composite offsets are a documented follow-up),
+    /// so those drains are byte-for-byte unchanged. `key_shared` and plain competing ROOT consumers DO
+    /// batch (a `key_shared` consumer's non-contiguous runs simply flush as length-1 per-record frames).
+    fn tierw_batchable(&self) -> bool {
+        self.deliver_batch_enabled
+            && self.stream.is_empty()
+            && self.partition.is_none()
+            && !self.priority_bound
+    }
+
+    /// Frames ONE staged record as a per-record `Deliver` directly onto `out` (#546): the length-1-run
+    /// and active-tail emit, byte-for-byte a poll's unbatched `Deliver`. Honors the compressed-delivery
+    /// gate (#1066) via `capable` exactly as the per-record path — a non-capable consumer gets a stored
+    /// compressed record decompressed; an undecodable record is skipped (it stays leased and redelivers,
+    /// never a shipped bad byte). The lease is already recorded in `self.leased`; this only frames it.
+    fn emit_staged_record(
+        record: &OwnedRecord,
+        offset: u64,
+        generation: u64,
+        capable: bool,
+        out: &mut Vec<u8>,
+    ) {
+        let Some((wire_flags, wire_payload)) =
+            Self::deliver_encoding_for(capable, record.flags.bits(), &record.payload)
+        else {
+            return;
+        };
+        let msg = DeliverBody {
+            offset,
+            generation,
+            flags: wire_flags,
+            timestamp_ms: record.timestamp_ms,
+            key: &record.key,
+            headers: &record.headers,
+            payload: wire_payload.as_ref(),
+        };
+        let result = encode_deliver_frame(&msg, out);
+        // A delivered record's frame is a produced (u16-field-bounded, MAX_FRAME_LEN-capped) record plus
+        // a tiny fixed prefix, so this can never exceed the cap in practice; debug-assert the invariant
+        // and roll the partial frame off on the impossible error (the frame encoder already truncated).
+        debug_assert!(result.is_ok(), "Deliver frame exceeded the frame cap");
+    }
+
+    /// Flushes a staged CONTIGUOUS run (#546, M1-I8) and returns how many records it delivered. A
+    /// multi-record (two-or-more) run ships as ONE `DeliverBatch`: the run's leases are first resealed to
+    /// ONE shared generation (in the engine AND in `self.leased`, so the wire, the engine fence, and the
+    /// in-flight map all agree), then the SEALED prefix ships zero-copy via `read_range_raw`
+    /// ([`Engine::work_batch_raw_in`]) as the batch body and any ACTIVE-tail (or next-segment) remainder
+    /// ships as per-record `Deliver`s from the records already decoded during the claim drain. A length-1
+    /// run ships as a single per-record `Deliver`, byte-for-byte the unbatched path (no reseal needed —
+    /// its lease already carries this generation). An at-rest-ENCRYPTED log yields an EMPTY raw run
+    /// (fail-closed, never ciphertext), so the WHOLE batch ships as the decrypted per-record tail. On a
+    /// raw-read error the run degrades to all-per-record from the decoded records, so no record is lost.
+    ///
+    /// The batch body ships the stored bytes VERBATIM (including any stored-COMPRESSED record) WITHOUT a
+    /// compressed-delivery gate, sound because a `DeliverBatch`-capable consumer decodes the on-disk
+    /// record layout and is therefore compression-capable by construction (the SAME contract the Tier-S
+    /// raw batch relies on, #1066); the per-record tail is still `capable`-gated as belt-and-suspenders.
+    fn flush_run<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+        &mut self,
+        engine: &E,
+        run: &mut StagedRun,
+        capable: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<u32, SessionError> {
+        let count = run.records.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let first = run.first_offset;
+        let generation = run.shared_generation;
+        if count == 1 {
+            Self::emit_staged_record(&run.records[0], first, generation, capable, out);
+            run.records.clear();
+            return Ok(1);
+        }
+        // Reseal every lease in [first, first+count) to the ONE shared generation, in the engine AND in
+        // this session's `leased` map, so the batch's single-generation wire frame, the engine fence, and
+        // the in-flight accounting all name the same generation for every offset.
+        let group = self.subscription.clone();
+        let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
+        engine
+            .with(move |e| e.reseal_batch_in(&group, Offset::new(first), count_u32, generation))?;
+        for i in 0..count as u64 {
+            if let Some(lease) = self.leased.get_mut(&first.saturating_add(i)) {
+                lease.generation = generation;
+            }
+        }
+        // Zero-copy raw bytes for the SEALED prefix; an encrypted log (or a raw-read error) yields no raw
+        // run, so the whole batch falls to the decrypted per-record tail below — never a ciphertext byte.
+        let raw = match engine.with(move |e| e.work_batch_raw_in(Offset::new(first), count)) {
+            Ok(Ok(raw)) => Some(raw),
+            Ok(Err(_)) | Err(_) => None,
+        };
+        let sealed = raw.as_ref().map_or(0usize, |r| {
+            usize::try_from(r.record_count).unwrap_or(0).min(count)
+        });
+        let mut delivered = 0u32;
+        if let Some(raw) = raw.as_ref() {
+            if sealed >= 1 {
+                let header = DeliverBatchHeader {
+                    first_offset: first,
+                    generation,
+                    record_count: u32::try_from(sealed).unwrap_or(u32::MAX),
+                };
+                let result = encode_deliver_batch_frame(&header, &raw.bytes, out);
+                debug_assert!(result.is_ok(), "DeliverBatch frame exceeded the frame cap");
+                delivered = delivered.saturating_add(u32::try_from(sealed).unwrap_or(u32::MAX));
+            }
+        }
+        // The ACTIVE-tail (or next-segment) remainder as per-record `Deliver`s, contiguous after the
+        // sealed prefix; for an encrypted log `sealed == 0`, so this ships the WHOLE run decrypted.
+        for i in sealed..count {
+            Self::emit_staged_record(
+                &run.records[i],
+                first.saturating_add(i as u64),
+                generation,
+                capable,
+                out,
+            );
+            delivered = delivered.saturating_add(1);
+        }
+        run.records.clear();
+        Ok(delivered)
+    }
+
     // One cohesive credit/byte-budget/AIMD/auto-tune-bounded drain loop (the #65/#275/#402/#552 bounds
     // must bind in order in one place), the per-record analogue of `handle_fetch`; splitting it would
     // scatter the single in-flight-window walk across helpers and obscure the order the bounds compose.
@@ -2743,6 +2924,14 @@ impl Session {
         // without `--enable-otlp-export`) makes every per-record emission a zero-cost no-op, so the
         // deliver hot path is byte-for-byte unchanged by default.
         let span_sink = engine.span_sink();
+        // Batched + zero-copy Tier-W delivery (#546, M1-I8): a `DeliverBatch`-capable ROOT consumer
+        // STAGES a contiguous run of leased records and flushes it as ONE zero-copy `DeliverBatch`
+        // instead of N per-record `Deliver`s. `run` accumulates the current contiguous run; `capable` is
+        // the compressed-delivery gate reused for the per-record tail. When `!batchable` the run stays
+        // empty and every delivery takes the byte-for-byte-unchanged per-record path below.
+        let batchable = self.tierw_batchable();
+        let capable = self.compressed_delivery_enabled;
+        let mut run = StagedRun::new();
         loop {
             // FRESH per-pass generation snapshot, taken BEFORE this pass's drain (lost-wakeup safety and
             // stale-snapshot avoidance, see above).
@@ -2797,6 +2986,45 @@ impl Session {
                     }
                 })?;
                 match poll {
+                    Ok(Poll::Message(d)) if batchable => {
+                        // BATCHED Tier-W (#546): STAGE this record into the current contiguous run
+                        // instead of framing a `Deliver` now. The lease + tracing span are recorded
+                        // EXACTLY as the per-record path (so the byte budget, in-flight accounting, and
+                        // producer->consumer link are unchanged); only the WIRE framing is deferred to
+                        // the run flush. A NON-contiguous delivery (a `key_shared` skip, a competing
+                        // peer's interleave, an acked hole) flushes the current run first, then anchors a
+                        // fresh run — so a run only ever holds contiguous offsets the batch frame can
+                        // carry positionally. The `delivered` total is counted at flush, not here.
+                        //
+                        // NO compressed-delivery gate here: the batch body ships stored bytes VERBATIM
+                        // and a `DeliverBatch`-capable consumer is compression-capable by construction
+                        // (the Tier-S raw-batch contract, #1066); the per-record tail is `capable`-gated
+                        // inside `flush_run`.
+                        if !run.is_empty() && d.offset.get() != run.next_offset() {
+                            delivered = delivered
+                                .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
+                        }
+                        if run.is_empty() {
+                            run.begin(d.offset.get(), d.token.generation);
+                        }
+                        // Consumer span (#770), byte-for-byte the per-record arm — before the record is
+                        // moved into the run.
+                        if let Some(sink) = &span_sink {
+                            emit_consume_span(sink, &d.record.headers);
+                        }
+                        // Lease ownership + byte size (#175/#275), recorded now under this record's OWN
+                        // claim generation; a multi-record run reseals it to the shared generation at
+                        // flush. The byte budget therefore binds correctly WHILE staging.
+                        let bytes = lease_bytes(&d.record);
+                        self.leased.insert(
+                            d.offset.get(),
+                            Lease {
+                                generation: d.token.generation,
+                                bytes,
+                            },
+                        );
+                        run.records.push(d.record);
+                    }
                     Ok(Poll::Message(d)) => {
                         // Gate the delivery encoding on the negotiated compressed-delivery capability
                         // (#1066): a non-capable consumer gets a stored-COMPRESSED record DECOMPRESSED
@@ -2854,6 +3082,9 @@ impl Session {
                     // (#63); the durable DLQ topic write is still separate. The advisory does not
                     // count toward the delivered total. Keep draining the batch.
                     Ok(Poll::Parked { offset, .. }) => {
+                        // Flush any staged run FIRST so the batch's records precede this advisory (order).
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         frame_body.clear();
                         encode_dead_letter(
                             &DeadLetterBody {
@@ -2877,6 +3108,9 @@ impl Session {
                         earliest_retained,
                         skipped,
                     }) => {
+                        // Flush any staged run FIRST so the batch's records precede this advisory (order).
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         // Lane-scoped for a priority consumer (#553): a reap in one lane never fences
                         // another lane's in-flight leases (see `prune_leases_below_truncation`).
                         self.prune_leases_below_truncation(earliest_retained);
@@ -2898,6 +3132,9 @@ impl Session {
                     // emitted, so a non-capable consumer's batch is byte-for-byte unchanged. Keep draining
                     // either way: the next poll resumes at `to`.
                     Ok(Poll::Compacted { from, to }) => {
+                        // Flush any staged run FIRST so the batch's records precede this gap (order).
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         if self.gap_marker_enabled {
                             Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
                         }
@@ -2907,17 +3144,28 @@ impl Session {
                     // gap-marker-capable consumer) and keep draining — the next poll delivers the match
                     // after the run, exactly as the compaction-hole arm continues past a hole.
                     Ok(Poll::Filtered { from, to }) => {
+                        // Flush any staged run FIRST so the batch's records precede this gap (order).
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         if self.gap_marker_enabled {
                             Self::emit_filtered_gap(out, &mut frame_body, from.get(), to.get());
                         }
                     }
-                    // Nothing more deliverable right now: end the batch early.
-                    Ok(Poll::Idle) => break,
+                    // Nothing more deliverable right now: flush the staged run and end the batch early.
+                    Ok(Poll::Idle) => {
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
+                        break;
+                    }
                     Err(e) if e.is_fatal() => {
                         reply_err(out, "fatal storage error");
                         return Err(SessionError::EngineFatal(e));
                     }
                     Err(_) => {
+                        // Flush any staged run FIRST so its records ship before the Err terminator, exactly
+                        // as the per-record path emits records inline before hitting this arm. The delivered
+                        // count is not read past the immediate return, so it is discarded.
+                        self.flush_run(engine, &mut run, capable, out)?;
                         // The Err is this batch's terminator; do NOT also send a FlowEnd (that
                         // would desync the client, which expects exactly one terminator per Flow).
                         reply_err(out, "fetch failed");
@@ -2925,6 +3173,10 @@ impl Session {
                     }
                 }
             }
+            // Flush any run staged in this pass BEFORE the long-poll wait decision, so its records reach
+            // the client promptly (never held across a blocking wait) and `delivered` reflects them for
+            // the empty-drain re-wait test below.
+            delivered = delivered.saturating_add(self.flush_run(engine, &mut run, capable, out)?);
             // Long-poll re-wait decision (push delivery, #1100 L3): the drain drew NOTHING and a budget +
             // a commit-notify seam are both configured, so block on THIS stream's cell for the REMAINING
             // budget (recomputed from the loop's start each pass, so the TOTAL wait can never exceed
@@ -3089,6 +3341,11 @@ impl Session {
         let longpoll_cell = engine.commit_notify().map(|n| n.cell(&self.stream));
         let longpoll_budget = std::time::Duration::from_millis(self.consume_longpoll_ms);
         let longpoll_start = std::time::Instant::now();
+        // Batched + zero-copy Tier-W delivery (#546, M1-I8), the `handle_flow` twin: a `DeliverBatch`-
+        // capable ROOT consumer STAGES a contiguous run and flushes it as ONE zero-copy `DeliverBatch`.
+        let batchable = self.tierw_batchable();
+        let capable = self.compressed_delivery_enabled;
+        let mut run = StagedRun::new();
         loop {
             // FRESH per-pass generation snapshot, taken BEFORE this pass's drain.
             let longpoll_snapshot = longpoll_cell.as_ref().map(|c| c.seq());
@@ -3130,6 +3387,28 @@ impl Session {
                         e.poll_in_stream_member(&stream, &group, member, now)
                     }
                 })? {
+                    Ok(Poll::Message(d)) if batchable => {
+                        // BATCHED Tier-W (#546), the `handle_flow` twin: STAGE this record into the
+                        // current contiguous run; a non-contiguous delivery flushes the run first. The
+                        // lease + byte accounting are recorded now (byte budget unchanged while staging);
+                        // the wire framing is deferred to the run flush.
+                        if !run.is_empty() && d.offset.get() != run.next_offset() {
+                            delivered = delivered
+                                .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
+                        }
+                        if run.is_empty() {
+                            run.begin(d.offset.get(), d.token.generation);
+                        }
+                        let bytes = lease_bytes(&d.record);
+                        self.leased.insert(
+                            d.offset.get(),
+                            Lease {
+                                generation: d.token.generation,
+                                bytes,
+                            },
+                        );
+                        run.records.push(d.record);
+                    }
                     Ok(Poll::Message(d)) => {
                         // Compressed-delivery gate (#1066), IDENTICAL to `handle_flow`: a non-capable
                         // consumer gets a stored-COMPRESSED record decompressed (COMPRESSED bit cleared);
@@ -3171,6 +3450,9 @@ impl Session {
                     // A parked (poison) message: the same in-band dead-letter advisory as `handle_flow`. It
                     // consumes a credit slot (it ran a poll) but does not count toward `delivered`.
                     Ok(Poll::Parked { offset, .. }) => {
+                        // Flush any staged run FIRST so the batch's records precede this advisory (order).
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         frame_body.clear();
                         encode_dead_letter(
                             &DeadLetterBody {
@@ -3188,6 +3470,9 @@ impl Session {
                         earliest_retained,
                         skipped,
                     }) => {
+                        // Flush any staged run FIRST so the batch's records precede this advisory (order).
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         self.prune_leases_below_truncation(earliest_retained);
                         self.emit_truncation(
                             out,
@@ -3199,6 +3484,8 @@ impl Session {
                     // A key-compaction hole: identical to `handle_flow` — a gap-marker-capable consumer gets
                     // the COMPACTED marker, a non-capable one silently advances. Keep draining.
                     Ok(Poll::Compacted { from, to }) => {
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         if self.gap_marker_enabled {
                             Self::emit_compaction(out, &mut frame_body, from.get(), to.get());
                         }
@@ -3207,17 +3494,27 @@ impl Session {
                     // non-matching span; surface ONE coalesced gap marker (to a capable consumer) and
                     // keep draining, exactly as the compaction-hole arm does.
                     Ok(Poll::Filtered { from, to }) => {
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
                         if self.gap_marker_enabled {
                             Self::emit_filtered_gap(out, &mut frame_body, from.get(), to.get());
                         }
                     }
-                    // Nothing more deliverable right now: end the batch early (the no_wait / ready-now case).
-                    Ok(Poll::Idle) => break,
+                    // Nothing more deliverable right now: flush the staged run and end the batch early
+                    // (the no_wait / ready-now case).
+                    Ok(Poll::Idle) => {
+                        delivered = delivered
+                            .saturating_add(self.flush_run(engine, &mut run, capable, out)?);
+                        break;
+                    }
                     Err(e) if e.is_fatal() => {
                         reply_err(out, "fatal storage error");
                         return Err(SessionError::EngineFatal(e));
                     }
                     Err(_) => {
+                        // Flush any staged run FIRST so its records ship before the Err terminator; the
+                        // count is not read past the immediate return, so it is discarded.
+                        self.flush_run(engine, &mut run, capable, out)?;
                         // The Err is this batch's terminator; do NOT also send a FlowEnd (that would desync
                         // the client, which expects exactly one terminator per fetch), matching `handle_flow`.
                         reply_err(out, "fetch failed");
@@ -3225,6 +3522,9 @@ impl Session {
                     }
                 }
             }
+            // Flush any run staged in this pass (also covers the deadline / byte-cap `break`s above), so
+            // its records reach the client before the long-poll wait decision and `delivered` reflects them.
+            delivered = delivered.saturating_add(self.flush_run(engine, &mut run, capable, out)?);
             // Long-poll re-wait decision (push delivery, #1100 L3), the `handle_flow` twin plus the
             // `no_wait` exemption: an empty drain on a waiting fetch with a configured budget + seam blocks
             // on the default cell for the REMAINING budget (recomputed from the loop start each pass, so
@@ -17236,7 +17536,11 @@ mod tests {
         frame(FrameType::PubTo, &p)
     }
 
-    fn flow(s: &mut Session, e: &DirectEngine<InMemoryFs, ManualClock>, credit: u32) -> Vec<u8> {
+    fn flow(
+        s: &mut Session,
+        e: &DirectEngine<InMemoryFs, impl Clock + Clone + 'static>,
+        credit: u32,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         s.process(e, &frame(FrameType::Flow, &credit.to_le_bytes()), &mut out)
             .unwrap();
@@ -17848,6 +18152,419 @@ mod tests {
             one_response(&out).0,
             FrameType::PubAck,
             "a commits its own txn"
+        );
+    }
+
+    // ===== Batched + zero-copy Tier-W work-queue delivery (#546, M1-I8) ===========================
+    //
+    // A `DeliverBatch`-capable ROOT Tier-W consumer receives a contiguous run of LEASED records as ONE
+    // zero-copy `DeliverBatch` (its sealed prefix spliced verbatim via `read_range_raw`) instead of N
+    // per-record `Deliver` frames — while EVERY per-message semantic is preserved because the batch
+    // drains through the SAME per-record `poll_now_in_member` the unbatched path uses and only defers the
+    // WIRE framing. The crux is the SHARED lease generation: the reused batch frame carries one
+    // `generation`, so the run's leases are resealed to ONE generation, which is sound because fencing is
+    // per-OFFSET (see `LeaseTable::reseal_to`). These tests pin: the batched wire shape, per-record ack
+    // (by offset) with generation fencing, per-record nack redelivery, visibility-timeout redelivery of
+    // the un-acked, per-record MaxDeliver -> DLQ, key_shared per-key routing, the encrypted / active-tail
+    // per-record fallback (never zero-copy ciphertext), the credit bound, order, and single-record parity.
+
+    /// Connects a `DeliverBatch`-capable ROOT Tier-W consumer (competing by default; NOT marked
+    /// streaming, so `Flow`/poll LEASES each record) with member id `member`, subscribed to `group`.
+    fn tierw_batch_session<C: Clock + Clone + 'static>(
+        e: &DirectEngine<InMemoryFs, C>,
+        member: MemberId,
+        group: &[u8],
+    ) -> Session {
+        let mut s = Session::with_member_id(member);
+        let mut out = Vec::new();
+        s.process(
+            e,
+            &frame(FrameType::Connect, &batch_connect_body(true, true)),
+            &mut out,
+        )
+        .unwrap();
+        let info = ironbus_proto::message::decode_info(&one_response(&out).1).unwrap();
+        assert!(info.deliver_batch, "the server confirms DeliverBatch");
+        out.clear();
+        s.process(e, &frame(FrameType::Sub, group), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "SUB acked");
+        s
+    }
+
+    /// Every delivered record in a (possibly mixed `DeliverBatch` + per-record `Deliver`) Tier-W
+    /// response, as `(offset, generation, payload)` in wire order — decoded EXACTLY the way a batch-capable
+    /// client reconstructs them (a batch expands POSITIONALLY, each frame CRC-verified). Advisories
+    /// (`DeadLetter` / `GapMarker` / `FlowEnd`) are ignored.
+    fn tierw_deliveries(out: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
+        let mut v = Vec::new();
+        for (ty, body) in decode_all(out) {
+            match ty {
+                FrameType::DeliverBatch => {
+                    for r in decode_batch_records(&body) {
+                        v.push((r.0, r.1, r.6));
+                    }
+                }
+                FrameType::Deliver => {
+                    let d = decode_deliver(&body).unwrap();
+                    v.push((d.offset, d.generation, d.payload.to_vec()));
+                }
+                _ => {}
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn tierw_batch_delivers_a_contiguous_run_as_one_zero_copy_deliverbatch() {
+        // HEADLINE: a batch-capable Tier-W consumer gets a contiguous leased run as ONE `DeliverBatch`
+        // (zero-copy `read_range_raw`), not N `Deliver` frames — records in offset order, ONE shared
+        // generation, each record leased. A per-record (batch-INCAPABLE) consumer over the SAME log gets
+        // byte-for-byte the same records as N `Deliver`s, proving the batch is purely a delivery encoding.
+        let e = DirectEngine::new(engine());
+        for i in 0..8u8 {
+            produce_kh(&e, &[i], &[i, 1], &[i; 5]);
+        }
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let out = flow(&mut s, &e, 64);
+        let frames = decode_all(&out);
+        // Zero-copy: at least one `DeliverBatch` (the sealed contiguous run) — never a per-record run.
+        let batch = frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::DeliverBatch)
+            .expect("the contiguous sealed run ships as a DeliverBatch (raw_byte_range zero-copy)");
+        let (header, _) = ironbus_proto::message::decode_deliver_batch(&batch.1).unwrap();
+        assert!(
+            header.record_count >= 2,
+            "a real (>=2 record) batch, not a degenerate one"
+        );
+        // Order preserved and every record present, in offset order.
+        let got = tierw_deliveries(&out);
+        assert_eq!(
+            got.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<u64>>(),
+            "offsets 0..8 in order"
+        );
+        for (i, r) in got.iter().enumerate() {
+            assert_eq!(
+                r.2,
+                vec![u8::try_from(i).unwrap(); 5],
+                "payload of offset {i}"
+            );
+        }
+        // ONE shared generation across the whole batch (what the reused frame carries).
+        let g = got[0].1;
+        assert!(
+            got.iter().all(|r| r.1 == g),
+            "one shared generation across the batch"
+        );
+        // Every record is leased (in-flight): the FlowEnd count is 8 and a re-Flow (nothing expired)
+        // draws nothing new.
+        let flowend = frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::FlowEnd)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(flowend.1[..4].try_into().unwrap()), 8);
+        let again = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert!(
+            again.is_empty(),
+            "all 8 are leased in-flight; a re-Flow draws nothing"
+        );
+    }
+
+    #[test]
+    fn tierw_batch_per_record_ack_commits_only_that_record_and_fences_a_stale_generation() {
+        // Per-record ack IN a batch: acking one offset commits ONLY that record (the others stay leased),
+        // and an ack under the WRONG generation is fenced — exactly the per-record contract, over a batch.
+        let e = DirectEngine::new(engine());
+        for i in 0..5u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let got = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert_eq!(got.len(), 5);
+        let g = got[0].1; // the shared batch generation
+        assert_eq!(e.engine_mut().committed_offset_in("g").get(), 0);
+        // Ack offset 2 OUT OF ORDER: Acked, but the cursor does NOT advance (0,1 still un-acked ahead).
+        assert_eq!(
+            ack_reply(&mut s, &e, AckOp::Ack, 2, g),
+            vec![1u8],
+            "offset 2 acked"
+        );
+        assert_eq!(
+            e.engine_mut().committed_offset_in("g").get(),
+            0,
+            "an out-of-order ack of one batched record does not advance the cursor"
+        );
+        // A stale-generation ack of offset 3 is FENCED (status 0) — the shared generation still fences
+        // per offset, so a wrong token can never commit a batched record.
+        assert_eq!(
+            ack_reply(&mut s, &e, AckOp::Ack, 3, g.wrapping_add(1)),
+            vec![0u8],
+            "a wrong-generation ack of a batched record is fenced"
+        );
+        // Ack 0 and 1 (correct generation): now 0,1,2 are contiguously committed -> cursor 3. Offset 3
+        // was fenced above, so it is NOT committed (the cursor stops at 3, not 4).
+        assert_eq!(ack_reply(&mut s, &e, AckOp::Ack, 0, g), vec![1u8]);
+        assert_eq!(ack_reply(&mut s, &e, AckOp::Ack, 1, g), vec![1u8]);
+        assert_eq!(
+            e.engine_mut().committed_offset_in("g").get(),
+            3,
+            "0,1,2 committed contiguously; the fenced offset 3 is NOT committed"
+        );
+    }
+
+    #[test]
+    fn tierw_batch_per_record_nack_redelivers_only_that_record() {
+        // Per-record nack IN a batch: nacking one offset requeues ONLY it; the next Flow redelivers just
+        // that record (the others stay leased). Proves a batch is N independent leases, not one.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        for i in 0..5u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let got = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert_eq!(got.len(), 5);
+        let g = got[0].1;
+        // Nack offset 2 with the shared generation, immediate (delay 0): it becomes claimable at once.
+        assert_eq!(
+            ack_reply(&mut s, &e, AckOp::Nack, 2, g),
+            vec![1u8],
+            "nack accepted"
+        );
+        // The re-Flow redelivers ONLY offset 2 (0,1,3,4 are still leased in-flight, not expired).
+        let redelivered = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert_eq!(
+            redelivered.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![2u64],
+            "only the nacked record redelivers"
+        );
+        assert_eq!(redelivered[0].2, vec![2u8], "the nacked record's payload");
+    }
+
+    #[test]
+    fn tierw_batch_visibility_timeout_redelivers_the_unacked_records() {
+        // Visibility timeout over a batch: ack ONE record, let the lease window elapse, and only the
+        // UN-acked batched records redeliver — the acked one never does.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5)); // visibility 30ns
+        for i in 0..3u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let got = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let g = got[0].1;
+        // Ack offset 0; advance PAST the visibility window so 1 and 2 expire.
+        assert_eq!(ack_reply(&mut s, &e, AckOp::Ack, 0, g), vec![1u8]);
+        clock.advance_monotonic_nanos(50);
+        let redelivered = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert_eq!(
+            redelivered.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![1u64, 2u64],
+            "only the un-acked batched records redeliver after the visibility timeout"
+        );
+    }
+
+    #[test]
+    fn tierw_batch_maxdeliver_dead_letters_each_record_individually() {
+        // MaxDeliver -> DLQ per record IN a batch: with max_deliver=1, the batch delivers once, and after
+        // the visibility timeout EACH batched offset that exceeds its cap is dead-lettered individually
+        // (one DeadLetter advisory per record), never redelivered.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 1)); // max_deliver = 1
+        for i in 0..3u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let got = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert_eq!(got.len(), 3, "the batch delivers all three once");
+        // Expire the leases; the next poll of each finds attempt 2 > max_deliver 1 -> dead-letter.
+        clock.advance_monotonic_nanos(50);
+        let out = flow(&mut s, &e, 64);
+        let frames = decode_all(&out);
+        let dead: Vec<u64> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::DeadLetter)
+            .map(|(_, b)| {
+                ironbus_proto::message::decode_dead_letter(b)
+                    .unwrap()
+                    .offset
+            })
+            .collect();
+        assert_eq!(
+            dead,
+            vec![0, 1, 2],
+            "each batched record is dead-lettered individually, in order"
+        );
+        assert!(
+            tierw_deliveries(&out).is_empty(),
+            "a dead-lettered record is never redelivered"
+        );
+    }
+
+    #[test]
+    fn tierw_batch_preserves_key_shared_per_key_routing() {
+        // key_shared routing IN the batch path: a key's records go ONLY to its owning member, in order —
+        // batching (which stages non-contiguous key_shared runs as length-1 per-record frames) does not
+        // reroute a single record. The non-owner never sees the key.
+        let e = DirectEngine::new(engine());
+        e.engine_mut()
+            .set_configured_key_shared_groups(["shared".to_string()]);
+        let m1 = MemberId::new(101);
+        let m2 = MemberId::new(202);
+        let mut s1 = tierw_batch_session(&e, m1, b"shared");
+        let mut s2 = tierw_batch_session(&e, m2, b"shared");
+        assert_eq!(
+            e.engine_mut().key_ordering_in("shared"),
+            KeyOrdering::KeyShared
+        );
+        let key = (0..2000u32)
+            .map(|n| format!("k{n}").into_bytes())
+            .find(|k| {
+                matches!(
+                    e.engine_mut()
+                        .route_decision_in("shared", m1, k, Offset::ZERO),
+                    Some(ironbus_core::keyshared::RouteDecision::Deliver)
+                )
+            })
+            .expect("a key owned by m1");
+        produce_keyed(&e, &key, b"first");
+        produce_keyed(&e, &key, b"second");
+        // The non-owner sees nothing for this key.
+        assert!(
+            tierw_deliveries(&flow(&mut s2, &e, 64)).is_empty(),
+            "the non-owner never receives the key's records"
+        );
+        // The owner gets the first (the key is then busy until acked).
+        let got = tierw_deliveries(&flow(&mut s1, &e, 64));
+        assert_eq!(
+            got.iter().map(|r| r.2.clone()).collect::<Vec<_>>(),
+            vec![b"first".to_vec()]
+        );
+        let (off, gen) = (got[0].0, got[0].1);
+        assert_eq!(ack_reply(&mut s1, &e, AckOp::Ack, off, gen), vec![1u8]);
+        // Then the second delivers to the same owner, in per-key order.
+        let got2 = tierw_deliveries(&flow(&mut s1, &e, 64));
+        assert_eq!(
+            got2.iter().map(|r| r.2.clone()).collect::<Vec<_>>(),
+            vec![b"second".to_vec()]
+        );
+    }
+
+    #[test]
+    fn tierw_batch_falls_back_to_per_record_for_the_unsealed_remainder() {
+        // The RAW + PER-RECORD-TAIL split, which is ALSO the encrypted-log fallback path. `read_range_raw`
+        // serves at most ONE sealed segment, so a run that spans several small segments ships as a
+        // `DeliverBatch` (the sealed prefix, zero-copy) PLUS per-record `Deliver`s for the remainder —
+        // exercising the `for i in sealed..count` per-record tail loop in `flush_run`. That per-record tail
+        // is EXACTLY the whole-batch path an at-rest-encrypted log takes: `Log::read_range_raw` fail-closes
+        // an encrypted range to an EMPTY raw run (`sealed == 0`, never ciphertext; the storage-layer test
+        // pins that), so the entire batch flushes through this same per-record loop, decrypted-on-read.
+        // Whatever the split, EVERY record is delivered exactly once, in offset order, with its payload.
+        let e = DirectEngine::new(small_segment_engine()); // 160-byte segments, max_in_flight 10
+        for i in 0..10u8 {
+            produce_kh(&e, &[i], b"hh", &[i; 8]);
+        }
+        assert!(
+            e.engine_mut().segment_count() >= 2,
+            "the small cap rolled the run across several sealed segments"
+        );
+        // The engine's own raw read for the whole run is bounded to ONE segment, so the remainder must
+        // ship per-record (the same shape an encrypted `read_range_raw` — which returns 0 — forces).
+        let raw = e
+            .with(|eng| eng.work_batch_raw_in(Offset::new(0), 10))
+            .unwrap()
+            .unwrap();
+        assert!(
+            usize::try_from(raw.record_count).unwrap() < 10,
+            "a multi-segment run is not fully covered by one zero-copy segment read"
+        );
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let out = flow(&mut s, &e, 64);
+        let frames = decode_all(&out);
+        assert!(
+            frames.iter().any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "the sealed prefix ships zero-copy as a DeliverBatch"
+        );
+        assert!(
+            frames.iter().any(|(ty, _)| *ty == FrameType::Deliver),
+            "the unsealed remainder ships as per-record Deliver (the encrypted whole-batch path)"
+        );
+        let got = tierw_deliveries(&out);
+        assert_eq!(
+            got.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<u64>>(),
+            "every record delivered once, in order, across the split (max_in_flight 10)"
+        );
+        for (i, r) in got.iter().enumerate() {
+            assert_eq!(
+                r.2,
+                vec![u8::try_from(i).unwrap(); 8],
+                "payload of offset {i} (plaintext, not ciphertext)"
+            );
+        }
+        // ONE shared generation spans the batch AND the per-record tail (same run, one fence).
+        let g = got[0].1;
+        assert!(
+            got.iter().all(|r| r.1 == g),
+            "one shared generation across batch + tail"
+        );
+    }
+
+    #[test]
+    fn tierw_single_record_run_ships_as_a_plain_deliver_not_a_batch() {
+        // Single-record parity: a length-1 run ships as ONE per-record `Deliver` (byte-for-byte the
+        // unbatched path), never a degenerate 1-record `DeliverBatch`.
+        let e = DirectEngine::new(engine());
+        produce_kh(&e, b"k", b"h", b"solo");
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let out = flow(&mut s, &e, 64);
+        let frames = decode_all(&out);
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "a single record is a plain Deliver, not a batch"
+        );
+        let got = tierw_deliveries(&out);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].0, got[0].2.clone()), (0u64, b"solo".to_vec()));
+    }
+
+    #[test]
+    fn tierw_non_batch_consumer_is_byte_for_byte_per_record() {
+        // BACK-COMPAT: a consumer that did NOT negotiate DeliverBatch still gets per-record `Deliver`
+        // frames over the SAME log — the batched path is strictly opt-in.
+        let e = DirectEngine::new(engine());
+        for i in 0..4u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        let mut s = connect_and_sub(&e, MemberId::new(1), b"g");
+        let out = flow(&mut s, &e, 64);
+        assert!(
+            !decode_all(&out)
+                .iter()
+                .any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "a non-batch consumer never receives a DeliverBatch"
+        );
+        assert_eq!(delivered_offsets(&out), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn tierw_batch_respects_the_credit_and_in_flight_bounds() {
+        // BOUND: the batch never delivers more than the min of the requested credit and the group's
+        // max_in_flight window (10 here) — the batch is a bounded encoding of the SAME bounded drain.
+        let e = DirectEngine::new(engine()); // max_in_flight = 10
+        for i in 0..30u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        // Ask for far more than the window; the drain is capped at max_in_flight = 10.
+        let got = tierw_deliveries(&flow(&mut s, &e, 64));
+        assert_eq!(
+            got.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<u64>>(),
+            "the batched run is bounded by max_in_flight (10), in order"
         );
     }
 }
