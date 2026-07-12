@@ -793,6 +793,43 @@ pub fn encode_deliver_batch_frame(
     Ok(())
 }
 
+/// Encodes ONLY the `[len:u32][type][header]` PREFIX of a `DeliverBatch` frame onto `out` (#658, the
+/// Linux `sendfile(2)` zero-copy path) — everything `encode_deliver_batch_frame` writes EXCEPT the
+/// `record_bytes` body, whose `body_len` bytes the caller SPLICES straight from the segment's page cache
+/// into the socket right after this prefix. The framed length is computed from `body_len` (the eventual
+/// spliced length) EXACTLY as `encode_deliver_batch_frame` computes it from `record_bytes.len()`, so the
+/// bytes on the wire are byte-for-byte identical to the copy path's — the client is oblivious to whether
+/// the body was memcpy'd or spliced, and each stored record's CRC still ships end-to-end.
+///
+/// The caller writes this prefix, records where `out` ends (the splice injection point), then delivers
+/// `body_len` bytes via `sendfile(2)` before appending any further frames to `out`.
+///
+/// # Errors
+/// [`FrameError::FrameTooLarge`](crate::frame::FrameError::FrameTooLarge) if the framed length would
+/// exceed [`MAX_FRAME_LEN`](crate::frame::MAX_FRAME_LEN), exactly as [`encode_deliver_batch_frame`].
+pub fn encode_deliver_batch_frame_header(
+    header: &DeliverBatchHeader,
+    body_len: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), crate::frame::FrameError> {
+    // Identical length arithmetic to `encode_deliver_batch_frame`, only sourcing the body length from
+    // `body_len` (the spliced range) rather than a materialized `record_bytes` slice, so the framed
+    // length — and thus every wire byte of the prefix — matches the copy path exactly.
+    let frame_body_len = DELIVER_BATCH_HEADER_LEN as u64 + body_len as u64;
+    let frame_len = 1u64 + frame_body_len;
+    if frame_len > u64::from(crate::frame::MAX_FRAME_LEN) {
+        return Err(crate::frame::FrameError::FrameTooLarge { len: frame_len });
+    }
+    let Ok(frame_len) = u32::try_from(frame_len) else {
+        return Err(crate::frame::FrameError::FrameTooLarge { len: frame_len });
+    };
+    out.reserve(4 + 1 + DELIVER_BATCH_HEADER_LEN);
+    out.extend_from_slice(&frame_len.to_le_bytes());
+    out.push(crate::frame::FrameType::DeliverBatch.as_u8());
+    write_deliver_batch_header(header, out);
+    Ok(())
+}
+
 /// Decodes a `DeliverBatch` frame body (#541) into its fixed [`DeliverBatchHeader`] and a BORROWED slice
 /// of the contiguous on-disk record-frame bytes that follow it, cap-before-alloc and panic-free.
 ///
