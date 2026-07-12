@@ -663,14 +663,21 @@ pub struct EngineConfig {
     /// many named streams share ONE tagged commit log ([`ironbus_storage::shared_wal::SharedWal`]),
     /// trading per-stream resilience isolation for density (see the type docs for the tradeoff).
     ///
-    /// **Wiring status (surfaced, #597):** the shared-WAL storage PRIMITIVE — tagged interleaved
-    /// append, per-stream demux read, and index-rebuilding recovery — is implemented and tested at the
-    /// storage layer ([`ironbus_storage::shared_wal::SharedWal`]). Threading it through the engine's
-    /// `produce_in_stream`/`poll_in_stream`/`ack_in_stream` and recovery paths in place of the
-    /// per-stream `StreamSet` is the deferred follow-up (like #693's deferred cooperative rebalance);
-    /// until then [`Engine::open`] fail-closed REJECTS a config that selects [`StorageMode::SharedWal`]
-    /// with a typed error rather than silently running per-stream (an honest opt-in, never a silent
-    /// no-op). The default [`StorageMode::PerStreamLogs`] path is completely untouched.
+    /// **Wiring status (#597, WIRED):** the shared-WAL storage substrate — tagged interleaved append,
+    /// per-stream demux read, and index-rebuilding recovery — is implemented in
+    /// [`ironbus_storage::shared_wal::SharedWal`] and now THREADED through the engine's
+    /// `produce_in_stream`/`poll_in_stream`/`ack_in_stream` and recovery paths, so
+    /// [`StorageMode::SharedWal`] is a LIVE mode: [`Engine::open`] opens it when selected (it does NOT
+    /// reject it). The one combination [`Engine::open`] still fail-closed REJECTS is at-rest ENCRYPTION
+    /// with shared-WAL ([`EngineError::EncryptedSharedWalUnsupported`]); a plaintext shared-WAL data dir
+    /// opens and runs. The default [`StorageMode::PerStreamLogs`] path is completely untouched.
+    ///
+    /// **Append sharding (#811, C4):** a shared-WAL broker CANNOT shard the append plane — every named
+    /// stream shares ONE physical commit log, so its records cannot be split across writer threads.
+    /// [`Engine::append_shard_count`] therefore reports 1 for a shared-WAL engine regardless of the
+    /// configured count, and config validation ([`crate::actor::resolve_append_shards`]) fail-closed
+    /// REJECTS an EXPLICIT `--append-shards > 1` combined with this mode
+    /// ([`crate::actor::SharedWalCannotShard`]).
     pub storage_mode: ironbus_storage::shared_wal::StorageMode,
 }
 
@@ -15561,6 +15568,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.log.durable_record_bytes()
     }
 
+    /// The number of append shards this engine actually runs (#811, C4), given a `configured` count
+    /// (already resolved + capped by [`crate::actor::resolve_append_shards`]). A SHARED-WAL engine is
+    /// PINNED to ONE shard — every named stream shares one physical commit log, so its records cannot
+    /// be split across writer threads — so it clamps any request to 1; a per-stream-logs engine honors
+    /// `configured` (floored to >= 1). The named-stream produce path routes with
+    /// [`crate::actor::shard_of`]`(stream, this)`, so a shared-WAL engine returning 1 pins every stream
+    /// to shard 0. In C1 the effective `configured` is 1 (the C8 flip spawns K > 1), so this returns 1
+    /// on every engine today — byte-for-byte the single-actor path.
+    #[must_use]
+    pub fn append_shard_count(&self, configured: usize) -> usize {
+        if self.shared_wal.is_some() {
+            1
+        } else {
+            configured.max(1)
+        }
+    }
+
     /// The configured durable-log byte cap (`LogConfig::max_total_bytes`, the quantity
     /// [`Engine::durable_record_bytes`] is shed against). `0` means UNLIMITED (the cap is off). Fixed
     /// for the engine's life: the cap is layout/contract-bound and NOT live-reloadable (a change
@@ -16663,6 +16687,43 @@ mod tests {
             storage_mode: ironbus_storage::shared_wal::StorageMode::SharedWal,
             ..config(max_in_flight, max_deliver)
         }
+    }
+
+    #[test]
+    fn shared_wal_engine_reports_one_append_shard_and_named_produces_route_to_shard_zero() {
+        // #811 C4: a shared-WAL engine CANNOT shard the append plane (every named stream shares ONE
+        // physical commit log), so it reports exactly ONE append shard for ANY configured count, and
+        // `shard_of` therefore pins every named stream to shard 0 — its byte-identical single-log path.
+        let shared = open(shared_config(100, 5));
+        for configured in [1usize, 2, 8, 64] {
+            assert_eq!(
+                shared.append_shard_count(configured),
+                1,
+                "shared-WAL forces one append shard for configured={configured}",
+            );
+        }
+        for name in ["orders", "clicks", "alpha", "beta/gamma", "x"] {
+            assert_eq!(
+                crate::actor::shard_of(name, shared.append_shard_count(64)),
+                0,
+                "every named stream routes to shard 0 under shared-WAL",
+            );
+        }
+
+        // A per-stream-logs engine, by contrast, HONORS the configured count (the routing base the C8
+        // flip fans across) — still 1 by default today, so K=1 is byte-for-byte the single-actor path.
+        let per_stream = open(config(100, 5));
+        assert_eq!(per_stream.append_shard_count(1), 1);
+        assert_eq!(
+            per_stream.append_shard_count(8),
+            8,
+            "per-stream honors the configured count",
+        );
+        assert_eq!(
+            per_stream.append_shard_count(0),
+            1,
+            "the count is floored to at least one shard",
+        );
     }
 
     /// Polls stream `stream` in `group` and expects a delivered message.

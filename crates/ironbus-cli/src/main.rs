@@ -143,7 +143,9 @@ use ironbus_core::lease::LeaseConfig;
 #[cfg(unix)]
 use ironbus_core::types::RecordFlags;
 #[cfg(unix)]
-use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
+use ironbus_server::actor::{
+    resolve_append_shards, spawn_actor_with_gather, AppendShards, DEFAULT_CHANNEL_BOUND,
+};
 #[cfg(unix)]
 use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConfig};
 #[cfg(unix)]
@@ -292,6 +294,14 @@ const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 /// MANY named streams share ONE tagged commit log. The mode is RESTART-ONLY and layout-bound: the
 /// engine fail-closed refuses to open a data directory laid out by the other mode.
 const DEFAULT_STORAGE_MODE: &str = "per-stream";
+
+/// The default APPEND-SHARD count for `serve` (`1` = a single append shard, #811): today's
+/// byte-for-byte single-actor write plane. `auto` resolves to the machine's core count (capped at
+/// [`MAX_APPEND_SHARDS`]); an explicit positive integer pins the count. RESTART-ONLY, and in this
+/// release INERT — the broker runs one append shard regardless of a resolved `> 1` until append-actor
+/// sharding is enabled, so the knob is a validated, reported setting (it never changes runtime
+/// behavior yet). Shared-WAL forces `1` and rejects an explicit `> 1`.
+const DEFAULT_APPEND_SHARDS: &str = "1";
 
 /// The default durability LEVEL for `serve` (`sync`, matching the engine default, #341, #379): an ack
 /// is emitted only after the covering `fdatasync`, so I2 holds and an acknowledged record is never
@@ -998,7 +1008,7 @@ USAGE:
                   [--max-groups <n>] [--max-streams <n>] [--max-open-streams <n>]
                   [--group-idle-evict-ms <ms>]
                   [--disk-full-policy <drop-new|drop-oldest>]
-                  [--storage-mode <per-stream|shared-wal>]
+                  [--storage-mode <per-stream|shared-wal>] [--append-shards <auto|N>]
                   [--key-shared-group <name>]... [--broadcast-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>] [--enable-admin]
     ironbus passwd --auth-config <path> --user <name> [--scopes <publish,subscribe,admin>]
@@ -1169,6 +1179,13 @@ Notes:
     subjects/filtered subscriptions, Tier-S streaming, and partitioned streams (all typed rejects
     in shared-wal mode). RESTART-ONLY and layout-bound: opening a data dir laid out by the other
     mode is refused fail-closed, never silently misread.
+    --append-shards (default 1) sets how many append shards the write plane runs (#811): 1 is the
+    single-actor write plane (today's behavior byte-for-byte); auto resolves to the machine's core
+    count (capped at a safe maximum); an explicit positive integer pins the count. RESTART-ONLY, and
+    INERT in this release: a resolved value greater than 1 does NOT yet spawn multiple append actors
+    (the broker still runs a single append shard), so the knob is a validated, reported setting only.
+    shared-wal cannot shard (all named streams share one physical commit log), so it forces 1 and
+    rejects an explicit value greater than 1.
     --key-shared-group <name> (repeatable, default none) runs the named competing group in
     key_shared ordering: a record's key routes to one live member, so same-key records keep their
     order while the group drains in parallel across keys. A group not named here stays plain
@@ -2530,6 +2547,10 @@ struct ServeFlags {
     /// The named-stream STORAGE MODE (#597): `--storage-mode <per-stream|shared-wal>`; `None`
     /// falls back to the `per-stream` default. Restart-only (layout-bound), never reloadable.
     storage_mode: Option<String>,
+    /// The APPEND-SHARD count (#811): `--append-shards <auto|N>`; `None` falls back to `1` (a single
+    /// append shard, today's byte-for-byte single-actor write plane). Restart-only, and inert in this
+    /// release (a resolved `> 1` does not yet spawn K actors — that is the C8 flip).
+    append_shards: Option<String>,
     visibility_ms: Option<u64>,
     enable_admin: bool,
     /// Turn ON the OTLP span export (#99, #352): the `--enable-otlp-export` bare flag. OFF by
@@ -2856,6 +2877,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--storage-mode" => {
                 f.storage_mode = Some(take_value("--storage-mode", args, &mut i)?);
+            }
+            "--append-shards" => {
+                f.append_shards = Some(take_value("--append-shards", args, &mut i)?);
             }
             "--durability-level" => {
                 f.durability_level = Some(take_value("--durability-level", args, &mut i)?);
@@ -3372,6 +3396,45 @@ fn parse_serve_flags_with_env_and_reader(
             "`{source}` must be `per-stream` or `shared-wal`, got `{storage_mode_arg}`"
         ))
     })?;
+    // The APPEND-SHARD count (#811): flag > env > default (`1`), parsed like the other enum-ish flags,
+    // then RESOLVED against the storage mode in the one shared policy (`resolve_append_shards`): `auto`
+    // -> core count (capped at `MAX_APPEND_SHARDS`); an explicit count is honored (clamped to the cap);
+    // shared-WAL forces `1` and fail-closed REJECTS an explicit `> 1` (it shares one physical commit
+    // log across all named streams and cannot shard the append plane). RESTART-ONLY and, in this
+    // release, INERT: a resolved `> 1` does NOT yet spawn K actors (that is the owner-gated C8 flip), so
+    // the broker runs a single append shard (K=1) regardless — the resolved count is a validated,
+    // reported setting only.
+    let shards_from_flag = f.append_shards.is_some();
+    let append_shards_arg = resolve_string(
+        "--append-shards",
+        f.append_shards,
+        env,
+        DEFAULT_APPEND_SHARDS,
+    );
+    let append_shards_request = AppendShards::parse(&append_shards_arg).ok_or_else(|| {
+        let source = if shards_from_flag {
+            "--append-shards".to_string()
+        } else {
+            env_var_name("--append-shards")
+        };
+        CliError::Usage(format!(
+            "`{source}` must be `auto` or a positive integer, got `{append_shards_arg}`"
+        ))
+    })?;
+    let append_shards = resolve_append_shards(append_shards_request, storage_mode.to_engine())
+        .map_err(|_shared_wal_cannot_shard| {
+            let source = if shards_from_flag {
+                "--append-shards".to_string()
+            } else {
+                env_var_name("--append-shards")
+            };
+            CliError::Usage(format!(
+                "`{source} = {append_shards_arg}` cannot be combined with `--storage-mode shared-wal`: \
+                 a shared-WAL broker shares one physical commit log across all named streams and cannot \
+                 shard the append plane (use `auto`, which resolves to 1 under shared-WAL, or select \
+                 `--storage-mode per-stream`)"
+            ))
+        })?;
     // The durability LEVEL (#341, #379) resolves like the disk-full policy: an enum string with
     // flag > env > default (`sync`) precedence, parsed after resolution so a bad value names its
     // source (the flag if explicit, else the env var). The default `sync` keeps the historical
@@ -3589,6 +3652,7 @@ fn parse_serve_flags_with_env_and_reader(
             )?,
             disk_full_policy,
             storage_mode,
+            append_shards,
             visibility_ms: resolve_number(
                 "--visibility-timeout-ms",
                 f.visibility_ms,
@@ -5473,6 +5537,12 @@ struct ServeConfig {
     /// and layout-bound: deliberately absent from the SIGHUP-reloadable subset, and the engine
     /// fail-closed refuses a data dir laid out by the other mode.
     storage_mode: StorageModeArg,
+    /// The resolved APPEND-SHARD count (#811), `>= 1`: `1` (the default) is today's single-actor write
+    /// plane; a `> 1` value is the RESOLVED `--append-shards` request (auto core-count or an explicit
+    /// count, capped at [`ironbus_server::actor::MAX_APPEND_SHARDS`]; shared-WAL is forced to 1). Carried here only so the
+    /// materialized-config startup log can report it — in this release it is INERT (the broker runs one
+    /// append shard regardless; the C8 flip spawns K actors off this value). RESTART-ONLY.
+    append_shards: usize,
     visibility_ms: u64,
     /// Enable the OPT-IN read-only `/admin` introspection endpoint on the health server (#99). OFF
     /// by default: only with `--enable-admin` (and only when `--health-addr` is set) does `/admin`
@@ -5778,6 +5848,8 @@ impl ServeConfig {
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             storage_mode: StorageModeArg::PerStream,
+            // A single append shard = today's single-actor write plane (#811, the inert K=1 default).
+            append_shards: 1,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
             enable_otlp_export: false,
@@ -7644,7 +7716,8 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          power_loss_safe={power_loss_safe} compression={compression} io_mode={io_mode} \
          flush_interval_ms={} \
          flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
-         commit_gather_us={} sync_max_dirty_bytes={} storage_mode={storage_mode}",
+         commit_gather_us={} sync_max_dirty_bytes={} storage_mode={storage_mode} \
+         append_shards={append_shards}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -7680,6 +7753,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.sync_max_dirty_bytes,
         data_dir = data_dir.map_or_else(|| "none".to_string(), |d| d.display().to_string()),
         storage_mode = config.storage_mode.as_str(),
+        append_shards = config.append_shards,
     )
 }
 
@@ -14645,6 +14719,8 @@ mod tests {
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             storage_mode: StorageModeArg::PerStream,
+            // A single append shard = today's single-actor write plane (#811, the inert K=1 default).
+            append_shards: 1,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
             enable_otlp_export: false,
@@ -18596,6 +18672,8 @@ mod tests {
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             storage_mode: StorageModeArg::PerStream,
+            // A single append shard = today's single-actor write plane (#811, the inert K=1 default).
+            append_shards: 1,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
             enable_otlp_export: false,
