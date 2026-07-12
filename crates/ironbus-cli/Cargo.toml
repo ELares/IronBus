@@ -36,6 +36,13 @@ zstd = ["ironbus-storage/zstd", "ironbus-core/zstd"]
 # aws-lc-sys allowance is feature-scoped in deny.toml, and cffi-ban.sh proves the default ironbus-cli
 # graph stays pure-Rust).
 tls = ["ironbus-server/tls", "ironbus-client/tls"]
+# At-rest AEAD encryption (#780, phase 3 serve hookup). NON-DEFAULT: forwards `ironbus-server`'s
+# `encryption` feature (and through it `ironbus-storage`'s) so `cargo build -p ironbus-cli --features
+# encryption` produces a broker whose `--encryption-key-file` opens the engine's storage encrypted via
+# `Engine::open_encrypted`. UNLIKE `tls` it pulls NO new C-FFI (the RustCrypto AEAD stack is pure Rust,
+# already deny.toml-clean), so the DEFAULT binary, its SBOM, and cffi-ban stay unchanged, and the
+# default binary refuses the `--encryption-*` flags fail-closed rather than starting plaintext.
+encryption = ["ironbus-server/encryption", "ironbus-storage/encryption"]
 
 [dependencies]
 ironbus-core = { path = "../ironbus-core", version = "0.1.0" }

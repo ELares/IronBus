@@ -271,6 +271,16 @@ impl ErrorCode {
             EngineError::DueTimeInjected { .. } => Self::ERR_INVALID_DELAY_HEADER,
             EngineError::Storage(_) if error.is_at_capacity() => Self::ERR_AT_CAPACITY,
             EngineError::Storage(_) => Self::ERR_STORAGE,
+            // At-rest encryption fail-closed refusals (#780 phase 3) for the deferred paths
+            // (shared-WAL, dead-letter, txn). These are storage-layer refusals with their own
+            // human-readable Display text, but they DELIBERATELY reuse the FROZEN generic `ERR_STORAGE`
+            // wire code rather than mint new wire tokens (no proto-decoder change): each is a rare,
+            // fail-closed "the storage layer refused this under encryption" condition, not a routine
+            // client error. The shared body with the `Storage(_)` arm above is intentional.
+            #[allow(clippy::match_same_arms)]
+            EngineError::EncryptedSharedWalUnsupported
+            | EngineError::EncryptedDeadLetterUnsupported
+            | EngineError::EncryptedTxnUnsupported => Self::ERR_STORAGE,
         }
     }
 }

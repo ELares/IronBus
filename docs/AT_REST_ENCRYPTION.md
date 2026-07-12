@@ -1,27 +1,80 @@
 # IronBus optional at-rest AEAD encryption
 
-**Status: PHASE 2 IMPLEMENTED — SINGLE-NODE LIVE WIRING (#780); this document remains the
-normative design.** Phase 1 landed the cryptographic core and the on-disk format; phase 2
-wires that core through the LIVE `Log`/`StreamSet` so a configured key actually encrypts a
-running broker's segments (SINGLE-NODE), and DECRYPTS them on read. A configured key means
-every NEW active segment (fresh, rolled, or resumed after a crash) is created encrypted and
-every append AEAD-encrypts in place; reads and recovery decrypt transparently. The critical
-resume fix ships: recovery re-attaches the write crypto to a resumed encrypted active
-segment, so a post-crash append can never land PLAINTEXT into an encrypted segment. The
-zero-copy read plane is fail-closed for encrypted logs (it would ship ciphertext) — reads
-route through the actor's decrypt path. Clustered/replicated at-rest encryption is
-FAIL-CLOSED and DEFERRED to phase 3: verbatim replication under encryption is refused
-(the leader-nonce hazard), as are compaction/offload of an encrypted log. It remains
-**OFF by default and byte-identical when off**. Still tracked as follow-on: the CLI→engine
-serve-path hookup that loads the `[encryption]` config key and opens the engine's storage
-via `Log::open_encrypted`/`StreamSet::open_encrypted` (the storage seam ships here); the
-Argon2id-passphrase and TEE-sealed key sources; and clustered encryption / re-encryption /
-compaction+encryption (phase 3). The log and the
-dead-letter queue are plaintext on disk in a default deployment, exactly as
+**Status: PHASE 3 IMPLEMENTED — SINGLE-NODE SERVE HOOKUP (#780/#1165); this document remains
+the normative design.** Phase 1 landed the cryptographic core and the on-disk format; phase 2
+wired that core through the LIVE `Log`/`StreamSet` so a configured key encrypts a running
+broker's segments (SINGLE-NODE) and DECRYPTS them on read; phase 3 threads a `[encryption]`
+config through `ironbus serve` so a broker actually starts encrypted end to end (the seam that
+was inert at the serve layer now engages). A configured key means every NEW active segment
+(fresh, rolled, or resumed after a crash) is created encrypted and every append AEAD-encrypts
+in place; reads and recovery decrypt transparently. The critical resume fix ships: recovery
+re-attaches the write crypto to a resumed encrypted active segment, so a post-crash append can
+never land PLAINTEXT into an encrypted segment. The zero-copy read plane is fail-closed for
+encrypted logs (it would ship ciphertext) — reads route through the actor's decrypt path. It
+remains **OFF by default and byte-identical when off**, and a build compiled WITHOUT the
+`encryption` feature refuses an `[encryption]` config fail-closed (it never silently starts
+plaintext) and refuses to open an encrypted-on-disk log.
+
+DEFERRED and FAIL-CLOSED (phase 4): clustered/replicated at-rest encryption (verbatim
+replication under encryption is refused — the leader-nonce hazard), compaction/offload of an
+encrypted log, re-encryption/key-ROTATION-rewrite, and the Argon2id-passphrase / TEE-sealed /
+KMS key sources (only the raw key-file source ships). Because the serve hookup makes them newly
+reachable, three more deferred paths now fail CLOSED under encryption rather than leak: the
+shared-WAL storage mode (refused at open), dead-lettering (the DLQ is a plaintext-scanned log —
+refused rather than write a confidential body in the clear), and transactional messaging (the
+half-message store is likewise refused). The log's confidential record BODIES are ciphertext;
+the framing/metadata, cursor/counters checkpoints, and — in a deployment that does not exercise
+the fail-closed paths — the (unused) DLQ metadata are plaintext, exactly as
 [THREAT_MODEL.md](THREAT_MODEL.md) states. This spec is the child of the security epic
 #18 and the sibling of the auth spec ([AUTHENTICATION.md](AUTHENTICATION.md),
 #106), the TLS transport spec ([TRANSPORT.md](TRANSPORT.md), #107), and the
 secret-handling spec (#109).
+
+---
+
+## Serve configuration (phase 3, #1165)
+
+At-rest encryption is enabled by pointing `ironbus serve` at a raw key file. The config is
+feature-gated behind the `encryption` cargo feature; a build without it refuses every knob
+below fail-closed (it links no AEAD crypto, so honoring them would start the broker in plaintext
+under a config that asked for encryption). The three knobs resolve with the standard
+`flag > env > file > default` precedence (`docs/CONFIG.md`):
+
+| `[encryption]` file key | Flag | Env | Meaning |
+|---|---|---|---|
+| `key_file` | `--encryption-key-file` | `IRONBUS_ENCRYPTION_KEY_FILE` | Path to a file holding EXACTLY 32 raw key bytes. **Setting it enables at-rest encryption.** Owner-only: a group/world-readable file is refused at startup (#109). |
+| `key_id` | `--encryption-key-id` | `IRONBUS_ENCRYPTION_KEY_ID` | A **non-zero** `u64` identifier recorded in each encrypted segment header (never the key). **Required** when `key_file` is set. |
+| `suite` | `--encryption-suite` | `IRONBUS_ENCRYPTION_SUITE` | `auto` (default: pick by CPU feature detection), `aes-256-gcm`, or `chacha20-poly1305`. The chosen suite is recorded in the segment header, so a read is unambiguous on any host. |
+
+Example TOML:
+
+```toml
+[encryption]
+key_file = "/etc/ironbus/at-rest.key"
+key_id = 7
+# suite = "auto"   # optional; omit to auto-detect
+```
+
+Or equivalently: `ironbus serve --encryption-key-file /etc/ironbus/at-rest.key --encryption-key-id 7`.
+
+How the key threads to the storage seam: `ironbus serve` resolves + validates the `[encryption]`
+config, loads the 32-byte key with the fail-closed loader (`ironbus_storage::crypto::load_key_file`),
+builds the write-side `SegmentCrypto` + the read-side `KeyRing` under the single key/key-id, and
+opens the engine via `Engine::open_encrypted`, which threads the same opaque context to the root
+`Log::open_with_at_rest` and `StreamSet::open_with_at_rest` — the exact seam phase 2 verified. So
+the running broker's default and named-stream segments are ciphertext on disk, resume re-attaches
+the crypto, and the fail-closed guards engage.
+
+Operational limits in this phase (each fails CLOSED, never leaks):
+
+- **Disk backend only.** `--storage memory` + encryption is refused (no on-disk segments to encrypt).
+- **Per-stream-logs mode only.** `--storage-mode shared-wal` + encryption is refused at open.
+- **No dead-lettering / no transactions** while encryption is on (both refused at their seams).
+- **Single node only.** A cluster/federation path that would ship ciphertext off-node or replicate
+  a leader frame verbatim is refused by the always-compiled zero-copy / replication guards.
+- **Enable on a FRESH data directory.** Encryption is new-segments-only; opening a plaintext log
+  with a key is refused (`PlaintextSegmentWithKey`) and opening an encrypted log without the key is
+  refused (`EncryptedSegmentNoKey`) — a no-key reader never silently starts plaintext.
 
 This is the device-theft mitigation (threat row T1 in THREAT_MODEL.md), with its
 honest limit stated plainly: a key co-located with a stolen device defeats it.

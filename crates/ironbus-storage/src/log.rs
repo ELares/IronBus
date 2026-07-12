@@ -820,11 +820,13 @@ impl AtRestCrypto {
         }
     }
 
-    /// Whether this log participates in at-rest encryption at all (a write key and/or a read ring): its
-    /// segments are ciphertext, so reads route through the decrypt path and the zero-copy raw plane is
-    /// refused. Always `false` without the `encryption` feature.
+    /// Whether this context participates in at-rest encryption at all (a write key and/or a read ring):
+    /// its segments are ciphertext, so reads route through the decrypt path and the zero-copy raw plane
+    /// is refused. Always `false` without the `encryption` feature. Public so the engine (#780 phase 3)
+    /// can fail-closed the deferred paths (shared-WAL, dead-letter, txn) when a key is configured,
+    /// without naming the feature-gated crypto types.
     #[must_use]
-    fn is_encrypted(&self) -> bool {
+    pub fn is_encrypted(&self) -> bool {
         self.writes_encrypted() || self.reads_encrypted()
     }
 }
@@ -1354,8 +1356,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
 
     /// Opens a log with a pre-built [`AtRestCrypto`] context — the seam [`crate::streamset::StreamSet`]
     /// uses to open EVERY stream's log with the SAME at-rest crypto (#780 phase 2), so a named stream
-    /// is encrypted exactly like the default stream. `AtRestCrypto::default()` is the plaintext path.
-    pub(crate) fn open_with_at_rest(
+    /// is encrypted exactly like the default stream, AND the seam the ENGINE (#780 phase 3, the serve
+    /// hookup) uses to open the ROOT log with the SAME opaque, always-compiled context it threads to
+    /// [`crate::streamset::StreamSet::open_with_at_rest`]. `AtRestCrypto::default()` is the plaintext
+    /// path, byte-for-byte [`Log::open`]. Public (not `pub(crate)`) so the engine crate can pass the
+    /// same context to the root log and the stream set without naming the feature-gated crypto types.
+    ///
+    /// # Errors
+    /// As [`Log::open`], plus the fail-closed at-rest guards ([`StorageError::EncryptedSegmentNoKey`] /
+    /// [`StorageError::PlaintextSegmentWithKey`]) on an at-rest config that does not match the recovered
+    /// active segment.
+    pub fn open_with_at_rest(
         fs: F,
         clock: C,
         config: LogConfig,
@@ -12139,7 +12150,12 @@ mod tests {
         }
         // The raw on-disk bytes of segment `id` (records + any preallocated/footer tail).
         fn seg_bytes(log: &Log<InMemoryFs, ManualClock>, id: u64) -> Vec<u8> {
-            let f = log.filesystem().open(&segment_file_name(id)).unwrap();
+            seg_bytes_from_fs(log.filesystem(), id)
+        }
+        // The raw on-disk bytes of segment `id` read straight from the filesystem (used after the
+        // writing log has been dropped, e.g. to tear the tail before a recovery reopen).
+        fn seg_bytes_from_fs(fs: &InMemoryFs, id: u64) -> Vec<u8> {
+            let f = fs.open(&segment_file_name(id)).unwrap();
             let len = usize::try_from(f.len().unwrap()).unwrap();
             let mut buf = vec![0u8; len];
             f.read_exact_at(&mut buf, 0).unwrap();
@@ -12456,6 +12472,90 @@ mod tests {
             let out = log.read_from(Offset::ZERO, 10).unwrap();
             let got: Vec<&[u8]> = out.iter().map(|r| &r.payload[..]).collect();
             assert_eq!(got, vec![&b"n0"[..], &b"n1"[..], &b"n2"[..]]);
+        }
+
+        #[test]
+        fn log_level_torn_encrypted_tail_recovers_bounded_and_survivors_decrypt() {
+            // #780 phase 3 — the coverage-hardening test the phase-2 crypto review asked for: a
+            // LOG-LEVEL (not just segment-unit) encrypted torn tail. An encrypted log with a DURABLE
+            // prefix plus a TORN (corrupt) final encrypted frame must reopen to BOUNDED, REPORTED loss
+            // (the torn tail is dropped and COUNTED) — never an early truncation of the good prefix —
+            // and every surviving record must DECRYPT. This drives the real Log recovery path
+            // (`open_inner` -> `recover` -> `finalize_at_rest`) on an encrypted segment, exercising the
+            // shared `decoded_len` + `decode_encrypted` header-CRC-gated sizing end-to-end, not just the
+            // segment-unit decode the earlier test covered.
+            let survivors: [&[u8]; 5] = [
+                b"alpha-secret",
+                b"bravo-secret",
+                b"charlie-secret",
+                b"delta-secret",
+                b"echo-secret",
+            ];
+            let fs = InMemoryFs::new();
+            {
+                let mut log = open_enc(fs.clone(), big_cfg());
+                for p in survivors {
+                    log.append(&payload_rec(b"k", p)).unwrap();
+                }
+                // A 6th record — the one we will TEAR. Appended + synced so it is physically framed on
+                // disk (an append buffers until sync), then corrupted below so recovery must drop it as
+                // a torn/bit-rotted final frame while the 5 durable survivors before it are kept.
+                log.append(&payload_rec(b"k", b"TORN-TAIL-RECORD-that-must-be-lost"))
+                    .unwrap();
+                log.sync().unwrap();
+            }
+            // Walk the 5 durable frames key-free (the recovery-style sizing) to the start of the 6th,
+            // then corrupt a byte inside the 6th frame's ciphertext so its CRC-over-ciphertext fails —
+            // exactly the torn/crash-mid-write final frame. No key is used to place the tear.
+            let raw = seg_bytes_from_fs(&fs, 0);
+            let mut pos = SEGMENT_HEADER_LEN;
+            for _ in 0..5 {
+                let (_v, n) =
+                    codec::decode_encrypted(&raw[pos..]).expect("a durable frame decodes");
+                pos += n;
+            }
+            let (_v6, n6) =
+                codec::decode_encrypted(&raw[pos..]).expect("the 6th (soon-torn) frame decodes");
+            // A byte inside the 6th frame's ciphertext body (past its record header). Corrupting it
+            // breaks the CRC over the ciphertext, which recovery catches WITHOUT the key.
+            let corrupt_at = pos + RECORD_HEADER_LEN + 1;
+            assert!(
+                corrupt_at < pos + n6,
+                "corruption lands inside the 6th frame"
+            );
+            let torn = [raw[corrupt_at] ^ 0xFF];
+            fs.open(&segment_file_name(0))
+                .unwrap()
+                .write_all_at(&torn, u64::try_from(corrupt_at).unwrap())
+                .unwrap();
+
+            // Reopen with the SAME key: recovery finds the valid prefix, reports the torn tail, and the
+            // survivors decrypt.
+            let log = open_enc(fs, big_cfg());
+            // (1) BOUNDED, REPORTED loss — in EITHER accounted form (a truncated-byte count or a
+            //     loss-report event), never a silent drop.
+            let reported = log.recovered_truncated_bytes() > 0 || !log.loss_report().is_empty();
+            assert!(
+                reported,
+                "the torn encrypted tail must be REPORTED (truncated bytes {} / loss events {}), \
+                 never silent",
+                log.recovered_truncated_bytes(),
+                log.loss_report().total_bytes_skipped()
+            );
+            // (2) NOT an early truncation: every DURABLE survivor is still present...
+            let out = log.read_from(Offset::ZERO, 100).unwrap();
+            assert_eq!(
+                out.len(),
+                5,
+                "the good prefix must survive; ONLY the torn tail is lost (not an early truncation)"
+            );
+            // (3) ...and each survivor DECRYPTS to its original plaintext (decrypt-on-read), with the
+            //     storage-internal ENCRYPTED bit cleared on the materialized record.
+            for (i, r) in out.iter().enumerate() {
+                assert_eq!(&r.payload[..], survivors[i], "survivor {i} decrypts");
+                assert_eq!(&r.key[..], b"k");
+                assert!(!r.flags.contains(RecordFlags::ENCRYPTED));
+            }
         }
     }
 }
