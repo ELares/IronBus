@@ -9057,6 +9057,188 @@ mod tests {
         differential(&log);
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fd_range_byte_range_is_identical_for_compressed_subject_and_stream_tag_frames() {
+        // #1034 / #658 — the headline gate above
+        // (`read_range_fd_range_byte_range_is_identical_to_read_range_raw`) exercises only plain
+        // EMPTY-flag records. This pins the SAME fd (`sendfile`) range == copy-path raw byte-range
+        // equality for the FLAGGED frame types that actually SHIP in production and drive the
+        // header-only walk down its flag-dependent branches:
+        //   (a) a stored-COMPRESSED frame — an extra content flag in the header; framing is unchanged
+        //       (the body is stored verbatim, the storage read path never decompresses), so
+        //       `decoded_len` must size it exactly like a plain record;
+        //   (b) a HAS_SUBJECT (#594) frame and (c) a HAS_STREAM_TAG (#597) frame — each carries a `u16`
+        //       length prefix immediately after the record header, so the header-only `frame_len_at`
+        //       reads `RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX` (HDR_MAX) and `decoded_len` sizes
+        //       the frame from that prefix.
+        // Proving the header-only fd walk names byte-for-byte the same range the in-buffer `decoded_len`
+        // walk does for these frames means a `DeliverBatch` that splices their bodies ships bytes
+        // identical to the copy path — which is exactly what the session-level
+        // `socket_bytes_are_byte_identical_to_the_copy_path` wire differential rests on. Safe by
+        // construction today; this pins it. (HAS_STREAM_TAG is a storage-internal demux key cleared
+        // before a record materializes to the wire, so the fd/copy byte-range identity is the natural
+        // place to pin it.)
+        use crate::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(
+            StdFs::new(dir.path().to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .unwrap();
+
+        // Interleave the three flagged frame types with plain records so the header-only walk crosses
+        // each flag branch mid-run and at a segment boundary (the tiny `small_config` cap rolls often).
+        // A subject and a stream tag share the fixed post-header slot (mutually exclusive), so they go on
+        // separate records.
+        let subject: &[u8] = b"orders.eu.payments";
+        let stream_tag: &[u8] = b"orders";
+        for i in 0..24u64 {
+            let body = [u8::try_from(i % 256).unwrap(); 16];
+            match i % 4 {
+                0 => {
+                    log.append(&rec(&body)).unwrap();
+                }
+                1 => {
+                    // The COMPRESSED content flag is preserved in the header; the body is stored verbatim
+                    // (the read path never decompresses), so the frame is sized like a plain record.
+                    let mut r = rec(&body);
+                    r.flags = RecordFlags::COMPRESSED;
+                    log.append(&r).unwrap();
+                }
+                2 => {
+                    log.append_with_subject(&rec(&body), subject).unwrap();
+                }
+                _ => {
+                    log.append_with_stream_tag(&rec(&body), stream_tag).unwrap();
+                }
+            }
+        }
+        log.sync().unwrap();
+        // A short un-synced active tail, exactly as the plain fixture leaves it (the fd path serves only
+        // the sealed, spliceable prefix below `flushed`).
+        for i in 24..27u64 {
+            log.append(&rec(&[u8::try_from(i % 256).unwrap(); 16]))
+                .unwrap();
+        }
+        let flushed = log.flushed_offset().get();
+        assert!(
+            log.active_segment_id() >= 2,
+            "the small cap must have sealed several segments"
+        );
+
+        // Guard against a vacuous test: confirm each flagged frame type actually reached the header-only
+        // fd walk in the sealed prefix. `codec::decode` derives HAS_SUBJECT/HAS_STREAM_TAG from the
+        // stored field's presence and preserves COMPRESSED, so seeing a flag on a decoded fd byte proves
+        // `frame_len_at`/`decoded_len` sized that frame from its header correctly. Reading a run at every
+        // start makes each sealed frame the head of some run, so every flag is observed.
+        let mut seen = RecordFlags::EMPTY;
+        for start in 0..flushed {
+            if let (Some(run), _) = log
+                .read_range_fd_range(Offset::new(start), 1_000, None)
+                .unwrap()
+            {
+                if run.record_count() > 0 {
+                    let synthetic = RawByteRun {
+                        bytes: run.read_bytes().unwrap(),
+                        first_offset: run.first_offset(),
+                        record_count: run.record_count(),
+                        next_offset: run.next_offset(),
+                    };
+                    for (view, _) in decode_raw_run(&synthetic) {
+                        seen = seen.with(view.flags);
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.contains(RecordFlags::COMPRESSED),
+            "a stored-COMPRESSED frame reached the sealed fd walk"
+        );
+        assert!(
+            seen.contains(RecordFlags::HAS_SUBJECT),
+            "a HAS_SUBJECT (#594) frame reached the sealed fd walk"
+        );
+        assert!(
+            seen.contains(RecordFlags::HAS_STREAM_TAG),
+            "a HAS_STREAM_TAG (#597) frame reached the sealed fd walk"
+        );
+
+        // The differential: for every window and cap, the fd (`sendfile`) byte range EQUALS the copy-path
+        // raw bytes byte-for-byte, with the same run metadata, and the fd bytes decode (each frame
+        // CRC-checked) to whole frames — for the flagged frames as much as the plain ones.
+        let differential = |log: &Log<StdFs, ManualClock>| {
+            for start in 0..flushed {
+                for max in [1usize, 2, 3, 7, 1000] {
+                    for cap in [None, Some(1usize), Some(64), Some(4096)] {
+                        let (raw, raw_tail) =
+                            log.read_range_raw(Offset::new(start), max, cap).unwrap();
+                        let (fd, fd_tail) = log
+                            .read_range_fd_range(Offset::new(start), max, cap)
+                            .unwrap();
+                        let ctx = format!("start={start} max={max} cap={cap:?}");
+                        assert_eq!(fd_tail, raw_tail, "tail_from matches at {ctx}");
+                        match fd {
+                            Some(run) => {
+                                let fd_bytes = run.read_bytes().unwrap();
+                                assert_eq!(
+                                    &fd_bytes[..],
+                                    &raw.bytes[..],
+                                    "fd byte range == raw bytes at {ctx}"
+                                );
+                                assert_eq!(run.len(), raw.bytes.len(), "len matches at {ctx}");
+                                assert_eq!(
+                                    run.first_offset(),
+                                    raw.first_offset,
+                                    "first_offset at {ctx}"
+                                );
+                                assert_eq!(
+                                    run.record_count(),
+                                    raw.record_count,
+                                    "record_count at {ctx}"
+                                );
+                                assert_eq!(
+                                    run.next_offset(),
+                                    raw.next_offset,
+                                    "next_offset at {ctx}"
+                                );
+                                // The fd bytes are whole, CRC-valid frames tiling the run exactly
+                                // (`decode_raw_run` asserts the tiling and the count).
+                                let synthetic = RawByteRun {
+                                    bytes: fd_bytes,
+                                    first_offset: run.first_offset(),
+                                    record_count: run.record_count(),
+                                    next_offset: run.next_offset(),
+                                };
+                                let decoded = decode_raw_run(&synthetic);
+                                if let Some((_, off)) = decoded.first() {
+                                    assert_eq!(
+                                        *off, start,
+                                        "fd run starts at the requested offset {ctx}"
+                                    );
+                                }
+                            }
+                            None => {
+                                assert_eq!(
+                                    raw.record_count, 0,
+                                    "fd fallback (None) implies an empty raw run at {ctx}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // With the append-seeded indexes, then after dropping them so the freshly REBUILT seek path is
+        // proven byte-identical for the flagged frames too.
+        differential(&log);
+        log.clear_segment_indexes();
+        differential(&log);
+    }
+
     #[test]
     fn read_range_raw_honors_max_records_and_max_bytes_like_read_range() {
         // The raw read applies the SAME record-count and byte caps (first-frame-always rule) as
