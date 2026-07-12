@@ -230,6 +230,14 @@ impl ErrorCode {
     /// per-log [`Self::ERR_AT_CAPACITY`].
     pub const ERR_TENANT_MAX_STORAGE_BYTES: ErrorCode = ErrorCode("ERR_TENANT_MAX_STORAGE_BYTES");
 
+    /// A cross-tenant IMPORT was refused because NO matching export authorizes it for the requested
+    /// direction (#1163, multi-tenant phase-2). The client named one of its import aliases, but the
+    /// exporter has no `[[tenant.export]]` that admits this tenant, permits this direction, and covers
+    /// the name — so the alias resolves to a typed reject, never to the exporter's data and never to
+    /// ambient cross-tenant access. Fail-closed: this is the ONE deliberate boundary crossing, and it
+    /// stays shut until BOTH sides allowlist it. Not an `EngineError`.
+    pub const ERR_IMPORT_NOT_GRANTED: ErrorCode = ErrorCode("ERR_IMPORT_NOT_GRANTED");
+
     /// Maps an [`EngineError`] to its stable code. The single source of truth the conformance
     /// vectors and any wire error-code scheme share. A storage error is split into the two named
     /// outcomes ([`Self::ERR_AT_CAPACITY`] for the byte-cap shed) plus the residual
@@ -327,6 +335,7 @@ mod tests {
             ErrorCode::ERR_NOT_ENOUGH_ISR,
             ErrorCode::ERR_PRODUCER_FENCED,
             ErrorCode::ERR_OUT_OF_ORDER_SEQUENCE,
+            ErrorCode::ERR_IMPORT_NOT_GRANTED,
         ];
         for code in wire_codes {
             assert!(
@@ -374,6 +383,11 @@ mod tests {
         assert_eq!(
             ErrorCode::ERR_TENANT_MAX_STORAGE_BYTES.as_str(),
             crate::tenant::QuotaError::MaxStorageBytes.code()
+        );
+        // #1163 cross-tenant import/export reject code.
+        assert_eq!(
+            ErrorCode::ERR_IMPORT_NOT_GRANTED.as_str(),
+            "ERR_IMPORT_NOT_GRANTED"
         );
     }
 
