@@ -564,6 +564,14 @@ pub struct Session {
     /// fleet-wide concurrent-connection count is decremented on drop (connection close). `None` on a
     /// single-tenant / no-registry connection.
     conn_guard: Option<crate::tenant::ConnGuard>,
+    /// The broker's cross-tenant sharing (import/export) registry (#1163, multi-tenant phase-2), if
+    /// configured. `None` (the default, and every single-tenant broker) means EVERY resource name
+    /// resolves in the caller's OWN tenant — byte-for-byte the phase-1 isolated broker. When `Some(_)`,
+    /// each subscribe/publish seam first consults it: a name that matches one of this tenant's import
+    /// aliases resolves (ONLY with a matching export) to the EXPORTER's prefixed resource, and any name
+    /// that is not an alias stays in this tenant's own namespace. This is the ONE controlled path
+    /// across the otherwise-absolute tenant boundary. A cheap `Arc` clone, shared across connections.
+    sharing: Option<std::sync::Arc<crate::tenant::SharingRegistry>>,
     /// The shared connection-signal ("connz") metric (#572), if the server wired one in. `None` for a
     /// session that does not report connz (every test, and a `serve` overload built with the legacy
     /// un-scraped metric). When `Some(_)`, the session records the AUTHED-FLIP (a successful `Connect`
@@ -609,6 +617,26 @@ pub struct Session {
     consume_longpoll_ms: u64,
 }
 
+/// #1163: the outcome of resolving a client resource name (stream or subject) through the cross-tenant
+/// import/export layer at a subscribe/publish seam. The engine-ready name is already computed for the
+/// two proceed-cases; the session applies it (and, for `Cross`, charges the exporter's quotas).
+enum Resolved {
+    /// The name is in the caller's OWN tenant — the own-scoped engine name (phase-1 behavior, and the
+    /// single-tenant identity). The overwhelming common case.
+    Local(String),
+    /// An import alias resolved (with a matching export) to the EXPORTER's resource: the owning
+    /// tenant plus the exporter-scoped engine name.
+    Cross {
+        /// The exporter (owner of the resolved resource) — charged for a cross-tenant produce.
+        owner: crate::tenant::TenantId,
+        /// The exporter-scoped engine name, ready for the engine.
+        name: String,
+    },
+    /// The name matched an import alias but NO export authorizes it in this direction — a typed
+    /// reject. The caller replies `ERR_IMPORT_NOT_GRANTED` and never touches the exporter's data.
+    Denied,
+}
+
 impl Session {
     /// A new, not-yet-handshaked session with the default member identity (member 0). The server
     /// uses [`Session::with_member_id`] to give each connection a distinct `key_shared` identity;
@@ -641,14 +669,17 @@ impl Session {
         auth_config: std::sync::Arc<crate::auth::AuthConfig>,
         peer_san: Option<String>,
     ) -> Session {
-        // Pick up the per-tenant quota registry (#765) from the same auth config, so the whole
-        // existing accept path wires tenancy for free (no serve-signature change).
+        // Pick up the per-tenant quota registry (#765) and the cross-tenant sharing registry (#1163)
+        // from the same auth config, so the whole existing accept path wires tenancy for free (no
+        // serve-signature change).
         let tenants = auth_config.tenants();
+        let sharing = auth_config.sharing();
         Session {
             member_id,
             auth_config: Some(auth_config),
             peer_san,
             tenants,
+            sharing,
             ..Session::default()
         }
     }
@@ -760,6 +791,87 @@ impl Session {
     fn reserve_tenant_bytes(&self, n: u64) -> Result<(), crate::tenant::QuotaError> {
         match (&self.tenant, &self.tenants) {
             (Some(tenant), Some(reg)) => reg.reserve_bytes(tenant, n),
+            _ => Ok(()),
+        }
+    }
+
+    /// #1163: resolves a client-supplied STREAM id through the cross-tenant import/export layer for
+    /// the given access direction. Returns the engine-ready name (own-scoped OR the exporter's) plus,
+    /// for a cross-tenant hit, the OWNING (exporter) tenant so the caller can charge the right quotas.
+    /// When no sharing is configured (or the name is not an import alias) it is exactly
+    /// [`Session::tenant_stream`] — byte-for-byte the phase-1 path.
+    fn resolve_stream_for(&self, client_name: &str, access: crate::tenant::Access) -> Resolved {
+        match (&self.tenant, &self.sharing) {
+            (Some(t), Some(reg)) => match reg.resolve_stream(t, client_name, access) {
+                crate::tenant::Resolution::Own => Resolved::Local(t.scope_stream(client_name)),
+                crate::tenant::Resolution::Crossed { owner, scoped } => Resolved::Cross {
+                    owner,
+                    name: scoped,
+                },
+                crate::tenant::Resolution::Denied => Resolved::Denied,
+            },
+            _ => Resolved::Local(self.tenant_stream(client_name).into_owned()),
+        }
+    }
+
+    /// #1163: resolves a client-supplied SUBJECT (a concrete subject for a publish, or a pattern for
+    /// a subscribe) through the cross-tenant import/export layer. Own-namespace by default (exactly
+    /// [`Session::tenant_subject`]); a cross-tenant hit yields the exporter-scoped subject + owner.
+    fn resolve_subject_for(&self, client_subject: &str, access: crate::tenant::Access) -> Resolved {
+        match (&self.tenant, &self.sharing) {
+            (Some(t), Some(reg)) => match reg.resolve_subject(t, client_subject, access) {
+                crate::tenant::Resolution::Own => Resolved::Local(t.scope_subject(client_subject)),
+                crate::tenant::Resolution::Crossed { owner, scoped } => Resolved::Cross {
+                    owner,
+                    name: scoped,
+                },
+                crate::tenant::Resolution::Denied => Resolved::Denied,
+            },
+            _ => Resolved::Local(self.tenant_subject(client_subject).into_owned()),
+        }
+    }
+
+    /// #1163: scopes a consumer-GROUP name under THIS connection's own tenant. Used ONLY on a
+    /// cross-tenant SUBSCRIBE, so the importer's cursor on the exporter's shared stream is keyed by
+    /// `(<exporter>/stream, <importer>/group)` and can NEVER collide with — or advance — the
+    /// exporter's own consumer-group cursors on that stream. A single-tenant connection returns the
+    /// group unchanged (it is never reached on the cross path).
+    fn scope_group_under_self(&self, group: &str) -> String {
+        match &self.tenant {
+            Some(t) => t.scope_group(group),
+            None => group.to_string(),
+        }
+    }
+
+    /// #1163: charges a SCOPED stream against a SPECIFIC tenant's stream ceiling — the exporter on a
+    /// cross-tenant produce (the resource is theirs), or this connection's own tenant otherwise.
+    /// A no-op when no quota registry is wired or `tenant` is `None` (single-tenant).
+    ///
+    /// # Errors
+    /// [`crate::tenant::QuotaError::MaxStreams`] at the ceiling.
+    fn charge_stream(
+        &self,
+        tenant: Option<&crate::tenant::TenantId>,
+        scoped: &str,
+    ) -> Result<(), crate::tenant::QuotaError> {
+        match (tenant, &self.tenants) {
+            (Some(t), Some(reg)) => reg.reserve_stream(t, scoped),
+            _ => Ok(()),
+        }
+    }
+
+    /// #1163: charges `n` produced bytes against a SPECIFIC tenant's byte ceiling (the exporter on a
+    /// cross-tenant produce, else this connection's own tenant). A no-op when no registry is wired.
+    ///
+    /// # Errors
+    /// [`crate::tenant::QuotaError::MaxStorageBytes`] at the ceiling.
+    fn charge_bytes(
+        &self,
+        tenant: Option<&crate::tenant::TenantId>,
+        n: u64,
+    ) -> Result<(), crate::tenant::QuotaError> {
+        match (tenant, &self.tenants) {
+            (Some(t), Some(reg)) => reg.reserve_bytes(t, n),
             _ => Ok(()),
         }
     }
@@ -4569,9 +4681,18 @@ impl Session {
             reply_err(out, "stream id must be valid UTF-8");
             return Ok(());
         };
-        // #765: a StreamInfo existence/head probe is answered ONLY within the caller's tenant — the
-        // client name is prefixed so a client can never probe for another tenant's stream.
-        let stream = self.tenant_stream(stream).into_owned();
+        // #765/#1163: a StreamInfo existence/head probe is answered ONLY within the caller's tenant —
+        // the client name is prefixed so a client can never probe for another tenant's stream. An
+        // imported stream (SUBSCRIBE — a read probe) is answered against the EXPORTER's stream when a
+        // matching subscribe-granting export exists; an alias with no such export is a typed reject, so
+        // the probe can never be a cross-tenant existence oracle for a stream the caller may not read.
+        let stream = match self.resolve_stream_for(stream, crate::tenant::Access::Subscribe) {
+            Resolved::Denied => {
+                reply_import_not_granted(out);
+                return Ok(());
+            }
+            Resolved::Cross { name, .. } | Resolved::Local(name) => name,
+        };
         // One round-trip reads both the existence bit and the durable head: the head is meaningful only
         // when the stream exists, and `stream_head` reports `0` for an unknown/malformed stream (which
         // the response folds with `exists = false`), so the two reads are consistent.
@@ -4713,17 +4834,32 @@ impl Session {
             // counters; this named-stream produce path counts it explicitly in the engine job below.
             ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
-        // #765: SERVER-APPLY the tenant prefix (the engine only ever sees `<tenant>/<name>`), then
-        // charge the per-tenant STREAM ceiling (a named produce declares-on-first-produce) and BYTE
+        // #765/#1163: resolve the stream name through the cross-tenant import/export layer (PUBLISH
+        // direction). Own case: SERVER-APPLY the caller's tenant prefix and charge the caller's
+        // ceilings. CROSS case (a matching export granted the write): route to the EXPORTER's stream
+        // and charge the EXPORTER's ceilings — the bytes land in the exporter's log, so the exporter's
+        // storage accounting stays honest and the importer can never use an import to dodge the
+        // exporter's byte cap. No matching export (or a subscribe-only export) → `ERR_IMPORT_NOT_GRANTED`.
+        let (stream, charge_tenant) =
+            match self.resolve_stream_for(stream, crate::tenant::Access::Publish) {
+                Resolved::Denied => {
+                    reply_import_not_granted(out);
+                    return Ok(());
+                }
+                Resolved::Cross { owner, name } => (name, Some(owner)),
+                Resolved::Local(name) => (name, self.tenant.clone()),
+            };
+        let charge = charge_tenant.as_ref();
+        // Charge the per-tenant STREAM ceiling (a named produce declares-on-first-produce) and BYTE
         // ceiling fail-closed BEFORE the produce reaches the log.
-        let stream = self.tenant_stream(stream).into_owned();
-        if let Err(e) = self.reserve_tenant_stream(&stream) {
+        if let Err(e) = self.charge_stream(charge, &stream) {
             reply_err_coded(out, e.code(), e.message());
             return Ok(());
         }
-        if let Err(e) = self
-            .reserve_tenant_bytes((msg.payload.len() + msg.key.len() + msg.headers.len()) as u64)
-        {
+        if let Err(e) = self.charge_bytes(
+            charge,
+            (msg.payload.len() + msg.key.len() + msg.headers.len()) as u64,
+        ) {
             reply_err_coded(out, e.code(), e.message());
             return Ok(());
         }
@@ -5165,17 +5301,29 @@ impl Session {
             reply_err(out, "stream id must be valid UTF-8");
             return Ok(());
         };
-        // #765: SERVER-APPLY the tenant prefix. Every downstream use — the existence check, the
-        // (stream, group) binding pinned into `self.stream`, key_shared join, tier — then resolves
-        // strictly within the caller's tenant, so a SubTo can never bind another tenant's stream (an
-        // unknown-to-the-tenant name is the standard "does not exist" reject). The group is isolated
-        // by the scoped stream (group state is keyed by (stream, group)), so it needs no own prefix.
-        let scoped_stream = self.tenant_stream(stream).into_owned();
-        let stream = scoped_stream.as_str();
-        let Ok(group) = core::str::from_utf8(decoded.group) else {
+        let Ok(group_name) = core::str::from_utf8(decoded.group) else {
             reply_err(out, "group name must be valid UTF-8");
             return Ok(());
         };
+        // #765/#1163: resolve the stream name through the cross-tenant import/export layer (SUBSCRIBE
+        // direction). Common case (no import alias): SERVER-APPLY the caller's own tenant prefix so a
+        // SubTo can never bind another tenant's stream (an unknown-to-the-tenant name is the standard
+        // "does not exist" reject) and the group is isolated by the scoped stream. A CROSS-tenant hit
+        // (a matching export granted the read) binds the EXPORTER's stream — and here the group is
+        // scoped under the IMPORTER, so the importer's cursor on the shared stream is keyed by
+        // `(<exporter>/stream, <importer>/group)` and can never collide with or advance the exporter's
+        // own consumer-group cursors. No matching export → a typed `ERR_IMPORT_NOT_GRANTED` reject.
+        let (scoped_stream, scoped_group) =
+            match self.resolve_stream_for(stream, crate::tenant::Access::Subscribe) {
+                Resolved::Denied => {
+                    reply_import_not_granted(out);
+                    return Ok(());
+                }
+                Resolved::Cross { name, .. } => (name, self.scope_group_under_self(group_name)),
+                Resolved::Local(name) => (name, group_name.to_string()),
+            };
+        let stream = scoped_stream.as_str();
+        let group = scoped_group.as_str();
         // The named stream must already exist: a SubTo binds a consume cursor, and consuming an
         // unknown (never-declared) stream is a typed rejection, never a silent empty subscription.
         let stream_owned = stream.to_string();
@@ -5589,16 +5737,30 @@ impl Session {
             // counters; this subject-routed produce path counts it explicitly in the engine job below.
             ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
-        // #765: SERVER-APPLY the tenant prefix — the subject becomes `<tenant>.<subject>`, so it
-        // resolves ONLY against this tenant's bindings and the record is stored under the tenant's
-        // subject subtree. Charge the per-tenant byte ceiling fail-closed before the produce.
-        if let Err(e) = self
-            .reserve_tenant_bytes((msg.payload.len() + msg.key.len() + msg.headers.len()) as u64)
-        {
+        // #765/#1163: resolve the subject through the cross-tenant import/export layer (PUBLISH
+        // direction). Own case: the subject becomes `<tenant>.<subject>` and resolves ONLY against
+        // this tenant's bindings, charged to this tenant. CROSS case (a matching publish-granting
+        // export): the subject becomes `<exporter>.<subject>` and the record lands in the exporter's
+        // subject subtree, charged to the EXPORTER (their storage). A publish concrete subject must
+        // MATCH the export pattern — a sibling/deeper subject the grant does not cover is a typed
+        // reject. No matching export (or subscribe-only) → `ERR_IMPORT_NOT_GRANTED`.
+        let (subject, charge_tenant) =
+            match self.resolve_subject_for(subject, crate::tenant::Access::Publish) {
+                Resolved::Denied => {
+                    reply_import_not_granted(out);
+                    return Ok(());
+                }
+                Resolved::Cross { owner, name } => (name, Some(owner)),
+                Resolved::Local(name) => (name, self.tenant.clone()),
+            };
+        // Charge the per-tenant byte ceiling fail-closed before the produce.
+        if let Err(e) = self.charge_bytes(
+            charge_tenant.as_ref(),
+            (msg.payload.len() + msg.key.len() + msg.headers.len()) as u64,
+        ) {
             reply_err_coded(out, e.code(), e.message());
             return Ok(());
         }
-        let subject = self.tenant_subject(subject).into_owned();
         // Move the per-connection resolve cache into the job; the job returns it (and the produce
         // outcome) so the cache's freshly-cached entry + adopted generation persist across publishes.
         let cache = std::mem::take(&mut self.subject_cache);
@@ -5712,19 +5874,35 @@ impl Session {
             // DEFAULT stream (`""`), keeping the #594-A default-stream path BYTE-FOR-BYTE. The filter is
             // a per-GROUP property (D3: shared by every consumer in the group, so the durable cursor
             // stays coherent). Resolve + bind run in ONE actor job.
-            let group_owned = group.to_string();
-            // #765: SERVER-APPLY the tenant prefix to the filter PATTERN (`<tenant>.<pattern>`), so it
-            // covers ONLY this tenant's subjects. When no named stream covers it, the filtered consume
-            // falls back to the tenant's OWN default stream (`default_stream()`), NOT the shared root
-            // ("") — so a multi-tenant filtered subscribe can never bind the global default log.
-            let pattern_owned = self.tenant_subject(subject).into_owned();
-            let default_stream = self.default_stream();
+            // #765/#1163: resolve the filter PATTERN through the cross-tenant import/export layer
+            // (SUBSCRIBE direction). Own case: `<tenant>.<pattern>`, covering ONLY this tenant's
+            // subjects, falling back to the tenant's OWN default stream — NEVER the shared root ("").
+            // CROSS case (a matching subscribe-granting export): the pattern is EXPORTER-scoped
+            // (`<exporter>.<pattern>`), the fallback stream is the EXPORTER's default stream, and the
+            // group is scoped under the IMPORTER — so the importer reads the exporter's covering stream
+            // through an isolated cursor `(<exporter> stream, <importer>/group)` and can never advance
+            // the exporter's own group cursors. A requested pattern that widens past the grant (or with
+            // no export) → a typed `ERR_IMPORT_NOT_GRANTED` reject.
+            let (pattern_owned, default_stream, group_owned) =
+                match self.resolve_subject_for(subject, crate::tenant::Access::Subscribe) {
+                    Resolved::Denied => {
+                        reply_import_not_granted(out);
+                        return Ok(());
+                    }
+                    Resolved::Cross { owner, name } => (
+                        name,
+                        owner.scope_stream(""),
+                        self.scope_group_under_self(group),
+                    ),
+                    Resolved::Local(name) => (name, self.default_stream(), group.to_string()),
+                };
+            let group_bind = group_owned.clone();
             let (resolved_stream, set) = engine.with(move |e| {
                 let stream = e
                     .covering_named_stream_for_filter(&pattern_owned)
                     .map_or(default_stream, |id| id.name().to_string());
                 let set =
-                    e.set_subject_filter_in_stream(&stream, &group_owned, Some(&pattern_owned));
+                    e.set_subject_filter_in_stream(&stream, &group_bind, Some(&pattern_owned));
                 (stream, set)
             })?;
             if let Err(e) = set {
@@ -5735,9 +5913,10 @@ impl Session {
             // away from an EPHEMERAL subscription must release its engine-side membership (and
             // reap the group if this was the last member) rather than orphan it until disconnect.
             self.leave_current_subscription(engine)?;
-            // Bind this connection's consume path to the resolved stream (`""` = default) + the group.
+            // Bind this connection's consume path to the resolved stream (`""` = default) + the group
+            // (scoped under the importer on the cross-tenant path).
             self.stream = GroupName::from(resolved_stream.as_str());
-            self.subscription = GroupName::from(group);
+            self.subscription = GroupName::from(group_owned.as_str());
             // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
             self.partition = None;
             // #553: a subject subscribe is never priority-mode (priority streams have no subjects).
@@ -5762,9 +5941,21 @@ impl Session {
         // client sends is resolved through the engine's pattern-aware path below instead. To keep the
         // bind simple and single-home, resolve via `resolve_subject` (literal) and fall back to a typed
         // reject for a non-literal/unbound/ambiguous subject.
-        // #765: SERVER-APPLY the tenant prefix so the single-home resolve reads only this tenant's
-        // bindings; an unbound-within-tenant subject is the standard NoStreamForSubject reject.
-        let subject_owned = self.tenant_subject(subject).into_owned();
+        // #765/#1163: resolve the (single-home LITERAL) subject through the cross-tenant import/export
+        // layer (SUBSCRIBE direction). Own case: `<tenant>.<subject>`, reading only this tenant's
+        // bindings. CROSS case (a matching subscribe-granting export covers this concrete subject): the
+        // subject is EXPORTER-scoped so the single-home resolve binds the EXPORTER's covering stream,
+        // with the group scoped under the IMPORTER for cursor isolation. An unbound-within-tenant
+        // subject is the standard NoStreamForSubject reject; an alias with no export → typed reject.
+        let (subject_owned, group_owned) =
+            match self.resolve_subject_for(subject, crate::tenant::Access::Subscribe) {
+                Resolved::Denied => {
+                    reply_import_not_granted(out);
+                    return Ok(());
+                }
+                Resolved::Cross { name, .. } => (name, self.scope_group_under_self(group)),
+                Resolved::Local(name) => (name, group.to_string()),
+            };
         let cache = std::mem::take(&mut self.subject_cache);
         let (cache, resolved) = engine.with(move |e| {
             let mut cache = cache;
@@ -5785,7 +5976,7 @@ impl Session {
         // Bind this connection's consume path to the resolved stream + the requested work-group, exactly
         // as a `SubTo` binds an explicit stream id (the resolved stream is already declared by its bind).
         self.stream = GroupName::from(stream.name());
-        self.subscription = GroupName::from(group);
+        self.subscription = GroupName::from(group_owned.as_str());
         // A subject subscribe binds the stream as a whole (#693): clear any partition binding.
         self.partition = None;
         // #553: a subject subscribe is never priority-mode (priority streams have no subjects).
@@ -6117,6 +6308,18 @@ fn reply_err_coded(out: &mut Vec<u8>, code_token: &str, message: &str) {
     let mut body = Vec::with_capacity(2 + code_token.len() + message.len());
     ironbus_proto::err::encode_err_body(Some(code_token), message, &mut body);
     reply(out, FrameType::Err, &body);
+}
+
+/// #1163: the single typed reject for a cross-tenant import that no export authorizes for the
+/// requested direction. Emitted at EVERY resolution seam a [`Resolved::Denied`] can arise, so the
+/// wire signal is uniform: the client named an import alias, but the crossing is not (or no longer)
+/// allowlisted on both sides. It reveals NOTHING about the exporter's namespace beyond "not granted".
+fn reply_import_not_granted(out: &mut Vec<u8>) {
+    reply_err_coded(
+        out,
+        crate::codes::ErrorCode::ERR_IMPORT_NOT_GRANTED.as_str(),
+        "no export grant authorizes this import for the requested access",
+    );
 }
 
 /// Writes the single UNIFORM "Authorization Violation" `Err` frame (#631, V2-M7,
@@ -18565,6 +18768,605 @@ mod tests {
             got.iter().map(|r| r.0).collect::<Vec<_>>(),
             (0..10).collect::<Vec<u64>>(),
             "the batched run is bounded by max_in_flight (10), in order"
+        );
+    }
+
+    // ================================================================================================
+    // #1163 — CONTROLLED cross-tenant IMPORT / EXPORT (multi-tenant phase-2). The AUTHZ suite driven
+    // through REAL sessions over a REAL engine: an import crosses the (otherwise absolute) tenant
+    // boundary ONLY with a matching export; without one it is a typed reject and NO data crosses;
+    // an importer reaches EXACTLY the grant and nothing beyond it; the export's direction is
+    // respected; revoking the export cuts the import off; a non-imported name stays isolated
+    // (phase-1); two importers of one export are independent. A leak here is a cross-tenant BREACH.
+    // ================================================================================================
+
+    /// An audience over an explicit tenant allowlist.
+    fn aud(names: &[&str]) -> crate::tenant::Audience {
+        crate::tenant::Audience::Tenants(
+            names
+                .iter()
+                .map(|n| crate::tenant::TenantId::parse(n).unwrap())
+                .collect(),
+        )
+    }
+
+    fn export_stream(
+        name: &str,
+        audience: crate::tenant::Audience,
+        subscribe: bool,
+        publish: bool,
+    ) -> crate::tenant::Export {
+        crate::tenant::Export {
+            kind: crate::tenant::ShareKind::Stream,
+            name: name.to_string(),
+            audience,
+            direction: crate::tenant::GrantDirection { subscribe, publish },
+        }
+    }
+
+    fn export_subject(
+        name: &str,
+        audience: crate::tenant::Audience,
+        subscribe: bool,
+        publish: bool,
+    ) -> crate::tenant::Export {
+        crate::tenant::Export {
+            kind: crate::tenant::ShareKind::Subject,
+            name: name.to_string(),
+            audience,
+            direction: crate::tenant::GrantDirection { subscribe, publish },
+        }
+    }
+
+    fn import_stream(from: &str, remote: &str, local: &str) -> crate::tenant::Import {
+        crate::tenant::Import {
+            kind: crate::tenant::ShareKind::Stream,
+            from: crate::tenant::TenantId::parse(from).unwrap(),
+            remote: remote.to_string(),
+            local: local.to_string(),
+        }
+    }
+
+    fn import_subject(from: &str, remote: &str, local: &str) -> crate::tenant::Import {
+        crate::tenant::Import {
+            kind: crate::tenant::ShareKind::Subject,
+            from: crate::tenant::TenantId::parse(from).unwrap(),
+            remote: remote.to_string(),
+            local: local.to_string(),
+        }
+    }
+
+    /// Builds an auth config: identities each bound to a tenant, PLUS a cross-tenant sharing registry
+    /// built from the given per-tenant exports and imports. The tenant + the grants are properties of
+    /// the credential/config — the client never supplies them.
+    fn share_auth(
+        specs: &[(&[u8], &[Scope], &str)],
+        exports: &[(&str, crate::tenant::Export)],
+        imports: &[(&str, crate::tenant::Import)],
+    ) -> Arc<AuthConfig> {
+        use crate::tenant::{Export, Import, SharingRegistry, TenantId};
+        let mut cfg = AuthConfig::new();
+        for (i, (token, scopes, tenant)) in specs.iter().enumerate() {
+            cfg.add_identity(Identity {
+                name: format!("id{i}"),
+                scopes: ScopeSet::from_scopes(scopes),
+                credential: CredentialSet::Bearer {
+                    digests: vec![
+                        crate::auth::parse_token_digest_hex(&sha256_hex_token(token)).unwrap(),
+                    ],
+                },
+                tenant: Some(TenantId::parse(tenant).unwrap()),
+            });
+        }
+        let mut ex_map: std::collections::HashMap<TenantId, Vec<Export>> =
+            std::collections::HashMap::new();
+        for (who, ex) in exports {
+            ex_map
+                .entry(TenantId::parse(who).unwrap())
+                .or_default()
+                .push(ex.clone());
+        }
+        let mut im_map: std::collections::HashMap<TenantId, Vec<Import>> =
+            std::collections::HashMap::new();
+        for (who, im) in imports {
+            im_map
+                .entry(TenantId::parse(who).unwrap())
+                .or_default()
+                .push(im.clone());
+        }
+        cfg.set_sharing(Arc::new(SharingRegistry::new(ex_map, im_map)));
+        Arc::new(cfg)
+    }
+
+    /// The typed code carried on an `Err` reply (asserting the reply IS an `Err`).
+    fn err_code(out: &[u8]) -> Option<ironbus_proto::err::ServerErrorCode> {
+        let (ty, body) = one_response(out);
+        assert_eq!(ty, FrameType::Err, "expected an Err frame");
+        ironbus_proto::err::decode_err_body(&body).code
+    }
+
+    fn subsub_frame(subject: &[u8], group: &[u8], mode: u8) -> Vec<u8> {
+        let mut s = Vec::new();
+        ironbus_proto::message::encode_sub_subject(
+            &ironbus_proto::message::SubSubjectBody {
+                subject,
+                group,
+                filter_mode: mode,
+            },
+            &mut s,
+        )
+        .unwrap();
+        frame(FrameType::SubSubject, &s)
+    }
+
+    fn bind_frame(stream: &[u8], pattern: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: stream,
+                pattern,
+            },
+            &mut b,
+        )
+        .unwrap();
+        frame(FrameType::BindSubject, &b)
+    }
+
+    fn pubsub_frame(subject: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        ironbus_proto::message::encode_pub_subject(
+            &ironbus_proto::message::PubSubjectBody {
+                subject,
+                pub_body: &pub_body(payload),
+            },
+            &mut p,
+        )
+        .unwrap();
+        frame(FrameType::PubSubject, &p)
+    }
+
+    #[test]
+    fn stream_import_reads_the_exporters_stream_only_with_a_matching_export() {
+        // acme exports its stream "orders" (subscribe) to globex; globex imports it as "partner".
+        // globex naming its alias reads acme's stream — the ONE controlled crossing.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-1aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-1bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+            ],
+            &[(
+                "acme",
+                export_stream("orders", aud(&["globex"]), true, false),
+            )],
+            &[("globex", import_stream("acme", "orders", "partner"))],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-1aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-1bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        let mut out = Vec::new();
+        a.process(&e, &pubto_frame(b"orders", b"A-shared"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck, "acme produced");
+        // globex subscribes to its LOCAL alias — resolves to acme/orders.
+        out.clear();
+        b.process(&e, &sub_to_frame(b"partner", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "the import bound the exporter's stream"
+        );
+        assert_eq!(
+            delivered_payloads(&flow(&mut b, &e, 8)),
+            vec![b"A-shared".to_vec()],
+            "globex reads acme's exported record through the alias"
+        );
+        // The record physically lives in ACME's stream (globex read it cross-tenant), and globex's
+        // cursor is keyed under globex — the exporter's namespace is untouched.
+        assert_eq!(e.engine_mut().stream_head("acme/orders").get(), 1);
+        assert!(
+            !e.engine_mut().stream_exists("globex/partner"),
+            "the alias never minted a stream in the importer's namespace"
+        );
+    }
+
+    #[test]
+    fn a_stream_import_without_a_matching_export_is_denied_and_no_data_crosses() {
+        // globex imports acme's "orders" as "partner", but acme exports NOTHING → a typed reject and
+        // globex never reaches acme's data. This is the core invariant: no export, no crossing.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-2aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-2bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+            ],
+            &[], // acme exports nothing
+            &[("globex", import_stream("acme", "orders", "partner"))],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-2aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-2bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        a.process(&e, &pubto_frame(b"orders", b"A-secret"), &mut Vec::new())
+            .unwrap();
+        let mut out = Vec::new();
+        b.process(&e, &sub_to_frame(b"partner", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(
+            err_code(&out),
+            Some(ironbus_proto::err::ServerErrorCode::ImportNotGranted),
+            "import without an export is a typed ERR_IMPORT_NOT_GRANTED reject"
+        );
+        // The rejected subscribe bound nothing — globex is still on its own (empty) default stream and
+        // a Flow yields nothing of acme's.
+        assert!(
+            delivered_payloads(&flow(&mut b, &e, 8)).is_empty(),
+            "no cross-tenant data leaked past the reject"
+        );
+    }
+
+    #[test]
+    fn a_subject_import_cannot_reach_beyond_the_export_grant() {
+        // acme exports subject `orders.*` (subscribe) to globex, imported as `partner.orders`.
+        // A subscribe WITHIN `orders.*` is granted; one that widens past it (a deeper `>`) is denied —
+        // no wildcard escalation, no sibling subtree.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-3aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "acme",
+                ),
+                (
+                    b"tok-b-3bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "globex",
+                ),
+            ],
+            &[(
+                "acme",
+                export_subject("orders.*", aud(&["globex"]), true, false),
+            )],
+            &[("globex", import_subject("acme", "orders", "partner.orders"))],
+        );
+        // acme connects (establishing its default stream) and binds `orders.>` to a covering stream so
+        // the importer's filter has a real exporter stream to bind on.
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-3aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        a.process(&e, &bind_frame(b"ord", b"orders.>"), &mut Vec::new())
+            .unwrap();
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-3bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        // WITHIN the grant: `partner.orders.*` -> `orders.*` ⊑ `orders.*` -> OK.
+        let mut out = Vec::new();
+        b.process(&e, &subsub_frame(b"partner.orders.*", b"w", 1), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "a subscribe within the grant is allowed"
+        );
+        // BEYOND the grant: `partner.orders.>` -> `orders.>`, which is BROADER than `orders.*` -> denied.
+        out.clear();
+        b.process(&e, &subsub_frame(b"partner.orders.>", b"w2", 1), &mut out)
+            .unwrap();
+        assert_eq!(
+            err_code(&out),
+            Some(ironbus_proto::err::ServerErrorCode::ImportNotGranted),
+            "widening past the export grant is denied"
+        );
+    }
+
+    #[test]
+    fn export_direction_is_respected_subscribe_only_denies_publish() {
+        // acme exports stream "inbox" SUBSCRIBE-only to globex; globex imports it as "ai".
+        // globex may READ it but a PUBLISH into it is denied — direction is enforced.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-4aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-4bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+            ],
+            &[(
+                "acme",
+                export_stream("inbox", aud(&["globex"]), true, false),
+            )],
+            &[("globex", import_stream("acme", "inbox", "ai"))],
+        );
+        // acme creates its inbox so the SubTo existence check passes.
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-4aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        a.process(&e, &pubto_frame(b"inbox", b"seed"), &mut Vec::new())
+            .unwrap();
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-4bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        // A cross-tenant PUBLISH into a subscribe-only export is denied.
+        let mut out = Vec::new();
+        b.process(&e, &pubto_frame(b"ai", b"B-write"), &mut out)
+            .unwrap();
+        assert_eq!(
+            err_code(&out),
+            Some(ironbus_proto::err::ServerErrorCode::ImportNotGranted),
+            "publish into a subscribe-only export is denied"
+        );
+        // But a READ is granted.
+        out.clear();
+        b.process(&e, &sub_to_frame(b"ai", b"g"), &mut out).unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "the subscribe direction is allowed"
+        );
+    }
+
+    #[test]
+    fn a_publish_grant_lets_the_importer_write_into_the_exporters_stream() {
+        // acme exports stream "drop" PUBLISH to globex, imported as "acme-drop". globex writes into it;
+        // acme reads its own stream and sees globex's record — a controlled cross-tenant WRITE.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-5aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-5bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+            ],
+            &[("acme", export_stream("drop", aud(&["globex"]), false, true))],
+            &[("globex", import_stream("acme", "drop", "acme-drop"))],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-5aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-5bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        let mut out = Vec::new();
+        b.process(&e, &pubto_frame(b"acme-drop", b"from-globex"), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAck,
+            "the publish-granted cross-tenant write is acked"
+        );
+        // The record landed in ACME's stream, not globex's namespace.
+        assert_eq!(e.engine_mut().stream_head("acme/drop").get(), 1);
+        assert!(!e.engine_mut().stream_exists("globex/acme-drop"));
+        // acme reads its own "drop" stream and sees globex's write.
+        out.clear();
+        a.process(&e, &sub_to_frame(b"drop", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert_eq!(
+            delivered_payloads(&flow(&mut a, &e, 8)),
+            vec![b"from-globex".to_vec()],
+            "acme consumes the record globex wrote through the export"
+        );
+    }
+
+    #[test]
+    fn revoking_the_export_stops_the_import() {
+        // With the export present, globex reads acme's stream. Rebuild the auth config WITHOUT the
+        // export (a config reload) and the very same import alias now resolves to a typed reject.
+        let e = DirectEngine::new(engine());
+        let specs: &[(&[u8], &[Scope], &str)] = &[
+            (
+                b"tok-a-6aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &[Scope::Publish, Scope::Subscribe],
+                "acme",
+            ),
+            (
+                b"tok-b-6bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &[Scope::Publish, Scope::Subscribe],
+                "globex",
+            ),
+        ];
+        let imports = &[("globex", import_stream("acme", "orders", "partner"))];
+        // Phase A: export present.
+        let granted = share_auth(
+            specs,
+            &[(
+                "acme",
+                export_stream("orders", aud(&["globex"]), true, false),
+            )],
+            imports,
+        );
+        let mut a = mt_session(&e, &granted, 1, b"tok-a-6aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        a.process(&e, &pubto_frame(b"orders", b"A-shared"), &mut Vec::new())
+            .unwrap();
+        let mut b = mt_session(&e, &granted, 2, b"tok-b-6bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        let mut out = Vec::new();
+        b.process(&e, &sub_to_frame(b"partner", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "granted read binds");
+
+        // Phase B: REVOKE — the same import, but no export. New sessions on the reloaded config.
+        let revoked = share_auth(specs, &[], imports);
+        let mut b2 = mt_session(&e, &revoked, 3, b"tok-b-6bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        out.clear();
+        b2.process(&e, &sub_to_frame(b"partner", b"g2"), &mut out)
+            .unwrap();
+        assert_eq!(
+            err_code(&out),
+            Some(ironbus_proto::err::ServerErrorCode::ImportNotGranted),
+            "revoking the export stops the import on the next resolution"
+        );
+    }
+
+    #[test]
+    fn a_non_imported_name_stays_in_the_importers_own_tenant() {
+        // Even with a sharing registry configured, a name that is NOT an import alias resolves in the
+        // importer's OWN tenant (phase-1 unchanged): globex's "myown" is globex/myown, never acme's.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-7aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-7bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+            ],
+            &[(
+                "acme",
+                export_stream("orders", aud(&["globex"]), true, false),
+            )],
+            &[("globex", import_stream("acme", "orders", "partner"))],
+        );
+        // acme has a stream literally named "myown"; globex names "myown" (NOT its alias "partner").
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-7aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        a.process(&e, &pubto_frame(b"myown", b"A-private"), &mut Vec::new())
+            .unwrap();
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-7bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        b.process(&e, &pubto_frame(b"myown", b"B-private"), &mut Vec::new())
+            .unwrap();
+        let mut out = Vec::new();
+        b.process(&e, &sub_to_frame(b"myown", b"g"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert_eq!(
+            delivered_payloads(&flow(&mut b, &e, 8)),
+            vec![b"B-private".to_vec()],
+            "a non-imported name stays isolated in the importer's own tenant"
+        );
+        // Two distinct isolated logs.
+        assert_eq!(e.engine_mut().stream_head("acme/myown").get(), 1);
+        assert_eq!(e.engine_mut().stream_head("globex/myown").get(), 1);
+    }
+
+    #[test]
+    fn two_importers_of_the_same_export_are_independent() {
+        // acme exports stream "feed" PUBLIC; globex and initech each import it under their own alias.
+        // Both read acme's stream through INDEPENDENT (importer-scoped) cursors.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-8aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "acme",
+                ),
+                (
+                    b"tok-b-8bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "globex",
+                ),
+                (
+                    b"tok-c-8cccccccccccccccccccccccccc",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "initech",
+                ),
+            ],
+            &[(
+                "acme",
+                export_stream("feed", crate::tenant::Audience::Public, true, false),
+            )],
+            &[
+                ("globex", import_stream("acme", "feed", "gfeed")),
+                ("initech", import_stream("acme", "feed", "ifeed")),
+            ],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-8aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        a.process(&e, &pubto_frame(b"feed", b"broadcast"), &mut Vec::new())
+            .unwrap();
+        let mut g = mt_session(&e, &auth, 2, b"tok-b-8bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        let mut it = mt_session(&e, &auth, 3, b"tok-c-8cccccccccccccccccccccccccc", true);
+        let mut out = Vec::new();
+        g.process(&e, &sub_to_frame(b"gfeed", b"w"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        out.clear();
+        it.process(&e, &sub_to_frame(b"ifeed", b"w"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        // Each independently reads the one shared record — neither steals it from the other (their
+        // cursors are keyed by (acme/feed, <importer>/w)).
+        assert_eq!(
+            delivered_payloads(&flow(&mut g, &e, 8)),
+            vec![b"broadcast".to_vec()],
+            "globex reads the shared record"
+        );
+        assert_eq!(
+            delivered_payloads(&flow(&mut it, &e, 8)),
+            vec![b"broadcast".to_vec()],
+            "initech independently reads the same shared record"
+        );
+    }
+
+    #[test]
+    fn subject_import_reads_the_exporters_subjects_filtered_and_isolated() {
+        // The headline read use-case: acme binds `orders.>` to a stream and publishes `orders.us`;
+        // acme exports subject `orders.>` (subscribe) to globex; globex imports it as `partner.orders`
+        // and filtered-subscribes `partner.orders.>` — reading acme's subject records through an
+        // importer-scoped cursor. A sibling acme subject globex did not import stays invisible.
+        let e = DirectEngine::new(engine());
+        let auth = share_auth(
+            &[
+                (
+                    b"tok-a-9aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "acme",
+                ),
+                (
+                    b"tok-b-9bbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &[Scope::Publish, Scope::Subscribe, Scope::Admin],
+                    "globex",
+                ),
+            ],
+            &[(
+                "acme",
+                export_subject("orders.>", aud(&["globex"]), true, false),
+            )],
+            &[("globex", import_subject("acme", "orders", "partner.orders"))],
+        );
+        let mut a = mt_session(&e, &auth, 1, b"tok-a-9aaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        let mut out = Vec::new();
+        for f in [
+            bind_frame(b"ord", b"orders.>"),
+            pubsub_frame(b"orders.us", b"A-order"),
+            bind_frame(b"sec", b"secret.>"),
+            pubsub_frame(b"secret.k", b"A-secret"),
+        ] {
+            a.process(&e, &f, &mut out).unwrap();
+        }
+        // globex filtered-subscribes to its imported alias and reads acme's orders subject.
+        let mut b = mt_session(&e, &auth, 2, b"tok-b-9bbbbbbbbbbbbbbbbbbbbbbbbbb", true);
+        out.clear();
+        b.process(&e, &subsub_frame(b"partner.orders.>", b"w", 1), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "the subject import bound the exporter's covering stream"
+        );
+        assert_eq!(
+            delivered_payloads(&flow(&mut b, &e, 8)),
+            vec![b"A-order".to_vec()],
+            "globex reads acme's exported orders subject — and NOT acme's un-exported secret subject"
         );
     }
 }

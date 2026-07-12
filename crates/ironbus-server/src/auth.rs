@@ -320,6 +320,12 @@ pub struct AuthConfig {
     /// the same `Arc<AuthConfig>` it already receives — no new serve-path plumbing. `None` disables
     /// quota enforcement; isolation (name prefixing) is independent and comes from `Identity::tenant`.
     tenants: Option<std::sync::Arc<crate::tenant::TenantRegistry>>,
+    /// The broker's cross-tenant sharing (import/export) registry (#1163, multi-tenant phase-2), if
+    /// any tenant declared an `[[tenant.export]]` / `[[tenant.import]]`. Rides the auth config for the
+    /// same reason as `tenants`. `None` means no sharing is configured and EVERY resource resolution
+    /// stays in the caller's own tenant — byte-for-byte the phase-1 isolated broker. This is the ONLY
+    /// controlled path across the (otherwise absolute) tenant boundary.
+    sharing: Option<std::sync::Arc<crate::tenant::SharingRegistry>>,
 }
 
 impl AuthConfig {
@@ -339,6 +345,19 @@ impl AuthConfig {
     #[must_use]
     pub fn tenants(&self) -> Option<std::sync::Arc<crate::tenant::TenantRegistry>> {
         self.tenants.clone()
+    }
+
+    /// Attaches the broker's cross-tenant sharing (import/export) registry (#1163).
+    pub fn set_sharing(&mut self, sharing: std::sync::Arc<crate::tenant::SharingRegistry>) {
+        self.sharing = Some(sharing);
+    }
+
+    /// The broker's cross-tenant sharing (import/export) registry (#1163), if configured (a cheap
+    /// `Arc` clone). The session consults it at every subscribe/publish resolution seam to (with
+    /// authorization) resolve an import alias to the exporter's resource.
+    #[must_use]
+    pub fn sharing(&self) -> Option<std::sync::Arc<crate::tenant::SharingRegistry>> {
+        self.sharing.clone()
     }
 
     /// Whether ANY auth identity is configured (#631 / #629). This is the "at least one auth identity

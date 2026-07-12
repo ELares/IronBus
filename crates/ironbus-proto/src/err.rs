@@ -103,6 +103,10 @@ pub enum ServerErrorCode {
     /// its wire headers (#555 injection hardening) — a permanent reject; publish a `DLY1` relative
     /// delay request instead.
     InvalidDelayHeader,
+    /// `ERR_IMPORT_NOT_GRANTED`: a cross-tenant import was refused because no matching export
+    /// authorizes it for the requested direction (#1163, multi-tenant phase-2). A PERMANENT reject
+    /// until BOTH sides allowlist the crossing — never retry-able as-is.
+    ImportNotGranted,
 }
 
 impl ServerErrorCode {
@@ -140,6 +144,7 @@ impl ServerErrorCode {
             "ERR_TXN_CHECK_UNAUTHORIZED" => Self::TxnCheckUnauthorized,
             "ERR_DELAY_TOO_LONG" => Self::DelayTooLong,
             "ERR_INVALID_DELAY_HEADER" => Self::InvalidDelayHeader,
+            "ERR_IMPORT_NOT_GRANTED" => Self::ImportNotGranted,
             _ => return None,
         };
         Some(code)
@@ -177,6 +182,7 @@ impl ServerErrorCode {
             Self::TxnCheckUnauthorized => "ERR_TXN_CHECK_UNAUTHORIZED",
             Self::DelayTooLong => "ERR_DELAY_TOO_LONG",
             Self::InvalidDelayHeader => "ERR_INVALID_DELAY_HEADER",
+            Self::ImportNotGranted => "ERR_IMPORT_NOT_GRANTED",
         }
     }
 }
@@ -322,6 +328,7 @@ mod tests {
             ServerErrorCode::TxnCheckUnauthorized,
             ServerErrorCode::DelayTooLong,
             ServerErrorCode::InvalidDelayHeader,
+            ServerErrorCode::ImportNotGranted,
         ] {
             assert_eq!(ServerErrorCode::from_token(code.as_token()), Some(code));
         }

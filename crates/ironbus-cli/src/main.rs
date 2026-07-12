@@ -6479,8 +6479,16 @@ fn load_auth_config(
     // streams / storage bytes / connections). A tenant referenced by an identity but absent here is
     // valid and simply unlimited. Wired onto the auth config so the session picks it up for free.
     if let Some(tenant_tables) = parsed.get("tenant").and_then(toml::Value::as_array) {
-        use ironbus_server::tenant::{TenantId, TenantQuotas, TenantRegistry};
+        use ironbus_server::tenant::{
+            Export, Import, SharingRegistry, TenantId, TenantQuotas, TenantRegistry,
+        };
         let mut quotas = std::collections::HashMap::new();
+        // #1163: the nested `[[tenant.export]]` / `[[tenant.import]]` tables carry each tenant's
+        // cross-tenant sharing grants. Collected per tenant here and wired as a SharingRegistry.
+        let mut exports: std::collections::HashMap<TenantId, Vec<Export>> =
+            std::collections::HashMap::new();
+        let mut imports: std::collections::HashMap<TenantId, Vec<Import>> =
+            std::collections::HashMap::new();
         for (i, t) in tenant_tables.iter().enumerate() {
             let name = t.get("name").and_then(toml::Value::as_str).ok_or_else(|| {
                 CliError::Usage(format!(
@@ -6496,17 +6504,204 @@ fn load_auth_config(
                     .and_then(|v| u64::try_from(v).ok())
             };
             quotas.insert(
-                id,
+                id.clone(),
                 TenantQuotas {
                     max_streams: as_u64("max_streams"),
                     max_storage_bytes: as_u64("max_storage_bytes"),
                     max_connections: as_u64("max_connections"),
                 },
             );
+            // #1163: parse this tenant's EXPORT grants (what it shares, to whom, in which direction).
+            if let Some(export_tables) = t.get("export").and_then(toml::Value::as_array) {
+                let mut list = Vec::with_capacity(export_tables.len());
+                for ex in export_tables {
+                    list.push(parse_tenant_export(name, ex)?);
+                }
+                if !list.is_empty() {
+                    exports.insert(id.clone(), list);
+                }
+            }
+            // #1163: parse this tenant's IMPORTS (which exported resources it maps into its own space).
+            if let Some(import_tables) = t.get("import").and_then(toml::Value::as_array) {
+                let mut list = Vec::with_capacity(import_tables.len());
+                for im in import_tables {
+                    list.push(parse_tenant_import(name, im)?);
+                }
+                if !list.is_empty() {
+                    imports.insert(id.clone(), list);
+                }
+            }
         }
         cfg.set_tenants(std::sync::Arc::new(TenantRegistry::new(quotas)));
+        // Only wire a sharing registry when a grant is actually configured, so a broker with no
+        // import/export is byte-for-byte the phase-1 isolated broker.
+        if !exports.is_empty() || !imports.is_empty() {
+            cfg.set_sharing(std::sync::Arc::new(SharingRegistry::new(exports, imports)));
+        }
     }
     Ok(Some(std::sync::Arc::new(cfg)))
+}
+
+/// Parses one `[[tenant.export]]` table (#1163): exactly one of `stream` / `subject` (the exported
+/// resource, wildcards allowed on a subject), `to` (`"public"` or a list of importing tenant ids),
+/// and `access` (a non-empty subset of `["subscribe","publish"]`). Fail-closed on any malformation.
+#[cfg(unix)]
+fn parse_tenant_export(
+    tenant: &str,
+    ex: &toml::Value,
+) -> Result<ironbus_server::tenant::Export, CliError> {
+    use ironbus_server::tenant::{
+        validate_share_stream, validate_share_subject, Audience, Export, GrantDirection, ShareKind,
+        TenantId,
+    };
+    let (kind, name) = share_kind_and_name(tenant, ex, "export")?;
+    match kind {
+        ShareKind::Stream => validate_share_stream(&name),
+        ShareKind::Subject => validate_share_subject(&name, true),
+    }
+    .map_err(|e| CliError::Usage(format!("--auth-config tenant `{tenant}` export: {e}")))?;
+    // `to`: "public" (a string) or a list of tenant ids.
+    let audience = match ex.get("to") {
+        Some(toml::Value::String(s)) if s == "public" => Audience::Public,
+        Some(toml::Value::String(s)) => {
+            return Err(CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` export `to` must be \"public\" or a list of tenant \
+                 ids (got {s:?})"
+        )))
+        }
+        Some(toml::Value::Array(arr)) => {
+            let mut set = std::collections::BTreeSet::new();
+            for v in arr {
+                let who = v.as_str().ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "--auth-config tenant `{tenant}` export `to` has a non-string tenant id"
+                    ))
+                })?;
+                set.insert(TenantId::parse(who).map_err(|e| {
+                    CliError::Usage(format!(
+                        "--auth-config tenant `{tenant}` export `to` tenant `{who}`: {e}"
+                    ))
+                })?);
+            }
+            if set.is_empty() {
+                return Err(CliError::Usage(format!(
+                    "--auth-config tenant `{tenant}` export `to` list is empty (name a tenant or use \
+                     \"public\")"
+                )));
+            }
+            Audience::Tenants(set)
+        }
+        _ => {
+            return Err(CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` export needs a `to` (\"public\" or a list of tenant \
+                 ids)"
+        )))
+        }
+    };
+    // `access`: a non-empty subset of subscribe/publish. A grant that permits neither is refused —
+    // it could never authorize anything.
+    let access = ex.get("access").and_then(toml::Value::as_array).ok_or_else(|| {
+        CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` export needs an `access` list (any of subscribe, publish)"
+        ))
+    })?;
+    let mut direction = GrantDirection::default();
+    for a in access {
+        match a.as_str() {
+            Some("subscribe") => direction.subscribe = true,
+            Some("publish") => direction.publish = true,
+            other => {
+                return Err(CliError::Usage(format!(
+                    "--auth-config tenant `{tenant}` export has unknown access {other:?} (expected \
+                     subscribe or publish)"
+                )))
+            }
+        }
+    }
+    if !direction.subscribe && !direction.publish {
+        return Err(CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` export `access` is empty (grant subscribe and/or publish)"
+        )));
+    }
+    Ok(Export {
+        kind,
+        name,
+        audience,
+        direction,
+    })
+}
+
+/// Parses one `[[tenant.import]]` table (#1163): `from` (the exporting tenant), exactly one of
+/// `stream` / `subject` (the exporter's resource, a literal — the export's pattern bounds it), and
+/// `as` (the importer's local alias). Fail-closed on any malformation.
+#[cfg(unix)]
+fn parse_tenant_import(
+    tenant: &str,
+    im: &toml::Value,
+) -> Result<ironbus_server::tenant::Import, CliError> {
+    use ironbus_server::tenant::{
+        validate_share_stream, validate_share_subject, Import, ShareKind, TenantId,
+    };
+    let from = im
+        .get("from")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "--auth-config tenant `{tenant}` import needs a `from` (the exporting tenant id)"
+            ))
+        })?;
+    let from = TenantId::parse(from).map_err(|e| {
+        CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` import `from` `{from}`: {e}"
+        ))
+    })?;
+    let (kind, remote) = share_kind_and_name(tenant, im, "import")?;
+    let local = im.get("as").and_then(toml::Value::as_str).ok_or_else(|| {
+        CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` import needs an `as` (the local alias)"
+        ))
+    })?;
+    // Both the remote name and the local alias are LITERAL (no wildcards): an import alias is a plain
+    // prefix; the export's pattern is what bounds the shared set.
+    let validate = |n: &str| match kind {
+        ShareKind::Stream => validate_share_stream(n),
+        ShareKind::Subject => validate_share_subject(n, false),
+    };
+    validate(&remote).map_err(|e| {
+        CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` import remote: {e}"
+        ))
+    })?;
+    validate(local).map_err(|e| {
+        CliError::Usage(format!("--auth-config tenant `{tenant}` import `as`: {e}"))
+    })?;
+    Ok(Import {
+        kind,
+        from,
+        remote,
+        local: local.to_string(),
+    })
+}
+
+/// Extracts the `stream` / `subject` kind + name from an export or import table: EXACTLY one of the
+/// two must be present (never both, never neither), so a grant is unambiguously stream- or
+/// subject-typed. `role` is `"export"` / `"import"` for the error message.
+#[cfg(unix)]
+fn share_kind_and_name(
+    tenant: &str,
+    table: &toml::Value,
+    role: &str,
+) -> Result<(ironbus_server::tenant::ShareKind, String), CliError> {
+    use ironbus_server::tenant::ShareKind;
+    let stream = table.get("stream").and_then(toml::Value::as_str);
+    let subject = table.get("subject").and_then(toml::Value::as_str);
+    match (stream, subject) {
+        (Some(s), None) => Ok((ShareKind::Stream, s.to_string())),
+        (None, Some(s)) => Ok((ShareKind::Subject, s.to_string())),
+        _ => Err(CliError::Usage(format!(
+            "--auth-config tenant `{tenant}` {role} must declare EXACTLY one of `stream` or `subject`"
+        ))),
+    }
 }
 
 /// Loads exactly one identity's additive credential set from its `[[identity]]` TOML table (#631),
