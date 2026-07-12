@@ -3464,7 +3464,14 @@ struct BindingTable {
     /// The compiled, wait-free routing trie: a publish resolves a literal subject against this
     /// snapshot (directly or through a per-connection resolve cache) with no lock and no walk on a
     /// cache hit. Rebuilt and swapped on every successful `bind`, advancing its generation.
-    snapshot: SublistSnapshot<StreamId>,
+    ///
+    /// Held behind an `Arc` (#811 C3) so the SAME wait-free snapshot is SHARED with every
+    /// [`crate::actor::EngineHandle`]: a connection thread resolves a subject OFF the actor against
+    /// this exact object, and `bind_subject` publishes a rebuilt trie through the `ArcSwap` it wraps
+    /// (an interior-mutability `store`, so the shared `Arc` never has to be replaced), visible to
+    /// every reader. The `Arc` wrapper changes no routing behavior — it is the same snapshot, merely
+    /// reachable from the connection threads without a round-trip through the actor.
+    snapshot: Arc<SublistSnapshot<StreamId>>,
 }
 
 impl BindingTable {
@@ -3473,8 +3480,15 @@ impl BindingTable {
     fn new() -> BindingTable {
         BindingTable {
             entries: Vec::new(),
-            snapshot: SublistSnapshot::empty(),
+            snapshot: Arc::new(SublistSnapshot::empty()),
         }
+    }
+
+    /// A clone of the SHARED wait-free snapshot `Arc` (#811 C3), handed to each
+    /// [`crate::actor::EngineHandle`] at `spawn_actor` time so a connection thread resolves a subject
+    /// off the actor against the SAME snapshot `bind_subject` publishes to.
+    fn snapshot_arc(&self) -> Arc<SublistSnapshot<StreamId>> {
+        Arc::clone(&self.snapshot)
     }
 
     /// Builds an immutable routing trie from the current registry (generation `0`; the snapshot restamps
@@ -3502,7 +3516,7 @@ impl BindingTable {
     fn from_entries(entries: Vec<(String, StreamId)>) -> Result<BindingTable, SublistError> {
         let table = BindingTable {
             entries,
-            snapshot: SublistSnapshot::empty(),
+            snapshot: Arc::new(SublistSnapshot::empty()),
         };
         let trie = table.build()?;
         table.snapshot.store(trie);
@@ -10162,7 +10176,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// and generation-stamped, so the cache's generation-guard detects a bind change with one compare.
     #[must_use]
     pub fn binding_snapshot(&self) -> &SublistSnapshot<StreamId> {
-        &self.bindings.snapshot
+        self.bindings.snapshot.as_ref()
+    }
+
+    /// A clone of the SHARED subject-routing snapshot `Arc` (#811 C3): the same `ArcSwap`
+    /// [`Engine::bind_subject`] publishes to, taken at `spawn_actor` time and stored in every
+    /// [`crate::actor::EngineHandle`] so a connection thread resolves a subject WAIT-FREE off the
+    /// actor (then routes the produce to the resolved stream's shard). A resolve through this always
+    /// observes the latest committed bindings, exactly as an in-actor resolve does.
+    #[must_use]
+    pub fn binding_snapshot_arc(&self) -> Arc<SublistSnapshot<StreamId>> {
+        self.bindings.snapshot_arc()
     }
 
     /// Appends `message` durably-pending (write, NO fsync) and records the produce statistics that

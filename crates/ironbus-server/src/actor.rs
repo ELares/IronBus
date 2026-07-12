@@ -56,9 +56,11 @@ use crate::liveness::ActorWatchdog;
 use crate::produce_gate::ProduceCapGate;
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
+use ironbus_core::sublist::SublistSnapshot;
 use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
+use ironbus_storage::streamset::StreamId;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -725,6 +727,15 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// plain `bool` copied on clone (like `reply_spin`), set on the base handle before any per-connection
     /// clone via [`Self::with_zero_copy_sendfile`].
     zero_copy_sendfile: bool,
+    /// The SHARED wait-free subject routing snapshot (#585 / #811 C3): the SAME `Arc<SublistSnapshot>`
+    /// the engine's [`crate::engine::Engine::bind_subject`] publishes to, cloned into the handle at
+    /// `spawn_actor` time BEFORE the engine moves into the actor thread. A connection thread resolves a
+    /// subject WAIT-FREE off the actor against it (no round-trip through the append actor), then routes
+    /// the produce to the resolved stream's shard via [`EngineAccess::with_on_shard`] — parity with the
+    /// `PubTo` path. SHARED across every per-connection clone (one per actor, like `cap_gate`):
+    /// `bind_subject` stores a rebuilt trie through the `ArcSwap` this `Arc` wraps, so every reader sees
+    /// the latest committed bindings without the `Arc` itself ever being replaced.
+    binding_snapshot: Arc<SublistSnapshot<StreamId>>,
 }
 
 /// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
@@ -767,6 +778,10 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // The fixed-for-life zero-copy `sendfile(2)` toggle (#1034): a plain copy, like `reply_spin`,
             // so every connection clone inherits the base handle's operator setting.
             zero_copy_sendfile: self.zero_copy_sendfile,
+            // The SAME shared subject-routing snapshot (#811 C3): one per actor, published to by
+            // `bind_subject` and resolved off the actor by every connection, so the `Arc` is shared on
+            // clone (like `cap_gate`), never freshened.
+            binding_snapshot: Arc::clone(&self.binding_snapshot),
         }
     }
 }
@@ -1317,6 +1332,21 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         self.with(job)
     }
 
+    /// The wait-free SUBJECT ROUTING snapshot (#585 / #811 C3), read LOCALLY off the actor (no
+    /// round-trip) so a connection thread resolves a subject to its single bound stream BEFORE routing
+    /// the produce to that stream's shard — parity with the `PubTo` path, which hashes the stream name
+    /// on the connection thread. Returns a cheap `Arc` clone of the SAME snapshot the engine's
+    /// [`crate::engine::Engine::bind_subject`] publishes to, so a resolve always observes the latest
+    /// committed bindings, exactly as an in-actor resolve would.
+    ///
+    /// The DEFAULT returns an EMPTY snapshot (every subject resolves `NoStream`); that is correct ONLY
+    /// for the test fixtures that never drive a subject-addressed verb. Every real handle
+    /// ([`EngineHandle`], [`ShardedEngineHandle`], and the direct test engines that back the session's
+    /// subject tests) OVERRIDES it to return the engine's shared snapshot.
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        Arc::new(SublistSnapshot::empty())
+    }
+
     /// The current MONOTONIC time (nanoseconds) from the engine's clock seam, read LOCALLY (no actor
     /// round-trip), so a connection handler can stamp a produce's ENQUEUE instant for the CoDel
     /// admission sojourn (#68). It is the same clock the engine reads at dequeue, so the two readings
@@ -1528,6 +1558,13 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
     fn now_monotonic_nanos(&self) -> u64 {
         // A LOCAL clock read, no actor round-trip: the handle holds a clone of the engine's clock.
         self.clock.now_monotonic_nanos()
+    }
+
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // A LOCAL clone of the shared snapshot `Arc` (#811 C3), no actor round-trip: the handle holds
+        // the SAME snapshot `bind_subject` publishes to, so a connection resolves a subject off the
+        // actor and routes the produce to the resolved stream's shard.
+        Arc::clone(&self.binding_snapshot)
     }
 
     fn consumer_credit_caps(&self) -> (u32, u64) {
@@ -1760,6 +1797,12 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         self.primary().now_monotonic_nanos()
     }
 
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // Every shard shares the ONE subject-routing snapshot (bindings are engine-global, not
+        // per-shard), so the primary's snapshot is authoritative for the whole front (#811 C3).
+        EngineAccess::binding_snapshot(self.primary())
+    }
+
     fn consumer_credit_caps(&self) -> (u32, u64) {
         EngineAccess::consumer_credit_caps(self.primary())
     }
@@ -1882,6 +1925,13 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for DirectEngine<F, C> 
         self.engine.borrow().now_monotonic()
     }
 
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // The direct (same-thread) test engine resolves against the REAL engine's shared snapshot
+        // `Arc` (#811 C3), so the session's subject unit tests exercise the true off-actor resolve.
+        // A cloned `Arc` (owned), so it outlives the transient `RefCell` borrow.
+        self.engine.borrow().binding_snapshot_arc()
+    }
+
     fn consumer_credit_caps(&self) -> (u32, u64) {
         let e = self.engine.borrow();
         (e.consumer_credit(), e.consumer_credit_bytes())
@@ -1923,6 +1973,14 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for SharedEngine<F, C> 
         self.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .now_monotonic()
+    }
+
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // The shared-engine test fixture resolves against the REAL engine's snapshot `Arc` (#811 C3),
+        // read under the lock and cloned out (owned), so it outlives the guard.
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .binding_snapshot_arc()
     }
 
     fn consumer_credit_caps(&self) -> (u32, u64) {
@@ -2089,6 +2147,11 @@ where
     // stamp a produce's enqueue instant (the CoDel sojourn measurement, #68) with the SAME clock the
     // actor reads at dequeue.
     let clock = engine.clock_clone();
+    // Clone the SHARED subject-routing snapshot `Arc` (#811 C3) BEFORE the engine moves into the actor,
+    // so every connection thread resolves a subject WAIT-FREE off the actor against the SAME snapshot
+    // `bind_subject` publishes to (then routes the produce to the resolved stream's shard) — exactly the
+    // off-actor read the credit caps and clock above already do.
+    let binding_snapshot = engine.binding_snapshot_arc();
     // Snapshot the static per-consumer credit caps (#292) BEFORE the engine moves into the actor, so
     // the Connect handshake can negotiate them off the actor's hot path (no round-trip, #177).
     let consumer_credit_caps = (engine.consumer_credit(), engine.consumer_credit_bytes());
@@ -2222,6 +2285,9 @@ where
             // it off via [`EngineHandle::with_zero_copy_sendfile`] right after this returns, BEFORE any
             // connection's handle is cloned.
             zero_copy_sendfile: true,
+            // The shared subject-routing snapshot (#811 C3), cloned above before the engine moved: every
+            // connection resolves a subject off the actor against it, then routes to the resolved shard.
+            binding_snapshot,
         },
         join,
     )
