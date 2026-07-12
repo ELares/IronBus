@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Tiered storage: offloading cold, SEALED, immutable segments to an object store (#643, V2-M10,
-//! phase 1 — the Kafka KIP-405 / Pulsar / Redpanda tiered-storage class).
+//! Tiered storage: offloading cold, SEALED, immutable segments to an object store (#643, V2-M10 —
+//! the Kafka KIP-405 / Pulsar / Redpanda tiered-storage class).
+//!
+//! Phase 1 (#1152) shipped the mechanism + the local-directory [`FsColdStore`] backend; phase 2
+//! (#643) adds the S3 backend [`S3ColdStore`] behind the OFF-BY-DEFAULT `s3` feature — a small,
+//! purpose-built S3 client (`SigV4` request signing over aws-lc-rs; HTTPS over the same rustls +
+//! aws-lc-rs stack the `tls` feature already ships) that pulls NO `ring`, NO XML parser, and NO new
+//! crate into the tree (ADR-0004: aws-lc-rs is the sole crypto provider).
 //!
 //! A sealed segment is immutable (its footer is written, no in-place mutation ever races), which
 //! makes it the natural tiering unit: it can be copied to a cheap, high-capacity backing store and
@@ -15,9 +21,10 @@
 //! [`ColdStore`] is a tiny key/blob interface (`put`/`get`/`delete`/`exists`) over an opaque object
 //! key. Phase 1 ships one backend, [`FsColdStore`], which stores each object as a file in a
 //! directory (any [`crate::fs::Filesystem`]: an on-disk [`crate::fs::StdFs`] rooted at a local path
-//! or an NFS mount, or an in-memory filesystem for tests). A real S3 / `object_store` backend is a
-//! feature-gated follow-up: because it is just another `impl ColdStore`, it drops in with no change
-//! to the log's offload/fetch/recover machinery.
+//! or an NFS mount, or an in-memory filesystem for tests). Phase 2 adds [`S3ColdStore`] behind the
+//! `s3` feature: it is just another `impl ColdStore`, so it drops into the log's
+//! offload/fetch/recover machinery with NO change to any of that crash-safety logic (it is
+//! backend-agnostic — proven identically with either backend).
 //!
 //! ## The durability contract (where a bug is PERMANENT DATA LOSS)
 //!
@@ -330,6 +337,834 @@ impl<F: Filesystem> ColdStore for FsColdStore<F> {
 
     fn exists(&self, key: &str) -> Result<bool, ColdStoreError> {
         Ok(self.fs.exists(key)?)
+    }
+}
+
+// =================================================================================================
+// S3 backend (#643 phase 2): a `ColdStore` speaking S3 directly, behind the OFF-BY-DEFAULT `s3`
+// feature. This is a small, PURPOSE-BUILT S3 client — NOT a general object-storage crate — so it
+// pulls no `ring`, no XML parser, and no new crate into the tree (ADR-0004: aws-lc-rs is the sole
+// crypto provider). The four `ColdStore` verbs map to four S3 requests: PUT (upload), GET (download),
+// DELETE (idempotent), HEAD (exists) — none needs an XML response body, so a non-2xx is a typed error
+// read from the STATUS line, never a parsed error document.
+//
+// `S3ColdStore` is a drop-in `impl ColdStore`; the log's crash-safe offload/fetch/recover/reap
+// machinery is UNCHANGED. See `tests/cold_s3.rs` (a mock S3 server) + the `SigV4` vector tests below.
+// =================================================================================================
+#[cfg(feature = "s3")]
+pub use s3_backend::{S3ColdStore, S3ColdStoreConfig};
+
+#[cfg(feature = "s3")]
+mod s3_backend {
+    use super::{ColdStore, ColdStoreError};
+    use std::io;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+    use zeroize::Zeroize;
+
+    /// The default per-step network timeout for a connect (a hung/blackholed endpoint must NOT wedge
+    /// the single-writer append actor). Overridable via [`S3ColdStoreConfig::connect_timeout`].
+    const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// The default per-step network timeout for the HTTP request + response body. Overridable via
+    /// [`S3ColdStoreConfig::request_timeout`].
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// The AWS service name for the `SigV4` credential scope.
+    const SERVICE: &str = "s3";
+    /// The `SigV4` algorithm identifier.
+    const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+    /// The final scope terminator.
+    const AWS4_REQUEST: &str = "aws4_request";
+    /// SHA-256 of the empty string — the `x-amz-content-sha256` for a bodyless GET/DELETE/HEAD.
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// Connection + credential parameters for the [`S3ColdStore`] backend (#643 phase 2). `FsColdStore`
+    /// stays the default; this selects the S3 backend.
+    #[derive(Clone, Default)]
+    pub struct S3ColdStoreConfig {
+        /// The S3 bucket the log's cold objects live in.
+        pub bucket: String,
+        /// An object-key prefix within the bucket (the per-log root — the engine gives each log its own
+        /// prefix so the flat [`super::cold_object_name`] keys never collide across logs). May be empty.
+        pub prefix: String,
+        /// The AWS region (e.g. `us-east-1`) — part of the `SigV4` scope and the default endpoint host.
+        pub region: String,
+        /// An explicit endpoint URL for an S3-COMPATIBLE store (`MinIO`/Ceph/R2/`LocalStack`), e.g.
+        /// `https://s3.example.com` or `http://127.0.0.1:9000`. `None` = real AWS S3
+        /// (`s3.<region>.amazonaws.com`).
+        pub endpoint: Option<String>,
+        /// Path-style addressing (`/<bucket>/<key>`) vs virtual-hosted (`<bucket>.<host>/<key>`).
+        /// `true` for most S3-compatible stores + `LocalStack`; real AWS accepts either.
+        pub path_style: bool,
+        /// The AWS access key id (`SigV4` credential).
+        pub access_key_id: String,
+        /// The AWS secret access key (`SigV4` signing secret). Redacted in `Debug`.
+        pub secret_access_key: String,
+        /// An optional session token for temporary/STS credentials (sent as `x-amz-security-token`).
+        /// Redacted in `Debug`.
+        pub session_token: Option<String>,
+        /// The trust-anchor (CA) PEM bundle used to VERIFY the endpoint's certificate over HTTPS
+        /// (e.g. the Amazon root CA chain, or the system bundle bytes). REQUIRED for an `https`
+        /// endpoint; ignored for a plaintext `http` endpoint. Loading OS/bundled roots automatically
+        /// is a documented follow-up.
+        pub ca_pem: Option<Vec<u8>>,
+        /// The bound on a single TCP connect + TLS handshake. A hung/blackholed endpoint (accepts the
+        /// connection, never responds) must NEVER wedge the single-writer append actor, so every
+        /// network step is time-bounded; on expiry the op fails with a RETRYABLE typed error (a
+        /// timeout is never treated as "object absent"). `None` uses [`DEFAULT_CONNECT_TIMEOUT`] (30s).
+        pub connect_timeout: Option<Duration>,
+        /// The bound on the HTTP request send and on the response-body read (each separately). `None`
+        /// uses [`DEFAULT_REQUEST_TIMEOUT`] (60s). See [`S3ColdStoreConfig::connect_timeout`].
+        pub request_timeout: Option<Duration>,
+    }
+
+    impl std::fmt::Debug for S3ColdStoreConfig {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // Redact the secret credential material (#882 redaction discipline): the secret key and
+            // session token are never printed.
+            f.debug_struct("S3ColdStoreConfig")
+                .field("bucket", &self.bucket)
+                .field("prefix", &self.prefix)
+                .field("region", &self.region)
+                .field("endpoint", &self.endpoint)
+                .field("path_style", &self.path_style)
+                .field("access_key_id", &self.access_key_id)
+                .field("secret_access_key", &"<redacted>")
+                .field(
+                    "session_token",
+                    &self.session_token.as_ref().map(|_| "<redacted>"),
+                )
+                .field("has_ca_pem", &self.ca_pem.is_some())
+                .field("connect_timeout", &self.connect_timeout)
+                .field("request_timeout", &self.request_timeout)
+                .finish()
+        }
+    }
+
+    /// Lowercase-hex encode.
+    fn hex_lower(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    /// SHA-256 of `data`, lowercase hex (aws-lc-rs — no `ring`).
+    fn sha256_hex(data: &[u8]) -> String {
+        hex_lower(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data).as_ref())
+    }
+
+    /// HMAC-SHA256(`key`, `msg`) raw bytes (aws-lc-rs — no `ring`).
+    fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+        let k = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
+        aws_lc_rs::hmac::sign(&k, msg).as_ref().to_vec()
+    }
+
+    /// RFC 3986 percent-encode for the `SigV4` canonical URI. Leaves the unreserved set
+    /// (`A-Z a-z 0-9 - . _ ~`) as-is; when `encode_slash` is false, `/` is also left (S3 path segments).
+    fn uri_encode(input: &str, encode_slash: bool) -> String {
+        const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(input.len());
+        for &b in input.as_bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char);
+                }
+                b'/' if !encode_slash => out.push('/'),
+                _ => {
+                    out.push('%');
+                    out.push(UPPER_HEX[(b >> 4) as usize] as char);
+                    out.push(UPPER_HEX[(b & 0x0f) as usize] as char);
+                }
+            }
+        }
+        out
+    }
+
+    /// The `SigV4` signing key: the four-step HMAC-SHA256 derivation
+    /// `kSigning = HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), service), "aws4_request")`.
+    fn signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
+        let mut seed = format!("AWS4{secret}");
+        let mut k_date = hmac_sha256(seed.as_bytes(), date_stamp.as_bytes());
+        let mut k_region = hmac_sha256(&k_date, region.as_bytes());
+        let mut k_service = hmac_sha256(&k_region, service.as_bytes());
+        let k_signing = hmac_sha256(&k_service, AWS4_REQUEST.as_bytes());
+        // Defense-in-depth: wipe every intermediate that is derived directly from the secret.
+        seed.zeroize();
+        k_date.zeroize();
+        k_region.zeroize();
+        k_service.zeroize();
+        k_signing
+    }
+
+    /// Everything needed to compute one `SigV4` signature. Generic over the header set + service so the
+    /// AWS published test vectors (service `service`/`iam`) and the S3 client (service `s3`) both drive
+    /// the SAME code — the load-bearing correctness path.
+    struct SigningRequest<'a> {
+        method: &'a str,
+        /// The already-percent-encoded canonical URI (also the on-wire request target).
+        canonical_uri: &'a str,
+        /// The canonical query string (empty for the four `ColdStore` verbs).
+        canonical_query: &'a str,
+        /// The request headers to sign, `(lowercase-name, value)`; MUST include `host`.
+        headers: &'a [(String, String)],
+        /// Hex SHA-256 of the payload (the `x-amz-content-sha256` value).
+        payload_sha256: &'a str,
+        /// `YYYYMMDDTHHMMSSZ`.
+        amz_date: &'a str,
+        /// `YYYYMMDD`.
+        date_stamp: &'a str,
+        region: &'a str,
+        service: &'a str,
+        access_key_id: &'a str,
+        secret_access_key: &'a str,
+    }
+
+    impl SigningRequest<'_> {
+        /// Computes the `Authorization` header value (and the signed-headers list) per AWS `SigV4`.
+        fn authorization(&self) -> String {
+            // Canonical + signed headers: sort by lowercase name, trim values.
+            let mut hs: Vec<(String, String)> = self
+                .headers
+                .iter()
+                .map(|(n, v)| (n.to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            hs.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut canonical_headers = String::new();
+            for (n, v) in &hs {
+                canonical_headers.push_str(n);
+                canonical_headers.push(':');
+                canonical_headers.push_str(v);
+                canonical_headers.push('\n');
+            }
+            let signed_headers = hs
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(";");
+
+            let canonical_request = format!(
+                "{}\n{}\n{}\n{}\n{}\n{}",
+                self.method,
+                self.canonical_uri,
+                self.canonical_query,
+                canonical_headers,
+                signed_headers,
+                self.payload_sha256,
+            );
+            let scope = format!(
+                "{}/{}/{}/{}",
+                self.date_stamp, self.region, self.service, AWS4_REQUEST
+            );
+            let string_to_sign = format!(
+                "{}\n{}\n{}\n{}",
+                ALGORITHM,
+                self.amz_date,
+                scope,
+                sha256_hex(canonical_request.as_bytes()),
+            );
+            let mut key = signing_key(
+                self.secret_access_key,
+                self.date_stamp,
+                self.region,
+                self.service,
+            );
+            let signature = hex_lower(&hmac_sha256(&key, string_to_sign.as_bytes()));
+            key.zeroize(); // wipe the derived signing key once the signature is computed
+            format!(
+                "{} Credential={}/{}, SignedHeaders={}, Signature={}",
+                ALGORITHM, self.access_key_id, scope, signed_headers, signature
+            )
+        }
+    }
+
+    /// Formats a wall-clock instant as the `SigV4` `(amz_date = YYYYMMDDTHHMMSSZ, date_stamp = YYYYMMDD)`
+    /// pair, in UTC, with no external calendar dependency.
+    fn format_amz_date(now: SystemTime) -> (String, String) {
+        let secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let days = i64::try_from(secs / 86_400).unwrap_or(0);
+        let rem = secs % 86_400;
+        let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        let (year, month, day) = civil_from_days(days);
+        (
+            format!("{year:04}{month:02}{day:02}T{hour:02}{min:02}{sec:02}Z"),
+            format!("{year:04}{month:02}{day:02}"),
+        )
+    }
+
+    /// Days-since-Unix-epoch -> `(year, month, day)` (UTC), Howard Hinnant's `civil_from_days`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn civil_from_days(days: i64) -> (i64, u32, u32) {
+        let z = days + 719_468;
+        let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+        let doe = z - era * 146_097; // [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+        let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+        (if month <= 2 { year + 1 } else { year }, month, day)
+    }
+
+    /// A `ColdStore` that stores each offloaded segment as an S3 object (#643 phase 2). Whole-object
+    /// PUT/GET/DELETE/HEAD, `SigV4`-signed over aws-lc-rs, HTTPS over rustls + aws-lc-rs. The async S3
+    /// requests are driven from the sync `ColdStore` trait by one tokio CURRENT-THREAD runtime +
+    /// `block_on` (safe under the log's single-writer append actor — a plain sync thread never inside a
+    /// runtime, so `block_on` never re-enters a running one; the actor serializes cold-store calls).
+    pub struct S3ColdStore {
+        config: S3ColdStoreConfig,
+        /// The rustls client config for HTTPS (`None` for a plaintext `http` endpoint).
+        tls: Option<Arc<rustls::ClientConfig>>,
+        /// Whether the endpoint is HTTPS.
+        https: bool,
+        /// The connect + `Host`-header + SNI host (already accounts for path-style vs virtual-hosted).
+        host: String,
+        /// The connect port.
+        port: u16,
+        /// The resolved bound on a connect + TLS handshake.
+        connect_timeout: Duration,
+        /// The resolved bound on the request send and the response-body read.
+        request_timeout: Duration,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    impl std::fmt::Debug for S3ColdStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("S3ColdStore")
+                .field("config", &self.config)
+                .field("https", &self.https)
+                .field("host", &self.host)
+                .field("port", &self.port)
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// A small typed `io::Error` for an S3-backend failure (mapped to [`ColdStoreError::Io`]).
+    fn io_error(msg: impl Into<String>) -> ColdStoreError {
+        ColdStoreError::Io(io::Error::other(msg.into()))
+    }
+
+    /// A typed, RETRYABLE timeout error for a hung network step. Mapped to [`ColdStoreError::Io`] with
+    /// [`io::ErrorKind::TimedOut`] — NEVER [`ColdStoreError::NotFound`] (a timeout is not "object
+    /// absent"), so offload retries next tick and a fetch-on-read fails closed-retryable, never
+    /// deleting the local segment.
+    fn timeout_error(op: &str, dur: Duration) -> ColdStoreError {
+        ColdStoreError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("S3 {op} timed out after {dur:?}"),
+        ))
+    }
+
+    /// Whether `host` is loopback/local (exempt from the plaintext-credentials warning).
+    fn host_is_local(host: &str) -> bool {
+        host == "localhost" || host == "::1" || host.starts_with("127.")
+    }
+
+    impl S3ColdStore {
+        /// Builds an S3 cold-store backend from `config` (#643 phase 2). This is the production tiering
+        /// backend, selected by config in place of the default [`FsColdStore`].
+        ///
+        /// # Errors
+        /// [`ColdStoreError::Io`] if the endpoint URL is malformed, if an `https` endpoint is configured
+        /// without a `ca_pem` trust anchor (or the PEM has none), or if the tokio runtime cannot build.
+        pub fn new(config: S3ColdStoreConfig) -> Result<S3ColdStore, ColdStoreError> {
+            let (https, endpoint_host, port) = parse_endpoint(&config)?;
+            // Path-style => connect to the endpoint host, bucket goes in the path. Virtual-hosted =>
+            // the bucket is a host-name label. The chosen host is the Host header + SNI + connect host.
+            let host = if config.path_style {
+                endpoint_host
+            } else {
+                format!("{}.{}", config.bucket, endpoint_host)
+            };
+            let tls = if https {
+                let ca = config.ca_pem.as_deref().ok_or_else(|| {
+                    io_error("S3 cold store over https requires a ca_pem trust anchor")
+                })?;
+                Some(build_client_config(ca)?)
+            } else {
+                None
+            };
+            // #557-style warning: static credentials sent over a plaintext http:// endpoint to a
+            // REMOTE host are exposed on the wire. Real AWS (endpoint None) is always https; this only
+            // catches a misconfigured explicit http:// remote (a local dev endpoint is exempt).
+            if !https && !config.access_key_id.is_empty() && !host_is_local(&host) {
+                tracing::warn!(
+                    host = %host,
+                    "S3 cold store is sending credentials over a PLAINTEXT http:// endpoint to a \
+                     non-local host; the access key + SigV4 signature are exposed on the wire — use \
+                     an https endpoint in production"
+                );
+            }
+            let connect_timeout = config.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+            let request_timeout = config.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(ColdStoreError::Io)?;
+            Ok(S3ColdStore {
+                config,
+                tls,
+                https,
+                host,
+                port,
+                connect_timeout,
+                request_timeout,
+                runtime,
+            })
+        }
+
+        /// The full S3 object key for a bare `ColdStore` key: `<prefix>/<key>` (or `<key>` if no prefix).
+        fn object_key(&self, key: &str) -> String {
+            let prefix = self.config.prefix.trim_matches('/');
+            if prefix.is_empty() {
+                key.to_string()
+            } else {
+                format!("{prefix}/{key}")
+            }
+        }
+
+        /// The request path (path-style prepends the bucket), percent-encoded as the canonical URI.
+        fn request_path(&self, key: &str) -> String {
+            let object_key = self.object_key(key);
+            let raw = if self.config.path_style {
+                format!("/{}/{}", self.config.bucket, object_key)
+            } else {
+                format!("/{object_key}")
+            };
+            uri_encode(&raw, false)
+        }
+
+        /// Signs + sends one S3 request, returning `(status, response_body)`. A transport / TLS /
+        /// connect failure is a [`ColdStoreError::Io`]; HTTP status handling is the caller's.
+        async fn send(
+            &self,
+            method: &str,
+            key: &str,
+            body: Vec<u8>,
+        ) -> Result<(http::StatusCode, Vec<u8>), ColdStoreError> {
+            let canonical_uri = self.request_path(key);
+            let payload_sha256 = if body.is_empty() {
+                EMPTY_SHA256.to_string()
+            } else {
+                sha256_hex(&body)
+            };
+            let (amz_date, date_stamp) = format_amz_date(SystemTime::now());
+
+            let mut headers = vec![
+                ("host".to_string(), self.host.clone()),
+                ("x-amz-content-sha256".to_string(), payload_sha256.clone()),
+                ("x-amz-date".to_string(), amz_date.clone()),
+            ];
+            if let Some(token) = &self.config.session_token {
+                headers.push(("x-amz-security-token".to_string(), token.clone()));
+            }
+            let authorization = SigningRequest {
+                method,
+                canonical_uri: &canonical_uri,
+                canonical_query: "",
+                headers: &headers,
+                payload_sha256: &payload_sha256,
+                amz_date: &amz_date,
+                date_stamp: &date_stamp,
+                region: &self.config.region,
+                service: SERVICE,
+                access_key_id: &self.config.access_key_id,
+                secret_access_key: &self.config.secret_access_key,
+            }
+            .authorization();
+
+            let mut builder = http::Request::builder().method(method).uri(&canonical_uri);
+            for (name, value) in &headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            builder = builder.header("authorization", authorization);
+            let request = builder
+                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                .map_err(|e| io_error(format!("building the S3 request failed: {e}")))?;
+
+            self.round_trip(request).await
+        }
+
+        /// Opens a fresh connection (TCP, + TLS for https), runs the HTTP/1.1 exchange, collects the
+        /// response body. EVERY network step is time-bounded so a hung/blackholed endpoint cannot wedge
+        /// the single-writer append actor; on expiry the step returns a RETRYABLE typed timeout error.
+        async fn round_trip(
+            &self,
+            request: http::Request<http_body_util::Full<bytes::Bytes>>,
+        ) -> Result<(http::StatusCode, Vec<u8>), ColdStoreError> {
+            let connect_to = self.connect_timeout;
+            let request_to = self.request_timeout;
+
+            // 1. TCP connect (bounded).
+            let tcp = tokio::time::timeout(
+                connect_to,
+                tokio::net::TcpStream::connect((self.host.as_str(), self.port)),
+            )
+            .await
+            .map_err(|_| timeout_error("connect", connect_to))?
+            .map_err(ColdStoreError::Io)?;
+
+            // 2. TLS handshake for https (bounded).
+            let conn = if self.https {
+                let server_name = rustls::pki_types::ServerName::try_from(self.host.clone())
+                    .map_err(|_| io_error("the S3 endpoint host is not a valid TLS server name"))?;
+                let tls = self
+                    .tls
+                    .clone()
+                    .ok_or_else(|| io_error("S3 https endpoint has no TLS config"))?;
+                let stream = tokio::time::timeout(
+                    connect_to,
+                    tokio_rustls::TlsConnector::from(tls).connect(server_name, tcp),
+                )
+                .await
+                .map_err(|_| timeout_error("TLS handshake", connect_to))?
+                .map_err(ColdStoreError::Io)?;
+                Connection::Tls(Box::new(stream))
+            } else {
+                Connection::Plain(tcp)
+            };
+
+            // 3. HTTP handshake + request + body, driven concurrently with the connection task. The
+            // driver is ABORTED on EVERY exit path (success or error) so no parked task lingers for the
+            // next `block_on`.
+            let (mut sender, driver) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(conn))
+                    .await
+                    .map_err(|e| io_error(format!("S3 HTTP handshake failed: {e}")))?;
+            let driver = tokio::spawn(async move {
+                let _ = driver.await;
+            });
+            let result = self.exchange(&mut sender, request, request_to).await;
+            driver.abort();
+            result
+        }
+
+        /// Sends the request and reads the response body, each bounded by `request_to`.
+        async fn exchange(
+            &self,
+            sender: &mut hyper::client::conn::http1::SendRequest<
+                http_body_util::Full<bytes::Bytes>,
+            >,
+            request: http::Request<http_body_util::Full<bytes::Bytes>>,
+            request_to: Duration,
+        ) -> Result<(http::StatusCode, Vec<u8>), ColdStoreError> {
+            use http_body_util::BodyExt;
+
+            let response = tokio::time::timeout(request_to, sender.send_request(request))
+                .await
+                .map_err(|_| timeout_error("request", request_to))?
+                .map_err(|e| io_error(format!("S3 request failed: {e}")))?;
+            let status = response.status();
+            let body = tokio::time::timeout(request_to, response.into_body().collect())
+                .await
+                .map_err(|_| timeout_error("response body", request_to))?
+                .map_err(|e| io_error(format!("reading the S3 response body failed: {e}")))?
+                .to_bytes()
+                .to_vec();
+            Ok((status, body))
+        }
+
+        /// Blocks the calling (sync append-actor) thread on `fut` via the owned current-thread runtime.
+        fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+            self.runtime.block_on(fut)
+        }
+    }
+
+    /// A non-2xx S3 status turned into a typed transport error (the body may carry an S3 XML error
+    /// document; we surface the STATUS, not a parse of it — no XML dependency).
+    fn status_error(op: &str, key: &str, status: http::StatusCode) -> ColdStoreError {
+        io_error(format!(
+            "S3 {op} of {key} returned HTTP {} ({})",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("unknown")
+        ))
+    }
+
+    impl ColdStore for S3ColdStore {
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<(), ColdStoreError> {
+            // A 2xx PUT = the object is DURABLE in S3 before Ok (S3 acks a PUT only once the object is
+            // durably stored + cross-AZ replicated) — the ColdStore durability contract the log relies
+            // on before deleting the local segment. Overwrites any existing object (idempotent by key).
+            let (status, body) = self.block_on(self.send("PUT", key, bytes.to_vec()))?;
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(status_error("PUT", key, status).with_body(&body))
+            }
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+            let (status, body) = self.block_on(self.send("GET", key, Vec::new()))?;
+            if status.is_success() {
+                // The caller re-verifies (segment header/footer/CRC) before trusting these bytes.
+                Ok(body)
+            } else if status == http::StatusCode::NOT_FOUND {
+                Err(ColdStoreError::NotFound {
+                    key: key.to_string(),
+                })
+            } else {
+                Err(status_error("GET", key, status))
+            }
+        }
+
+        fn delete(&self, key: &str) -> Result<(), ColdStoreError> {
+            let (status, _) = self.block_on(self.send("DELETE", key, Vec::new()))?;
+            // Idempotent: 2xx OR a 404 (already gone) is success. A real 403/401/5xx is surfaced, NOT
+            // masked as success — a permission/transport failure must not look like a completed reap.
+            if status.is_success() || status == http::StatusCode::NOT_FOUND {
+                Ok(())
+            } else {
+                Err(status_error("DELETE", key, status))
+            }
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, ColdStoreError> {
+            let (status, _) = self.block_on(self.send("HEAD", key, Vec::new()))?;
+            if status.is_success() {
+                Ok(true)
+            } else if status == http::StatusCode::NOT_FOUND {
+                Ok(false)
+            } else {
+                Err(status_error("HEAD", key, status))
+            }
+        }
+    }
+
+    impl ColdStoreError {
+        /// Appends a short, non-secret snippet of the S3 error body to an IO error, for diagnosis.
+        fn with_body(self, body: &[u8]) -> ColdStoreError {
+            match self {
+                ColdStoreError::Io(e) => {
+                    let snippet: String = String::from_utf8_lossy(body).chars().take(200).collect();
+                    ColdStoreError::Io(io::Error::new(
+                        e.kind(),
+                        format!("{e}; body: {}", snippet.trim()),
+                    ))
+                }
+                other => other,
+            }
+        }
+    }
+
+    /// Parses `(https, host, port)` from the config's endpoint (or the AWS default for `None`).
+    fn parse_endpoint(config: &S3ColdStoreConfig) -> Result<(bool, String, u16), ColdStoreError> {
+        match &config.endpoint {
+            None => Ok((true, format!("s3.{}.amazonaws.com", config.region), 443)),
+            Some(endpoint) => {
+                let (scheme, rest) = endpoint
+                    .split_once("://")
+                    .ok_or_else(|| io_error("the S3 endpoint must be scheme://host[:port]"))?;
+                let https = scheme.eq_ignore_ascii_case("https");
+                // Strip any path; keep host[:port].
+                let authority = rest.split('/').next().unwrap_or(rest);
+                let (host, port) = match authority.split_once(':') {
+                    Some((h, p)) => (
+                        h.to_string(),
+                        p.parse::<u16>()
+                            .map_err(|_| io_error("the S3 endpoint port is not a number"))?,
+                    ),
+                    None => (authority.to_string(), if https { 443 } else { 80 }),
+                };
+                if host.is_empty() {
+                    return Err(io_error("the S3 endpoint host is empty"));
+                }
+                Ok((https, host, port))
+            }
+        }
+    }
+
+    /// Builds the rustls 1.3-only, aws-lc-rs `ClientConfig` verifying the endpoint against `ca_pem`
+    /// (mirrors the client TLS builder; never `ring`, never insecure-skip-verify).
+    fn build_client_config(ca_pem: &[u8]) -> Result<Arc<rustls::ClientConfig>, ColdStoreError> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
+
+        let anchors = CertificateDer::pem_slice_iter(ca_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| io_error("the S3 ca_pem could not be parsed as PEM certificates"))?;
+        let mut roots = rustls::RootCertStore::empty();
+        let (added, _ignored) = roots.add_parsable_certificates(anchors);
+        if added == 0 {
+            return Err(io_error("the S3 ca_pem contained no usable trust anchor"));
+        }
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| io_error(format!("building the S3 TLS config failed: {e}")))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
+
+    /// A plaintext TCP or a rustls TLS stream, unified so hyper can drive either. Both variants are
+    /// `Unpin`, so the pin projection is a simple `get_mut` + `Pin::new` delegation.
+    enum Connection {
+        Plain(tokio::net::TcpStream),
+        Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+    }
+
+    impl tokio::io::AsyncRead for Connection {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            match self.get_mut() {
+                Connection::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+                Connection::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Connection {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            match self.get_mut() {
+                Connection::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+                Connection::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            }
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            match self.get_mut() {
+                Connection::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+                Connection::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            }
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            match self.get_mut() {
+                Connection::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+                Connection::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // AWS-published "deriving the signing key" example (`SigV4` docs): PROVES the four-step HMAC
+        // key-derivation chain byte-for-byte.
+        #[test]
+        fn signing_key_matches_aws_documented_vector() {
+            let key = signing_key(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "20150830",
+                "us-east-1",
+                "iam",
+            );
+            assert_eq!(
+                hex_lower(&key),
+                "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+            );
+        }
+
+        // AWS `SigV4` test suite `get-vanilla`: PROVES the full canonical-request -> string-to-sign ->
+        // signature pipeline byte-for-byte against AWS's published expected signature.
+        #[test]
+        fn get_vanilla_signature_matches_aws_test_suite() {
+            let headers = vec![
+                ("host".to_string(), "example.amazonaws.com".to_string()),
+                ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+            ];
+            let auth = SigningRequest {
+                method: "GET",
+                canonical_uri: "/",
+                canonical_query: "",
+                headers: &headers,
+                payload_sha256: EMPTY_SHA256,
+                amz_date: "20150830T123600Z",
+                date_stamp: "20150830",
+                region: "us-east-1",
+                service: "service",
+                access_key_id: "AKIDEXAMPLE",
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            }
+            .authorization();
+            assert_eq!(
+                auth,
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+                 SignedHeaders=host;x-amz-date, \
+                 Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+            );
+        }
+
+        // AWS S3 docs' "Transferring Payload in a Single Chunk" PUT example: PROVES the PUT-with-body
+        // path the client actually uses — method PUT, a NON-EMPTY payload hash (`x-amz-content-sha256`
+        // computed here from the real payload), a key with a percent-encoded special char
+        // (`/test%24file.text`), service `s3`, and the S3 example's `/`-in-secret credential — against
+        // AWS's published Signature byte-for-byte.
+        #[test]
+        fn put_object_signature_matches_aws_s3_single_chunk_example() {
+            // The exact payload from the AWS example; its SHA-256 is the `x-amz-content-sha256`.
+            let content_sha = sha256_hex(b"Welcome to Amazon S3.");
+            let headers = vec![
+                (
+                    "date".to_string(),
+                    "Fri, 24 May 2013 00:00:00 GMT".to_string(),
+                ),
+                (
+                    "host".to_string(),
+                    "examplebucket.s3.amazonaws.com".to_string(),
+                ),
+                ("x-amz-content-sha256".to_string(), content_sha.clone()),
+                ("x-amz-date".to_string(), "20130524T000000Z".to_string()),
+                (
+                    "x-amz-storage-class".to_string(),
+                    "REDUCED_REDUNDANCY".to_string(),
+                ),
+            ];
+            let auth = SigningRequest {
+                method: "PUT",
+                canonical_uri: "/test%24file.text",
+                canonical_query: "",
+                headers: &headers,
+                payload_sha256: &content_sha,
+                amz_date: "20130524T000000Z",
+                date_stamp: "20130524",
+                region: "us-east-1",
+                service: "s3",
+                access_key_id: "AKIAIOSFODNN7EXAMPLE",
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            }
+            .authorization();
+            assert_eq!(
+                auth,
+                "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+                 SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, \
+                 Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
+            );
+        }
+
+        #[test]
+        fn sha256_and_uri_encode_are_correct() {
+            assert_eq!(sha256_hex(b""), EMPTY_SHA256);
+            // Unreserved chars pass through; a space and a colon are percent-encoded; '/' is kept.
+            assert_eq!(uri_encode("/a b/seg-01.obj", false), "/a%20b/seg-01.obj");
+            assert_eq!(uri_encode("a/b", true), "a%2Fb");
+        }
+
+        #[test]
+        fn civil_from_days_matches_known_dates() {
+            assert_eq!(civil_from_days(0), (1970, 1, 1)); // Unix epoch
+            assert_eq!(civil_from_days(10_957), (2000, 1, 1)); // 30y + 7 leap days
+                                                               // The get-vanilla date: 20150830 is 16677 days after the epoch.
+            assert_eq!(civil_from_days(16_677), (2015, 8, 30));
+        }
     }
 }
 
