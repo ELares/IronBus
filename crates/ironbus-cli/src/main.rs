@@ -5079,6 +5079,22 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
     validate_durability(config)?;
     validate_storage(config)?;
     validate_ram_ceiling(config)?;
+    // At-rest encryption (#780 phase 3) is mutually exclusive with the maintenance passes that are not
+    // yet crypto-aware. Key-compaction rewrites sealed segments and would either lose the encryption or
+    // mis-place nonces, so the storage layer refuses it at runtime (`EncryptedMaintenanceUnsupported`).
+    // Refuse `--compact` + encryption at STARTUP for a clean error, consistent with the shared-WAL /
+    // memory-backend startup refusals, rather than letting a produce start returning ERR_STORAGE once a
+    // compaction pass first triggers. (Tiered cold-segment offload is not serve-configurable, so there
+    // is nothing to refuse for it here; its runtime guard remains the backstop.)
+    // `encryption_key_file` is only ever `Some` on an `encryption`-feature build, so this is a no-op on
+    // the default build.
+    if config.encryption_key_file.is_some() && config.compact {
+        return Err(CliError::Usage(
+            "`--compact` is not supported with at-rest encryption (`--encryption-key-file`): \
+             key-compaction rewrites sealed segments and is not yet crypto-aware. Disable one of them."
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -15339,33 +15355,67 @@ mod tests {
     /// the serve layer: it exercises `resolve_encryption` → `load_encryption_context` →
     /// `Engine::open_encrypted` → `StreamSet::open_with_at_rest` → `create_encrypted` → encrypting
     /// append, then the resume-reattach + the `EncryptedSegmentNoKey` guard on a no-key reopen.
+    /// Writes a 32-byte OWNER-ONLY at-rest key file at `path` (the phase-1 loader refuses a
+    /// group/world-readable file) and returns an encryption `ServeConfig` keyed off it.
     #[cfg(all(unix, feature = "encryption"))]
-    #[test]
-    fn serve_with_encryption_writes_encrypted_segments_and_a_no_key_reader_refuses() {
+    fn encryption_test_config(key_path: &std::path::Path) -> ServeConfig {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let base =
-            std::env::temp_dir().join(format!("ironbus-cli-enc-serve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        // A 32-byte OWNER-ONLY key file (the phase-1 loader refuses a group/world-readable file).
-        let key_path = base.join("at-rest.key");
-        std::fs::File::create(&key_path)
+        std::fs::File::create(key_path)
             .unwrap()
             .write_all(&[0x5Au8; 32])
             .unwrap();
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let data_dir = base.join("data");
-
-        let secret: &[u8] = b"the-confidential-encrypted-payload-CANARY-xyzzy-4242";
-        let enc_config = ServeConfig {
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        ServeConfig {
             encryption_key_file: Some(key_path.display().to_string()),
             encryption_key_id: Some(7),
             encryption_suite: None, // auto-detect the suite by CPU features
             ..test_serve_config(64, 1)
-        };
+        }
+    }
 
-        // 1) An encrypted broker produces an encrypted-on-disk segment.
+    /// RECURSIVELY walks every file under `dir` (descending into `pstreams/`, `prstreams/`, `streams/`,
+    /// `dlq/`, and all other subdirs) and asserts `needle` — a confidential plaintext canary — appears in
+    /// NONE of them. Returns the number of files scanned. This is what catches a leak in a substrate the
+    /// crypto seam does not reach (the #693/#553 partitioned/priority sub-logs the earlier non-recursive
+    /// scan missed).
+    #[cfg(all(unix, feature = "encryption"))]
+    fn assert_no_plaintext_under(dir: &std::path::Path, needle: &[u8]) -> usize {
+        let mut files = 0usize;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files += assert_no_plaintext_under(&path, needle);
+            } else {
+                files += 1;
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    !bytes.windows(needle.len()).any(|w| w == needle),
+                    "the plaintext canary leaked onto disk in {}",
+                    path.display()
+                );
+            }
+        }
+        files
+    }
+
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn serve_with_encryption_writes_encrypted_segments_and_a_no_key_reader_refuses() {
+        use ironbus_server::engine::EngineError;
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-enc-serve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let enc_config = encryption_test_config(&base.join("at-rest.key"));
+        let data_dir = base.join("data");
+
+        let secret: &[u8] = b"the-confidential-encrypted-payload-CANARY-xyzzy-4242";
+
+        // 1) An encrypted broker produces an encrypted-on-disk segment; and a partitioned (#693) /
+        //    priority-lane (#553) stream declare is REFUSED fail-closed under encryption (their
+        //    PartitionedStream sub-logs are not crypto-aware — a regression that dropped the guard would
+        //    let the declare succeed here, and a produce leak into pstreams//prstreams/).
         {
             let mut engine = open_disk_engine(&data_dir, &enc_config, &[], &[]).unwrap();
             engine
@@ -15377,24 +15427,32 @@ mod tests {
                     payload: secret,
                 })
                 .unwrap();
+            assert!(
+                matches!(
+                    engine.declare_partitioned_stream("orders", 4),
+                    Err(EngineError::EncryptedPartitionedStreamUnsupported)
+                ),
+                "a partitioned-stream declare must be refused under encryption"
+            );
+            assert!(
+                matches!(
+                    engine.declare_priority_stream("alerts", 3),
+                    Err(EngineError::EncryptedPartitionedStreamUnsupported)
+                ),
+                "a priority-lane-stream declare must be refused under encryption"
+            );
             drop(engine);
         }
 
-        // 2) The confidential PLAINTEXT payload NEVER appears on disk in any segment (it is ciphertext).
-        let mut segment_files = 0usize;
-        for entry in std::fs::read_dir(&data_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) == Some("log") {
-                segment_files += 1;
-                let bytes = std::fs::read(&path).unwrap();
-                assert!(
-                    !bytes.windows(secret.len()).any(|w| w == secret),
-                    "the plaintext payload leaked onto disk in {}",
-                    path.display()
-                );
-            }
-        }
-        assert!(segment_files >= 1, "at least one segment file was written");
+        // 2) The confidential PLAINTEXT payload NEVER appears on disk ANYWHERE under the data dir (a
+        //    RECURSIVE scan: the default stream is ciphertext, and no pstreams//prstreams/ subtree
+        //    leaked it — the refused declares created none).
+        let scanned = assert_no_plaintext_under(&data_dir, secret);
+        assert!(scanned >= 1, "at least one file was written + scanned");
+        assert!(
+            !data_dir.join("pstreams").exists() && !data_dir.join("prstreams").exists(),
+            "a refused partitioned/priority declare must materialize no pstreams//prstreams/ subtree"
+        );
 
         // 3) A DEFAULT (no-key) reader REFUSES the encrypted-on-disk log fail-closed (the
         //    always-compiled EncryptedSegmentNoKey guard) — it never silently starts plaintext.
@@ -15425,6 +15483,145 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #780 phase 3 (the reviewer-found LEAK, fail-closed): declaring a partitioned (#693) OR a
+    /// priority-lane (#553) stream on an encrypted broker is REFUSED with
+    /// `EncryptedPartitionedStreamUnsupported`, and NO confidential body lands anywhere under the data
+    /// dir (a recursive scan). Their `PartitionedStream` sub-logs are not threaded through the at-rest
+    /// crypto seam, so a plaintext write would be a real at-rest leak; this pins the guard.
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn partitioned_and_priority_stream_declares_are_refused_under_encryption_with_no_leak() {
+        use ironbus_server::engine::EngineError;
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-enc-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let enc_config = encryption_test_config(&base.join("at-rest.key"));
+        let data_dir = base.join("data");
+        // A distinct canary we would produce to a partition IF the declare wrongly succeeded.
+        let part_secret: &[u8] = b"PARTITIONED-CONFIDENTIAL-CANARY-abc-98765";
+
+        {
+            let mut engine = open_disk_engine(&data_dir, &enc_config, &[], &[]).unwrap();
+            // Both partitioned modes must refuse at declare, before any pstreams//prstreams/ subtree.
+            match engine.declare_partitioned_stream("orders", 8) {
+                Err(EngineError::EncryptedPartitionedStreamUnsupported) => {}
+                Ok(_) => {
+                    // A guard regression: prove the leak so the recursive scan below FAILS loudly.
+                    let _ = engine.produce_in_stream(
+                        "orders",
+                        &Append {
+                            timestamp_ms: 1,
+                            flags: RecordFlags::EMPTY,
+                            key: b"k",
+                            headers: b"",
+                            payload: part_secret,
+                        },
+                    );
+                    panic!(
+                        "the partitioned declare must be refused under encryption, it succeeded"
+                    );
+                }
+                Err(other) => {
+                    panic!("expected EncryptedPartitionedStreamUnsupported, got {other:?}")
+                }
+            }
+            match engine.declare_priority_stream("alerts", 4) {
+                Err(EngineError::EncryptedPartitionedStreamUnsupported) => {}
+                other => panic!(
+                    "the priority declare must be refused with EncryptedPartitionedStreamUnsupported, \
+                     got {other:?}"
+                ),
+            }
+            drop(engine);
+        }
+
+        // No partitioned/priority subtree was created, and neither canary appears in the clear anywhere.
+        assert!(
+            !data_dir.join("pstreams").exists() && !data_dir.join("prstreams").exists(),
+            "a refused declare must materialize no pstreams//prstreams/ subtree"
+        );
+        assert_no_plaintext_under(&data_dir, part_secret);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #780 phase 3: an encrypted broker that INHERITS a pre-existing plaintext `pstreams/` subtree on
+    /// disk (a broker that ran plaintext with partitioned streams, then had encryption turned on) must
+    /// FAIL CLOSED at open rather than silently reopen + serve those crypto-unaware sub-logs plaintext.
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn an_encrypted_open_of_a_preexisting_partitioned_subtree_fails_closed() {
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-enc-inherit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let data_dir = base.join("data");
+        let enc_config = encryption_test_config(&base.join("at-rest.key"));
+
+        // 1) An ENCRYPTED broker lays down an encrypted ROOT log (and, correctly, NO pstreams/ — the
+        //    declare path refuses partitioned streams under encryption). A clean encrypted deployment.
+        {
+            let mut engine = open_disk_engine(&data_dir, &enc_config, &[], &[]).unwrap();
+            engine
+                .produce(&Append {
+                    timestamp_ms: 1,
+                    flags: RecordFlags::EMPTY,
+                    key: b"k",
+                    headers: b"",
+                    payload: b"encrypted-default-body",
+                })
+                .unwrap();
+            drop(engine);
+        }
+        assert!(
+            !data_dir.join("pstreams").exists(),
+            "a clean encrypted broker declares no partitioned streams, so no pstreams/ exists"
+        );
+
+        // 2) Simulate an INHERITED / hand-crafted crypto-unaware `pstreams/` subtree appearing under the
+        //    encrypted data dir (a copied-in subtree, or a future materialization bug). The open-time
+        //    guard is the defense-in-depth backstop the declare-time guard cannot cover: a broker that
+        //    reopens an encrypted root must NOT silently reopen + serve a plaintext partition sub-log.
+        std::fs::create_dir_all(data_dir.join("pstreams").join("6f7264657273")).unwrap();
+
+        // 3) Reopening WITH the key must FAIL CLOSED at open (the encrypted root would open fine; the
+        //    inherited pstreams/ subtree is what must trip the refusal).
+        let opened = open_disk_engine(&data_dir, &enc_config, &[], &[]);
+        match opened {
+            Err(CliError::Internal(msg)) => assert!(
+                msg.to_lowercase().contains("partitioned")
+                    || msg.to_lowercase().contains("priority"),
+                "the open must refuse the inherited partitioned subtree, got: {msg}"
+            ),
+            Ok(_) => {
+                panic!("an encrypted open of a pre-existing pstreams/ subtree must fail closed")
+            }
+            Err(other) => panic!("expected a partitioned-stream refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #780 phase 3: `--compact` (key-compaction, not yet crypto-aware) alongside at-rest encryption is
+    /// refused at STARTUP with a clean usage error (consistent with the shared-WAL / memory-backend
+    /// startup refusals), rather than only fail-closing at runtime once a compaction pass first triggers.
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn compact_plus_encryption_is_refused_at_startup() {
+        let cfg = ServeConfig {
+            encryption_key_file: Some("/some/at-rest.key".to_string()),
+            encryption_key_id: Some(7),
+            encryption_suite: None,
+            compact: true,
+            ..test_serve_config(64, 1)
+        };
+        let err = validate_serve_config(&cfg).unwrap_err();
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("compact") && msg.contains("encryption"),
+            "the startup refusal must name both --compact and encryption, got: {msg}"
+        );
     }
 
     // --- offline mutating admin verbs (#299) ---

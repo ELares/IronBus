@@ -915,6 +915,13 @@ pub enum EngineError {
     /// messaging under encryption is a phase-4 item. REFUSED fail-closed rather than buffering the
     /// confidential prepared payload in PLAINTEXT.
     EncryptedTxnUnsupported,
+    /// A partitioned stream (#693, `P > 1`) or a priority-lane stream (#553) was declared/produced, or
+    /// its `pstreams/`/`prstreams/` subtree was found on disk at open, while at-rest encryption is on
+    /// (#780 phase 3). Both are backed by the separate `PartitionedStream` storage primitive (P sub-logs
+    /// under `pstreams/`/`prstreams/`) which is NOT threaded through the at-rest crypto seam, so its
+    /// segments would be written PLAINTEXT. REFUSED fail-closed rather than leak a confidential record
+    /// body — per-partition `segment_id`/nonce continuity under encryption is a phase-4 crypto feature.
+    EncryptedPartitionedStreamUnsupported,
 }
 
 impl core::fmt::Display for EngineError {
@@ -1033,6 +1040,13 @@ impl core::fmt::Display for EngineError {
                 "transactional messaging is not supported while at-rest encryption is on (#780 phase \
                  3): the half-message store is not yet threaded through the at-rest crypto seam, so a \
                  prepare is refused fail-closed rather than buffered in plaintext"
+            ),
+            EngineError::EncryptedPartitionedStreamUnsupported => write!(
+                f,
+                "partitioned streams (#693) and priority-lane streams (#553) are not supported while \
+                 at-rest encryption is on (#780 phase 3): their PartitionedStream sub-logs are not yet \
+                 threaded through the at-rest crypto seam, so a declare/produce is refused fail-closed \
+                 rather than writing a confidential body in plaintext"
             ),
         }
     }
@@ -4598,6 +4612,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // partition's own subdir — the per-partition twin of `recover_named_stream_groups` above. A
         // deployment that never declared `P > 1` has no `pstreams/` subtree, so this is a no-op and the
         // on-disk image is byte-for-byte unchanged.
+        // At-rest encryption FAIL-CLOSED at open (#780 phase 3): a broker that INHERITED plaintext
+        // partitioned (`pstreams/`) or priority-lane (`prstreams/`) subtrees and is now started with a
+        // key must NOT silently reopen + serve them plaintext. Refuse the open rather than recover a
+        // crypto-unaware subtree. A fresh encrypted deployment has NEITHER subtree (the declare paths
+        // refuse creating them under encryption), so this is a no-op there. The root `log` carries the
+        // threaded at-rest context, so `is_at_rest_encrypted()` reflects the configured key (`at_rest`
+        // itself was already moved into the per-stream open above).
+        if log.is_at_rest_encrypted() {
+            let root_fs = log.filesystem();
+            if root_fs.subdir_exists(PARTITIONED_STREAMS_SUBDIR)?
+                || root_fs.subdir_exists(PRIORITY_STREAMS_SUBDIR)?
+            {
+                return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+            }
+        }
         let (mut partitioned, mut partition_consumers, mut partition_recoveries) =
             recover_partitioned_streams(&log, config.lease, opened_at)?;
         // Recover each PRIORITY-LANE stream (#553) from its SEPARATE `prstreams/<hex(name)>/` subtree,
@@ -6847,6 +6876,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if partition_count <= 1 {
             return self.declare_stream(stream);
         }
+        // At-rest encryption FAIL-CLOSED (#780 phase 3): a partitioned stream (P > 1) is backed by the
+        // separate `PartitionedStream` primitive (P sub-logs under `pstreams/`) that is NOT threaded
+        // through the at-rest crypto seam, so its segments would be PLAINTEXT. Refuse the declare BEFORE
+        // any open/create rather than leak a confidential body. (P <= 1 above routes to the crypto-aware
+        // named-stream path and is unaffected.) Per-partition nonce continuity is a phase-4 feature.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // SHARED-WAL mode (#597): partitioned streams are per-stream-log storage (P sub-logs under
         // pstreams/) and do not compose with the one shared commit log — fail-closed typed reject,
         // matching the open-time pstreams/ layout refusal, never a half-supported hybrid.
@@ -6947,6 +6984,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         id: &StreamId,
         message: &Append<'_>,
     ) -> Result<(PartitionIndex, Offset), EngineError> {
+        // At-rest encryption FAIL-CLOSED defense-in-depth (#780 phase 3): the declare path already
+        // refuses a partitioned stream under encryption, so a resident `PartitionedStream` here means a
+        // subtree that predates encryption (open fails closed on that too); refuse the append regardless,
+        // so a confidential body can NEVER be written to a crypto-unaware partition sub-log in plaintext.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // Route + append to the key's partition (short mutable borrow of the storage map).
         let (idx, offset) = {
             let ps = self
@@ -7532,6 +7576,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 name: stream.to_string(),
             });
         }
+        // At-rest encryption FAIL-CLOSED (#780 phase 3): a priority-lane stream is backed by the same
+        // crypto-unaware `PartitionedStream` primitive (lane sub-logs under `prstreams/`), so its
+        // segments would be PLAINTEXT. Refuse the declare BEFORE any open/create — the priority twin of
+        // the partitioned-stream guard.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // SHARED-WAL mode (#597): priority streams are per-stream-log storage (P lane sub-logs under
         // prstreams/) and do not compose with the one shared commit log — fail-closed typed reject,
         // matching the open-time prstreams/ layout refusal.
@@ -7619,6 +7670,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         message: &Append<'_>,
         priority: u8,
     ) -> Result<(PartitionIndex, Offset), EngineError> {
+        // At-rest encryption FAIL-CLOSED defense-in-depth (#780 phase 3): the priority twin of the guard
+        // in `produce_partitioned` — never append a confidential body to a crypto-unaware lane sub-log.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // Route + append to the priority's lane (short mutable borrow of the storage map). The lane is
         // `min(priority, P-1)`: priority mode requires `P >= 2`, so `P - 1 >= 1` never underflows, and a
         // priority >= P saturates to the top (highest) lane.

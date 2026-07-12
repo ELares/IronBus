@@ -65,13 +65,33 @@ opens the engine via `Engine::open_encrypted`, which threads the same opaque con
 the running broker's default and named-stream segments are ciphertext on disk, resume re-attaches
 the crypto, and the fail-closed guards engage.
 
-Operational limits in this phase (each fails CLOSED, never leaks):
+### What at-rest encryption currently constrains (each fails CLOSED, never leaks)
 
-- **Disk backend only.** `--storage memory` + encryption is refused (no on-disk segments to encrypt).
-- **Per-stream-logs mode only.** `--storage-mode shared-wal` + encryption is refused at open.
-- **No dead-lettering / no transactions** while encryption is on (both refused at their seams).
-- **Single node only.** A cluster/federation path that would ship ciphertext off-node or replicate
-  a leader frame verbatim is refused by the always-compiled zero-copy / replication guards.
+Phase 3 encrypts the **default stream and named single-log streams** (the crypto-aware
+`Log`/`StreamSet` seam). Every OTHER substrate is not yet threaded through the at-rest crypto seam,
+so with a key configured each is **refused fail-closed** — never written, opened, or served in
+plaintext — and is a tracked follow-up. Operators must know encryption currently constrains these:
+
+| Substrate / operation | Behavior under encryption | Where it fails closed |
+|---|---|---|
+| Default + named single-log streams | **ENCRYPTED** (supported) | the crypto-aware `Log`/`StreamSet` seam |
+| Partitioned streams (#693, `pstreams/`) | refused | `declare`/`produce` + open (`EncryptedPartitionedStreamUnsupported`) |
+| Priority-lane streams (#553, `prstreams/`) | refused | `declare`/`produce` + open (`EncryptedPartitionedStreamUnsupported`) |
+| Shared-WAL storage mode | refused | `Engine::open` (`EncryptedSharedWalUnsupported`) |
+| Dead-letter queue (DLQ) | refused | the DLQ sink seam (`EncryptedDeadLetterUnsupported`) |
+| Transactions (half-message store) | refused | the txn-store seam (`EncryptedTxnUnsupported`) |
+| In-memory backend (`--storage memory`) | refused at startup | no on-disk segments to encrypt |
+| Key-compaction (`--compact`) | refused at startup | `validate_serve_config` (runtime guard `EncryptedMaintenanceUnsupported` is the backstop) |
+| Tiered cold-segment offload | refused | runtime `EncryptedMaintenanceUnsupported` (not serve-configurable) |
+| Zero-copy / off-actor consume plane | refused (reads route through the actor decrypt path) | `Log::read_plane` (`EncryptedZeroCopyUnsupported`) |
+| Verbatim replication (clustered/federation) | refused | `Log::append_frame_verbatim` (`EncryptedReplicationUnsupported`) |
+
+Consequences: at-rest encryption is **single-node, per-stream-logs, disk-backed only**, and a broker
+using partitioned/priority streams, the DLQ, transactions, shared-WAL, compaction, tiered offload, or
+clustering must NOT enable it this phase (each of those is a separate crypto follow-up). A partitioned
+or priority stream `declare` returns `ERR_STORAGE` with an explanatory message; a broker that inherits
+a `pstreams/`/`prstreams/` subtree and is then keyed refuses to open rather than serve it plaintext.
+
 - **Enable on a FRESH data directory.** Encryption is new-segments-only; opening a plaintext log
   with a key is refused (`PlaintextSegmentWithKey`) and opening an encrypted log without the key is
   refused (`EncryptedSegmentNoKey`) — a no-key reader never silently starts plaintext.

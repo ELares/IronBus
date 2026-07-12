@@ -280,7 +280,8 @@ impl ErrorCode {
             #[allow(clippy::match_same_arms)]
             EngineError::EncryptedSharedWalUnsupported
             | EngineError::EncryptedDeadLetterUnsupported
-            | EngineError::EncryptedTxnUnsupported => Self::ERR_STORAGE,
+            | EngineError::EncryptedTxnUnsupported
+            | EngineError::EncryptedPartitionedStreamUnsupported => Self::ERR_STORAGE,
         }
     }
 }
