@@ -4409,6 +4409,139 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok((trimmed, tail_from))
     }
 
+    /// The fd (Linux `sendfile(2)`) sibling of [`Log::read_range_raw`] (#1034 / #658): instead of the
+    /// run's bytes in userspace, it names the exact on-disk byte range of the SAME contiguous run and
+    /// hands back a [`FdRun`] holding the opened segment reader (so the splice fd outlives the syscall)
+    /// plus that range. The SEEK / gap-trim / `max_records` / `max_bytes` / flushed-frontier logic is
+    /// IDENTICAL to `read_range_raw`, so the named range `[file_offset, file_offset + len)` is
+    /// byte-for-byte the [`RawByteRun::bytes`] the copy path returns for the same window (the
+    /// differential test pins this) — the wire body is unchanged and the client is oblivious.
+    ///
+    /// The boundary walk touches only frame HEADERS: no record body is ever read into userspace, which
+    /// is the whole point of the zero-copy path (the kernel splices the bodies straight from the page
+    /// cache to the socket).
+    ///
+    /// Returns `(Some(fd_run), tail_from)` when a spliceable run was found, or `(None, tail_from)` when
+    /// there is nothing to splice here and the caller must serve the window through the COPY path
+    /// ([`Log::read_range_raw`] / [`Log::read_range`]): the same fail-closed reroutes `read_range_raw`
+    /// uses — at-rest encryption, a compacted (v2 sparse) or offloaded (remote) slot, a not-yet-indexed
+    /// active tail — PLUS the no-splice-fd backends (an `O_DIRECT` segment), all of which take the copy
+    /// path for free. `(None, None)` means nothing remains to serve. `tail_from` matches
+    /// `read_range_raw`'s exactly, so a caller can chain the two paths interchangeably.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::OffsetOutOfRange`] if `start` is older than the oldest retained record,
+    /// or an IO error reading a segment header.
+    #[cfg(unix)]
+    pub fn read_range_fd_range(
+        &self,
+        start: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<FdRangeRead<F::File>, StorageError> {
+        let start_v = start.get();
+        let flushed = self.flushed_offset.get();
+        if max_records == 0 || start_v >= flushed {
+            return Ok((None, None));
+        }
+        // At-rest encryption FAIL-CLOSED: the on-disk bytes are CIPHERTEXT, never spliceable to a
+        // plaintext consumer. Reroute the whole window to the materialize path (which decrypts on
+        // read), exactly as `read_range_raw` does.
+        if self.at_rest.is_encrypted() {
+            return Ok((None, Some(start)));
+        }
+        let oldest = self
+            .segments
+            .first()
+            .map_or(0, SegmentSlot::covered_base_offset);
+        if start_v < oldest {
+            return Err(StorageError::OffsetOutOfRange {
+                requested: start_v,
+                oldest,
+            });
+        }
+        // #643 tiered storage: restore an offloaded slot to local disk before opening it.
+        let slot_id = self.segments[self.segment_index_for(start_v)].id;
+        if self.is_segment_remote(slot_id) {
+            self.ensure_segment_local(slot_id)?;
+        }
+        let slot = &self.segments[self.segment_index_for(start_v)];
+        // A COMPACTED (sparse, v2) slot's byte run is non-contiguous: serve it via the materialize
+        // path from this segment's covered base (clamped to start), exactly as `read_range_raw`.
+        if slot.compacted_covered.is_some() {
+            let tail = start_v.max(slot.covered_base_offset());
+            return Ok((None, Some(Offset::new(tail))));
+        }
+        let seg_start = start_v.max(slot.base_offset);
+        let Some((anchor_offset, byte_pos, read_end)) =
+            self.seek_in_segment(slot, seg_start, max_records)?
+        else {
+            // The dense index does not cover `seg_start` (a not-yet-indexed active tail): copy path.
+            return Ok((None, Some(start)));
+        };
+        // Identical gap / want / byte-cap setup to `read_range_raw` (see its comments): read
+        // `gap + max_records` frames so the wanted count survives the leading-gap trim, and bind the
+        // byte cap to the anchor read only when there is no gap.
+        let gap = usize::try_from(seg_start.saturating_sub(anchor_offset)).unwrap_or(0);
+        let below_flushed =
+            usize::try_from(flushed.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
+        let want = max_records.saturating_add(gap).min(below_flushed);
+        let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+        let raw_max_bytes = if gap == 0 { max_bytes } else { None };
+        // The anchor run over this single segment, header-only. `None` = no splice fd for this segment
+        // (an `O_DIRECT` sealed segment): the caller serves the whole window through the copy path.
+        let Some(anchor) = reader.raw_fd_range(
+            byte_pos,
+            Offset::new(anchor_offset),
+            read_end,
+            want,
+            raw_max_bytes,
+        )?
+        else {
+            return Ok((None, Some(start)));
+        };
+        // Copy the anchor run's plain byte plan out before the borrowed `fd` (which borrows `reader`)
+        // has to be dropped so `reader` can move into `FdRun`. `RawFdRun` is `Copy`, so its last field
+        // read below ends the borrow (NLL) — no explicit `drop` (which clippy would reject on a Copy).
+        let anchor_start = anchor.file_offset;
+        let anchor_len = anchor.len;
+        let anchor_first = anchor.first_offset.get();
+        // Trim the leading `gap` frames and re-bound to `max_records` / `max_bytes` — the fd twin of
+        // `trim_and_bound_raw_run`, header-only, producing byte-identical boundaries.
+        let (file_offset, len, first_offset, record_count, next) = reader.trim_fd_run(
+            anchor_start,
+            anchor_len,
+            anchor_first,
+            seg_start,
+            max_records,
+            max_bytes,
+        )?;
+        // Resume reporting: byte-for-byte the same computation `read_range_raw` performs.
+        let tail_from = if next < flushed && record_count >= max_records as u64 {
+            None
+        } else if next < flushed {
+            Some(Offset::new(next))
+        } else {
+            None
+        };
+        if record_count == 0 {
+            // Nothing survived the trim as a spliceable run (mirrors an empty `read_range_raw` run):
+            // hand back only the resume point so the caller serves it via the copy path.
+            return Ok((None, tail_from));
+        }
+        Ok((
+            Some(FdRun {
+                reader,
+                file_offset,
+                len,
+                first_offset: Offset::new(first_offset),
+                record_count,
+                next_offset: Offset::new(next),
+            }),
+            tail_from,
+        ))
+    }
+
     // -----------------------------------------------------------------------------------------
     // Tiered storage: offload cold sealed segments to an object store (#643, V2-M10, phase 1).
     // All of these run on the single append actor (the `&mut Log` owner), so they are serialized
@@ -6108,6 +6241,101 @@ impl<F: Filesystem + Clone, C: Clock> Log<F, C> {
         );
         *self.read_plane.borrow_mut() = Some(plane.clone());
         Ok(plane)
+    }
+}
+
+/// The result of [`Log::read_range_fd_range`]: `Some(fd_run)` to splice plus the resume offset, or
+/// `None` plus the resume offset when the window must be served through the copy path.
+#[cfg(unix)]
+pub type FdRangeRead<F> = (Option<FdRun<F>>, Option<Offset>);
+
+/// The owned result of [`Log::read_range_fd_range`]: the opened [`SegmentReader`] whose descriptor the
+/// `sendfile(2)` splice reads — held here so the fd outlives the syscall — plus the bounded run's
+/// on-disk byte range and offsets. Keep this alive across the whole splice; the [`FdRun::run`] and
+/// [`FdRun::read_bytes`] accessors borrow it. Unix-only (a `BorrowedFd` is unix-only; the disk backend
+/// is a v1 non-goal off unix).
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct FdRun<F: RandomAccessFile> {
+    reader: SegmentReader<F>,
+    file_offset: u64,
+    len: usize,
+    first_offset: Offset,
+    record_count: u64,
+    next_offset: Offset,
+}
+
+#[cfg(unix)]
+impl<F: RandomAccessFile> FdRun<F> {
+    /// The absolute byte offset in the segment file where the run's first frame begins.
+    #[must_use]
+    pub fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
+
+    /// The run's total on-disk byte length: exactly `record_count` whole frames, verbatim.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the run carries no bytes. A `read_range_fd_range` `FdRun` is never empty (an empty run
+    /// is reported as `None`), but the accessor exists for completeness and clippy's `len`/`is_empty`
+    /// pairing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The log offset of the FIRST frame in the range.
+    #[must_use]
+    pub fn first_offset(&self) -> Offset {
+        self.first_offset
+    }
+
+    /// How many complete frames the range carries.
+    #[must_use]
+    pub fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
+    /// The next offset AFTER the run: where a follow-on read resumes.
+    #[must_use]
+    pub fn next_offset(&self) -> Offset {
+        self.next_offset
+    }
+
+    /// The borrowed splice descriptor plus this run's byte range as a [`RawFdRun`], the value the
+    /// `sendfile(2)` writer consumes. Borrows `self`, so the caller must hold the `FdRun` across the
+    /// whole splice (the fd must stay open while the kernel reads it).
+    ///
+    /// # Panics
+    /// Never in practice: an `FdRun` is only constructed after `raw_fd_range` returned a splice fd for
+    /// its (immutable) reader, so the reader still exposes one. The `expect` documents that invariant.
+    #[must_use]
+    pub fn run(&self) -> crate::segment::RawFdRun<'_> {
+        crate::segment::RawFdRun {
+            // Guaranteed `Some`: an `FdRun` is only built after `raw_fd_range` returned a splice fd for
+            // this reader, and the reader is immutable, so the fd is still present.
+            fd: self
+                .reader
+                .splice_fd()
+                .expect("an FdRun is only built when the reader has a splice fd"),
+            file_offset: self.file_offset,
+            len: self.len,
+            first_offset: self.first_offset,
+            record_count: self.record_count,
+            next_offset: self.next_offset,
+        }
+    }
+
+    /// Materializes this run's bytes into an owned [`Bytes`] via a userspace copy — the byte-identity
+    /// oracle and the copy fallback, NEVER the zero-copy hot path (which splices the fd instead).
+    ///
+    /// # Errors
+    /// Returns an IO error from the positioned read.
+    pub fn read_bytes(&self) -> Result<Bytes, StorageError> {
+        self.reader.read_fd_run_bytes(self.file_offset, self.len)
     }
 }
 
@@ -8542,6 +8770,38 @@ mod tests {
         log
     }
 
+    /// The disk-backed twin of [`rolled_log_unsynced_tail`]: same shape (a synced multi-segment prefix
+    /// plus a 3-record unsynced active tail) but over a REAL [`StdFs`] so the sealed segments are
+    /// buffered `StdFile`s with an OS descriptor — the only backend the fd (`sendfile`) path serves.
+    /// The `TempDir` is returned so the caller keeps the data directory alive for the log's lifetime.
+    #[cfg(unix)]
+    fn rolled_disk_log_unsynced_tail(
+        n: u64,
+    ) -> (tempfile::TempDir, Log<crate::fs::StdFs, ManualClock>) {
+        use crate::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(
+            StdFs::new(dir.path().to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .unwrap();
+        for i in 0..n {
+            log.append(&rec(&[u8::try_from(i % 256).unwrap(); 16]))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        for i in n..n + 3 {
+            log.append(&rec(&[u8::try_from(i % 256).unwrap(); 16]))
+                .unwrap();
+        }
+        assert!(
+            log.active_segment_id() >= 2,
+            "should have rolled several times"
+        );
+        (dir, log)
+    }
+
     #[test]
     fn read_range_equals_n_single_record_reads_over_every_window() {
         // The core differential: a single-pass `read_range(start, max, None)` must return the EXACT
@@ -8673,6 +8933,125 @@ mod tests {
             );
         };
 
+        differential(&log);
+        log.clear_segment_indexes();
+        differential(&log);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_range_fd_range_byte_range_is_identical_to_read_range_raw() {
+        // #1034 / #658 HEADLINE GATE: the fd (`sendfile`) run for a window names the EXACT same bytes
+        // the copy-path raw read returns — proven over a REAL on-disk (spliceable) segment. For every
+        // window and every record/byte cap, `read_range_fd_range`'s `[file_offset, file_offset + len)`
+        // byte range EQUALS `read_range_raw`'s `bytes` byte-for-byte, with the same first_offset /
+        // record_count / next_offset / tail_from. Those bytes then decode (each frame CRC-validated) to
+        // the SAME records the materialize path returns, so the body a later DeliverBatch splices is
+        // identical to today's — and the header-only walk produced the range without ever reading a body.
+        let n: u64 = 25;
+        let (_dir, log) = rolled_disk_log_unsynced_tail(n);
+        let flushed = log.flushed_offset().get();
+        assert!(log.active_segment_id() >= 2, "must span several segments");
+
+        let differential = |log: &Log<crate::fs::StdFs, ManualClock>| {
+            for start in 0..flushed {
+                for max in [1usize, 2, 3, 7, 1000] {
+                    for cap in [None, Some(1usize), Some(64), Some(4096)] {
+                        let (raw, raw_tail) =
+                            log.read_range_raw(Offset::new(start), max, cap).unwrap();
+                        let (fd, fd_tail) = log
+                            .read_range_fd_range(Offset::new(start), max, cap)
+                            .unwrap();
+                        let ctx = format!("start={start} max={max} cap={cap:?}");
+                        // The resume point matches, so a caller can chain fd and copy paths freely.
+                        assert_eq!(fd_tail, raw_tail, "tail_from matches at {ctx}");
+                        match fd {
+                            Some(run) => {
+                                // The named byte range EQUALS the copy path's bytes, byte for byte.
+                                let fd_bytes = run.read_bytes().unwrap();
+                                assert_eq!(
+                                    &fd_bytes[..],
+                                    &raw.bytes[..],
+                                    "fd byte range == raw bytes at {ctx}"
+                                );
+                                assert_eq!(run.len(), raw.bytes.len(), "len matches at {ctx}");
+                                assert_eq!(
+                                    run.first_offset(),
+                                    raw.first_offset,
+                                    "first_offset at {ctx}"
+                                );
+                                assert_eq!(
+                                    run.record_count(),
+                                    raw.record_count,
+                                    "record_count at {ctx}"
+                                );
+                                assert_eq!(
+                                    run.next_offset(),
+                                    raw.next_offset,
+                                    "next_offset at {ctx}"
+                                );
+                                assert!(
+                                    run.record_count() >= 1,
+                                    "a Some run is non-empty at {ctx}"
+                                );
+                                // The `RawFdRun` splice view names the same range and a live fd.
+                                let view = run.run();
+                                assert_eq!(
+                                    view.file_offset,
+                                    run.file_offset(),
+                                    "view offset {ctx}"
+                                );
+                                assert_eq!(view.len, run.len(), "view len at {ctx}");
+                                assert_eq!(view.record_count, run.record_count());
+                                // The fd bytes decode (each frame CRC-checked) to the SAME records the
+                                // materialize path returns — the spliced body is valid and identical.
+                                let synthetic = RawByteRun {
+                                    bytes: fd_bytes,
+                                    first_offset: run.first_offset(),
+                                    record_count: run.record_count(),
+                                    next_offset: run.next_offset(),
+                                };
+                                let decoded = decode_raw_run(&synthetic);
+                                let materialized =
+                                    log.read_range(Offset::new(start), max, cap).unwrap();
+                                // A raw/fd run is bounded to ONE segment, so it is a PREFIX of what the
+                                // (possibly segment-crossing) materialize path returns — never more.
+                                assert!(
+                                    decoded.len() <= materialized.len(),
+                                    "fd run is a prefix of materialize at {ctx}"
+                                );
+                                for ((view, off), owned) in decoded.iter().zip(materialized.iter())
+                                {
+                                    assert_eq!(*off, owned.offset.get(), "offset at {ctx}");
+                                    assert_eq!(
+                                        view.payload,
+                                        &owned.payload[..],
+                                        "payload at {ctx}"
+                                    );
+                                }
+                                if let Some((_, off)) = decoded.first() {
+                                    assert_eq!(
+                                        *off, start,
+                                        "fd run starts at the requested offset {ctx}"
+                                    );
+                                }
+                            }
+                            None => {
+                                // No spliceable run here: the copy-path read must also be empty, so the
+                                // caller loses nothing by taking the copy path from `tail_from`.
+                                assert_eq!(
+                                    raw.record_count, 0,
+                                    "fd fallback (None) implies an empty raw run at {ctx}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // With the append-seeded / lazily-built indexes, then after dropping them so the freshly
+        // REBUILT seek path is proven byte-identical too.
         differential(&log);
         log.clear_segment_indexes();
         differential(&log);
