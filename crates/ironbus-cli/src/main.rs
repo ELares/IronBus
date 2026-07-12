@@ -2536,6 +2536,11 @@ struct ServeFlags {
     /// default. Honored only when the broker is built with the non-default `otlp` feature; on the
     /// default build, setting it logs a clear "built without otlp" diagnostic and export stays off.
     enable_otlp_export: bool,
+    /// The Linux `sendfile(2)` zero-copy Tier-S delivery KILL-SWITCH (#1034 / #658): the
+    /// `--no-zero-copy-sendfile` bare flag. `true` only if it appeared; without it the zero-copy path is
+    /// AUTO-ON where sound (a plaintext, disk-backed, unencrypted window on a Linux build). Setting it
+    /// forces the userspace copy path on every connection, with no behavioral or wire change.
+    disable_zero_copy_sendfile: bool,
     /// The OTLP collector endpoint (#352): `--otlp-endpoint <url>`, e.g. `http://127.0.0.1:4317`
     /// (plaintext gRPC). `None` falls back to the default endpoint when export is on. Read only when
     /// export is on AND the `otlp` feature is built in.
@@ -2952,6 +2957,12 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             // explicit EPHEMERAL data-loss consent that gates `--storage memory` (#443).
             "--ephemeral-loss-ack" => {
                 f.ephemeral_loss_ack = true;
+                i += 1;
+            }
+            // A bare boolean flag (advance ONE token): the zero-copy `sendfile(2)` KILL-SWITCH (#1034).
+            // Its presence forces the userspace copy path; absence keeps the AUTO-ON default.
+            "--no-zero-copy-sendfile" => {
+                f.disable_zero_copy_sendfile = true;
                 i += 1;
             }
             "--key-shared-group" => {
@@ -3748,6 +3759,14 @@ fn parse_serve_flags_with_env_and_reader(
                 f.consume_longpoll_ms,
                 env,
                 DEFAULT_CONSUME_LONGPOLL_MS,
+            )?,
+            // Zero-copy `sendfile(2)` delivery (#1034 / #658) is AUTO-ON by default; the
+            // `--no-zero-copy-sendfile` kill-switch (flag > env) flips it off. The resolve is on the
+            // NEGATED flag, so the resolved value is `true` unless the operator opted out.
+            zero_copy_sendfile: !resolve_bool(
+                "--no-zero-copy-sendfile",
+                f.disable_zero_copy_sendfile,
+                env,
             )?,
             // V2-M4 routing richness (#549/#551), the #710 serve surface. Each defaults to its
             // disabling value (no TTL, no exchange, expired-routing off), so a zero-config broker
@@ -5636,6 +5655,13 @@ struct ServeConfig {
     /// `Flow`/`Fetch` block up to this budget on the broker's commit-notify seam and re-poll the
     /// instant a record commits. Threaded into [`EngineConfig::consume_longpoll_ms`]. Server-only.
     consume_longpoll_ms: u64,
+    /// Whether Linux `sendfile(2)` zero-copy Tier-S delivery (#1034 / #658) is ENABLED (default `true` =
+    /// AUTO-ON). `--no-zero-copy-sendfile` flips it `false` (the operator kill-switch that forces the
+    /// userspace copy path). Installed on the base engine handle via
+    /// [`ironbus_server::actor::EngineHandle::with_zero_copy_sendfile`]. Server-only — read ONLY by the
+    /// `#[cfg(unix)]` `run_broker`, so on a non-unix build (which never serves) the field is inert.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    zero_copy_sendfile: bool,
     /// The per-stream DEFAULT message TTL in MILLISECONDS (V2-M4 #549, wired by #710): a record
     /// older than this (its durable producer `timestamp_ms + ttl` against the wall-clock seam) is
     /// EXPIRED — skipped on read, never delivered, reclaimed by the segment reap. `0` = OFF (the
@@ -5717,6 +5743,9 @@ impl ServeConfig {
     fn bench_default() -> ServeConfig {
         ServeConfig {
             consume_longpoll_ms: 0,
+            // Zero-copy `sendfile(2)` delivery (#1034) AUTO-ON, the shipped default (the in-process bench
+            // broker is a memory backend, where the fd path fail-closes to the copy path anyway).
+            zero_copy_sendfile: true,
             // V2-M4 routing richness (#549/#551) at its shipped defaults: no TTL, no dead-letter
             // exchange (the fixed `dlq/`), expired-routing off — the historical broker.
             default_message_ttl_ms: 0,
@@ -9443,6 +9472,10 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         Some(slot) => shared.with_client_ack_slot(slot),
         None => shared,
     };
+    // Install the zero-copy `sendfile(2)` operator toggle (#1034 / #658) onto the base handle BEFORE any
+    // per-connection clone, so every connection reads the resolved setting locally. Default `true`
+    // (AUTO-ON where sound); `--no-zero-copy-sendfile` resolves it `false` (force the copy path).
+    let shared = shared.with_zero_copy_sendfile(config.zero_copy_sendfile);
     // Install the SHARED span-emission sink (#770) onto the base handle BEFORE any per-connection clone,
     // so every connection's produce/deliver/ack sites reach the ONE sink over the exporter's bounded
     // queue. `None` (export off) installs nothing, so `EngineAccess::span_sink` stays `None` and every
@@ -14580,6 +14613,7 @@ mod tests {
     fn test_serve_config(max_in_flight: u32, checkpoint_interval: u64) -> ServeConfig {
         ServeConfig {
             consume_longpoll_ms: 0,
+            zero_copy_sendfile: true,
             // V2-M4 routing (#549/#551) at its inert defaults: no TTL, no exchange, no
             // expired-routing — the historical fixed-`dlq/` broker.
             default_message_ttl_ms: 0,
@@ -18531,6 +18565,7 @@ mod tests {
     fn validation_config() -> ServeConfig {
         ServeConfig {
             consume_longpoll_ms: 0,
+            zero_copy_sendfile: true,
             // V2-M4 routing (#549/#551) at its inert defaults, mirroring production.
             default_message_ttl_ms: 0,
             max_delay_ms: DEFAULT_MAX_DELAY_MS,

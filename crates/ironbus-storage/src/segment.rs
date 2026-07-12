@@ -578,6 +578,41 @@ pub struct RawByteRun {
     pub next_offset: Offset,
 }
 
+/// The fd sibling of [`RawByteRun`] for the Linux `sendfile(2)` zero-copy Tier-S consume path
+/// (#1034 / #658): instead of the run's bytes IN userspace, it names the exact on-disk BYTE RANGE
+/// `[file_offset, file_offset + len)` — a contiguous run of `record_count` whole, header-validated
+/// frames in one segment file — plus a BORROWED descriptor to splice that range straight from the
+/// page cache to the socket. The bodies are never read into userspace: the boundary walk that
+/// produced this touched only the frame HEADERS (see [`SegmentReader::raw_fd_range`]).
+///
+/// Byte-for-byte, `[file_offset, file_offset + len)` equals the [`RawByteRun::bytes`] the copy path
+/// returns for the SAME window (the differential test in `log.rs` pins this), so the wire body a
+/// later `DeliverBatch` splices is identical to today's — the client is oblivious. Each frame's
+/// header CRC was validated while walking; each frame's body CRC ships VERBATIM inside the range for
+/// the consumer to verify end to end, exactly as [`RawByteRun`] documents.
+///
+/// The `fd` BORROWS the [`SegmentReader`] it came from: the caller MUST keep that reader alive for
+/// the whole splice (the fd must stay open while the kernel reads it). Unix-only (a `BorrowedFd` is
+/// unix-only; the disk backend is a v1 non-goal off unix).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub struct RawFdRun<'a> {
+    /// The borrowed segment descriptor to `sendfile(2)` from. Borrows the reader; keep it alive.
+    pub fd: std::os::fd::BorrowedFd<'a>,
+    /// The absolute byte offset in the segment file where the run's first frame begins.
+    pub file_offset: u64,
+    /// The run's total on-disk byte length: exactly `record_count` whole frames, verbatim. Zero iff
+    /// `record_count == 0`.
+    pub len: usize,
+    /// The log offset of the FIRST frame in the range.
+    pub first_offset: Offset,
+    /// How many complete frames the range carries. `next_offset == first_offset + record_count`.
+    pub record_count: u64,
+    /// The next offset AFTER the run (the first offset NOT included): where a follow-on read resumes.
+    /// Equals `first_offset` when the run is empty.
+    pub next_offset: Offset,
+}
+
 impl OwnedRecord {
     /// Materializes a record from a CRC-VALIDATED [`RecordView`] by taking refcounted slices of the
     /// shared read `buf` the view borrows (#480). `buf` MUST be the exact buffer the `view` was
@@ -2684,6 +2719,197 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         })
     }
 
+    /// A borrowed descriptor to `sendfile(2)` this segment's bytes from, or `None` when the backend
+    /// has no spliceable fd (memory, ephemeral, or `O_DIRECT`). The fd BORROWS `self`; keep the reader
+    /// alive across the splice. The unix-only gate on the [`RandomAccessFile::splice_fd`] seam.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.file.splice_fd()
+    }
+
+    /// Reads ONLY the frame header at absolute file offset `abs` (never the body) and returns the whole
+    /// frame's on-disk length via [`codec::decoded_len`], or `None` when the header is torn, corrupt,
+    /// or too short — which ENDS a run exactly as [`SegmentReader::raw_byte_range`]'s in-buffer walk
+    /// does when `decoded_len` errors. `region_end` bounds the read so it never reads past the admitted
+    /// region; at most `RECORD_HEADER_LEN` + the fixed post-header `u16` prefix (the width the subject
+    /// (#594) and stream-tag (#597) fields share) enter userspace — never a record body. This is the
+    /// header-only atom that keeps the fd walk zero-copy.
+    #[cfg(unix)]
+    fn frame_len_at(&self, abs: u64, region_end: u64) -> Result<Option<usize>, StorageError> {
+        const HDR_MAX: usize = RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX;
+        let want = usize::try_from(region_end.saturating_sub(abs))
+            .unwrap_or(HDR_MAX)
+            .min(HDR_MAX);
+        if want < RECORD_HEADER_LEN {
+            // Fewer bytes than a header remain: a torn tail. `decoded_len` would report `Truncated`, so
+            // end the run — mirroring `raw_byte_range` where `decoded_len(&body[cursor..])` breaks.
+            return Ok(None);
+        }
+        let mut hdr = [0u8; HDR_MAX];
+        self.file.read_exact_at(&mut hdr[..want], abs)?;
+        // `decoded_len` reads only the header fields (and, for a tagged/subject frame, the `u16` at the
+        // fixed post-header offset), so `want` bytes always suffice: it returns the SAME length the
+        // in-buffer walk computes for the identical on-disk header. A header-CRC/magic/version failure
+        // (or a short tagged frame) errors, which we map to `None` = end of run.
+        Ok(codec::decoded_len(&hdr[..want]).ok())
+    }
+
+    /// The fd sibling of [`SegmentReader::raw_byte_range`]: walks the SAME contiguous run of whole,
+    /// header-validated frames from `start_byte`, under the IDENTICAL bounds (`max`, `read_end`,
+    /// `max_bytes` with the first-frame-always rule), but reads ONLY the frame headers — never a body —
+    /// and returns the run's on-disk BYTE RANGE plus a borrowed splice fd as a [`RawFdRun`], for the
+    /// Linux `sendfile(2)` zero-copy path (#1034 / #658).
+    ///
+    /// Returns `Ok(None)` when this backend has no spliceable descriptor (memory / ephemeral /
+    /// `O_DIRECT`): the caller then takes the copy path via [`SegmentReader::raw_byte_range`]. Otherwise
+    /// the returned range `[file_offset, file_offset + len)` is byte-for-byte the [`RawByteRun::bytes`]
+    /// `raw_byte_range` would return for the same arguments (the differential test pins this), with the
+    /// same `first_offset` / `record_count` / `next_offset`. `start_byte` MUST be a real frame boundary;
+    /// a header that fails its CRC ENDS the run, so the range is always a clean whole-frame prefix.
+    ///
+    /// # Errors
+    /// Returns an IO error from reading a header, or [`StorageError::SegmentFull`] if the region length
+    /// does not fit `usize`. A torn or corrupt header is NOT an error: it ends the run.
+    #[cfg(unix)]
+    pub fn raw_fd_range(
+        &self,
+        start_byte: u64,
+        start_offset: Offset,
+        read_end: u64,
+        max: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<Option<RawFdRun<'_>>, StorageError> {
+        // Only a backend with a spliceable descriptor can serve the zero-copy path; otherwise the
+        // caller copies. Take the fd first so `None` short-circuits before any IO.
+        let Some(fd) = self.file.splice_fd() else {
+            return Ok(None);
+        };
+        let mut run = RawFdRun {
+            fd,
+            file_offset: start_byte,
+            len: 0,
+            first_offset: start_offset,
+            record_count: 0,
+            next_offset: start_offset,
+        };
+        if max == 0 || start_byte >= read_end {
+            return Ok(Some(run));
+        }
+        // The region is `[start_byte, read_end)` — the exact window `raw_byte_range` reads into `body`,
+        // so `region_len` plays the role of `body.len()` and every bound below matches it one-for-one.
+        let region_len = usize::try_from(read_end.saturating_sub(start_byte))
+            .map_err(|_| StorageError::SegmentFull)?;
+        let mut rel = 0usize;
+        let mut byte_total = 0usize;
+        let mut count = 0usize;
+        let mut next_offset = start_offset.get();
+        while rel < region_len && count < max {
+            // HEADER-ONLY boundary walk (`decoded_len`, header-CRC-validated); a torn/corrupt header
+            // ends the run exactly as `raw_byte_range`'s `decoded_len(&body[cursor..])` does.
+            let Some(consumed) = self.frame_len_at(start_byte + rel as u64, read_end)? else {
+                break;
+            };
+            // A frame that would run past the region is a torn tail: end the run (mirrors
+            // `cursor + consumed > body.len()`).
+            if rel.saturating_add(consumed) > region_len {
+                break;
+            }
+            // Byte cap: stop before a frame that would exceed `max_bytes`, but ALWAYS admit the first
+            // (the "at least one" rule) — the identical check `raw_byte_range` applies.
+            if let Some(cap) = max_bytes {
+                if count != 0 && byte_total.saturating_add(consumed) > cap {
+                    break;
+                }
+            }
+            byte_total = byte_total.saturating_add(consumed);
+            count += 1;
+            next_offset = next_offset.saturating_add(1);
+            rel += consumed;
+        }
+        run.len = byte_total;
+        run.record_count = count as u64;
+        run.next_offset = Offset::new(next_offset);
+        Ok(Some(run))
+    }
+
+    /// The fd sibling of `trim_and_bound_raw_run` (in `log.rs`): given an anchor run's byte range
+    /// `[anchor_start, anchor_start + anchor_len)`, drops the leading frames below `seg_start` and
+    /// re-bounds the remainder to `max_records` / `max_bytes` (first-frame-always), returning the
+    /// trimmed `(file_offset, len, first_offset, record_count, next_offset)`. A header-only re-walk of
+    /// the SAME frames the anchor run admitted, so it produces byte-identical boundaries without ever
+    /// reading a body. `anchor_first_offset` is the log offset of the anchor run's first frame.
+    ///
+    /// # Errors
+    /// Propagates an IO error from reading a header.
+    #[cfg(unix)]
+    pub(crate) fn trim_fd_run(
+        &self,
+        anchor_start: u64,
+        anchor_len: usize,
+        anchor_first_offset: u64,
+        seg_start: u64,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<(u64, usize, u64, u64, u64), StorageError> {
+        let region_end = anchor_start + anchor_len as u64;
+        let mut rel = 0usize;
+        let mut offset = anchor_first_offset;
+        // Drop the leading frames below `seg_start` by walking their header lengths (mirrors the first
+        // loop of `trim_and_bound_raw_run`, bounded by `anchor_len` == the run's `bytes.len()`).
+        while offset < seg_start && rel < anchor_len {
+            let Some(consumed) = self.frame_len_at(anchor_start + rel as u64, region_end)? else {
+                break;
+            };
+            if rel.saturating_add(consumed) > anchor_len {
+                break;
+            }
+            rel += consumed;
+            offset = offset.saturating_add(1);
+        }
+        let run_start_rel = rel;
+        let first_offset = offset;
+        // Admit up to `max_records` / `max_bytes` frames from `seg_start`, "at least one" honored.
+        let mut count = 0usize;
+        let mut byte_total = 0usize;
+        while rel < anchor_len && count < max_records {
+            let Some(consumed) = self.frame_len_at(anchor_start + rel as u64, region_end)? else {
+                break;
+            };
+            if rel.saturating_add(consumed) > anchor_len {
+                break;
+            }
+            if let Some(cap) = max_bytes {
+                if count != 0 && byte_total.saturating_add(consumed) > cap {
+                    break;
+                }
+            }
+            byte_total = byte_total.saturating_add(consumed);
+            count += 1;
+            offset = offset.saturating_add(1);
+            rel += consumed;
+        }
+        Ok((
+            anchor_start + run_start_rel as u64,
+            byte_total,
+            first_offset,
+            count as u64,
+            offset,
+        ))
+    }
+
+    /// Materializes the bytes of `[file_offset, file_offset + len)` into an owned [`Bytes`] — the
+    /// copy-path twin of a [`RawFdRun`]'s byte range, for the byte-identity oracle and any caller that
+    /// must fall back to a userspace copy. This DOES read the bytes into userspace (unlike the sendfile
+    /// splice), so it is the verification/fallback path, never the zero-copy hot path.
+    ///
+    /// # Errors
+    /// Returns an IO error from the positioned read.
+    #[cfg(unix)]
+    pub fn read_fd_run_bytes(&self, file_offset: u64, len: usize) -> Result<Bytes, StorageError> {
+        self.read_into_fresh(len, file_offset)
+    }
+
     /// Scans a COMPACTED (`version` = 2) segment (#337): validates the v2 header (the caller's
     /// [`SegmentReader::open`] already accepted it), reads its SPARSE survivor records, the v2
     /// footer, and the trailing 44-byte compaction-metadata block, and returns them as a
@@ -4047,6 +4273,113 @@ mod tests {
         let (view, consumed) = codec::decode(&raw.bytes).expect("the one good frame decodes");
         assert_eq!(view.payload, b"good1");
         assert_eq!(consumed, raw.bytes.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_fd_range_names_the_same_bytes_as_raw_byte_range() {
+        // #1034 / #658: `raw_fd_range` (the fd/sendfile sibling) names EXACTLY the byte range
+        // `raw_byte_range` returns, over a REAL StdFile (the only backend with a splice fd). Same
+        // record_count / first_offset / next_offset, and `[file_offset, file_offset + len)` reads back
+        // byte-for-byte equal — under the unbounded, record-capped, byte-capped (first-frame-always),
+        // and TORN-TAIL cases — all via a HEADER-ONLY walk that never reads a body.
+        use crate::io::StdFile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        let file = Arc::new(StdFile::create(&path).unwrap());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        for i in 0..6u64 {
+            w.append(&rec(i, &[u8::try_from(i).unwrap(); 7])).unwrap();
+        }
+        w.sync().unwrap();
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let (positions, valid_end) = reader.record_byte_positions().unwrap();
+        let one_frame = reader
+            .raw_byte_range(positions[0], Offset::new(0), valid_end, 1, None)
+            .unwrap()
+            .bytes
+            .len();
+
+        // Every (max, byte-cap) combination the copy path handles, the fd path must NAME identically.
+        let caps = [
+            None,
+            Some(1usize),
+            Some(one_frame),
+            Some(one_frame * 3 + 1),
+            Some(usize::MAX),
+        ];
+        for max in [0usize, 1, 2, 3, 6, usize::MAX] {
+            for cap in caps {
+                let raw = reader
+                    .raw_byte_range(positions[0], Offset::new(0), valid_end, max, cap)
+                    .unwrap();
+                let fd = reader
+                    .raw_fd_range(positions[0], Offset::new(0), valid_end, max, cap)
+                    .unwrap()
+                    .expect("a StdFile-backed reader has a splice fd");
+                let ctx = format!("max={max} cap={cap:?}");
+                assert_eq!(fd.file_offset, positions[0], "file_offset at {ctx}");
+                assert_eq!(fd.len, raw.bytes.len(), "len at {ctx}");
+                assert_eq!(fd.record_count, raw.record_count, "record_count at {ctx}");
+                assert_eq!(fd.first_offset, raw.first_offset, "first_offset at {ctx}");
+                assert_eq!(fd.next_offset, raw.next_offset, "next_offset at {ctx}");
+                let fd_bytes = reader.read_fd_run_bytes(fd.file_offset, fd.len).unwrap();
+                assert_eq!(&fd_bytes[..], &raw.bytes[..], "byte range at {ctx}");
+            }
+        }
+
+        // An in-memory reader has NO splice fd: the fd path declines (copy path), never mis-serves.
+        let mem_file = Arc::new(InMemoryFile::new());
+        let mut mw = SegmentWriter::create(Arc::clone(&mem_file), header()).unwrap();
+        mw.append(&rec(0, b"m")).unwrap();
+        mw.sync().unwrap();
+        let mem_reader = SegmentReader::open(Arc::clone(&mem_file)).unwrap();
+        let (mpos, mend) = mem_reader.record_byte_positions().unwrap();
+        assert!(
+            mem_reader
+                .raw_fd_range(mpos[0], Offset::new(0), mend, 10, None)
+                .unwrap()
+                .is_none(),
+            "the in-memory backend has no splice fd — the fd path declines to the copy path"
+        );
+
+        // TORN TAIL: corrupt the last frame's header magic on disk; the header-only walk ends the run
+        // at the last good frame, naming the same bytes the copy path does.
+        let last_pos = *positions.last().unwrap();
+        let mut b = [0u8; 1];
+        file.read_at(&mut b, last_pos).unwrap();
+        b[0] ^= 0xFF;
+        file.write_all_at(&b, last_pos).unwrap();
+        let file_len = file.len().unwrap();
+        let torn_reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let raw_torn = torn_reader
+            .raw_byte_range(positions[0], Offset::new(0), file_len, 10, None)
+            .unwrap();
+        let fd_torn = torn_reader
+            .raw_fd_range(positions[0], Offset::new(0), file_len, 10, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fd_torn.record_count, 5,
+            "the torn last header ends the run at 5 frames"
+        );
+        assert_eq!(
+            fd_torn.record_count, raw_torn.record_count,
+            "torn count matches copy path"
+        );
+        assert_eq!(
+            fd_torn.len,
+            raw_torn.bytes.len(),
+            "torn len matches copy path"
+        );
+        let fd_torn_bytes = torn_reader
+            .read_fd_run_bytes(fd_torn.file_offset, fd_torn.len)
+            .unwrap();
+        assert_eq!(
+            &fd_torn_bytes[..],
+            &raw_torn.bytes[..],
+            "torn byte range matches copy path"
+        );
     }
 
     #[test]

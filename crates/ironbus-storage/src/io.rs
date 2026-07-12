@@ -156,6 +156,26 @@ pub trait RandomAccessFile: Send + Sync {
         let _ = len;
         Ok(())
     }
+
+    /// A borrowed OS file descriptor to splice a STORED byte range straight from the page cache to a
+    /// socket with Linux `sendfile(2)` — the zero-copy Tier-S consume path (#1034 / #658) — or `None`
+    /// when this backend has no descriptor safe to splice from. `None` is the always-available signal
+    /// to take the ordinary copy path; it is never a correctness compromise, so a backend that cannot
+    /// (or should not) be spliced simply keeps the default.
+    ///
+    /// The default is `None`; a backend opts IN by returning its descriptor. The in-memory and
+    /// ephemeral backends keep the default (no OS fd), and the `O_DIRECT` [`DirectFile`] returns `None`
+    /// on purpose (its page-cache coherence model makes a `sendfile` splice unsafe to assume — see its
+    /// override). Only the buffered production file ([`StdFile`], and the buffered arm of
+    /// [`MaybeDirectFile`]) returns `Some`.
+    ///
+    /// The returned descriptor BORROWS `self`: the caller MUST keep this file (or the reader owning it)
+    /// alive for the whole splice, because the fd must stay open while the kernel reads it. The method
+    /// exists only on unix (a `BorrowedFd` is unix-only; the disk backend is a v1 non-goal off unix).
+    #[cfg(unix)]
+    fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
 }
 
 /// Returns one past the LAST non-zero byte of `file` in `[start, end)`, or `start` when the
@@ -1189,6 +1209,15 @@ impl RandomAccessFile for StdFile {
     fn preallocate(&self, len: u64) -> io::Result<()> {
         preallocate_file(&self.file, len)
     }
+
+    // The buffered production file IS spliceable: `sendfile(2)` reads it straight from the page cache
+    // to the socket with no userspace copy of the record bodies (#1034 / #658). The borrow is tied to
+    // `self`, so the caller keeps this `StdFile` (or the `SegmentReader` owning it) alive across the
+    // whole splice.
+    fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.file.as_fd())
+    }
 }
 
 /// Reserves `len` backing blocks for `file` AND advances its LOGICAL length up to `len`, with the
@@ -1342,6 +1371,34 @@ pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod std_file_tests {
     use super::*;
+
+    #[test]
+    fn splice_fd_some_for_buffered_none_for_memory_backends() {
+        // The zero-copy Tier-S consume path (#1034 / #658) gates on `splice_fd()`: `Some` means the
+        // stored bytes can `sendfile(2)` straight from the page cache, `None` means take the copy path.
+        // Pin the contract so a backend that forgets to opt in fails SAFE (the default `None` = copy).
+        assert!(
+            InMemoryFile::new().splice_fd().is_none(),
+            "the in-memory backend has no OS fd"
+        );
+        assert!(
+            EphemeralFile::new().splice_fd().is_none(),
+            "the ephemeral backend has no OS fd"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("splice.log")).unwrap();
+        assert!(
+            f.splice_fd().is_some(),
+            "the buffered production file is spliceable"
+        );
+        // `StdFs::File` IS `MaybeDirectFile`, so the delegating override is what actually engages on
+        // the disk read path: the buffered arm stays spliceable.
+        let mdf = MaybeDirectFile::Buffered(StdFile::create(&dir.path().join("mdf.log")).unwrap());
+        assert!(
+            mdf.splice_fd().is_some(),
+            "the buffered MaybeDirectFile delegates to Some"
+        );
+    }
 
     #[test]
     fn stdfile_roundtrip_and_persists() {
@@ -2039,6 +2096,18 @@ impl RandomAccessFile for DirectFile {
         // was (0 for a fresh create), which is what keeps the following appends read-free.
         Ok(())
     }
+
+    // NOT spliceable — return `None` so the splice caller takes the copy path (#1034 / #658). A
+    // `DirectFile` writes O_DIRECT (cache-bypassing) and reads through a SEPARATE buffered fd, relying
+    // on the write-invalidates-page-cache coherence rule that holds for `pread`; a `sendfile(2)` on the
+    // read fd would read through the very page cache the direct writes deliberately bypass, so whether
+    // it observes the freshest bytes for a still-active segment is exactly the kind of coherence
+    // question the design says to sidestep. A SEALED segment can be opened as a `DirectFile` when the
+    // io-mode is `direct`, so this case is reachable; the task's rule is to return `None` on any
+    // uncertainty, which keeps direct-mode consumes on the always-correct copy path.
+    fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
 }
 
 /// The [`Filesystem`](crate::fs::Filesystem)-selected production file: either the buffered
@@ -2099,6 +2168,16 @@ impl RandomAccessFile for MaybeDirectFile {
             MaybeDirectFile::Direct(f) => f.preallocate(len),
         }
     }
+    // Delegate so the filesystem-selected file reports its true spliceability: the buffered arm hands
+    // out its fd (splice-eligible), the O_DIRECT arm returns `None` (copy path). This delegation is
+    // load-bearing — `StdFs::File` IS `MaybeDirectFile`, so without it every disk read would report no
+    // fd and the zero-copy path would never engage.
+    fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        match self {
+            MaybeDirectFile::Buffered(f) => f.splice_fd(),
+            MaybeDirectFile::Direct(f) => f.splice_fd(),
+        }
+    }
 }
 
 /// Sharing a file behind a reference forwards to the inner implementation, so the
@@ -2125,6 +2204,10 @@ impl<F: RandomAccessFile + ?Sized> RandomAccessFile for &F {
     fn preallocate(&self, len: u64) -> io::Result<()> {
         (**self).preallocate(len)
     }
+    #[cfg(unix)]
+    fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        (**self).splice_fd()
+    }
 }
 
 /// Sharing a file behind an [`std::sync::Arc`] forwards to the inner implementation.
@@ -2150,6 +2233,10 @@ impl<F: RandomAccessFile + ?Sized> RandomAccessFile for std::sync::Arc<F> {
     fn preallocate(&self, len: u64) -> io::Result<()> {
         (**self).preallocate(len)
     }
+    #[cfg(unix)]
+    fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        (**self).splice_fd()
+    }
 }
 
 // The direct-write backend's byte-level correctness (alignment, the partial-tail read-modify-write,
@@ -2166,6 +2253,25 @@ mod direct_file_tests {
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn splice_fd_none_for_o_direct() {
+        // A `DirectFile` (O_DIRECT, page-cache-bypassing writes with a SEPARATE buffered read fd) is
+        // NOT spliceable: a `sendfile(2)` on the read fd would read through the very page cache the
+        // direct writes bypass, so it returns `None` and direct-mode consumes take the copy path
+        // (#1034 / #658). A SEALED segment can be opened as a DirectFile, so this case is reachable.
+        let d = dir();
+        let df = DirectFile::create_new(&d.path().join("seg")).unwrap();
+        assert!(
+            df.splice_fd().is_none(),
+            "an O_DIRECT DirectFile is not spliceable"
+        );
+        let mdf = MaybeDirectFile::Direct(df);
+        assert!(
+            mdf.splice_fd().is_none(),
+            "the direct MaybeDirectFile delegates to None"
+        );
     }
 
     /// Reads the whole file (through the buffered read fd) into a `Vec` for oracle comparison.

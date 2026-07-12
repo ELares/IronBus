@@ -234,6 +234,17 @@ rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 x509-cert = { version = "0.2", optional = true }
 const-oid = { version = "0.9", optional = true, features = ["db"] }
 
+# The Linux `sendfile(2)` zero-copy Tier-S consume path (#1034 / #658) makes the raw `sendfile` syscall
+# on the blocking connection-handler thread. `libc` is the raw binding only (no vendored C, no `links`
+# key, no build script), is ALREADY in the workspace tree (declared directly by `ironbus-storage`'s
+# per-OS preallocation and used by `ironbus-bench`), is MIT/permissive and on the deny.toml pure-Rust-
+# syscall allow-list, so it adds NO new crate to `Cargo.lock` and keeps the #139 pure-Rust posture (this
+# is NOT `nix`). Gated on `target_os = "linux"` — the only target the splice path compiles on; every
+# other target takes the userspace copy path and never links it, so the DEFAULT non-Linux build is
+# byte-for-byte unchanged.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # The semantics conformance vector suite (#35) is a checked-in JSON data file driven by a Rust

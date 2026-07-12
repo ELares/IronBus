@@ -7847,31 +7847,63 @@ toYtkjmdU2eQ2pK/3gM=
         handle.join().unwrap();
     }
 
-    #[test]
-    fn a_scripted_deliver_batch_with_a_corrupt_record_is_a_typed_error_never_a_panic() {
-        // CRC end-to-end: a DeliverBatch body whose on-disk record bytes are corrupted (a flipped byte
-        // breaks the body CRC) is a typed `BadResponse`, never a panic and never a corrupt message handed
-        // to the caller — the client verifies each record's CRC as it decodes the batch.
-        let recs: Vec<BatchRec<'_>> = vec![(0, b"", b"", b"good-record")];
-        let mut record_bytes = on_disk_record_bytes(0, &recs);
-        // Flip a payload byte: the header CRC still passes (the header is untouched), but the body CRC
-        // now mismatches, so `codec::decode` rejects it.
-        let last = record_bytes.len() - ironbus_core::format::RECORD_TRAILER_LEN - 1;
-        record_bytes[last] ^= 0xFF;
+    /// Frames a `DeliverBatch` response script (`Info` handshake, one batch body, a `FlowEnd`) for the CRC
+    /// end-to-end test below, sharing the framing between the CLEAN and CORRUPT cases so the ONLY
+    /// difference under test is the flipped body byte.
+    #[cfg(test)]
+    fn deliver_batch_script(record_bytes: &[u8], record_count: u32) -> Vec<u8> {
         let mut batch_body = Vec::new();
         ironbus_proto::message::encode_deliver_batch(
             &ironbus_proto::message::DeliverBatchHeader {
                 first_offset: 0,
                 generation: 0,
-                record_count: 1,
+                record_count,
             },
-            &record_bytes,
+            record_bytes,
             &mut batch_body,
         );
         let mut script = frame(FrameType::Info, b"");
         script.extend(frame(FrameType::DeliverBatch, &batch_body));
-        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
-        let (addr, handle) = raw_server(script);
+        script.extend(frame(FrameType::FlowEnd, &record_count.to_le_bytes()));
+        script
+    }
+
+    #[test]
+    fn a_scripted_deliver_batch_with_a_corrupt_record_is_a_typed_error_never_a_panic() {
+        // CRC end-to-end (#541, and the #1034 sendfile path): a DeliverBatch body is the STORED on-disk
+        // record bytes VERBATIM — identical whether the broker memcpy'd them (copy path) or spliced them
+        // straight from the page cache (`sendfile(2)`), so this client-side CRC check is the SAME integrity
+        // guarantee for both paths. A flipped body byte breaks the record's body CRC, so the fetch is a
+        // typed `BadResponse` — never a panic and never a corrupt message handed to the caller.
+        let recs: Vec<BatchRec<'_>> = vec![(0, b"", b"", b"good-record")];
+
+        // POSITIVE CONTROL: the untouched batch decodes to exactly the good record (so the rejection below
+        // is provably the flipped byte, not the framing).
+        {
+            let clean = on_disk_record_bytes(0, &recs);
+            let (addr, handle) = raw_server(deliver_batch_script(&clean, 1));
+            let mut c = Client::connect_with(
+                addr,
+                &ClientConfig {
+                    understands_deliver_batch: true,
+                    ..ClientConfig::default()
+                },
+            )
+            .unwrap();
+            let msgs = c.fetch(10).unwrap().messages;
+            assert_eq!(msgs.len(), 1, "the clean batch yields the one record");
+            assert_eq!(msgs[0].payload, b"good-record");
+            assert_eq!(msgs[0].offset, 0);
+            drop(c);
+            handle.join().unwrap();
+        }
+
+        // CORRUPT: flip a payload byte — the header CRC still passes (the header is untouched), but the
+        // body CRC now mismatches, so `codec::decode` rejects it.
+        let mut record_bytes = on_disk_record_bytes(0, &recs);
+        let last = record_bytes.len() - ironbus_core::format::RECORD_TRAILER_LEN - 1;
+        record_bytes[last] ^= 0xFF;
+        let (addr, handle) = raw_server(deliver_batch_script(&record_bytes, 1));
         let mut c = Client::connect_with(
             addr,
             &ClientConfig {

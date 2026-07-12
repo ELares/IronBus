@@ -716,6 +716,15 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// `None`/empty on a non-tracing broker, so [`EngineAccess::span_sink`] returns `None` and emission
     /// is a zero-cost no-op — the byte-for-byte default hot path.
     span_sink: Arc<OnceLock<crate::obs::SpanSink>>,
+    /// Whether the Linux `sendfile(2)` zero-copy Tier-S delivery path (#1034 / #658) is ENABLED for this
+    /// broker — the operator tunable (default `true` = AUTO-ON). A connection actually splices only when
+    /// ALSO on a plaintext wire, a Linux build, and a disk-backed/unencrypted window (all enforced
+    /// downstream); this flag is the operator KILL-SWITCH that forces the userspace copy path everywhere
+    /// when `false`, with no behavioral or wire change. Read LOCALLY by the connection setup (no actor
+    /// round-trip) to seed `Session::with_splice_enabled`, exactly like [`Self::consume_longpoll_ms`]. A
+    /// plain `bool` copied on clone (like `reply_spin`), set on the base handle before any per-connection
+    /// clone via [`Self::with_zero_copy_sendfile`].
+    zero_copy_sendfile: bool,
 }
 
 /// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
@@ -755,6 +764,9 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // The SAME shared span-emission sink (#770): the ONE sink the serve path installed reaches
             // every connection, so the `Arc<OnceLock>` is shared on clone (like `client_ack`).
             span_sink: Arc::clone(&self.span_sink),
+            // The fixed-for-life zero-copy `sendfile(2)` toggle (#1034): a plain copy, like `reply_spin`,
+            // so every connection clone inherits the base handle's operator setting.
+            zero_copy_sendfile: self.zero_copy_sendfile,
         }
     }
 }
@@ -769,6 +781,18 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     #[must_use]
     pub fn with_client_ack_slot(mut self, slot: ClientAckSlot<F, C>) -> Self {
         self.client_ack = Some(slot);
+        self
+    }
+
+    /// Set the Linux `sendfile(2)` zero-copy delivery toggle (#1034 / #658) on this base handle: `true`
+    /// (the default) AUTO-ONs the zero-copy path wherever it is sound; `false` is the operator KILL-SWITCH
+    /// that forces the userspace copy path on every connection. Called ONCE at serve start, RIGHT AFTER
+    /// [`spawn_actor_with_gather`] and BEFORE any per-connection clone, so every connection's handle
+    /// captures the setting (the `bool` is copied on clone). A consuming builder like
+    /// [`Self::with_client_ack_slot`]; a serve that never calls it keeps the AUTO-ON default.
+    #[must_use]
+    pub fn with_zero_copy_sendfile(mut self, on: bool) -> Self {
+        self.zero_copy_sendfile = on;
         self
     }
 
@@ -826,6 +850,16 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     #[must_use]
     pub fn consume_longpoll_ms(&self) -> u64 {
         self.consume_longpoll_ms
+    }
+
+    /// Whether Linux `sendfile(2)` zero-copy Tier-S delivery (#1034 / #658) is enabled for this broker
+    /// (the operator tunable; default `true`). Read by the connection setup to seed
+    /// `Session::with_splice_enabled` WITHOUT an actor round-trip (like [`Self::consume_longpoll_ms`]); a
+    /// connection still splices only on a plaintext wire, a Linux build, and a spliceable window. `false`
+    /// is the operator kill-switch forcing the copy path.
+    #[must_use]
+    pub fn zero_copy_sendfile(&self) -> bool {
+        self.zero_copy_sendfile
     }
 
     /// The engine-wide commit-notify wakeup seam (push delivery): the shared `Arc` an idle
@@ -1901,6 +1935,12 @@ where
             // shared sink via [`EngineHandle::set_span_sink`] right after this returns, BEFORE any
             // connection's handle is cloned, so every connection sees it.
             span_sink: Arc::new(OnceLock::new()),
+            // Zero-copy `sendfile(2)` delivery (#1034) AUTO-ON by default (the tunability-safe default: it
+            // is enabled precisely where it is sound — a plaintext, disk-backed, unencrypted window on a
+            // Linux build — and inert everywhere else). A serve started with the operator kill-switch flips
+            // it off via [`EngineHandle::with_zero_copy_sendfile`] right after this returns, BEFORE any
+            // connection's handle is cloned.
+            zero_copy_sendfile: true,
         },
         join,
     )

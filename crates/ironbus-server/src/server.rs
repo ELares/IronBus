@@ -685,6 +685,16 @@ where
     // into the session as `peer_san` so an `Mtls`-mechanism `Connect` authenticates on the certificate
     // alone; a non-mTLS connection carries `None` and an mTLS-mechanism connect fails closed.
     let peer_san = wire.peer_san();
+    // Zero-copy `sendfile(2)` eligibility for THIS connection (#1034 / #658): a plaintext wire, a Linux
+    // build (the whole splice path is `cfg(target_os = "linux")`), and the operator toggle on. A TLS wire,
+    // a non-Linux target, or the kill-switch leaves it `false`, so the session emits NO splice directives
+    // and every `DeliverBatch` takes the unchanged userspace copy path. Computed ONCE here (the wire type
+    // is fixed for the connection's life), read off the handle with no actor round-trip like the long-poll
+    // budget. Split by target so a non-Linux build never even references the eligibility inputs.
+    #[cfg(target_os = "linux")]
+    let splice_enabled = matches!(wire, Wire::Plain(_)) && engine.zero_copy_sendfile();
+    #[cfg(not(target_os = "linux"))]
+    let splice_enabled = false;
     // Pin the auth requirement onto the session: with a configured table the `Connect` handshake must
     // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev).
     // The connz handle (#572) is attached so a successful `Connect` records the authed-flip.
@@ -696,7 +706,9 @@ where
     // Seed the event-driven consume long-poll budget (push delivery) from the engine config via a
     // LOCAL handle read (no actor round-trip), exactly like the credit-cap negotiation. `0` (the
     // default) keeps the byte-identical empty-and-return consume path.
-    .with_consume_longpoll_ms(engine.consume_longpoll_ms());
+    .with_consume_longpoll_ms(engine.consume_longpoll_ms())
+    // Seed the zero-copy `sendfile(2)` eligibility (#1034): a no-op on a non-Linux build.
+    .with_splice_enabled(splice_enabled);
     // Attach the pre-auth `DoS` guard (#633) so the `Connect` handshake reports its auth outcome to the
     // per-IP failed-auth lockout (a failure feeds the lockout + bumps `rejected_total{auth_failed}`; a
     // success clears the IP's window). A no-op when no `DoS` defense is configured.
@@ -852,7 +864,13 @@ where
                 if session.has_parked() {
                     out.clear();
                     let _ = session.flush_all_parked_blocking(engine, &mut out);
-                    let _ = stream.write_all(&out);
+                    // Route the EOF drain through `write_response` so the invariant "a `DeliverBatch`
+                    // header queued in `out` ALWAYS gets its spliced body" (#1034) holds STRUCTURALLY on
+                    // EVERY write path, not just the two `process`-pass sites above. This drain only ever
+                    // emits produce-ack frames (never a batch), so `take_splices` is empty here and this
+                    // is byte-for-byte today's `write_all(&out)`; routing keeps it correct-by-construction
+                    // if a future refactor ever enqueues a splice directive on the parked/EOF path.
+                    let _ = write_response(stream, &out, session);
                 }
                 return Ok(());
             }
@@ -867,8 +885,10 @@ where
                 let Ok(progress) = session.process(engine, &inbuf, &mut out) else {
                     // A malformed frame, a fatal engine error, or a gone actor: flush any queued response
                     // (which, on the closing path, already carries the block-drained window) and close (a
-                    // length-prefixed stream cannot resync).
-                    let _ = stream.write_all(&out);
+                    // length-prefixed stream cannot resync). Route through `write_response` so a
+                    // `DeliverBatch` whose header was queued before the error still gets its spliced body
+                    // (#1034) rather than shipping a torn frame on the way out.
+                    let _ = write_response(stream, &out, session);
                     return Ok(());
                 };
                 inbuf.drain(..progress.consumed);
@@ -882,7 +902,10 @@ where
                 // round-trip from directly in front of the client-visible response, shaving it off the
                 // delivery/ack median (the hop still runs every committing pass, just AFTER the write).
                 if !out.is_empty() {
-                    stream.write_all(&out)?;
+                    // Write the response, splicing any zero-copy `DeliverBatch` bodies (#1034) in order
+                    // between the buffered frames; with no directives this is exactly today's
+                    // `write_all(&out)`.
+                    write_response(stream, &out, session)?;
                 }
                 // Persist the session's work-group cursor on the configured interval so a crash
                 // redelivers a bounded tail. ONLY when this pass actually advanced a committed cursor (an
@@ -914,12 +937,17 @@ where
             // this and instead closes the connection via the arm below.
             Err(ref e) if want_nonblocking && e.kind() == std::io::ErrorKind::WouldBlock => {
                 out.clear();
+                // Both drain-write sites route through `write_response` for the same structural
+                // splice-safety invariant as the EOF path above (#1034): `drain_one_parked_blocking` only
+                // emits produce-ack frames, so `take_splices` is empty and the wire bytes are identical to
+                // `write_all(&out)` today, but a queued `DeliverBatch` header could never silently ship
+                // without its spliced body on this path either.
                 if session.drain_one_parked_blocking(engine, &mut out).is_err() {
-                    let _ = stream.write_all(&out);
+                    let _ = write_response(stream, &out, session);
                     return Ok(());
                 }
                 if !out.is_empty() {
-                    stream.write_all(&out)?;
+                    write_response(stream, &out, session)?;
                 }
             }
             // A real IO error, or a BLOCKING-mode read timeout (the slowloris defense with nothing
@@ -927,6 +955,120 @@ where
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Writes a `process` pass's response `out` to the wire, splicing any zero-copy `DeliverBatch` bodies
+/// (#1034 / #658) in order between the buffered frames. With NO splice directives — a TLS wire, a
+/// non-Linux build, the operator kill-switch, or a pass that emitted no batch — this is EXACTLY today's
+/// `stream.write_all(out)`. With directives (only ever a PLAINTEXT Linux connection), it delegates to
+/// [`write_response_spliced`], which walks them front-to-back: write the buffered prefix up to each
+/// directive's `out_pos`, then `sendfile(2)` its segment byte range straight from the page cache to the
+/// socket — so the batch body never entered userspace, yet the wire bytes are byte-identical to the copy
+/// path (the client is oblivious).
+fn write_response(stream: &mut Wire, out: &[u8], session: &mut Session) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let splices = session.take_splices();
+        if !splices.is_empty() {
+            match stream {
+                Wire::Plain(sock) => return write_response_spliced(sock, out, &splices),
+                // Unreachable: the session only emits directives when `splice_enabled`, which requires a
+                // plaintext wire. Fail CLOSED (close the connection) rather than risk a torn frame — the
+                // header is in `out` but the body is not — if that invariant is ever violated.
+                #[cfg(feature = "tls")]
+                Wire::Tls(_) => {
+                    return Err(std::io::Error::other(
+                        "zero-copy splice directive on a non-plaintext wire",
+                    ))
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = session;
+    }
+    stream.write_all(out)
+}
+
+/// Writes `out` to a PLAINTEXT socket, interleaving each ordered `sendfile(2)` splice (#1034) at its
+/// `out_pos`: the buffered prefix (the `DeliverBatch` frame header, plus any earlier frames) is written,
+/// then the directive's segment byte range is spliced from the page cache to the socket, then the walk
+/// continues. Each directive's `holder` keeps its segment fd OPEN until `splices` drops at the end of the
+/// call — AFTER every splice — so a concurrent compaction retire cannot close an fd mid-`sendfile`.
+#[cfg(target_os = "linux")]
+fn write_response_spliced(
+    sock: &mut TcpStream,
+    out: &[u8],
+    splices: &[crate::session::SpliceDirective],
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let sock_fd = sock.as_raw_fd();
+    let mut cursor = 0usize;
+    for directive in splices {
+        // The buffered prefix up to this splice's injection point (the batch header + any earlier frames).
+        if directive.out_pos > cursor {
+            sock.write_all(&out[cursor..directive.out_pos])?;
+        }
+        cursor = directive.out_pos;
+        // Splice the batch body straight from the segment's page cache into the socket.
+        sendfile_all(
+            sock_fd,
+            directive.holder.splice_raw_fd(),
+            directive.file_offset,
+            directive.len,
+        )?;
+    }
+    // The trailing frames after the last splice (tail `Deliver`s, the `FlowEnd`, any following batch).
+    if cursor < out.len() {
+        sock.write_all(&out[cursor..])?;
+    }
+    Ok(())
+}
+
+/// Splices exactly `len` bytes at `file_offset` from the segment descriptor `in_fd` to the socket
+/// `out_fd` via a BLOCKING `libc::sendfile(2)` loop (#1034 / #658), advancing a PRIVATE offset (NOT the
+/// fd cursor) so a concurrent reader of the same segment is unaffected and a partial write resumes from
+/// exactly where the kernel stopped. `EINTR` retries; `EAGAIN`/`EWOULDBLOCK` (the blocking-socket write
+/// TIMEOUT under `SO_SNDTIMEO`) and any other errno close the connection exactly as `write_all` does on a
+/// stalled write; a `0` return before the range is complete is an unexpected short segment, surfaced as
+/// `UnexpectedEof` rather than a silently truncated body.
+#[cfg(target_os = "linux")]
+fn sendfile_all(
+    out_fd: std::os::fd::RawFd,
+    in_fd: std::os::fd::RawFd,
+    file_offset: u64,
+    len: usize,
+) -> std::io::Result<()> {
+    // A PRIVATE offset the kernel advances (NOT the fd cursor), so a concurrent reader of the same
+    // segment is unaffected and a partial write resumes from exactly where the kernel stopped.
+    let mut off: libc::off_t = libc::off_t::try_from(file_offset).unwrap_or(libc::off_t::MAX);
+    let mut remaining = len;
+    while remaining > 0 {
+        // SAFETY: `out_fd` (the socket) and `in_fd` (the segment, kept open by the caller's `holder`) are
+        // valid open descriptors for this call; `&mut off` points to a live local. `sendfile` only READS
+        // `in_fd` and WRITES `out_fd`, advancing `off` by the byte count it returns (at most `remaining`).
+        // The one justified FFI call for the #1034 zero-copy path.
+        #[allow(unsafe_code)]
+        let n = unsafe { libc::sendfile(out_fd, in_fd, &mut off, remaining) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                // EINTR: the kernel did not advance `off`; retry the same range.
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sendfile returned 0 before the full range was sent",
+            ));
+        }
+        // Partial write: the kernel advanced `off` by `n` (> 0, and <= `remaining`); shrink the remainder.
+        remaining = remaining.saturating_sub(usize::try_from(n).unwrap_or(0));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2215,5 +2357,130 @@ zxTKkkRkG34kW+An4JfM0v3R6HpyUKFFNJP37W1f1Ari7Abj6pI3Df40
         let _ = handle.shutdown();
         drop(handle);
         let _ = actor.join();
+    }
+
+    // ===== Linux sendfile(2) zero-copy writer: real syscall over a real socket (#1034 / #658) ======
+    // These exercise the ACTUAL `write_response_spliced` / `sendfile_all` against a live loopback socket
+    // and a real file, so the partial-write loop and the fd-lifetime guarantee are proven end to end (the
+    // buffer-level byte-identity + zero-copy + ordering + fallback tests live in `session.rs`).
+
+    /// A minimal [`crate::engine::SpliceSource`] over an owned file handle, so a test can build a
+    /// `SpliceDirective` and drive the real splice writer without standing up a whole engine.
+    #[cfg(target_os = "linux")]
+    struct FileSplice(std::fs::File);
+
+    #[cfg(target_os = "linux")]
+    impl crate::engine::SpliceSource for FileSplice {
+        fn splice_raw_fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd;
+            self.0.as_raw_fd()
+        }
+    }
+
+    /// A connected loopback `TcpStream` pair `(sender, reader)` with DEFAULT socket buffers.
+    #[cfg(target_os = "linux")]
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = TcpStream::connect(addr).unwrap();
+        let (reader, _) = listener.accept().unwrap();
+        (sender, reader)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sendfile_partial_write_loop_delivers_the_whole_body_byte_identical() {
+        // (6) PARTIAL-WRITE: a body far larger than the socket send buffer forces `sendfile` to return
+        // SHORT counts, so the loop must iterate on a PRIVATE offset until the whole range is sent. A
+        // concurrent reader drains the socket so the blocking sender never wedges (default buffers). The
+        // reader must receive `prefix ++ body ++ suffix` byte-for-byte.
+        let prefix = b"PREFIX-DELIVERBATCH-HEADER".to_vec();
+        let suffix = b"SUFFIX-TAIL-DELIVER-FLOWEND".to_vec();
+        // 4 MiB body with a recognizable pattern (detects any misorder / partial-loop bug).
+        let body: Vec<u8> = (0..4 * 1024 * 1024u32)
+            .map(|i| u8::try_from(i % 251).expect("< 256"))
+            .collect();
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, &body).unwrap();
+        let reopened = file.reopen().unwrap();
+
+        // `out` = prefix, then a splice at out_pos = prefix.len() (the body is NOT in `out`), then suffix.
+        let mut out = prefix.clone();
+        let out_pos = out.len();
+        out.extend_from_slice(&suffix);
+        let directive = crate::session::SpliceDirective {
+            out_pos,
+            holder: Box::new(FileSplice(reopened)),
+            file_offset: 0,
+            len: body.len(),
+        };
+
+        let (mut sender, mut reader) = socket_pair();
+        let expected_len = prefix.len() + body.len() + suffix.len();
+        let reader_thread = std::thread::spawn(move || {
+            let mut got = vec![0u8; expected_len];
+            reader.read_exact(&mut got).unwrap();
+            got
+        });
+
+        write_response_spliced(&mut sender, &out, &[directive]).unwrap();
+        drop(sender);
+
+        let got = reader_thread.join().unwrap();
+        let mut want = prefix.clone();
+        want.extend_from_slice(&body);
+        want.extend_from_slice(&suffix);
+        assert_eq!(got.len(), want.len(), "full length delivered");
+        assert_eq!(got, want, "prefix ++ spliced body ++ suffix, byte-for-byte");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sendfile_survives_the_segment_file_being_retired_mid_hold() {
+        // (7) fd LIFETIME / RETIRE RACE: the splice holder owns an OPEN fd, so UNLINKING the segment file
+        // (what a concurrent compaction retire does) does NOT close it — the kernel keeps the inode alive
+        // for the open fd, and `sendfile` still delivers the original bytes. This is the guarantee the
+        // `FdRun` holder provides across the whole splice.
+        let body: Vec<u8> = (0..64 * 1024u32)
+            .map(|i| u8::try_from(i % 97).expect("< 256"))
+            .collect();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &body).unwrap();
+        let open = std::fs::File::open(file.path()).unwrap();
+        // RETIRE the segment: remove the file while our fd stays open (simulating a compaction retire).
+        std::fs::remove_file(file.path()).unwrap();
+        assert!(
+            !file.path().exists(),
+            "the segment file is unlinked (retired)"
+        );
+
+        let out = b"HDR".to_vec();
+        let out_pos = out.len();
+        let directive = crate::session::SpliceDirective {
+            out_pos,
+            holder: Box::new(FileSplice(open)),
+            file_offset: 0,
+            len: body.len(),
+        };
+
+        let (mut sender, mut reader) = socket_pair();
+        let expected_len = out.len() + body.len();
+        let reader_thread = std::thread::spawn(move || {
+            let mut got = vec![0u8; expected_len];
+            reader.read_exact(&mut got).unwrap();
+            got
+        });
+
+        write_response_spliced(&mut sender, &out, &[directive]).unwrap();
+        drop(sender);
+
+        let got = reader_thread.join().unwrap();
+        let mut want = out.clone();
+        want.extend_from_slice(&body);
+        assert_eq!(
+            got, want,
+            "sendfile from the still-open fd delivered the original bytes despite the unlink"
+        );
     }
 }
