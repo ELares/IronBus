@@ -194,6 +194,11 @@ fn key_to_env_name(key: &str) -> Option<&'static str> {
         "network.health_allow_public" => "IRONBUS_HEALTH_ALLOW_PUBLIC",
         "network.health_liveness_window_ms" => "IRONBUS_HEALTH_LIVENESS_WINDOW_MS",
         "network.enable_admin" => "IRONBUS_ENABLE_ADMIN",
+        // [encryption] — optional at-rest AEAD encryption (#780 phase 3). Feature-gated behind the CLI
+        // `encryption` cargo feature: a build WITHOUT the feature refuses these fail-closed at resolve.
+        "encryption.key_file" => "IRONBUS_ENCRYPTION_KEY_FILE",
+        "encryption.key_id" => "IRONBUS_ENCRYPTION_KEY_ID",
+        "encryption.suite" => "IRONBUS_ENCRYPTION_SUITE",
         _ => return None,
     };
     Some(env)
@@ -490,6 +495,35 @@ mod tests {
         assert_eq!(
             layer.lookup_env_name("IRONBUS_DEAD_LETTER_EXPIRED"),
             Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn the_encryption_keys_map_to_their_env_names() {
+        // The #780 phase-3 at-rest keys: a raw key-file path (string), a key-id (integer), and a suite
+        // (string), each exposed under its IRONBUS_<FLAG> env name for the shared resolution path. The
+        // `[encryption]` section is WIRED (no longer reserved-and-ignored), so its keys are accepted and
+        // exposed rather than warned-and-dropped.
+        let doc = "[encryption]\nkey_file = \"/etc/ironbus/at-rest.key\"\n\
+                   key_id = 7\nsuite = \"aes-256-gcm\"\n";
+        let layer = load_config_file("/x.toml", false, &reader(doc)).unwrap();
+        assert_eq!(
+            layer.lookup_env_name("IRONBUS_ENCRYPTION_KEY_FILE"),
+            Some("/etc/ironbus/at-rest.key".to_string())
+        );
+        assert_eq!(
+            layer.lookup_env_name("IRONBUS_ENCRYPTION_KEY_ID"),
+            Some("7".to_string())
+        );
+        assert_eq!(
+            layer.lookup_env_name("IRONBUS_ENCRYPTION_SUITE"),
+            Some("aes-256-gcm".to_string())
+        );
+        // The wired section produces NO reserved-section warning (it is no longer tolerated-and-ignored).
+        assert!(
+            layer.warnings().iter().all(|w| !w.contains("[encryption]")),
+            "a WIRED [encryption] section must not warn as ignored: {:?}",
+            layer.warnings()
         );
     }
 

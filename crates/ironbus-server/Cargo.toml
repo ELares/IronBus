@@ -39,6 +39,14 @@ edge-min = []
 # drops its ring-backed webpki path and the tls12 code: IronBus is TLS 1.3-only (docs/TRANSPORT.md),
 # so the shipped tls graph is aws-lc-rs only, never ring.
 tls = ["dep:rustls", "dep:rustls-pki-types", "dep:x509-cert", "dep:const-oid"]
+# At-rest AEAD encryption (#780, phase 3 serve hookup). NON-DEFAULT: forwards `ironbus-storage`'s
+# `encryption` feature so the engine's live storage seam (`Log::open_with_at_rest` /
+# `StreamSet::open_with_at_rest`) and `Engine::open_encrypted` compile, and so the `#[cfg(feature =
+# "encryption")]` gates in this crate that build the at-rest context activate. UNLIKE `tls` it pulls NO
+# C-FFI: the RustCrypto AEAD stack is pure Rust and already deny.toml-clean, so the DEFAULT (no-feature)
+# server graph and the `edge-min` build are byte-for-byte unchanged and link zero crypto. When OFF the
+# engine still refuses to open an encrypted-on-disk log (the always-compiled storage guard).
+encryption = ["ironbus-storage/encryption"]
 
 [dependencies]
 ironbus-core = { path = "../ironbus-core", version = "0.1.0" }

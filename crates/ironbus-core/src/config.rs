@@ -448,6 +448,25 @@ pub const KEY_TABLE: &[KeySpec] = &[
         key: "network.enable_admin",
         kind: KeyKind::Bool,
     },
+    // [encryption] — optional at-rest AEAD encryption (#780 phase 3, docs/AT_REST_ENCRYPTION.md). WIRED
+    // keys, feature-gated behind the CLI/server `encryption` cargo feature: a build WITHOUT the feature
+    // refuses these keys fail-closed at resolve (never silently starts plaintext), and a build WITH it
+    // opens the engine's storage encrypted. `key_file` is the raw 32-byte key-file path (the phase-1
+    // fail-closed loader; owner-only perms enforced); `key_id` is its non-zero identifier recorded in
+    // the segment header (never the key); `suite` is `auto` (default: CPU detect) / `aes-256-gcm` /
+    // `chacha20-poly1305`. Encryption is ON iff `key_file` is set.
+    KeySpec {
+        key: "encryption.key_file",
+        kind: KeyKind::Str,
+    },
+    KeySpec {
+        key: "encryption.key_id",
+        kind: KeyKind::Integer,
+    },
+    KeySpec {
+        key: "encryption.suite",
+        kind: KeyKind::Str,
+    },
 ];
 
 /// True when `section` is a top-level TOML section FROZEN as reserved by the #14 stability
@@ -458,14 +477,12 @@ pub const KEY_TABLE: &[KeySpec] = &[
 /// reject-unknown rule applies only to keys under the WIRED sections in [`KEY_TABLE`].
 #[must_use]
 pub fn is_reserved_section(section: &str) -> bool {
-    // `[encryption]` (#780) is the reserved landing section for at-rest AEAD encryption config (the
-    // key source: `encryption.key_file` etc). The functional raw-key-file loader ships in
-    // `ironbus_storage::crypto::load_key_file`; the full typed key-config schema is owned by #14/#109,
-    // so the section is tolerated-but-ignored here until those keys are wired into `KEY_TABLE`.
-    matches!(
-        section,
-        "observability" | "auth" | "compression" | "encryption"
-    )
+    // `[encryption]` (#780) is NO LONGER reserved: as of the phase-3 serve hookup its keys
+    // (`encryption.key_file`, `encryption.key_id`, `encryption.suite`) are WIRED into `KEY_TABLE`
+    // above and resolved by the CLI (feature-gated behind `encryption`; a build without the feature
+    // refuses them fail-closed rather than tolerating-and-ignoring them). The remaining reserved
+    // sections' per-key contents are still owned by other issues.
+    matches!(section, "observability" | "auth" | "compression")
 }
 
 /// Looks up a fully-qualified dotted key in [`KEY_TABLE`], returning its [`KeySpec`].

@@ -370,6 +370,25 @@ impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
         Self::open_inner(fs, clock, config, AtRestCrypto::new(crypto, keyring))
     }
 
+    /// Opens the whole stream set with a pre-built [`AtRestCrypto`] context (#780 phase 3, the serve
+    /// hookup): the seam the ENGINE uses to open EVERY stream's log with the SAME opaque, always-compiled
+    /// at-rest context it also threads to the root [`Log::open_with_at_rest`], WITHOUT naming the
+    /// feature-gated `SegmentCrypto`/`KeyRing` types. `AtRestCrypto::default()` is byte-for-byte
+    /// [`StreamSet::open`]; a configured context encrypts (and decrypts on read) the default stream and
+    /// every named stream with the same key.
+    ///
+    /// # Errors
+    /// As [`StreamSet::open`], plus the fail-closed at-rest guards of [`Log::open_with_at_rest`] on a
+    /// per-stream config mismatch.
+    pub fn open_with_at_rest(
+        fs: &F,
+        clock: C,
+        config: LogConfig,
+        at_rest: AtRestCrypto,
+    ) -> Result<OpenedStreamSet<F, C>, StorageError> {
+        Self::open_inner(fs, clock, config, at_rest)
+    }
+
     /// The shared body behind [`StreamSet::open`] and [`StreamSet::open_encrypted`]: opens every
     /// stream's log with the SAME at-rest context.
     fn open_inner(

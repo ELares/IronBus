@@ -53,7 +53,7 @@ use ironbus_storage::fs::Filesystem;
 use ironbus_storage::layout::{
     PARTITIONED_STREAMS_SUBDIR, PRIORITY_STREAMS_SUBDIR, SHARED_WAL_SUBDIR, STREAMS_SUBDIR,
 };
-use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds, SyncTicket};
+use ironbus_storage::log::{Append, AtRestCrypto, Log, LogConfig, RetentionBounds, SyncTicket};
 use ironbus_storage::loss::LossReport;
 use ironbus_storage::naming::{
     parse_partition_subdir_name, parse_stream_subdir_name, stream_subdir_name, MAX_STREAM_NAME_LEN,
@@ -899,9 +899,33 @@ pub enum EngineError {
         /// The absolute due-instant the wire tried to smuggle in, in Unix milliseconds.
         due_unix_ms: u64,
     },
+    /// At-rest encryption was configured together with the shared-WAL storage mode (#780 phase 3).
+    /// The shared-WAL substrate interleaves every named stream's records in ONE commit log and is not
+    /// wired through the at-rest crypto seam, so encrypting it is a phase-4 item. REFUSED fail-closed
+    /// at open rather than silently writing the shared commit log in PLAINTEXT.
+    EncryptedSharedWalUnsupported,
+    /// A message would be DEAD-LETTERED while at-rest encryption is on (#780 phase 3). The DLQ sink is
+    /// a separate on-disk `Log` whose recovery rebuild reads with the plaintext scanner, so it is NOT
+    /// yet threaded through the at-rest crypto seam; dead-lettering under encryption is a phase-4 item.
+    /// REFUSED fail-closed rather than writing the confidential record body to the DLQ in PLAINTEXT.
+    EncryptedDeadLetterUnsupported,
+    /// A transaction (half-message prepare) was attempted while at-rest encryption is on (#780 phase
+    /// 3). The transactional half-message store is a separate on-disk `Log` whose replay reads with the
+    /// plaintext scanner, so it is NOT yet threaded through the at-rest crypto seam; transactional
+    /// messaging under encryption is a phase-4 item. REFUSED fail-closed rather than buffering the
+    /// confidential prepared payload in PLAINTEXT.
+    EncryptedTxnUnsupported,
+    /// A partitioned stream (#693, `P > 1`) or a priority-lane stream (#553) was declared/produced, or
+    /// its `pstreams/`/`prstreams/` subtree was found on disk at open, while at-rest encryption is on
+    /// (#780 phase 3). Both are backed by the separate `PartitionedStream` storage primitive (P sub-logs
+    /// under `pstreams/`/`prstreams/`) which is NOT threaded through the at-rest crypto seam, so its
+    /// segments would be written PLAINTEXT. REFUSED fail-closed rather than leak a confidential record
+    /// body — per-partition `segment_id`/nonce continuity under encryption is a phase-4 crypto feature.
+    EncryptedPartitionedStreamUnsupported,
 }
 
 impl core::fmt::Display for EngineError {
+    #[allow(clippy::too_many_lines)] // one cohesive arm-per-variant match; splitting it hurts clarity
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             EngineError::Storage(e) => write!(f, "storage error: {e}"),
@@ -999,6 +1023,30 @@ impl core::fmt::Display for EngineError {
                 f,
                 "a publish may not carry a broker-resolved `DUE1` due-time block \
                  (due_unix_ms = {due_unix_ms}); send a `DLY1` relative delay request instead"
+            ),
+            EngineError::EncryptedSharedWalUnsupported => write!(
+                f,
+                "at-rest encryption is not supported with the shared-WAL storage mode (#780 phase 3): \
+                 use the default per-stream-logs mode, or run without an [encryption] key"
+            ),
+            EngineError::EncryptedDeadLetterUnsupported => write!(
+                f,
+                "dead-lettering is not supported while at-rest encryption is on (#780 phase 3): the \
+                 DLQ sink is not yet threaded through the at-rest crypto seam, so a dead-letter is \
+                 refused fail-closed rather than written in plaintext"
+            ),
+            EngineError::EncryptedTxnUnsupported => write!(
+                f,
+                "transactional messaging is not supported while at-rest encryption is on (#780 phase \
+                 3): the half-message store is not yet threaded through the at-rest crypto seam, so a \
+                 prepare is refused fail-closed rather than buffered in plaintext"
+            ),
+            EngineError::EncryptedPartitionedStreamUnsupported => write!(
+                f,
+                "partitioned streams (#693) and priority-lane streams (#553) are not supported while \
+                 at-rest encryption is on (#780 phase 3): their PartitionedStream sub-logs are not yet \
+                 threaded through the at-rest crypto seam, so a declare/produce is refused fail-closed \
+                 rather than writing a confidential body in plaintext"
             ),
         }
     }
@@ -4234,13 +4282,70 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// # Errors
     /// Returns [`EngineError::ZeroMaxInFlight`] for a zero window, or a storage error from
     /// opening the log or the cursor checkpoint.
-    #[allow(clippy::too_many_lines)]
     pub fn open(fs: F, clock: C, config: EngineConfig) -> Result<Engine<F, C>, EngineError>
+    where
+        F: Clone,
+    {
+        // The PLAINTEXT default (#780 phase 3): byte-for-byte the historical open, every existing
+        // caller unchanged. Only the opt-in `Engine::open_encrypted` threads a non-default context.
+        Self::open_inner(fs, clock, config, AtRestCrypto::default())
+    }
+
+    /// Opens the engine with LIVE at-rest AEAD encryption (#780 phase 3, the serve hookup): a
+    /// configured write `crypto` means every NEW active segment across the whole engine (the root/default
+    /// stream and every named stream) is created encrypted and every append AEAD-encrypts in place; a
+    /// configured `keyring` decrypts on read and recovery. This threads the SAME opaque context phase 2
+    /// verified through the storage seam (`Log::open_with_at_rest` / `StreamSet::open_with_at_rest`), so
+    /// the resume-reattach fix and every fail-closed guard engage. Passing all-`None` is byte-for-byte
+    /// [`Engine::open`].
+    ///
+    /// The deferred-under-encryption paths fail CLOSED rather than leak: the shared-WAL storage mode is
+    /// refused at open ([`EngineError::EncryptedSharedWalUnsupported`]); dead-lettering and transactional
+    /// prepares are refused at their seams ([`EngineError::EncryptedDeadLetterUnsupported`] /
+    /// [`EngineError::EncryptedTxnUnsupported`]); the off-actor zero-copy plane and verbatim replication
+    /// stay refused by the always-compiled storage guards.
+    ///
+    /// # Errors
+    /// As [`Engine::open`], plus [`EngineError::EncryptedSharedWalUnsupported`] on a shared-WAL +
+    /// encryption config, and the storage at-rest guards (a missing key for an encrypted-on-disk log,
+    /// or a plaintext log opened with a key).
+    #[cfg(feature = "encryption")]
+    pub fn open_encrypted(
+        fs: F,
+        clock: C,
+        config: EngineConfig,
+        crypto: Option<std::sync::Arc<ironbus_storage::crypto::SegmentCrypto>>,
+        keyring: Option<std::sync::Arc<ironbus_storage::crypto::KeyRing>>,
+    ) -> Result<Engine<F, C>, EngineError>
+    where
+        F: Clone,
+    {
+        Self::open_inner(fs, clock, config, AtRestCrypto::new(crypto, keyring))
+    }
+
+    /// The shared body behind [`Engine::open`] and [`Engine::open_encrypted`]: opens the engine with the
+    /// given opaque at-rest context (`AtRestCrypto::default()` for the plaintext path). Threading the
+    /// context (always-compiled, `None`-equivalent without the `encryption` feature) through here is what
+    /// lets every existing `Engine::open` call site stay byte-for-byte unchanged.
+    #[allow(clippy::too_many_lines)]
+    fn open_inner(
+        fs: F,
+        clock: C,
+        config: EngineConfig,
+        at_rest: AtRestCrypto,
+    ) -> Result<Engine<F, C>, EngineError>
     where
         F: Clone,
     {
         if config.max_in_flight == 0 {
             return Err(EngineError::ZeroMaxInFlight);
+        }
+        // At-rest encryption FAIL-CLOSED for the deferred shared-WAL substrate (#780 phase 3): the
+        // shared commit log interleaves every named stream and is NOT threaded through the at-rest
+        // crypto seam, so refuse BEFORE any open rather than silently write it in plaintext. A phase-4
+        // item; the default per-stream-logs mode is fully encrypted.
+        if at_rest.is_encrypted() && config.storage_mode == StorageMode::SharedWal {
+            return Err(EngineError::EncryptedSharedWalUnsupported);
         }
         // MODE-vs-LAYOUT fail-closed check (#597 wiring): opening a data directory under the WRONG
         // storage mode is a typed refusal BEFORE any recovery runs, never a silent misread of the
@@ -4265,7 +4370,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     Self::open_log_and_shared_wal(fs, clock, config.log)?;
                 (log, streams, Some(wal), BTreeMap::new(), Some(recovery))
             } else {
-                let (log, streams, recoveries) = Self::open_log_and_streams(fs, clock, config.log)?;
+                // Move the at-rest context into the per-stream open (its only consumer): the shared-WAL
+                // branch above never uses it, and encryption + shared-WAL was already refused, so this
+                // branch owns it outright.
+                let (log, streams, recoveries) =
+                    Self::open_log_and_streams(fs, clock, config.log, at_rest)?;
                 (log, streams, None, recoveries, None)
             };
 
@@ -4503,6 +4612,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // partition's own subdir — the per-partition twin of `recover_named_stream_groups` above. A
         // deployment that never declared `P > 1` has no `pstreams/` subtree, so this is a no-op and the
         // on-disk image is byte-for-byte unchanged.
+        // At-rest encryption FAIL-CLOSED at open (#780 phase 3): a broker that INHERITED plaintext
+        // partitioned (`pstreams/`) or priority-lane (`prstreams/`) subtrees and is now started with a
+        // key must NOT silently reopen + serve them plaintext. Refuse the open rather than recover a
+        // crypto-unaware subtree. A fresh encrypted deployment has NEITHER subtree (the declare paths
+        // refuse creating them under encryption), so this is a no-op there. The root `log` carries the
+        // threaded at-rest context, so `is_at_rest_encrypted()` reflects the configured key (`at_rest`
+        // itself was already moved into the per-stream open above).
+        if log.is_at_rest_encrypted() {
+            let root_fs = log.filesystem();
+            if root_fs.subdir_exists(PARTITIONED_STREAMS_SUBDIR)?
+                || root_fs.subdir_exists(PRIORITY_STREAMS_SUBDIR)?
+            {
+                return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+            }
+        }
         let (mut partitioned, mut partition_consumers, mut partition_recoveries) =
             recover_partitioned_streams(&log, config.lease, opened_at)?;
         // Recover each PRIORITY-LANE stream (#553) from its SEPARATE `prstreams/<hex(name)>/` subtree,
@@ -4879,17 +5003,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         fs: F,
         clock: C,
         config: LogConfig,
+        at_rest: AtRestCrypto,
     ) -> Result<LogAndStreams<F, C>, EngineError>
     where
         F: Clone,
     {
         let fs_for_streams = fs.clone();
-        let log = Log::open(fs, clock.clone(), config)?;
+        // At-rest encryption (#780 phase 3): the root/default stream and the whole stream set are opened
+        // with the SAME opaque at-rest context, so a configured key encrypts EVERY stream through the
+        // phase-2-verified seam (resume-reattach + the fail-closed guards engage), and
+        // `AtRestCrypto::default()` is byte-for-byte the historical plaintext `Log::open`/`StreamSet::open`.
+        let log = Log::open_with_at_rest(fs, clock.clone(), config, at_rest.clone())?;
         // The per-stream recovery summaries are RETURNED (not discarded, #575/#1130) so `open` can
         // fold every named stream's torn-tail / corruption loss events into the recovery-event
         // counters — a named stream's crash damage must be as visible as the root log's.
         let (streams, stream_recoveries) =
-            StreamSet::open(&fs_for_streams, clock, config).map_err(EngineError::Storage)?;
+            StreamSet::open_with_at_rest(&fs_for_streams, clock, config, at_rest)
+                .map_err(EngineError::Storage)?;
         Ok((log, streams, stream_recoveries))
     }
 
@@ -6746,6 +6876,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if partition_count <= 1 {
             return self.declare_stream(stream);
         }
+        // At-rest encryption FAIL-CLOSED (#780 phase 3): a partitioned stream (P > 1) is backed by the
+        // separate `PartitionedStream` primitive (P sub-logs under `pstreams/`) that is NOT threaded
+        // through the at-rest crypto seam, so its segments would be PLAINTEXT. Refuse the declare BEFORE
+        // any open/create rather than leak a confidential body. (P <= 1 above routes to the crypto-aware
+        // named-stream path and is unaffected.) Per-partition nonce continuity is a phase-4 feature.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // SHARED-WAL mode (#597): partitioned streams are per-stream-log storage (P sub-logs under
         // pstreams/) and do not compose with the one shared commit log — fail-closed typed reject,
         // matching the open-time pstreams/ layout refusal, never a half-supported hybrid.
@@ -6846,6 +6984,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         id: &StreamId,
         message: &Append<'_>,
     ) -> Result<(PartitionIndex, Offset), EngineError> {
+        // At-rest encryption FAIL-CLOSED defense-in-depth (#780 phase 3): the declare path already
+        // refuses a partitioned stream under encryption, so a resident `PartitionedStream` here means a
+        // subtree that predates encryption (open fails closed on that too); refuse the append regardless,
+        // so a confidential body can NEVER be written to a crypto-unaware partition sub-log in plaintext.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // Route + append to the key's partition (short mutable borrow of the storage map).
         let (idx, offset) = {
             let ps = self
@@ -7431,6 +7576,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 name: stream.to_string(),
             });
         }
+        // At-rest encryption FAIL-CLOSED (#780 phase 3): a priority-lane stream is backed by the same
+        // crypto-unaware `PartitionedStream` primitive (lane sub-logs under `prstreams/`), so its
+        // segments would be PLAINTEXT. Refuse the declare BEFORE any open/create — the priority twin of
+        // the partitioned-stream guard.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // SHARED-WAL mode (#597): priority streams are per-stream-log storage (P lane sub-logs under
         // prstreams/) and do not compose with the one shared commit log — fail-closed typed reject,
         // matching the open-time prstreams/ layout refusal.
@@ -7518,6 +7670,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         message: &Append<'_>,
         priority: u8,
     ) -> Result<(PartitionIndex, Offset), EngineError> {
+        // At-rest encryption FAIL-CLOSED defense-in-depth (#780 phase 3): the priority twin of the guard
+        // in `produce_partitioned` — never append a confidential body to a crypto-unaware lane sub-log.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedPartitionedStreamUnsupported);
+        }
         // Route + append to the priority's lane (short mutable borrow of the storage map). The lane is
         // `min(priority, P-1)`: priority mode requires `P >= 2`, so `P - 1 >= 1` never underflows, and a
         // priority >= P saturates to the top (highest) lane.
@@ -7744,6 +7901,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// # Errors
     /// Propagates a storage error from creating the subdirectory or opening the txn log.
     fn ensure_txn_store(&mut self) -> Result<&mut TxnStore<F, C>, EngineError> {
+        // At-rest encryption FAIL-CLOSED (#780 phase 3): the txn store is a separate on-disk `Log`
+        // whose replay reads with the PLAINTEXT scanner, so it is not yet threaded through the at-rest
+        // crypto seam. Refuse a transactional prepare under encryption rather than buffer the
+        // confidential prepared payload in plaintext. Reached only from the transactional verbs, so a
+        // non-transactional broker never trips it; encrypting the txn store is a phase-4 follow-up.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedTxnUnsupported);
+        }
         if self.txn.is_none() {
             let store = TxnStore::open(
                 self.log.filesystem(),
@@ -9132,6 +9297,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         id: &StreamId,
         slot: usize,
     ) -> Result<&mut DlqSink<F, C>, EngineError> {
+        // At-rest encryption FAIL-CLOSED (#780 phase 3): the per-stream twin of the guard in
+        // [`Engine::dlq_sink_slot`] — a named stream's DLQ sink is likewise a plaintext-scanned `Log`,
+        // so refuse to dead-letter under encryption rather than leak the confidential body in plaintext.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedDeadLetterUnsupported);
+        }
         if slot >= self.dead_letter_targets.len() {
             // Unreachable: every caller iterates 0..dead_letter_targets.len(). Surface loudly
             // rather than panic if the invariant ever breaks.
@@ -12103,6 +12274,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// directory, [`Engine::open`] eagerly opens that slot so the dead-lettered offset set is
     /// present before the first poison redelivers.
     fn dlq_sink_slot(&mut self, slot: usize) -> Result<&mut DlqSink<F, C>, EngineError> {
+        // At-rest encryption FAIL-CLOSED (#780 phase 3): the DLQ sink is a separate on-disk `Log` whose
+        // recovery rebuild reads with the PLAINTEXT scanner, so it is not yet threaded through the
+        // at-rest crypto seam. Refuse to dead-letter under encryption rather than write the confidential
+        // record body to the DLQ in plaintext — the whole point of at-rest encryption. Reached only from
+        // the poison/expiry fan-out, so a broker that never dead-letters never trips it; encrypting the
+        // DLQ end-to-end is a phase-4 follow-up.
+        if self.log.is_at_rest_encrypted() {
+            return Err(EngineError::EncryptedDeadLetterUnsupported);
+        }
         if self.dlq.get(slot).is_none() {
             // Unreachable: every caller iterates 0..dead_letter_targets.len() and `dlq` is sized
             // to it at open. Surface loudly rather than panic if the invariant ever breaks.

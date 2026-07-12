@@ -2703,6 +2703,19 @@ struct ServeFlags {
     /// (#107): mTLS identity-mapping needs the (unwired) TLS layer to supply a verified peer
     /// certificate, so a set value is a fail-closed startup refusal until the TLS layer lands.
     tls_client_ca: Option<String>,
+    /// The at-rest encryption raw KEY-FILE path (#780 phase 3): a file holding exactly 32 raw key bytes,
+    /// owner-only (the phase-1 fail-closed loader refuses a group/world-readable file). Setting it ENABLES
+    /// at-rest encryption. `--encryption-key-file` / `IRONBUS_ENCRYPTION_KEY_FILE` / `[encryption]
+    /// key_file`. Feature-gated: a build without `encryption` refuses it fail-closed.
+    encryption_key_file: Option<String>,
+    /// The at-rest key IDENTIFIER (#780 phase 3): a non-zero u64 recorded in each encrypted segment
+    /// header (never the key). REQUIRED when `encryption_key_file` is set. `--encryption-key-id` /
+    /// `IRONBUS_ENCRYPTION_KEY_ID` / `[encryption] key_id`.
+    encryption_key_id: Option<String>,
+    /// The at-rest AEAD SUITE selector (#780 phase 3): `auto` (default: pick by CPU feature detection),
+    /// `aes-256-gcm`, or `chacha20-poly1305`. `--encryption-suite` / `IRONBUS_ENCRYPTION_SUITE` /
+    /// `[encryption] suite`.
+    encryption_suite: Option<String>,
     /// The EXPLICIT, loud opt-in for a plaintext non-loopback wire (#629): the `--insecure-plaintext-wire`
     /// bare flag. ALLOWS a non-loopback bind WITHOUT TLS but WITH auth, for the legitimate
     /// TLS-terminated-upstream pattern (a mesh / proxy / VPN encrypts the wire; the broker terminates
@@ -3114,6 +3127,47 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                     return Err(reserved_tls_flag_refusal("--tls-client-ca"));
                 }
             }
+            // At-rest AEAD encryption (#780 phase 3). HONORED behind `--features encryption`: the key
+            // file is loaded (fail-closed on non-owner-only perms) and the engine's storage opens
+            // encrypted. On a NON-encryption build every `--encryption-*` flag is a fail-closed startup
+            // REFUSAL (the crypto is not compiled in), never a silently-ignored value that would start
+            // the broker in plaintext under a config that asked for encryption.
+            "--encryption-key-file" => {
+                let value = take_value("--encryption-key-file", args, &mut i)?;
+                #[cfg(feature = "encryption")]
+                {
+                    f.encryption_key_file = Some(value);
+                }
+                #[cfg(not(feature = "encryption"))]
+                {
+                    let _ = value;
+                    return Err(reserved_encryption_flag_refusal("--encryption-key-file"));
+                }
+            }
+            "--encryption-key-id" => {
+                let value = take_value("--encryption-key-id", args, &mut i)?;
+                #[cfg(feature = "encryption")]
+                {
+                    f.encryption_key_id = Some(value);
+                }
+                #[cfg(not(feature = "encryption"))]
+                {
+                    let _ = value;
+                    return Err(reserved_encryption_flag_refusal("--encryption-key-id"));
+                }
+            }
+            "--encryption-suite" => {
+                let value = take_value("--encryption-suite", args, &mut i)?;
+                #[cfg(feature = "encryption")]
+                {
+                    f.encryption_suite = Some(value);
+                }
+                #[cfg(not(feature = "encryption"))]
+                {
+                    let _ = value;
+                    return Err(reserved_encryption_flag_refusal("--encryption-suite"));
+                }
+            }
             "--auth-config" => f.auth_config = Some(take_value("--auth-config", args, &mut i)?),
             // The EXPLICIT, loud plaintext-wire opt-in (#629). A bare boolean flag (no value): advance
             // ONE token, not two, or the loop spins.
@@ -3409,6 +3463,16 @@ fn parse_serve_flags_with_env_and_reader(
         }
         None => Vec::new(),
     };
+    // At-rest encryption (#780 phase 3): resolve + validate the `[encryption]` config (flag > env >
+    // file), feature-gated. A build WITHOUT the `encryption` feature refuses any at-rest config
+    // fail-closed here (never silently starts plaintext); a build WITH it validates the key-file/key-id
+    // pairing and the suite name before the broker opens, so a misconfiguration is a clean startup error.
+    let (encryption_key_file, encryption_key_id, encryption_suite) = resolve_encryption(
+        f.encryption_key_file,
+        f.encryption_key_id,
+        f.encryption_suite,
+        env,
+    )?;
     let mut parsed = ParsedServe {
         addr: resolve_string("--addr", f.addr, env, DEFAULT_ADDR),
         data_dir: resolve_opt_string("--data-dir", f.data_dir, env),
@@ -3724,6 +3788,11 @@ fn parse_serve_flags_with_env_and_reader(
             // The security audit-event sink (#635), flag > env > default `None` (off). A reference,
             // never an inline secret: `stderr` or `@<path>`.
             audit_log: resolve_opt_string("--audit-log", f.audit_log.clone(), env),
+            // At-rest encryption (#780 phase 3): the resolved+validated values (or all-`None` for the
+            // plaintext default). `open_engine_with` turns a `Some(key_file)` into the live crypto.
+            encryption_key_file,
+            encryption_key_id,
+            encryption_suite,
         },
         key_shared_groups: f.key_shared_groups,
         broadcast_groups: f.broadcast_groups,
@@ -5010,6 +5079,22 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
     validate_durability(config)?;
     validate_storage(config)?;
     validate_ram_ceiling(config)?;
+    // At-rest encryption (#780 phase 3) is mutually exclusive with the maintenance passes that are not
+    // yet crypto-aware. Key-compaction rewrites sealed segments and would either lose the encryption or
+    // mis-place nonces, so the storage layer refuses it at runtime (`EncryptedMaintenanceUnsupported`).
+    // Refuse `--compact` + encryption at STARTUP for a clean error, consistent with the shared-WAL /
+    // memory-backend startup refusals, rather than letting a produce start returning ERR_STORAGE once a
+    // compaction pass first triggers. (Tiered cold-segment offload is not serve-configurable, so there
+    // is nothing to refuse for it here; its runtime guard remains the backstop.)
+    // `encryption_key_file` is only ever `Some` on an `encryption`-feature build, so this is a no-op on
+    // the default build.
+    if config.encryption_key_file.is_some() && config.compact {
+        return Err(CliError::Usage(
+            "`--compact` is not supported with at-rest encryption (`--encryption-key-file`): \
+             key-compaction rewrites sealed segments and is not yet crypto-aware. Disable one of them."
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -5598,6 +5683,26 @@ struct ServeConfig {
     /// appends to a file at `<path>` (an owner-only audit log). Events carry the identity NAME and the
     /// mechanism/scope/verb tags only — NEVER a credential. Operator-selectable, off by default.
     audit_log: Option<String>,
+    /// The resolved at-rest encryption RAW KEY-FILE path (#780 phase 3), or `None` for the plaintext
+    /// default (byte-for-byte historical). When `Some`, `open_engine_with` loads the 32-byte key (the
+    /// phase-1 fail-closed owner-only loader) and opens the engine's storage encrypted via
+    /// `Engine::open_encrypted`. Resolved from `--encryption-key-file` / `IRONBUS_ENCRYPTION_KEY_FILE` /
+    /// `[encryption] key_file`; only ever `Some` on an `encryption`-feature build. The serve path that
+    /// reads it (`open_engine_with` / `open_memory_engine`) is `cfg(unix)`, so on a non-Unix build it is
+    /// intentionally dead (the broker cannot serve there anyway — v1 serve is Unix-only).
+    #[cfg_attr(not(all(unix, feature = "encryption")), allow(dead_code))]
+    encryption_key_file: Option<String>,
+    /// The resolved at-rest KEY-ID (#780 phase 3): the non-zero u64 recorded in each encrypted segment
+    /// header. `Some` iff `encryption_key_file` is `Some` (validated at resolve). Only READ on a Unix
+    /// `encryption`-feature build (by `load_encryption_context`); otherwise it is always `None`
+    /// (`resolve_encryption` refuses any at-rest config off an `encryption` build), so it is dead there.
+    #[cfg_attr(not(all(unix, feature = "encryption")), allow(dead_code))]
+    encryption_key_id: Option<u64>,
+    /// The resolved at-rest AEAD SUITE (#780 phase 3): `auto` (CPU detect), `aes-256-gcm`, or
+    /// `chacha20-poly1305`. `None` (with a key file set) means `auto`. Only READ on a Unix
+    /// `encryption`-feature build; intentionally dead otherwise (always `None`).
+    #[cfg_attr(not(all(unix, feature = "encryption")), allow(dead_code))]
+    encryption_suite: Option<String>,
 }
 
 // Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
@@ -5693,6 +5798,9 @@ impl ServeConfig {
             // shipped `serve` default so a future bench teardown behaves like production.
             drain_timeout_ms: DEFAULT_DRAIN_TIMEOUT_MS,
             audit_log: None,
+            encryption_key_file: None,
+            encryption_key_id: None,
+            encryption_suite: None,
         }
     }
 }
@@ -7283,6 +7391,113 @@ fn reserved_tls_flag_refusal(flag: &str) -> CliError {
          upstream (mesh / proxy / VPN), or pass --insecure-plaintext-wire to explicitly accept a \
          plaintext wire WITH auth."
     ))
+}
+
+/// Fail-closed refusal for an `--encryption-*` flag (or `[encryption]` config key / env) on a build
+/// compiled WITHOUT the `encryption` feature (#780 phase 3). Such a build links no AEAD crypto, so it
+/// CANNOT encrypt segments — accepting the config and starting the broker would write PLAINTEXT under a
+/// configuration that asked for at-rest encryption, the exact silent-downgrade this refuses.
+///
+/// Only reachable on a build WITHOUT the `encryption` feature: its callers (the `--encryption-*` flag
+/// arms and `resolve_encryption`'s refusal branch) are all `cfg(not(feature = "encryption"))`, so on an
+/// `encryption` build (which honors the flags) it would be dead code — hence the cfg gate.
+#[cfg(not(feature = "encryption"))]
+fn reserved_encryption_flag_refusal(what: &str) -> CliError {
+    CliError::Usage(format!(
+        "{what} is not honored in this build: it was compiled WITHOUT the `encryption` feature, so it \
+         links no AEAD crypto and cannot encrypt segments at rest. Accepting it would start the broker \
+         in PLAINTEXT under a configuration that asked for encryption. Rebuild with `--features \
+         encryption` to enable at-rest AES-256-GCM / ChaCha20-Poly1305, or remove the at-rest \
+         encryption configuration."
+    ))
+}
+
+/// Resolves + validates the `[encryption]` config (#780 phase 3): the raw key-file path, the key-id,
+/// and the AEAD suite, each `flag > env > file > default`. Returns `(key_file, key_id, suite)` where a
+/// `Some(key_file)` means at-rest encryption is ON (the broker will open its storage encrypted). This
+/// is the ONLY place the at-rest config is validated, so a misconfiguration is a clean startup error
+/// before the broker opens rather than a late failure.
+///
+/// Feature-gated fail-closed: a build compiled WITHOUT the `encryption` feature refuses ANY at-rest
+/// config (flag, env, or `[encryption]` file key) rather than silently starting plaintext under it.
+///
+/// # Errors
+/// [`CliError::Usage`] on a non-`encryption` build with any at-rest config set; a key-id without a key
+/// file (or vice versa); a non-integer / zero key-id; or an unknown suite name.
+#[allow(clippy::type_complexity)] // the (key_file, key_id, suite) resolved triple is clearer inline
+fn resolve_encryption(
+    key_file_flag: Option<String>,
+    key_id_flag: Option<String>,
+    suite_flag: Option<String>,
+    env: &EnvFn<'_>,
+) -> Result<(Option<String>, Option<u64>, Option<String>), CliError> {
+    let key_file = resolve_opt_string("--encryption-key-file", key_file_flag, env);
+    let key_id_raw = resolve_opt_string("--encryption-key-id", key_id_flag, env);
+    let suite = resolve_opt_string("--encryption-suite", suite_flag, env);
+
+    #[cfg(not(feature = "encryption"))]
+    {
+        // A build without the crypto cannot honor ANY at-rest config: refuse fail-closed rather than
+        // ignore it and start the broker in plaintext under a config that asked for encryption.
+        if key_file.is_some() || key_id_raw.is_some() || suite.is_some() {
+            return Err(reserved_encryption_flag_refusal(
+                "at-rest encryption config ([encryption] / --encryption-* / IRONBUS_ENCRYPTION_*)",
+            ));
+        }
+        Ok((None, None, None))
+    }
+
+    #[cfg(feature = "encryption")]
+    {
+        // Encryption is ON iff a key file is configured. A key-id / suite set WITHOUT a key file is a
+        // misconfiguration (the operator asked for encryption but supplied no key) — refuse, never
+        // silently ignore, so the intent is not lost.
+        let Some(key_file) = key_file else {
+            if key_id_raw.is_some() || suite.is_some() {
+                return Err(CliError::Usage(
+                    "encryption.key_id / encryption.suite were set without encryption.key_file; \
+                     at-rest encryption is enabled by setting the key file (--encryption-key-file / \
+                     IRONBUS_ENCRYPTION_KEY_FILE / [encryption] key_file)"
+                        .to_string(),
+                ));
+            }
+            return Ok((None, None, None));
+        };
+        // The key-id is REQUIRED and must be a NON-ZERO u64 (0 is the no-key/plaintext sentinel the
+        // crypto core rejects), recorded in each encrypted segment header (never the key).
+        let Some(key_id_raw) = key_id_raw else {
+            return Err(CliError::Usage(
+                "at-rest encryption requires --encryption-key-id (a non-zero identifier for the key, \
+                 recorded in the segment header), set alongside --encryption-key-file"
+                    .to_string(),
+            ));
+        };
+        let key_id: u64 = key_id_raw.parse().map_err(|_| {
+            CliError::Usage(format!(
+                "--encryption-key-id must be a non-negative integer, got {key_id_raw:?}"
+            ))
+        })?;
+        if key_id == 0 {
+            return Err(CliError::Usage(
+                "--encryption-key-id must be non-zero (0 is the no-key/plaintext sentinel)"
+                    .to_string(),
+            ));
+        }
+        // Validate the suite name up front so a typo is a clean parse error, not a late open failure.
+        // `auto` (the default when omitted) picks by CPU feature detection at open.
+        if let Some(s) = &suite {
+            match s.as_str() {
+                "auto" | "aes-256-gcm" | "chacha20-poly1305" => {}
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "--encryption-suite must be auto, aes-256-gcm, or chacha20-poly1305, got \
+                         {other:?}"
+                    )))
+                }
+            }
+        }
+        Ok((Some(key_file), Some(key_id), suite))
+    }
 }
 
 /// Refusal for incomplete TLS material (ADR-0004, #766): `--tls-cert` and `--tls-key` are BOTH
@@ -10466,6 +10681,17 @@ fn open_memory_engine(
     key_shared_groups: &[String],
     broadcast_groups: &[String],
 ) -> Result<Engine<EphemeralFs, SystemClock>, CliError> {
+    // At-rest encryption FAIL-CLOSED (#780 phase 3): the in-memory backend has no on-disk segments to
+    // encrypt, so an at-rest key is meaningless here. Refuse rather than pretend to protect data at rest
+    // that never touches a disk. `encryption_key_file` is only ever `Some` on an `encryption`-feature
+    // build (resolve_encryption returns `None` otherwise), so this is a no-op on the default build.
+    if config.encryption_key_file.is_some() {
+        return Err(CliError::Usage(
+            "at-rest encryption (--encryption-key-file) requires an on-disk backend; the in-memory \
+             (--storage memory) broker has no on-disk segments to encrypt"
+                .to_string(),
+        ));
+    }
     open_engine_with(
         EphemeralFs::new(),
         config,
@@ -10473,6 +10699,66 @@ fn open_memory_engine(
         broadcast_groups,
         "in memory",
     )
+}
+
+/// Builds the LIVE at-rest encryption context (#780 phase 3) from the resolved `[encryption]` config:
+/// the write-side [`SegmentCrypto`](ironbus_storage::crypto::SegmentCrypto) (new segments encrypt) and
+/// the read-side [`KeyRing`](ironbus_storage::crypto::KeyRing) (decrypt-on-read), both under the SAME
+/// single key + key-id. The 32-byte raw key is loaded by the phase-1 fail-closed loader, which refuses a
+/// group/world-readable file (#109). Mirrors [`load_tls_termination`] for security material. Only ever
+/// called with a `Some(key_file)` config, and only on an `encryption`-feature build.
+///
+/// # Errors
+/// [`CliError::Usage`] if the key file cannot be loaded (missing, wrong length, or non-owner-only
+/// permissions), or on an unsupported suite name (already validated at resolve; belt-and-braces here).
+#[cfg(all(unix, feature = "encryption"))]
+#[allow(clippy::type_complexity)] // the (write-crypto, read-ring) Arc-option pair is clearer inline
+fn load_encryption_context(
+    config: &ServeConfig,
+) -> Result<
+    (
+        Option<std::sync::Arc<ironbus_storage::crypto::SegmentCrypto>>,
+        Option<std::sync::Arc<ironbus_storage::crypto::KeyRing>>,
+    ),
+    CliError,
+> {
+    use ironbus_storage::crypto::{AeadSuite, KeyRing, SegmentCrypto};
+    let Some(key_file) = config.encryption_key_file.as_deref() else {
+        return Ok((None, None));
+    };
+    let key_id = config
+        .encryption_key_id
+        .expect("key_id is resolved alongside key_file (resolve_encryption)");
+    let suite = match config.encryption_suite.as_deref() {
+        None | Some("auto") => AeadSuite::detect(),
+        Some("aes-256-gcm") => AeadSuite::Aes256Gcm,
+        Some("chacha20-poly1305") => AeadSuite::ChaCha20Poly1305,
+        Some(other) => {
+            return Err(CliError::Usage(format!(
+                "unknown at-rest encryption suite {other:?} (auto, aes-256-gcm, chacha20-poly1305)"
+            )))
+        }
+    };
+    // Load the 32-byte raw key (fail-closed on a non-owner-only file, #109). The key zeroizes on drop.
+    let key = ironbus_storage::crypto::load_key_file(std::path::Path::new(key_file))
+        .map_err(|e| CliError::Usage(format!("at-rest encryption key file {key_file:?}: {e}")))?;
+    // One active WRITE key encrypts new segments; the read RING carries the same key under the same id
+    // so every segment this broker writes decrypts on read. Multi-key rotation (a read ring with prior
+    // keys) is a phase-4 follow-up. The key is cloned into both (it zeroizes on each drop).
+    let crypto = SegmentCrypto::new(suite, key_id, key.clone());
+    let mut ring = KeyRing::new();
+    ring.insert(key_id, key);
+    // A loud, credential-free operator confirmation on the log stream (never the key, only its id +
+    // the chosen suite). `let _`: a broken stderr never blocks serve.
+    let _ = writeln!(
+        std::io::stderr(),
+        "encryption: at-rest AEAD ENABLED (suite {}, key_id {key_id})",
+        suite.name()
+    );
+    Ok((
+        Some(std::sync::Arc::new(crypto)),
+        Some(std::sync::Arc::new(ring)),
+    ))
 }
 
 /// Rebuilds the validated dead-letter EXCHANGE (#551/#710) from the resolved target list, or
@@ -10497,6 +10783,7 @@ fn dead_letter_exchange_config(
 /// (same caps, same retention, same durability mapping, same compression). `context` names the
 /// store in an open error (e.g. `at /var/lib/ironbus`, `in memory`).
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)] // one cohesive EngineConfig build + the at-rest open branch
 fn open_engine_with<F: Filesystem + Clone>(
     fs: F,
     config: &ServeConfig,
@@ -10523,149 +10810,166 @@ fn open_engine_with<F: Filesystem + Clone>(
     )
     .map_err(|e| CliError::Internal(format!("delivery config: {e:?}")))?;
     let visibility_ms = config.visibility_ms;
-    let engine = Engine::open(
-        fs,
-        SystemClock::new(),
-        EngineConfig {
-            // The named-stream STORAGE MODE (#597): `--storage-mode` selects per-stream logs (the
-            // default, byte-for-byte) or the shared-WAL density fallback. Restart-only; the engine
-            // fail-closed refuses a data dir laid out by the other mode.
-            storage_mode: config.storage_mode.to_engine(),
-            // Both caps are honored: `new` validates and sets the segment cap, the builder
-            // layers on the durable-log total byte cap (the drop-new shed; `0` = unlimited).
-            log: LogConfig::new(config.max_segment_bytes)
-                .map_err(|e| CliError::Internal(format!("log config: {e}")))?
-                .with_max_total_bytes(config.max_total_bytes)
-                .with_tindex_stride_records(config.tindex_stride_records),
-            lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
-            delivery,
-            max_in_flight: config.max_in_flight,
-            // V2-M4 routing richness (per-message/stream TTL + dead-letter exchanges, #549/#551),
-            // wired from `--default-message-ttl-ms` / `--dead-letter-exchange` /
-            // `--dead-letter-expired` (#710). Every knob defaults to its disabling value (no TTL,
-            // no exchange, expired-routing off), so a zero-config broker keeps the historical
-            // fixed-`dlq/` behavior byte-for-byte. The target list was already validated at parse;
-            // re-constructing the typed exchange here cannot fail on a parsed config (surfaced as
-            // an internal error, not a panic, if the invariant ever breaks).
-            default_message_ttl_ms: config.default_message_ttl_ms,
-            // The max accepted per-message delivery delay (V2-M4 #555), wired from
-            // `--max-delay-ms` / `delivery.max_delay_ms`; `0` = unbounded.
-            max_delay_ms: config.max_delay_ms,
-            dead_letter_exchange: dead_letter_exchange_config(config)?,
-            dead_letter_expired: config.dead_letter_expired,
-            // The per-CONSUMER (per-connection) standing in-flight credit CEILING (#65, #552): the most
-            // un-acked messages one connection may EVER hold — the ceiling the auto-tuning credit window
-            // grows toward from a 64 floor as the consumer keeps draining. The effective Flow bound is
-            // min(the current auto-tuned window, the byte budget, the per-group max_in_flight window).
-            // Floored to 1 by the engine. Default 2048 (NOT 65535), the Kafka-class auto-tune ceiling.
-            consumer_credit: config.consumer_credit,
-            // The per-CONSUMER (per-connection) in-flight BYTE budget (#275): the RAM-side companion
-            // to the message-count credit. The effective Flow bound is min(message credit, byte
-            // budget) with a hard floor of one message. Default 8 MiB; `0` = unlimited (off).
-            consumer_credit_bytes: config.consumer_credit_bytes,
-            checkpoint_interval: config.checkpoint_interval,
-            // The acked-ahead RANGE cap (#543) at the engine's safe default: bounds each
-            // work-group cursor's out-of-order-ack memory to 16 KiB (1024 ranges), decoupled
-            // from `--max-in-flight`. Deliberately not a CLI/profile knob yet (the default
-            // never fires at any shipped profile's in-flight window); a
-            // `delivery.max_acked_ahead_runs` knob is the follow-up if operators need it.
-            max_acked_ahead_runs: ironbus_server::engine::DEFAULT_MAX_ACKED_AHEAD_RUNS,
-            // Consumer-safe retention (#13, #80), each `0` = disabled (off), the default. Size in
-            // record bytes, age in milliseconds (against the engine clock), count in messages; the
-            // bounds compose, so a segment is reaped if ANY enabled bound trips.
-            max_retained_bytes: config.max_retained_bytes,
-            max_age_ms: config.max_age_ms,
-            max_messages: config.max_messages,
-            // The work-group cap (refs #240, #9, #10): bounds consumer-state memory once the wire
-            // can name groups. `0` = unlimited (off); the default is non-zero (1024). A new named
-            // group past the cap is rejected by the engine before it allocates.
-            max_groups: config.max_groups,
-            max_streams: config.max_streams,
-            max_open_streams: config.max_open_streams,
-            max_metric_streams: ironbus_server::engine::DEFAULT_MAX_METRIC_STREAMS,
-            // Idle named-group eviction (refs #277, #240): the lifecycle reclaim that completes the
-            // #240 cap. `0` = disabled (off, the default), a non-zero value is the idle window in ms
-            // after which a fully-caught-up, lease-free named group is reclaimed. Never deletes a
-            // durable checkpoint, so a re-subscribe resumes; only caught-up groups are evicted, so a
-            // consumer's committed position is never lost.
-            group_idle_evict_ms: config.group_idle_evict_ms,
-            // The refuse-to-boot RAM ceiling (#115, #19), wired from `--ram-ceiling-bytes` (or the
-            // profile preset: 0 = off for balanced/throughput, 64 MiB for edge-tiny). `0` leaves the
-            // guard off and `ironbus_ram_headroom_bytes` at the `-1` sentinel; a set ceiling makes the
-            // gauge report a real `ceiling - RSS` value AND is enforced before this point by
-            // `validate_serve_config` (which refuses to boot when the worst-case bounded-buffer
-            // footprint provably exceeds it).
-            ram_ceiling_bytes: config.ram_ceiling_bytes,
-            // The disk-full overflow policy (#82): drop-new (default) sheds, drop-oldest force-reaps
-            // the oldest sealed segment then accepts. Honored only when `max_total_bytes` is set.
-            disk_full_policy: match config.disk_full_policy {
-                DiskFullPolicyArg::DropNew => DiskFullPolicy::DropNew,
-                DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
-            },
-            // The OPT-IN effectively-once dedup window (#3, #33): the dual count + time bound on each
-            // per-producer dedup ring, plus the cap on the NUMBER of distinct producer windows.
-            // Dedup is OFF by default and activates per-producer only when a publish carries a
-            // `msg_id`; these flags only SIZE the window when it does. `--dedup-max-ids` is the count
-            // bound (default 100k), `--dedup-window-ms` the time bound in ms (default 2 min), and
-            // `--dedup-max-producers` (default 4096) caps the producer windows so a flood of
-            // attacker-chosen `producer_id`s cannot grow RAM without bound (LRU eviction).
-            dedup: ironbus_core::dedup::DedupConfig {
-                max_ids: config.dedup_max_ids,
-                window_nanos: config.dedup_window_ms.saturating_mul(1_000_000),
-                max_producers: config.dedup_max_producers,
-            },
-            // The DURABILITY LEVEL (#341, #379), wired from `--durability-level`. Default `sync`
-            // (ack only after the covering fdatasync, I2, zero acked loss): a zero-config broker is
-            // byte-for-byte the historical durable broker. The relaxed levels are strictly opt-in and
-            // weaken I2 by a documented loss window; `async`/`none` are already gated behind the
-            // explicit `--async-loss-ack` acknowledgement by `validate_serve_config`, so an engine can
-            // only reach a loss-bearing level once the operator accepted the loss. The `interval`
-            // triggers (time/bytes) only matter under `interval`.
-            durability_level: match config.durability_level {
-                DurabilityLevelArg::Sync => DurabilityLevel::Sync,
-                DurabilityLevelArg::Interval => DurabilityLevel::Interval,
-                DurabilityLevelArg::Async => DurabilityLevel::Async,
-                DurabilityLevelArg::None => DurabilityLevel::None,
-            },
-            flush_interval_ms: config.flush_interval_ms,
-            flush_max_bytes: config.flush_max_bytes,
-            // The backpressure controls (#68, #69), wired from the serve flags. Every knob defaults
-            // to its disabling value (CoDel off, retry budget off, fire-and-forget ungoverned, egress
-            // at its floor), so a zero-config broker is byte-for-byte the historical broker. The
-            // engine CLAMPS the CoDel values and bounds the egress limiter, never rejecting a value.
-            codel_target_ms: config.codel_target_ms,
-            codel_interval_ms: config.codel_interval_ms,
-            retry_budget_ratio_per_million: config.retry_budget_ratio_per_million,
-            retry_budget_window_ms: config.retry_budget_window_ms,
-            fire_and_forget_msg_rate: config.fire_and_forget_msg_rate,
-            fire_and_forget_byte_rate: config.fire_and_forget_byte_rate,
-            fire_and_forget_refill_ms: config.fire_and_forget_refill_ms,
-            egress_limit: config.egress_limit,
-            // The event-driven consume long-poll budget (push delivery), wired from
-            // `--consume-longpoll-ms` (default `0` = OFF). Server-only: an idle consumer wakes on a
-            // commit instead of returning empty; no wire/client/format change.
-            consume_longpoll_ms: config.consume_longpoll_ms,
-            // The fsync-headroom admission window (#378), wired from `--wal-fsync-headroom-bytes`.
-            // Default `0` = OFF (the un-fsynced frontier is bounded only by the group-commit
-            // drain under `sync` / the interval window under a relaxed level), so a zero-config
-            // broker is unchanged; a non-zero value is the opt-in tight RAM / loss-window bound.
-            wal_fsync_headroom_bytes: config.wal_fsync_headroom_bytes,
-            // The pipelined sync tier's dirty-byte admission bound (#1040, INV-9), wired from
-            // `--sync-max-dirty-bytes` (default 16 MiB; explicit `0` disables). Enforced by the
-            // append actor's pipelined branch as a THROTTLE (block for the in-flight barrier's
-            // completion), never a shed — the sync tier's semantics.
-            sync_max_dirty_bytes: config.sync_max_dirty_bytes,
-            // The per-record write-path compression codec (#430, ADR-0003), wired from
-            // `--compression` (default `lz4`). `none` stores every record raw, byte-for-byte the
-            // historical layout; `zstd` was already rejected at parse on this build, so the two
-            // arms here are exhaustive.
-            compression: match config.compression {
-                CompressionArg::None => ironbus_core::compress::Codec::None,
-                CompressionArg::Lz4 => ironbus_core::compress::Codec::Lz4,
-            },
+    let engine_config = EngineConfig {
+        // The named-stream STORAGE MODE (#597): `--storage-mode` selects per-stream logs (the
+        // default, byte-for-byte) or the shared-WAL density fallback. Restart-only; the engine
+        // fail-closed refuses a data dir laid out by the other mode.
+        storage_mode: config.storage_mode.to_engine(),
+        // Both caps are honored: `new` validates and sets the segment cap, the builder
+        // layers on the durable-log total byte cap (the drop-new shed; `0` = unlimited).
+        log: LogConfig::new(config.max_segment_bytes)
+            .map_err(|e| CliError::Internal(format!("log config: {e}")))?
+            .with_max_total_bytes(config.max_total_bytes)
+            .with_tindex_stride_records(config.tindex_stride_records),
+        lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
+        delivery,
+        max_in_flight: config.max_in_flight,
+        // V2-M4 routing richness (per-message/stream TTL + dead-letter exchanges, #549/#551),
+        // wired from `--default-message-ttl-ms` / `--dead-letter-exchange` /
+        // `--dead-letter-expired` (#710). Every knob defaults to its disabling value (no TTL,
+        // no exchange, expired-routing off), so a zero-config broker keeps the historical
+        // fixed-`dlq/` behavior byte-for-byte. The target list was already validated at parse;
+        // re-constructing the typed exchange here cannot fail on a parsed config (surfaced as
+        // an internal error, not a panic, if the invariant ever breaks).
+        default_message_ttl_ms: config.default_message_ttl_ms,
+        // The max accepted per-message delivery delay (V2-M4 #555), wired from
+        // `--max-delay-ms` / `delivery.max_delay_ms`; `0` = unbounded.
+        max_delay_ms: config.max_delay_ms,
+        dead_letter_exchange: dead_letter_exchange_config(config)?,
+        dead_letter_expired: config.dead_letter_expired,
+        // The per-CONSUMER (per-connection) standing in-flight credit CEILING (#65, #552): the most
+        // un-acked messages one connection may EVER hold — the ceiling the auto-tuning credit window
+        // grows toward from a 64 floor as the consumer keeps draining. The effective Flow bound is
+        // min(the current auto-tuned window, the byte budget, the per-group max_in_flight window).
+        // Floored to 1 by the engine. Default 2048 (NOT 65535), the Kafka-class auto-tune ceiling.
+        consumer_credit: config.consumer_credit,
+        // The per-CONSUMER (per-connection) in-flight BYTE budget (#275): the RAM-side companion
+        // to the message-count credit. The effective Flow bound is min(message credit, byte
+        // budget) with a hard floor of one message. Default 8 MiB; `0` = unlimited (off).
+        consumer_credit_bytes: config.consumer_credit_bytes,
+        checkpoint_interval: config.checkpoint_interval,
+        // The acked-ahead RANGE cap (#543) at the engine's safe default: bounds each
+        // work-group cursor's out-of-order-ack memory to 16 KiB (1024 ranges), decoupled
+        // from `--max-in-flight`. Deliberately not a CLI/profile knob yet (the default
+        // never fires at any shipped profile's in-flight window); a
+        // `delivery.max_acked_ahead_runs` knob is the follow-up if operators need it.
+        max_acked_ahead_runs: ironbus_server::engine::DEFAULT_MAX_ACKED_AHEAD_RUNS,
+        // Consumer-safe retention (#13, #80), each `0` = disabled (off), the default. Size in
+        // record bytes, age in milliseconds (against the engine clock), count in messages; the
+        // bounds compose, so a segment is reaped if ANY enabled bound trips.
+        max_retained_bytes: config.max_retained_bytes,
+        max_age_ms: config.max_age_ms,
+        max_messages: config.max_messages,
+        // The work-group cap (refs #240, #9, #10): bounds consumer-state memory once the wire
+        // can name groups. `0` = unlimited (off); the default is non-zero (1024). A new named
+        // group past the cap is rejected by the engine before it allocates.
+        max_groups: config.max_groups,
+        max_streams: config.max_streams,
+        max_open_streams: config.max_open_streams,
+        max_metric_streams: ironbus_server::engine::DEFAULT_MAX_METRIC_STREAMS,
+        // Idle named-group eviction (refs #277, #240): the lifecycle reclaim that completes the
+        // #240 cap. `0` = disabled (off, the default), a non-zero value is the idle window in ms
+        // after which a fully-caught-up, lease-free named group is reclaimed. Never deletes a
+        // durable checkpoint, so a re-subscribe resumes; only caught-up groups are evicted, so a
+        // consumer's committed position is never lost.
+        group_idle_evict_ms: config.group_idle_evict_ms,
+        // The refuse-to-boot RAM ceiling (#115, #19), wired from `--ram-ceiling-bytes` (or the
+        // profile preset: 0 = off for balanced/throughput, 64 MiB for edge-tiny). `0` leaves the
+        // guard off and `ironbus_ram_headroom_bytes` at the `-1` sentinel; a set ceiling makes the
+        // gauge report a real `ceiling - RSS` value AND is enforced before this point by
+        // `validate_serve_config` (which refuses to boot when the worst-case bounded-buffer
+        // footprint provably exceeds it).
+        ram_ceiling_bytes: config.ram_ceiling_bytes,
+        // The disk-full overflow policy (#82): drop-new (default) sheds, drop-oldest force-reaps
+        // the oldest sealed segment then accepts. Honored only when `max_total_bytes` is set.
+        disk_full_policy: match config.disk_full_policy {
+            DiskFullPolicyArg::DropNew => DiskFullPolicy::DropNew,
+            DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
         },
-    )
-    .map_err(|e| CliError::Internal(format!("opening broker {context}: {e}")))?;
+        // The OPT-IN effectively-once dedup window (#3, #33): the dual count + time bound on each
+        // per-producer dedup ring, plus the cap on the NUMBER of distinct producer windows.
+        // Dedup is OFF by default and activates per-producer only when a publish carries a
+        // `msg_id`; these flags only SIZE the window when it does. `--dedup-max-ids` is the count
+        // bound (default 100k), `--dedup-window-ms` the time bound in ms (default 2 min), and
+        // `--dedup-max-producers` (default 4096) caps the producer windows so a flood of
+        // attacker-chosen `producer_id`s cannot grow RAM without bound (LRU eviction).
+        dedup: ironbus_core::dedup::DedupConfig {
+            max_ids: config.dedup_max_ids,
+            window_nanos: config.dedup_window_ms.saturating_mul(1_000_000),
+            max_producers: config.dedup_max_producers,
+        },
+        // The DURABILITY LEVEL (#341, #379), wired from `--durability-level`. Default `sync`
+        // (ack only after the covering fdatasync, I2, zero acked loss): a zero-config broker is
+        // byte-for-byte the historical durable broker. The relaxed levels are strictly opt-in and
+        // weaken I2 by a documented loss window; `async`/`none` are already gated behind the
+        // explicit `--async-loss-ack` acknowledgement by `validate_serve_config`, so an engine can
+        // only reach a loss-bearing level once the operator accepted the loss. The `interval`
+        // triggers (time/bytes) only matter under `interval`.
+        durability_level: match config.durability_level {
+            DurabilityLevelArg::Sync => DurabilityLevel::Sync,
+            DurabilityLevelArg::Interval => DurabilityLevel::Interval,
+            DurabilityLevelArg::Async => DurabilityLevel::Async,
+            DurabilityLevelArg::None => DurabilityLevel::None,
+        },
+        flush_interval_ms: config.flush_interval_ms,
+        flush_max_bytes: config.flush_max_bytes,
+        // The backpressure controls (#68, #69), wired from the serve flags. Every knob defaults
+        // to its disabling value (CoDel off, retry budget off, fire-and-forget ungoverned, egress
+        // at its floor), so a zero-config broker is byte-for-byte the historical broker. The
+        // engine CLAMPS the CoDel values and bounds the egress limiter, never rejecting a value.
+        codel_target_ms: config.codel_target_ms,
+        codel_interval_ms: config.codel_interval_ms,
+        retry_budget_ratio_per_million: config.retry_budget_ratio_per_million,
+        retry_budget_window_ms: config.retry_budget_window_ms,
+        fire_and_forget_msg_rate: config.fire_and_forget_msg_rate,
+        fire_and_forget_byte_rate: config.fire_and_forget_byte_rate,
+        fire_and_forget_refill_ms: config.fire_and_forget_refill_ms,
+        egress_limit: config.egress_limit,
+        // The event-driven consume long-poll budget (push delivery), wired from
+        // `--consume-longpoll-ms` (default `0` = OFF). Server-only: an idle consumer wakes on a
+        // commit instead of returning empty; no wire/client/format change.
+        consume_longpoll_ms: config.consume_longpoll_ms,
+        // The fsync-headroom admission window (#378), wired from `--wal-fsync-headroom-bytes`.
+        // Default `0` = OFF (the un-fsynced frontier is bounded only by the group-commit
+        // drain under `sync` / the interval window under a relaxed level), so a zero-config
+        // broker is unchanged; a non-zero value is the opt-in tight RAM / loss-window bound.
+        wal_fsync_headroom_bytes: config.wal_fsync_headroom_bytes,
+        // The pipelined sync tier's dirty-byte admission bound (#1040, INV-9), wired from
+        // `--sync-max-dirty-bytes` (default 16 MiB; explicit `0` disables). Enforced by the
+        // append actor's pipelined branch as a THROTTLE (block for the in-flight barrier's
+        // completion), never a shed — the sync tier's semantics.
+        sync_max_dirty_bytes: config.sync_max_dirty_bytes,
+        // The per-record write-path compression codec (#430, ADR-0003), wired from
+        // `--compression` (default `lz4`). `none` stores every record raw, byte-for-byte the
+        // historical layout; `zstd` was already rejected at parse on this build, so the two
+        // arms here are exhaustive.
+        compression: match config.compression {
+            CompressionArg::None => ironbus_core::compress::Codec::None,
+            CompressionArg::Lz4 => ironbus_core::compress::Codec::Lz4,
+        },
+    };
+    // At-rest encryption (#780 phase 3): a configured `--encryption-key-file` opens the engine's storage
+    // ENCRYPTED via `Engine::open_encrypted` — the phase-2-verified seam, so the resume-reattach fix and
+    // every fail-closed guard engage — and no key is the PLAINTEXT default (byte-for-byte the historical
+    // `Engine::open`). Feature-gated: a non-`encryption` build cannot reach here with a key configured
+    // (`resolve_encryption` refused it), so it always takes the plaintext open.
+    let opened = {
+        #[cfg(feature = "encryption")]
+        {
+            if config.encryption_key_file.is_some() {
+                let (crypto, keyring) = load_encryption_context(config)?;
+                Engine::open_encrypted(fs, SystemClock::new(), engine_config, crypto, keyring)
+            } else {
+                Engine::open(fs, SystemClock::new(), engine_config)
+            }
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            Engine::open(fs, SystemClock::new(), engine_config)
+        }
+    };
+    let engine =
+        opened.map_err(|e| CliError::Internal(format!("opening broker {context}: {e}")))?;
     let mut engine = engine;
     // Bound the concurrently-PREPARED transactional half messages (#909): the refuse-to-boot RAM guard
     // charges `max_prepared * a maximal frame` (term 7), so the engine MUST honor the configured cap
@@ -14350,6 +14654,9 @@ mod tests {
             // drain timeout) / off (no audit sink), so these validation/precedence tests are unaffected.
             drain_timeout_ms: DEFAULT_DRAIN_TIMEOUT_MS,
             audit_log: None,
+            encryption_key_file: None,
+            encryption_key_id: None,
+            encryption_suite: None,
         }
     }
 
@@ -15040,6 +15347,281 @@ mod tests {
         }
         drop(engine);
         dir
+    }
+
+    /// #780 phase 3 (the SERVE hookup): a broker started with an `[encryption]` config actually writes
+    /// ENCRYPTED-on-disk segments through the CLI → engine → storage seam, and a DEFAULT (no-key) reader
+    /// REFUSES them fail-closed. This is the end-to-end proof the phase-2 crypto is no longer inert at
+    /// the serve layer: it exercises `resolve_encryption` → `load_encryption_context` →
+    /// `Engine::open_encrypted` → `StreamSet::open_with_at_rest` → `create_encrypted` → encrypting
+    /// append, then the resume-reattach + the `EncryptedSegmentNoKey` guard on a no-key reopen.
+    /// Writes a 32-byte OWNER-ONLY at-rest key file at `path` (the phase-1 loader refuses a
+    /// group/world-readable file) and returns an encryption `ServeConfig` keyed off it.
+    #[cfg(all(unix, feature = "encryption"))]
+    fn encryption_test_config(key_path: &std::path::Path) -> ServeConfig {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::File::create(key_path)
+            .unwrap()
+            .write_all(&[0x5Au8; 32])
+            .unwrap();
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        ServeConfig {
+            encryption_key_file: Some(key_path.display().to_string()),
+            encryption_key_id: Some(7),
+            encryption_suite: None, // auto-detect the suite by CPU features
+            ..test_serve_config(64, 1)
+        }
+    }
+
+    /// RECURSIVELY walks every file under `dir` (descending into `pstreams/`, `prstreams/`, `streams/`,
+    /// `dlq/`, and all other subdirs) and asserts `needle` — a confidential plaintext canary — appears in
+    /// NONE of them. Returns the number of files scanned. This is what catches a leak in a substrate the
+    /// crypto seam does not reach (the #693/#553 partitioned/priority sub-logs the earlier non-recursive
+    /// scan missed).
+    #[cfg(all(unix, feature = "encryption"))]
+    fn assert_no_plaintext_under(dir: &std::path::Path, needle: &[u8]) -> usize {
+        let mut files = 0usize;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files += assert_no_plaintext_under(&path, needle);
+            } else {
+                files += 1;
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    !bytes.windows(needle.len()).any(|w| w == needle),
+                    "the plaintext canary leaked onto disk in {}",
+                    path.display()
+                );
+            }
+        }
+        files
+    }
+
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn serve_with_encryption_writes_encrypted_segments_and_a_no_key_reader_refuses() {
+        use ironbus_server::engine::EngineError;
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-enc-serve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let enc_config = encryption_test_config(&base.join("at-rest.key"));
+        let data_dir = base.join("data");
+
+        let secret: &[u8] = b"the-confidential-encrypted-payload-CANARY-xyzzy-4242";
+
+        // 1) An encrypted broker produces an encrypted-on-disk segment; and a partitioned (#693) /
+        //    priority-lane (#553) stream declare is REFUSED fail-closed under encryption (their
+        //    PartitionedStream sub-logs are not crypto-aware — a regression that dropped the guard would
+        //    let the declare succeed here, and a produce leak into pstreams//prstreams/).
+        {
+            let mut engine = open_disk_engine(&data_dir, &enc_config, &[], &[]).unwrap();
+            engine
+                .produce(&Append {
+                    timestamp_ms: 100,
+                    flags: RecordFlags::EMPTY,
+                    key: b"k",
+                    headers: b"",
+                    payload: secret,
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    engine.declare_partitioned_stream("orders", 4),
+                    Err(EngineError::EncryptedPartitionedStreamUnsupported)
+                ),
+                "a partitioned-stream declare must be refused under encryption"
+            );
+            assert!(
+                matches!(
+                    engine.declare_priority_stream("alerts", 3),
+                    Err(EngineError::EncryptedPartitionedStreamUnsupported)
+                ),
+                "a priority-lane-stream declare must be refused under encryption"
+            );
+            drop(engine);
+        }
+
+        // 2) The confidential PLAINTEXT payload NEVER appears on disk ANYWHERE under the data dir (a
+        //    RECURSIVE scan: the default stream is ciphertext, and no pstreams//prstreams/ subtree
+        //    leaked it — the refused declares created none).
+        let scanned = assert_no_plaintext_under(&data_dir, secret);
+        assert!(scanned >= 1, "at least one file was written + scanned");
+        assert!(
+            !data_dir.join("pstreams").exists() && !data_dir.join("prstreams").exists(),
+            "a refused partitioned/priority declare must materialize no pstreams//prstreams/ subtree"
+        );
+
+        // 3) A DEFAULT (no-key) reader REFUSES the encrypted-on-disk log fail-closed (the
+        //    always-compiled EncryptedSegmentNoKey guard) — it never silently starts plaintext.
+        let opened = open_disk_engine(&data_dir, &test_serve_config(64, 1), &[], &[]);
+        assert!(
+            opened.is_err(),
+            "a no-key reader must REFUSE an encrypted log, not silently start plaintext"
+        );
+        let err = opened.err().unwrap();
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("encrypt") || msg.contains("key"),
+            "the no-key reopen must refuse an encrypted log, got: {msg}"
+        );
+
+        // 4) Reopening WITH the key succeeds (finalize_at_rest re-attaches the crypto) and the record
+        //    round-trips: the decrypt-on-read path returns the original plaintext.
+        {
+            let mut engine = open_disk_engine(&data_dir, &enc_config, &[], &[]).unwrap();
+            match engine.poll(0).unwrap() {
+                ironbus_server::engine::Poll::Message(d) => assert_eq!(
+                    &d.record.payload[..],
+                    secret,
+                    "the encrypted record decrypts back to its plaintext on read"
+                ),
+                other => panic!("expected the decrypted message, got {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #780 phase 3 (the reviewer-found LEAK, fail-closed): declaring a partitioned (#693) OR a
+    /// priority-lane (#553) stream on an encrypted broker is REFUSED with
+    /// `EncryptedPartitionedStreamUnsupported`, and NO confidential body lands anywhere under the data
+    /// dir (a recursive scan). Their `PartitionedStream` sub-logs are not threaded through the at-rest
+    /// crypto seam, so a plaintext write would be a real at-rest leak; this pins the guard.
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn partitioned_and_priority_stream_declares_are_refused_under_encryption_with_no_leak() {
+        use ironbus_server::engine::EngineError;
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-enc-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let enc_config = encryption_test_config(&base.join("at-rest.key"));
+        let data_dir = base.join("data");
+        // A distinct canary we would produce to a partition IF the declare wrongly succeeded.
+        let part_secret: &[u8] = b"PARTITIONED-CONFIDENTIAL-CANARY-abc-98765";
+
+        {
+            let mut engine = open_disk_engine(&data_dir, &enc_config, &[], &[]).unwrap();
+            // Both partitioned modes must refuse at declare, before any pstreams//prstreams/ subtree.
+            match engine.declare_partitioned_stream("orders", 8) {
+                Err(EngineError::EncryptedPartitionedStreamUnsupported) => {}
+                Ok(_) => {
+                    // A guard regression: prove the leak so the recursive scan below FAILS loudly.
+                    let _ = engine.produce_in_stream(
+                        "orders",
+                        &Append {
+                            timestamp_ms: 1,
+                            flags: RecordFlags::EMPTY,
+                            key: b"k",
+                            headers: b"",
+                            payload: part_secret,
+                        },
+                    );
+                    panic!(
+                        "the partitioned declare must be refused under encryption, it succeeded"
+                    );
+                }
+                Err(other) => {
+                    panic!("expected EncryptedPartitionedStreamUnsupported, got {other:?}")
+                }
+            }
+            match engine.declare_priority_stream("alerts", 4) {
+                Err(EngineError::EncryptedPartitionedStreamUnsupported) => {}
+                other => panic!(
+                    "the priority declare must be refused with EncryptedPartitionedStreamUnsupported, \
+                     got {other:?}"
+                ),
+            }
+            drop(engine);
+        }
+
+        // No partitioned/priority subtree was created, and neither canary appears in the clear anywhere.
+        assert!(
+            !data_dir.join("pstreams").exists() && !data_dir.join("prstreams").exists(),
+            "a refused declare must materialize no pstreams//prstreams/ subtree"
+        );
+        assert_no_plaintext_under(&data_dir, part_secret);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #780 phase 3: an encrypted broker that INHERITS a pre-existing plaintext `pstreams/` subtree on
+    /// disk (a broker that ran plaintext with partitioned streams, then had encryption turned on) must
+    /// FAIL CLOSED at open rather than silently reopen + serve those crypto-unaware sub-logs plaintext.
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn an_encrypted_open_of_a_preexisting_partitioned_subtree_fails_closed() {
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-enc-inherit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let data_dir = base.join("data");
+        let enc_config = encryption_test_config(&base.join("at-rest.key"));
+
+        // 1) An ENCRYPTED broker lays down an encrypted ROOT log (and, correctly, NO pstreams/ — the
+        //    declare path refuses partitioned streams under encryption). A clean encrypted deployment.
+        {
+            let mut engine = open_disk_engine(&data_dir, &enc_config, &[], &[]).unwrap();
+            engine
+                .produce(&Append {
+                    timestamp_ms: 1,
+                    flags: RecordFlags::EMPTY,
+                    key: b"k",
+                    headers: b"",
+                    payload: b"encrypted-default-body",
+                })
+                .unwrap();
+            drop(engine);
+        }
+        assert!(
+            !data_dir.join("pstreams").exists(),
+            "a clean encrypted broker declares no partitioned streams, so no pstreams/ exists"
+        );
+
+        // 2) Simulate an INHERITED / hand-crafted crypto-unaware `pstreams/` subtree appearing under the
+        //    encrypted data dir (a copied-in subtree, or a future materialization bug). The open-time
+        //    guard is the defense-in-depth backstop the declare-time guard cannot cover: a broker that
+        //    reopens an encrypted root must NOT silently reopen + serve a plaintext partition sub-log.
+        std::fs::create_dir_all(data_dir.join("pstreams").join("6f7264657273")).unwrap();
+
+        // 3) Reopening WITH the key must FAIL CLOSED at open (the encrypted root would open fine; the
+        //    inherited pstreams/ subtree is what must trip the refusal).
+        let opened = open_disk_engine(&data_dir, &enc_config, &[], &[]);
+        match opened {
+            Err(CliError::Internal(msg)) => assert!(
+                msg.to_lowercase().contains("partitioned")
+                    || msg.to_lowercase().contains("priority"),
+                "the open must refuse the inherited partitioned subtree, got: {msg}"
+            ),
+            Ok(_) => {
+                panic!("an encrypted open of a pre-existing pstreams/ subtree must fail closed")
+            }
+            Err(other) => panic!("expected a partitioned-stream refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #780 phase 3: `--compact` (key-compaction, not yet crypto-aware) alongside at-rest encryption is
+    /// refused at STARTUP with a clean usage error (consistent with the shared-WAL / memory-backend
+    /// startup refusals), rather than only fail-closing at runtime once a compaction pass first triggers.
+    #[cfg(all(unix, feature = "encryption"))]
+    #[test]
+    fn compact_plus_encryption_is_refused_at_startup() {
+        let cfg = ServeConfig {
+            encryption_key_file: Some("/some/at-rest.key".to_string()),
+            encryption_key_id: Some(7),
+            encryption_suite: None,
+            compact: true,
+            ..test_serve_config(64, 1)
+        };
+        let err = validate_serve_config(&cfg).unwrap_err();
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("compact") && msg.contains("encryption"),
+            "the startup refusal must name both --compact and encryption, got: {msg}"
+        );
     }
 
     // --- offline mutating admin verbs (#299) ---
@@ -18022,6 +18604,9 @@ mod tests {
             // drain timeout) / off (no audit sink), so these validation/precedence tests are unaffected.
             drain_timeout_ms: DEFAULT_DRAIN_TIMEOUT_MS,
             audit_log: None,
+            encryption_key_file: None,
+            encryption_key_id: None,
+            encryption_suite: None,
         }
     }
 

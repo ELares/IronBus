@@ -451,6 +451,26 @@ warning), since TLS/auth are not yet wired there either. `enable_admin` ships (i
 gates the read-only `/admin` introspection endpoint) but the mutating `CONFIG`
 verbs do not (#88).
 
+### At-rest encryption (`[encryption]`)
+
+Optional at-rest AEAD encryption of segment record bodies (#780 phase 3,
+[AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md)). WIRED keys, **feature-gated behind the
+`encryption` cargo feature**: a build compiled WITHOUT the feature refuses these keys fail-closed
+(it links no AEAD crypto, so honoring them would start the broker in plaintext under a config that
+asked for encryption), never a silent warn-and-ignore. Encryption is ON iff `key_file` is set.
+
+| Knob (file key) | Flag / env | Type | Default | Units | Valid range | Reload |
+| --- | --- | --- | --- | --- | --- | --- |
+| `key_file` | `--encryption-key-file` / `IRONBUS_ENCRYPTION_KEY_FILE` | path | off (not set) | -- | a file of EXACTLY 32 raw key bytes, mode `& 0o077 == 0` (owner-only, #109). Setting it ENABLES encryption. | COLD |
+| `key_id` | `--encryption-key-id` / `IRONBUS_ENCRYPTION_KEY_ID` | u64 | none | -- | a NON-ZERO identifier; REQUIRED when `key_file` is set | COLD |
+| `suite` | `--encryption-suite` / `IRONBUS_ENCRYPTION_SUITE` | enum | `auto` | -- | `auto` (CPU detect) / `aes-256-gcm` / `chacha20-poly1305` | COLD |
+
+Phase-3 limits (each fails CLOSED, never leaks): disk backend only (not `--storage memory`),
+per-stream-logs mode only (not `--storage-mode shared-wal`), no dead-lettering and no transactions
+while on, single-node only (a cluster/federation ciphertext path is refused), and enable on a FRESH
+data directory (a no-key reader refuses an encrypted log; a keyed open of a plaintext log is
+refused). See [AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md) "Serve configuration".
+
 ### Observability (`[observability]`) and auth (`[auth]`)
 
 Per the #139 coherence resolution, the locked, fatal-on-unknown top-level section
@@ -470,7 +490,8 @@ under the existing tables.
 
 The top-level TOML sections are FROZEN as a stability contract: `[durability]`,
 `[storage]`, `[retention]`, `[backpressure]`, `[network]` (with `[network.tls]`),
-`[delivery]`, `[observability]`, and `[auth]`. A future rename ships the new name
+`[delivery]`, `[encryption]` (WIRED as of #780 phase 3), `[observability]`, and
+`[auth]`. A future rename ships the new name
 WITH the old name as a deprecated alias, never a silent break. Unknown top-level
 sections and unknown keys are REJECTED fatally by default (with an edit-distance
 did-you-mean), because warn-and-ignore is how a typo silently disables durability
