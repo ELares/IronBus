@@ -2287,7 +2287,15 @@ impl Session {
         if self.level0_pending.is_empty() {
             return Ok(());
         }
-        engine.produce_no_reply_batch(std::mem::take(&mut self.level0_pending))?;
+        // Reuse ONE batch allocation across passes (#775): `mem::take` hands the drained batch to the
+        // actor by value (the actor returns it to this connection's buffer pool once appended), then
+        // REFILL `level0_pending` with a recycled buffer (its capacity retained, always cleared — see
+        // `l0_buf_return`) so the next pass's appends never regrow from a zero-capacity `Vec`. The buffer
+        // taken here is NEVER the one just sent (that one is owned by the actor until it drains it), so
+        // there is no aliasing; a cold pool simply hands back a fresh empty `Vec` (today's behavior).
+        let batch = std::mem::take(&mut self.level0_pending);
+        self.level0_pending = engine.take_l0_buf();
+        engine.produce_no_reply_batch(batch)?;
         Ok(())
     }
 
@@ -15051,6 +15059,28 @@ mod tests {
         frame(FrameType::Pub, &pub_body)
     }
 
+    /// Encodes one LEVEL-0 (QoS-0, fire-and-forget) PUB frame carrying `payload`, for the server-side
+    /// batch-path tests (#775). The only difference from [`pub_frame`] is the fire-and-forget bit
+    /// ([`PUB_FLAG_FIRE_AND_FORGET`], which `pub_ack_level` reads as [`AckLevel::NoAck`]), so the session
+    /// routes it into the pass-scoped Level-0 batch instead of the parked at-least-once window.
+    fn l0_pub_frame(payload: &[u8]) -> Vec<u8> {
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: true,
+                payload,
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        frame(FrameType::Pub, &pub_body)
+    }
+
     #[test]
     fn pipelined_pubs_in_one_pass_reply_fifo_acks_in_frame_order() {
         // The pipelined window's WIRE contract (#450): N PUB frames in ONE input buffer get N
@@ -15428,6 +15458,272 @@ mod tests {
             1,
             "the second produce takes the next offset — FIFO, no reorder"
         );
+
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join().unwrap();
+    }
+
+    // -- #775: server-side Level-0 (QoS-0) batch-path ordering + buffer-pool tests ------------------
+    //
+    // The #755 tests were client-side only; these guard the SERVER side of the Level-0 batch path: the
+    // session's flush-ordering discipline (the batch reaches the actor before any Level-1 produce or
+    // non-produce op, and the MAX_PARKED cap-flush splits in order) and the #775 batch-buffer pool's
+    // clear-on-reuse. The three ordering tests use a recording `EngineAccess` double so the session's
+    // exact flush SEQUENCE is observed directly; the pool test uses a real actor (the pool lives on the
+    // real handle).
+
+    /// One recorded flush-path event the session drove on the [`L0OrderRecorder`] (#775), in call order.
+    #[derive(Debug, PartialEq, Eq)]
+    enum L0FlushEvent {
+        /// A `produce_no_reply_batch` (a Level-0 batch flush), carrying the batched appends' payloads in
+        /// order — so a test can assert both the split boundaries and the in-order, no-drop contents.
+        Batch(Vec<Vec<u8>>),
+        /// A `produce_submit` (an at-least-once produce), carrying its payload.
+        Submit(Vec<u8>),
+    }
+
+    /// A recording [`EngineAccess`] double (#775) that captures the SEQUENCE of produce operations the
+    /// session drives — every Level-0 `produce_no_reply_batch` and every at-least-once `produce_submit`,
+    /// in call order — so a test can assert the session's flush-before-produce / flush-before-dispatch
+    /// ordering and the `MAX_PARKED_PRODUCES` cap-flush split DIRECTLY, with no actor or fsync. It uses
+    /// the DEFAULT (unpooled) `take_l0_buf`, so it exercises the session's flush logic independently of
+    /// the buffer pool (which the real-actor pool test covers separately). `produce_submit` hands back a
+    /// `Ready` outcome at the next monotonically-assigned offset, so a batched L0 run advances the offset
+    /// the same as the actor would and a trailing L1 observes the offset AFTER every batched L0.
+    struct L0OrderRecorder {
+        events: std::cell::RefCell<Vec<L0FlushEvent>>,
+        next_offset: std::cell::Cell<u64>,
+    }
+
+    impl L0OrderRecorder {
+        fn new() -> Self {
+            Self {
+                events: std::cell::RefCell::new(Vec::new()),
+                next_offset: std::cell::Cell::new(0),
+            }
+        }
+
+        fn events(&self) -> Vec<L0FlushEvent> {
+            self.events.borrow_mut().drain(..).collect()
+        }
+    }
+
+    impl EngineAccess<InMemoryFs, ManualClock> for L0OrderRecorder {
+        fn produce(&self, _append: OwnedAppend) -> Result<ProduceOutcome, ActorGone> {
+            // Never reached: `handle_pub` routes an at-least-once produce through `produce_submit` and a
+            // Level-0 produce through `produce_no_reply_batch`.
+            Ok(ProduceOutcome::Appended(Offset::new(0)))
+        }
+        fn produce_submit(&self, append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
+            self.events
+                .borrow_mut()
+                .push(L0FlushEvent::Submit(append.payload.to_vec()));
+            let offset = self.next_offset.get();
+            self.next_offset.set(offset + 1);
+            Ok(ProduceSubmission::Ready(ProduceOutcome::Appended(
+                Offset::new(offset),
+            )))
+        }
+        fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
+            // Record the batch as ONE event (do NOT fall through to the default's per-append fan-out):
+            // this IS the coalesced Level-0 batch the session handed over.
+            self.events.borrow_mut().push(L0FlushEvent::Batch(
+                appends.iter().map(|a| a.payload.to_vec()).collect(),
+            ));
+            self.next_offset
+                .set(self.next_offset.get() + appends.len() as u64);
+            Ok(())
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            // Unreached by the ordering tests (they use PING as the non-produce frame, which never
+            // touches the engine); a call here would be a test-scenario bug, so fail loudly.
+            Err(ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+    }
+
+    #[test]
+    fn a_level0_batch_flushes_before_a_level1_produce_in_the_same_pass_775() {
+        // FLUSH-ORDERING (the `flush_level0`-before-`produce_submit` seam, session.rs handle_pub): a
+        // Level-0 batch accumulated BEFORE an at-least-once produce in the SAME pass must reach the actor
+        // FIRST, so the single total order holds (the earlier-decoded L0s are appended before the L1).
+        // Observed directly: the recorder saw the whole L0 batch, THEN the L1 submit, and the L1 took the
+        // offset AFTER every batched L0.
+        let engine = L0OrderRecorder::new();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&engine, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&l0_pub_frame(b"a0"));
+        input.extend_from_slice(&l0_pub_frame(b"a1"));
+        input.extend_from_slice(&l0_pub_frame(b"a2"));
+        input.extend_from_slice(&pub_frame(b"z")); // the at-least-once produce
+        s.process(&engine, &input, &mut out).unwrap();
+        s.flush_all_parked_blocking(&engine, &mut out).unwrap();
+
+        assert_eq!(
+            engine.events(),
+            vec![
+                L0FlushEvent::Batch(vec![b"a0".to_vec(), b"a1".to_vec(), b"a2".to_vec()]),
+                L0FlushEvent::Submit(b"z".to_vec()),
+            ],
+            "the L0 batch is flushed to the actor BEFORE the L1 is submitted (single total order)"
+        );
+        // The L1's PubAck carries the offset AFTER the three batched L0s (offsets 0,1,2 → L1 = 3).
+        let acks = decode_all(&out);
+        assert_eq!(acks.len(), 1, "exactly the L1 acks (the L0s are no-ack)");
+        assert_eq!(acks[0].0, FrameType::PubAck);
+        assert_eq!(
+            decode_pub_ack(&acks[0].1).unwrap().offset,
+            3,
+            "the L1 lands AFTER every batched L0"
+        );
+    }
+
+    #[test]
+    fn a_level0_batch_over_the_max_parked_cap_splits_into_in_order_batches_775() {
+        // THE `MAX_PARKED_PRODUCES` CAP-FLUSH (session.rs, the `level0_pending.len() >= cap` flush): more
+        // than one cap's worth of Level-0 produces in ONE pass cannot accumulate unbounded — the session
+        // flushes at the cap and starts a fresh batch. Proven: the run splits into a first batch at
+        // EXACTLY the cap and the remainder at end-of-pass, with the payloads still 0..N IN ORDER across
+        // the split (no reorder, no drop).
+        let engine = L0OrderRecorder::new();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&engine, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        let total = MAX_PARKED_PRODUCES + 5;
+        let mut input = Vec::new();
+        for i in 0..total {
+            let tag = u32::try_from(i).expect("index fits in u32");
+            input.extend_from_slice(&l0_pub_frame(&tag.to_le_bytes()));
+        }
+        s.process(&engine, &input, &mut out).unwrap();
+
+        let events = engine.events();
+        assert_eq!(
+            events.len(),
+            2,
+            "the pass split into two in-order batches at the MAX_PARKED cap"
+        );
+        let (b0, b1) = match (&events[0], &events[1]) {
+            (L0FlushEvent::Batch(b0), L0FlushEvent::Batch(b1)) => (b0, b1),
+            other => panic!("expected two Batch events, got {other:?}"),
+        };
+        assert_eq!(
+            b0.len(),
+            MAX_PARKED_PRODUCES,
+            "the first batch flushed at exactly the cap"
+        );
+        assert_eq!(b1.len(), 5, "the remainder flushed at end-of-pass");
+        let seen: Vec<u32> = b0
+            .iter()
+            .chain(b1.iter())
+            .map(|p| u32::from_le_bytes(p.as_slice().try_into().unwrap()))
+            .collect();
+        let expected: Vec<u32> = (0..u32::try_from(total).expect("total fits in u32")).collect();
+        assert_eq!(
+            seen, expected,
+            "concatenated the two batches are the appends 0..N IN ORDER — no reorder, none dropped"
+        );
+    }
+
+    #[test]
+    fn a_non_produce_frame_flushes_the_level0_batch_before_it_dispatches_775() {
+        // FLUSH-BEFORE-DISPATCH (session.rs, the `flush_level0` before `drain_parked` + `dispatch` for a
+        // non-produce frame): a Level-0 batch accumulated BEFORE a non-produce frame (ack/flow/sub/ping)
+        // must reach the actor FIRST, so the actor observes the earlier L0s before the non-produce op
+        // (single total order). Proven with a PING mid-pass: the batch splits at the PING — the earlier
+        // L0s flush as one batch BEFORE the dispatch, the trailing L0 flushes at end-of-pass. A missing
+        // flush-before-dispatch would coalesce all three into ONE end-of-pass batch.
+        let engine = L0OrderRecorder::new();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&engine, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&l0_pub_frame(b"a0"));
+        input.extend_from_slice(&l0_pub_frame(b"a1"));
+        input.extend_from_slice(&frame(FrameType::Ping, b"")); // the non-produce frame
+        input.extend_from_slice(&l0_pub_frame(b"a2"));
+        s.process(&engine, &input, &mut out).unwrap();
+
+        assert_eq!(
+            engine.events(),
+            vec![
+                L0FlushEvent::Batch(vec![b"a0".to_vec(), b"a1".to_vec()]),
+                L0FlushEvent::Batch(vec![b"a2".to_vec()]),
+            ],
+            "the pending L0 batch flushes BEFORE the non-produce frame dispatches (split at the PING)"
+        );
+        // The PING dispatched (its Pong is the only wire reply) — between the two batch flushes.
+        let frames = decode_all(&out);
+        assert_eq!(
+            frames.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![FrameType::Pong],
+            "the non-produce frame ran after the earlier L0s were flushed"
+        );
+    }
+
+    #[test]
+    fn the_level0_batch_buffer_is_cleared_before_reuse_across_flush_passes_775() {
+        // THE #775 BATCH-BUFFER POOL's clear-on-reuse, over a REAL actor (the pool lives on the real
+        // handle). Several flush passes, each a batch of Level-0 PUBs with pass-distinct payloads. A
+        // `with` job between passes BARRIERS the actor: because it drains commands FIFO, by the time
+        // `with` returns the actor has appended the pass's batch AND returned the drained buffer (cleared)
+        // to the connection's pool — so the NEXT pass's `flush_level0` DETERMINISTICALLY reuses that
+        // recycled buffer. If a reused buffer were NOT cleared, the next batch would replay the prior
+        // pass's appends and the durable head would jump by more than that pass's count. Asserting
+        // head == cumulative count after every pass proves the clear-on-reuse (no stale appends leak).
+        use crate::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
+
+        let engine = Engine::open(InMemoryFs::new(), ManualClock::new(), test_config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&handle, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        let pass_sizes = [3usize, 2, 4, 1];
+        let mut cumulative = 0u64;
+        for (p, &k) in pass_sizes.iter().enumerate() {
+            let mut input = Vec::new();
+            for i in 0..k {
+                input.extend_from_slice(&l0_pub_frame(format!("p{p}-{i}").as_bytes()));
+            }
+            s.process(&handle, &input, &mut out).unwrap();
+            cumulative += k as u64;
+            // Barrier + observe: the `with` job runs AFTER the pass's batch command (FIFO), so the
+            // actor has appended the batch and returned the drained buffer to the pool before it runs.
+            // `append_head` is the visible appended head (a no-ack L0 is not fsync'd, so read the
+            // appended head, not the durable one). Exactly `cumulative` records were appended — a
+            // recycled-but-uncleared buffer would have replayed a prior pass's appends and bumped the
+            // head past `cumulative`.
+            let head = handle.with(|e| e.append_head().get()).unwrap();
+            assert_eq!(
+                head, cumulative,
+                "after pass {p} exactly {cumulative} records were appended — a reused batch buffer never \
+                 replays a prior pass's appends (clear-on-reuse)"
+            );
+        }
 
         let _ = handle.shutdown();
         drop(handle);

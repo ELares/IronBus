@@ -145,6 +145,48 @@ fn pool_return(pool: &ReplyPool, channel: ReplyChannel) {
         .push(channel);
 }
 
+/// A per-CONNECTION free-list of drained Level-0 batch buffers (#775), so the QoS-0 batch path reuses
+/// ONE `Vec<OwnedAppend>` allocation across flush passes instead of regrowing from zero every pass
+/// (`Session::flush_level0` `mem::take`s the batch by value into the command, leaving a zero-capacity
+/// `Vec` behind). It mirrors [`ReplyPool`] (#475): each cloned [`EngineHandle`] (one per connection,
+/// see `server.rs`) gets its OWN fresh pool, and the pool rides WITH the `Command::ProduceNoReplyBatch`
+/// so the SHARED actor returns the drained buffer to the ORIGINATING connection's pool (a buffer never
+/// crosses connections).
+///
+/// Correctness — the two seams the buffer's lifecycle is kept provably clean on:
+///  * NO STALE APPENDS: [`l0_buf_return`] `clear()`s the `Vec` BEFORE it re-enters the pool, so the pool
+///    only ever holds empty buffers and a reuse can never replay a prior batch's appends.
+///  * NO ALIASING: the buffer is owned by exactly one party at a time — the session `mem::take`s it
+///    (relinquishing its reference) into the command, the channel move hands the actor SOLE ownership,
+///    and the actor returns it to the pool only AFTER its drain loop finished reading it. A `take_l0_buf`
+///    hands out a DIFFERENT buffer (or a fresh one), never the one currently in flight.
+///
+/// Unlike [`ReplyPool`] (locked only by the connection thread), BOTH threads touch this `Mutex` (the
+/// connection thread pops on flush, the actor pushes on drain), but the critical section is a single
+/// `Vec` push/pop — far cheaper than the per-pass regrow it removes.
+pub type L0BufPool = std::sync::Arc<std::sync::Mutex<Vec<Vec<OwnedAppend>>>>;
+
+/// Pops a reusable (already-cleared) Level-0 batch buffer from the pool, or makes a fresh empty one if
+/// the pool is cold (#775). Warms to the connection's steady batch depth once, then recycles; the lock
+/// is a single `Vec::pop`.
+fn l0_buf_take(pool: &L0BufPool) -> Vec<OwnedAppend> {
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+        .unwrap_or_default()
+}
+
+/// Returns a DRAINED Level-0 batch buffer to the pool for the next flush pass to reuse (#775). Called by
+/// the actor only AFTER the drain loop finished reading `buf` (no aliasing), and `clear()`s it here so
+/// the pool's INVARIANT — empty buffers only — holds by construction and a reuse can never replay a
+/// stale append. A poisoned lock is recovered (the pool is plain data), so recycling never panics.
+fn l0_buf_return(pool: &L0BufPool, mut buf: Vec<OwnedAppend>) {
+    buf.clear();
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(buf);
+}
+
 /// A produce request's payload, OWNED so it can cross the channel to the actor (the wire [`Append`]
 /// borrows the connection's input buffer, which the actor cannot hold). The actor borrows it back as
 /// an [`Append`] to append it. Fields mirror [`Append`], plus the opt-in dedup identity (#33).
@@ -619,6 +661,12 @@ enum Command<F: Filesystem, C: Clock> {
     ProduceNoReplyBatch {
         /// The owned Level-0 produce payloads, in connection order.
         appends: Vec<OwnedAppend>,
+        /// The ORIGINATING connection's Level-0 batch-buffer pool (#775). After the actor drains
+        /// `appends`, it returns the (cleared) `Vec` here so the session reuses the allocation next
+        /// flush pass instead of regrowing from zero. The pool rides WITH the command because the actor
+        /// is SHARED across connections — this routes the drained buffer back to exactly the connection
+        /// that sent it (each cloned handle has its own fresh pool, like [`ReplyPool`]).
+        buf_pool: L0BufPool,
     },
     /// Run an engine job (an ack, a flow/poll batch, a subscribe, a checkpoint), then it replies itself.
     Run(Job<F, C>),
@@ -657,6 +705,14 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// pool is only ever locked by the owning connection thread (uncontended). It carries no produce
     /// state: it is purely an allocation cache, so it never affects reply ORDER or I2.
     reply_pool: ReplyPool,
+    /// The per-CONNECTION free-list of drained Level-0 batch buffers (#775), the QoS-0 twin of
+    /// `reply_pool`: `produce_no_reply_batch` attaches it to the `Command::ProduceNoReplyBatch` so the
+    /// actor returns the drained `Vec<OwnedAppend>` here (cleared) after appending it, and
+    /// [`EngineHandle::take_l0_buf`] pops it back so the session reuses ONE allocation across flush passes
+    /// instead of regrowing from zero. [`Clone`] gives each new connection a FRESH empty pool (a buffer
+    /// never crosses connections). Pure allocation cache: it never affects the batch's contents, order, or
+    /// the single total order (the actor only ever recycles an already-cleared, no-longer-referenced Vec).
+    l0_buf_pool: L0BufPool,
     /// The connection-thread byte-cap fast-reject gate (#476, fixes #465): a relaxed-atomic snapshot
     /// of the durable-log byte-cap shed state the connection thread reads BEFORE the blocking
     /// `tx.send`, so an at-or-over-cap produce is replied `AtCapacity` immediately WITHOUT enqueuing
@@ -755,6 +811,9 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // recycled reply channels stay strictly per-connection and never cross-deliver. The pool
             // warms lazily on that connection's first produces.
             reply_pool: Arc::new(Mutex::new(Vec::new())),
+            // A FRESH Level-0 batch-buffer pool per clone (#775), like `reply_pool`: recycled batch
+            // buffers stay strictly per-connection (a buffer never crosses connections). Warms lazily.
+            l0_buf_pool: Arc::new(Mutex::new(Vec::new())),
             // The SAME shared gate (#476): every connection reads the one byte-cap snapshot the actor
             // publishes, so the `Arc` is shared on clone (NOT freshened like `reply_pool`).
             cap_gate: Arc::clone(&self.cap_gate),
@@ -1022,7 +1081,10 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
         if self.cap_gate.cap() == 0 {
             return self
                 .tx
-                .send(Command::ProduceNoReplyBatch { appends })
+                .send(Command::ProduceNoReplyBatch {
+                    appends,
+                    buf_pool: self.l0_buf_pool.clone(),
+                })
                 .map_err(|_| ActorGone);
         }
         // CAPPED PATH: per-append fast-reject, SAME as `produce_no_reply`. The byte-cap snapshot can
@@ -1046,8 +1108,22 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
             return Ok(());
         }
         self.tx
-            .send(Command::ProduceNoReplyBatch { appends })
+            .send(Command::ProduceNoReplyBatch {
+                appends,
+                buf_pool: self.l0_buf_pool.clone(),
+            })
             .map_err(|_| ActorGone)
+    }
+
+    /// Takes a REUSABLE Level-0 batch buffer for the session to accumulate the next pass's no-ack
+    /// produces into (#775): pops one the actor drained and returned (its capacity retained, always
+    /// cleared, see [`l0_buf_return`]), or a fresh empty `Vec` when the pool is cold. The session's
+    /// [`Session::flush_level0`] calls this right after it `mem::take`s the batch into the command, so the
+    /// buffer it accumulates into next never regrows from zero. The buffer handed back is NEVER the one
+    /// currently in flight (that one is owned by the actor until it drains + returns it), so there is no
+    /// aliasing.
+    pub fn take_l0_buf(&self) -> Vec<OwnedAppend> {
+        l0_buf_take(&self.l0_buf_pool)
     }
 
     /// Runs `job` on the owned engine and AWAITS its result. Used for every engine operation that is
@@ -1287,6 +1363,16 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
             self.produce_no_reply(append)?;
         }
         Ok(())
+    }
+
+    /// Takes a REUSABLE Level-0 batch buffer for the session to accumulate the next pass's no-ack
+    /// produces into (#775). [`EngineHandle`] overrides this to pop a buffer the actor drained and
+    /// returned (capacity retained, always cleared) so the QoS-0 batch path reuses one allocation across
+    /// passes. The DEFAULT (the direct/test engines) has no actor to recycle through, so it returns a
+    /// fresh empty `Vec` — correct, just unpooled (those engines produce synchronously, so there is
+    /// nothing in flight to recycle).
+    fn take_l0_buf(&self) -> Vec<OwnedAppend> {
+        Vec::new()
     }
 
     /// Runs `job` on the engine and returns its result.
@@ -1547,6 +1633,12 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         EngineHandle::produce_no_reply_batch(self, appends)
     }
 
+    fn take_l0_buf(&self) -> Vec<OwnedAppend> {
+        // The REAL pooled take (#775): pop a buffer the actor drained + cleared + returned, so the
+        // session's next Level-0 batch reuses the allocation instead of regrowing from zero.
+        EngineHandle::take_l0_buf(self)
+    }
+
     fn with<R, J>(&self, job: J) -> Result<R, ActorGone>
     where
         R: Send + 'static,
@@ -1763,6 +1855,12 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
 
     fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
         EngineAccess::produce_no_reply_batch(self.primary(), appends)
+    }
+
+    fn take_l0_buf(&self) -> Vec<OwnedAppend> {
+        // Route through the primary handle's pool (#775): at K = 1 this is byte-for-byte the single
+        // handle, and the primary is the connection's real L0-batch target.
+        EngineAccess::take_l0_buf(self.primary())
     }
 
     fn with<R, J>(&self, job: J) -> Result<R, ActorGone>
@@ -2258,6 +2356,9 @@ where
             // The base handle's pool (#475); each per-connection `clone` gets its own fresh pool, so
             // this one is only used if the base handle itself produces (e.g. in tests).
             reply_pool: Arc::new(Mutex::new(Vec::new())),
+            // The base handle's Level-0 batch-buffer pool (#775); each per-connection `clone` gets its
+            // own fresh pool. Only the base handle's is used if the base handle itself batches (tests).
+            l0_buf_pool: Arc::new(Mutex::new(Vec::new())),
             // The shared fast-reject gate (#476); every connection `clone` shares this same `Arc`.
             cap_gate,
             // The spin discriminant snapshotted above (#1032); copied into every connection clone.
@@ -2602,10 +2703,14 @@ where
                 // CHANNEL-SEND coalescing — the per-append append/admission work is byte-identical to the
                 // per-message arm; only the session->actor handoff was batched, so the single total order
                 // and I2 for other records are untouched.
-                Command::ProduceNoReplyBatch { appends } => {
+                Command::ProduceNoReplyBatch { appends, buf_pool } => {
                     for append in &appends {
                         process_produce(&mut engine, &mut pending, append, None);
                     }
+                    // Return the DRAINED buffer to the originating connection's pool (#775): the loop
+                    // above finished reading `appends` (no aliasing), so `l0_buf_return` clears it and
+                    // recycles the allocation for the session's next flush pass.
+                    l0_buf_return(&buf_pool, appends);
                 }
                 // A non-produce job must observe a consistent durable head and keep the total durable
                 // order, so flush the parked produces (one fsync) BEFORE it runs.
@@ -2819,10 +2924,13 @@ where
                 Command::ProduceNoReply { append } => {
                     process_produce(&mut engine, &mut pipeline, &append, None);
                 }
-                Command::ProduceNoReplyBatch { appends } => {
+                Command::ProduceNoReplyBatch { appends, buf_pool } => {
                     for append in &appends {
                         process_produce(&mut engine, &mut pipeline, append, None);
                     }
+                    // Recycle the drained buffer to the connection's pool (#775), same as the legacy
+                    // loop: read the whole batch first, then clear + return the allocation.
+                    l0_buf_return(&buf_pool, appends);
                 }
                 // E5: a Run job does NOT quiesce the pipeline (L9). The job observes a consistent,
                 // MONOTONE durable head that may trail the appended head by the in-flight window;
@@ -3227,10 +3335,14 @@ where
                         Ok(Command::ProduceNoReply { append }) => {
                             process_produce(engine, self, &append, None);
                         }
-                        Ok(Command::ProduceNoReplyBatch { appends }) => {
+                        Ok(Command::ProduceNoReplyBatch { appends, buf_pool }) => {
                             for append in &appends {
                                 process_produce(engine, self, append, None);
                             }
+                            // Recycle the drained buffer to the connection's pool (#775): the linger
+                            // loop reads the batch, then clears + returns the allocation like the
+                            // main loops.
+                            l0_buf_return(&buf_pool, appends);
                         }
                         // A non-produce command ends the linger: dispatch the window now and
                         // handle the command in the normal loop (as the next pass's head).
