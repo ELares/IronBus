@@ -182,6 +182,32 @@ cargo build --release --target aarch64-unknown-linux-musl
 scp target/aarch64-unknown-linux-musl/release/ironbus pi@edge-device:/usr/local/bin/ironbus
 ```
 
+### The fastest local loop: `ironbus dev`
+
+Just want to see a message move? After installing, **one command** stands up a throwaway local broker — friendly loopback ports, a pre-declared `demo` stream with a couple of `demo.*` subjects, and a copy-paste produce/consume snippet — all backed by an **ephemeral temp data dir that is removed on exit** (a clean stop *and* `Ctrl-C` / `SIGTERM`). Nothing to configure, nothing to clean up:
+
+```sh
+ironbus dev
+```
+
+It prints exactly what to paste into another terminal, pointed at the address it bound, for example:
+
+```sh
+# consume the default stream (this blocks, waiting for messages):
+ironbus sub --addr 127.0.0.1:7777 --group demo --ack
+
+# produce a message — watch it land in the consumer above:
+ironbus pub --addr 127.0.0.1:7777 --key demo.hello 'hello from ironbus dev'
+```
+
+Want instant activity in `ironbus top` and `/admin`? Seed some synthetic messages into the demo stream on startup:
+
+```sh
+ironbus dev --seed 1000
+```
+
+`dev` is **pure sugar** over the normal `serve` / `top` / `/admin` surfaces — the same single binary, no extra process, no Docker, no config file, no embedded console. If `127.0.0.1:7777` / `:7778` are already in use it picks free ports and tells you. It is for local exploration only; for a real node use `serve` below. (Unix only, like the broker itself.)
+
 ### 2. Start the broker on the edge
 
 The only required flag is `--data-dir` (the durable log, the consumer cursors, and the dead-letter sink all live there). Use the `edge-tiny` profile for a small-RAM, flash-gentle node:

@@ -277,6 +277,12 @@ pub(crate) const COMMAND_TREE: &[Cmd] = &[
         ],
     },
     Cmd {
+        name: "dev",
+        about: "One-command local quickstart broker (ephemeral)",
+        flags: &["--seed", "--addr", "--health-addr"],
+        subs: &[],
+    },
+    Cmd {
         name: "completion",
         about: "Generate a shell-completion script",
         flags: &[],
@@ -613,6 +619,7 @@ mod tests {
             "migrate",
             "dict",
             "context",
+            "dev",
             "completion",
             "cheat",
             "version",

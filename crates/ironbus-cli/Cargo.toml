@@ -118,6 +118,14 @@ bytes = { version = "1", default-features = false }
 tempfile = "3"
 sha2 = { version = "0.10", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+# The `ironbus dev` end-to-end test (#796) launches the REAL `ironbus dev` binary as a subprocess and
+# then drives the live broker as a genuine client to prove the acceptance: the demo stream is
+# pre-declared (`stream_info`), `--seed N` lands N messages (a consume count via `subscribe_to`), and a
+# produce->consume roundtrip works. `ironbus-client` is ALREADY a normal (shipped) dependency of this
+# crate and is already in `Cargo.lock`; an integration test of this BIN-only crate cannot see the
+# crate's normal deps, so it is re-declared here DEV-ONLY. It adds NO new crate to the graph, never
+# enters the shipped binary, and leaves the SBOM, `deny.toml`, and the cffi-ban gate byte-identical.
+ironbus-client = { path = "../ironbus-client" }
 
 [lints]
 workspace = true
