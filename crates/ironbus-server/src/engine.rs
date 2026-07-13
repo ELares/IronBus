@@ -2459,6 +2459,42 @@ fn validate_group_name(name: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Whether `group` is a FOREIGN cross-tenant IMPORTER's guest cursor on stream `stream_id`, and so
+/// must NOT pin the stream owner's consumer-safe retention reap floor (#1170, ITEM 1 — cross-tenant
+/// resource isolation).
+///
+/// A live cross-subscribe from a foreign importer keys its cursor on the EXPORTER's stream under an
+/// IMPORTER-scoped group name — `(<exporter>/stream, <importer>/group)` (see
+/// [`crate::session::Session::scope_group_under_self`]) — so on an `<exporter>/…` stream a foreign
+/// group is named `<importer>/…`, a leading `/`-token that DIFFERS from the stream's owning-tenant
+/// token. Left in the reap-floor min, a dead/lagging importer would pin the exporter's log from
+/// reaping — a cross-tenant availability/DoS vector (an importer holding the exporter's disk
+/// hostage). Excluding it means the exporter's retention reclaims on ITS OWN policy regardless of a
+/// foreign guest's position; a LIVE, keeping-up importer is unaffected (its cursor sits near the
+/// head, well above any reaped prefix), while a lagging importer is subject to the exporter's
+/// retention window exactly like any consumer that falls outside it — it can never HOLD the window
+/// open. Because the classification is purely by NAME it also holds across a restart (a ghost
+/// `<importer>/…` checkpoint on the exporter's stream is excluded too), with no new durable state.
+///
+/// Precision rests on the ITEM-4 wire-ingress guard: a SAME-tenant own group is a bare client name
+/// with NO `/`, so it can never be mistaken for a foreign `<importer>/…` cursor. Fail-closed toward
+/// DATA-SAFETY: when the group carries no `/` tenant token (an own group), or its token MATCHES the
+/// stream owner's (a pathological self-import stays same-tenant), it PINS — never wrongly reaped.
+/// Only the server-applied cross-tenant importer group is ever excluded.
+fn is_foreign_importer_group(stream_id: &str, group: &str) -> bool {
+    // An own group is a bare client name (no `/`, guaranteed by the ITEM-4 ingress guard): it pins.
+    let Some((group_owner, _)) = group.split_once(crate::tenant::STREAM_DELIM) else {
+        return false;
+    };
+    // The stream's owning-tenant token is the part before its first `/` (`<exporter>/orders`), or the
+    // whole id when it has none (`<exporter>`, a tenant's bare default stream). Foreign iff the
+    // group's leading tenant token differs from the stream owner's.
+    let stream_owner = stream_id
+        .split_once(crate::tenant::STREAM_DELIM)
+        .map_or(stream_id, |(owner, _)| owner);
+    group_owner != stream_owner
+}
+
 /// The filename prefix and suffix of a named work-group's durable cursor checkpoint. The
 /// default group uses `cursor.ckpt` (note `cursor.`, not `cursor-`), so it never matches the
 /// named pattern and the two never collide.
@@ -11651,10 +11687,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // records. The default stream needs no twin: its groups are never dropped while their
         // intent is live (the #277 sweep refuses ephemeral groups and the default stream is never
         // LRU-evicted), so a parked default-stream offset cannot exist.
+        // #1170 (ITEM 1): a FOREIGN cross-tenant importer's guest cursor (`<importer>/…` on this
+        // `<exporter>/…` stream) is EXCLUDED from the exporter's reap floor at every source below —
+        // live groups, durable ghosts, AND parked ephemeral offsets — so a dead/lagging importer can
+        // never pin the exporter's retention reclamation (see `is_foreign_importer_group`). A same-
+        // tenant own group (bare name, no `/`) is never excluded, so consumer-safety within the
+        // exporter's own tenant is unchanged.
+        let stream_name = id.name();
         let parked = self
             .ephemeral_subs
             .iter()
             .filter(|((sid, _), _)| sid == id)
+            .filter(|((_, group), _)| !is_foreign_importer_group(stream_name, group.as_str()))
             .filter_map(|(_, sub)| sub.parked_committed);
         let Some(ns) = self.named_streams.get(id) else {
             // No resident consumer state: only a parked ephemeral position (if any) can pin; with
@@ -11665,13 +11709,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let live = ns
             .groups
-            .values()
-            .filter(|g| g.touched)
-            .map(|g| g.cursor.committed().get());
+            .iter()
+            .filter(|(name, _)| !is_foreign_importer_group(stream_name, name.as_str()))
+            .filter(|(_, g)| g.touched)
+            .map(|(_, g)| g.cursor.committed().get());
         let ghosts = ns
             .group_last_checkpointed
             .iter()
             .filter(|(name, _)| !ns.groups.contains_key(name.as_str()))
+            .filter(|(name, _)| !is_foreign_importer_group(stream_name, name.as_str()))
             .map(|(_, &committed)| committed);
         live.chain(ghosts).chain(parked).min().unwrap_or(head)
     }
@@ -32224,6 +32270,114 @@ mod tests {
             earliest > 3,
             "with the intent gone the floor released and reaping proceeded (earliest = \
              {earliest})"
+        );
+    }
+
+    // Drains + acks EVERY currently-deliverable record of `stream`'s group `group`, so the group's
+    // committed cursor catches up to the durable head. Returns the monotonic `now` it advanced to.
+    fn drain_and_ack_all(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        group: &str,
+    ) -> u64 {
+        let mut now = 0u64;
+        loop {
+            match e.poll_in_stream(stream, group, now).unwrap() {
+                Poll::Message(d) => {
+                    assert_eq!(e.ack_in_stream(stream, group, &d.token), AckResult::Acked);
+                    now += 1;
+                }
+                _ => break now,
+            }
+        }
+    }
+
+    #[test]
+    fn a_foreign_cross_tenant_importer_group_is_excluded_from_the_exporters_reap_floor() {
+        // #1170 (ITEM 1): a lagging/dead cross-tenant IMPORTER group on the EXPORTER's stream must
+        // NOT pin the exporter's consumer-safe retention reap floor — otherwise a foreign importer
+        // holds the exporter's disk hostage (a cross-tenant availability/DoS vector). A live cross-
+        // subscribe keys its guest cursor `(<exporter>/stream, <importer>/group)`, so on stream
+        // "a/orders" a foreign group is named "b/g" (a leading tenant token differing from the
+        // stream owner "a"); the exporter's OWN group is a bare client name (no '/', guaranteed by
+        // the ITEM-4 ingress guard) and still pins. See `is_foreign_importer_group`.
+        //
+        // Retention OFF here so nothing reaps DURING production; this isolates the pure reap-FLOOR
+        // computation, the exact fix point.
+        let mut e = open(config(64, 5));
+        for _ in 0..24 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        // The exporter's OWN group "g": drain + ack everything, so it is caught up to the head (24).
+        drain_and_ack_all(&mut e, "a/orders", "g");
+        let head = e
+            .streams
+            .get(&sid("a/orders"))
+            .unwrap()
+            .flushed_offset()
+            .get();
+        assert_eq!(head, 24);
+
+        // A FOREIGN importer group "b/g" lagging at committed 0 (one poll creates + touches it; its
+        // leased offset 0 is never acked) is EXCLUDED: the floor stays at the exporter's own head.
+        let _ = e.poll_in_stream("a/orders", "b/g", 0).unwrap();
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            head,
+            "the foreign importer cursor at 0 is EXCLUDED — the floor stays at the exporter's own \
+             caught-up head, not 0 (mutation: dropping the is_foreign_importer_group filter → 0)"
+        );
+
+        // Contrast: a SAME-tenant own group "g2" (bare name, no '/') lagging at 0 STILL pins — the
+        // exclusion is scoped to a FOREIGN importer only, so within-tenant consumer-safety is intact.
+        let _ = e.poll_in_stream("a/orders", "g2", 0).unwrap();
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            0,
+            "a same-tenant own group lagging at 0 still pins the floor"
+        );
+    }
+
+    #[test]
+    fn a_lagging_foreign_importer_does_not_block_the_exporters_retention_reap() {
+        // #1170 (ITEM 1), the end-to-end reclaim: with retention ON, a dead/lagging foreign importer
+        // at 0 must NOT block the exporter reaping below its OWN (caught-up) group's floor.
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "a/orders", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("a/orders"))
+            .unwrap()
+            .durable_record_bytes();
+
+        // Retain ~4 records. Produce 3 (UNDER the bound: no reap yet), then establish the cursors.
+        let mut e = open(config_with_retention(4 * one));
+        for _ in 0..3 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        // The exporter's OWN group "g" caught up to 3; the FOREIGN importer "b/g" lagging at 0.
+        assert_eq!(drain_and_ack_all(&mut e, "a/orders", "g"), 3);
+        let _ = e.poll_in_stream("a/orders", "b/g", 0).unwrap();
+        // Grow well past the retention bound; each produce runs the per-stream reap, floored at g=3
+        // because the foreign "b/g" at 0 is EXCLUDED (without the fix the floor is 0 → no reap).
+        for _ in 0..24 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            3,
+            "the floor is the exporter's own group (3), NOT the foreign importer's 0 (mutation → 0)"
+        );
+        let earliest = e
+            .streams
+            .get(&sid("a/orders"))
+            .unwrap()
+            .earliest_offset()
+            .get();
+        assert!(
+            earliest > 0 && earliest <= 3,
+            "the exporter reaped old sealed segments below its own floor despite the dead/lagging \
+             foreign importer at 0 (earliest = {earliest}; without the exclusion it stays 0)"
         );
     }
 }

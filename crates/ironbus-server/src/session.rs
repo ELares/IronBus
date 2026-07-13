@@ -1316,7 +1316,7 @@ impl Session {
         // unchanged (no actor round-trip for the scan). The scan itself is a no-op when there are no
         // in-doubt txns, so even a back-checking broker with nothing prepared pays ~nothing.
         if self.registered_txn_listener() {
-            drive_back_check(engine, member_id, out);
+            drive_back_check(engine, member_id, self.tenant.as_ref(), out);
         }
         // Persist the (possibly non-empty) pipelined window back onto the session (#1045), so produces
         // parked but not yet acked survive into the next pass. Empty after a closing exit (the block
@@ -2655,6 +2655,11 @@ impl Session {
             reply_err(out, "cumulative-ack group name must be valid UTF-8");
             return Ok(());
         };
+        // #1170 (ITEM 4): a `/` in a client group name is rejected at every group ingress, so a
+        // cumulative ack can never target (nor lazily mint) a group colliding with a server key.
+        if reject_delimited_group_name(group.as_bytes(), out) {
+            return Ok(());
+        }
         let group = group.to_string();
         let up_to = Offset::new(ack.up_to);
         let up_to_exclusive = ack.up_to;
@@ -4613,6 +4618,10 @@ impl Session {
             reply_err(out, "stream-commit group name must be valid UTF-8");
             return Ok(());
         };
+        // #1170 (ITEM 4): reject a `/` in the client group name at this ingress too, uniformly.
+        if reject_delimited_group_name(group.as_bytes(), out) {
+            return Ok(());
+        }
         let group = group.to_string();
         let up_to = Offset::new(commit.up_to);
         // Route by stream (#681 follow-up): a NAMED-stream streaming consumer commits its OWN per-stream
@@ -4850,6 +4859,11 @@ impl Session {
             reply_err(out, "subscription name must be valid UTF-8");
             return Ok(());
         };
+        // #1170 (ITEM 4): a client group name may not carry the `/` group-namespace delimiter, so it
+        // can never collide with a server-scoped group key (see `reject_delimited_group_name`).
+        if reject_delimited_group_name(group.as_bytes(), out) {
+            return Ok(());
+        }
         // An EPHEMERAL subscribe (#771, routed here by a default-stream `SubTo` carrying the flag;
         // a plain `Sub` body cannot carry it) is gated on the negotiated capability, exactly like
         // the #594 filter gate: a connection that did not advertise it is fail-closed rejected, so
@@ -5590,6 +5604,11 @@ impl Session {
             reply_err(out, "listener group must not be empty");
             return Ok(());
         }
+        // #1170 (ITEM 4): reject a `/` in the RAW client listener-group name BEFORE it is tenant-
+        // scoped, so a client can never name a listener that collides with a server-scoped group key.
+        if reject_delimited_group_name(decoded.group, out) {
+            return Ok(());
+        }
         // #765: SERVER-APPLY the tenant prefix to the back-check listener group — the one group-only
         // routing seam not already isolated by a paired (scoped) stream — so a `TxnCheck` for one
         // tenant's in-doubt half message can NEVER be routed to another tenant that registered the
@@ -5743,6 +5762,11 @@ impl Session {
             reply_err(out, "group name must be valid UTF-8");
             return Ok(());
         };
+        // #1170 (ITEM 4): reject a `/` in the RAW client group name BEFORE it is scoped, so it can
+        // never collide with a server-scoped group key on the resolved stream.
+        if reject_delimited_group_name(group_name.as_bytes(), out) {
+            return Ok(());
+        }
         // #765/#1163: resolve the stream name through the cross-tenant import/export layer (SUBSCRIBE
         // direction). Common case (no import alias): SERVER-APPLY the caller's own tenant prefix so a
         // SubTo can never bind another tenant's stream (an unknown-to-the-tenant name is the standard
@@ -6064,6 +6088,11 @@ impl Session {
             reply_err(out, "group must be valid UTF-8");
             return Ok(());
         };
+        // #1170 (ITEM 4): a `/` in the client group name is rejected here too, so a PauseGroup can
+        // never create (the setter mints an absent group) a group colliding with a server-scoped key.
+        if reject_delimited_group_name(group.as_bytes(), out) {
+            return Ok(());
+        }
         if !stream.is_empty() && !self.streams_enabled {
             reply_err(
                 out,
@@ -6344,6 +6373,11 @@ impl Session {
             reply_err(out, "group name must be valid UTF-8");
             return Ok(());
         };
+        // #1170 (ITEM 4): reject a `/` in the RAW client group name BEFORE it is scoped (own OR
+        // cross-tenant), so it can never collide with a server-scoped group key.
+        if reject_delimited_group_name(group.as_bytes(), out) {
+            return Ok(());
+        }
         // PER-SUBJECT FILTERED consume (#594, filter_mode == 1): fail-closed on the capability, bind the
         // subject PATTERN (wildcards allowed) as the work-group's filter, and consume the covering
         // stream filtered — the DEFAULT stream (#594-A) OR a covering NAMED stream (#594-B). A pre-#594
@@ -6798,6 +6832,36 @@ fn reply_err_coded(out: &mut Vec<u8>, code_token: &str, message: &str) {
     reply(out, FrameType::Err, &body);
 }
 
+/// Rejects a CLIENT-supplied consumer-GROUP name that carries the group-namespace delimiter `/`
+/// (#1170, ITEM 4 — defense-in-depth). A group is server-scoped `<tenant>/<group>` for the txn
+/// back-check listener seam ([`crate::tenant::TenantId::scope_group`]) and `<importer>/<group>` for a
+/// cross-tenant importer's guest cursor ([`Session::scope_group_under_self`]). Permitting a client `/`
+/// would let a tenant NAME a group that COLLIDES with such a server-scoped key on its OWN stream —
+/// e.g. an exporter naming a group `<importer>/orders` that shares the cursor an importer's
+/// `<importer>/orders` guest group keys to. That is un-forgeable BY an importer and only
+/// self-inflicted, but it is a cheap footgun to forbid; forbidding it ALSO keeps the retention-floor
+/// guest classification ([`crate::engine::Engine`]'s `min_committed_offset_named`, ITEM 1) precise,
+/// since a same-tenant own group is then guaranteed to carry NO `/` and can never be mistaken for a
+/// foreign importer's `<importer>/…` cursor. Applied to the RAW client bytes at the wire ingress,
+/// BEFORE any server scoping, so a legitimately server-scoped group (which does contain `/`) is never
+/// rejected. `.` is deliberately NOT restricted: it is the SUBJECT delimiter, never a group prefix
+/// delimiter, so a dotted group name cannot collide with a server-applied group key.
+///
+/// Returns `true` and writes a typed `ERR_INVALID_GROUP_NAME` reply when the name is rejected (the
+/// caller returns early); `false` (no reply) when the name is clean.
+fn reject_delimited_group_name(group: &[u8], out: &mut Vec<u8>) -> bool {
+    if group.contains(&(crate::tenant::STREAM_DELIM as u8)) {
+        reply_err_coded(
+            out,
+            crate::codes::ErrorCode::ERR_INVALID_GROUP_NAME.as_str(),
+            "consumer-group name must not contain '/'",
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// #1163: the single typed reject for a cross-tenant import that no export authorizes for the
 /// requested direction. Emitted at EVERY resolution seam a [`Resolved::Denied`] can arise, so the
 /// wire signal is uniform: the client named an import alias, but the crossing is not (or no longer)
@@ -6921,15 +6985,57 @@ fn drain_produce_confirms<
     }
 }
 
+/// Strips the server-applied `<tenant>/` prefix off an engine-stored txn id for the OUTBOUND
+/// `TxnCheck` echo (#1170, ITEM 3 — a real multi-tenant bug, pre-existing from #1162). In
+/// multi-tenant mode a producer's client txn id `tx1` is server-scoped to `<tenant>/tx1` before it
+/// reaches the engine ([`Session::tenant_txn_id`]); the back-check scan then drains that ALREADY-
+/// scoped id and, without this strip, would echo `<tenant>/tx1` back to the producer's listener. The
+/// listener answers by ECHOING the id it received, and the inbound
+/// [`Session::handle_txn_check_result`] re-scopes it UNCONDITIONALLY — so a scoped echo became
+/// `<tenant>/<tenant>/tx1`, which matches no stored txn, never resolves, and (after the bounded
+/// attempt cap) wrongly ROLLS BACK a live multi-tenant transaction. Presenting the listener its OWN
+/// (client) id — the exact bytes it sent in `TxnPrepare` — makes the echo re-scope to the SAME
+/// `<tenant>/tx1`, so the txn resolves correctly.
+///
+/// ISOLATION is preserved because ONLY this client-facing OUTBOUND echo is de-scoped: the security-
+/// critical INBOUND scoping in `handle_txn_check_result` stays unconditional, so a forged
+/// `TxnCheckResult` from a DIFFERENT tenant is still scoped under THAT tenant (`<other>/tx1`) and can
+/// never resolve this tenant's txn — cross-tenant txns stay in their own namespace. A no-op for a
+/// single-tenant connection (`tenant` is `None`) or, defensively, for an id that does not carry the
+/// expected `<tenant>/` prefix (a can't-happen the strip leaves untouched rather than truncating).
+fn strip_tenant_txn_id<'a>(tenant: Option<&crate::tenant::TenantId>, txn_id: &'a [u8]) -> &'a [u8] {
+    let Some(t) = tenant else {
+        return txn_id;
+    };
+    let tid = t.as_str().as_bytes();
+    // The scoped id is exactly `<tenant>` + `/` + `<client id>`; strip that and only that.
+    if txn_id.len() > tid.len() && txn_id.starts_with(tid) && txn_id[tid.len()] == b'/' {
+        &txn_id[tid.len() + 1..]
+    } else {
+        txn_id
+    }
+}
+
 /// Writes one `TxnCheck` frame (#640 part 2) asking the producer's listener about an in-doubt
 /// transaction. Reuses the frozen [`encode_txn_resolve`] codec (the same `txn_id`-only body shape as
-/// `TxnCommit`/`TxnRollback`), so the wire body cannot drift from the proto definition.
-fn write_txn_check(txn_id: &[u8], out: &mut Vec<u8>) {
+/// `TxnCommit`/`TxnRollback`), so the wire body cannot drift from the proto definition. The stored id
+/// is DE-SCOPED to the producer's own client id for a multi-tenant connection (#1170, ITEM 3) via
+/// [`strip_tenant_txn_id`], so the listener's echoed answer re-scopes to the same txn (not a double-
+/// prefixed one that never resolves).
+fn write_txn_check(tenant: Option<&crate::tenant::TenantId>, txn_id: &[u8], out: &mut Vec<u8>) {
+    let client_txn_id = strip_tenant_txn_id(tenant, txn_id);
     let mut body = Vec::new();
     // The encode only fails for a txn id over the u16 wire cap, which the lifecycle bounds to 256, so
     // this is infallible in practice; on the unreachable error we simply emit no frame (the txn is
     // re-checked on a later scan).
-    if encode_txn_resolve(&TxnResolveBody { txn_id }, &mut body).is_ok() {
+    if encode_txn_resolve(
+        &TxnResolveBody {
+            txn_id: client_txn_id,
+        },
+        &mut body,
+    )
+    .is_ok()
+    {
         reply(out, FrameType::TxnCheck, &body);
     }
 }
@@ -6949,6 +7055,7 @@ fn drive_back_check<
 >(
     engine: &E,
     member_id: MemberId,
+    tenant: Option<&crate::tenant::TenantId>,
     out: &mut Vec<u8>,
 ) {
     // Run one scan tick (single-writer). A gone actor or a storage error both mean "skip this pass".
@@ -6959,8 +7066,11 @@ fn drive_back_check<
     let Ok(checks) = engine.with(move |e| e.drain_txn_checks(member_id)) else {
         return; // a gone actor: the connection is ending, nothing to deliver
     };
+    // The drained ids are ALREADY tenant-scoped (`handle_txn_prepare` scoped them before the engine
+    // stored them); de-scope each to the producer's own client id for the outbound echo (#1170,
+    // ITEM 3), so the listener's answer re-scopes to the same txn rather than a double-prefixed one.
     for check in checks {
-        write_txn_check(&check.txn_id, out);
+        write_txn_check(tenant, &check.txn_id, out);
     }
 }
 
@@ -18890,6 +19000,213 @@ mod tests {
     // failure). Every test drives real Sessions (tenant derived from the authenticated identity) over a
     // real Engine, so it exercises the actual server-applied prefixing at the session→engine boundary.
     // ================================================================================================
+
+    // ---- #1170 (ITEM 4): the wire-ingress group-name guard ----
+
+    #[test]
+    fn a_client_group_name_with_a_slash_is_rejected_at_the_wire_ingress() {
+        // #1170 (ITEM 4): the `/` group-namespace delimiter is forbidden in a CLIENT group name at
+        // EVERY group ingress, so a client can never name a group that collides with a server-scoped
+        // key (`<tenant>/…` back-check listener / `<importer>/…` cross-tenant cursor) — a typed
+        // ERR_INVALID_GROUP_NAME, never a silent bind. Applies universally (single- or multi-tenant);
+        // exercised here on a plain no-auth session (the guard runs before the tenant branch).
+        use ironbus_proto::err::ServerErrorCode;
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+
+        // A plain Sub (the default-stream group) carrying `/` is rejected.
+        s.process(&e, &frame(FrameType::Sub, b"tenant/evil"), &mut out)
+            .unwrap();
+        assert_eq!(
+            err_code(&out),
+            Some(ServerErrorCode::InvalidGroupName),
+            "a Sub group with '/' is rejected"
+        );
+
+        // The TxnListen listener group is guarded too (it is the one seam that is tenant-scoped).
+        out.clear();
+        let mut listen_body = Vec::new();
+        ironbus_proto::message::encode_txn_listen(
+            &ironbus_proto::message::TxnListenBody { group: b"a/b" },
+            &mut listen_body,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::TxnListen, &listen_body), &mut out)
+            .unwrap();
+        assert_eq!(
+            err_code(&out),
+            Some(ServerErrorCode::InvalidGroupName),
+            "a TxnListen group with '/' is rejected"
+        );
+
+        // A clean group name (no '/') still binds — the guard rejects ONLY the delimiter.
+        out.clear();
+        s.process(&e, &frame(FrameType::Sub, b"good-group"), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "a delimiter-free group still binds"
+        );
+    }
+
+    // ---- #1170 (ITEM 3): the multi-tenant txn back-check double-prefix fix ----
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn multi_tenant_txn_back_check_resolves_without_double_prefix_and_stays_isolated() {
+        // #1170 (ITEM 3, a real BUG pre-existing from #1162): the back-check echo must present a
+        // MULTI-TENANT producer its OWN client txn id, not the server-scoped `<tenant>/tx1`. Before
+        // the fix, `write_txn_check` echoed the scoped id and `handle_txn_check_result` re-scoped it
+        // to `<tenant>/<tenant>/tx1`, which matched no stored txn and never resolved — so after the
+        // bounded attempt cap a live multi-tenant transaction was WRONGLY ROLLED BACK. ISOLATION is
+        // preserved: a DIFFERENT tenant's answer scopes into ITS OWN namespace and can never resolve
+        // this tenant's txn.
+        //
+        // Connects three tenant sessions (t1 producer, t1 consumer, t2 attacker).
+        fn mk(
+            e: &DirectEngine<InMemoryFs, Arc<ManualClock>>,
+            auth: &Arc<AuthConfig>,
+            member: u64,
+            token: &[u8],
+        ) -> Session {
+            let mut s =
+                Session::with_member_id_and_auth(MemberId::new(member), Arc::clone(auth), None);
+            let mut o = Vec::new();
+            s.process(e, &mt_connect(token, false), &mut o).unwrap();
+            assert!(s.authenticated, "tenant handshake succeeds");
+            s
+        }
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        // Immediate back-check eligibility + a generous attempt cap so the test drives the resolve.
+        e.engine_mut()
+            .set_back_check_config(ironbus_core::txn::BackCheckConfig {
+                timeout: 0,
+                retry: 1,
+                max_attempts: 1000,
+                batch: 256,
+            });
+        let auth = mt_auth(
+            &[
+                (
+                    b"tok-t1-000000000000000000000000000",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "t1",
+                ),
+                (
+                    b"tok-t2-000000000000000000000000000",
+                    &[Scope::Publish, Scope::Subscribe],
+                    "t2",
+                ),
+            ],
+            &[],
+        );
+        let mut p1 = mk(&e, &auth, 1, b"tok-t1-000000000000000000000000000"); // producer (t1)
+        let mut c1 = mk(&e, &auth, 2, b"tok-t1-000000000000000000000000000"); // consumer (t1)
+        let mut p2 = mk(&e, &auth, 3, b"tok-t2-000000000000000000000000000"); // attacker (t2)
+
+        let result_body = |txn_id: &[u8], decision: ironbus_proto::message::TxnCheckDecision| {
+            let mut b = Vec::new();
+            ironbus_proto::message::encode_txn_check_result(
+                &ironbus_proto::message::TxnCheckResultBody { txn_id, decision },
+                &mut b,
+            )
+            .unwrap();
+            b
+        };
+
+        // p1 registers a listener group, then prepares an INVISIBLE half message named "tx1".
+        let mut out = Vec::new();
+        let mut listen_body = Vec::new();
+        ironbus_proto::message::encode_txn_listen(
+            &ironbus_proto::message::TxnListenBody { group: b"svc" },
+            &mut listen_body,
+        )
+        .unwrap();
+        p1.process(&e, &frame(FrameType::TxnListen, &listen_body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "listener registered");
+        out.clear();
+        p1.process(&e, &txn_prepare_frame(b"tx1", b"half"), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "half prepared (invisible)"
+        );
+
+        // Make the half due, then drive p1's OWN pass (a Ping): the back-check scan routes a TxnCheck
+        // to its listener, drained onto this pass. The echoed id must be the producer's OWN "tx1".
+        clock.advance_monotonic_nanos(2);
+        out.clear();
+        p1.process(&e, &frame(FrameType::Ping, b""), &mut out)
+            .unwrap();
+        let check_id = decode_all(&out)
+            .into_iter()
+            .find(|(ty, _)| *ty == FrameType::TxnCheck)
+            .map(|(_, body)| decode_txn_resolve(&body).unwrap().txn_id.to_vec())
+            .expect("a TxnCheck was routed to the producer's listener");
+        assert_eq!(
+            check_id, b"tx1",
+            "the outbound TxnCheck carries the producer's OWN (unscoped) txn id — not the scoped \
+             b\"t1/tx1\" (mutation: dropping the strip makes this b\"t1/tx1\")"
+        );
+
+        // ISOLATION: attacker t2 echoes the SAME id back. Its inbound scoping sends it to t2/tx1, so
+        // it CANNOT resolve t1's t1/tx1 — the txn stays PREPARED (invisible), unaffected. (No consume
+        // is driven here: a prepared half is invisible by construction, so `txn_prepared_count == 1`
+        // is the clean isolation proof; polling now would only advance c1 past the not-yet-visible
+        // record.)
+        out.clear();
+        p2.process(
+            &e,
+            &frame(
+                FrameType::TxnCheckResult,
+                &result_body(&check_id, ironbus_proto::message::TxnCheckDecision::Commit),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            e.engine_mut().txn_prepared_count(),
+            1,
+            "a different tenant's answer cannot resolve this tenant's txn (isolation preserved)"
+        );
+
+        // LEGIT: p1 echoes the received (unscoped) id — it re-scopes to t1/tx1, resolves, and commits.
+        out.clear();
+        p1.process(
+            &e,
+            &frame(
+                FrameType::TxnCheckResult,
+                &result_body(&check_id, ironbus_proto::message::TxnCheckDecision::Commit),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "the producer's own answer resolves its txn (no double-prefix)"
+        );
+        assert_eq!(
+            e.engine_mut().txn_prepared_count(),
+            0,
+            "the half committed via the back-check — NOT left in doubt to be rolled back"
+        );
+        // t1's consumer subscribes to its tenant default stream + flows: it receives the committed
+        // half (proving the txn COMMITTED, not spuriously rolled back by the double-prefix bug).
+        out.clear();
+        c1.process(&e, &frame(FrameType::Sub, b"g"), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&flow(&mut c1, &e, 8)),
+            vec![b"half".to_vec()],
+            "t1's committed half is delivered (the multi-tenant txn was not spuriously rolled back)"
+        );
+    }
 
     /// Builds an auth config whose identities each carry a tenant (`token`, `scopes`, `tenant`), plus an
     /// optional per-tenant quota table. The tenant is a property of the credential — the client never

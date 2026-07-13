@@ -402,6 +402,45 @@ impl Drop for ConnGuard {
 // The whole authorization decision is this one pure, side-effect-free module — [`SharingRegistry`]
 // plus the token matchers below — so the security argument is auditable in one place and unit-tested
 // exhaustively. The session layer merely applies the [`Resolution`] it returns.
+//
+// ------------------------------------------------------------------------------------------------
+// #1170 — cross-tenant sharing SECURITY / CORRECTNESS policy (the #1169-review follow-ups).
+//
+// RETENTION ISOLATION (a foreign importer never holds the exporter's disk hostage). A live importer
+// cross-subscribe keeps a cursor on the EXPORTER's stream, keyed `(<exporter>/stream,
+// <importer>/group)` (the importer's group is scoped under ITSELF, never the exporter). That guest
+// cursor is DELIBERATELY EXCLUDED from the exporter's consumer-safe retention reap floor
+// (`Engine::min_committed_offset_named` via `Engine::is_foreign_importer_group`): a dead or lagging
+// importer must NOT be able to pin the exporter's log from reaping (a cross-tenant availability/DoS
+// vector). The exporter therefore reclaims disk strictly on ITS OWN retention policy regardless of a
+// foreign guest's position. A LIVE, keeping-up importer is unaffected (its cursor sits near the head,
+// well above any reaped prefix); an importer that falls outside the exporter's retention window is
+// subject to it exactly like any consumer that lags past the window — it can never HOLD the window
+// open. The exclusion is by NAME (the importer's `<importer>/…` token differs from the exporter's
+// stream-owner token), so it holds for a live guest, a durable ghost, AND across a restart, with no
+// new durable state; a SAME-tenant own group (a bare client name, no `/`, enforced at the wire
+// ingress — see below) is never excluded, so within-tenant consumer-safety is unchanged.
+//
+// REVOKE SEMANTICS (effective on the next resolution; live cross-subs are NOT torn down). A grant is
+// AUTHORIZED at resolution time (SubTo / PubTo / StreamInfo / SubSubject / PubSubject); the whole
+// sharing config is loaded at broker start into the immutable [`crate::auth::AuthConfig`] and pinned
+// per-connection at `Connect`. Removing an export/import (a revoke) is therefore effective for every
+// resolution that happens AFTER the new config is in force — a new connection, or a re-subscribe on a
+// connection that re-reads the registry — but an ALREADY-BOUND live cross-subscription keeps
+// delivering off its established binding until it re-resolves (a reconnect/rebind). IronBus does NOT
+// proactively tear down live cross-subscriptions on revoke: the broker is thread-per-connection with
+// no central live-session registry and no cross-thread teardown channel, so enumerating and dropping
+// exactly the cross-subs bound under a now-revoked grant — WITHOUT risking a same-tenant session — is
+// not a contained change. The STRONGER "revoke is immediately effective (tear down live cross-subs)"
+// behavior is an intentional, separately-tracked owner decision, NOT a silent default here.
+//
+// GROUP-NAME INGRESS GUARD (defense-in-depth). A consumer-group is server-scoped `<tenant>/<group>`
+// for the txn back-check listener seam and `<importer>/<group>` for a cross-tenant importer cursor,
+// both using the `/` [`STREAM_DELIM`]. A CLIENT-supplied group name may therefore NOT contain `/`
+// (rejected at every group ingress with `ERR_INVALID_GROUP_NAME`): it stops a tenant self-colliding
+// by naming a group `<importer>/…` on its own stream, and it keeps the retention-floor guest
+// classification above precise (an own group is then guaranteed `/`-free). `.` is NOT a group prefix
+// delimiter, so a dotted group name is unaffected.
 // ================================================================================================
 
 /// The direction of a single resource access at a resolution seam. An export grants a subset of
