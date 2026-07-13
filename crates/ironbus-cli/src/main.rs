@@ -85,6 +85,13 @@ mod dict_cmd;
 mod completion;
 /// Named connection profiles (server + auth + TLS + data-dir), `kubectl config`-style (#581).
 mod context;
+/// The `dev` one-command local quickstart (#796): spawn the SAME `ironbus serve` on an ephemeral
+/// temp dir + friendly loopback ports, pre-declare a demo stream + subjects, print a copy-paste
+/// produce/consume snippet, and optionally `--seed` synthetic messages. Pure sugar — the broker
+/// binary and its data plane are untouched. The module compiles on every target (the parser, help,
+/// and snippet builder are cross-platform); the broker orchestration + signal-cleanup is Unix-only,
+/// and the non-Unix stub errors cleanly, exactly like `serve` itself.
+mod dev;
 /// The interactive fuzzy stream/group picker (TTY-only, scriptable-safe) (#583).
 mod fuzzy;
 /// The uniform `--json` envelope + frozen exit-code contract (V2-M6, #579).
@@ -1014,6 +1021,11 @@ USAGE:
                   [--storage-mode <per-stream|shared-wal>] [--append-shards <auto|N>]
                   [--key-shared-group <name>]... [--broadcast-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>] [--enable-admin]
+    ironbus dev   [--seed <n>] [--addr <host:port>] [--health-addr <host:port>]
+                  (one-command local quickstart: spins up the broker on an ephemeral temp dir with
+                   friendly loopback ports, pre-declares a demo stream + subjects, prints a
+                   copy-paste produce/consume snippet, and optionally seeds N messages; the temp dir
+                   is removed on exit incl. Ctrl-C. Unix only)
     ironbus passwd --auth-config <path> --user <name> [--scopes <publish,subscribe,admin>]
                   [--password-file <path>] [--remove]
                   (sets/updates or removes a username+password identity; the password is read from
@@ -1572,6 +1584,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "migrate" => run_migrate(rest, out),
         "dict" => run_dict(rest, out),
         "context" => context::run_context(rest, out),
+        "dev" => dev::run_dev(rest, out),
         "completion" => completion::run_completion(rest, out),
         "cheat" => completion::run_cheat(rest, out),
         "help" | "--help" | "-h" => {
