@@ -16,7 +16,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use ironbus_client::Client;
-use ironbus_iceberg_sink::{run, scan_offsets, RunMode, SinkConfig};
+use ironbus_iceberg_sink::{run, scan_offsets, IcebergTable, Record, RunMode, SinkConfig};
 use ironbus_proto::message::PubBody;
 
 /// Kills the broker child on drop so a failed assertion never leaks a process.
@@ -108,6 +108,21 @@ fn sink_config(addr: &str, output: &str) -> SinkConfig {
         start_offset: 0,
         mode: RunMode::DrainAndExit,
         poll_interval_ms: 50,
+        // Threshold above the ~6 snapshots this test makes, so it does NOT compact: keeps the base
+        // materialize/resume test exercising the plain append path unchanged.
+        manifest_compaction_threshold: 16,
+        snapshot_retention_count: 10,
+    }
+}
+
+/// Like [`sink_config`] but with a small compaction threshold + retention window, so compaction fires
+/// mid-run and the snapshot log stays bounded.
+fn compacting_sink_config(addr: &str, output: &str) -> SinkConfig {
+    SinkConfig {
+        batch_max_records: 2, // 2 records/append => many manifests, so compaction triggers
+        manifest_compaction_threshold: 6,
+        snapshot_retention_count: 4,
+        ..sink_config(addr, output)
     }
 }
 
@@ -176,4 +191,146 @@ fn end_to_end_materialize_and_resume() {
     unique.dedup();
     assert_eq!(all.len(), unique.len(), "no duplicate offsets in the table");
     assert_eq!(all.len(), 17);
+}
+
+/// End-to-end proof that compaction fires DURING a real sink run against a live broker, that the
+/// table still reads back every row through the real Iceberg chain, that the snapshot log stays
+/// bounded, and that a COLD RESTART after compaction resumes at the correct watermark with no dups.
+#[test]
+fn end_to_end_compaction_and_resume() {
+    let Ok(bin) = std::env::var("IRONBUS_BIN") else {
+        eprintln!("SKIP: IRONBUS_BIN not set");
+        return;
+    };
+    assert!(
+        PathBuf::from(&bin).exists(),
+        "IRONBUS_BIN {bin} does not exist"
+    );
+
+    let broker = boot_broker(&bin);
+    let table_dir = tempfile::tempdir().unwrap();
+    let output = table_dir.path().join("compact_table");
+    let output = output.to_str().unwrap();
+
+    // --- Phase 1: produce 40, sink with compaction enabled -> it must compact mid-run ---
+    produce(&broker.addr, 0, 40);
+    let stats = run(&compacting_sink_config(&broker.addr, output)).expect("compacting sink run 1");
+    assert_eq!(stats.records_written, 40, "run 1 writes all 40");
+    assert!(
+        stats.compactions >= 1,
+        "40 records / batch 2 / threshold 6 must trigger at least one compaction (got {})",
+        stats.compactions
+    );
+    assert!(
+        stats.snapshots_expired >= 1,
+        "compaction with retention 4 must expire snapshots"
+    );
+    assert_eq!(
+        sorted_offsets(output),
+        (0..40).collect::<Vec<_>>(),
+        "every row survives compaction, contiguous, no dup/drop"
+    );
+
+    // The snapshot log is bounded (retention 4 + at most one threshold window of 6 accumulated since
+    // the last compaction), NOT the 20 a no-compaction run would have left.
+    let reopened = IcebergTable::open_or_create(output, 0).unwrap();
+    assert_eq!(
+        reopened.next_offset(),
+        40,
+        "watermark intact after compaction"
+    );
+    assert!(
+        reopened.snapshot_count() <= 10,
+        "snapshot log must be bounded by retention (got {})",
+        reopened.snapshot_count()
+    );
+    // The manifest set stays bounded by the compaction threshold (each compaction resets it to 1 and
+    // it grows by one per append), NOT the 20 a no-compaction run would accumulate.
+    assert!(
+        reopened.current_manifest_count().unwrap() <= 6,
+        "manifest set must stay bounded by the compaction threshold (got {})",
+        reopened.current_manifest_count().unwrap()
+    );
+
+    // --- Phase 2: produce 15 more, RESTART the sink (cold resume after compaction) ---
+    produce(&broker.addr, 40, 15);
+    let stats2 = run(&compacting_sink_config(&broker.addr, output))
+        .expect("compacting sink run 2 (restart)");
+    assert_eq!(
+        stats2.records_written, 15,
+        "resume after compaction writes only the 15 new records — no re-materialization"
+    );
+    assert_eq!(
+        sorted_offsets(output),
+        (0..55).collect::<Vec<_>>(),
+        "no duplicates across the compaction + restart boundary"
+    );
+
+    // --- Phase 3: no new data -> a pure no-op ---
+    let stats3 = run(&compacting_sink_config(&broker.addr, output)).expect("compacting sink run 3");
+    assert_eq!(stats3.records_written, 0);
+    assert_eq!(sorted_offsets(output), (0..55).collect::<Vec<_>>());
+
+    // Belt-and-suspenders: no duplicate offsets anywhere.
+    let all = scan_offsets(output).unwrap();
+    let mut unique = all.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        all.len(),
+        unique.len(),
+        "no duplicate offsets after compaction"
+    );
+    assert_eq!(all.len(), 55);
+}
+
+/// Writes a COMPACTED table to `ICEBERG_SINK_PROOF_DIR` and leaves it on disk, so an EXTERNAL engine
+/// (`DuckDB`, via `scripts/duckdb-verify.sh`) can prove the compacted table is queryable and its
+/// offsets are contiguous with no dup/drop. Broker-free (drives the table API directly); a no-op skip
+/// when the env var is unset, so a plain `cargo test` stays green.
+#[test]
+fn compaction_duckdb_external_query_proof() {
+    let Ok(dir) = std::env::var("ICEBERG_SINK_PROOF_DIR") else {
+        eprintln!("SKIP: ICEBERG_SINK_PROOF_DIR not set (no external-query proof requested)");
+        return;
+    };
+
+    let mut t = IcebergTable::open_or_create(&dir, 0).unwrap();
+    // 100 rows across 20 snapshots (5 rows each), then compact to a single manifest, retention 3.
+    for b in 0..20i64 {
+        let recs: Vec<Record> = (b * 5..b * 5 + 5)
+            .map(|offset| Record {
+                offset,
+                timestamp_ms: 1_700_000_000_000 + offset,
+                flags: 0,
+                key: format!("k{offset}").into_bytes(),
+                headers: Vec::new(),
+                payload: format!("payload-{offset}").into_bytes(),
+            })
+            .collect();
+        t.append(&recs).unwrap();
+    }
+    let stats = t.compact_and_expire(3).unwrap();
+    assert!(
+        stats.manifests_before >= 2,
+        "table must have accumulated manifests"
+    );
+    assert_eq!(
+        t.current_manifest_count().unwrap(),
+        1,
+        "compacted to one manifest"
+    );
+    assert_eq!(t.snapshot_count(), 3, "snapshot log trimmed to retention");
+
+    let mut got = scan_offsets(&dir).unwrap();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        (0..100).collect::<Vec<_>>(),
+        "all 100 rows survive compaction"
+    );
+    eprintln!(
+        "PROOF TABLE WRITTEN: {dir} (100 rows 0..100, compacted {} manifests -> 1, {} snapshots expired, {} stale files reclaimed)",
+        stats.manifests_before, stats.snapshots_expired, stats.files_deleted
+    );
 }

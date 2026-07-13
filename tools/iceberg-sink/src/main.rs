@@ -52,6 +52,16 @@ struct Cli {
     /// Poll interval in follow mode, milliseconds.
     #[arg(long, default_value_t = 500)]
     poll_interval_ms: u64,
+
+    /// Compact the manifest set once the current snapshot references at least this many manifests
+    /// (bounds per-commit manifest-list bytes on a long-lived table). 0 disables compaction.
+    #[arg(long, default_value_t = 16)]
+    manifest_compaction_threshold: u32,
+
+    /// Snapshots to retain (the current snapshot is always kept); older ones are expired from
+    /// metadata.json on a compaction pass. Clamped to at least 1.
+    #[arg(long, default_value_t = 10)]
+    snapshot_retention_count: u32,
 }
 
 fn main() -> Result<()> {
@@ -70,6 +80,8 @@ fn main() -> Result<()> {
             RunMode::DrainAndExit
         },
         poll_interval_ms: cli.poll_interval_ms,
+        manifest_compaction_threshold: cli.manifest_compaction_threshold,
+        snapshot_retention_count: cli.snapshot_retention_count,
     };
 
     eprintln!(
@@ -78,8 +90,15 @@ fn main() -> Result<()> {
     );
     let stats = run(&cfg)?;
     println!(
-        "done: wrote {} records in {} snapshot(s); table watermark = offset {} (broker cursor committed to {})",
-        stats.records_written, stats.batches, stats.final_next_offset, stats.last_committed_offset
+        "done: wrote {} records in {} snapshot(s); table watermark = offset {} (broker cursor committed to {}); \
+         {} compaction pass(es), {} snapshot(s) expired, {} stale metadata file(s) reclaimed",
+        stats.records_written,
+        stats.batches,
+        stats.final_next_offset,
+        stats.last_committed_offset,
+        stats.compactions,
+        stats.snapshots_expired,
+        stats.files_reclaimed
     );
     Ok(())
 }
