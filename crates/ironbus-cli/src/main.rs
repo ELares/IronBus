@@ -9507,7 +9507,7 @@ fn sleep_interruptible_cli(dur: std::time::Duration, shutdown: &std::sync::atomi
                                  // loop, the graceful drain); splitting it further would scatter a
                                  // single concern across helpers.
 fn run_broker<F: Filesystem + Clone + 'static>(
-    engine: Engine<F, SystemClock>,
+    mut engine: Engine<F, SystemClock>,
     addr: &str,
     data_dir: Option<&Path>,
     config: &ServeConfig,
@@ -9538,6 +9538,18 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // it only through the bounded-channel handle, so no handler holds a lock across an fsync. The
     // actor's join handle yields the engine back on its clean exit (a Shutdown drain), which is how
     // the graceful-shutdown cursor flush (#195) completes before the process exits 0.
+    //
+    // #1170 (ITEM 1): tell the engine whether CROSS-TENANT SHARING is configured (a non-empty
+    // import/export registry on the auth config). This GATES the cross-tenant retention-floor
+    // exclusion — set BEFORE the engine moves into the append actor. With no sharing (a single-tenant
+    // broker, or a tenant broker with no grants) it stays `false`, so NO consumer group is ever
+    // excluded from the reap floor and a legal `/`-in-name group keeps its full consumer-safe
+    // protection (the delimiter is an ordinary user character absent tenancy).
+    let cross_tenant_sharing_active = auth
+        .as_ref()
+        .and_then(|a| a.sharing())
+        .is_some_and(|s| !s.is_empty());
+    engine.set_cross_tenant_sharing_active(cross_tenant_sharing_active);
     let (shared, actor) =
         spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, config.commit_gather_us);
     // Install the SHARED client produce-ack slot (#719) onto the base handle BEFORE any per-connection

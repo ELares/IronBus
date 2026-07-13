@@ -418,8 +418,20 @@ impl Drop for ConnGuard {
 // subject to it exactly like any consumer that lags past the window — it can never HOLD the window
 // open. The exclusion is by NAME (the importer's `<importer>/…` token differs from the exporter's
 // stream-owner token), so it holds for a live guest, a durable ghost, AND across a restart, with no
-// new durable state; a SAME-tenant own group (a bare client name, no `/`, enforced at the wire
-// ingress — see below) is never excluded, so within-tenant consumer-safety is unchanged.
+// new durable state.
+//
+// This name test is GATED on `Engine::cross_tenant_sharing_active` — set true ONLY when a non-empty
+// SharingRegistry is wired at serve time — because `/` is a fully LEGAL, user-choosable character in
+// stream AND group names on a single-tenant broker. Without the gate, a single-tenant consumer group
+// `b/g` on a stream `a/orders` would be misread as a "foreign importer" and its unread records
+// silently reaped (a #566 consumer-safety violation). With the gate, the exclusion applies ONLY where
+// tenancy's server-scoping invariant actually holds (sharing implies tenancy), so a SAME-tenant own
+// group — a bare client name with no `/`, enforced at the CLIENT wire ingress (ITEM 4) — is never
+// excluded, and on a NON-sharing broker no group is EVER excluded (every group keeps its full
+// consumer-safe protection). NOTE the engine deliberately still ACCEPTS `/` in a group name: a
+// server-applied cross-tenant guest group is legitimately `<importer>/<group>`, and `/` is a
+// long-supported path-unsafe group-name character (hex-encoded in checkpoint filenames); only the
+// client-facing wire ingress forbids it.
 //
 // REVOKE SEMANTICS (effective on the next resolution; live cross-subs are NOT torn down). A grant is
 // AUTHORIZED at resolution time (SubTo / PubTo / StreamInfo / SubSubject / PubSubject); the whole
