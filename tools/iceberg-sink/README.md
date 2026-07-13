@@ -39,7 +39,24 @@ ironbus-iceberg-sink --addr 127.0.0.1:7777 --stream orders --group lake-orders \
 
 Flags: `--addr`, `--stream` (empty = the default stream), `--group`, `--output` (the table
 directory), `--batch-max-records`, `--batch-max-bytes`, `--start-offset` (for a brand-new table),
-`--follow`, `--poll-interval-ms`.
+`--follow`, `--poll-interval-ms`, `--manifest-compaction-threshold` (compact once the current
+snapshot references this many manifests; `0` disables — default 16) and `--snapshot-retention-count`
+(snapshots to keep; the current snapshot is always kept — default 10).
+
+## Bounded metadata growth (manifest compaction + expire-snapshots)
+
+Every append carries the full manifest set forward and adds a snapshot, so a naively long-lived table
+would write O(N²) manifest-list bytes over N commits and grow an unbounded snapshot log. Once the
+current snapshot accumulates `--manifest-compaction-threshold` manifests, the sink rewrites them into
+one compacted manifest (a spec `replace` snapshot over the **same** data files — no row is added or
+dropped) and expires snapshots outside `--snapshot-retention-count`, bounding both. This is
+correctness-preserving: the compaction commit uses the **identical** crash-safe fsync discipline as an
+append and is published atomically by the `version-hint.text` swap, and the durable resume watermark is
+carried onto the replace snapshot so a cold restart resumes exactly where it left off. Stale
+manifest/manifest-list files are reclaimed **only after** the new metadata is durably committed
+(delete-after-commit), and only if **no** retained snapshot references them; data files are never
+deleted (this append-only sink keeps them all live). A crash at any point leaves a valid table — at
+worst a few harmless orphan files, never a dangling pointer.
 
 ## Table schema
 
@@ -105,5 +122,6 @@ manifests → Parquet) and asserts contiguous offsets across a restart with no d
 Iceberg v2 table — against a **local-directory** object store, with resumable, dup-safe append.
 
 **Follow-ups:** S3/GCS object-store backends; a REST-catalog endpoint; typed payload columns via the
-schema-encoding story (#762); partitioning (e.g. by time); schema evolution; compaction/expiry of the
-small per-batch data files; Parquet compression tuning; multi-topic fan-out.
+schema-encoding story (#762); partitioning (e.g. by time); schema evolution; **data-file** compaction
+(bin-packing the small per-batch Parquet files — manifest compaction + snapshot expiry already ship,
+see above); Parquet compression tuning; multi-topic fan-out.

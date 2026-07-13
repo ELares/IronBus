@@ -33,6 +33,14 @@ pub struct SinkConfig {
     pub mode: RunMode,
     /// The poll interval when following and caught up, in milliseconds.
     pub poll_interval_ms: u64,
+    /// Compact the manifest set once the current snapshot references at least this many manifests
+    /// (each append adds one), bounding per-commit manifest-list bytes. `0` disables compaction (full
+    /// history is kept and metadata grows without bound — an explicit opt-out, not the default).
+    pub manifest_compaction_threshold: u32,
+    /// How many snapshots to retain (the current snapshot is ALWAYS kept; this is the total window,
+    /// clamped to at least 1). A compaction pass expires snapshots older than this window from
+    /// `metadata.json`, bounding the snapshot log. Larger keeps more time-travel history.
+    pub snapshot_retention_count: u32,
 }
 
 impl Default for SinkConfig {
@@ -47,6 +55,12 @@ impl Default for SinkConfig {
             start_offset: 0,
             mode: RunMode::DrainAndExit,
             poll_interval_ms: 500,
+            // Safe defaults (tunable, not baked in): compact every 16 accumulated manifests and keep
+            // the last 10 snapshots. Both bound long-lived-table metadata growth while leaving a
+            // useful time-travel window; a compaction pass rewrites ~16 manifests into 1 and trims the
+            // snapshot log back to 10.
+            manifest_compaction_threshold: 16,
+            snapshot_retention_count: 10,
         }
     }
 }

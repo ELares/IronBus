@@ -37,7 +37,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -132,6 +132,30 @@ pub struct IcebergTable {
     version: u64,
     /// The path of the current persisted metadata file (for the metadata-log), if any.
     meta_path: Option<String>,
+}
+
+/// What a [`IcebergTable::compact_and_expire`] pass accomplished.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionStats {
+    /// Manifests the current snapshot referenced BEFORE compaction — what a plain append would have
+    /// carried forward wholesale into its next commit.
+    pub manifests_before: usize,
+    /// Manifests the compacted snapshot references (`1` on a real compaction).
+    pub manifests_after: usize,
+    /// Snapshots dropped from `metadata.json` by expiry (always keeping the current + retained window).
+    pub snapshots_expired: usize,
+    /// Stale manifest / manifest-list files physically deleted AFTER the commit was made durable.
+    pub files_deleted: usize,
+}
+
+/// One live data file carried over into the compacted manifest, with the original provenance a
+/// rewrite must preserve (resolved from the manifest-list entry when the manifest stored it
+/// unassigned, exactly as a reader inherits it).
+struct ExistingFile {
+    data_file: iceberg::spec::DataFile,
+    snapshot_id: i64,
+    sequence_number: i64,
+    file_sequence_number: i64,
 }
 
 impl IcebergTable {
@@ -387,6 +411,308 @@ impl IcebergTable {
         Ok(fresh.len())
     }
 
+    /// The number of manifest files the CURRENT snapshot references (its manifest list's entry count).
+    /// This is exactly the set a plain [`append`](Self::append) carries forward wholesale into the next
+    /// commit, so it is what bounds per-commit manifest-list bytes; the sink watches it to decide when
+    /// to compact. `0` when nothing has been committed yet.
+    pub fn current_manifest_count(&self) -> Result<usize> {
+        let Some(snapshot) = self.metadata.current_snapshot() else {
+            return Ok(0);
+        };
+        let bytes =
+            std::fs::read(snapshot.manifest_list()).context("reading the current manifest list")?;
+        let list = ManifestList::parse_with_version(&bytes, FormatVersion::V2)
+            .context("parsing the current manifest list")?;
+        Ok(list.entries().len())
+    }
+
+    /// Compacts the current snapshot's manifests into ONE and expires snapshots beyond
+    /// `snapshot_retention_count`, as a single atomic, crash-safe commit; then deletes the manifest /
+    /// manifest-list files that NO retained snapshot references any more (delete-AFTER-commit). This
+    /// bounds two forms of unbounded metadata growth on a long-lived table: the O(N) manifest list
+    /// every append must otherwise carry forward (hence O(N^2) total manifest-list bytes over N
+    /// commits), and the ever-growing snapshot log in `metadata.json`.
+    ///
+    /// ## Correctness — never drop a live file
+    ///
+    /// Compaction is a pure metadata REWRITE: the new "replace" snapshot references the exact same set
+    /// of live data files as the snapshot it replaces — each carried over with
+    /// [`ManifestWriter::add_existing_file`](iceberg::spec::ManifestWriter), preserving its original
+    /// snapshot id and data/file sequence numbers (resolved from the manifest-list entry exactly as a
+    /// reader inherits them), so a reader sees byte-identical table contents. Expiry only removes
+    /// snapshots that are NOT the current one and fall outside the retained window. The
+    /// delete-after-commit sweep computes the RETAINED live set = the union of every manifest list,
+    /// manifest and data file reachable from EVERY snapshot still in the committed metadata, and
+    /// deletes a physical file only if it is in NO retained snapshot's reachable set. So no file any
+    /// retained snapshot (current included) needs is ever removed.
+    ///
+    /// ## Crash-safety — delete strictly after the commit is durable
+    ///
+    /// The new compacted manifest, manifest list and `metadata.json` are written and fsynced with the
+    /// IDENTICAL fail-closed discipline as [`append`](Self::append) (contents fsynced, dirents fsynced
+    /// before any pointer references them), and the commit is published atomically by the
+    /// `version-hint.text` rename in [`commit_metadata`](Self::commit_metadata). Only AFTER that swap is
+    /// durable does this delete the now-unreferenced old files. A crash before the swap leaves the
+    /// table valid at the previous version (the compaction simply re-runs later); a crash DURING the
+    /// post-commit sweep leaves a few orphan files nothing live references — never a dangling pointer.
+    /// The reachable-set computation the sweep trusts is FAIL-CLOSED: if any retained snapshot's
+    /// manifest chain cannot be fully read, the sweep deletes nothing (bounded metadata growth is the
+    /// goal; a missed reclaim is harmless, a wrong delete is not), and an individual unlink failure is
+    /// ignored — it never fails the already-durable commit.
+    ///
+    /// `snapshot_retention_count` is clamped to at least 1 (the current snapshot is always kept).
+    /// Returns a no-op (zeroed stats) when there is nothing to gain: no snapshot yet, or already a
+    /// single manifest with no snapshots to expire.
+    #[allow(clippy::too_many_lines)]
+    pub fn compact_and_expire(
+        &mut self,
+        snapshot_retention_count: usize,
+    ) -> Result<CompactionStats> {
+        let retain = snapshot_retention_count.max(1);
+
+        // Snapshot the current manifest-list path, releasing the borrow of self before we mutate.
+        let current_ml = match self.metadata.current_snapshot() {
+            Some(s) => s.manifest_list().to_string(),
+            None => return Ok(CompactionStats::default()),
+        };
+
+        // Read the current manifest list -> every LIVE data-file entry across all its manifests, each
+        // with its original provenance resolved (inheriting snapshot id + sequence numbers from the
+        // manifest-list entry when the manifest stored them unassigned, exactly as a reader would).
+        let ml_bytes = std::fs::read(&current_ml).context("reading the current manifest list")?;
+        let manifest_list = ManifestList::parse_with_version(&ml_bytes, FormatVersion::V2)
+            .context("parsing the current manifest list")?;
+        let manifests_before = manifest_list.entries().len();
+        let snapshots_now = self.metadata.snapshots().count();
+
+        // Nothing to gain: already a single manifest AND nothing to expire.
+        if manifests_before <= 1 && snapshots_now <= retain {
+            return Ok(CompactionStats {
+                manifests_before,
+                manifests_after: manifests_before,
+                snapshots_expired: 0,
+                files_deleted: 0,
+            });
+        }
+
+        let mut live: Vec<ExistingFile> = Vec::new();
+        for mf in manifest_list.entries() {
+            let man_bytes = std::fs::read(&mf.manifest_path)
+                .with_context(|| format!("reading manifest {}", mf.manifest_path))?;
+            let manifest = iceberg::spec::Manifest::parse_avro(&man_bytes)
+                .with_context(|| format!("parsing manifest {}", mf.manifest_path))?;
+            for e in manifest.entries() {
+                if !e.is_alive() {
+                    continue;
+                }
+                live.push(ExistingFile {
+                    data_file: e.data_file().clone(),
+                    snapshot_id: e.snapshot_id().unwrap_or(mf.added_snapshot_id),
+                    sequence_number: e.sequence_number().unwrap_or(mf.sequence_number),
+                    file_sequence_number: e.file_sequence_number.unwrap_or(mf.sequence_number),
+                });
+            }
+        }
+
+        // Preserve the durable resume watermark on the replace snapshot: next_offset() reads it from
+        // the CURRENT snapshot summary, so the compacted snapshot MUST carry it or a cold resume would
+        // regress to the table's start offset and re-materialize everything.
+        let watermark = self.next_offset();
+
+        let existing_ids: HashSet<i64> =
+            self.metadata.snapshots().map(|s| s.snapshot_id()).collect();
+        let new_sid = new_snapshot_id(&existing_ids);
+        let next_seq = self.metadata.next_sequence_number();
+        let schema_ref = self.metadata.current_schema().clone();
+        let spec = self.metadata.default_partition_spec().as_ref().clone();
+        let commit_uuid = Uuid::new_v4();
+
+        // 1. One compacted manifest holding every live data file as an EXISTING entry (status
+        //    Existing, original provenance preserved — this is a rewrite, not a re-append).
+        let manifest_path = format!("{}/metadata/{commit_uuid}-compact-m0.avro", self.location);
+        let out = self
+            .file_io
+            .new_output(&manifest_path)
+            .context("opening the compacted manifest output")?;
+        let mut mw =
+            ManifestWriterBuilder::new(out, Some(new_sid), None, schema_ref, spec).build_v2_data();
+        for e in live {
+            mw.add_existing_file(
+                e.data_file,
+                e.snapshot_id,
+                e.sequence_number,
+                Some(e.file_sequence_number),
+            )
+            .context("adding an existing data file to the compacted manifest")?;
+        }
+        let compacted = self
+            .rt
+            .block_on(mw.write_manifest_file())
+            .context("writing the compacted manifest")?;
+        fsync_file(&manifest_path).context("fsyncing the compacted manifest")?;
+
+        // 2. Manifest list referencing only the one compacted manifest.
+        let ml_path = format!(
+            "{}/metadata/snap-{new_sid}-0-{commit_uuid}.avro",
+            self.location
+        );
+        let out2 = self
+            .file_io
+            .new_output(&ml_path)
+            .context("opening the compacted manifest-list output")?;
+        let mut mlw =
+            ManifestListWriter::v2(out2, new_sid, self.metadata.current_snapshot_id(), next_seq);
+        mlw.add_manifests(std::iter::once(compacted))
+            .context("adding the compacted manifest to the manifest list")?;
+        self.rt
+            .block_on(mlw.close())
+            .context("writing the compacted manifest list")?;
+        fsync_file(&ml_path).context("fsyncing the compacted manifest list")?;
+
+        // 3. A "replace" snapshot over the same data, carrying the resume watermark forward.
+        let mut props = HashMap::new();
+        props.insert(NEXT_OFFSET_PROP.to_string(), watermark.to_string());
+        props.insert(
+            "compacted-manifests".to_string(),
+            manifests_before.to_string(),
+        );
+        let summary = Summary {
+            operation: Operation::Replace,
+            additional_properties: props,
+        };
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(new_sid)
+            .with_parent_snapshot_id(self.metadata.current_snapshot_id())
+            .with_sequence_number(next_seq)
+            .with_timestamp_ms(now_ms())
+            .with_manifest_list(ml_path)
+            .with_summary(summary)
+            .with_schema_id(self.metadata.current_schema_id())
+            .build();
+
+        // 4. Choose which OLD snapshots to expire: keep the newest `retain - 1` of them plus the new
+        //    replace snapshot = `retain` total. The current snapshot always survives (it is never in
+        //    the expire set, and after set_ref the main ref points at the new snapshot).
+        let mut by_seq: Vec<(i64, i64)> = self
+            .metadata
+            .snapshots()
+            .map(|s| (s.sequence_number(), s.snapshot_id()))
+            .collect();
+        by_seq.sort_by_key(|(seq, _)| *seq);
+        let keep_old = retain.saturating_sub(1);
+        let expire_ids: Vec<i64> = if by_seq.len() > keep_old {
+            by_seq[..by_seq.len() - keep_old]
+                .iter()
+                .map(|(_, id)| *id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // 5. New metadata: add the replace snapshot, advance main, expire the old snapshots. The
+        //    builder prunes the snapshot log to the retained suffix ending at the current snapshot.
+        let new_metadata =
+            TableMetadataBuilder::new_from_metadata(self.metadata.clone(), self.meta_path.clone())
+                .add_snapshot(snapshot)
+                .context("adding the compaction snapshot to table metadata")?
+                .set_ref(
+                    MAIN_BRANCH,
+                    SnapshotReference::new(new_sid, SnapshotRetention::branch(None, None, None)),
+                )
+                .context("advancing the main branch ref to the compaction snapshot")?
+                .remove_snapshots(&expire_ids)
+                .build()
+                .context("building the compacted table metadata")?
+                .metadata;
+
+        // 6. Atomic, crash-safe commit (identical discipline to append).
+        let new_version = self.version + 1;
+        let meta_path = self
+            .commit_metadata(new_version, &new_metadata)
+            .context("committing the compacted table metadata")?;
+        self.metadata = new_metadata;
+        self.version = new_version;
+        self.meta_path = Some(meta_path);
+
+        // 7. Delete-AFTER-commit: only now that the new pointer chain (which references NONE of the
+        //    old per-commit manifests / manifest lists that fell out of the retained set) is durable
+        //    do we reclaim them. Fail-closed + best-effort: an incompletely computed reachable set
+        //    deletes nothing, and an individual unlink failure is ignored (a harmless orphan either
+        //    way). This NEVER fails the already-durable commit.
+        let files_deleted = match self.unreferenced_metadata_files() {
+            Ok(paths) => paths
+                .iter()
+                .filter(|p| std::fs::remove_file(p).is_ok())
+                .count(),
+            Err(e) => {
+                eprintln!(
+                    "iceberg-sink: compaction GC skipped (reachable set incomplete, fail-closed): {e:#}"
+                );
+                0
+            }
+        };
+
+        Ok(CompactionStats {
+            manifests_before,
+            manifests_after: 1,
+            snapshots_expired: expire_ids.len(),
+            files_deleted,
+        })
+    }
+
+    /// The delete-after-commit reclaim set: the manifest / manifest-list (`*.avro`) files under
+    /// `metadata/` that NO snapshot currently in the table references. Computes the RETAINED live set —
+    /// the union of every manifest list, manifest, and data file reachable from every snapshot still in
+    /// the committed metadata — and returns the `*.avro` files not in it. FAIL-CLOSED: any failure to
+    /// fully walk a retained snapshot's manifest chain (or to canonicalize a file it references)
+    /// returns `Err`, so the caller deletes nothing rather than risk removing a file a retained
+    /// snapshot still needs. Data files ARE included in the reachable set (so a live `.parquet` can
+    /// never become a candidate) but are never themselves returned: this append-only sink keeps every
+    /// data file live, so the only reclaimable garbage is stale metadata. All paths are canonicalized
+    /// so string-form differences (relative vs absolute) cannot cause a false "unreferenced" verdict.
+    fn unreferenced_metadata_files(&self) -> Result<Vec<PathBuf>> {
+        let mut reachable: HashSet<PathBuf> = HashSet::new();
+        for snapshot in self.metadata.snapshots() {
+            let ml = snapshot.manifest_list();
+            reachable.insert(canonical(ml)?);
+            let ml_bytes =
+                std::fs::read(ml).with_context(|| format!("reading manifest list {ml}"))?;
+            let list = ManifestList::parse_with_version(&ml_bytes, FormatVersion::V2)
+                .with_context(|| format!("parsing manifest list {ml}"))?;
+            for mf in list.entries() {
+                reachable.insert(canonical(&mf.manifest_path)?);
+                let man_bytes = std::fs::read(&mf.manifest_path)
+                    .with_context(|| format!("reading manifest {}", mf.manifest_path))?;
+                let manifest = iceberg::spec::Manifest::parse_avro(&man_bytes)
+                    .with_context(|| format!("parsing manifest {}", mf.manifest_path))?;
+                for e in manifest.entries() {
+                    if e.is_alive() {
+                        reachable.insert(canonical(e.data_file().file_path())?);
+                    }
+                }
+            }
+        }
+
+        // Candidates: every `*.avro` (manifest / manifest list) under metadata/. metadata.json,
+        // version-hint.text and the *.tmp.* staging files are deliberately NOT candidates — the
+        // pointer chain / metadata log is governed by the atomic commit, not this sweep.
+        let meta_dir = format!("{}/metadata", self.location);
+        let mut garbage = Vec::new();
+        for entry in std::fs::read_dir(&meta_dir).with_context(|| format!("listing {meta_dir}"))? {
+            let path = entry
+                .with_context(|| format!("reading a dir entry in {meta_dir}"))?
+                .path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("avro") {
+                continue;
+            }
+            let canon = canonical(&path)?;
+            if !reachable.contains(&canon) {
+                garbage.push(canon);
+            }
+        }
+        Ok(garbage)
+    }
+
     /// Persists `v{version}.metadata.json` and then atomically publishes it by renaming
     /// `version-hint.text` over it — the table's commit point. The ordering is crash-safe and
     /// FAIL-CLOSED:
@@ -510,6 +836,15 @@ fn fsync_file(path: &str) -> Result<()> {
     let f = File::open(path).with_context(|| format!("opening {path} for fsync"))?;
     f.sync_all().with_context(|| format!("fsyncing {path}"))?;
     Ok(())
+}
+
+/// Resolves a path to its canonical, absolute form (following the real filesystem). Used by the
+/// compaction GC to compare on-disk files against the reachable set by identity rather than by string
+/// form; it requires the file to EXIST, so a canonicalize failure on a supposedly-reachable file is a
+/// fail-closed signal that aborts the sweep.
+fn canonical<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("canonicalizing {}", path.as_ref().display()))
 }
 
 fn write_parquet(path: &str, records: &[&Record]) -> Result<u64> {
@@ -792,5 +1127,272 @@ mod tests {
         assert!(ids.iter().all(|&id| id != 0), "no snapshot id may be 0");
         let uniq: HashSet<i64> = ids.iter().copied().collect();
         assert_eq!(uniq.len(), ids.len(), "all snapshot ids must be distinct");
+    }
+
+    // ----------------------------------------------------------------------------------------------
+    // Bounded manifest compaction + expire-snapshots (#1179)
+    // ----------------------------------------------------------------------------------------------
+
+    /// Walks a table's WHOLE metadata graph (every retained snapshot -> its manifest list -> every
+    /// manifest -> every live data file) and returns every physical file path any retained snapshot
+    /// references. This is the "retained live set" the never-drop-a-live-file property is stated over.
+    fn all_referenced_files(t: &IcebergTable) -> Vec<String> {
+        let mut files = Vec::new();
+        for snap in t.metadata.snapshots() {
+            let ml = snap.manifest_list().to_string();
+            files.push(ml.clone());
+            let bytes = std::fs::read(&ml).unwrap();
+            let list = ManifestList::parse_with_version(&bytes, FormatVersion::V2).unwrap();
+            for mf in list.entries() {
+                files.push(mf.manifest_path.clone());
+                let mb = std::fs::read(&mf.manifest_path).unwrap();
+                let manifest = iceberg::spec::Manifest::parse_avro(&mb).unwrap();
+                for e in manifest.entries() {
+                    if e.is_alive() {
+                        files.push(e.data_file().file_path().to_string());
+                    }
+                }
+            }
+        }
+        files
+    }
+
+    /// Appends `batches` batches of `per` records each, contiguously from offset 0. Returns the loc.
+    fn table_with_batches(loc: &str, batches: i64, per: i64) {
+        let mut t = IcebergTable::open_or_create(loc, 0).unwrap();
+        for b in 0..batches {
+            let recs: Vec<Record> = (b * per..b * per + per).map(mk).collect();
+            t.append(&recs).unwrap();
+        }
+    }
+
+    /// The core proof: after compaction the table reads back EVERY committed row at the exact offsets,
+    /// no dups, the watermark is preserved, and a COLD reopen recovers all of it. The manifest set is
+    /// collapsed to one, and the snapshot log is trimmed to the retention window.
+    #[test]
+    fn compaction_preserves_all_rows_watermark_and_reads_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().to_str().unwrap();
+        table_with_batches(loc, 12, 3); // offsets 0..36 across 12 snapshots
+
+        let mut t = IcebergTable::open_or_create(loc, 0).unwrap();
+        assert_eq!(
+            t.current_manifest_count().unwrap(),
+            12,
+            "one manifest per append"
+        );
+        assert_eq!(t.snapshot_count(), 12);
+        assert_eq!(t.next_offset(), 36);
+
+        let stats = t.compact_and_expire(5).unwrap();
+        assert_eq!(stats.manifests_before, 12);
+        assert_eq!(stats.manifests_after, 1, "compacted to a single manifest");
+        assert_eq!(
+            stats.snapshots_expired, 8,
+            "12 old + 1 new, keep 5 => expire 8"
+        );
+
+        // Manifest set collapsed; snapshot log trimmed to the retention window.
+        assert_eq!(t.current_manifest_count().unwrap(), 1);
+        assert_eq!(t.snapshot_count(), 5);
+        // Watermark preserved on the in-memory handle.
+        assert_eq!(t.next_offset(), 36);
+
+        // Structural read via the real Iceberg chain: all 36 offsets, contiguous, no dup/drop.
+        let mut got = scan_offsets(loc).unwrap();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            (0..36).collect::<Vec<_>>(),
+            "every row survives compaction"
+        );
+
+        // COLD reopen: watermark + full contents recover from the committed metadata.
+        let t2 = IcebergTable::open_or_create(loc, 999).unwrap();
+        assert_eq!(
+            t2.next_offset(),
+            36,
+            "cold resume watermark survives compaction"
+        );
+        assert_eq!(t2.snapshot_count(), 5);
+        let mut got2 = scan_offsets(loc).unwrap();
+        got2.sort_unstable();
+        assert_eq!(got2, (0..36).collect::<Vec<_>>());
+    }
+
+    /// THE LOAD-BEARING SAFETY PROPERTY: after compaction (with aggressive expiry AND physical GC),
+    /// every file referenced by every RETAINED snapshot still exists on disk. A single missing live
+    /// file would be a broken/lossy table.
+    #[test]
+    fn compaction_never_drops_a_retained_live_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().to_str().unwrap();
+        table_with_batches(loc, 10, 4); // offsets 0..40
+
+        let mut t = IcebergTable::open_or_create(loc, 0).unwrap();
+        // retention=1 => keep ONLY the compacted snapshot => maximal expiry + maximal GC.
+        let stats = t.compact_and_expire(1).unwrap();
+        assert_eq!(t.snapshot_count(), 1);
+        assert!(
+            stats.files_deleted > 0,
+            "aggressive expiry must reclaim stale manifests"
+        );
+
+        // Every file the (sole) retained snapshot references must still exist.
+        for f in all_referenced_files(&t) {
+            assert!(
+                Path::new(&f).exists(),
+                "a retained-snapshot-referenced file was deleted: {f}"
+            );
+        }
+        // And the table still reads back every row.
+        let mut got = scan_offsets(loc).unwrap();
+        got.sort_unstable();
+        assert_eq!(got, (0..40).collect::<Vec<_>>());
+    }
+
+    /// Physical GC deletes ONLY files no retained snapshot references, and is bounded by retention: a
+    /// large retention window keeps the old manifests alive (deletes nothing), a retention of 1
+    /// reclaims all of them but the compacted one.
+    #[test]
+    fn gc_deletes_only_unreferenced_files_and_respects_retention() {
+        // High retention: every old snapshot is retained, so nothing is unreferenced -> no deletion.
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().to_str().unwrap();
+        table_with_batches(loc, 8, 2);
+        let mut t = IcebergTable::open_or_create(loc, 0).unwrap();
+        let avro_before = count_avro(loc);
+        let stats = t.compact_and_expire(100).unwrap();
+        assert_eq!(stats.snapshots_expired, 0, "retention 100 expires nothing");
+        assert_eq!(
+            stats.files_deleted, 0,
+            "nothing unreferenced -> nothing deleted"
+        );
+        // The new compacted manifest + list were added, old ones all still referenced.
+        assert!(count_avro(loc) > avro_before);
+        for f in all_referenced_files(&t) {
+            assert!(Path::new(&f).exists(), "referenced file missing: {f}");
+        }
+
+        // Low retention on a fresh table: reclaims the now-unreferenced old .avro files.
+        let dir2 = tempfile::tempdir().unwrap();
+        let loc2 = dir2.path().to_str().unwrap();
+        table_with_batches(loc2, 8, 2);
+        let mut t2 = IcebergTable::open_or_create(loc2, 0).unwrap();
+        let stats2 = t2.compact_and_expire(1).unwrap();
+        assert!(stats2.files_deleted > 0);
+        // Belt-and-suspenders: the surviving .avro files are exactly the referenced ones.
+        let referenced: HashSet<PathBuf> = all_referenced_files(&t2)
+            .iter()
+            .filter(|f| Path::new(f).extension().and_then(std::ffi::OsStr::to_str) == Some("avro"))
+            .map(|f| std::fs::canonicalize(f).unwrap())
+            .collect();
+        for entry in std::fs::read_dir(format!("{loc2}/metadata")).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(std::ffi::OsStr::to_str) == Some("avro") {
+                assert!(
+                    referenced.contains(&std::fs::canonicalize(&p).unwrap()),
+                    "an unreferenced .avro survived the GC: {}",
+                    p.display()
+                );
+            }
+        }
+    }
+
+    fn count_avro(loc: &str) -> usize {
+        std::fs::read_dir(format!("{loc}/metadata"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.path().extension().and_then(std::ffi::OsStr::to_str) == Some("avro"))
+            .count()
+    }
+
+    /// Appends continue correctly AFTER a compaction: dedup still holds (the watermark carried onto the
+    /// replace snapshot), and new records extend the table contiguously.
+    #[test]
+    fn append_after_compaction_dedups_and_extends() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().to_str().unwrap();
+        table_with_batches(loc, 6, 3); // 0..18
+
+        let mut t = IcebergTable::open_or_create(loc, 0).unwrap();
+        t.compact_and_expire(2).unwrap();
+        assert_eq!(t.next_offset(), 18);
+        assert_eq!(t.current_manifest_count().unwrap(), 1);
+
+        // A redelivery of already-materialized offsets is dropped; only the new tail is written.
+        let redelivered: Vec<Record> = (15..24).map(mk).collect();
+        assert_eq!(t.append(&redelivered).unwrap(), 6, "only 18..24 are new");
+        assert_eq!(t.next_offset(), 24);
+        // Post-compaction append carries forward the one compacted manifest + the new one.
+        assert_eq!(t.current_manifest_count().unwrap(), 2);
+
+        let mut got = scan_offsets(loc).unwrap();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            (0..24).collect::<Vec<_>>(),
+            "no dup/drop across the compaction seam"
+        );
+    }
+
+    /// Expiry always keeps the CURRENT snapshot and never leaves the main ref dangling, even when
+    /// retention is smaller than the number of pre-existing snapshots.
+    #[test]
+    fn expiry_keeps_current_snapshot_and_valid_main_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().to_str().unwrap();
+        table_with_batches(loc, 9, 1);
+
+        let mut t = IcebergTable::open_or_create(loc, 0).unwrap();
+        t.compact_and_expire(3).unwrap();
+        assert_eq!(t.snapshot_count(), 3);
+        let current = t
+            .metadata
+            .current_snapshot()
+            .expect("a current snapshot must survive expiry");
+        // The main ref points at a snapshot that still exists (build() validates this, but assert it).
+        assert!(
+            t.metadata
+                .snapshots()
+                .any(|s| s.snapshot_id() == current.snapshot_id()),
+            "current snapshot must remain in the snapshot set"
+        );
+        // The compacted current snapshot carries the resume watermark.
+        assert_eq!(t.next_offset(), 9);
+    }
+
+    /// Compaction is a no-op (no churn, no growth) when there is nothing to gain: an empty table, and a
+    /// table already at a single manifest within the retention window.
+    #[test]
+    fn compaction_is_a_noop_when_nothing_to_gain() {
+        // Empty table.
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().to_str().unwrap();
+        let mut empty = IcebergTable::open_or_create(loc, 0).unwrap();
+        let s = empty.compact_and_expire(5).unwrap();
+        assert_eq!(s, CompactionStats::default());
+        assert_eq!(empty.version(), 0, "no commit on an empty table");
+
+        // Single-manifest table within retention: compacting again must not add a snapshot.
+        let dir2 = tempfile::tempdir().unwrap();
+        let loc2 = dir2.path().to_str().unwrap();
+        table_with_batches(loc2, 4, 2);
+        let mut t = IcebergTable::open_or_create(loc2, 0).unwrap();
+        t.compact_and_expire(2).unwrap(); // -> 1 manifest, 2 snapshots
+        let v = t.version();
+        let snaps = t.snapshot_count();
+        let s2 = t.compact_and_expire(10).unwrap(); // nothing to gain (1 manifest, within retention)
+        assert_eq!(s2.files_deleted, 0);
+        assert_eq!(
+            t.version(),
+            v,
+            "no-op compaction must not commit a new version"
+        );
+        assert_eq!(
+            t.snapshot_count(),
+            snaps,
+            "no-op compaction must not add a snapshot"
+        );
     }
 }

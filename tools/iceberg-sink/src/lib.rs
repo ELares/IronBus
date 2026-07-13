@@ -44,4 +44,4 @@ pub mod table;
 
 pub use config::{RunMode, SinkConfig};
 pub use sink::{run, SinkStats};
-pub use table::{scan_offsets, IcebergTable, Record};
+pub use table::{scan_offsets, CompactionStats, IcebergTable, Record};

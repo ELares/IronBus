@@ -22,6 +22,12 @@ pub struct SinkStats {
     pub last_committed_offset: i64,
     /// The table's resume watermark when the run ended.
     pub final_next_offset: i64,
+    /// The number of manifest-compaction / expire-snapshots passes performed.
+    pub compactions: u64,
+    /// The number of snapshots expired from `metadata.json` across those passes.
+    pub snapshots_expired: u64,
+    /// The number of stale manifest / manifest-list files reclaimed (delete-after-commit).
+    pub files_reclaimed: u64,
 }
 
 fn message_to_record(m: &Message) -> Record {
@@ -122,6 +128,25 @@ pub fn run(cfg: &SinkConfig) -> Result<SinkStats> {
             .stream_commit(&cfg.group, committed as u64)
             .context("committing the broker consumer cursor")?;
         stats.last_committed_offset = committed;
+
+        // Bound long-lived-table metadata growth: once the current snapshot has accumulated enough
+        // manifests, rewrite them into one and expire snapshots beyond the retention window. This is a
+        // correctness-preserving metadata rewrite (same crash-safe commit discipline as the append
+        // above, and delete-after-commit), so a failure leaves the table valid at the pre-compaction
+        // version — the watermark (read back on the next loop) is unaffected.
+        if cfg.manifest_compaction_threshold > 0 {
+            let manifests = table
+                .current_manifest_count()
+                .context("counting the current snapshot's manifests")?;
+            if manifests >= cfg.manifest_compaction_threshold as usize {
+                let c = table
+                    .compact_and_expire(cfg.snapshot_retention_count as usize)
+                    .context("compacting manifests / expiring snapshots")?;
+                stats.compactions += 1;
+                stats.snapshots_expired += c.snapshots_expired as u64;
+                stats.files_reclaimed += c.files_deleted as u64;
+            }
+        }
     }
 
     stats.final_next_offset = table.next_offset();
