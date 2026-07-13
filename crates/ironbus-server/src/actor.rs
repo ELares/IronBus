@@ -56,9 +56,11 @@ use crate::liveness::ActorWatchdog;
 use crate::produce_gate::ProduceCapGate;
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
+use ironbus_core::sublist::SublistSnapshot;
 use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
+use ironbus_storage::streamset::StreamId;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -725,6 +727,15 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// plain `bool` copied on clone (like `reply_spin`), set on the base handle before any per-connection
     /// clone via [`Self::with_zero_copy_sendfile`].
     zero_copy_sendfile: bool,
+    /// The SHARED wait-free subject routing snapshot (#585 / #811 C3): the SAME `Arc<SublistSnapshot>`
+    /// the engine's [`crate::engine::Engine::bind_subject`] publishes to, cloned into the handle at
+    /// `spawn_actor` time BEFORE the engine moves into the actor thread. A connection thread resolves a
+    /// subject WAIT-FREE off the actor against it (no round-trip through the append actor), then routes
+    /// the produce to the resolved stream's shard via [`EngineAccess::with_on_shard`] — parity with the
+    /// `PubTo` path. SHARED across every per-connection clone (one per actor, like `cap_gate`):
+    /// `bind_subject` stores a rebuilt trie through the `ArcSwap` this `Arc` wraps, so every reader sees
+    /// the latest committed bindings without the `Arc` itself ever being replaced.
+    binding_snapshot: Arc<SublistSnapshot<StreamId>>,
 }
 
 /// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
@@ -767,6 +778,10 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // The fixed-for-life zero-copy `sendfile(2)` toggle (#1034): a plain copy, like `reply_spin`,
             // so every connection clone inherits the base handle's operator setting.
             zero_copy_sendfile: self.zero_copy_sendfile,
+            // The SAME shared subject-routing snapshot (#811 C3): one per actor, published to by
+            // `bind_subject` and resolved off the actor by every connection, so the `Arc` is shared on
+            // clone (like `cap_gate`), never freshened.
+            binding_snapshot: Arc::clone(&self.binding_snapshot),
         }
     }
 }
@@ -1114,6 +1129,106 @@ pub fn shard_of(stream: &str, shards: usize) -> usize {
     usize::try_from(hasher.finish() % shards as u64).unwrap_or(0)
 }
 
+/// The maximum number of append shards `--append-shards auto` (or an explicit request) resolves to
+/// (#811). `auto` picks the machine's core count, but a shard is a dedicated append actor THREAD, so
+/// an unbounded `auto` on a very-many-core box would spawn a pathological number of threads for no
+/// gain past the number of distinct hot streams; this caps the fan-out at a safe, conservative bound.
+/// A deliberately conservative value the owner can revisit alongside the C8 flip that first spawns
+/// K > 1 actors (until then every resolution is inert — see [`resolve_append_shards`]).
+pub const MAX_APPEND_SHARDS: usize = 64;
+
+/// A requested append-shard count (#811) — the parsed form of the `--append-shards` knob BEFORE
+/// resolution. [`AppendShards::Auto`] defers the count to the machine (its core count, capped at
+/// [`MAX_APPEND_SHARDS`]); [`AppendShards::Fixed`] pins an explicit count. The [`Default`] is
+/// `Fixed(1)` — a single append shard, i.e. today's byte-for-byte single-actor engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendShards {
+    /// Resolve the count from the machine's available parallelism, capped at [`MAX_APPEND_SHARDS`].
+    Auto,
+    /// An explicit shard count (clamped to `1..=MAX_APPEND_SHARDS` on resolution).
+    Fixed(usize),
+}
+
+impl Default for AppendShards {
+    fn default() -> Self {
+        // One append shard = today's unsharded single-actor engine, byte-for-byte.
+        AppendShards::Fixed(1)
+    }
+}
+
+impl AppendShards {
+    /// Parses an `--append-shards` value: the token `auto` (any case) → [`AppendShards::Auto`]; a
+    /// positive decimal integer → [`AppendShards::Fixed`]. Returns `None` for an empty string, a
+    /// non-numeric token, or `0` (a broker must have at least one append shard), so the caller can
+    /// name the bad source in a usage error (mirroring the other enum-string flags).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<AppendShards> {
+        if value.eq_ignore_ascii_case("auto") {
+            return Some(AppendShards::Auto);
+        }
+        match value.parse::<usize>() {
+            Ok(n) if n >= 1 => Some(AppendShards::Fixed(n)),
+            _ => None,
+        }
+    }
+
+    /// Whether this is an EXPLICIT request for MORE than one shard (`Fixed(n)` with `n > 1`). The
+    /// shared-WAL guard ([`resolve_append_shards`]) rejects exactly this combined with
+    /// [`StorageMode::SharedWal`](ironbus_storage::shared_wal::StorageMode::SharedWal); an `Auto`
+    /// request is NOT explicit (it silently resolves to 1 under shared-WAL), so it is allowed.
+    #[must_use]
+    fn is_explicit_multi(self) -> bool {
+        matches!(self, AppendShards::Fixed(n) if n > 1)
+    }
+}
+
+/// The typed error from [`resolve_append_shards`] (#811, C4): the operator EXPLICITLY asked for more
+/// than one append shard AND selected the shared-WAL storage mode, which cannot shard — every named
+/// stream shares ONE physical commit log, so its records cannot be split across writer threads. Raised
+/// fail-closed rather than silently downgrading to one shard, so the contradiction is a visible boot
+/// error, never a surprise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedWalCannotShard;
+
+/// Resolves a requested [`AppendShards`] count against the selected storage mode (#811, C4) — the ONE
+/// place the `auto` core-count resolution, the [`MAX_APPEND_SHARDS`] cap, and the shared-WAL guard
+/// live, so the CLI, the engine, and the tests agree on one policy.
+///
+/// - [`StorageMode::SharedWal`](ironbus_storage::shared_wal::StorageMode::SharedWal) can NEVER shard,
+///   so an EXPLICIT `Fixed(n > 1)` is REJECTED with [`SharedWalCannotShard`] (fail-closed) and every
+///   non-explicit request (`Auto` or `Fixed(1)`) resolves to `1`.
+/// - [`StorageMode::PerStreamLogs`](ironbus_storage::shared_wal::StorageMode::PerStreamLogs) resolves
+///   `Auto` to the machine's available parallelism capped at [`MAX_APPEND_SHARDS`], and `Fixed(n)` to
+///   `n` clamped to `1..=MAX_APPEND_SHARDS`.
+///
+/// The result is always `>= 1`. NOTE: resolving `> 1` does NOT itself spawn K actors — that is the
+/// owner-gated C8 flip; until then the resolved count is a validated, reported setting and the broker
+/// runs a single append shard (K = 1), byte-for-byte today.
+///
+/// # Errors
+/// Returns [`SharedWalCannotShard`] when an explicit multi-shard request is combined with shared-WAL.
+pub fn resolve_append_shards(
+    request: AppendShards,
+    storage_mode: ironbus_storage::shared_wal::StorageMode,
+) -> Result<usize, SharedWalCannotShard> {
+    use ironbus_storage::shared_wal::StorageMode;
+    if storage_mode == StorageMode::SharedWal {
+        if request.is_explicit_multi() {
+            return Err(SharedWalCannotShard);
+        }
+        // A shared-WAL broker is pinned to ONE append shard: every named stream shares one physical
+        // commit log, so the write plane cannot be split across writer threads.
+        return Ok(1);
+    }
+    let resolved = match request {
+        AppendShards::Auto => std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(MAX_APPEND_SHARDS),
+        AppendShards::Fixed(n) => n.clamp(1, MAX_APPEND_SHARDS),
+    };
+    Ok(resolved)
+}
+
 /// The engine access a [`Session`](crate::session::Session) needs: a group-committed produce and a
 /// generic "run this on the engine" call. Production wires [`EngineHandle`] (the channel to the
 /// append actor); session UNIT tests wire [`DirectEngine`] (a same-thread `&mut Engine`), so the
@@ -1215,6 +1330,21 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         );
         let _ = shard;
         self.with(job)
+    }
+
+    /// The wait-free SUBJECT ROUTING snapshot (#585 / #811 C3), read LOCALLY off the actor (no
+    /// round-trip) so a connection thread resolves a subject to its single bound stream BEFORE routing
+    /// the produce to that stream's shard — parity with the `PubTo` path, which hashes the stream name
+    /// on the connection thread. Returns a cheap `Arc` clone of the SAME snapshot the engine's
+    /// [`crate::engine::Engine::bind_subject`] publishes to, so a resolve always observes the latest
+    /// committed bindings, exactly as an in-actor resolve would.
+    ///
+    /// The DEFAULT returns an EMPTY snapshot (every subject resolves `NoStream`); that is correct ONLY
+    /// for the test fixtures that never drive a subject-addressed verb. Every real handle
+    /// ([`EngineHandle`], [`ShardedEngineHandle`], and the direct test engines that back the session's
+    /// subject tests) OVERRIDES it to return the engine's shared snapshot.
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        Arc::new(SublistSnapshot::empty())
     }
 
     /// The current MONOTONIC time (nanoseconds) from the engine's clock seam, read LOCALLY (no actor
@@ -1430,6 +1560,13 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
         self.clock.now_monotonic_nanos()
     }
 
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // A LOCAL clone of the shared snapshot `Arc` (#811 C3), no actor round-trip: the handle holds
+        // the SAME snapshot `bind_subject` publishes to, so a connection resolves a subject off the
+        // actor and routes the produce to the resolved stream's shard.
+        Arc::clone(&self.binding_snapshot)
+    }
+
     fn consumer_credit_caps(&self) -> (u32, u64) {
         // A LOCAL read of the snapshotted caps, no actor round-trip (the #177 head-of-line guard).
         EngineHandle::consumer_credit_caps(self)
@@ -1546,6 +1683,193 @@ impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F
     }
 }
 
+/// A #811 append-sharding FRONT over the engine-access surface: it holds K per-shard
+/// [`EngineHandle`]s (each a channel to one shard's append actor) and routes an [`EngineAccess`] call
+/// to the shard the caller selected via [`EngineAccess::with_on_shard`]. Shard 0 is the DEFAULT shard:
+/// the default stream `""` pins to it ([`shard_of`]`("", _) == 0`) and every NON-shard-routed call
+/// (produce, the per-connection cleanups, health) forwards to it.
+///
+/// In THIS phase (C1) it is ALWAYS built with K = 1 via [`Self::single`], so it is a PURE PASS-THROUGH
+/// to today's single [`EngineHandle`] — byte-for-byte identical at runtime: [`EngineAccess::shard_count`]
+/// returns 1, so [`shard_of`] yields 0 for every stream and [`EngineAccess::with_on_shard`]`(0, ..)`
+/// collapses to [`EngineHandle`]'s `with`. Spawning K > 1 shard actors (and building this with K
+/// handles) is the owner-gated C8 flip; the type exists now so that flip is a single small commit —
+/// swap [`Self::single`] for a K-handle constructor over K spawned actors.
+///
+/// Every [`EngineAccess`] method is forwarded EXPLICITLY to the selected shard's handle (rather than
+/// left to the trait default), so the front carries [`EngineHandle`]'s real cluster / watchdog /
+/// span-sink / commit-notify behavior verbatim instead of the inert non-actor defaults — the invariant
+/// that makes K = 1 byte-for-byte the single-handle engine.
+pub struct ShardedEngineHandle<F: Filesystem, C: Clock> {
+    /// The per-shard engine handles, indexed by shard id in `0..shards.len()`. Exactly ONE entry today
+    /// ([`Self::single`]); the C8 flip builds this with K handles over K spawned actors.
+    shards: Vec<EngineHandle<F, C>>,
+}
+
+// Spelled out (not derived) so it does not demand `F: Clone`: [`EngineHandle`]'s own manual `Clone`
+// clones the `SyncSender` + the clock for ANY `F`, so cloning the vec of handles does too. Cloning a
+// front is exactly the per-connection clone the serve loop makes of a single handle today (a FRESH
+// per-connection reply pool, the SAME shared actor channel + gates on each shard), so a future
+// K-shard serve path can clone this per connection with identical semantics.
+impl<F: Filesystem, C: Clock + Clone> Clone for ShardedEngineHandle<F, C> {
+    fn clone(&self) -> Self {
+        ShardedEngineHandle {
+            shards: self.shards.clone(),
+        }
+    }
+}
+
+impl<F: Filesystem, C: Clock + Clone> ShardedEngineHandle<F, C> {
+    /// The single-shard (K = 1) front: wraps ONE [`EngineHandle`] so every call forwards to it,
+    /// byte-for-byte today's unsharded engine. The ONLY constructor in C1 — no second actor is spawned
+    /// (that is the C8 flip).
+    #[must_use]
+    pub fn single(handle: EngineHandle<F, C>) -> Self {
+        ShardedEngineHandle {
+            shards: vec![handle],
+        }
+    }
+
+    /// The DEFAULT shard (shard 0): the target of every non-shard-routed call and of the default
+    /// stream `""`. Present for any K >= 1, so it is always in range.
+    fn primary(&self) -> &EngineHandle<F, C> {
+        &self.shards[0]
+    }
+}
+
+// The same bounds as `EngineAccess for EngineHandle` (the follower-read override needs `F: Clone`);
+// every production `EngineAccess` path already carries them.
+impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
+    for ShardedEngineHandle<F, C>
+{
+    // NOTE: several forwarded methods (`produce*`, `with`, `consumer_credit_caps`, `commit_notify`,
+    // `drop_client_acks`) share a NAME with an inherent [`EngineHandle`] method, and an inherent method
+    // shadows a trait one in `self.primary().m()` resolution (e.g. inherent `commit_notify` returns
+    // `&Arc<..>`, the trait one `Option<&Arc<..>>`). These are called through fully-qualified
+    // [`EngineAccess`] syntax so the front carries the TRAIT behavior verbatim — the invariant that
+    // makes K = 1 byte-for-byte the single handle.
+
+    fn produce(&self, append: OwnedAppend) -> Result<ProduceOutcome, ActorGone> {
+        EngineAccess::produce(self.primary(), append)
+    }
+
+    fn produce_submit(&self, append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
+        EngineAccess::produce_submit(self.primary(), append)
+    }
+
+    fn produce_no_reply(&self, append: OwnedAppend) -> Result<(), ActorGone> {
+        EngineAccess::produce_no_reply(self.primary(), append)
+    }
+
+    fn produce_no_reply_batch(&self, appends: Vec<OwnedAppend>) -> Result<(), ActorGone> {
+        EngineAccess::produce_no_reply_batch(self.primary(), appends)
+    }
+
+    fn with<R, J>(&self, job: J) -> Result<R, ActorGone>
+    where
+        R: Send + 'static,
+        J: FnOnce(&mut Engine<F, C>) -> R + Send + 'static,
+    {
+        EngineAccess::with(self.primary(), job)
+    }
+
+    fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    fn with_on_shard<R, J>(&self, shard: usize, job: J) -> Result<R, ActorGone>
+    where
+        R: Send + 'static,
+        J: FnOnce(&mut Engine<F, C>) -> R + Send + 'static,
+    {
+        debug_assert!(
+            shard < self.shards.len(),
+            "shard index {shard} out of range for {} shards",
+            self.shards.len()
+        );
+        // Route to the chosen shard's OWN engine via `with` (NOT `with_on_shard` — each handle owns
+        // exactly one shard, so re-routing would be wrong). At K = 1 `shard` is always 0, so this is
+        // `primary().with(job)` — byte-for-byte [`EngineHandle`]'s default `with_on_shard`.
+        EngineAccess::with(&self.shards[shard], job)
+    }
+
+    fn now_monotonic_nanos(&self) -> u64 {
+        self.primary().now_monotonic_nanos()
+    }
+
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // Every shard shares the ONE subject-routing snapshot (bindings are engine-global, not
+        // per-shard), so the primary's snapshot is authoritative for the whole front (#811 C3).
+        EngineAccess::binding_snapshot(self.primary())
+    }
+
+    fn consumer_credit_caps(&self) -> (u32, u64) {
+        EngineAccess::consumer_credit_caps(self.primary())
+    }
+
+    fn has_client_ack_gate(&self) -> bool {
+        self.primary().has_client_ack_gate()
+    }
+
+    fn span_sink(&self) -> Option<crate::obs::SpanSink> {
+        self.primary().span_sink()
+    }
+
+    fn actor_watchdog_overran(&self, now_monotonic_nanos: u64) -> bool {
+        self.primary().actor_watchdog_overran(now_monotonic_nanos)
+    }
+
+    fn writer_appears_healthy(&self) -> bool {
+        self.primary().writer_appears_healthy()
+    }
+
+    fn actor_alive(&self) -> bool {
+        self.primary().actor_alive()
+    }
+
+    fn commit_notify(&self) -> Option<&Arc<CommitNotify>> {
+        EngineAccess::commit_notify(self.primary())
+    }
+
+    fn consume_wait_spin(&self) -> bool {
+        self.primary().consume_wait_spin()
+    }
+
+    fn client_ack_disposition(
+        &self,
+        member: MemberId,
+        offset: u64,
+        reply_bytes: Vec<u8>,
+    ) -> Option<AckDisposition> {
+        self.primary()
+            .client_ack_disposition(member, offset, reply_bytes)
+    }
+
+    fn drain_client_acks(&self, member: MemberId) -> Vec<Vec<u8>> {
+        self.primary().drain_client_acks(member)
+    }
+
+    fn drop_client_acks(&self, member: MemberId) {
+        EngineAccess::drop_client_acks(self.primary(), member);
+    }
+
+    fn cluster_produce_routing(&self, partition: u64) -> ClusterProduceRouting {
+        self.primary().cluster_produce_routing(partition)
+    }
+
+    fn cluster_follower_consume(
+        &self,
+        partition: u64,
+        tier: ReadTier,
+        from: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Option<FollowerReadOutcome> {
+        self.primary()
+            .cluster_follower_consume(partition, tier, from, max_records, max_bytes)
+    }
+}
+
 /// A test-only [`EngineAccess`] that drives an engine DIRECTLY on the calling thread (no actor, no
 /// channel), so the session unit tests can interleave `Session::process` with direct engine reads and
 /// mutations exactly as they did before the actor existed. A produce here is a one-message group
@@ -1601,6 +1925,13 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for DirectEngine<F, C> 
         self.engine.borrow().now_monotonic()
     }
 
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // The direct (same-thread) test engine resolves against the REAL engine's shared snapshot
+        // `Arc` (#811 C3), so the session's subject unit tests exercise the true off-actor resolve.
+        // A cloned `Arc` (owned), so it outlives the transient `RefCell` borrow.
+        self.engine.borrow().binding_snapshot_arc()
+    }
+
     fn consumer_credit_caps(&self) -> (u32, u64) {
         let e = self.engine.borrow();
         (e.consumer_credit(), e.consumer_credit_bytes())
@@ -1642,6 +1973,14 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for SharedEngine<F, C> 
         self.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .now_monotonic()
+    }
+
+    fn binding_snapshot(&self) -> Arc<SublistSnapshot<StreamId>> {
+        // The shared-engine test fixture resolves against the REAL engine's snapshot `Arc` (#811 C3),
+        // read under the lock and cloned out (owned), so it outlives the guard.
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .binding_snapshot_arc()
     }
 
     fn consumer_credit_caps(&self) -> (u32, u64) {
@@ -1808,6 +2147,11 @@ where
     // stamp a produce's enqueue instant (the CoDel sojourn measurement, #68) with the SAME clock the
     // actor reads at dequeue.
     let clock = engine.clock_clone();
+    // Clone the SHARED subject-routing snapshot `Arc` (#811 C3) BEFORE the engine moves into the actor,
+    // so every connection thread resolves a subject WAIT-FREE off the actor against the SAME snapshot
+    // `bind_subject` publishes to (then routes the produce to the resolved stream's shard) — exactly the
+    // off-actor read the credit caps and clock above already do.
+    let binding_snapshot = engine.binding_snapshot_arc();
     // Snapshot the static per-consumer credit caps (#292) BEFORE the engine moves into the actor, so
     // the Connect handshake can negotiate them off the actor's hot path (no round-trip, #177).
     let consumer_credit_caps = (engine.consumer_credit(), engine.consumer_credit_bytes());
@@ -1941,6 +2285,9 @@ where
             // it off via [`EngineHandle::with_zero_copy_sendfile`] right after this returns, BEFORE any
             // connection's handle is cloned.
             zero_copy_sendfile: true,
+            // The shared subject-routing snapshot (#811 C3), cloned above before the engine moved: every
+            // connection resolves a subject off the actor against it, then routes to the resolved shard.
+            binding_snapshot,
         },
         join,
     )
@@ -3465,6 +3812,115 @@ mod tests {
             "200 named streams spread across the shards (got {} of {K})",
             distinct.len()
         );
+    }
+
+    #[test]
+    fn append_shards_parse_accepts_auto_and_positive_ints_only() {
+        assert_eq!(AppendShards::parse("auto"), Some(AppendShards::Auto));
+        assert_eq!(AppendShards::parse("AUTO"), Some(AppendShards::Auto));
+        assert_eq!(AppendShards::parse("Auto"), Some(AppendShards::Auto));
+        assert_eq!(AppendShards::parse("1"), Some(AppendShards::Fixed(1)));
+        assert_eq!(AppendShards::parse("8"), Some(AppendShards::Fixed(8)));
+        // Rejected: zero (a broker needs at least one shard), non-numeric, empty, negative, junk.
+        for bad in ["0", "", "x", "-1", "1.5", "auto2", " 4"] {
+            assert_eq!(AppendShards::parse(bad), None, "`{bad}` must be rejected");
+        }
+        // The DEFAULT request is a single shard — today's byte-for-byte single-actor engine.
+        assert_eq!(AppendShards::default(), AppendShards::Fixed(1));
+    }
+
+    #[test]
+    fn resolve_append_shards_per_stream_resolves_and_caps() {
+        use ironbus_storage::shared_wal::StorageMode::PerStreamLogs;
+        // The default (Fixed(1)) stays 1 — the inert K=1 path.
+        assert_eq!(
+            resolve_append_shards(AppendShards::default(), PerStreamLogs),
+            Ok(1)
+        );
+        // An explicit fixed count is honored, clamped to the safe max.
+        assert_eq!(
+            resolve_append_shards(AppendShards::Fixed(4), PerStreamLogs),
+            Ok(4)
+        );
+        assert_eq!(
+            resolve_append_shards(AppendShards::Fixed(1), PerStreamLogs),
+            Ok(1)
+        );
+        assert_eq!(
+            resolve_append_shards(AppendShards::Fixed(100_000), PerStreamLogs),
+            Ok(MAX_APPEND_SHARDS),
+            "an oversized explicit request clamps to the cap"
+        );
+        // `auto` resolves to the machine's parallelism, always in `1..=MAX`.
+        let auto = resolve_append_shards(AppendShards::Auto, PerStreamLogs).unwrap();
+        assert!(
+            (1..=MAX_APPEND_SHARDS).contains(&auto),
+            "auto resolved {auto} out of 1..={MAX_APPEND_SHARDS}"
+        );
+    }
+
+    #[test]
+    fn resolve_append_shards_shared_wal_forces_one_and_rejects_explicit_multi() {
+        use ironbus_storage::shared_wal::StorageMode::SharedWal;
+        // Non-explicit requests silently resolve to 1 under shared-WAL (it cannot shard).
+        assert_eq!(resolve_append_shards(AppendShards::Auto, SharedWal), Ok(1));
+        assert_eq!(
+            resolve_append_shards(AppendShards::Fixed(1), SharedWal),
+            Ok(1)
+        );
+        assert_eq!(
+            resolve_append_shards(AppendShards::default(), SharedWal),
+            Ok(1)
+        );
+        // But an EXPLICIT request for > 1 shard + shared-WAL is a contradiction — fail closed.
+        for n in [2usize, 4, 64] {
+            assert_eq!(
+                resolve_append_shards(AppendShards::Fixed(n), SharedWal),
+                Err(SharedWalCannotShard),
+                "explicit --append-shards {n} + shared-WAL must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_engine_handle_single_is_a_byte_for_byte_k1_pass_through() {
+        // C1: `ShardedEngineHandle::single` wraps ONE `EngineHandle`, so it is a pure pass-through — K=1,
+        // every stream routes to shard 0, and `with_on_shard(0, ..)` collapses to `with(..)`.
+        let engine = Engine::open(InMemoryFs::new(), ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let sharded = ShardedEngineHandle::single(handle);
+
+        assert_eq!(sharded.shard_count(), 1, "single => one shard");
+        assert_eq!(shard_of("", sharded.shard_count()), 0);
+        for name in ["orders", "clicks", "a/b/c", "payments"] {
+            assert_eq!(
+                shard_of(name, sharded.shard_count()),
+                0,
+                "at K=1 every stream pins to shard 0"
+            );
+        }
+
+        // `with_on_shard(0, ..)` observes the SAME engine state as `with(..)`.
+        let via_with = sharded.with(|e| e.durable_record_bytes()).unwrap();
+        let via_shard = sharded
+            .with_on_shard(0, |e| e.durable_record_bytes())
+            .unwrap();
+        assert_eq!(via_with, via_shard);
+
+        // A produce through the front lands on the one engine, visible identically to both entry points.
+        sharded.produce(append(b"hello-shard")).expect("produce ok");
+        let after_with = sharded.with(|e| e.durable_record_bytes()).unwrap();
+        let after_shard = sharded
+            .with_on_shard(0, |e| e.durable_record_bytes())
+            .unwrap();
+        assert_eq!(after_with, after_shard);
+        assert!(
+            after_with > via_with,
+            "the produce advanced the durable byte total"
+        );
+
+        drop(sharded);
+        let _ = actor.join();
     }
 
     fn config() -> EngineConfig {

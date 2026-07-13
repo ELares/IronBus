@@ -663,14 +663,21 @@ pub struct EngineConfig {
     /// many named streams share ONE tagged commit log ([`ironbus_storage::shared_wal::SharedWal`]),
     /// trading per-stream resilience isolation for density (see the type docs for the tradeoff).
     ///
-    /// **Wiring status (surfaced, #597):** the shared-WAL storage PRIMITIVE — tagged interleaved
-    /// append, per-stream demux read, and index-rebuilding recovery — is implemented and tested at the
-    /// storage layer ([`ironbus_storage::shared_wal::SharedWal`]). Threading it through the engine's
-    /// `produce_in_stream`/`poll_in_stream`/`ack_in_stream` and recovery paths in place of the
-    /// per-stream `StreamSet` is the deferred follow-up (like #693's deferred cooperative rebalance);
-    /// until then [`Engine::open`] fail-closed REJECTS a config that selects [`StorageMode::SharedWal`]
-    /// with a typed error rather than silently running per-stream (an honest opt-in, never a silent
-    /// no-op). The default [`StorageMode::PerStreamLogs`] path is completely untouched.
+    /// **Wiring status (#597, WIRED):** the shared-WAL storage substrate — tagged interleaved append,
+    /// per-stream demux read, and index-rebuilding recovery — is implemented in
+    /// [`ironbus_storage::shared_wal::SharedWal`] and now THREADED through the engine's
+    /// `produce_in_stream`/`poll_in_stream`/`ack_in_stream` and recovery paths, so
+    /// [`StorageMode::SharedWal`] is a LIVE mode: [`Engine::open`] opens it when selected (it does NOT
+    /// reject it). The one combination [`Engine::open`] still fail-closed REJECTS is at-rest ENCRYPTION
+    /// with shared-WAL ([`EngineError::EncryptedSharedWalUnsupported`]); a plaintext shared-WAL data dir
+    /// opens and runs. The default [`StorageMode::PerStreamLogs`] path is completely untouched.
+    ///
+    /// **Append sharding (#811, C4):** a shared-WAL broker CANNOT shard the append plane — every named
+    /// stream shares ONE physical commit log, so its records cannot be split across writer threads.
+    /// [`Engine::append_shard_count`] therefore reports 1 for a shared-WAL engine regardless of the
+    /// configured count, and config validation ([`crate::actor::resolve_append_shards`]) fail-closed
+    /// REJECTS an EXPLICIT `--append-shards > 1` combined with this mode
+    /// ([`crate::actor::SharedWalCannotShard`]).
     pub storage_mode: ironbus_storage::shared_wal::StorageMode,
 }
 
@@ -3457,7 +3464,14 @@ struct BindingTable {
     /// The compiled, wait-free routing trie: a publish resolves a literal subject against this
     /// snapshot (directly or through a per-connection resolve cache) with no lock and no walk on a
     /// cache hit. Rebuilt and swapped on every successful `bind`, advancing its generation.
-    snapshot: SublistSnapshot<StreamId>,
+    ///
+    /// Held behind an `Arc` (#811 C3) so the SAME wait-free snapshot is SHARED with every
+    /// [`crate::actor::EngineHandle`]: a connection thread resolves a subject OFF the actor against
+    /// this exact object, and `bind_subject` publishes a rebuilt trie through the `ArcSwap` it wraps
+    /// (an interior-mutability `store`, so the shared `Arc` never has to be replaced), visible to
+    /// every reader. The `Arc` wrapper changes no routing behavior — it is the same snapshot, merely
+    /// reachable from the connection threads without a round-trip through the actor.
+    snapshot: Arc<SublistSnapshot<StreamId>>,
 }
 
 impl BindingTable {
@@ -3466,8 +3480,15 @@ impl BindingTable {
     fn new() -> BindingTable {
         BindingTable {
             entries: Vec::new(),
-            snapshot: SublistSnapshot::empty(),
+            snapshot: Arc::new(SublistSnapshot::empty()),
         }
+    }
+
+    /// A clone of the SHARED wait-free snapshot `Arc` (#811 C3), handed to each
+    /// [`crate::actor::EngineHandle`] at `spawn_actor` time so a connection thread resolves a subject
+    /// off the actor against the SAME snapshot `bind_subject` publishes to.
+    fn snapshot_arc(&self) -> Arc<SublistSnapshot<StreamId>> {
+        Arc::clone(&self.snapshot)
     }
 
     /// Builds an immutable routing trie from the current registry (generation `0`; the snapshot restamps
@@ -3495,7 +3516,7 @@ impl BindingTable {
     fn from_entries(entries: Vec<(String, StreamId)>) -> Result<BindingTable, SublistError> {
         let table = BindingTable {
             entries,
-            snapshot: SublistSnapshot::empty(),
+            snapshot: Arc::new(SublistSnapshot::empty()),
         };
         let trie = table.build()?;
         table.snapshot.store(trie);
@@ -4787,6 +4808,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // existence cap (`max_streams`) and the reopen-vs-reject decision are correct BEFORE any client
         // touches a stream. This survives a hot-set LRU eviction (which drops the open `Log`), so an
         // evicted-then-consumed stream is recognized as KNOWN (reopened), never UNKNOWN (rejected).
+        //
+        // #811 C7: this is seeded from `streams.stream_ids()`, i.e. exactly the named streams THIS
+        // append shard recovered (its `shard_of` subset). At K = 1 that subset is the WHOLE named set,
+        // so this is byte-for-byte today; at K > 1 each shard's set is its own subset and the union
+        // across shards is the full existence set (the cross-shard existence sum the front assembles
+        // is the owner-gated C6 concern, not done here).
         let known_named_streams: std::collections::BTreeSet<StreamId> = match shared_known {
             // Shared mode (#597): existence is the wal-scanned ∪ metadata-dir union recovered above
             // (a shared stream has no per-stream log for `stream_ids` to report).
@@ -5089,9 +5116,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // The per-stream recovery summaries are RETURNED (not discarded, #575/#1130) so `open` can
         // fold every named stream's torn-tail / corruption loss events into the recovery-event
         // counters — a named stream's crash damage must be as visible as the root log's.
-        let (streams, stream_recoveries) =
-            StreamSet::open_with_at_rest(&fs_for_streams, clock, config, at_rest)
-                .map_err(EngineError::Storage)?;
+        //
+        // #811 C7 recovery partition: this engine opens the named-stream substrate through the
+        // SHARD-FILTERED open, recovering only the named streams THIS append shard owns
+        // (`shard_of(name, K) == shard_index`, in parallel, per-stream isolation preserved). At K = 1
+        // — the default and, until the owner-gated C8 flip, the only runtime mode — the sole shard is
+        // the COORDINATOR (shard 0), so its predicate is `|_| true`: it opens the root default log
+        // (above) plus EVERY named stream, byte-for-byte the historical `StreamSet::open_with_at_rest`.
+        // The K > 1 flip that gives each shard a real `shard_of`-derived predicate (and has the LEAN
+        // shards skip the root log + the global producer-seq/counters/bindings/txn checkpoints so the
+        // coordinator opens them ONCE) is C6/C8 and is NOT done here.
+        let (streams, stream_recoveries) = StreamSet::open_with_at_rest_for_shard(
+            &fs_for_streams,
+            clock,
+            config,
+            at_rest,
+            |_name| true,
+        )
+        .map_err(EngineError::Storage)?;
         Ok((log, streams, stream_recoveries))
     }
 
@@ -10155,7 +10197,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// and generation-stamped, so the cache's generation-guard detects a bind change with one compare.
     #[must_use]
     pub fn binding_snapshot(&self) -> &SublistSnapshot<StreamId> {
-        &self.bindings.snapshot
+        self.bindings.snapshot.as_ref()
+    }
+
+    /// A clone of the SHARED subject-routing snapshot `Arc` (#811 C3): the same `ArcSwap`
+    /// [`Engine::bind_subject`] publishes to, taken at `spawn_actor` time and stored in every
+    /// [`crate::actor::EngineHandle`] so a connection thread resolves a subject WAIT-FREE off the
+    /// actor (then routes the produce to the resolved stream's shard). A resolve through this always
+    /// observes the latest committed bindings, exactly as an in-actor resolve does.
+    #[must_use]
+    pub fn binding_snapshot_arc(&self) -> Arc<SublistSnapshot<StreamId>> {
+        self.bindings.snapshot_arc()
     }
 
     /// Appends `message` durably-pending (write, NO fsync) and records the produce statistics that
@@ -15561,6 +15613,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.log.durable_record_bytes()
     }
 
+    /// The number of append shards this engine actually runs (#811, C4), given a `configured` count
+    /// (already resolved + capped by [`crate::actor::resolve_append_shards`]). A SHARED-WAL engine is
+    /// PINNED to ONE shard — every named stream shares one physical commit log, so its records cannot
+    /// be split across writer threads — so it clamps any request to 1; a per-stream-logs engine honors
+    /// `configured` (floored to >= 1). The named-stream produce path routes with
+    /// [`crate::actor::shard_of`]`(stream, this)`, so a shared-WAL engine returning 1 pins every stream
+    /// to shard 0. In C1 the effective `configured` is 1 (the C8 flip spawns K > 1), so this returns 1
+    /// on every engine today — byte-for-byte the single-actor path.
+    #[must_use]
+    pub fn append_shard_count(&self, configured: usize) -> usize {
+        if self.shared_wal.is_some() {
+            1
+        } else {
+            configured.max(1)
+        }
+    }
+
     /// The configured durable-log byte cap (`LogConfig::max_total_bytes`, the quantity
     /// [`Engine::durable_record_bytes`] is shed against). `0` means UNLIMITED (the cap is off). Fixed
     /// for the engine's life: the cap is layout/contract-bound and NOT live-reloadable (a change
@@ -16663,6 +16732,165 @@ mod tests {
             storage_mode: ironbus_storage::shared_wal::StorageMode::SharedWal,
             ..config(max_in_flight, max_deliver)
         }
+    }
+
+    #[test]
+    fn shared_wal_engine_reports_one_append_shard_and_named_produces_route_to_shard_zero() {
+        // #811 C4: a shared-WAL engine CANNOT shard the append plane (every named stream shares ONE
+        // physical commit log), so it reports exactly ONE append shard for ANY configured count, and
+        // `shard_of` therefore pins every named stream to shard 0 — its byte-identical single-log path.
+        let shared = open(shared_config(100, 5));
+        for configured in [1usize, 2, 8, 64] {
+            assert_eq!(
+                shared.append_shard_count(configured),
+                1,
+                "shared-WAL forces one append shard for configured={configured}",
+            );
+        }
+        for name in ["orders", "clicks", "alpha", "beta/gamma", "x"] {
+            assert_eq!(
+                crate::actor::shard_of(name, shared.append_shard_count(64)),
+                0,
+                "every named stream routes to shard 0 under shared-WAL",
+            );
+        }
+
+        // A per-stream-logs engine, by contrast, HONORS the configured count (the routing base the C8
+        // flip fans across) — still 1 by default today, so K=1 is byte-for-byte the single-actor path.
+        let per_stream = open(config(100, 5));
+        assert_eq!(per_stream.append_shard_count(1), 1);
+        assert_eq!(
+            per_stream.append_shard_count(8),
+            8,
+            "per-stream honors the configured count",
+        );
+        assert_eq!(
+            per_stream.append_shard_count(0),
+            1,
+            "the count is floored to at least one shard",
+        );
+    }
+
+    /// #811 C7 (recovery partition): the REAL routing hash [`crate::actor::shard_of`], used as the
+    /// `StreamSet::open_with_at_rest_for_shard` predicate over a real on-disk named set, yields a
+    /// TOTAL, LOSSLESS partition of RECOVERY. For K in {1, 2, 4}: each shard recovers EXACTLY its
+    /// `shard_of` subset (and each stream's OWN records — per-stream isolation), every named stream is
+    /// recovered by exactly ONE shard, and the total recovered record count equals the pre-crash
+    /// total. At K = 1 the sole shard recovers ALL named streams — byte-for-byte the unsharded open —
+    /// which is the inert property this whole phase-1 PR rests on.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one cohesive K in {1,2,4} partition sweep; splitting hurts clarity
+    fn shard_of_partitions_named_stream_recovery_losslessly() {
+        use crate::actor::shard_of;
+        fn mkrec(p: &[u8]) -> Append<'_> {
+            Append {
+                timestamp_ms: 1,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: p,
+            }
+        }
+        let fs = InMemoryFs::new();
+        let def = StreamId::default_stream();
+        let cfg = LogConfig::default();
+        let names = [
+            "orders",
+            "clicks",
+            "alpha",
+            "beta",
+            "gamma",
+            "payments",
+            "audit",
+            "telemetry",
+            "carts",
+            "users",
+        ];
+        // Lay down the pre-crash image: stream i carries i + 1 records tagged with its own name, so a
+        // wrong-shard or mis-assembled recovery surfaces as a wrong count or wrong bytes.
+        {
+            let (mut set, _) = StreamSet::open(&fs, ManualClock::new(), cfg).unwrap();
+            for name in names {
+                set.declare(&StreamId::named(name).unwrap()).unwrap();
+            }
+            for (i, name) in names.iter().enumerate() {
+                let id = StreamId::named(name).unwrap();
+                for r in 0..=i {
+                    set.append_to(&id, &mkrec(format!("{name}-{r}").as_bytes()))
+                        .unwrap();
+                }
+            }
+            set.sync_all().unwrap();
+        }
+        let full: Vec<StreamId> = names.iter().map(|n| StreamId::named(n).unwrap()).collect();
+        let expected: std::collections::BTreeMap<StreamId, usize> = full
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i + 1))
+            .collect();
+        let total_records: usize = expected.values().sum();
+
+        for k in [1usize, 2, 4] {
+            let mut seen: std::collections::BTreeSet<StreamId> = std::collections::BTreeSet::new();
+            let mut recovered = 0usize;
+            for idx in 0..k {
+                let (shard, recoveries) = StreamSet::open_with_at_rest_for_shard(
+                    &fs,
+                    ManualClock::new(),
+                    cfg,
+                    AtRestCrypto::default(),
+                    |name| shard_of(name, k) == idx,
+                )
+                .unwrap();
+                // The coordinator-owned default root is opened by every shard (unconditional at K = 1).
+                assert!(
+                    shard.is_open(&def),
+                    "K={k} shard {idx} opens the default root"
+                );
+                for id in shard.stream_ids() {
+                    if id.is_default() {
+                        continue;
+                    }
+                    assert_eq!(
+                        shard_of(id.name(), k),
+                        idx,
+                        "K={k} shard {idx} recovered {} outside its shard_of subset",
+                        id.name()
+                    );
+                    assert!(
+                        recoveries[&id].loss_report.is_empty(),
+                        "{} clean",
+                        id.name()
+                    );
+                    let read = shard.read_range(&id, Offset::ZERO, 1000, None).unwrap();
+                    assert_eq!(read.len(), expected[&id], "{} own record count", id.name());
+                    recovered += read.len();
+                    assert!(
+                        seen.insert(id.clone()),
+                        "K={k}: {} was recovered by more than one shard",
+                        id.name()
+                    );
+                }
+            }
+            assert_eq!(
+                seen,
+                full.iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "K={k}: the union of the shard subsets is the whole named set"
+            );
+            assert_eq!(
+                recovered, total_records,
+                "K={k}: total recovered records equals the pre-crash total"
+            );
+        }
+
+        // K = 1 inert identity: the unfiltered open recovers the identical (default-first) named set.
+        let (all, _) = StreamSet::open(&fs, ManualClock::new(), cfg).unwrap();
+        let mut expected_ids = vec![def.clone()];
+        expected_ids.extend(full.iter().cloned());
+        expected_ids.sort();
+        assert_eq!(all.stream_ids(), expected_ids);
     }
 
     /// Polls stream `stream` in `group` and expects a delivered message.

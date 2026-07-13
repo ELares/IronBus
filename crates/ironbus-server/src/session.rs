@@ -22,7 +22,7 @@ use crate::actor::{
 use crate::cluster::dataplane::FollowerReadOutcome;
 use crate::cluster::read_consistency::ReadTier;
 use crate::engine::{
-    AckResult, Engine, EngineError, NackResult, Poll, ProgressResult, StreamBatch, StreamRawBatch,
+    AckResult, EngineError, NackResult, Poll, ProgressResult, StreamBatch, StreamRawBatch,
 };
 // The Linux `sendfile(2)` zero-copy Tier-S types (#1034 / #658). Gated on `target_os = "linux"` — the
 // only target the splice path compiles on; every other target takes the userspace copy path and never
@@ -42,6 +42,7 @@ use ironbus_core::keyshared::{KeyOrdering, MemberId};
 use ironbus_core::lease::LeaseToken;
 use ironbus_core::resolve_cache::ResolveCache;
 use ironbus_core::subject::{Subject, SubjectPattern};
+use ironbus_core::sublist::SublistSnapshot;
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
@@ -979,7 +980,11 @@ impl Session {
             }
         }
         let name = default.clone();
-        match engine.with(move |e| e.declare_stream(&name))? {
+        // #811 C2: a named stream's log is materialized on `shard_of(name)`, so declaring the tenant's
+        // own default stream routes to that stream's shard — parity with declare-on-first-produce, which
+        // already routes to `shard_of(stream)`. Byte-for-byte `with` at K = 1 (a named tenant → shard 0).
+        let shard = crate::actor::shard_of(&name, engine.shard_count());
+        match engine.with_on_shard(shard, move |e| e.declare_stream(&name))? {
             Ok(_) => {}
             Err(e) if e.is_fatal() => {
                 reply_err(out, "fatal storage error");
@@ -2225,7 +2230,11 @@ impl Session {
             return Ok(());
         }
         let level = append.ack_level;
-        let outcome = engine.with(move |e| {
+        // #811 C2: a multi-tenant connection's default stream is the NAMED stream `<tenant>`, so this
+        // synchronous id-routed produce must land on `shard_of(stream)` — the same shard the `PubTo`
+        // named-stream produce path routes to. Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let outcome = engine.with_on_shard(shard, move |e| {
             let view = Append {
                 timestamp_ms: append.timestamp_ms,
                 flags: RecordFlags::from_bits(append.flags),
@@ -2471,7 +2480,12 @@ impl Session {
         match ack.op {
             AckOp::Ack => {
                 let token = *token;
-                let status = match engine.with(move |e| e.ack_in_stream(&stream, &group, &token))? {
+                // #811 C2: route the named-stream ack to the shard that OWNS the stream. With one shard
+                // (today) `shard_of` is 0 and `with_on_shard` is byte-for-byte `with`.
+                let shard = crate::actor::shard_of(&stream, engine.shard_count());
+                let status = match engine
+                    .with_on_shard(shard, move |e| e.ack_in_stream(&stream, &group, &token))?
+                {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -2516,9 +2530,11 @@ impl Session {
         match ack.op {
             AckOp::Ack => {
                 let token = *token;
-                let status = match engine
-                    .with(move |e| e.ack_partition(&stream, partition, &group, &token))?
-                {
+                // #811 C2: a partition's records live on its stream's shard, so route the ack there.
+                let shard = crate::actor::shard_of(&stream, engine.shard_count());
+                let status = match engine.with_on_shard(shard, move |e| {
+                    e.ack_partition(&stream, partition, &group, &token)
+                })? {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -2557,7 +2573,11 @@ impl Session {
         match ack.op {
             AckOp::Ack => {
                 let token = *token;
-                let status = match engine.with(move |e| e.ack_priority(&stream, &group, &token))? {
+                // #811 C2: a priority stream's lanes live on its shard, so route the ack there.
+                let shard = crate::actor::shard_of(&stream, engine.shard_count());
+                let status = match engine
+                    .with_on_shard(shard, move |e| e.ack_priority(&stream, &group, &token))?
+                {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -2839,8 +2859,11 @@ impl Session {
         if !self.stream.is_empty() {
             let stream = self.stream.clone();
             let group = self.subscription.clone();
-            let committed =
-                engine.with(move |e| e.committed_offset_in_stream(&stream, &group).get())?;
+            // #811 C2: read the named stream's committed cursor on its OWN shard.
+            let shard = crate::actor::shard_of(&stream, engine.shard_count());
+            let committed = engine.with_on_shard(shard, move |e| {
+                e.committed_offset_in_stream(&stream, &group).get()
+            })?;
             self.leased.retain(|&offset, _| offset >= committed);
             return Ok(());
         }
@@ -3173,7 +3196,11 @@ impl Session {
                 // consumer takes the unchanged member-aware paths below.
                 let partition = self.partition;
                 let priority_bound = self.priority_bound;
-                let poll = engine.with(move |e| {
+                // #811 C2: route every per-record poll to the bound stream's shard. The default
+                // (empty) stream hashes to shard 0 (`poll_now_in_member`); a named/partitioned/priority
+                // stream to its own shard. With one shard (today) this is 0 and `with_on_shard` == `with`.
+                let shard = crate::actor::shard_of(&stream, engine.shard_count());
+                let poll = engine.with_on_shard(shard, move |e| {
                     if let Some(partition) = partition {
                         let now = e.now_monotonic();
                         e.poll_partition(&stream, partition, &group, now)
@@ -3409,7 +3436,10 @@ impl Session {
         // cursor byte-for-byte.
         let group = self.subscription.clone();
         let stream = self.stream.clone();
-        let committed = engine.with(move |e| {
+        // #811 C2: route the committed-cursor read to the bound stream's shard. The default (empty)
+        // stream hashes to shard 0 (`committed_offset_in`), a named stream to its own shard.
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let committed = engine.with_on_shard(shard, move |e| {
             if stream.is_empty() {
                 e.committed_offset_in(&group).get()
             } else {
@@ -3581,7 +3611,9 @@ impl Session {
                 // stream drains its OWN id-routed log via `poll_in_stream_member`. Without this a
                 // multi-tenant Sub+Fetch drained the SHARED root default stream (a cross-tenant leak).
                 let stream = self.stream.clone();
-                match engine.with(move |e| {
+                // #811 C2: route the batch-fetch poll to the bound stream's shard (default → shard 0).
+                let shard = crate::actor::shard_of(&stream, engine.shard_count());
+                match engine.with_on_shard(shard, move |e| {
                     if stream.is_empty() {
                         e.poll_now_in_member(&group, member)
                     } else {
@@ -3755,7 +3787,9 @@ impl Session {
         // named/tenant cursor), mirroring the poll above — not the root-only `committed_offset_in`.
         let group = self.subscription.clone();
         let stream = self.stream.clone();
-        let committed = engine.with(move |e| {
+        // #811 C2: route the committed-cursor read to the bound stream's shard (default → shard 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let committed = engine.with_on_shard(shard, move |e| {
             if stream.is_empty() {
                 e.committed_offset_in(&group).get()
             } else {
@@ -3854,7 +3888,11 @@ impl Session {
         if has_time {
             let (st, et) = (req.start_time_ms, req.end_time_ms);
             let (s, g) = (stream.clone(), group.clone());
-            match engine.with(move |e| e.stream_resolve_time_in_stream(&s, &g, st, et))? {
+            // #811 C2: resolve the seek-by-time bounds on the target stream's OWN shard.
+            let shard = crate::actor::shard_of(&stream, engine.shard_count());
+            match engine.with_on_shard(shard, move |e| {
+                e.stream_resolve_time_in_stream(&s, &g, st, et)
+            })? {
                 Ok((resolved_start, resolved_end)) => {
                     if let Some(rs) = resolved_start {
                         start = rs;
@@ -4094,7 +4132,9 @@ impl Session {
         // ONE actor round-trip serves the whole contiguous batch — the heart of the Tier-S win versus
         // the N per-record round-trips the Tier-W poll loop makes. The engine reads off the shared
         // durable read path, claims no lease, and writes no cursor.
-        match engine.with(move |e| {
+        // #811 C2: serve the contiguous batch from the target stream's OWN shard (default → shard 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        match engine.with_on_shard(shard, move |e| {
             e.stream_fetch_in_stream(&stream, &group, member, start, want, max_bytes)
         })? {
             Ok(StreamBatch { records, .. }) => {
@@ -4270,7 +4310,9 @@ impl Session {
         // `stream_fetch_raw_in_stream`; the DEFAULT stream (`stream` empty) routes to `stream_fetch_raw_in`
         // BYTE-FOR-BYTE. Same lease-free raw contiguous read — only the log differs.
         let stream = stream.clone();
-        match engine.with(move |e| {
+        // #811 C2: serve the raw contiguous batch from the target stream's OWN shard (default → shard 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        match engine.with_on_shard(shard, move |e| {
             e.stream_fetch_raw_in_stream(&stream, &group, member, start, want, max_bytes)
         })? {
             Ok(StreamRawBatch { raw, tail, .. }) => {
@@ -4318,7 +4360,9 @@ impl Session {
     {
         let group = group.clone();
         let stream = stream.clone();
-        match engine.with(move |e| {
+        // #811 C2: fetch the fd run from the target stream's OWN shard (default → shard 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        match engine.with_on_shard(shard, move |e| {
             e.stream_fetch_fd_in_stream(&stream, &group, member, start, want, max_bytes)
         })? {
             Ok(StreamFdBatch::Fd {
@@ -4419,7 +4463,11 @@ impl Session {
         // cursor via `stream_commit_in_stream`; the DEFAULT stream (`self.stream` empty) routes to
         // `stream_commit_in` BYTE-FOR-BYTE (the engine method dispatches on the empty name).
         let stream = self.stream.clone();
-        match engine.with(move |e| e.stream_commit_in_stream(&stream, &group, up_to))? {
+        // #811 C2: advance the named stream's streaming cursor on its OWN shard (default → shard 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        match engine.with_on_shard(shard, move |e| {
+            e.stream_commit_in_stream(&stream, &group, up_to)
+        })? {
             // A committed (or idempotent no-op) streaming commit: the generic body-less success. There
             // is no per-connection lease to release (Tier-S grants none), so unlike the broadcast
             // cumulative-ack path there is no `self.leased` bookkeeping here.
@@ -4556,7 +4604,11 @@ impl Session {
         // durable subscribe against a live-ephemeral conflict — exactly like `handle_sub_to`.
         if ephemeral {
             let (s, g) = (stream.to_string(), group.to_string());
-            match engine.with(move |e| e.subscribe_ephemeral_in_stream(&s, &g, member))? {
+            // #811 C2: register the ephemeral subscription on the target stream's OWN shard.
+            let shard = crate::actor::shard_of(stream, engine.shard_count());
+            match engine.with_on_shard(shard, move |e| {
+                e.subscribe_ephemeral_in_stream(&s, &g, member)
+            })? {
                 Ok(()) => {}
                 Err(e) => {
                     reply_err_coded(out, e.code().as_str(), &e.to_string());
@@ -4565,7 +4617,9 @@ impl Session {
             }
         } else {
             let (s, g) = (stream.to_string(), group.to_string());
-            if engine.with(move |e| e.is_ephemeral_in_stream(&s, &g))? {
+            // #811 C2: probe the ephemeral conflict on the target stream's OWN shard.
+            let shard = crate::actor::shard_of(stream, engine.shard_count());
+            if engine.with_on_shard(shard, move |e| e.is_ephemeral_in_stream(&s, &g))? {
                 reply_err_coded(
                     out,
                     crate::codes::ErrorCode::ERR_EPHEMERAL_GROUP_CONFLICT.as_str(),
@@ -4583,13 +4637,20 @@ impl Session {
         self.subscription = GroupName::from(group);
         self.partition = None;
         let stream_p = stream.to_string();
-        self.priority_bound = engine.with(move |e| e.is_priority_stream(&stream_p))?;
+        // #811 C2: the priority-mode flag is per-stream metadata OWNED by `shard_of(stream)`, so read it
+        // on that stream's shard — parity with the key_shared + streaming sets routed just below.
+        // Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(stream, engine.shard_count());
+        self.priority_bound =
+            engine.with_on_shard(shard, move |e| e.is_priority_stream(&stream_p))?;
         self.registered_subscription = ephemeral;
         self.ephemeral_subscription = ephemeral;
         self.leased.clear();
         let stream_name = self.stream.clone();
         let sub = self.subscription.clone();
-        let joined = engine.with(move |e| {
+        // #811 C2: enable key_shared + join membership on the stream's OWN per-stream work-group shard.
+        let shard = crate::actor::shard_of(&stream_name, engine.shard_count());
+        let joined = engine.with_on_shard(shard, move |e| {
             if e.is_configured_key_shared(&sub)
                 && e.set_key_ordering_in_stream(&stream_name, &sub, KeyOrdering::KeyShared)
                     .is_ok()
@@ -4604,7 +4665,9 @@ impl Session {
         if self.default_tier == ConsumeTier::Streaming {
             let stream_name = self.stream.clone();
             let sub = self.subscription.clone();
-            engine.with(move |e| {
+            // #811 C2: mark THIS stream's group streaming on the stream's OWN shard.
+            let shard = crate::actor::shard_of(&stream_name, engine.shard_count());
+            engine.with_on_shard(shard, move |e| {
                 let _ = e.set_streaming_in_stream(&stream_name, &sub, true);
             })?;
         }
@@ -4711,7 +4774,9 @@ impl Session {
         // the stream: a same-name subscription on a DIFFERENT stream is a different group. The
         // default-stream durable path is byte-for-byte the historical `unsubscribe_in`.
         if self.registered_subscription && (!old_stream.is_empty() || *old_group != *new_group) {
-            engine.with(move |e| {
+            // #811 C2: deregister the old subscription on ITS stream's shard (default → shard 0).
+            let shard = crate::actor::shard_of(&old_stream, engine.shard_count());
+            engine.with_on_shard(shard, move |e| {
                 if old_stream.is_empty() {
                     e.unsubscribe_in(&old_group, member);
                 } else {
@@ -4840,7 +4905,11 @@ impl Session {
         // fails closed with the engine's typed reason. The two partitioned modes are mutually exclusive.
         let partition_count = decoded.partition_count;
         let priority = decoded.priority;
-        let result = engine.with(move |e| {
+        // #811 C2: a declare materializes the named stream's OWN log / partition sub-logs / priority
+        // lanes, so route it to `shard_of(stream)` — parity with declare-on-first-produce, which routes
+        // there too. Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let result = engine.with_on_shard(shard, move |e| {
             if priority {
                 e.declare_priority_stream(&stream, partition_count)
             } else {
@@ -4904,8 +4973,13 @@ impl Session {
         // One round-trip reads both the existence bit and the durable head: the head is meaningful only
         // when the stream exists, and `stream_head` reports `0` for an unknown/malformed stream (which
         // the response folds with `exists = false`), so the two reads are consistent.
-        let (exists, head) =
-            engine.with(move |e| (e.stream_exists(&stream), e.stream_head(&stream).get()))?;
+        // #811 C2: `stream_head` reads the named stream's OWN durable log head, state OWNED by
+        // `shard_of(stream)`, so route the probe to that stream's shard (the existence bit is read in the
+        // same job). Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let (exists, head) = engine.with_on_shard(shard, move |e| {
+            (e.stream_exists(&stream), e.stream_head(&stream).get())
+        })?;
         let resp = StreamInfoResponseBody { exists, head };
         let mut resp_body = Vec::new();
         encode_stream_info_response(&resp, &mut resp_body);
@@ -5535,7 +5609,10 @@ impl Session {
         // The named stream must already exist: a SubTo binds a consume cursor, and consuming an
         // unknown (never-declared) stream is a typed rejection, never a silent empty subscription.
         let stream_owned = stream.to_string();
-        if !engine.with(move |e| e.stream_exists(&stream_owned))? {
+        // #811 C2: existence keys on the named stream (its own log/subtree), so probe it on
+        // `shard_of(stream)`. Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream_owned, engine.shard_count());
+        if !engine.with_on_shard(shard, move |e| e.stream_exists(&stream_owned))? {
             reply_err(
                 out,
                 &format!("stream {stream:?} does not exist (declare or publish to it first)"),
@@ -5565,7 +5642,11 @@ impl Session {
             // a priority lane; subscribe to the stream and the broker picks). Checked alongside the range
             // check in one engine query.
             let stream_q = stream.to_string();
-            let (in_range, is_priority) = engine.with(move |e| {
+            // #811 C2: partition count + priority-mode are per-stream metadata OWNED by
+            // `shard_of(stream)`, so read them on that stream's shard. Byte-for-byte `with` at K = 1
+            // (`shard_of` → 0).
+            let shard = crate::actor::shard_of(stream, engine.shard_count());
+            let (in_range, is_priority) = engine.with_on_shard(shard, move |e| {
                 (
                     e.partition_count_of(&stream_q)
                         .is_some_and(|pc| partition < pc.get()),
@@ -5622,9 +5703,11 @@ impl Session {
             // current subscription fully intact.
             let stream_q = stream.to_string();
             let group_q = group.to_string();
-            match engine
-                .with(move |e| e.subscribe_ephemeral_in_stream(&stream_q, &group_q, member))?
-            {
+            // #811 C2: register the ephemeral named subscription on the target stream's OWN shard.
+            let shard = crate::actor::shard_of(stream, engine.shard_count());
+            match engine.with_on_shard(shard, move |e| {
+                e.subscribe_ephemeral_in_stream(&stream_q, &group_q, member)
+            })? {
                 Ok(()) => {}
                 Err(e) => {
                     reply_err_coded(out, e.code().as_str(), &e.to_string());
@@ -5634,7 +5717,11 @@ impl Session {
         } else {
             let stream_q = stream.to_string();
             let group_q = group.to_string();
-            if engine.with(move |e| e.is_ephemeral_in_stream(&stream_q, &group_q))? {
+            // #811 C2: probe the ephemeral conflict on the target stream's OWN shard.
+            let shard = crate::actor::shard_of(stream, engine.shard_count());
+            if engine.with_on_shard(shard, move |e| {
+                e.is_ephemeral_in_stream(&stream_q, &group_q)
+            })? {
                 reply_err_coded(
                     out,
                     crate::codes::ErrorCode::ERR_EPHEMERAL_GROUP_CONFLICT.as_str(),
@@ -5672,7 +5759,12 @@ impl Session {
         // first). A non-priority whole-stream subscribe clears it (byte-for-byte the pre-#553 path). One
         // engine query; a false for every non-priority stream.
         let stream_p = stream.to_string();
-        self.priority_bound = engine.with(move |e| e.is_priority_stream(&stream_p))?;
+        // #811 C2: the priority-mode flag is per-stream metadata OWNED by `shard_of(stream)`, so read it
+        // on that stream's shard — parity with the key_shared + streaming sets routed just below.
+        // Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(stream, engine.shard_count());
+        self.priority_bound =
+            engine.with_on_shard(shard, move |e| e.is_priority_stream(&stream_p))?;
         // A DURABLE named-stream consume does not register in the default-stream broadcast subscriber
         // set (#676); an EPHEMERAL one registers per-stream membership (#771) that the leave path
         // routes by `self.stream`.
@@ -5689,7 +5781,9 @@ impl Session {
         let stream_name = self.stream.clone();
         let sub = self.subscription.clone();
         let member = self.member_id;
-        let joined = engine.with(move |e| {
+        // #811 C2: enable key_shared + join membership on THIS stream's OWN per-stream work-group shard.
+        let shard = crate::actor::shard_of(&stream_name, engine.shard_count());
+        let joined = engine.with_on_shard(shard, move |e| {
             if e.is_configured_key_shared(&sub)
                 && e.set_key_ordering_in_stream(&stream_name, &sub, KeyOrdering::KeyShared)
                     .is_ok()
@@ -5713,7 +5807,9 @@ impl Session {
         if self.default_tier == ConsumeTier::Streaming {
             let stream_name = self.stream.clone();
             let sub = self.subscription.clone();
-            engine.with(move |e| {
+            // #811 C2: mark THIS stream's group streaming on the stream's OWN shard.
+            let shard = crate::actor::shard_of(&stream_name, engine.shard_count());
+            engine.with_on_shard(shard, move |e| {
                 let _ = e.set_streaming_in_stream(&stream_name, &sub, true);
             })?;
         }
@@ -5825,7 +5921,11 @@ impl Session {
         let stream = self.tenant_stream(stream).into_owned();
         let group = group.to_string();
         let pause_ms = decoded.pause_ms;
-        match engine.with(move |e| e.pause_group_in_stream(&stream, &group, pause_ms))? {
+        // #811 C2: pause/resume the group on the target stream's OWN shard (default → shard 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        match engine.with_on_shard(shard, move |e| {
+            e.pause_group_in_stream(&stream, &group, pause_ms)
+        })? {
             Ok(_resumes_at) => reply(out, FrameType::Ok, &[]),
             Err(e) => reply_err_coded(out, e.code().as_str(), &e.to_string()),
         }
@@ -5969,13 +6069,43 @@ impl Session {
             reply_err_coded(out, e.code(), e.message());
             return Ok(());
         }
-        // Move the per-connection resolve cache into the job; the job returns it (and the produce
-        // outcome) so the cache's freshly-cached entry + adopted generation persist across publishes.
-        let cache = std::mem::take(&mut self.subject_cache);
-        let (cache, outcome) = engine.with(move |e| {
-            let mut cache = cache;
-            let level = append.ack_level;
-            let outcome = resolve_then_produce(e, &mut cache, &subject, &append);
+        // #811 C3: resolve the subject to its single bound stream OFF the actor, on THIS connection
+        // thread, through the generation-guarded resolve cache against the engine's SHARED wait-free
+        // routing snapshot (the SAME `ArcSwap` `bind_subject` publishes to). Then route the produce to
+        // the RESOLVED stream's shard — parity with `PubTo`, which hashes the stream name on the
+        // connection thread. The resolve stays single-home FAIL-CLOSED byte-for-byte (`NoStream` /
+        // `Ambiguous` / `Invalid` are typed rejects WITHOUT touching a log — no silent drop, no partial
+        // write, the beat over NATS); only WHERE it runs moved off the actor. At K = 1 the resolved
+        // shard is 0, so the append is byte-for-byte the pre-#811 shard-0 path.
+        let stream = {
+            let snapshot = engine.binding_snapshot();
+            match resolve_subject_cached(&snapshot, &mut self.subject_cache, &subject) {
+                Ok(id) => id,
+                Err(e) => {
+                    // An unbound/ambiguous/malformed subject: a typed, connection-preserving reject,
+                    // never a panic and NEVER a silent drop. A resolve reject is never fatal.
+                    reply_err_coded(out, e.code().as_str(), &e.to_string());
+                    return Ok(());
+                }
+            }
+        };
+        let level = append.ack_level;
+        // Route the append to the resolved stream's shard: the default stream `""` hashes to shard 0
+        // and appends byte-for-byte through the default path; a named stream appends to its own log.
+        let shard = crate::actor::shard_of(stream.name(), engine.shard_count());
+        let outcome = engine.with_on_shard(shard, move |e| {
+            // The literal subject is PERSISTED with the record (#594) so a per-subject filtered consumer
+            // can match it — on the default stream (#594-A) AND the resolved NAMED stream (#594-B); the
+            // subject was validated `Subject::parse_literal` at resolve.
+            let view = Append {
+                timestamp_ms: append.timestamp_ms,
+                flags: RecordFlags::from_bits(append.flags),
+                key: &append.key,
+                headers: &append.headers,
+                payload: &append.payload,
+            };
+            let outcome =
+                e.produce_in_stream_with_subject(stream.name(), &view, subject.as_bytes());
             // Per-ack-level PRODUCE throughput (#571) for the subject-routed produce path (which runs
             // synchronously in this engine job, not through the actor drain that counts the default
             // batched path): count only on a successful append, so the per-level sum matches the
@@ -5983,9 +6113,8 @@ impl Session {
             if outcome.is_ok() {
                 e.record_produce_ack_level(level);
             }
-            (cache, outcome)
+            outcome
         })?;
-        self.subject_cache = cache;
         match outcome {
             Ok(offset) => {
                 let ack = PubAckBody {
@@ -6002,9 +6131,10 @@ impl Session {
                 reply_err(out, "fatal storage error");
                 Err(SessionError::EngineFatal(e))
             }
-            // An unbound (NoStreamForSubject) or ambiguous (AmbiguousSubject) subject, a malformed
-            // subject, or a non-fatal storage shed is a typed, connection-preserving reject — never a
-            // panic and (critically) NEVER a silent drop.
+            // A non-fatal storage shed on the resolved stream (a byte-cap drop, etc.) is a typed,
+            // connection-preserving reject — never a panic and (critically) NEVER a silent drop. The
+            // resolve rejects (NoStreamForSubject / AmbiguousSubject / InvalidSubject) were already
+            // handled off the actor above, BEFORE the produce, so this arm only sees produce errors.
             Err(e) => {
                 reply_err_coded(out, e.code().as_str(), &e.to_string());
                 Ok(())
@@ -6105,10 +6235,24 @@ impl Session {
                     Resolved::Local(name) => (name, self.default_stream(), group.to_string()),
                 };
             let group_bind = group_owned.clone();
+            // #811 C2: this filter-bind resolves its covering stream IN-JOB (see the ROUTE-EXEMPT note
+            // below), so it stays on `with` — atomic resolve+set on shard 0, byte-for-byte at K=1.
             let (resolved_stream, set) = engine.with(move |e| {
                 let stream = e
                     .covering_named_stream_for_filter(&pattern_owned)
                     .map_or(default_stream, |id| id.name().to_string());
+                // ROUTE-EXEMPT(#811): `set_subject_filter_in_stream` DOES write per-stream state (it
+                // mints/updates the resolved stream's OWN per-shard work-group + filter), so on the face
+                // of it this is a routable per-stream verb. The blocker is the SHARD KEY, not the write:
+                // the target `stream` is resolved HERE, IN-JOB, from the binding ENTRIES
+                // (`covering_named_stream_for_filter` reduces `bindings.entries` by pattern-subset — a
+                // GLOBAL registry, NOT the wait-free subject snapshot the C3 publish path reads), so the
+                // caller cannot pick `shard_of(stream)` BEFORE dispatch. The only correct K > 1 route is a
+                // TWO-PHASE resolve-on-shard-0 → set-on-`shard_of(resolved)`, which needs the binding
+                // registry shared off-actor (owner-gated, C6) AND breaks the current ATOMIC resolve+set
+                // (a TOCTOU window opens between the two dispatches) — i.e. it is NOT byte-for-byte at
+                // K = 1. So the resolve+set stays ONE job on shard 0 (byte-for-byte at K = 1). This is an
+                // explicit, reviewed exemption from the route-completeness lint — never a missed site.
                 let set =
                     e.set_subject_filter_in_stream(&stream, &group_bind, Some(&pattern_owned));
                 (stream, set)
@@ -6164,13 +6308,14 @@ impl Session {
                 Resolved::Cross { name, .. } => (name, self.scope_group_under_self(group)),
                 Resolved::Local(name) => (name, group.to_string()),
             };
-        let cache = std::mem::take(&mut self.subject_cache);
-        let (cache, resolved) = engine.with(move |e| {
-            let mut cache = cache;
-            let resolved = resolve_subject_cached(e, &mut cache, &subject_owned);
-            (cache, resolved)
-        })?;
-        self.subject_cache = cache;
+        // #811 C3: resolve the subject OFF the actor (parity with `PubSubject`), on this connection
+        // thread, through the generation-guarded cache against the engine's SHARED wait-free snapshot.
+        // Single-home fail-closed is unchanged; a `SubSubject` only binds session state (the subsequent
+        // Flow/Ack route by `self.stream`), so there is no cross-shard hazard — just the off-actor read.
+        let resolved = {
+            let snapshot = engine.binding_snapshot();
+            resolve_subject_cached(&snapshot, &mut self.subject_cache, &subject_owned)
+        };
         let stream = match resolved {
             Ok(id) => id,
             Err(e) => {
@@ -6263,7 +6408,9 @@ impl Session {
             let group = self.subscription.clone();
             let stream = self.stream.clone();
             let member = self.member_id;
-            engine.with(move |e| {
+            // #811 C2: leave the key_shared membership on the bound stream's shard (default → shard 0).
+            let shard = crate::actor::shard_of(&stream, engine.shard_count());
+            engine.with_on_shard(shard, move |e| {
                 // The membership is per-(stream, group) (#64 follow-up): a named-stream subscription
                 // leaves THIS stream's router, the default stream (`""`) the default-group router.
                 if stream.is_empty() {
@@ -6297,7 +6444,9 @@ impl Session {
             let group = self.subscription.clone();
             let stream = self.stream.clone();
             let member = self.member_id;
-            engine.with(move |e| {
+            // #811 C2: deregister the subscription on the bound stream's shard (default → shard 0).
+            let shard = crate::actor::shard_of(&stream, engine.shard_count());
+            engine.with_on_shard(shard, move |e| {
                 // Routed per-stream (#771), like `leave_current_key_shared`: an EPHEMERAL
                 // named-stream subscription registered membership on THAT stream's group (and the
                 // leave is what triggers its reap when this member was the last). Only ephemeral
@@ -6416,18 +6565,22 @@ fn negotiate_credit_bytes(requested: Option<u64>, cap: u64) -> u64 {
 /// This is the cached twin of [`Engine::resolve_subject`]: the engine method walks the trie directly;
 /// this resolves through the connection's cache so a hot subject is O(1). The single-home reduction is
 /// the shared [`single_home`] policy, so the two agree.
-fn resolve_subject_cached<F: Filesystem, C: Clock + Clone>(
-    engine: &Engine<F, C>,
+// #811 C3: resolves against a SHARED wait-free routing snapshot (`&SublistSnapshot`) rather than a
+// borrowed `&Engine`, so a connection thread resolves a subject OFF the actor (then routes the produce
+// to the resolved stream's shard). The snapshot the caller passes is the SAME `ArcSwap` `bind_subject`
+// publishes to, so the resolution is identical to the historical in-actor one — only WHERE it runs moved.
+fn resolve_subject_cached(
+    snapshot: &SublistSnapshot<StreamId>,
     cache: &mut ResolveCache<StreamId>,
     subject: &str,
 ) -> Result<StreamId, EngineError> {
     // Validate as a #567 LITERAL (no wildcards on the publish/subscribe-by-literal side); a wildcard or
     // malformed subject is a typed reject before any routing.
     let subj = Subject::parse_literal(subject).map_err(EngineError::InvalidSubject)?;
-    // Resolve through the cache against the engine's wait-free snapshot, then reduce single-home over the
+    // Resolve through the cache against the shared wait-free snapshot, then reduce single-home over the
     // cached target slice WITHOUT cloning the whole Vec (only the one routed id is cloned on the happy
     // path).
-    match cache.resolve_with(engine.binding_snapshot(), &subj, single_home) {
+    match cache.resolve_with(snapshot, &subj, single_home) {
         Resolution::Routed(id) => Ok(id),
         Resolution::NoStream => Err(EngineError::NoStreamForSubject {
             subject: subject.to_string(),
@@ -6437,35 +6590,6 @@ fn resolve_subject_cached<F: Filesystem, C: Clock + Clone>(
             matched,
         }),
     }
-}
-
-/// Resolves `subject` single-home through `cache` (fail-closed) and, on a single-home hit, routes the
-/// owned `append` to the resolved stream via the id-routed [`Engine::produce_in_stream`] — the publish
-/// half of a `PubSubject` (#585), run in ONE actor job. An unbound/ambiguous/malformed subject is
-/// returned as a typed reject WITHOUT any append (no silent drop, no partial write — the fail-closed
-/// beat over NATS). Returns the assigned [`Offset`] in the resolved stream on success.
-fn resolve_then_produce<F: Filesystem + Clone, C: Clock + Clone>(
-    engine: &mut Engine<F, C>,
-    cache: &mut ResolveCache<StreamId>,
-    subject: &str,
-    append: &OwnedAppend,
-) -> Result<Offset, EngineError> {
-    // Resolve first (fail-closed): a NoStream/Ambiguous/Invalid subject is refused BEFORE any append.
-    let stream = resolve_subject_cached(engine, cache, subject)?;
-    // Route the append to the resolved stream's log via the id-routed produce (the default stream `""`
-    // routes byte-for-byte through `produce`; a named stream appends to its own log + commit tick).
-    // The literal subject is PERSISTED with the record (#594) so a per-subject filtered consumer can
-    // match it — on the default stream (#594-A) AND on the resolved NAMED stream (#594-B); the subject
-    // was validated `Subject::parse_literal` at resolve. `produce_in_stream_with_subject` routes the
-    // subject to whichever log the stream resolved to.
-    let view = Append {
-        timestamp_ms: append.timestamp_ms,
-        flags: RecordFlags::from_bits(append.flags),
-        key: &append.key,
-        headers: &append.headers,
-        payload: &append.payload,
-    };
-    engine.produce_in_stream_with_subject(stream.name(), &view, subject.as_bytes())
 }
 
 /// The #438 compressed-descriptor SHAPE gate, shared by ALL FOUR produce verbs (`handle_pub`,
@@ -7164,6 +7288,154 @@ mod tests {
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::{Append, LogConfig};
     use std::sync::Arc;
+
+    /// #811 C2 ROUTE-COMPLETENESS LINT — the safety net for the future owner-gated K > 1 append-shard flip.
+    ///
+    /// Proves that EVERY per-NAMED-stream engine verb dispatched in the PRODUCTION (non-test) code of
+    /// EVERY file that can reach the actor is routed through `with_on_shard(shard_of(stream), …)`, never
+    /// plain `with(…)`, so a produce, consume, ack, cursor-checkpoint, declare, subscribe, or membership
+    /// op ALWAYS lands on the shard that OWNS that stream's log/cursors. At K = 1
+    /// `with_on_shard(0, …) == with(…)`, so this is inert today; it is the tripwire that catches a NEW
+    /// per-stream verb (or a missed conversion) being routed to the WRONG shard once the flip spawns K
+    /// actors — a miss is a SILENT DATA DEFECT (e.g. a cursor checkpoint persisted on the wrong shard →
+    /// nowhere → mass redelivery on restart).
+    ///
+    /// It source-scans every production file that dispatches engine verbs — `session.rs` (the
+    /// SUB/ACK/FLOW/DECLARE/produce verbs), `server.rs` (the clean-disconnect + per-pass cursor
+    /// checkpoints — the two misses that slipped past the ORIGINAL `session.rs`-only lint, #1177), and
+    /// `health.rs` (its admin/metrics snapshots dispatch engine reads through `with` too; scanned for
+    /// defense-in-depth even though today they read only GLOBAL aggregates) — cuts each file's `mod tests`
+    /// out (so this very verb list and the fixtures' direct `&mut Engine` calls are not scanned), then for
+    /// every enumerated verb call locates its ENCLOSING dispatch opener (the NEAREST preceding `.with(` vs
+    /// `.with_on_shard(`). A verb under a plain `.with(` FAILS, UNLESS that closure carries an explicit
+    /// `ROUTE-EXEMPT(#811)` marker (the single filtered-subscribe site whose target stream is resolved
+    /// IN-JOB from the GLOBAL binding registry — see its documented rationale in `handle_sub_subject`).
+    ///
+    /// `PER_STREAM_VERBS` is the EXHAUSTIVE per-named-stream surface (every `engine.rs` method that
+    /// resolves `StreamId::named(stream)` and touches THAT stream's own log / durable cursors / work-group
+    /// membership+leases / partition sub-logs / priority lanes / per-stream subscription+filter+ordering).
+    /// GLOBAL / cross-shard verbs are deliberately EXCLUDED — routing them to `shard_of(stream)` would be
+    /// WRONG at K > 1 because they do NOT key on one stream's shard: the default-stream `*_in` family
+    /// (`ack_in`/`nack_in`/`term_in`/`progress_in`/`cumulative_ack_in`/…, all pinned to shard 0), the
+    /// GLOBAL subject-binding registry (`bind_subject`, read off-actor via `binding_snapshot`), the GLOBAL
+    /// txn 2PC coordinator (`txn_prepare`/`txn_commit`/`txn_rollback`, keyed by `txn_id` — the stream is
+    /// only the eventual-produce destination metadata), and the broker-global mirror config
+    /// (`is_mirror_read_only`) / key-shared config (`is_configured_key_shared`). Those are owner-gated
+    /// C5/C6 subsystems, out of scope for this inert-at-K=1 phase.
+    #[test]
+    fn every_named_stream_verb_routes_through_with_on_shard() {
+        const PER_STREAM_VERBS: &[&str] = &[
+            // Synchronous id-routed produce into a named stream's OWN log.
+            "produce_in_stream",
+            "produce_in_stream_with_subject",
+            "produce_in_stream_prioritized",
+            // Durable work-group cursor checkpoints (the #1177 blocking miss lived here).
+            "checkpoint_in_stream",
+            "maybe_checkpoint_in_stream",
+            // Stream lifecycle — materializes the stream's own log / partition sub-logs / priority lanes.
+            "declare_stream",
+            "declare_partitioned_stream",
+            "declare_priority_stream",
+            // Whole-stream consume + ack + committed-cursor read on the stream's own work-group.
+            "ack_in_stream",
+            "poll_in_stream",
+            "poll_in_stream_member",
+            "committed_offset_in_stream",
+            // Durable head / existence / residency reads of the stream's own log.
+            "stream_head",
+            "stream_exists",
+            "is_named_stream_resident",
+            // Partition twins — a partition's records live on its stream's shard.
+            "partition_count_of",
+            "poll_partition",
+            "ack_partition",
+            "committed_offset_in_partition",
+            // Priority twins — a priority stream's lanes live on its stream's shard.
+            "is_priority_stream",
+            "poll_priority",
+            "ack_priority",
+            "committed_offset_in_priority_lane",
+            // Named-stream fetch / resolve-time / stream-commit (Tier-S + replay).
+            "stream_fetch_in_stream",
+            "stream_fetch_raw_in_stream",
+            "stream_fetch_fd_in_stream",
+            "stream_resolve_time_in_stream",
+            "stream_commit_in_stream",
+            // Per-stream subscription + membership.
+            "subscribe_ephemeral_in_stream",
+            "is_ephemeral_in_stream",
+            "unsubscribe_in_stream",
+            "join_member_in_stream",
+            "leave_member_in_stream",
+            "pause_group_in_stream",
+            // Per-stream work-group configuration + routing reads.
+            "set_key_ordering_in_stream",
+            "key_ordering_in_stream",
+            "set_streaming_in_stream",
+            "is_streaming_in_stream",
+            "busy_keys_in_stream",
+            "route_decision_in_stream",
+            "subject_filter_in_stream",
+            "set_subject_filter_in_stream",
+        ];
+        // Scan EVERY production file that dispatches engine verbs. The ORIGINAL lint scanned `session.rs`
+        // ALONE, so the two mis-routed `server.rs` checkpoint verbs slipped through green (#1177).
+        const FILES: &[(&str, &str)] = &[
+            ("session.rs", include_str!("session.rs")),
+            ("server.rs", include_str!("server.rs")),
+            ("health.rs", include_str!("health.rs")),
+        ];
+        let mut violations: Vec<String> = Vec::new();
+        for &(fname, src) in FILES {
+            // Everything from the `mod tests {` declaration on is test-only (a verb list + the fixtures'
+            // direct `&mut Engine` calls), so scan ONLY the production prefix before it.
+            let prod = src
+                .split_once("\nmod tests {")
+                .map_or(src, |(head, _)| head);
+            for verb in PER_STREAM_VERBS {
+                let needle = format!(".{verb}(");
+                let mut from = 0usize;
+                while let Some(rel) = prod[from..].find(&needle) {
+                    let idx = from + rel;
+                    from = idx + needle.len();
+                    let before = &prod[..idx];
+                    let plain = before.rfind(".with(");
+                    let sharded = before.rfind(".with_on_shard(");
+                    // The enclosing dispatch is the NEAREST preceding opener. Dispatch closures never nest
+                    // a second `with`/`with_on_shard` before the verb, so nearest == enclosing.
+                    let enclosed_by_plain_with = match (plain, sharded) {
+                        // Both openers precede the verb: the enclosing one is the NEARER (larger index).
+                        (Some(p), Some(s)) => p > s,
+                        // Only `with_on_shard` precedes it → routed, good.
+                        (None, Some(_)) => false,
+                        // Only plain `with` precedes it, OR — a refactor hazard — NEITHER opener does (a
+                        // per-stream verb called outside any dispatch closure): treat as plain, flag it.
+                        _ => true,
+                    };
+                    if enclosed_by_plain_with {
+                        // Honor the explicit exemption: the closure body (opener → verb) carries a
+                        // `ROUTE-EXEMPT(#811)` marker whose rationale lives at the call site.
+                        let body = plain.map_or("", |p| &prod[p..idx]);
+                        if !body.contains("ROUTE-EXEMPT") {
+                            let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
+                            violations.push(format!(
+                                "`{verb}` at {fname}:{line} is dispatched through plain `with` — it must \
+                                 go through `with_on_shard(shard_of(stream), …)`"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "#811 route-completeness: {} per-named-stream verb call(s) still route through plain `with` \
+             instead of `with_on_shard`, so a future K > 1 append-shard flip would land them on the \
+             WRONG shard:\n{}",
+            violations.len(),
+            violations.join("\n"),
+        );
+    }
 
     /// The shared session-test engine config, factored out so the pipelined-window test (#450) can
     /// open the SAME config over a fault-injecting filesystem (to count fsyncs).
