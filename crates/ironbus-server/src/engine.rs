@@ -2459,6 +2459,52 @@ fn validate_group_name(name: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Whether `group` is a FOREIGN cross-tenant IMPORTER's guest cursor on stream `stream_id`, and so
+/// must NOT pin the stream owner's consumer-safe retention reap floor (#1170, ITEM 1 — cross-tenant
+/// resource isolation).
+///
+/// GATED, LOAD-BEARING PRECONDITION: this name test is meaningful ONLY when cross-tenant sharing is
+/// active (`Engine::cross_tenant_sharing_active`), which the sole caller
+/// ([`Engine::min_committed_offset_named`]) enforces. `/` is a fully legal, user-choosable character
+/// in stream AND group names on a single-tenant broker, so a bare name test with no tenancy gate
+/// would misclassify a single-tenant consumer group `b/g` on a stream `a/orders` as "foreign" and
+/// silently reap its unread records — a data-loss regression. The gate makes the test apply ONLY
+/// where tenancy's server-scoping invariant guarantees a same-tenant own group and its stream share
+/// the leading `<tenant>/` token; there, only a GENUINE cross-tenant guest differs.
+///
+/// A live cross-subscribe from a foreign importer keys its cursor on the EXPORTER's stream under an
+/// IMPORTER-scoped group name — `(<exporter>/stream, <importer>/group)` (see
+/// [`crate::session::Session::scope_group_under_self`]) — so on an `<exporter>/…` stream a foreign
+/// group is named `<importer>/…`, a leading `/`-token that DIFFERS from the stream's owning-tenant
+/// token. Left in the reap-floor min, a dead/lagging importer would pin the exporter's log from
+/// reaping — a cross-tenant availability/DoS vector (an importer holding the exporter's disk
+/// hostage). Excluding it means the exporter's retention reclaims on ITS OWN policy regardless of a
+/// foreign guest's position; a LIVE, keeping-up importer is unaffected (its cursor sits near the
+/// head, well above any reaped prefix), while a lagging importer is subject to the exporter's
+/// retention window exactly like any consumer that falls outside it — it can never HOLD the window
+/// open. Because the classification is purely by NAME it also holds across a restart (a ghost
+/// `<importer>/…` checkpoint on the exporter's stream is excluded too), with no new durable state.
+///
+/// Under the active-sharing gate a SAME-tenant own group is a bare client name with NO `/` (a client
+/// group name may not carry `/`, enforced at the wire ingress — ITEM 4), so it can never be mistaken
+/// for a foreign `<importer>/…` cursor. Fail-closed toward DATA-SAFETY: when the group carries no `/`
+/// tenant token (an own group), or its token MATCHES the stream owner's (a pathological self-import
+/// stays same-tenant), it PINS — never wrongly reaped. Only the server-applied cross-tenant importer
+/// group is ever excluded, and only on a sharing-active broker.
+fn is_foreign_importer_group(stream_id: &str, group: &str) -> bool {
+    // An own group is a bare client name (no `/`, guaranteed by the ITEM-4 ingress guard): it pins.
+    let Some((group_owner, _)) = group.split_once(crate::tenant::STREAM_DELIM) else {
+        return false;
+    };
+    // The stream's owning-tenant token is the part before its first `/` (`<exporter>/orders`), or the
+    // whole id when it has none (`<exporter>`, a tenant's bare default stream). Foreign iff the
+    // group's leading tenant token differs from the stream owner's.
+    let stream_owner = stream_id
+        .split_once(crate::tenant::STREAM_DELIM)
+        .map_or(stream_id, |(owner, _)| owner);
+    group_owner != stream_owner
+}
+
 /// The filename prefix and suffix of a named work-group's durable cursor checkpoint. The
 /// default group uses `cursor.ckpt` (note `cursor.`, not `cursor-`), so it never matches the
 /// named pattern and the two never collide.
@@ -4114,6 +4160,17 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// configured ONCE via [`Engine::set_mirror_read_only_streams`] only when a `--mirror` is present, so
     /// a non-geo broker's produce path is byte-for-byte unchanged (a single `is_empty()` short-circuit).
     mirror_read_only: std::collections::BTreeSet<String>,
+    /// Whether CROSS-TENANT SHARING is configured on this broker (#1170, ITEM 1). `false` by default —
+    /// a single-tenant broker, or a multi-tenant broker with NO import/export grants — and set `true`
+    /// ONCE at serve time ([`Engine::set_cross_tenant_sharing_active`]) only when a non-empty
+    /// [`crate::tenant::SharingRegistry`] is wired. It GATES the cross-tenant retention-floor exclusion
+    /// in [`Engine::min_committed_offset_named`]: the `<importer>/…`-vs-`<exporter>/…` name test is only
+    /// meaningful when the server-scoping invariant actually holds (sharing implies tenancy, so a same-
+    /// tenant own group and its stream share the leading `<tenant>/` token and a genuine guest is the
+    /// only thing that differs). When `false`, `/` is an ordinary user-chosen character in stream and
+    /// group names, so NO group is EVER excluded from the reap floor — a single-tenant consumer group
+    /// named `b/g` on a stream `a/orders` keeps its full #566 consumer-safe protection (no silent loss).
+    cross_tenant_sharing_active: bool,
     /// The opt-in effectively-once dedup registry (#3, #33): the per-producer bounded windows of
     /// `(msg_id -> offset)`. Empty until a producer opts in by sending a `msg_id`, so a broker no
     /// producer dedups against costs nothing here. Consulted on the produce path (the actor thread,
@@ -4991,6 +5048,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // produce path is byte-for-byte unchanged. Configured once via
             // `set_mirror_read_only_streams` only when a `--mirror` is present.
             mirror_read_only: std::collections::BTreeSet::new(),
+            // Cross-tenant sharing is OFF until the serve path wires a non-empty SharingRegistry
+            // (#1170): a single-tenant broker never excludes a group from the reap floor.
+            cross_tenant_sharing_active: false,
             // The opt-in dedup registry (#33), sized by the configured window. Empty until a
             // producer opts in by sending a `msg_id`, so it costs nothing for a no-dedup workload.
             dedup: ironbus_core::dedup::DedupRegistry::new(config.dedup),
@@ -5275,6 +5335,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn is_mirror_read_only(&self, stream: &str) -> bool {
         !self.mirror_read_only.is_empty() && self.mirror_read_only.contains(stream)
+    }
+
+    /// Declares whether CROSS-TENANT SHARING is configured on this broker (#1170, ITEM 1). Set `true`
+    /// ONCE at serve time when — and only when — a non-empty [`crate::tenant::SharingRegistry`] is wired
+    /// (which implies tenancy is active and the server-scoping invariant holds). It GATES the
+    /// cross-tenant retention-floor exclusion in [`Engine::min_committed_offset_named`]. With sharing
+    /// OFF (the default), `/` is an ordinary user character in stream/group names and NO group is ever
+    /// excluded from the reap floor, so a single-tenant `b/g`-on-`a/orders` consumer keeps its full
+    /// consumer-safe retention protection. Idempotent; a no-op cost on the produce path (a single bool).
+    pub fn set_cross_tenant_sharing_active(&mut self, active: bool) {
+        self.cross_tenant_sharing_active = active;
+    }
+
+    /// Whether cross-tenant sharing is active (test/introspection helper for the #1170 reap-floor gate).
+    #[must_use]
+    pub fn cross_tenant_sharing_active(&self) -> bool {
+        self.cross_tenant_sharing_active
     }
 
     /// The current key-compaction configuration (#337). Disabled by default. Read-only echo for the
@@ -11651,10 +11728,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // records. The default stream needs no twin: its groups are never dropped while their
         // intent is live (the #277 sweep refuses ephemeral groups and the default stream is never
         // LRU-evicted), so a parked default-stream offset cannot exist.
+        // #1170 (ITEM 1): a FOREIGN cross-tenant importer's guest cursor (`<importer>/…` on this
+        // `<exporter>/…` stream) is EXCLUDED from the exporter's reap floor at every source below —
+        // live groups, durable ghosts, AND parked ephemeral offsets — so a dead/lagging importer can
+        // never pin the exporter's retention reclamation (see `is_foreign_importer_group`).
+        //
+        // GATED on `cross_tenant_sharing_active`: the `<importer>/…`-vs-`<exporter>/…` name test is
+        // ONLY consulted when cross-tenant sharing is configured, i.e. when the server-scoping
+        // invariant actually holds and a same-tenant own group is guaranteed `/`-free. On a SINGLE-
+        // tenant broker (or a multi-tenant broker with no sharing grants) `/` is an ordinary user-
+        // chosen character in stream and group names, so the gate is OFF and NO group is ever
+        // excluded — a single-tenant consumer group named `b/g` on a stream `a/orders` keeps its full
+        // #566 consumer-safe protection (no silent reap of its unread records).
+        let stream_name = id.name();
+        let sharing = self.cross_tenant_sharing_active;
+        let is_guest = |group: &str| sharing && is_foreign_importer_group(stream_name, group);
         let parked = self
             .ephemeral_subs
             .iter()
             .filter(|((sid, _), _)| sid == id)
+            .filter(|((_, group), _)| !is_guest(group.as_str()))
             .filter_map(|(_, sub)| sub.parked_committed);
         let Some(ns) = self.named_streams.get(id) else {
             // No resident consumer state: only a parked ephemeral position (if any) can pin; with
@@ -11665,13 +11758,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let live = ns
             .groups
-            .values()
-            .filter(|g| g.touched)
-            .map(|g| g.cursor.committed().get());
+            .iter()
+            .filter(|(name, _)| !is_guest(name.as_str()))
+            .filter(|(_, g)| g.touched)
+            .map(|(_, g)| g.cursor.committed().get());
         let ghosts = ns
             .group_last_checkpointed
             .iter()
             .filter(|(name, _)| !ns.groups.contains_key(name.as_str()))
+            .filter(|(name, _)| !is_guest(name.as_str()))
             .map(|(_, &committed)| committed);
         live.chain(ghosts).chain(parked).min().unwrap_or(head)
     }
@@ -32224,6 +32319,167 @@ mod tests {
             earliest > 3,
             "with the intent gone the floor released and reaping proceeded (earliest = \
              {earliest})"
+        );
+    }
+
+    // Drains + acks EVERY currently-deliverable record of `stream`'s group `group`, so the group's
+    // committed cursor catches up to the durable head. Returns the monotonic `now` it advanced to.
+    fn drain_and_ack_all(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        stream: &str,
+        group: &str,
+    ) -> u64 {
+        let mut now = 0u64;
+        loop {
+            match e.poll_in_stream(stream, group, now).unwrap() {
+                Poll::Message(d) => {
+                    assert_eq!(e.ack_in_stream(stream, group, &d.token), AckResult::Acked);
+                    now += 1;
+                }
+                _ => break now,
+            }
+        }
+    }
+
+    #[test]
+    fn a_cross_tenant_guest_is_excluded_from_the_reap_floor_only_when_sharing_is_active() {
+        // #1170 (ITEM 1) — the SHARING-GATED reap-floor exclusion, and its INVERSE (the data-loss
+        // regression fix). A genuine cross-tenant importer keys its guest cursor
+        // `(<exporter>/stream, <importer>/group)`, so on exporter "a/orders" a guest is named "b/g".
+        // With CROSS-TENANT SHARING ACTIVE (the server-scoping invariant holds — a same-tenant own
+        // group and its stream share the leading `<tenant>/` token) the guest is EXCLUDED so a
+        // dead/lagging importer can never pin the exporter's disk. But `/` is a FULLY LEGAL user
+        // character in group/stream names on a SINGLE-TENANT broker, so with sharing OFF the SAME
+        // "b/g" group MUST pin — otherwise its unread records are silently reaped (the regression the
+        // review caught). Same group + same cursor; only the sharing gate flips the floor.
+        let mut e = open(config(64, 5)); // retention OFF: isolate the pure reap-FLOOR computation
+        e.set_cross_tenant_sharing_active(true); // a broker with cross-tenant sharing configured
+        for _ in 0..24 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        // Exporter a's OWN group "g" (a bare name, no '/') caught up to the head (24).
+        drain_and_ack_all(&mut e, "a/orders", "g");
+        let head = e
+            .streams
+            .get(&sid("a/orders"))
+            .unwrap()
+            .flushed_offset()
+            .get();
+        assert_eq!(head, 24);
+
+        // Importer b's guest cursor "b/g" lagging at committed 0 (one poll creates + touches it; the
+        // leased offset 0 is never acked). Creation is ALLOWED because sharing is active.
+        let _ = e.poll_in_stream("a/orders", "b/g", 0).unwrap();
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            head,
+            "SHARING ACTIVE: the cross-tenant guest cursor at 0 is EXCLUDED — the floor stays at the \
+             exporter's own caught-up head (a dead importer can't pin the exporter's disk)"
+        );
+
+        // THE REGRESSION FIX: on a SINGLE-TENANT broker the SAME "b/g" is an ordinary user group, so
+        // it MUST pin. Flip sharing OFF and re-read the floor — no group is excluded now.
+        e.set_cross_tenant_sharing_active(false);
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            0,
+            "SHARING OFF (single-tenant): the same 'b/g' group PINS at 0 — its unread records are \
+             protected, NOT silently reaped (mutation: an ungated name-only exclusion makes this 24)"
+        );
+
+        // And a SAME-tenant own group "g2" at 0 pins under sharing too (exclusion is guest-only).
+        e.set_cross_tenant_sharing_active(true);
+        let _ = e.poll_in_stream("a/orders", "g2", 0).unwrap();
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            0,
+            "even with sharing active, a same-tenant own group (bare name) at 0 still pins"
+        );
+    }
+
+    #[test]
+    fn a_single_tenant_slash_group_is_never_reaped_the_data_loss_regression_fix() {
+        // #1170 (ITEM 1) regression, end-to-end with retention ON: a SINGLE-TENANT broker (sharing
+        // OFF, the default) with a legal consumer group "b/g" lagging on stream "a/orders" must keep
+        // its #566 consumer-safe protection — its unread records are NOT reaped. `/` is a long-
+        // supported user character in group/stream names, so nothing here uses tenancy; this is
+        // exactly the deployment the review flagged as silently losing data before the gate.
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "a/orders", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("a/orders"))
+            .unwrap()
+            .durable_record_bytes();
+
+        // Sharing is OFF for the whole test (a genuine single-tenant broker never sets the flag).
+        let mut e = open(config_with_retention(4 * one)); // retain ~4 records
+        assert!(!e.cross_tenant_sharing_active());
+        for _ in 0..3 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        // The single-tenant user's group "b/g" lagging at 0 (one poll leases offset 0, never acked).
+        let _ = e.poll_in_stream("a/orders", "b/g", 0).unwrap();
+        // Grow well past the retention bound; each produce runs the per-stream reap.
+        for _ in 0..24 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            0,
+            "the lagging single-tenant 'b/g' group PINS the floor at 0 (mutation: an ungated \
+             name-only exclusion would exclude it and let the reap advance)"
+        );
+        assert_eq!(
+            e.streams
+                .get(&sid("a/orders"))
+                .unwrap()
+                .earliest_offset()
+                .get(),
+            0,
+            "NOT ONE record is reaped out from under the lagging single-tenant 'b/g' consumer — its \
+             consumer-safe retention protection is intact (the data-loss regression is fixed)"
+        );
+    }
+
+    #[test]
+    fn a_lagging_cross_tenant_guest_does_not_block_the_exporters_retention_reap() {
+        // #1170 (ITEM 1), the guest side end-to-end with SHARING ACTIVE: a dead/lagging importer
+        // guest at 0 must NOT block the exporter reaping below its OWN (caught-up) group's floor.
+        let mut probe = open(config_with_retention(0));
+        produce_named(&mut probe, "a/orders", &[0xab; 16]);
+        let one = probe
+            .streams
+            .get(&sid("a/orders"))
+            .unwrap()
+            .durable_record_bytes();
+
+        let mut e = open(config_with_retention(4 * one));
+        e.set_cross_tenant_sharing_active(true);
+        for _ in 0..3 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        // Exporter a's OWN group "g" caught up to 3; importer b's guest "b/g" lagging at 0.
+        assert_eq!(drain_and_ack_all(&mut e, "a/orders", "g"), 3);
+        let _ = e.poll_in_stream("a/orders", "b/g", 0).unwrap();
+        for _ in 0..24 {
+            produce_named(&mut e, "a/orders", &[0xab; 16]);
+        }
+        assert_eq!(
+            e.min_committed_offset_named(&sid("a/orders")),
+            3,
+            "the floor is the exporter's own group (3), NOT the guest's 0 (mutation → 0)"
+        );
+        let earliest = e
+            .streams
+            .get(&sid("a/orders"))
+            .unwrap()
+            .earliest_offset()
+            .get();
+        assert!(
+            earliest > 0 && earliest <= 3,
+            "the exporter reaped old sealed segments below its own floor despite the dead/lagging \
+             cross-tenant guest at 0 (earliest = {earliest}; without the exclusion it stays 0)"
         );
     }
 }
