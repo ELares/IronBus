@@ -3001,33 +3001,50 @@ impl Session {
                 lease.generation = generation;
             }
         }
+        // #1175: on a splice-enabled plaintext Linux connection, deliver the SEALED prefix's BODY by
+        // `sendfile(2)` — write only the `DeliverBatch` HEADER into `out` and record a `SpliceDirective`
+        // for the body — instead of copying the body into `out`. Byte-identical on the wire; the client
+        // is oblivious. Every other case (TLS, non-Linux, the operator kill-switch, or a non-spliceable
+        // window) takes the unchanged copy path below.
+        #[cfg(target_os = "linux")]
+        if self.splice_enabled {
+            return Ok(self.flush_run_spliced(engine, run, capable, out));
+        }
         // Zero-copy raw bytes for the SEALED prefix; an encrypted log (or a raw-read error) yields no raw
-        // run, so the whole batch falls to the decrypted per-record tail below — never a ciphertext byte.
+        // run, so the whole batch falls to the decrypted per-record tail — never a ciphertext byte.
         let raw = match engine.with(move |e| e.work_batch_raw_in(Offset::new(first), count)) {
             Ok(Ok(raw)) => Some(raw),
             Ok(Err(_)) | Err(_) => None,
         };
-        let sealed = raw.as_ref().map_or(0usize, |r| {
-            usize::try_from(r.record_count).unwrap_or(0).min(count)
+        let (sealed, body): (usize, &[u8]) = raw.as_ref().map_or((0, &[][..]), |r| {
+            (
+                usize::try_from(r.record_count).unwrap_or(0).min(count),
+                r.bytes.as_ref(),
+            )
         });
+        let delivered =
+            Self::emit_work_batch_copy(sealed, body, &run.records, first, generation, capable, out);
+        run.records.clear();
+        Ok(delivered)
+    }
+
+    /// Frames the ACTIVE-tail remainder of a Tier-W run — the staged records at `records[from..]` — as
+    /// per-record `Deliver`s carrying the shared reseal `generation`, contiguous after the batch prefix,
+    /// returning how many it delivered. Shared by [`Session::flush_run`]'s copy path and the `sendfile(2)`
+    /// path (#1175) so the tail framing (and its generation) has ONE source of truth. Each record is
+    /// `capable`-gated exactly as the per-record path (via [`Session::emit_staged_record`]).
+    fn emit_work_run_tail(
+        records: &[OwnedRecord],
+        from: usize,
+        first: u64,
+        generation: u64,
+        capable: bool,
+        out: &mut Vec<u8>,
+    ) -> u32 {
         let mut delivered = 0u32;
-        if let Some(raw) = raw.as_ref() {
-            if sealed >= 1 {
-                let header = DeliverBatchHeader {
-                    first_offset: first,
-                    generation,
-                    record_count: u32::try_from(sealed).unwrap_or(u32::MAX),
-                };
-                let result = encode_deliver_batch_frame(&header, &raw.bytes, out);
-                debug_assert!(result.is_ok(), "DeliverBatch frame exceeded the frame cap");
-                delivered = delivered.saturating_add(u32::try_from(sealed).unwrap_or(u32::MAX));
-            }
-        }
-        // The ACTIVE-tail (or next-segment) remainder as per-record `Deliver`s, contiguous after the
-        // sealed prefix; for an encrypted log `sealed == 0`, so this ships the WHOLE run decrypted.
-        for i in sealed..count {
+        for (i, record) in records.iter().enumerate().skip(from) {
             Self::emit_staged_record(
-                &run.records[i],
+                record,
                 first.saturating_add(i as u64),
                 generation,
                 capable,
@@ -3035,8 +3052,147 @@ impl Session {
             );
             delivered = delivered.saturating_add(1);
         }
+        delivered
+    }
+
+    /// Emits a materialized Tier-W run (the COPY path): the contiguous SEALED prefix — `sealed` frames of
+    /// `body`, the on-disk record bytes VERBATIM — as ONE `DeliverBatch` carrying the reseal `generation`,
+    /// then the ACTIVE-tail remainder `records[sealed..]` per-record. Returns the total delivered. Shared
+    /// by [`Session::flush_run`]'s copy path and the `sendfile(2)` path's copy-fallback (#1175), so the
+    /// batch framing has ONE source of truth. `sealed == 0` ships the WHOLE run per-record (an encrypted
+    /// log / raw-read-error degrade), never an empty batch frame on the wire.
+    fn emit_work_batch_copy(
+        sealed: usize,
+        body: &[u8],
+        records: &[OwnedRecord],
+        first: u64,
+        generation: u64,
+        capable: bool,
+        out: &mut Vec<u8>,
+    ) -> u32 {
+        let mut delivered = 0u32;
+        if sealed >= 1 {
+            let header = DeliverBatchHeader {
+                first_offset: first,
+                generation,
+                record_count: u32::try_from(sealed).unwrap_or(u32::MAX),
+            };
+            let result = encode_deliver_batch_frame(&header, body, out);
+            debug_assert!(result.is_ok(), "DeliverBatch frame exceeded the frame cap");
+            delivered = delivered.saturating_add(u32::try_from(sealed).unwrap_or(u32::MAX));
+        }
+        delivered.saturating_add(Self::emit_work_run_tail(
+            records, sealed, first, generation, capable, out,
+        ))
+    }
+
+    /// The Linux `sendfile(2)` zero-copy sibling of [`Session::flush_run`]'s batch emission (#1175, the
+    /// Tier-W follow-up to #1034 / #658): fetches the resealed contiguous SEALED prefix as an FD RUN via
+    /// [`crate::engine::Engine::work_batch_fd_in`] and, when one is available, writes ONLY the
+    /// `DeliverBatch` frame HEADER into `out` and records a [`SpliceDirective`] (the segment byte range the
+    /// server splices at `out.len()`) — the batch body never enters userspace. The ACTIVE-tail remainder
+    /// past the sealed prefix (`run.records[sealed..]`) frames per-record exactly as the copy path,
+    /// carrying the reseal `generation`. When the fd path is not available for the window
+    /// (encryption / compacted / remote / no-fd / unindexed tail) the engine returns [`StreamFdBatch::Copy`]
+    /// and this serves the materialized batch byte-for-byte as the copy path; on ANY dispatch/engine error
+    /// the whole run degrades to per-record from the decoded records (no record lost), identical to the
+    /// copy path's `raw = None` degrade. Byte-identical on the wire to [`Session::flush_run`]'s copy path;
+    /// the client is oblivious. The reseal + `self.leased` generation update already ran in `flush_run`.
+    #[cfg(target_os = "linux")]
+    fn flush_run_spliced<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        run: &mut StagedRun,
+        capable: bool,
+        out: &mut Vec<u8>,
+    ) -> u32
+    where
+        <F as Filesystem>::File: 'static,
+    {
+        // The reseal + `self.leased` generation update already ran in `flush_run`; these mirror its locals.
+        let first = run.first_offset;
+        let generation = run.shared_generation;
+        let count = run.records.len();
+        // Fetch the SEALED prefix as an fd run (or a copy-path batch when the window is not spliceable).
+        // On ANY dispatch/engine error, `batch` is `None` and the whole run ships per-record from the
+        // decoded records — byte-for-byte the copy path's `raw = None` degrade.
+        let batch = match engine.with(move |e| e.work_batch_fd_in(Offset::new(first), count)) {
+            Ok(Ok(batch)) => Some(batch),
+            Ok(Err(_)) | Err(_) => None,
+        };
+        let delivered = match batch {
+            Some(StreamFdBatch::Fd {
+                holder,
+                file_offset,
+                len,
+                record_count,
+                ..
+            }) => {
+                let sealed = usize::try_from(record_count).unwrap_or(0).min(count);
+                let mut delivered = 0u32;
+                // A zero-record fd run never occurs (the engine reports an empty run as `Copy`), but the
+                // guard mirrors the copy path exactly. Write ONLY the frame header, then record the splice
+                // so the server writes the body straight from the page cache at `out.len()`. The framed
+                // length accounts for the spliced `len` body, so the wire frame is byte-identical to the
+                // copy path's `encode_deliver_batch_frame`.
+                if sealed >= 1 {
+                    let header = DeliverBatchHeader {
+                        first_offset: first,
+                        generation,
+                        record_count: u32::try_from(sealed).unwrap_or(u32::MAX),
+                    };
+                    match ironbus_proto::message::encode_deliver_batch_frame_header(
+                        &header, len, out,
+                    ) {
+                        Ok(()) => {
+                            self.pending_splices.push(SpliceDirective {
+                                out_pos: out.len(),
+                                holder,
+                                file_offset,
+                                len,
+                            });
+                            delivered =
+                                delivered.saturating_add(u32::try_from(sealed).unwrap_or(u32::MAX));
+                        }
+                        Err(_) => {
+                            debug_assert!(false, "DeliverBatch frame exceeded the frame cap");
+                        }
+                    }
+                }
+                delivered.saturating_add(Self::emit_work_run_tail(
+                    &run.records,
+                    sealed,
+                    first,
+                    generation,
+                    capable,
+                    out,
+                ))
+            }
+            // The fd path was unavailable for this window: serve the materialized batch byte-for-byte as
+            // the copy path (the engine already fail-closed to a plain `RawByteRun`).
+            Some(StreamFdBatch::Copy(StreamRawBatch { raw, .. })) => {
+                let sealed = usize::try_from(raw.record_count).unwrap_or(0).min(count);
+                Self::emit_work_batch_copy(
+                    sealed,
+                    raw.bytes.as_ref(),
+                    &run.records,
+                    first,
+                    generation,
+                    capable,
+                    out,
+                )
+            }
+            // A dispatch/engine error: ship the WHOLE run per-record from the decoded records.
+            None => {
+                Self::emit_work_batch_copy(0, &[], &run.records, first, generation, capable, out)
+            }
+        };
         run.records.clear();
-        Ok(delivered)
+        delivered
     }
 
     // One cohesive credit/byte-budget/AIMD/auto-tune-bounded drain loop (the #65/#275/#402/#552 bounds
@@ -10589,6 +10745,276 @@ mod tests {
                 }
             }
             assert_eq!(got, (0..16).collect::<Vec<_>>());
+        }
+
+        // ===== Tier-W work-queue sendfile(2) parity (#1175) ======================================
+        // The Tier-W (lease/reseal) `flush_run` batch path splices its DeliverBatch body from the page
+        // cache on a splice-enabled plaintext Linux connection, exactly as the Tier-S path does — but the
+        // batch carries the reseal generation and the ACTIVE-tail remainder ships per-record from the
+        // decoded records. These mirror the Tier-S suite above, driven by a batch-capable WORK-QUEUE
+        // consumer (NOT streaming) through a `Fetch`.
+
+        /// A batch-capable Tier-W WORK-QUEUE session over a disk engine, with `sendfile(2)` splicing on or
+        /// off. Unlike [`disk_batch_session`] the group is NOT marked streaming, so a `Fetch` drains it
+        /// through the lease/reseal `flush_run` batch path (the Tier-W splice seam) rather than the
+        /// cursor-based Tier-S stream fetch.
+        fn disk_work_batch_session(
+            e: &DirectEngine<StdFs, ManualClock>,
+            group: &[u8],
+            splice: bool,
+        ) -> Session {
+            let mut s = Session::new().with_splice_enabled(splice);
+            let mut out = Vec::new();
+            s.process(
+                e,
+                &frame(FrameType::Connect, &batch_connect_body(true, true)),
+                &mut out,
+            )
+            .unwrap();
+            out.clear();
+            s.process(e, &frame(FrameType::Sub, group), &mut out)
+                .unwrap();
+            s
+        }
+
+        #[test]
+        fn tier_w_socket_bytes_are_byte_identical_to_the_copy_path() {
+            // (a) HEADLINE DIFFERENTIAL: the wire the Tier-W sendfile path produces (header-only `out` +
+            // spliced bodies) is BYTE-FOR-BYTE the wire the materialize+encode copy path produces for the
+            // SAME lease batch. Two disk engines with identical records; one splices, one copies.
+            let dir_s = tempfile::tempdir().unwrap();
+            let dir_c = tempfile::tempdir().unwrap();
+            let es = DirectEngine::new(disk_engine(dir_s.path()));
+            let ec = DirectEngine::new(disk_engine(dir_c.path()));
+            for i in 0..16u8 {
+                produce_disk(&es, &[i], &[i, 1], &[i; 6]);
+                produce_disk(&ec, &[i], &[i, 1], &[i; 6]);
+            }
+            assert!(
+                es.engine_mut().segment_count() >= 2,
+                "the small cap must have sealed several segments"
+            );
+            let mut ss = disk_work_batch_session(&es, b"w", true);
+            let mut sc = disk_work_batch_session(&ec, b"w", false);
+
+            let mut out_splice = Vec::new();
+            ss.process(&es, &fetch_frame(100, 0, 0, true), &mut out_splice)
+                .unwrap();
+            let splices = ss.take_splices();
+            assert!(
+                !splices.is_empty(),
+                "the disk sealed prefix of the lease batch was delivered via sendfile (directives emitted)"
+            );
+
+            let mut out_copy = Vec::new();
+            sc.process(&ec, &fetch_frame(100, 0, 0, true), &mut out_copy)
+                .unwrap();
+            assert!(
+                sc.take_splices().is_empty(),
+                "the copy session emits no directives"
+            );
+            assert!(!out_copy.is_empty(), "the copy path produced a response");
+
+            assert_eq!(
+                reconstruct_wire(&out_splice, &splices),
+                out_copy,
+                "the Tier-W spliced wire == the copy-path wire, byte for byte (incl. the reseal generation)"
+            );
+        }
+
+        #[test]
+        fn tier_w_body_bytes_are_absent_from_out_when_spliced() {
+            // (b) ZERO-COPY HAPPENS: when a Tier-W splice directive is emitted, the batch BODY (the sealed
+            // record bytes) is NOT present in `out` — the body never entered userspace; only the frame
+            // header did.
+            let dir = tempfile::tempdir().unwrap();
+            let e = DirectEngine::new(disk_engine(dir.path()));
+            for i in 0..16u8 {
+                produce_disk(&e, &[i], &[i, 1], &[i; 6]);
+            }
+            let mut s = disk_work_batch_session(&e, b"w", true);
+            let mut out = Vec::new();
+            s.process(&e, &fetch_frame(100, 0, 0, true), &mut out)
+                .unwrap();
+            let splices = s.take_splices();
+            assert!(!splices.is_empty());
+            for d in &splices {
+                let body = pread_exact(d.holder.splice_raw_fd(), d.file_offset, d.len);
+                assert!(d.len > 0, "a splice carries a non-empty body");
+                assert!(
+                    !out.windows(body.len()).any(|w| w == body.as_slice()),
+                    "the spliced body must NOT appear in `out` (zero user-space copy)"
+                );
+                assert!(d.out_pos <= out.len(), "the splice injects within `out`");
+            }
+        }
+
+        #[test]
+        fn tier_w_memory_backend_fails_closed_to_the_copy_path() {
+            // (c) FALLBACK — a MEMORY backend has no spliceable fd, so even with splicing ENABLED the
+            // engine fail-closes to the copy path: NO directives, and the wire carries full DeliverBatch
+            // frames byte-identical to the splice-off run.
+            let e = DirectEngine::new(small_segment_engine()); // InMemoryFs
+            for i in 0..16u8 {
+                produce_kh(&e, &[i], &[i, 1], &[i; 6]);
+            }
+            let mut s = Session::new().with_splice_enabled(true);
+            let mut scratch = Vec::new();
+            s.process(
+                &e,
+                &frame(FrameType::Connect, &batch_connect_body(true, true)),
+                &mut scratch,
+            )
+            .unwrap();
+            scratch.clear();
+            s.process(&e, &frame(FrameType::Sub, b"w"), &mut scratch)
+                .unwrap();
+
+            let mut out = Vec::new();
+            s.process(&e, &fetch_frame(100, 0, 0, true), &mut out)
+                .unwrap();
+            assert!(
+                s.take_splices().is_empty(),
+                "a memory backend never splices (no spliceable fd)"
+            );
+            assert!(
+                decode_all(&out)
+                    .iter()
+                    .any(|(t, _)| *t == FrameType::DeliverBatch),
+                "the sealed run still ships as a DeliverBatch via the copy path"
+            );
+        }
+
+        #[test]
+        fn tier_w_kill_switch_forces_the_full_frame_copy_path() {
+            // (c) FALLBACK — with splicing DISABLED (a TLS wire, a non-Linux build, or the operator
+            // kill-switch) the Tier-W session emits NO directives and the batch BODY is present in `out`
+            // (the full-frame copy path); decoding it yields exactly the records the splice run does.
+            let dir_off = tempfile::tempdir().unwrap();
+            let dir_on = tempfile::tempdir().unwrap();
+            let e_off = DirectEngine::new(disk_engine(dir_off.path()));
+            let e_on = DirectEngine::new(disk_engine(dir_on.path()));
+            for i in 0..16u8 {
+                produce_disk(&e_off, &[i], &[i, 1], &[i; 6]);
+                produce_disk(&e_on, &[i], &[i, 1], &[i; 6]);
+            }
+            let mut s_off = disk_work_batch_session(&e_off, b"w", false);
+            let mut out_off = Vec::new();
+            s_off
+                .process(&e_off, &fetch_frame(100, 0, 0, true), &mut out_off)
+                .unwrap();
+            assert!(
+                s_off.take_splices().is_empty(),
+                "a disabled connection never emits a splice directive"
+            );
+            // The whole run decodes straight out of `out_off` (bodies present) — the copy path.
+            let decode_offsets = |wire: &[u8]| -> Vec<u64> {
+                let mut got: Vec<u64> = Vec::new();
+                for (ty, body) in decode_all(wire) {
+                    match ty {
+                        FrameType::DeliverBatch => {
+                            for r in decode_batch_records(&body) {
+                                got.push(r.0);
+                            }
+                        }
+                        FrameType::Deliver => got.push(decode_deliver(&body).unwrap().offset),
+                        _ => {}
+                    }
+                }
+                got
+            };
+            let off_offsets = decode_offsets(&out_off);
+            assert!(!off_offsets.is_empty(), "the copy path delivered records");
+
+            // The splice-ON run delivers the SAME offsets (reconstructing its spliced bodies).
+            let mut s_on = disk_work_batch_session(&e_on, b"w", true);
+            let mut out_on = Vec::new();
+            s_on.process(&e_on, &fetch_frame(100, 0, 0, true), &mut out_on)
+                .unwrap();
+            let splices = s_on.take_splices();
+            assert!(!splices.is_empty());
+            let on_offsets = decode_offsets(&reconstruct_wire(&out_on, &splices));
+            assert_eq!(
+                off_offsets, on_offsets,
+                "kill-switch copy path and splice path deliver identical offsets"
+            );
+        }
+
+        #[test]
+        fn tier_w_a_flipped_stored_body_byte_is_rejected_by_the_client_crc() {
+            // (d) CRC END-TO-END: the sendfile path ships each stored record frame (its header + body CRC)
+            // VERBATIM, so a single corrupted body byte is caught by the client's per-record CRC check
+            // exactly as for a per-record Deliver. Splice the Tier-W batch, reconstruct the wire, then flip
+            // one byte of a spliced record's frame and confirm it no longer decodes.
+            let dir = tempfile::tempdir().unwrap();
+            let e = DirectEngine::new(disk_engine(dir.path()));
+            for i in 0..16u8 {
+                produce_disk(&e, &[i], &[i, 1], &[i; 6]);
+            }
+            let mut s = disk_work_batch_session(&e, b"w", true);
+            let mut out = Vec::new();
+            s.process(&e, &fetch_frame(100, 0, 0, true), &mut out)
+                .unwrap();
+            let splices = s.take_splices();
+            assert!(!splices.is_empty(), "the sealed prefix spliced");
+            let wire = reconstruct_wire(&out, &splices);
+            let batch = decode_all(&wire)
+                .into_iter()
+                .find(|(t, _)| *t == FrameType::DeliverBatch)
+                .expect("a DeliverBatch on the wire")
+                .1;
+            let (_hdr, record_bytes) =
+                ironbus_proto::message::decode_deliver_batch(&batch).expect("batch header decodes");
+            // The intact first record decodes (its CRC verifies) — the control.
+            let (_view, consumed) =
+                ironbus_core::codec::decode(record_bytes).expect("the intact stored body decodes");
+            // Flip one byte inside that record's frame: the client's per-record CRC must now reject it.
+            let mut corrupted = record_bytes.to_vec();
+            corrupted[consumed / 2] ^= 0xFF;
+            assert!(
+                ironbus_core::codec::decode(&corrupted).is_err(),
+                "a flipped stored body byte fails the client's per-record CRC check"
+            );
+        }
+
+        #[test]
+        fn tier_w_splice_holder_survives_a_concurrent_segment_retire() {
+            // (e) fd LIFETIME / RETIRE RACE: the Tier-W splice directive's holder owns a FRESH, INDEPENDENT
+            // segment fd (a `FdRun` opened by `work_batch_fd_in`), so dropping the whole engine AND
+            // unlinking every segment file (what a concurrent compaction retire does) does NOT close it —
+            // the kernel keeps the inode alive for the open fd, and the spliced bytes are still readable.
+            let dir = tempfile::tempdir().unwrap();
+            let e = DirectEngine::new(disk_engine(dir.path()));
+            for i in 0..16u8 {
+                produce_disk(&e, &[i], &[i, 1], &[i; 6]);
+            }
+            let mut s = disk_work_batch_session(&e, b"w", true);
+            let mut out = Vec::new();
+            s.process(&e, &fetch_frame(100, 0, 0, true), &mut out)
+                .unwrap();
+            let splices = s.take_splices();
+            assert!(!splices.is_empty());
+            // Capture the ORIGINAL spliced bytes before the retire.
+            let d = &splices[0];
+            let before = pread_exact(d.holder.splice_raw_fd(), d.file_offset, d.len);
+            assert!(!before.is_empty(), "a splice carries a non-empty body");
+            // Drop the session and the whole engine, then RETIRE every segment file on disk (an unlink),
+            // while the directive's owned fd stays open.
+            drop(s);
+            drop(e);
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            // The held fd still reads the ORIGINAL bytes: the retire did not close it (the holder keeps it
+            // open across the whole splice — the retire-race guarantee the server's writer relies on).
+            let after = pread_exact(d.holder.splice_raw_fd(), d.file_offset, d.len);
+            assert_eq!(
+                before, after,
+                "the spliced fd survives the engine drop + segment retire (holder keeps it open)"
+            );
         }
     }
 

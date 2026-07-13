@@ -13577,6 +13577,72 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(raw)
     }
 
+    /// The Linux `sendfile(2)` zero-copy sibling of [`Engine::work_batch_raw_in`] (#1175, the Tier-W
+    /// follow-up to #1034 / #658): serves the contiguous SEALED prefix of a Tier-W batch run
+    /// `[first, first+count)` as an FD RUN — a borrowed segment descriptor plus the on-disk byte range to
+    /// splice — instead of the run's bytes in userspace, so the broker never reads the record bodies into
+    /// RAM (the kernel splices them straight from the page cache to the socket). DEFAULT log only (the
+    /// batched Tier-W path is scoped to the root stream, exactly as `work_batch_raw_in`).
+    ///
+    /// Unlike the Tier-S [`Engine::stream_fetch_fd_in`], this ships NO active-tail and bumps NO delivered
+    /// counter: the Tier-W drain materializes the ACTIVE-tail remainder itself (from the records it
+    /// already decoded during the claim drain — `run.records[sealed..]`) and counts its own deliveries,
+    /// so the returned [`StreamFdBatch::Fd`] carries an EMPTY `tail` and the method is byte-for-byte
+    /// interchangeable with `work_batch_raw_in` (same `record_count`, same on-disk byte range).
+    ///
+    /// FAIL-CLOSES to [`StreamFdBatch::Copy`] (a materialized [`RawByteRun`]) for every non-spliceable
+    /// window — at-rest encryption, a compacted (v2 sparse) or offloaded (remote) slot, a no-fd backend
+    /// (memory / `O_DIRECT`), or a not-yet-indexed active tail — reusing the exact fail-closed reroutes
+    /// [`ironbus_storage::log::Log::read_range_fd_range`] already applies (byte-for-byte the
+    /// `read_range_raw` the copy path falls back to). On the fd path the returned [`StreamFdBatch::Fd`]
+    /// holds the segment reader ALIVE (via its `Box<dyn SpliceSource>` holder) so a concurrent compaction
+    /// retire cannot close the fd mid-splice.
+    ///
+    /// # Errors
+    /// A storage error from the header walk or the raw fallback read (the same errors `work_batch_raw_in`
+    /// surfaces); the session degrades to shipping the whole run per-record from the decoded records, so
+    /// a read failure never drops a record.
+    #[cfg(target_os = "linux")]
+    pub fn work_batch_fd_in(
+        &self,
+        first: Offset,
+        count: usize,
+    ) -> Result<StreamFdBatch, EngineError>
+    where
+        <F as Filesystem>::File: 'static,
+    {
+        // Try the zero-copy fd path first. `read_range_fd_range` fail-closes (returns `None`) for every
+        // case the copy path must handle, so a `Some` here is a genuine spliceable sealed run. `max_bytes:
+        // None` mirrors `work_batch_raw_in` — the run is already bounded to `count` records.
+        let (fd_run, _tail_from) = self.log.read_range_fd_range(first, count, None)?;
+        if let Some(fd_run) = fd_run {
+            let file_offset = fd_run.file_offset();
+            let len = fd_run.len();
+            let first_offset = fd_run.first_offset();
+            let record_count = fd_run.record_count();
+            let next_offset = fd_run.next_offset();
+            return Ok(StreamFdBatch::Fd {
+                holder: Box::new(fd_run),
+                file_offset,
+                len,
+                first_offset,
+                record_count,
+                // The Tier-W drain ships the ACTIVE-tail remainder per-record from its OWN decoded
+                // records (`run.records[sealed..]`), so the engine returns no tail here.
+                tail: Vec::new(),
+                next_offset,
+            });
+        }
+        // Copy fallback: byte-for-byte `work_batch_raw_in` (the same single-segment `read_range_raw`).
+        let (raw, _tail_from) = self.log.read_range_raw(first, count, None)?;
+        let next_offset = raw.next_offset;
+        Ok(StreamFdBatch::Copy(StreamRawBatch {
+            raw,
+            tail: Vec::new(),
+            next_offset,
+        }))
+    }
+
     /// The name of the ONE designated group whose ack confirms a Level-2 produce (#497). Defaults to
     /// the default/unnamed group; see [`Engine::set_confirm_group`].
     #[must_use]
