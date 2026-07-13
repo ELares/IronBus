@@ -980,7 +980,11 @@ impl Session {
             }
         }
         let name = default.clone();
-        match engine.with(move |e| e.declare_stream(&name))? {
+        // #811 C2: a named stream's log is materialized on `shard_of(name)`, so declaring the tenant's
+        // own default stream routes to that stream's shard — parity with declare-on-first-produce, which
+        // already routes to `shard_of(stream)`. Byte-for-byte `with` at K = 1 (a named tenant → shard 0).
+        let shard = crate::actor::shard_of(&name, engine.shard_count());
+        match engine.with_on_shard(shard, move |e| e.declare_stream(&name))? {
             Ok(_) => {}
             Err(e) if e.is_fatal() => {
                 reply_err(out, "fatal storage error");
@@ -2226,7 +2230,11 @@ impl Session {
             return Ok(());
         }
         let level = append.ack_level;
-        let outcome = engine.with(move |e| {
+        // #811 C2: a multi-tenant connection's default stream is the NAMED stream `<tenant>`, so this
+        // synchronous id-routed produce must land on `shard_of(stream)` — the same shard the `PubTo`
+        // named-stream produce path routes to. Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let outcome = engine.with_on_shard(shard, move |e| {
             let view = Append {
                 timestamp_ms: append.timestamp_ms,
                 flags: RecordFlags::from_bits(append.flags),
@@ -4629,7 +4637,12 @@ impl Session {
         self.subscription = GroupName::from(group);
         self.partition = None;
         let stream_p = stream.to_string();
-        self.priority_bound = engine.with(move |e| e.is_priority_stream(&stream_p))?;
+        // #811 C2: the priority-mode flag is per-stream metadata OWNED by `shard_of(stream)`, so read it
+        // on that stream's shard — parity with the key_shared + streaming sets routed just below.
+        // Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(stream, engine.shard_count());
+        self.priority_bound =
+            engine.with_on_shard(shard, move |e| e.is_priority_stream(&stream_p))?;
         self.registered_subscription = ephemeral;
         self.ephemeral_subscription = ephemeral;
         self.leased.clear();
@@ -4892,7 +4905,11 @@ impl Session {
         // fails closed with the engine's typed reason. The two partitioned modes are mutually exclusive.
         let partition_count = decoded.partition_count;
         let priority = decoded.priority;
-        let result = engine.with(move |e| {
+        // #811 C2: a declare materializes the named stream's OWN log / partition sub-logs / priority
+        // lanes, so route it to `shard_of(stream)` — parity with declare-on-first-produce, which routes
+        // there too. Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let result = engine.with_on_shard(shard, move |e| {
             if priority {
                 e.declare_priority_stream(&stream, partition_count)
             } else {
@@ -4956,8 +4973,13 @@ impl Session {
         // One round-trip reads both the existence bit and the durable head: the head is meaningful only
         // when the stream exists, and `stream_head` reports `0` for an unknown/malformed stream (which
         // the response folds with `exists = false`), so the two reads are consistent.
-        let (exists, head) =
-            engine.with(move |e| (e.stream_exists(&stream), e.stream_head(&stream).get()))?;
+        // #811 C2: `stream_head` reads the named stream's OWN durable log head, state OWNED by
+        // `shard_of(stream)`, so route the probe to that stream's shard (the existence bit is read in the
+        // same job). Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream, engine.shard_count());
+        let (exists, head) = engine.with_on_shard(shard, move |e| {
+            (e.stream_exists(&stream), e.stream_head(&stream).get())
+        })?;
         let resp = StreamInfoResponseBody { exists, head };
         let mut resp_body = Vec::new();
         encode_stream_info_response(&resp, &mut resp_body);
@@ -5587,7 +5609,10 @@ impl Session {
         // The named stream must already exist: a SubTo binds a consume cursor, and consuming an
         // unknown (never-declared) stream is a typed rejection, never a silent empty subscription.
         let stream_owned = stream.to_string();
-        if !engine.with(move |e| e.stream_exists(&stream_owned))? {
+        // #811 C2: existence keys on the named stream (its own log/subtree), so probe it on
+        // `shard_of(stream)`. Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(&stream_owned, engine.shard_count());
+        if !engine.with_on_shard(shard, move |e| e.stream_exists(&stream_owned))? {
             reply_err(
                 out,
                 &format!("stream {stream:?} does not exist (declare or publish to it first)"),
@@ -5617,7 +5642,11 @@ impl Session {
             // a priority lane; subscribe to the stream and the broker picks). Checked alongside the range
             // check in one engine query.
             let stream_q = stream.to_string();
-            let (in_range, is_priority) = engine.with(move |e| {
+            // #811 C2: partition count + priority-mode are per-stream metadata OWNED by
+            // `shard_of(stream)`, so read them on that stream's shard. Byte-for-byte `with` at K = 1
+            // (`shard_of` → 0).
+            let shard = crate::actor::shard_of(stream, engine.shard_count());
+            let (in_range, is_priority) = engine.with_on_shard(shard, move |e| {
                 (
                     e.partition_count_of(&stream_q)
                         .is_some_and(|pc| partition < pc.get()),
@@ -5730,7 +5759,12 @@ impl Session {
         // first). A non-priority whole-stream subscribe clears it (byte-for-byte the pre-#553 path). One
         // engine query; a false for every non-priority stream.
         let stream_p = stream.to_string();
-        self.priority_bound = engine.with(move |e| e.is_priority_stream(&stream_p))?;
+        // #811 C2: the priority-mode flag is per-stream metadata OWNED by `shard_of(stream)`, so read it
+        // on that stream's shard — parity with the key_shared + streaming sets routed just below.
+        // Byte-for-byte `with` at K = 1 (`shard_of` → 0).
+        let shard = crate::actor::shard_of(stream, engine.shard_count());
+        self.priority_bound =
+            engine.with_on_shard(shard, move |e| e.is_priority_stream(&stream_p))?;
         // A DURABLE named-stream consume does not register in the default-stream broadcast subscriber
         // set (#676); an EPHEMERAL one registers per-stream membership (#771) that the leave path
         // routes by `self.stream`.
@@ -6207,13 +6241,18 @@ impl Session {
                 let stream = e
                     .covering_named_stream_for_filter(&pattern_owned)
                     .map_or(default_stream, |id| id.name().to_string());
-                // ROUTE-EXEMPT(#811): the target `stream` is resolved HERE, IN-JOB, from the binding
-                // ENTRIES (`covering_named_stream_for_filter` reduces `bindings.entries` by pattern-
-                // subset — NOT the wait-free subject snapshot the C3 publish path reads), so it cannot
-                // pick a shard BEFORE dispatch. Keeping the resolve+set atomic in ONE job is byte-for-
-                // byte at K=1 (shard 0); routing this one site needs the binding registry shared
-                // off-actor (owner-gated, C6 territory). This is an explicit, reviewed exemption from
-                // the route-completeness lint — never a missed site.
+                // ROUTE-EXEMPT(#811): `set_subject_filter_in_stream` DOES write per-stream state (it
+                // mints/updates the resolved stream's OWN per-shard work-group + filter), so on the face
+                // of it this is a routable per-stream verb. The blocker is the SHARD KEY, not the write:
+                // the target `stream` is resolved HERE, IN-JOB, from the binding ENTRIES
+                // (`covering_named_stream_for_filter` reduces `bindings.entries` by pattern-subset — a
+                // GLOBAL registry, NOT the wait-free subject snapshot the C3 publish path reads), so the
+                // caller cannot pick `shard_of(stream)` BEFORE dispatch. The only correct K > 1 route is a
+                // TWO-PHASE resolve-on-shard-0 → set-on-`shard_of(resolved)`, which needs the binding
+                // registry shared off-actor (owner-gated, C6) AND breaks the current ATOMIC resolve+set
+                // (a TOCTOU window opens between the two dispatches) — i.e. it is NOT byte-for-byte at
+                // K = 1. So the resolve+set stays ONE job on shard 0 (byte-for-byte at K = 1). This is an
+                // explicit, reviewed exemption from the route-completeness lint — never a missed site.
                 let set =
                     e.set_subject_filter_in_stream(&stream, &group_bind, Some(&pattern_owned));
                 (stream, set)
@@ -7250,89 +7289,140 @@ mod tests {
     use ironbus_storage::log::{Append, LogConfig};
     use std::sync::Arc;
 
-    /// #811 C2 ROUTE-COMPLETENESS LINT — the safety net for the future K > 1 append-shard flip.
+    /// #811 C2 ROUTE-COMPLETENESS LINT — the safety net for the future owner-gated K > 1 append-shard flip.
     ///
-    /// Proves that EVERY per-NAMED-stream engine verb in the PRODUCTION (non-test) part of this file is
-    /// dispatched through `with_on_shard(shard_of(stream), …)`, never plain `with(…)`, so a produce,
-    /// consume, ack, cursor-commit, subscribe, or membership op ALWAYS lands on the shard that OWNS the
-    /// stream. At K = 1 `with_on_shard(0, …) == with(…)`, so this is inert today; it is the tripwire that
-    /// catches a NEW per-stream verb (or a missed conversion) being routed to the WRONG shard once the
-    /// owner-gated flip spawns K actors.
+    /// Proves that EVERY per-NAMED-stream engine verb dispatched in the PRODUCTION (non-test) code of
+    /// EVERY file that can reach the actor is routed through `with_on_shard(shard_of(stream), …)`, never
+    /// plain `with(…)`, so a produce, consume, ack, cursor-checkpoint, declare, subscribe, or membership
+    /// op ALWAYS lands on the shard that OWNS that stream's log/cursors. At K = 1
+    /// `with_on_shard(0, …) == with(…)`, so this is inert today; it is the tripwire that catches a NEW
+    /// per-stream verb (or a missed conversion) being routed to the WRONG shard once the flip spawns K
+    /// actors — a miss is a SILENT DATA DEFECT (e.g. a cursor checkpoint persisted on the wrong shard →
+    /// nowhere → mass redelivery on restart).
     ///
-    /// It source-scans THIS file (`include_str!`), cuts the test module out (so this very verb list and
-    /// the test fixtures' direct `&mut Engine` calls are not scanned), then for every enumerated verb
-    /// call locates its ENCLOSING dispatch opener — the NEAREST preceding `.with(` vs `.with_on_shard(`.
-    /// A verb under a plain `.with(` FAILS, UNLESS that closure carries an explicit `ROUTE-EXEMPT(#811)`
-    /// marker (the single site whose target stream is resolved IN-JOB from the binding registry — see its
-    /// documented call site in `handle_sub_subject`). The verbs it enforces (the whole named-stream
-    /// surface): the 16 `*_in_stream` twins (ack / committed-offset / resolve-time / stream-fetch{,-raw,
-    /// -fd} / stream-commit / subscribe-ephemeral / is-ephemeral / set-key-ordering / join-member /
-    /// leave-member / set-streaming / unsubscribe / pause-group / set-subject-filter) plus the member-
-    /// aware `poll_in_stream_member` and the partition/priority twins (`ack_partition` / `poll_partition`
-    /// / `ack_priority` / `poll_priority`).
+    /// It source-scans every production file that dispatches engine verbs — `session.rs` (the
+    /// SUB/ACK/FLOW/DECLARE/produce verbs), `server.rs` (the clean-disconnect + per-pass cursor
+    /// checkpoints — the two misses that slipped past the ORIGINAL `session.rs`-only lint, #1177), and
+    /// `health.rs` (its admin/metrics snapshots dispatch engine reads through `with` too; scanned for
+    /// defense-in-depth even though today they read only GLOBAL aggregates) — cuts each file's `mod tests`
+    /// out (so this very verb list and the fixtures' direct `&mut Engine` calls are not scanned), then for
+    /// every enumerated verb call locates its ENCLOSING dispatch opener (the NEAREST preceding `.with(` vs
+    /// `.with_on_shard(`). A verb under a plain `.with(` FAILS, UNLESS that closure carries an explicit
+    /// `ROUTE-EXEMPT(#811)` marker (the single filtered-subscribe site whose target stream is resolved
+    /// IN-JOB from the GLOBAL binding registry — see its documented rationale in `handle_sub_subject`).
+    ///
+    /// `PER_STREAM_VERBS` is the EXHAUSTIVE per-named-stream surface (every `engine.rs` method that
+    /// resolves `StreamId::named(stream)` and touches THAT stream's own log / durable cursors / work-group
+    /// membership+leases / partition sub-logs / priority lanes / per-stream subscription+filter+ordering).
+    /// GLOBAL / cross-shard verbs are deliberately EXCLUDED — routing them to `shard_of(stream)` would be
+    /// WRONG at K > 1 because they do NOT key on one stream's shard: the default-stream `*_in` family
+    /// (`ack_in`/`nack_in`/`term_in`/`progress_in`/`cumulative_ack_in`/…, all pinned to shard 0), the
+    /// GLOBAL subject-binding registry (`bind_subject`, read off-actor via `binding_snapshot`), the GLOBAL
+    /// txn 2PC coordinator (`txn_prepare`/`txn_commit`/`txn_rollback`, keyed by `txn_id` — the stream is
+    /// only the eventual-produce destination metadata), and the broker-global mirror config
+    /// (`is_mirror_read_only`) / key-shared config (`is_configured_key_shared`). Those are owner-gated
+    /// C5/C6 subsystems, out of scope for this inert-at-K=1 phase.
     #[test]
     fn every_named_stream_verb_routes_through_with_on_shard() {
         const PER_STREAM_VERBS: &[&str] = &[
+            // Synchronous id-routed produce into a named stream's OWN log.
+            "produce_in_stream",
+            "produce_in_stream_with_subject",
+            "produce_in_stream_prioritized",
+            // Durable work-group cursor checkpoints (the #1177 blocking miss lived here).
+            "checkpoint_in_stream",
+            "maybe_checkpoint_in_stream",
+            // Stream lifecycle — materializes the stream's own log / partition sub-logs / priority lanes.
+            "declare_stream",
+            "declare_partitioned_stream",
+            "declare_priority_stream",
+            // Whole-stream consume + ack + committed-cursor read on the stream's own work-group.
             "ack_in_stream",
+            "poll_in_stream",
+            "poll_in_stream_member",
             "committed_offset_in_stream",
-            "stream_resolve_time_in_stream",
+            // Durable head / existence / residency reads of the stream's own log.
+            "stream_head",
+            "stream_exists",
+            "is_named_stream_resident",
+            // Partition twins — a partition's records live on its stream's shard.
+            "partition_count_of",
+            "poll_partition",
+            "ack_partition",
+            "committed_offset_in_partition",
+            // Priority twins — a priority stream's lanes live on its stream's shard.
+            "is_priority_stream",
+            "poll_priority",
+            "ack_priority",
+            "committed_offset_in_priority_lane",
+            // Named-stream fetch / resolve-time / stream-commit (Tier-S + replay).
             "stream_fetch_in_stream",
             "stream_fetch_raw_in_stream",
             "stream_fetch_fd_in_stream",
+            "stream_resolve_time_in_stream",
             "stream_commit_in_stream",
+            // Per-stream subscription + membership.
             "subscribe_ephemeral_in_stream",
             "is_ephemeral_in_stream",
-            "set_key_ordering_in_stream",
+            "unsubscribe_in_stream",
             "join_member_in_stream",
             "leave_member_in_stream",
-            "set_streaming_in_stream",
-            "unsubscribe_in_stream",
             "pause_group_in_stream",
+            // Per-stream work-group configuration + routing reads.
+            "set_key_ordering_in_stream",
+            "key_ordering_in_stream",
+            "set_streaming_in_stream",
+            "is_streaming_in_stream",
+            "busy_keys_in_stream",
+            "route_decision_in_stream",
+            "subject_filter_in_stream",
             "set_subject_filter_in_stream",
-            "poll_in_stream_member",
-            "ack_partition",
-            "poll_partition",
-            "ack_priority",
-            "poll_priority",
         ];
-        const SRC: &str = include_str!("session.rs");
-        // Everything from the module declaration on is test-only (this verb list + the fixtures' direct
-        // `&mut Engine` calls), so scan ONLY the production prefix before it.
-        let prod = SRC
-            .split("\nmod tests {")
-            .next()
-            .expect("session.rs always has a production prefix before its test module");
+        // Scan EVERY production file that dispatches engine verbs. The ORIGINAL lint scanned `session.rs`
+        // ALONE, so the two mis-routed `server.rs` checkpoint verbs slipped through green (#1177).
+        const FILES: &[(&str, &str)] = &[
+            ("session.rs", include_str!("session.rs")),
+            ("server.rs", include_str!("server.rs")),
+            ("health.rs", include_str!("health.rs")),
+        ];
         let mut violations: Vec<String> = Vec::new();
-        for verb in PER_STREAM_VERBS {
-            let needle = format!(".{verb}(");
-            let mut from = 0usize;
-            while let Some(rel) = prod[from..].find(&needle) {
-                let idx = from + rel;
-                from = idx + needle.len();
-                let before = &prod[..idx];
-                let plain = before.rfind(".with(");
-                let sharded = before.rfind(".with_on_shard(");
-                // The enclosing dispatch is the NEAREST preceding opener. Dispatch closures never nest a
-                // second `with`/`with_on_shard` before the verb in this file, so nearest == enclosing.
-                let enclosed_by_plain_with = match (plain, sharded) {
-                    // Both openers precede the verb: the enclosing one is the NEARER (larger index).
-                    (Some(p), Some(s)) => p > s,
-                    // Only `with_on_shard` precedes it → routed, good.
-                    (None, Some(_)) => false,
-                    // Only plain `with` precedes it, OR — a refactor hazard — NEITHER opener does (a
-                    // per-stream verb called outside any dispatch closure): treat as plain, flag it.
-                    _ => true,
-                };
-                if enclosed_by_plain_with {
-                    // Honor the ONE explicit exemption: its closure body (opener → verb) carries a
-                    // `ROUTE-EXEMPT(#811)` marker whose rationale lives at the call site.
-                    let body = plain.map_or("", |p| &prod[p..idx]);
-                    if !body.contains("ROUTE-EXEMPT") {
-                        let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
-                        violations.push(format!(
-                            "`{verb}` at session.rs:{line} is dispatched through plain `with` — it must \
-                             go through `with_on_shard(shard_of(stream), …)`"
-                        ));
+        for &(fname, src) in FILES {
+            // Everything from the `mod tests {` declaration on is test-only (a verb list + the fixtures'
+            // direct `&mut Engine` calls), so scan ONLY the production prefix before it.
+            let prod = src
+                .split_once("\nmod tests {")
+                .map_or(src, |(head, _)| head);
+            for verb in PER_STREAM_VERBS {
+                let needle = format!(".{verb}(");
+                let mut from = 0usize;
+                while let Some(rel) = prod[from..].find(&needle) {
+                    let idx = from + rel;
+                    from = idx + needle.len();
+                    let before = &prod[..idx];
+                    let plain = before.rfind(".with(");
+                    let sharded = before.rfind(".with_on_shard(");
+                    // The enclosing dispatch is the NEAREST preceding opener. Dispatch closures never nest
+                    // a second `with`/`with_on_shard` before the verb, so nearest == enclosing.
+                    let enclosed_by_plain_with = match (plain, sharded) {
+                        // Both openers precede the verb: the enclosing one is the NEARER (larger index).
+                        (Some(p), Some(s)) => p > s,
+                        // Only `with_on_shard` precedes it → routed, good.
+                        (None, Some(_)) => false,
+                        // Only plain `with` precedes it, OR — a refactor hazard — NEITHER opener does (a
+                        // per-stream verb called outside any dispatch closure): treat as plain, flag it.
+                        _ => true,
+                    };
+                    if enclosed_by_plain_with {
+                        // Honor the explicit exemption: the closure body (opener → verb) carries a
+                        // `ROUTE-EXEMPT(#811)` marker whose rationale lives at the call site.
+                        let body = plain.map_or("", |p| &prod[p..idx]);
+                        if !body.contains("ROUTE-EXEMPT") {
+                            let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
+                            violations.push(format!(
+                                "`{verb}` at {fname}:{line} is dispatched through plain `with` — it must \
+                                 go through `with_on_shard(shard_of(stream), …)`"
+                            ));
+                        }
                     }
                 }
             }

@@ -11,7 +11,7 @@
 //! produce fsync never blocks another connection's ping. Concurrency is bounded by a connection cap
 //! so a connection flood cannot spawn unbounded threads.
 
-use crate::actor::EngineHandle;
+use crate::actor::{EngineAccess, EngineHandle};
 use crate::auth::AuthConfig;
 use crate::connz::ConnectionMetrics;
 use crate::session::Session;
@@ -779,7 +779,14 @@ where
     // a named-stream consumer's committed position is made durable to that stream's own checkpoint, the
     // default stream (`""`) stays byte-for-byte the historical `checkpoint_group`.
     let stream = session.stream().to_string();
-    let _ = engine.with(move |e| {
+    // #811 C2: a named-stream consumer's committed cursor is state OWNED by `shard_of(stream)` (it
+    // persists to `streams/<hex(name)>/cursor-<hex(group)>.ckpt`), so this clean-disconnect flush must
+    // land on that stream's shard, exactly like the session.rs named-stream verbs — the default stream
+    // (`""`) pins to shard 0. At K = 1 `with_on_shard(0, …)` is byte-for-byte `with`; this is the inert
+    // routing plumbing the future owner-gated K > 1 flip needs (a miss would persist the cursor on the
+    // wrong shard → nowhere → mass redelivery on restart, #1177).
+    let shard = crate::actor::shard_of(&stream, engine.shard_count());
+    let _ = engine.with_on_shard(shard, move |e| {
         let _ = e.checkpoint_in_stream(&stream, &group);
     });
     outcome
@@ -921,7 +928,12 @@ where
                     // consumer persists its cursor to that stream's own `cursor-<hex(group)>.ckpt`, the
                     // default stream (`""`) stays byte-for-byte the historical `maybe_checkpoint_group`.
                     let stream = session.stream().to_string();
-                    let _ = engine.with(move |e| {
+                    // #811 C2: route the per-pass committed-progress checkpoint to the shard that OWNS
+                    // this (stream, group)'s durable cursor — the same seam the session.rs named-stream
+                    // verbs use, byte-for-byte `with` at K = 1 (default `""` → shard 0), inert plumbing
+                    // for the future K > 1 flip (a miss would persist the cursor nowhere at K > 1, #1177).
+                    let shard = crate::actor::shard_of(&stream, engine.shard_count());
+                    let _ = engine.with_on_shard(shard, move |e| {
                         let _ = e.maybe_checkpoint_in_stream(&stream, &group);
                     });
                 }
