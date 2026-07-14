@@ -13619,27 +13619,41 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.poll_in_member(group, member, now)
     }
 
-    /// Reseals the fencing generation of the live leases at the contiguous range `[first, first+count)`
-    /// in `group` to ONE shared `generation` (#546, batched + zero-copy Tier-W delivery). Every record
-    /// in one `DeliverBatch` frame shares a single generation so the reused batch frame — which carries
-    /// exactly one `generation` field and reconstructs each offset POSITIONALLY (`first + i`) — can
-    /// deliver them: the session claims a contiguous run through the ordinary per-record
-    /// [`poll_now_in_member`](Engine::poll_now_in_member) drain (so EVERY per-message semantic — TTL,
-    /// delayed delivery, per-subject filter, `key_shared` routing, retry-throttle, `MaxDeliver`/DLQ — is
-    /// preserved verbatim), each record leased under its own distinct generation, then reseals the run
-    /// to the run's FIRST generation here before framing.
+    /// Reseals the fencing generation of the live leases at the contiguous range
+    /// `[first, first + staged.len())` in `group` to ONE shared `generation` (#546, batched + zero-copy
+    /// Tier-W delivery). Every record in one `DeliverBatch` frame shares a single generation so the
+    /// reused batch frame — which carries exactly one `generation` field and reconstructs each offset
+    /// POSITIONALLY (`first + i`) — can deliver them: the session claims a contiguous run through the
+    /// ordinary per-record [`poll_now_in_member`](Engine::poll_now_in_member) drain (so EVERY
+    /// per-message semantic — TTL, delayed delivery, per-subject filter, `key_shared` routing,
+    /// retry-throttle, `MaxDeliver`/DLQ — is preserved verbatim), each record leased under its own
+    /// distinct generation, then reseals the run to the run's FIRST generation here before framing.
     ///
-    /// SOUND because fencing is per-offset: see [`LeaseTable::reseal_to`]. `next_generation` already
-    /// sits above the resealed value, so a later redelivery of any offset in the run fences the stale
-    /// shared-generation ack; ack/nack/visibility-timeout/redelivery therefore act on each record
-    /// INDIVIDUALLY exactly as with distinct generations. DEFAULT-group only (the batched Tier-W path is
-    /// scoped to the root stream); a never-created group is a silent no-op (nothing to reseal).
-    pub fn reseal_batch_in(&mut self, group: &str, first: Offset, count: u32, generation: u64) {
+    /// Each offset's reseal is GATED on the run's STAGED generations (#1168): `staged[i]` is the
+    /// generation the calling session was granted when it staged the record at `first + i`, and the
+    /// offset is resealed ONLY while its current lease generation is still exactly that value (see
+    /// [`LeaseTable::reseal_from_to`]). If a COMPETING consumer reclaimed the offset between staging
+    /// and this flush (drawing a strictly-greater generation — reachable only under a pathological
+    /// near-zero visibility window), the reseal SKIPS it: the competitor's fence survives, its ack
+    /// still lands, and the staging session's stale shared-generation ack is the one fenced — the
+    /// correct at-least-once outcome instead of a clobbered fence and a spurious extra redelivery.
+    ///
+    /// SOUND because fencing is per-offset: see [`LeaseTable::reseal_from_to`]. `next_generation`
+    /// already sits above the resealed value, so a later redelivery of any offset in the run fences the
+    /// stale shared-generation ack; ack/nack/visibility-timeout/redelivery therefore act on each record
+    /// INDIVIDUALLY exactly as with distinct generations. Scoped to the DEFAULT (root) stream's group
+    /// tables — the batched Tier-W path only engages there — but within them it reseals whatever group
+    /// the session is subscribed to (`self.subscription`), not only the default group; a never-created
+    /// group is a silent no-op (nothing to reseal).
+    pub fn reseal_batch_in(&mut self, group: &str, first: Offset, staged: &[u64], generation: u64) {
         if let Some(g) = self.groups.get_mut(group) {
             let base = first.get();
-            for i in 0..u64::from(count) {
-                g.leases
-                    .reseal_to(Offset::new(base.saturating_add(i)), generation);
+            for (i, &from) in staged.iter().enumerate() {
+                g.leases.reseal_from_to(
+                    Offset::new(base.saturating_add(i as u64)),
+                    from,
+                    generation,
+                );
             }
         }
     }
