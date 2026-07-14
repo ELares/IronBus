@@ -351,27 +351,38 @@ impl LeaseTable {
         }
     }
 
-    /// Overwrites the fencing generation of the live lease at `offset` to `generation`, returning
-    /// whether a live lease was present to reseal (#546, batched Tier-W delivery). Every record in one
-    /// zero-copy `DeliverBatch` shares ONE generation so the reused batch frame (a single `generation`
-    /// field, positional offsets) can carry them all: each record is first [`claim`]ed under its own
-    /// distinct generation, then the whole contiguous run is resealed to the run's first generation.
+    /// Overwrites the fencing generation of the live lease at `offset` to `generation` — GATED on the
+    /// lease still carrying the caller's own claim generation `from` — returning whether the reseal was
+    /// applied (#546 batched Tier-W delivery, gated per #1168). Every record in one zero-copy
+    /// `DeliverBatch` shares ONE generation so the reused batch frame (a single `generation` field,
+    /// positional offsets) can carry them all: each record is first [`claim`]ed under its own distinct
+    /// generation, then the whole contiguous run is resealed to the run's first generation.
     ///
-    /// This is SOUND because fencing is PER-OFFSET — the lease map is keyed by offset and an ack's
-    /// token is `(offset, generation)`, so a generation shared across DISTINCT offsets never collides
-    /// (the offset disambiguates). Distinctness is only required ACROSS REDELIVERIES OF THE SAME OFFSET,
-    /// and that still holds: `next_generation` already sits strictly ABOVE every value in the resealed
-    /// run (each was drawn by [`claim`] below it), so any future redelivery of a resealed offset draws a
-    /// strictly-greater generation and FENCES the stale shared-generation ack. At-least-once and
-    /// no-double-ack are therefore preserved per record exactly as with distinct generations. A no-op
-    /// (returns `false`) if `offset` holds no live lease — e.g. it was concurrently acked or freed; the
-    /// batch caller reseals offsets it JUST claimed under the same lock, so the live case is the norm.
-    pub fn reseal_to(&mut self, offset: Offset, generation: u64) -> bool {
-        if let Some(lease) = self.leases.get_mut(&offset.get()) {
-            lease.generation = generation;
-            true
-        } else {
-            false
+    /// The SHARED generation is SOUND because fencing is PER-OFFSET — the lease map is keyed by offset
+    /// and an ack's token is `(offset, generation)`, so a generation shared across DISTINCT offsets
+    /// never collides (the offset disambiguates). Distinctness is only required ACROSS REDELIVERIES OF
+    /// THE SAME OFFSET, and that still holds: `next_generation` already sits strictly ABOVE every value
+    /// in the resealed run (each was drawn by [`claim`] below it), so any future redelivery of a
+    /// resealed offset draws a strictly-greater generation and FENCES the stale shared-generation ack.
+    /// At-least-once and no-double-ack are therefore preserved per record exactly as with distinct
+    /// generations.
+    ///
+    /// The `from` GATE (#1168) makes the reseal safe against a mid-drain reclaim: between the caller
+    /// STAGING a run (claiming each record) and FLUSHING it (resealing here), a COMPETING consumer may
+    /// reclaim an already-expired staged offset, drawing a strictly-greater generation (reachable only
+    /// under a pathological near-zero visibility window — a drain pass is sub-millisecond, visibility
+    /// is normally seconds). An ungated overwrite would clobber that competitor's generation back down,
+    /// FENCING its legitimate ack and forcing a spurious extra redelivery. Generations are never
+    /// reused, so a current generation equal to `from` PROVES the caller's own claim is still the live
+    /// lease; anything else (a competitor's newer claim, or no live lease at all — concurrently acked
+    /// or freed) is a no-op returning `false`, leaving the current owner's fence intact.
+    pub fn reseal_from_to(&mut self, offset: Offset, from: u64, generation: u64) -> bool {
+        match self.leases.get_mut(&offset.get()) {
+            Some(lease) if lease.generation == from => {
+                lease.generation = generation;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -605,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn reseal_to_shares_one_generation_yet_keeps_per_offset_fencing() {
+    fn reseal_from_to_shares_one_generation_yet_keeps_per_offset_fencing() {
         // #546 batched Tier-W: a contiguous run is claimed under DISTINCT generations, then resealed to
         // ONE shared generation so the reused `DeliverBatch` frame (a single generation, positional
         // offsets) can carry them. This must stay SOUND: (a) an ack of ANY offset under the shared
@@ -619,11 +630,12 @@ mod tests {
             a.generation != b.generation && b.generation != c.generation,
             "distinct at claim"
         );
-        // Reseal the whole run to the FIRST claim's generation.
+        // Reseal the whole run to the FIRST claim's generation, each gated on its own claim generation
+        // (#1168): the caller still holds every staged lease, so every reseal applies.
         let shared = a.generation;
-        assert!(t.reseal_to(off(0), shared));
-        assert!(t.reseal_to(off(1), shared));
-        assert!(t.reseal_to(off(2), shared));
+        assert!(t.reseal_from_to(off(0), a.generation, shared));
+        assert!(t.reseal_from_to(off(1), b.generation, shared));
+        assert!(t.reseal_from_to(off(2), c.generation, shared));
         // Every offset now acks under the shared generation (a batch is N independent leases).
         let shared_tok = |o| LeaseToken {
             offset: off(o),
@@ -662,7 +674,42 @@ mod tests {
             "only the fresh token commits the redelivery"
         );
         // Reseal is a no-op for an offset with no live lease (returns false).
-        assert!(!t.reseal_to(off(99), shared));
+        assert!(!t.reseal_from_to(off(99), shared, shared));
+    }
+
+    #[test]
+    fn reseal_from_to_refuses_to_clobber_a_competitors_reclaim() {
+        // THE #1168 GATE: a staged lease expires and a COMPETITOR reclaims the offset (drawing a
+        // strictly-greater generation) BEFORE the staging session's flush reseals the run. The gated
+        // reseal must be REFUSED — the competitor's generation survives, so ITS ack still lands and the
+        // stale stager's shared-generation ack is the one fenced. An ungated overwrite would invert
+        // that: it would fence the competitor's legitimate ack and force a spurious extra redelivery.
+        let mut t = LeaseTable::new(cfg());
+        let staged = token(t.claim(off(0), 0));
+        // The pathological near-zero visibility window: the staged lease expires mid-drain and a
+        // competitor reclaims it.
+        assert_eq!(t.expired(30), vec![off(0)]);
+        let competitor = token(t.claim(off(0), 30));
+        assert!(
+            competitor.generation > staged.generation,
+            "a reclaim draws a strictly-greater generation"
+        );
+        // The stager's flush-time reseal (gated on ITS OWN staged generation) is refused.
+        assert!(
+            !t.reseal_from_to(off(0), staged.generation, staged.generation),
+            "the gate refuses an offset whose lease the caller no longer holds"
+        );
+        // The competitor's fence is intact: its ack commits, the stale staged token is fenced.
+        assert_eq!(
+            t.ack(&staged),
+            AckOutcome::Fenced,
+            "the stale staged-generation ack is fenced"
+        );
+        assert_eq!(
+            t.ack(&competitor),
+            AckOutcome::Acked,
+            "the competitor's legitimate ack is NOT fenced"
+        );
     }
 
     #[test]

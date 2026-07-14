@@ -212,6 +212,14 @@ struct StagedRun {
     /// The decoded records in offset order, held for the per-record tail / length-1 emit (the sealed
     /// prefix ships zero-copy from `read_range_raw`, so those decoded copies are simply dropped).
     records: Vec<OwnedRecord>,
+    /// The run's STAGED generation set (#1168), parallel to `records`: `generations[i]` is the claim
+    /// generation THIS session was granted when it staged the record at `first_offset + i`. The
+    /// flush-time engine reseal is GATED on it — an offset is resealed to `shared_generation` ONLY
+    /// while its current lease generation is still exactly the one staged here — so the reseal can
+    /// never clobber a competing consumer's newer mid-drain reclaim (see [`Engine::reseal_batch_in`]).
+    ///
+    /// [`Engine::reseal_batch_in`]: crate::engine::Engine::reseal_batch_in
+    generations: Vec<u64>,
 }
 
 impl StagedRun {
@@ -220,6 +228,7 @@ impl StagedRun {
             first_offset: 0,
             shared_generation: 0,
             records: Vec::new(),
+            generations: Vec::new(),
         }
     }
 
@@ -233,11 +242,26 @@ impl StagedRun {
     }
 
     /// Begins a fresh run anchored at `offset` under `generation` (the caller flushed any prior run
-    /// first). Reuses the record `Vec`'s capacity (it was cleared on the prior flush).
+    /// first). Reuses the vecs' capacity (they were cleared on the prior flush).
     fn begin(&mut self, offset: u64, generation: u64) {
         self.first_offset = offset;
         self.shared_generation = generation;
+        self.clear();
+    }
+
+    /// Stages `record` (claimed under `generation`) at the run's tail. The staged generation set
+    /// extends in LOCKSTEP with the records, so `generations[i]` always names the claim generation of
+    /// the record at `first_offset + i` (#1168).
+    fn push(&mut self, record: OwnedRecord, generation: u64) {
+        self.records.push(record);
+        self.generations.push(generation);
+    }
+
+    /// Empties the run after a flush. The records AND the staged generation set clear in lockstep, so
+    /// a stale staged generation can never leak into a later run's reseal gate (#1168).
+    fn clear(&mut self) {
         self.records.clear();
+        self.generations.clear();
     }
 }
 
@@ -2980,6 +3004,17 @@ impl Session {
     /// (fail-closed, never ciphertext), so the WHOLE batch ships as the decrypted per-record tail. On a
     /// raw-read error the run degrades to all-per-record from the decoded records, so no record is lost.
     ///
+    /// The engine reseal is GATED on the run's STAGED generations (#1168): each offset is resealed ONLY
+    /// while its current lease generation is exactly the one THIS session drew when it staged the record
+    /// (`run.generations`), so the reseal can never clobber a COMPETING consumer's newer mid-drain
+    /// reclaim (reachable only under a pathological near-zero visibility window). A gate-SKIPPED offset
+    /// is still DELIVERED in place under the (now stale) shared generation rather than dropped from the
+    /// run: the batch frame is POSITIONAL (one `first_offset`, one `generation`), so excising an
+    /// interior record would split the frame for zero correctness gain, and the stale token is harmless
+    /// — the competitor's lease stands, its ack lands, and THIS session's ack of that offset is fenced
+    /// by the engine, the correct at-least-once outcome (the extra delivery became inevitable the moment
+    /// the competitor reclaimed the offset).
+    ///
     /// The batch body ships the stored bytes VERBATIM (including any stored-COMPRESSED record) WITHOUT a
     /// compressed-delivery gate, sound because a `DeliverBatch`-capable consumer decodes the on-disk
     /// record layout and is therefore compression-capable by construction (the SAME contract the Tier-S
@@ -2995,20 +3030,31 @@ impl Session {
         if count == 0 {
             return Ok(0);
         }
+        debug_assert_eq!(
+            run.generations.len(),
+            count,
+            "the staged generation set tracks the staged records in lockstep (#1168)"
+        );
         let first = run.first_offset;
         let generation = run.shared_generation;
         if count == 1 {
             Self::emit_staged_record(&run.records[0], first, generation, capable, out);
-            run.records.clear();
+            run.clear();
             return Ok(1);
         }
         // Reseal every lease in [first, first+count) to the ONE shared generation, in the engine AND in
         // this session's `leased` map, so the batch's single-generation wire frame, the engine fence, and
-        // the in-flight accounting all name the same generation for every offset.
+        // the in-flight accounting all name the same generation for every offset. The engine reseal is
+        // GATED per offset on the generation THIS session staged (#1168, see the doc above): an offset a
+        // competitor reclaimed mid-drain is skipped, leaving the competitor's fence intact.
         let group = self.subscription.clone();
-        let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
-        engine
-            .with(move |e| e.reseal_batch_in(&group, Offset::new(first), count_u32, generation))?;
+        let staged = std::mem::take(&mut run.generations);
+        engine.with(move |e| e.reseal_batch_in(&group, Offset::new(first), &staged, generation))?;
+        // The session-side map takes the shared generation for EVERY run offset, including a gate-skipped
+        // one: the wire carries the shared generation for it regardless (positional batch frame), so this
+        // keeps `leased` agreeing with what the client will echo — its ack then passes the session fence,
+        // reaches the engine, is fenced THERE by the competitor's newer generation (status 0), and clears
+        // this session's in-flight entry rather than stranding it until the stale-lease sweep.
         for i in 0..count as u64 {
             if let Some(lease) = self.leased.get_mut(&first.saturating_add(i)) {
                 lease.generation = generation;
@@ -3037,7 +3083,7 @@ impl Session {
         });
         let delivered =
             Self::emit_work_batch_copy(sealed, body, &run.records, first, generation, capable, out);
-        run.records.clear();
+        run.clear();
         Ok(delivered)
     }
 
@@ -3204,7 +3250,7 @@ impl Session {
                 Self::emit_work_batch_copy(0, &[], &run.records, first, generation, capable, out)
             }
         };
-        run.records.clear();
+        run.clear();
         delivered
     }
 
@@ -3412,7 +3458,9 @@ impl Session {
                         }
                         // Lease ownership + byte size (#175/#275), recorded now under this record's OWN
                         // claim generation; a multi-record run reseals it to the shared generation at
-                        // flush. The byte budget therefore binds correctly WHILE staging.
+                        // flush. The byte budget therefore binds correctly WHILE staging. The claim
+                        // generation is ALSO staged into the run's generation set (#1168), the flush-time
+                        // reseal gate.
                         let bytes = lease_bytes(&d.record);
                         self.leased.insert(
                             d.offset.get(),
@@ -3421,7 +3469,8 @@ impl Session {
                                 bytes,
                             },
                         );
-                        run.records.push(d.record);
+                        let staged_generation = d.token.generation;
+                        run.push(d.record, staged_generation);
                     }
                     Ok(Poll::Message(d)) => {
                         // Gate the delivery encoding on the negotiated compressed-delivery capability
@@ -3810,7 +3859,8 @@ impl Session {
                                 bytes,
                             },
                         );
-                        run.records.push(d.record);
+                        let staged_generation = d.token.generation;
+                        run.push(d.record, staged_generation);
                     }
                     Ok(Poll::Message(d)) => {
                         // Compressed-delivery gate (#1066), IDENTICAL to `handle_flow`: a non-capable
@@ -20223,7 +20273,9 @@ mod tests {
     // drains through the SAME per-record `poll_now_in_member` the unbatched path uses and only defers the
     // WIRE framing. The crux is the SHARED lease generation: the reused batch frame carries one
     // `generation`, so the run's leases are resealed to ONE generation, which is sound because fencing is
-    // per-OFFSET (see `LeaseTable::reseal_to`). These tests pin: the batched wire shape, per-record ack
+    // per-OFFSET (see `LeaseTable::reseal_from_to`), and the reseal is GATED on the run's staged
+    // generations (#1168) so it can never clobber a competitor's mid-drain reclaim. These tests pin: the
+    // batched wire shape, the staged-generation reseal gate, per-record ack
     // (by offset) with generation fencing, per-record nack redelivery, visibility-timeout redelivery of
     // the un-acked, per-record MaxDeliver -> DLQ, key_shared per-key routing, the encrypted / active-tail
     // per-record fallback (never zero-copy ciphertext), the credit bound, order, and single-record parity.
@@ -20371,6 +20423,190 @@ mod tests {
             e.engine_mut().committed_offset_in("g").get(),
             3,
             "0,1,2 committed contiguously; the fenced offset 3 is NOT committed"
+        );
+    }
+
+    #[test]
+    fn tierw_batch_reseal_skips_an_offset_a_competitor_reclaimed_mid_drain() {
+        // THE #1168 RACE: under a pathological near-zero visibility window, a COMPETING consumer can
+        // reclaim a staged offset between the staging drain and the flush's reseal, drawing a
+        // strictly-greater generation. The gated reseal must SKIP that offset — the competitor's
+        // generation survives, so ITS ack is NOT fenced — while the rest of the run reseals to the
+        // shared generation exactly as before. The skipped offset is still delivered in place under the
+        // (stale) shared generation (positional batch frame), and THIS session's ack of it is the one
+        // the engine fences: the correct at-least-once outcome. An UNGATED reseal inverts this — it
+        // clobbers the competitor's generation, this session's stale ack lands, and the competitor's
+        // legitimate ack is fenced into a spurious extra redelivery.
+        //
+        // The interleave cannot occur inside one synchronous `process` call, so the test drives the
+        // REAL machinery at its seams: it stages the run exactly as the drain arm does (per-record
+        // `poll_now_in_member` claims), interposes the competitor's reclaim, then calls the REAL
+        // `flush_run`.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        for i in 0..3u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        // STAGE offsets 0..3 exactly as the batched drain arm does: claim each through the ordinary
+        // per-record poll, record the lease in `leased`, and stage record + claim generation in the run.
+        let mut run = StagedRun::new();
+        for _ in 0..3 {
+            let d = match e
+                .engine_mut()
+                .poll_now_in_member("g", MemberId::new(1))
+                .unwrap()
+            {
+                Poll::Message(d) => d,
+                other => panic!("expected a message to stage, got {other:?}"),
+            };
+            if run.is_empty() {
+                run.begin(d.offset.get(), d.token.generation);
+            }
+            let staged_generation = d.token.generation;
+            let bytes = lease_bytes(&d.record);
+            s.leased.insert(
+                d.offset.get(),
+                Lease {
+                    generation: staged_generation,
+                    bytes,
+                },
+            );
+            run.push(d.record, staged_generation);
+        }
+        let shared = run.shared_generation;
+        // MID-DRAIN RECLAIM (the pathological near-zero visibility window): every staged lease expires
+        // and a competitor reclaims offset 0, drawing a generation strictly above every staged one.
+        clock.advance_monotonic_nanos(31);
+        let competitor = match e
+            .engine_mut()
+            .poll_now_in_member("g", MemberId::new(2))
+            .unwrap()
+        {
+            Poll::Message(d) => d,
+            other => panic!("expected the competitor to reclaim a message, got {other:?}"),
+        };
+        assert_eq!(
+            competitor.offset.get(),
+            0,
+            "the competitor reclaimed the staged offset 0"
+        );
+        assert!(
+            competitor.token.generation > shared,
+            "the reclaim generation sits strictly above the staged shared generation"
+        );
+        // FLUSH the staged run through the real reseal path.
+        let mut out = Vec::new();
+        let delivered = s.flush_run(&e, &mut run, true, &mut out).unwrap();
+        // The skipped offset is still DELIVERED in place under the (stale) shared generation: the batch
+        // frame is positional, and the stale token is harmless (its ack fences below).
+        assert_eq!(delivered, 3, "the whole run is delivered, skip included");
+        let got = tierw_deliveries(&out);
+        assert_eq!(
+            got.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "offsets 0..3 delivered in order"
+        );
+        assert!(
+            got.iter().all(|r| r.1 == shared),
+            "the wire carries the shared generation for every record, the skipped one included"
+        );
+        // THIS session's ack of the reclaimed offset is the one FENCED (by the ENGINE — the session
+        // fence passes because the wire really did deliver the shared generation). Asserted BEFORE the
+        // competitor acks: had the ungated reseal clobbered the competitor's generation, this ack would
+        // have SUCCEEDED.
+        assert_eq!(
+            ack_reply(&mut s, &e, AckOp::Ack, 0, shared),
+            vec![0u8],
+            "the staging session's stale ack of the reclaimed offset is fenced"
+        );
+        // THE HEADLINE: the competitor's generation survived the flush, so its ack is NOT fenced.
+        assert_eq!(
+            e.engine_mut().ack_in("g", &competitor.token),
+            AckResult::Acked,
+            "the competitor's legitimate ack lands — its reclaim was not clobbered"
+        );
+        // The rest of the run resealed exactly as before: offsets 1 and 2 ack under the shared
+        // generation.
+        assert_eq!(ack_reply(&mut s, &e, AckOp::Ack, 1, shared), vec![1u8]);
+        assert_eq!(ack_reply(&mut s, &e, AckOp::Ack, 2, shared), vec![1u8]);
+        assert_eq!(
+            e.engine_mut().committed_offset_in("g").get(),
+            3,
+            "every record committed exactly once: 0 by the competitor, 1 and 2 by this session"
+        );
+    }
+
+    #[test]
+    fn tierw_batch_staged_generations_track_each_run_exactly_across_a_multi_run_pass() {
+        // #1168: ONE drain pass that flushes MULTIPLE runs must gate each run's reseal on THAT run's
+        // OWN staged generations — the staged set has to clear and re-fill in lockstep from run to run.
+        // Setup: a per-record peer leases offsets 0,1,2, then requeues 0 and 1 (keeping 2 in-flight),
+        // so the batch consumer's single Flow drains the redelivered [0,1], skips the in-flight 2, and
+        // drains [3,4,5]: two multi-record flush_run calls in one pass. If the first run's staged set
+        // leaked into (or misaligned) the second run's gate, the second reseal would be skipped and its
+        // shared-generation acks would fence.
+        let e = DirectEngine::new(engine());
+        for i in 0..6u8 {
+            produce_kh(&e, &[i], b"", &[i]);
+        }
+        // The batch-INCAPABLE per-record peer: lease 0,1,2, requeue 0 and 1 immediately (delay 0).
+        let mut peer = Session::with_member_id(MemberId::new(9));
+        let mut pout = Vec::new();
+        peer.process(
+            &e,
+            &frame(FrameType::Connect, &batch_connect_body(true, false)),
+            &mut pout,
+        )
+        .unwrap();
+        pout.clear();
+        peer.process(&e, &frame(FrameType::Sub, b"g"), &mut pout)
+            .unwrap();
+        assert_eq!(one_response(&pout).0, FrameType::Ok, "peer SUB acked");
+        let held = tierw_deliveries(&flow(&mut peer, &e, 3));
+        assert_eq!(
+            held.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the peer leased 0,1,2 per-record"
+        );
+        assert_eq!(ack_reply(&mut peer, &e, AckOp::Nack, 0, held[0].1), vec![1]);
+        assert_eq!(ack_reply(&mut peer, &e, AckOp::Nack, 1, held[1].1), vec![1]);
+        // The batch consumer's ONE Flow: redelivered [0,1] + fresh [3,4,5], with 2 held by the peer.
+        let mut s = tierw_batch_session(&e, MemberId::new(1), b"g");
+        let got = tierw_deliveries(&flow(&mut s, &e, 64));
+        let mut offsets = got.iter().map(|r| r.0).collect::<Vec<_>>();
+        offsets.sort_unstable();
+        assert_eq!(
+            offsets,
+            vec![0, 1, 3, 4, 5],
+            "the pass delivered the two non-contiguous runs and skipped the peer-held 2"
+        );
+        let gen_of = |o: u64| got.iter().find(|r| r.0 == o).unwrap().1;
+        // Two runs, each under its OWN shared generation (two separate reseals in one pass).
+        assert_eq!(gen_of(0), gen_of(1), "run [0,1] shares one generation");
+        assert_eq!(gen_of(3), gen_of(4), "run [3,4,5] shares one generation");
+        assert_eq!(gen_of(4), gen_of(5), "run [3,4,5] shares one generation");
+        assert_ne!(
+            gen_of(0),
+            gen_of(3),
+            "the two runs resealed independently, each to its own shared generation"
+        );
+        // THE EXACTNESS PIN: every record acks cleanly under its run's wire generation. Each run's
+        // engine reseal must therefore have run with THAT run's exact staged set — a leaked or
+        // misaligned set would have skipped a reseal and fenced these acks.
+        for (offset, generation, _) in &got {
+            assert_eq!(
+                ack_reply(&mut s, &e, AckOp::Ack, *offset, *generation),
+                vec![1u8],
+                "offset {offset} acks under its run's shared generation"
+            );
+        }
+        // The peer settles its held record; the whole log commits.
+        assert_eq!(ack_reply(&mut peer, &e, AckOp::Ack, 2, held[2].1), vec![1]);
+        assert_eq!(
+            e.engine_mut().committed_offset_in("g").get(),
+            6,
+            "all six records committed exactly once"
         );
     }
 
