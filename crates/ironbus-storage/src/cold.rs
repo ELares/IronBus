@@ -61,6 +61,15 @@ pub const DEFAULT_KEEP_RECENT_SEGMENTS: u64 = 4;
 /// offloads has a byte-for-byte unchanged data directory (the default-OFF conformance guarantee).
 pub const COLD_MANIFEST_FILE: &str = "cold-manifest.ckpt";
 
+/// The subdirectory of a log's data directory into which the startup orphan sweep (#1153)
+/// QUARANTINE-relocates a local `seg-<id>.log` file it cannot PROVE is a reaped-and-forgotten
+/// restore-cache leftover: the bytes are preserved for forensics (never destroyed on ambiguity),
+/// while the flat data directory — the only place segment enumeration looks — is cleared so the
+/// chain-continuity scan can proceed. A sibling of the `quarantine/` forensic store, with the same
+/// structural invisibility guarantee: recovery lists only the flat data directory's files, so a
+/// relocated orphan can never be re-read as live data.
+pub const COLD_ORPHANS_SUBDIR: &str = "orphans";
+
 /// The magic prefix of the cold-manifest payload (IronBus Cold Manifest), distinguishing a real
 /// manifest from an unrelated file: a CRC-valid slot whose magic does not match is treated as a
 /// corrupt manifest, never silently as an empty one.
@@ -239,6 +248,21 @@ pub trait ColdStore: std::fmt::Debug + Send + Sync {
     /// # Errors
     /// Returns [`ColdStoreError::Io`] on a transport error.
     fn exists(&self, key: &str) -> Result<bool, ColdStoreError>;
+
+    /// Lists every object key currently in the store, or `Ok(None)` for a backend that cannot
+    /// enumerate cheaply. Used ONLY by the best-effort startup orphan-object sweep (#1153), which
+    /// deletes the bounded object leak a crash mid-reap can leave (the object whose manifest entry
+    /// was durably removed but whose delete never ran); a `None` simply skips that sweep — the leak
+    /// stays bounded and harmless, exactly as before the sweep existed — so `None` is the safe
+    /// default for any backend. The `s3` backend deliberately keeps the default: an S3 LIST needs
+    /// the `ListObjectsV2` XML response the purpose-built client is designed NOT to parse (no XML
+    /// dependency), and the sweep is an optimization, never correctness.
+    ///
+    /// # Errors
+    /// Returns [`ColdStoreError::Io`] on a transport error.
+    fn list(&self) -> Result<Option<Vec<String>>, ColdStoreError> {
+        Ok(None)
+    }
 }
 
 /// The [`ColdStore`] object key for the segment with this id: `seg-<16 hex>.obj`. The `.obj` suffix
@@ -250,6 +274,20 @@ pub trait ColdStore: std::fmt::Debug + Send + Sync {
 #[must_use]
 pub fn cold_object_name(segment_id: u64) -> String {
     format!("seg-{segment_id:016x}.obj")
+}
+
+/// The exact inverse of [`cold_object_name`]: the segment id parsed from a canonical cold-object
+/// key, or `None` for any other shape (a foreign object, a wrong-width or non-lowercase-hex id).
+/// Strict on purpose — the startup orphan-object sweep (#1153) classifies ONLY keys it can prove
+/// are cold segment objects and leaves everything else untouched, so a foreign object sharing the
+/// store's directory can never be swept.
+#[must_use]
+pub fn parse_cold_object_name(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("seg-")?.strip_suffix(".obj")?;
+    if hex.len() != 16 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
 }
 
 /// A local-directory [`ColdStore`]: each object is one file in a [`crate::fs::Filesystem`]. This is
@@ -337,6 +375,13 @@ impl<F: Filesystem> ColdStore for FsColdStore<F> {
 
     fn exists(&self, key: &str) -> Result<bool, ColdStoreError> {
         Ok(self.fs.exists(key)?)
+    }
+
+    fn list(&self) -> Result<Option<Vec<String>>, ColdStoreError> {
+        // A directory-backed store CAN enumerate (one readdir), so the startup orphan-object sweep
+        // (#1153) is exact here. Only regular file names are returned (the `Filesystem::list`
+        // contract), each usable as an object key.
+        Ok(Some(self.fs.list()?))
     }
 }
 
@@ -1486,6 +1531,60 @@ mod tests {
         assert_eq!(
             crate::naming::parse_segment_file_name(&cold_object_name(1)),
             None
+        );
+    }
+
+    #[test]
+    fn parse_cold_object_name_is_the_strict_inverse_and_rejects_foreign() {
+        // Round-trips every canonical key (#1153: the orphan-object sweep's classification input).
+        for id in [0u64, 1, 0xABCD, u64::MAX] {
+            assert_eq!(parse_cold_object_name(&cold_object_name(id)), Some(id));
+        }
+        // Foreign shapes never parse, so the sweep can never classify (or delete) them: a live
+        // segment file name, wrong width, uppercase hex, non-hex, or an unrelated file.
+        for bad in [
+            "seg-0000000000000001.log",
+            "seg-001.obj",
+            "seg-000000000000ABCD.obj",
+            "seg-000000000000000g.obj",
+            "cold-manifest.ckpt",
+            "seg-.obj",
+        ] {
+            assert_eq!(parse_cold_object_name(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn fs_cold_store_lists_its_objects_and_the_trait_default_is_unsupported() {
+        // A backend without the override reports None ("cannot enumerate"), so the sweep skips it.
+        #[derive(Debug)]
+        struct NoList;
+        impl ColdStore for NoList {
+            fn put(&self, _: &str, _: &[u8]) -> Result<(), ColdStoreError> {
+                Ok(())
+            }
+            fn get(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+                Err(ColdStoreError::NotFound {
+                    key: key.to_string(),
+                })
+            }
+            fn delete(&self, _: &str) -> Result<(), ColdStoreError> {
+                Ok(())
+            }
+            fn exists(&self, _: &str) -> Result<bool, ColdStoreError> {
+                Ok(false)
+            }
+        }
+        assert_eq!(NoList.list().unwrap(), None);
+
+        // FsColdStore enumerates (the #1153 orphan-object sweep is exact on it).
+        let store = FsColdStore::new(InMemoryFs::new());
+        assert_eq!(store.list().unwrap(), Some(Vec::new()));
+        store.put(&cold_object_name(3), b"x").unwrap();
+        store.put(&cold_object_name(1), b"y").unwrap();
+        assert_eq!(
+            store.list().unwrap(),
+            Some(vec![cold_object_name(1), cold_object_name(3)])
         );
     }
 

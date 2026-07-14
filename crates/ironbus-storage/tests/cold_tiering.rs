@@ -25,7 +25,9 @@ use std::sync::Arc;
 
 use ironbus_core::clock::ManualClock;
 use ironbus_core::types::{Offset, RecordFlags};
-use ironbus_storage::cold::{cold_object_name, ColdStorageConfig, ColdStore, FsColdStore};
+use ironbus_storage::cold::{
+    cold_object_name, ColdStorageConfig, ColdStore, ColdStoreError, FsColdStore,
+};
 use ironbus_storage::fault::FaultFs;
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
 use ironbus_storage::io::RandomAccessFile;
@@ -540,5 +542,136 @@ fn offload_error_leaves_the_segment_local_and_retries() {
         read_all(&log),
         baseline,
         "readable after a successful retry"
+    );
+}
+
+/// A `ColdStore` whose `delete` always fails, so a reap's best-effort object delete behaves exactly
+/// as a crash at that step (the manifest entry is already durably gone, the object survives): the
+/// #1153 crash-state builder. `list` keeps the trait default (`None`), so the crash state stays
+/// inert while it is built.
+#[derive(Debug)]
+struct RefusingDeleteStore {
+    inner: FsColdStore<InMemoryFs>,
+}
+
+impl ColdStore for RefusingDeleteStore {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), ColdStoreError> {
+        self.inner.put(key, bytes)
+    }
+    fn get(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+        self.inner.get(key)
+    }
+    fn delete(&self, _key: &str) -> Result<(), ColdStoreError> {
+        Err(ColdStoreError::Io(std::io::Error::other(
+            "injected: the process crashed before the reap's object delete",
+        )))
+    }
+    fn exists(&self, key: &str) -> Result<bool, ColdStoreError> {
+        self.inner.exists(key)
+    }
+}
+
+/// #1153 (the follow-up #1152 deferred): a reap of a REMOTE segment durably removes its manifest
+/// entry FIRST, then best-effort deletes the cold object and any restore-cache file. A crash in
+/// between leaves a surviving `seg-<id>.log` for the now-reaped id BELOW the still-remote prefix —
+/// pre-#1153 an unbootable `SegmentChainBroken` local-chain gap (no loss, but manual cleanup) —
+/// plus a leaked cold object. The startup orphan sweep must: boot the broker on exactly this state,
+/// serve every retained record intact, sweep the leaked object once a backend attaches, NEVER touch
+/// an object the manifest still records REMOTE, and re-run idempotently.
+#[test]
+fn reap_crash_orphan_cache_is_swept_at_open_and_the_leaked_object_on_attach() {
+    let data_fs = InMemoryFs::new();
+    let cold_fs = InMemoryFs::new();
+    let expected_tail;
+    let earliest;
+    {
+        // Build the EXACT crash state through the public API: offload the cold prefix, restore a
+        // cache file for segment 0 by reading it, then reap it with the object delete refused (the
+        // store) and the cache-file unlink refused (a single-shot armed fault) — byte-for-byte the
+        // mid-reap crash window after the DURABLE manifest-entry removal.
+        let (fault_fs, control) = FaultFs::new(data_fs.clone());
+        let mut log = Log::open(fault_fs, ManualClock::new(), config()).unwrap();
+        log.set_cold_store(
+            Arc::new(RefusingDeleteStore {
+                inner: FsColdStore::new(cold_fs.clone()),
+            }),
+            ColdStorageConfig::enabled(1),
+        );
+        append_n(&mut log, 60);
+        let offloaded = log.offload_cold_segments().unwrap();
+        assert!(
+            offloaded >= 2,
+            "a still-remote prefix must remain above the reaped id"
+        );
+        let _ = log.read_from(Offset::ZERO, 1).unwrap(); // restore-on-access caches seg 0
+        assert!(data_fs.exists(&format!("seg-{:016x}.log", 0u64)).unwrap());
+        control.fail_remove_on(1); // the cache-file unlink "crashes"
+        log.reap_oldest_forced()
+            .unwrap()
+            .expect("one segment reaped");
+        assert!(
+            !log.is_segment_remote(0),
+            "the manifest entry removal committed"
+        );
+        earliest = log.earliest_offset();
+        expected_tail = log
+            .read_from(earliest, 100_000)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.offset.get(), r.payload.to_vec()))
+            .collect::<Vec<_>>();
+    }
+    // The crash state: the orphan cache below the still-remote prefix + the leaked object.
+    assert!(data_fs.exists(&format!("seg-{:016x}.log", 0u64)).unwrap());
+    assert!(cold_fs.exists(&cold_object_name(0)).unwrap());
+
+    // RESTART: pre-#1153 this open hard-failed `SegmentChainBroken` on the orphan's gap. The sweep
+    // (before the chain-continuity check) clears the provably-reaped orphan and the broker boots.
+    let log2 = Log::open(data_fs.clone(), ManualClock::new(), config()).unwrap();
+    assert!(
+        !data_fs.exists(&format!("seg-{:016x}.log", 0u64)).unwrap(),
+        "the orphaned restore-cache file was swept at open"
+    );
+    assert_eq!(log2.earliest_offset(), earliest);
+    let remote_ids: Vec<u64> = (0..64).filter(|&id| log2.is_segment_remote(id)).collect();
+    assert!(!remote_ids.is_empty() && !remote_ids.contains(&0));
+    drop(log2);
+
+    // IDEMPOTENT: a further reopen of the already-swept directory changes nothing and boots.
+    let before = data_fs.list().unwrap();
+    let mut log3 = Log::open(data_fs.clone(), ManualClock::new(), config()).unwrap();
+    assert_eq!(
+        data_fs.list().unwrap(),
+        before,
+        "the re-run sweep is a no-op"
+    );
+    assert_eq!(log3.earliest_offset(), earliest);
+
+    // Attaching the backend sweeps the LEAKED object (provably reaped: durably absent from the
+    // manifest, below the still-remote prefix) and NEVER a manifest-REMOTE object.
+    log3.set_cold_store(
+        Arc::new(FsColdStore::new(cold_fs.clone())),
+        ColdStorageConfig::enabled(1),
+    );
+    assert!(
+        !cold_fs.exists(&cold_object_name(0)).unwrap(),
+        "the leaked object for the reaped id is swept on attach"
+    );
+    for &id in &remote_ids {
+        assert!(
+            cold_fs.exists(&cold_object_name(id)).unwrap(),
+            "object {id} is still REMOTE and must survive"
+        );
+    }
+    // Every retained record reads back intact.
+    let tail: Vec<(u64, Vec<u8>)> = log3
+        .read_from(earliest, 100_000)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.offset.get(), r.payload.to_vec()))
+        .collect();
+    assert_eq!(
+        tail, expected_tail,
+        "all remaining data is durable and intact"
     );
 }
