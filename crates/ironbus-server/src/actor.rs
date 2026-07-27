@@ -4037,6 +4037,7 @@ mod tests {
 
     fn config() -> EngineConfig {
         EngineConfig {
+            min_splice_bytes: 0,
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default(),

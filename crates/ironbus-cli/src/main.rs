@@ -2578,6 +2578,10 @@ struct ServeFlags {
     /// AUTO-ON where sound (a plaintext, disk-backed, unencrypted window on a Linux build). Setting it
     /// forces the userspace copy path on every connection, with no behavioral or wire change.
     disable_zero_copy_sendfile: bool,
+    /// The `sendfile(2)` MIN-SPLICE threshold in BYTES (#1198): `--min-splice-bytes <n>`. A spliceable
+    /// run below this is served through the byte-identical copy path (the splice's fixed per-run costs
+    /// only pay above it). `None` falls back to the 64 KiB default; `0` splices every non-empty run.
+    min_splice_bytes: Option<u64>,
     /// The OTLP collector endpoint (#352): `--otlp-endpoint <url>`, e.g. `http://127.0.0.1:4317`
     /// (plaintext gRPC). `None` falls back to the default endpoint when export is on. Read only when
     /// export is on AND the `otlp` feature is built in.
@@ -3004,6 +3008,11 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--no-zero-copy-sendfile" => {
                 f.disable_zero_copy_sendfile = true;
                 i += 1;
+            }
+            // The `sendfile(2)` min-splice threshold in bytes (#1198): runs below it copy, at or
+            // above it splice. `0` splices every non-empty run.
+            "--min-splice-bytes" => {
+                f.min_splice_bytes = Some(take_number("--min-splice-bytes", args, &mut i)?);
             }
             "--key-shared-group" => {
                 f.key_shared_groups
@@ -3847,6 +3856,15 @@ fn parse_serve_flags_with_env_and_reader(
                 "--no-zero-copy-sendfile",
                 f.disable_zero_copy_sendfile,
                 env,
+            )?,
+            // The `sendfile(2)` min-splice threshold (#1198), flag > env > the 64 KiB default: a
+            // spliceable run below it takes the byte-identical copy path (the splice's fixed per-run
+            // costs only pay above it); `0` splices every non-empty run.
+            min_splice_bytes: resolve_number(
+                "--min-splice-bytes",
+                f.min_splice_bytes,
+                env,
+                ironbus_server::engine::DEFAULT_MIN_SPLICE_BYTES,
             )?,
             // V2-M4 routing richness (#549/#551), the #710 serve surface. Each defaults to its
             // disabling value (no TTL, no exchange, expired-routing off), so a zero-config broker
@@ -5748,6 +5766,16 @@ struct ServeConfig {
     /// `#[cfg(unix)]` `run_broker`, so on a non-unix build (which never serves) the field is inert.
     #[cfg_attr(not(unix), allow(dead_code))]
     zero_copy_sendfile: bool,
+    /// The `sendfile(2)` MIN-SPLICE threshold in BYTES (#1198, `--min-splice-bytes`, default 64 KiB):
+    /// a spliceable run below this many on-disk bytes is served through the byte-identical copy path
+    /// (the splice's fixed per-run costs — syscall + directive bookkeeping + interleaved socket writes
+    /// — only pay once the avoided body copy is large enough). `0` splices every non-empty run.
+    /// Threaded into [`EngineConfig::min_splice_bytes`]; `--no-zero-copy-sendfile` remains the full
+    /// kill-switch. See `ironbus_server::engine::DEFAULT_MIN_SPLICE_BYTES` for the measured basis.
+    /// Server-only — read ONLY by the `#[cfg(unix)]` serve path (`open_engine_with`), so on a
+    /// non-unix build (which never serves) the field is inert, same as `zero_copy_sendfile` above.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    min_splice_bytes: u64,
     /// The per-stream DEFAULT message TTL in MILLISECONDS (V2-M4 #549, wired by #710): a record
     /// older than this (its durable producer `timestamp_ms + ttl` against the wall-clock seam) is
     /// EXPIRED — skipped on read, never delivered, reclaimed by the segment reap. `0` = OFF (the
@@ -5832,6 +5860,8 @@ impl ServeConfig {
             // Zero-copy `sendfile(2)` delivery (#1034) AUTO-ON, the shipped default (the in-process bench
             // broker is a memory backend, where the fd path fail-closes to the copy path anyway).
             zero_copy_sendfile: true,
+            // The `sendfile(2)` min-splice threshold (#1198) at its shipped 64 KiB default.
+            min_splice_bytes: ironbus_server::engine::DEFAULT_MIN_SPLICE_BYTES,
             // V2-M4 routing richness (#549/#551) at its shipped defaults: no TTL, no dead-letter
             // exchange (the fixed `dlq/`), expired-routing off — the historical broker.
             default_message_ttl_ms: 0,
@@ -11064,6 +11094,11 @@ fn open_engine_with<F: Filesystem + Clone>(
         // `--consume-longpoll-ms` (default `0` = OFF). Server-only: an idle consumer wakes on a
         // commit instead of returning empty; no wire/client/format change.
         consume_longpoll_ms: config.consume_longpoll_ms,
+        // The `sendfile(2)` min-splice threshold (#1198), wired from `--min-splice-bytes`
+        // (default 64 KiB): a spliceable run below this many bytes is served through the
+        // byte-identical copy path, because the splice's fixed per-run costs only pay above it.
+        // `0` splices every non-empty run; `--no-zero-copy-sendfile` remains the full kill-switch.
+        min_splice_bytes: config.min_splice_bytes,
         // The fsync-headroom admission window (#378), wired from `--wal-fsync-headroom-bytes`.
         // Default `0` = OFF (the un-fsynced frontier is bounded only by the group-commit
         // drain under `sync` / the interval window under a relaxed level), so a zero-config
@@ -14716,6 +14751,7 @@ mod tests {
         ServeConfig {
             consume_longpoll_ms: 0,
             zero_copy_sendfile: true,
+            min_splice_bytes: ironbus_server::engine::DEFAULT_MIN_SPLICE_BYTES,
             // V2-M4 routing (#549/#551) at its inert defaults: no TTL, no exchange, no
             // expired-routing — the historical fixed-`dlq/` broker.
             default_message_ttl_ms: 0,
@@ -17056,6 +17092,7 @@ mod tests {
             StdFs::new(dir.clone()),
             Arc::clone(&clock),
             EngineConfig {
+                min_splice_bytes: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
@@ -18094,6 +18131,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
@@ -18186,6 +18224,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
@@ -18670,6 +18709,7 @@ mod tests {
         ServeConfig {
             consume_longpoll_ms: 0,
             zero_copy_sendfile: true,
+            min_splice_bytes: ironbus_server::engine::DEFAULT_MIN_SPLICE_BYTES,
             // V2-M4 routing (#549/#551) at its inert defaults, mirroring production.
             default_message_ttl_ms: 0,
             max_delay_ms: DEFAULT_MAX_DELAY_MS,
@@ -22516,6 +22556,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,
@@ -22607,6 +22648,7 @@ eImsLe+T6lqrpgIgENKsK8qL9U5HkY7evGZM+CZNPHezUtmVVeASiOLgQO8=
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 consume_longpoll_ms: 0,
                 compression: ironbus_core::compress::Codec::None,

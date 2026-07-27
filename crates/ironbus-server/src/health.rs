@@ -2765,6 +2765,7 @@ mod tests {
     /// extracted so the connz/disk-free integration test reuses the SAME config as `start()`.
     fn test_eng_cfg() -> EngineConfig {
         EngineConfig {
+            min_splice_bytes: 0,
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             compression: ironbus_core::compress::Codec::None,
@@ -3208,6 +3209,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -4102,6 +4104,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -4255,6 +4258,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -4341,6 +4345,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -4624,6 +4629,7 @@ mod tests {
                 InMemoryFs::new(),
                 SystemClock::new(),
                 EngineConfig {
+                    min_splice_bytes: 0,
                     consume_longpoll_ms: 0,
                     storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                     compression: ironbus_core::compress::Codec::None,
@@ -4688,6 +4694,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -4851,6 +4858,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -4998,6 +5006,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -5224,6 +5233,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -6360,6 +6370,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -6579,6 +6590,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -6808,6 +6820,7 @@ mod tests {
             fs,
             ManualClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -7126,6 +7139,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,

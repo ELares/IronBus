@@ -656,6 +656,20 @@ pub struct EngineConfig {
     /// against a long-poll-enabled broker simply gets its empty batches later (once a commit or the
     /// budget wakes it) instead of instantly.
     pub consume_longpoll_ms: u64,
+    /// The MINIMUM spliceable-run size in BYTES for the Linux `sendfile(2)` zero-copy consume path
+    /// (#1198, the tunability principle): a spliceable run whose on-disk byte length is BELOW this
+    /// is served through the ordinary copy path instead of being spliced, because the splice's
+    /// per-run fixed costs (the extra syscall + directive bookkeeping + interleaved socket writes)
+    /// only pay for themselves once the avoided userspace body copy is large enough. Enforced at
+    /// the ONE engine chokepoint both the Tier-S ([`Engine::stream_fetch_fd_in`] /
+    /// [`Engine::stream_fetch_fd_in_stream`]) and Tier-W ([`Engine::work_batch_fd_in`]) splice
+    /// decisions share, so every splice site honors it. Routing through the copy path is always
+    /// byte-identical on the wire (the differential oracles pin this), so this knob is pure
+    /// performance policy — never a correctness switch. `0` splices every non-empty spliceable run.
+    /// The default is [`DEFAULT_MIN_SPLICE_BYTES`] (64 KiB — see its doc for the measured #1191
+    /// basis); the `--no-zero-copy-sendfile` kill-switch remains the operator OFF-switch that forces
+    /// the copy path regardless of run size.
+    pub min_splice_bytes: u64,
     /// How named streams are STORED — the storage-mode selector (#597, M2-I13). The SAFE default is
     /// [`StorageMode::PerStreamLogs`] (today's per-stream [`ironbus_storage::streamset::StreamSet`]
     /// logs, byte-for-byte), so the shared-WAL fallback is strictly OPT-IN and an existing deployment
@@ -2341,6 +2355,25 @@ pub const DEFAULT_CONSUMER_CREDIT: u32 = ironbus_core::backpressure::DEFAULT_CRE
 /// in-flight RAM, which is why a no-byte-budget config is charged the full count ceiling by the RAM
 /// guard). See [`EngineConfig::consumer_credit_bytes`].
 pub const DEFAULT_CONSUMER_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The default MINIMUM spliceable-run size in BYTES below which the Linux `sendfile(2)` zero-copy
+/// consume path routes a batch to the ordinary copy path instead of splicing (#1198, the tunability
+/// principle): 64 KiB.
+///
+/// MEASURED BASIS (#1191 refresh, `docs/benchmarks/matched-vm-harness/refresh-2026-07/`): the
+/// splice's advantage over the copy path is avoiding the userspace body copy, which SCALES WITH RUN
+/// BYTES, while its costs are FIXED per run (the extra `sendfile(2)` syscall, the directive
+/// bookkeeping, and the interleaved socket writes around each splice point). The refresh measured
+/// small-batch/loopback C1 shapes losing up to 3.4x on the splice path — the dominant mechanism was
+/// the per-record assembly walk (fixed by the #1198 bulk-read assembly), but it also showed the copy
+/// path serving a sub-socket-buffer run with ONE buffered write that a splice turns into at least
+/// three syscalls. Below one typical socket send buffer (~64 KiB) a memcpy into the already-flushing
+/// outbound buffer is reliably cheaper than that fixed splice overhead, and both measured C1 batch
+/// shapes (~360 KiB @128 B and ~2.2 MiB @1 KiB per run) sit well ABOVE this default, so the shipped
+/// default keeps them on the (now fixed) splice path — the post-fix VM re-measure is the acceptance
+/// gate that validates exactly that routing. `0` splices every non-empty run (the pre-#1198
+/// behavior); the `--no-zero-copy-sendfile` kill-switch still forces the copy path everywhere.
+pub const DEFAULT_MIN_SPLICE_BYTES: u64 = 64 * 1024;
 
 /// The default pipelined-sync-tier dirty-byte admission bound (#1040): the most UNSYNCED record
 /// bytes the append actor's pipelined branch lets accumulate behind an in-flight `fdatasync`
@@ -4147,6 +4180,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// to this budget on the commit-notify seam instead of returning empty immediately. Fixed for the
     /// engine's life (a `serve` flag sets it once), like the per-consumer credit caps.
     consume_longpoll_ms: u64,
+    /// The minimum spliceable-run size in BYTES for the `sendfile(2)` zero-copy consume path (#1198),
+    /// from [`EngineConfig::min_splice_bytes`] at open: a spliceable run below this is served through
+    /// the copy path (byte-identical on the wire), because the splice's fixed per-run costs only pay
+    /// above it. `0` splices every non-empty run. Set at open (a `serve` flag), re-settable server-side
+    /// via [`Engine::set_min_splice_bytes`] (like [`Engine::set_confirm_group`], NOT on the wire).
+    min_splice_bytes: u64,
     /// The set of group names CONFIGURED to use `key_shared` ordering (#64), declared server-side
     /// (NOT on the wire). Empty by default, so every group is plain competing
     /// ([`KeyOrdering::None`]) unless an operator opts it in. A session consults
@@ -5110,6 +5149,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             dead_letter_exchange: config.dead_letter_exchange,
             dead_letter_expired: config.dead_letter_expired,
             consume_longpoll_ms: config.consume_longpoll_ms,
+            // The `sendfile(2)` min-splice threshold (#1198): a spliceable run below this many bytes
+            // routes to the copy path (byte-identical wire), because the splice's fixed per-run costs
+            // only pay above it. `0` = splice every non-empty run.
+            min_splice_bytes: config.min_splice_bytes,
         };
         engine.seed_registry_from_recovered_state(flushed);
         // RESTORE the durable idempotent-producer SEQUENCE high-waters (V2-M8) into the registry, so a
@@ -13703,7 +13746,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// window — at-rest encryption, a compacted (v2 sparse) or offloaded (remote) slot, a no-fd backend
     /// (memory / `O_DIRECT`), or a not-yet-indexed active tail — reusing the exact fail-closed reroutes
     /// [`ironbus_storage::log::Log::read_range_fd_range`] already applies (byte-for-byte the
-    /// `read_range_raw` the copy path falls back to). On the fd path the returned [`StreamFdBatch::Fd`]
+    /// `read_range_raw` the copy path falls back to). A spliceable run BELOW
+    /// [`EngineConfig::min_splice_bytes`] is likewise served as `Copy` (#1198, the shared
+    /// [`Engine::splice_meets_min`] gate): too small for the splice's fixed per-run costs, identical on
+    /// the wire. On the fd path the returned [`StreamFdBatch::Fd`]
     /// holds the segment reader ALIVE (via its `Box<dyn SpliceSource>` holder) so a concurrent compaction
     /// retire cannot close the fd mid-splice.
     ///
@@ -13725,22 +13771,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // None` mirrors `work_batch_raw_in` — the run is already bounded to `count` records.
         let (fd_run, _tail_from) = self.log.read_range_fd_range(first, count, None)?;
         if let Some(fd_run) = fd_run {
-            let file_offset = fd_run.file_offset();
-            let len = fd_run.len();
-            let first_offset = fd_run.first_offset();
-            let record_count = fd_run.record_count();
-            let next_offset = fd_run.next_offset();
-            return Ok(StreamFdBatch::Fd {
-                holder: Box::new(fd_run),
-                file_offset,
-                len,
-                first_offset,
-                record_count,
-                // The Tier-W drain ships the ACTIVE-tail remainder per-record from its OWN decoded
-                // records (`run.records[sealed..]`), so the engine returns no tail here.
-                tail: Vec::new(),
-                next_offset,
-            });
+            // The min-splice size gate (#1198): a run below the threshold falls through to the
+            // byte-identical copy fallback below — the splice's fixed per-run costs only pay above it.
+            if self.splice_meets_min(fd_run.len()) {
+                let file_offset = fd_run.file_offset();
+                let len = fd_run.len();
+                let first_offset = fd_run.first_offset();
+                let record_count = fd_run.record_count();
+                let next_offset = fd_run.next_offset();
+                return Ok(StreamFdBatch::Fd {
+                    holder: Box::new(fd_run),
+                    file_offset,
+                    len,
+                    first_offset,
+                    record_count,
+                    // The Tier-W drain ships the ACTIVE-tail remainder per-record from its OWN decoded
+                    // records (`run.records[sealed..]`), so the engine returns no tail here.
+                    tail: Vec::new(),
+                    next_offset,
+                });
+            }
         }
         // Copy fallback: byte-for-byte `work_batch_raw_in` (the same single-segment `read_range_raw`).
         let (raw, _tail_from) = self.log.read_range_raw(first, count, None)?;
@@ -13750,6 +13800,32 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             tail: Vec::new(),
             next_offset,
         }))
+    }
+
+    /// The MINIMUM spliceable-run size in BYTES for the `sendfile(2)` zero-copy consume path (#1198);
+    /// see [`EngineConfig::min_splice_bytes`]. A spliceable run below this is served through the
+    /// byte-identical copy path; `0` splices every non-empty run.
+    #[must_use]
+    pub fn min_splice_bytes(&self) -> u64 {
+        self.min_splice_bytes
+    }
+
+    /// Retunes the `sendfile(2)` min-splice threshold (#1198) server-side (NOT on the wire), like
+    /// [`Engine::set_confirm_group`]: a spliceable run below `bytes` routes to the copy path from the
+    /// next fetch on. Pure performance policy — both routes are byte-identical on the wire — so it is
+    /// safe to change at any time. `0` splices every non-empty run.
+    pub fn set_min_splice_bytes(&mut self, bytes: u64) {
+        self.min_splice_bytes = bytes;
+    }
+
+    /// The ONE splice-vs-copy SIZE gate (#1198) every `sendfile(2)` decision consults — the Tier-S
+    /// [`Engine::stream_fetch_fd_in`] / [`Engine::stream_fetch_fd_in_stream`] and the Tier-W
+    /// [`Engine::work_batch_fd_in`] all route a spliceable run through this single predicate, so the
+    /// min-splice policy cannot drift between tiers: `true` iff a run of `len` on-disk bytes is at or
+    /// above [`Engine::min_splice_bytes`] (a below-threshold run takes the byte-identical copy path).
+    #[cfg(target_os = "linux")]
+    fn splice_meets_min(&self, len: usize) -> bool {
+        u64::try_from(len).unwrap_or(u64::MAX) >= self.min_splice_bytes
     }
 
     /// The name of the ONE designated group whose ack confirms a Level-2 produce (#497). Defaults to
@@ -15168,7 +15244,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// FAIL-CLOSES to the copy path (a materialized [`StreamRawBatch`] in [`StreamFdBatch::Copy`]) whenever
     /// the fd path is not available for the window — at-rest encryption, a compacted (v2 sparse) or remote
     /// (offloaded) slot, a no-fd backend (memory / `O_DIRECT`), or a not-yet-indexed active tail — reusing
-    /// the exact fail-closed reroutes [`ironbus_storage::log::Log::read_range_fd_range`] already applies. On
+    /// the exact fail-closed reroutes [`ironbus_storage::log::Log::read_range_fd_range`] already applies.
+    /// A spliceable run BELOW [`EngineConfig::min_splice_bytes`] is likewise served through the copy path
+    /// (#1198, the shared [`Engine::splice_meets_min`] gate): too small for the splice's fixed per-run
+    /// costs, identical on the wire. On
     /// the fd path the returned [`StreamFdBatch::Fd`] holds the segment reader ALIVE (via its
     /// `Box<dyn SpliceSource>` holder) so a concurrent compaction retire cannot close the fd mid-splice.
     ///
@@ -15214,34 +15293,38 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.log
                 .read_range_fd_range(start_offset, max_records, max_bytes)?;
         if let Some(fd_run) = fd_run {
-            // ACTIVE-tail remainder, bounded exactly as `stream_fetch_raw_in` bounds it.
-            let fd_count = usize::try_from(fd_run.record_count()).unwrap_or(usize::MAX);
-            let tail = match tail_from {
-                Some(from) if fd_count < max_records => {
-                    self.log
-                        .read_range(from, max_records - fd_count, max_bytes)?
-                }
-                _ => Vec::new(),
-            };
-            let next_offset = tail.last().map_or(fd_run.next_offset(), |r| {
-                r.offset.checked_next().unwrap_or(r.offset)
-            });
-            let total = fd_run.record_count().saturating_add(tail.len() as u64);
-            let file_offset = fd_run.file_offset();
-            let len = fd_run.len();
-            let first_offset = fd_run.first_offset();
-            let record_count = fd_run.record_count();
-            // `self.log` borrow ended above (the tail read was its last use); bump the counter now.
-            self.counters.delivered = self.counters.delivered.saturating_add(total);
-            return Ok(StreamFdBatch::Fd {
-                holder: Box::new(fd_run),
-                file_offset,
-                len,
-                first_offset,
-                record_count,
-                tail,
-                next_offset,
-            });
+            // The min-splice size gate (#1198): a run below the threshold falls through to the
+            // byte-identical copy fallback below — the splice's fixed per-run costs only pay above it.
+            if self.splice_meets_min(fd_run.len()) {
+                // ACTIVE-tail remainder, bounded exactly as `stream_fetch_raw_in` bounds it.
+                let fd_count = usize::try_from(fd_run.record_count()).unwrap_or(usize::MAX);
+                let tail = match tail_from {
+                    Some(from) if fd_count < max_records => {
+                        self.log
+                            .read_range(from, max_records - fd_count, max_bytes)?
+                    }
+                    _ => Vec::new(),
+                };
+                let next_offset = tail.last().map_or(fd_run.next_offset(), |r| {
+                    r.offset.checked_next().unwrap_or(r.offset)
+                });
+                let total = fd_run.record_count().saturating_add(tail.len() as u64);
+                let file_offset = fd_run.file_offset();
+                let len = fd_run.len();
+                let first_offset = fd_run.first_offset();
+                let record_count = fd_run.record_count();
+                // `self.log` borrow ended above (the tail read was its last use); bump the counter now.
+                self.counters.delivered = self.counters.delivered.saturating_add(total);
+                return Ok(StreamFdBatch::Fd {
+                    holder: Box::new(fd_run),
+                    file_offset,
+                    len,
+                    first_offset,
+                    record_count,
+                    tail,
+                    next_offset,
+                });
+            }
         }
         // Copy fallback: byte-for-byte the body of `stream_fetch_raw_in` post-guard.
         let (raw, tail_from) = self
@@ -15333,32 +15416,36 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let (fd_run, tail_from) = log.read_range_fd_range(start_offset, max_records, max_bytes)?;
         if let Some(fd_run) = fd_run {
-            let fd_count = usize::try_from(fd_run.record_count()).unwrap_or(usize::MAX);
-            let tail = match tail_from {
-                Some(from) if fd_count < max_records => {
-                    log.read_range(from, max_records - fd_count, max_bytes)?
-                }
-                _ => Vec::new(),
-            };
-            let next_offset = tail.last().map_or(fd_run.next_offset(), |r| {
-                r.offset.checked_next().unwrap_or(r.offset)
-            });
-            let total = fd_run.record_count().saturating_add(tail.len() as u64);
-            let file_offset = fd_run.file_offset();
-            let len = fd_run.len();
-            let first_offset = fd_run.first_offset();
-            let record_count = fd_run.record_count();
-            // `log` borrow (of `self.streams`) ended above; bump the counter now.
-            self.counters.delivered = self.counters.delivered.saturating_add(total);
-            return Ok(StreamFdBatch::Fd {
-                holder: Box::new(fd_run),
-                file_offset,
-                len,
-                first_offset,
-                record_count,
-                tail,
-                next_offset,
-            });
+            // The min-splice size gate (#1198): a run below the threshold falls through to the
+            // byte-identical copy fallback below — the splice's fixed per-run costs only pay above it.
+            if self.splice_meets_min(fd_run.len()) {
+                let fd_count = usize::try_from(fd_run.record_count()).unwrap_or(usize::MAX);
+                let tail = match tail_from {
+                    Some(from) if fd_count < max_records => {
+                        log.read_range(from, max_records - fd_count, max_bytes)?
+                    }
+                    _ => Vec::new(),
+                };
+                let next_offset = tail.last().map_or(fd_run.next_offset(), |r| {
+                    r.offset.checked_next().unwrap_or(r.offset)
+                });
+                let total = fd_run.record_count().saturating_add(tail.len() as u64);
+                let file_offset = fd_run.file_offset();
+                let len = fd_run.len();
+                let first_offset = fd_run.first_offset();
+                let record_count = fd_run.record_count();
+                // `log` borrow (of `self.streams`) ended above; bump the counter now.
+                self.counters.delivered = self.counters.delivered.saturating_add(total);
+                return Ok(StreamFdBatch::Fd {
+                    holder: Box::new(fd_run),
+                    file_offset,
+                    len,
+                    first_offset,
+                    record_count,
+                    tail,
+                    next_offset,
+                });
+            }
         }
         let (raw, tail_from) = log.read_range_raw(start_offset, max_records, max_bytes)?;
         let raw_count = usize::try_from(raw.record_count).unwrap_or(usize::MAX);
@@ -16190,6 +16277,7 @@ mod tests {
 
     fn config(max_in_flight: u32, max_deliver: u32) -> EngineConfig {
         EngineConfig {
+            min_splice_bytes: 0,
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default(),

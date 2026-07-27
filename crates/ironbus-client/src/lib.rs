@@ -4917,6 +4917,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
@@ -4985,6 +4986,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
@@ -5082,6 +5084,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                min_splice_bytes: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
@@ -8896,6 +8899,7 @@ toYtkjmdU2eQ2pK/3gM=
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
@@ -9223,6 +9227,7 @@ toYtkjmdU2eQ2pK/3gM=
     #[cfg(unix)]
     fn cluster_test_engine_config() -> EngineConfig {
         EngineConfig {
+            min_splice_bytes: 0,
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             log: LogConfig::default(),
