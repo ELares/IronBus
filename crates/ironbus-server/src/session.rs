@@ -7765,6 +7765,10 @@ mod tests {
     /// open the SAME config over a fault-injecting filesystem (to count fsyncs).
     fn test_config() -> EngineConfig {
         EngineConfig {
+            // Min-splice threshold OFF (`0` = splice every non-empty run) in the shared test config
+            // (#1198), so the sendfile differential tests keep exercising the splice path over their
+            // deliberately tiny runs; the threshold-routing tests set a non-zero value explicitly.
+            min_splice_bytes: 0,
             consume_longpoll_ms: 0,
             storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
             compression: ironbus_core::compress::Codec::None,
@@ -7875,6 +7879,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -7937,6 +7942,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -8264,6 +8270,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -10595,8 +10602,18 @@ mod tests {
 
         /// A disk-backed engine with a SMALL segment cap so a run SEALS several segments (the raw fd path
         /// serves only the SEALED/indexed prefix) plus an active tail. `StdFs` gives each sealed segment a
-        /// real spliceable fd (unlike `InMemoryFs`, whose `splice_fd` is `None`).
+        /// real spliceable fd (unlike `InMemoryFs`, whose `splice_fd` is `None`). Min-splice threshold OFF
+        /// (`test_config`'s `0`), so the tiny runs these tests build still exercise the splice.
         fn disk_engine(dir: &std::path::Path) -> Engine<StdFs, ManualClock> {
+            disk_engine_with_min_splice(dir, 0)
+        }
+
+        /// [`disk_engine`] with an EXPLICIT `sendfile(2)` min-splice threshold (#1198), for the
+        /// threshold-routing tests.
+        fn disk_engine_with_min_splice(
+            dir: &std::path::Path,
+            min_splice_bytes: u64,
+        ) -> Engine<StdFs, ManualClock> {
             Engine::open(
                 StdFs::new(dir.to_path_buf()),
                 ManualClock::new(),
@@ -10605,6 +10622,7 @@ mod tests {
                         max_segment_bytes: 160,
                         ..LogConfig::default()
                     },
+                    min_splice_bytes,
                     ..test_config()
                 },
             )
@@ -11184,6 +11202,142 @@ mod tests {
                 "the spliced fd survives the engine drop + segment retire (holder keeps it open)"
             );
         }
+
+        // ===== Min-splice auto-on threshold (#1198) ==============================================
+        // A spliceable run BELOW `min_splice_bytes` routes to the byte-identical copy path (the
+        // splice's fixed per-run costs only pay above it); at or above, it splices. The operator
+        // kill-switch (splice_enabled = false) forcing the copy path regardless is pinned by
+        // `kill_switch_forces_the_full_frame_copy_path` / `tier_w_kill_switch_forces_the_full_frame_
+        // copy_path` above, unchanged.
+
+        #[test]
+        fn min_splice_threshold_routes_a_small_run_to_the_copy_path() {
+            // Tier-S: a splice-ENABLED session over an engine whose threshold exceeds every run in the
+            // window emits NO directives — and the wire is byte-for-byte the copy engine's (the
+            // threshold is pure routing policy, never a wire change).
+            let dir_t = tempfile::tempdir().unwrap();
+            let dir_c = tempfile::tempdir().unwrap();
+            let et = DirectEngine::new(disk_engine_with_min_splice(dir_t.path(), 1 << 20));
+            let ec = DirectEngine::new(disk_engine(dir_c.path()));
+            for i in 0..16u8 {
+                produce_disk(&et, &[i], &[i, 1], &[i; 6]);
+                produce_disk(&ec, &[i], &[i, 1], &[i; 6]);
+            }
+            let mut st = disk_batch_session(&et, b"s", true);
+            let mut sc = disk_batch_session(&ec, b"s", false);
+            let mut out_thresh = Vec::new();
+            st.process(
+                &et,
+                &frame(FrameType::StreamFetch, &stream_fetch_req()),
+                &mut out_thresh,
+            )
+            .unwrap();
+            assert!(
+                st.take_splices().is_empty(),
+                "every run in this window is below the 1 MiB threshold: no splice directive"
+            );
+            let mut out_copy = Vec::new();
+            sc.process(
+                &ec,
+                &frame(FrameType::StreamFetch, &stream_fetch_req()),
+                &mut out_copy,
+            )
+            .unwrap();
+            assert_eq!(
+                out_thresh, out_copy,
+                "the threshold-rerouted wire == the copy-path wire, byte for byte"
+            );
+        }
+
+        #[test]
+        fn min_splice_threshold_engages_at_and_only_at_the_boundary() {
+            // The `>=` boundary, engine-level for exactness: with the threshold set EXACTLY to a run's
+            // on-disk byte length the run still splices (`Fd`); one byte higher routes it to the copy
+            // path (`Copy`). Uses the Tier-S engine chokepoint directly so the boundary is exact.
+            use crate::engine::StreamFdBatch;
+            let dir = tempfile::tempdir().unwrap();
+            let e = DirectEngine::new(disk_engine(dir.path()));
+            for i in 0..16u8 {
+                produce_disk(&e, &[i], &[i, 1], &[i; 6]);
+            }
+            e.with(|eng| eng.set_streaming_in("s", true).unwrap())
+                .unwrap();
+            // Threshold 0 (`disk_engine`): the first sealed run splices; capture its byte length.
+            let len = e
+                .with(|eng| {
+                    match eng
+                        .stream_fetch_fd_in("s", MemberId::default(), Offset::new(0), 100, None)
+                        .unwrap()
+                    {
+                        StreamFdBatch::Fd { len, .. } => len,
+                        StreamFdBatch::Copy(_) => panic!("threshold 0 must splice a sealed run"),
+                    }
+                })
+                .unwrap();
+            assert!(len > 0);
+            // Exactly AT the threshold: still spliced (the gate is `>=`).
+            e.with(move |eng| eng.set_min_splice_bytes(len as u64))
+                .unwrap();
+            let at = e
+                .with(|eng| {
+                    eng.stream_fetch_fd_in("s", MemberId::default(), Offset::new(0), 100, None)
+                        .unwrap()
+                })
+                .unwrap();
+            assert!(
+                matches!(at, StreamFdBatch::Fd { .. }),
+                "a run exactly at the threshold splices"
+            );
+            // One byte ABOVE: routed to the byte-identical copy path.
+            e.with(move |eng| eng.set_min_splice_bytes(len as u64 + 1))
+                .unwrap();
+            let above = e
+                .with(|eng| {
+                    eng.stream_fetch_fd_in("s", MemberId::default(), Offset::new(0), 100, None)
+                        .unwrap()
+                })
+                .unwrap();
+            match above {
+                StreamFdBatch::Copy(batch) => assert_eq!(
+                    batch.raw.bytes.len(),
+                    len,
+                    "the copy route serves the same run bytes"
+                ),
+                StreamFdBatch::Fd { .. } => panic!("a run below the threshold must not splice"),
+            }
+        }
+
+        #[test]
+        fn tier_w_min_splice_threshold_routes_a_small_run_to_the_copy_path() {
+            // Tier-W twin: the lease/reseal `flush_run` batch path honors the SAME engine chokepoint —
+            // a splice-enabled work-queue session over a high-threshold engine emits NO directives and
+            // its wire is byte-for-byte the copy engine's (incl. the reseal generation).
+            let dir_t = tempfile::tempdir().unwrap();
+            let dir_c = tempfile::tempdir().unwrap();
+            let et = DirectEngine::new(disk_engine_with_min_splice(dir_t.path(), 1 << 20));
+            let ec = DirectEngine::new(disk_engine(dir_c.path()));
+            for i in 0..16u8 {
+                produce_disk(&et, &[i], &[i, 1], &[i; 6]);
+                produce_disk(&ec, &[i], &[i, 1], &[i; 6]);
+            }
+            let mut st = disk_work_batch_session(&et, b"w", true);
+            let mut sc = disk_work_batch_session(&ec, b"w", false);
+            let mut out_thresh = Vec::new();
+            st.process(&et, &fetch_frame(100, 0, 0, true), &mut out_thresh)
+                .unwrap();
+            assert!(
+                st.take_splices().is_empty(),
+                "every Tier-W run in this window is below the 1 MiB threshold: no splice directive"
+            );
+            let mut out_copy = Vec::new();
+            sc.process(&ec, &fetch_frame(100, 0, 0, true), &mut out_copy)
+                .unwrap();
+            assert!(!out_copy.is_empty(), "the copy path produced a response");
+            assert_eq!(
+                out_thresh, out_copy,
+                "the Tier-W threshold-rerouted wire == the copy-path wire, byte for byte"
+            );
+        }
     }
 
     #[test]
@@ -11638,6 +11792,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -12991,6 +13146,7 @@ mod tests {
                 InMemoryFs::new(),
                 ManualClock::new(),
                 EngineConfig {
+                    min_splice_bytes: 0,
                     consume_longpoll_ms: 0,
                     storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                     compression: ironbus_core::compress::Codec::None,
@@ -13620,6 +13776,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -13687,6 +13844,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,
@@ -13905,6 +14063,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::Lz4,
@@ -14957,6 +15116,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                min_splice_bytes: 0,
                 consume_longpoll_ms: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 compression: ironbus_core::compress::Codec::None,

@@ -4429,9 +4429,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// byte-for-byte the [`RawByteRun::bytes`] the copy path returns for the same window (the
     /// differential test pins this) — the wire body is unchanged and the client is oblivious.
     ///
-    /// The boundary walk touches only frame HEADERS: no record body is ever read into userspace, which
-    /// is the whole point of the zero-copy path (the kernel splices the bodies straight from the page
-    /// cache to the socket).
+    /// The boundary walk is ONE bulk read of the seek window into a transient scratch buffer plus an
+    /// in-memory walk (#1198 — the old per-header `pread64` walk was ~2 syscalls per record, a
+    /// 2.3-3.4x C1 consume regression; see `SegmentReader::raw_fd_range_with_plan` for the honest
+    /// memory accounting). The scratch is the same order the copy path already allocates and is
+    /// dropped before the splice; the bodies still reach the socket kernel-side via `sendfile(2)`,
+    /// never through the outbound frame buffer.
     ///
     /// Returns `(Some(fd_run), tail_from)` when a spliceable run was found, or `(None, tail_from)` when
     /// there is nothing to splice here and the caller must serve the window through the COPY path
@@ -4500,9 +4503,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let want = max_records.saturating_add(gap).min(below_flushed);
         let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
         let raw_max_bytes = if gap == 0 { max_bytes } else { None };
-        // The anchor run over this single segment, header-only. `None` = no splice fd for this segment
+        // The anchor run over this single segment: ONE bulk window read + an in-memory walk that also
+        // records the admitted frames' LENGTH PLAN (#1198). `None` = no splice fd for this segment
         // (an `O_DIRECT` sealed segment): the caller serves the whole window through the copy path.
-        let Some(anchor) = reader.raw_fd_range(
+        let Some((anchor, plan)) = reader.raw_fd_range_with_plan(
             byte_pos,
             Offset::new(anchor_offset),
             read_end,
@@ -4516,18 +4520,18 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // has to be dropped so `reader` can move into `FdRun`. `RawFdRun` is `Copy`, so its last field
         // read below ends the borrow (NLL) — no explicit `drop` (which clippy would reject on a Copy).
         let anchor_start = anchor.file_offset;
-        let anchor_len = anchor.len;
         let anchor_first = anchor.first_offset.get();
         // Trim the leading `gap` frames and re-bound to `max_records` / `max_bytes` — the fd twin of
-        // `trim_and_bound_raw_run`, header-only, producing byte-identical boundaries.
-        let (file_offset, len, first_offset, record_count, next) = reader.trim_fd_run(
+        // `trim_and_bound_raw_run`, pure arithmetic over the anchor walk's frame plan (#1198): it
+        // never re-reads a header, producing byte-identical boundaries with zero additional syscalls.
+        let (file_offset, len, first_offset, record_count, next) = crate::segment::trim_fd_run(
             anchor_start,
-            anchor_len,
             anchor_first,
+            &plan,
             seg_start,
             max_records,
             max_bytes,
-        )?;
+        );
         // Resume reporting: byte-for-byte the same computation `read_range_raw` performs.
         let tail_from = if next < flushed && record_count >= max_records as u64 {
             None

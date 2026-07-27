@@ -672,6 +672,7 @@ mod tests {
             SystemClock::new(),
             EngineConfig {
                 consume_longpoll_ms: 0,
+                min_splice_bytes: 0,
                 storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),

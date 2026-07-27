@@ -66,6 +66,7 @@ fn engine_config() -> EngineConfig {
 /// subject), not the per-group window, is the binding constraint the bench measures.
 fn engine_config_with_credit(consumer_credit: u32, max_in_flight: u32) -> EngineConfig {
     EngineConfig {
+        min_splice_bytes: 0,
         consume_longpoll_ms: 0,
         storage_mode: ironbus_storage::shared_wal::StorageMode::PerStreamLogs,
         log: LogConfig::default(),

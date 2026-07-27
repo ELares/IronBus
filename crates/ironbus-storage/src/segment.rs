@@ -582,8 +582,10 @@ pub struct RawByteRun {
 /// (#1034 / #658): instead of the run's bytes IN userspace, it names the exact on-disk BYTE RANGE
 /// `[file_offset, file_offset + len)` — a contiguous run of `record_count` whole, header-validated
 /// frames in one segment file — plus a BORROWED descriptor to splice that range straight from the
-/// page cache to the socket. The bodies are never read into userspace: the boundary walk that
-/// produced this touched only the frame HEADERS (see [`SegmentReader::raw_fd_range`]).
+/// page cache to the socket. The bodies never enter the OUTBOUND path in userspace: the boundary
+/// walk that produced this bulk-read the window into a transient, immediately-dropped scratch (see
+/// [`SegmentReader::raw_fd_range_with_plan`] for the #1198 syscall/memory accounting), and the splice
+/// itself moves the bodies kernel-side.
 ///
 /// Byte-for-byte, `[file_offset, file_offset + len)` equals the [`RawByteRun::bytes`] the copy path
 /// returns for the SAME window (the differential test in `log.rs` pins this), so the wire body a
@@ -611,6 +613,113 @@ pub struct RawFdRun<'a> {
     /// The next offset AFTER the run (the first offset NOT included): where a follow-on read resumes.
     /// Equals `first_offset` when the run is empty.
     pub next_offset: Offset,
+}
+
+/// The ONE in-memory frame-boundary walk shared by the copy path ([`SegmentReader::raw_byte_range`])
+/// and the fd path ([`SegmentReader::raw_fd_range`]) (#1198): steps whole, HEADER-CRC-validated
+/// frames through `body` under the identical bounds — at most `max` frames, the `max_bytes` cap with
+/// the first-frame-always rule, a torn/corrupt header or a frame running past `body` ends the run —
+/// invoking `on_frame(frame_len)` for each ADMITTED frame, and returns `(count, byte_total)`.
+///
+/// Both read paths walking the SAME window bytes through this ONE loop is what makes the fd run's
+/// `[file_offset, file_offset + len)` byte-identical to the copy run's `bytes` by CONSTRUCTION (the
+/// differential tests then pin it), instead of by maintaining two parallel walks. It is also the
+/// #1198 syscall fix: the walk touches only memory, so the per-frame `pread64`s the old
+/// `frame_len_at` header walk issued (~2 per record with the trim re-walk — the measured 2.3-3.4x C1
+/// consume regression) are gone; the callers pay ONE bulk window read instead.
+fn walk_frame_run(
+    body: &[u8],
+    max: usize,
+    max_bytes: Option<usize>,
+    mut on_frame: impl FnMut(usize),
+) -> (usize, usize) {
+    let mut cursor = 0usize;
+    let mut byte_total = 0usize;
+    let mut count = 0usize;
+    while cursor < body.len() && count < max {
+        // HEADER-ONLY boundary check: `decoded_len` validates the frame's HEADER CRC and returns the
+        // full frame length WITHOUT touching the body — the cheap half of `codec::decode`. A torn or
+        // corrupt header ends the run, exactly as `scan_range`'s `decode` does, so the admitted bytes
+        // are always whole, header-validated frames.
+        let Ok(consumed) = codec::decoded_len(&body[cursor..]) else {
+            break;
+        };
+        // The frame must lie WHOLLY within the read region; a frame that would run off the end of
+        // the buffer is a torn tail and ends the run (matching `scan_range`, whose `decode` of a
+        // short tail returns `Truncated` and breaks).
+        if cursor.saturating_add(consumed) > body.len() {
+            break;
+        }
+        // Byte cap: stop BEFORE a frame that would push the accumulated bytes past `max_bytes`,
+        // but ALWAYS admit the first frame so a single frame larger than the cap never stalls —
+        // the identical rule `scan_range` applies against `OwnedRecord::encoded_len`.
+        if let Some(cap) = max_bytes {
+            if count != 0 && byte_total.saturating_add(consumed) > cap {
+                break;
+            }
+        }
+        byte_total = byte_total.saturating_add(consumed);
+        count += 1;
+        cursor += consumed;
+        on_frame(consumed);
+    }
+    (count, byte_total)
+}
+
+/// The fd sibling of `trim_and_bound_raw_run` (in `log.rs`): given an anchor fd run starting at file
+/// byte `anchor_start` whose admitted frames' lengths are `plan` (in order, as
+/// [`SegmentReader::raw_fd_range_with_plan`] recorded them), drops the leading frames below
+/// `seg_start` and re-bounds the remainder to `max_records` / `max_bytes` (first-frame-always),
+/// returning the trimmed `(file_offset, len, first_offset, record_count, next_offset)`.
+/// `anchor_first_offset` is the log offset of the anchor run's first frame.
+///
+/// PURE ARITHMETIC over the anchor walk's frame plan (#1198): the old implementation RE-WALKED the
+/// same on-disk headers with one positioned `pread64` each — half of the measured ~2-preads-PER-RECORD
+/// fd-assembly regression — but the anchor walk already validated and measured every admitted frame,
+/// so carrying its lengths here reproduces byte-identical boundaries with ZERO file access.
+#[cfg(unix)]
+pub(crate) fn trim_fd_run(
+    anchor_start: u64,
+    anchor_first_offset: u64,
+    plan: &[usize],
+    seg_start: u64,
+    max_records: usize,
+    max_bytes: Option<usize>,
+) -> (u64, usize, u64, u64, u64) {
+    let mut idx = 0usize;
+    let mut rel = 0usize;
+    let mut offset = anchor_first_offset;
+    // Drop the leading frames below `seg_start` by stepping their recorded lengths (mirrors the
+    // first loop of `trim_and_bound_raw_run`, bounded by the plan == the anchor run's frames).
+    while offset < seg_start && idx < plan.len() {
+        rel = rel.saturating_add(plan[idx]);
+        idx += 1;
+        offset = offset.saturating_add(1);
+    }
+    let run_start_rel = rel;
+    let first_offset = offset;
+    // Admit up to `max_records` / `max_bytes` frames from `seg_start`, "at least one" honored.
+    let mut count = 0usize;
+    let mut byte_total = 0usize;
+    while idx < plan.len() && count < max_records {
+        let consumed = plan[idx];
+        if let Some(cap) = max_bytes {
+            if count != 0 && byte_total.saturating_add(consumed) > cap {
+                break;
+            }
+        }
+        byte_total = byte_total.saturating_add(consumed);
+        count += 1;
+        offset = offset.saturating_add(1);
+        idx += 1;
+    }
+    (
+        anchor_start + run_start_rel as u64,
+        byte_total,
+        first_offset,
+        count as u64,
+        offset,
+    )
 }
 
 impl OwnedRecord {
@@ -2678,44 +2787,16 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         // one syscall + one allocation + zero per-record allocations and zero body decodes.
         // Read straight into fresh (unzeroed) capacity: the read fully overwrites it (#813 / #815).
         let body = self.read_into_fresh(len, start_byte)?;
-        let mut cursor = 0usize;
-        let mut byte_total = 0usize;
-        let mut count = 0usize;
-        let mut next_offset = start_offset.get();
-        while cursor < body.len() && count < max {
-            // HEADER-ONLY boundary walk: `decoded_len` validates the frame's HEADER CRC and returns
-            // the full frame length WITHOUT touching the body — the cheap half of `codec::decode`. A
-            // torn or corrupt header ends the run, exactly as `scan_range`'s `decode` does, so the
-            // admitted bytes are always whole, header-validated frames.
-            let Ok(consumed) = codec::decoded_len(&body[cursor..]) else {
-                break;
-            };
-            // The frame must lie WHOLLY within the read region; a frame that would run off the end of
-            // the buffer is a torn tail and ends the run (matching `scan_range`, whose `decode` of a
-            // short tail returns `Truncated` and breaks).
-            if cursor.saturating_add(consumed) > body.len() {
-                break;
-            }
-            // Byte cap: stop BEFORE a frame that would push the accumulated bytes past `max_bytes`,
-            // but ALWAYS admit the first frame so a single frame larger than the cap never stalls —
-            // the identical rule `scan_range` applies against `OwnedRecord::encoded_len`.
-            if let Some(cap) = max_bytes {
-                if count != 0 && byte_total.saturating_add(consumed) > cap {
-                    break;
-                }
-            }
-            byte_total = byte_total.saturating_add(consumed);
-            count += 1;
-            next_offset = next_offset.saturating_add(1);
-            cursor += consumed;
-        }
+        // The boundary walk is the ONE shared in-memory walker (`walk_frame_run`, #1198) — the same
+        // loop the fd path runs over the same window bytes, so the two paths cannot drift.
+        let (count, byte_total) = walk_frame_run(&body, max, max_bytes, |_| {});
         Ok(RawByteRun {
             // The admitted prefix: the first `byte_total` bytes are exactly `count` whole frames. A
             // refcount slice of the shared buffer, never a copy.
             bytes: body.slice(0..byte_total),
             first_offset: start_offset,
             record_count: count as u64,
-            next_offset: Offset::new(next_offset),
+            next_offset: Offset::new(start_offset.get().saturating_add(count as u64)),
         })
     }
 
@@ -2728,38 +2809,10 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         self.file.splice_fd()
     }
 
-    /// Reads ONLY the frame header at absolute file offset `abs` (never the body) and returns the whole
-    /// frame's on-disk length via [`codec::decoded_len`], or `None` when the header is torn, corrupt,
-    /// or too short — which ENDS a run exactly as [`SegmentReader::raw_byte_range`]'s in-buffer walk
-    /// does when `decoded_len` errors. `region_end` bounds the read so it never reads past the admitted
-    /// region; at most `RECORD_HEADER_LEN` + the fixed post-header `u16` prefix (the width the subject
-    /// (#594) and stream-tag (#597) fields share) enter userspace — never a record body. This is the
-    /// header-only atom that keeps the fd walk zero-copy.
-    #[cfg(unix)]
-    fn frame_len_at(&self, abs: u64, region_end: u64) -> Result<Option<usize>, StorageError> {
-        const HDR_MAX: usize = RECORD_HEADER_LEN + RECORD_SUBJECT_LEN_PREFIX;
-        let want = usize::try_from(region_end.saturating_sub(abs))
-            .unwrap_or(HDR_MAX)
-            .min(HDR_MAX);
-        if want < RECORD_HEADER_LEN {
-            // Fewer bytes than a header remain: a torn tail. `decoded_len` would report `Truncated`, so
-            // end the run — mirroring `raw_byte_range` where `decoded_len(&body[cursor..])` breaks.
-            return Ok(None);
-        }
-        let mut hdr = [0u8; HDR_MAX];
-        self.file.read_exact_at(&mut hdr[..want], abs)?;
-        // `decoded_len` reads only the header fields (and, for a tagged/subject frame, the `u16` at the
-        // fixed post-header offset), so `want` bytes always suffice: it returns the SAME length the
-        // in-buffer walk computes for the identical on-disk header. A header-CRC/magic/version failure
-        // (or a short tagged frame) errors, which we map to `None` = end of run.
-        Ok(codec::decoded_len(&hdr[..want]).ok())
-    }
-
     /// The fd sibling of [`SegmentReader::raw_byte_range`]: walks the SAME contiguous run of whole,
     /// header-validated frames from `start_byte`, under the IDENTICAL bounds (`max`, `read_end`,
-    /// `max_bytes` with the first-frame-always rule), but reads ONLY the frame headers — never a body —
-    /// and returns the run's on-disk BYTE RANGE plus a borrowed splice fd as a [`RawFdRun`], for the
-    /// Linux `sendfile(2)` zero-copy path (#1034 / #658).
+    /// `max_bytes` with the first-frame-always rule), and returns the run's on-disk BYTE RANGE plus a
+    /// borrowed splice fd as a [`RawFdRun`], for the Linux `sendfile(2)` zero-copy path (#1034 / #658).
     ///
     /// Returns `Ok(None)` when this backend has no spliceable descriptor (memory / ephemeral /
     /// `O_DIRECT`): the caller then takes the copy path via [`SegmentReader::raw_byte_range`]. Otherwise
@@ -2768,9 +2821,13 @@ impl<F: RandomAccessFile> SegmentReader<F> {
     /// same `first_offset` / `record_count` / `next_offset`. `start_byte` MUST be a real frame boundary;
     /// a header that fails its CRC ENDS the run, so the range is always a clean whole-frame prefix.
     ///
+    /// SYSCALL SHAPE (#1198): ONE bulk positioned read of the window into a TRANSIENT scratch buffer,
+    /// then the boundary walk runs in memory — see [`SegmentReader::raw_fd_range_with_plan`] for the
+    /// memory-vs-throughput accounting (the scratch is the same order the copy path already allocates).
+    ///
     /// # Errors
-    /// Returns an IO error from reading a header, or [`StorageError::SegmentFull`] if the region length
-    /// does not fit `usize`. A torn or corrupt header is NOT an error: it ends the run.
+    /// Returns an IO error from reading the window, or [`StorageError::SegmentFull`] if the region
+    /// length does not fit `usize`. A torn or corrupt header is NOT an error: it ends the run.
     #[cfg(unix)]
     pub fn raw_fd_range(
         &self,
@@ -2780,6 +2837,43 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         max: usize,
         max_bytes: Option<usize>,
     ) -> Result<Option<RawFdRun<'_>>, StorageError> {
+        Ok(self
+            .raw_fd_range_with_plan(start_byte, start_offset, read_end, max, max_bytes)?
+            .map(|(run, _plan)| run))
+    }
+
+    /// [`SegmentReader::raw_fd_range`] plus the admitted frames' LENGTH PLAN (#1198): the per-frame
+    /// on-disk lengths of the run's frames, in order, so [`trim_fd_run`] can trim and re-bound the run
+    /// with pure arithmetic instead of re-walking the same headers off disk.
+    ///
+    /// This is where the #1198 fd-assembly regression is fixed. The old walk read each frame HEADER
+    /// with its own positioned `pread64` (`frame_len_at`), and the trim re-walked them: ~2 syscalls PER
+    /// RECORD (strace: 2,010,730 preads for 1M records vs 1,134 on the copy path), a 2.3-3.4x C1
+    /// consume regression. Now the walk does ONE bulk read of the SAME `[start_byte, read_end)` window
+    /// the copy path reads and steps frames in memory via the shared [`walk_frame_run`].
+    ///
+    /// MEMORY vs THROUGHPUT, honestly: the bulk read materializes the window (bodies included) in a
+    /// transient scratch buffer, so the strict "only headers ever enter userspace" property of the old
+    /// walk is deliberately traded for O(1) syscalls per batch. The scratch is bounded by the SAME
+    /// window every `read_range` copy-path call already reads into userspace (the #664 seek window,
+    /// `O(want + stride)` bytes, further bounded by `max_bytes`) and is DROPPED before the splice, so
+    /// peak per-fetch memory is the same order as the copy path's — the fd path does not regress the
+    /// broker's memory story, it stops regressing its throughput. What stays zero-copy is the part
+    /// that matters on the wire: the bodies are still spliced kernel-side by `sendfile(2)`, never
+    /// copied into the outbound frame buffer.
+    ///
+    /// # Errors
+    /// Returns an IO error from reading the window, or [`StorageError::SegmentFull`] if the region
+    /// length does not fit `usize`. A torn or corrupt header is NOT an error: it ends the run.
+    #[cfg(unix)]
+    pub(crate) fn raw_fd_range_with_plan(
+        &self,
+        start_byte: u64,
+        start_offset: Offset,
+        read_end: u64,
+        max: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<Option<(RawFdRun<'_>, Vec<usize>)>, StorageError> {
         // Only a backend with a spliceable descriptor can serve the zero-copy path; otherwise the
         // caller copies. Take the fd first so `None` short-circuits before any IO.
         let Some(fd) = self.file.splice_fd() else {
@@ -2794,108 +2888,20 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             next_offset: start_offset,
         };
         if max == 0 || start_byte >= read_end {
-            return Ok(Some(run));
+            return Ok(Some((run, Vec::new())));
         }
-        // The region is `[start_byte, read_end)` — the exact window `raw_byte_range` reads into `body`,
-        // so `region_len` plays the role of `body.len()` and every bound below matches it one-for-one.
+        // The region is `[start_byte, read_end)` — the exact window `raw_byte_range` reads into `body`.
         let region_len = usize::try_from(read_end.saturating_sub(start_byte))
             .map_err(|_| StorageError::SegmentFull)?;
-        let mut rel = 0usize;
-        let mut byte_total = 0usize;
-        let mut count = 0usize;
-        let mut next_offset = start_offset.get();
-        while rel < region_len && count < max {
-            // HEADER-ONLY boundary walk (`decoded_len`, header-CRC-validated); a torn/corrupt header
-            // ends the run exactly as `raw_byte_range`'s `decoded_len(&body[cursor..])` does.
-            let Some(consumed) = self.frame_len_at(start_byte + rel as u64, read_end)? else {
-                break;
-            };
-            // A frame that would run past the region is a torn tail: end the run (mirrors
-            // `cursor + consumed > body.len()`).
-            if rel.saturating_add(consumed) > region_len {
-                break;
-            }
-            // Byte cap: stop before a frame that would exceed `max_bytes`, but ALWAYS admit the first
-            // (the "at least one" rule) — the identical check `raw_byte_range` applies.
-            if let Some(cap) = max_bytes {
-                if count != 0 && byte_total.saturating_add(consumed) > cap {
-                    break;
-                }
-            }
-            byte_total = byte_total.saturating_add(consumed);
-            count += 1;
-            next_offset = next_offset.saturating_add(1);
-            rel += consumed;
-        }
+        // ONE bulk read + the ONE shared in-memory walker (`walk_frame_run`): the identical read shape
+        // and loop `raw_byte_range` runs, so the admitted boundaries are byte-identical by construction.
+        let window = self.read_into_fresh(region_len, start_byte)?;
+        let mut plan = Vec::new();
+        let (count, byte_total) = walk_frame_run(&window, max, max_bytes, |len| plan.push(len));
         run.len = byte_total;
         run.record_count = count as u64;
-        run.next_offset = Offset::new(next_offset);
-        Ok(Some(run))
-    }
-
-    /// The fd sibling of `trim_and_bound_raw_run` (in `log.rs`): given an anchor run's byte range
-    /// `[anchor_start, anchor_start + anchor_len)`, drops the leading frames below `seg_start` and
-    /// re-bounds the remainder to `max_records` / `max_bytes` (first-frame-always), returning the
-    /// trimmed `(file_offset, len, first_offset, record_count, next_offset)`. A header-only re-walk of
-    /// the SAME frames the anchor run admitted, so it produces byte-identical boundaries without ever
-    /// reading a body. `anchor_first_offset` is the log offset of the anchor run's first frame.
-    ///
-    /// # Errors
-    /// Propagates an IO error from reading a header.
-    #[cfg(unix)]
-    pub(crate) fn trim_fd_run(
-        &self,
-        anchor_start: u64,
-        anchor_len: usize,
-        anchor_first_offset: u64,
-        seg_start: u64,
-        max_records: usize,
-        max_bytes: Option<usize>,
-    ) -> Result<(u64, usize, u64, u64, u64), StorageError> {
-        let region_end = anchor_start + anchor_len as u64;
-        let mut rel = 0usize;
-        let mut offset = anchor_first_offset;
-        // Drop the leading frames below `seg_start` by walking their header lengths (mirrors the first
-        // loop of `trim_and_bound_raw_run`, bounded by `anchor_len` == the run's `bytes.len()`).
-        while offset < seg_start && rel < anchor_len {
-            let Some(consumed) = self.frame_len_at(anchor_start + rel as u64, region_end)? else {
-                break;
-            };
-            if rel.saturating_add(consumed) > anchor_len {
-                break;
-            }
-            rel += consumed;
-            offset = offset.saturating_add(1);
-        }
-        let run_start_rel = rel;
-        let first_offset = offset;
-        // Admit up to `max_records` / `max_bytes` frames from `seg_start`, "at least one" honored.
-        let mut count = 0usize;
-        let mut byte_total = 0usize;
-        while rel < anchor_len && count < max_records {
-            let Some(consumed) = self.frame_len_at(anchor_start + rel as u64, region_end)? else {
-                break;
-            };
-            if rel.saturating_add(consumed) > anchor_len {
-                break;
-            }
-            if let Some(cap) = max_bytes {
-                if count != 0 && byte_total.saturating_add(consumed) > cap {
-                    break;
-                }
-            }
-            byte_total = byte_total.saturating_add(consumed);
-            count += 1;
-            offset = offset.saturating_add(1);
-            rel += consumed;
-        }
-        Ok((
-            anchor_start + run_start_rel as u64,
-            byte_total,
-            first_offset,
-            count as u64,
-            offset,
-        ))
+        run.next_offset = Offset::new(start_offset.get().saturating_add(count as u64));
+        Ok(Some((run, plan)))
     }
 
     /// Materializes the bytes of `[file_offset, file_offset + len)` into an owned [`Bytes`] — the
@@ -4379,6 +4385,94 @@ mod tests {
             &fd_torn_bytes[..],
             &raw_torn.bytes[..],
             "torn byte range matches copy path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_run_assembly_reads_o_few_not_o_records() {
+        // #1198 MECHANISM PIN: assembling an N-record fd run (`raw_fd_range_with_plan` + the
+        // `trim_fd_run` re-bound) must cost O(few) positioned reads — ONE bulk window read — NOT the
+        // O(2 per record) header walk + trim re-walk that strace measured as 2,010,730 preads per 1M
+        // records (the 2.3-3.4x C1 consume regression vs the copy path). Counted through the
+        // `RandomAccessFile` seam with a delegating wrapper over the REAL `StdFile` (the only backend
+        // with a splice fd), so any future re-introduction of a per-frame file read fails this test.
+        use crate::io::StdFile;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingFile {
+            inner: StdFile,
+            reads: AtomicUsize,
+        }
+        impl RandomAccessFile for CountingFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.inner.read_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn sync_data(&self) -> std::io::Result<()> {
+                self.inner.sync_data()
+            }
+            fn sync_all(&self) -> std::io::Result<()> {
+                self.inner.sync_all()
+            }
+            fn len(&self) -> std::io::Result<u64> {
+                self.inner.len()
+            }
+            fn set_len(&self, len: u64) -> std::io::Result<()> {
+                self.inner.set_len(len)
+            }
+            fn splice_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+                self.inner.splice_fd()
+            }
+        }
+
+        const N: u64 = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let file = Arc::new(CountingFile {
+            inner: StdFile::create(&dir.path().join("seg.log")).unwrap(),
+            reads: AtomicUsize::new(0),
+        });
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        for i in 0..N {
+            w.append(&rec(i, &[u8::try_from(i % 251).unwrap(); 24]))
+                .unwrap();
+        }
+        w.sync().unwrap();
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let (positions, valid_end) = reader.record_byte_positions().unwrap();
+
+        // Count ONLY the assembly: the anchor walk over the whole N-record window plus the trim
+        // re-bound (leading-gap drop + re-cap), the exact pair `Log::read_range_fd_range` runs.
+        let before = file.reads.load(Ordering::Relaxed);
+        let (anchor, plan) = reader
+            .raw_fd_range_with_plan(positions[0], Offset::new(0), valid_end, usize::MAX, None)
+            .unwrap()
+            .expect("a StdFile-backed reader has a splice fd");
+        assert_eq!(anchor.record_count, N, "the walk admitted every record");
+        assert_eq!(
+            plan.len() as u64,
+            N,
+            "the plan carries one length per frame"
+        );
+        let anchor_start = anchor.file_offset;
+        let (_, _, first_offset, record_count, _) = trim_fd_run(
+            anchor_start,
+            0,
+            &plan,
+            3, // drop a leading gap, exercising the first trim loop
+            usize::MAX,
+            None,
+        );
+        let reads = file.reads.load(Ordering::Relaxed) - before;
+        assert_eq!(first_offset, 3);
+        assert_eq!(record_count, N - 3);
+        assert!(
+            reads <= 3,
+            "fd-run assembly of {N} records must cost O(few) positioned reads (one bulk window \
+             read), got {reads} — a per-record file walk has been re-introduced (#1198)"
         );
     }
 
