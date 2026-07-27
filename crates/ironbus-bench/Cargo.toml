@@ -65,6 +65,15 @@ path = "src/bin/cluster_consume_bench.rs"
 name = "cluster-durability-bench"
 path = "src/bin/cluster_durability_bench.rs"
 
+# Many-streams fsync-storm durable produce driver (#1192 S1, epic #1196; gates #1193): N producer
+# threads, EACH to its OWN named stream on a LIVE broker, one awaited `publish_to` per message (the
+# per-message storm shape both audits point at). Driven by the matched-VM harness scenario script
+# (docs/benchmarks/matched-vm-harness/storm2.sh) next to its method-identical Kafka-side twin
+# (StormProducers.java). On demand; off the per-PR CI path.
+[[bin]]
+name = "storm-produce"
+path = "src/bin/storm_produce.rs"
+
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.
