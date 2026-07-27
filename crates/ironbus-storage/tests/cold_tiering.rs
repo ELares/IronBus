@@ -27,6 +27,7 @@ use ironbus_core::clock::ManualClock;
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::cold::{
     cold_object_name, ColdStorageConfig, ColdStore, ColdStoreError, FsColdStore,
+    COLD_MANIFEST_DAMAGED_FILE, COLD_MANIFEST_FILE,
 };
 use ironbus_storage::fault::FaultFs;
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
@@ -674,4 +675,57 @@ fn reap_crash_orphan_cache_is_swept_at_open_and_the_leaked_object_on_attach() {
         tail, expected_tail,
         "all remaining data is durable and intact"
     );
+}
+
+/// The PR #1188 review CRITICAL, exact repro through the public API: offload a cold prefix,
+/// overwrite `cold-manifest.ckpt` with `0xFF` (external dual-slot damage — both slots
+/// nonzero-sequence, both CRC-bad), reopen (the broker still BOOTS: the manifest recovers as
+/// EMPTY, the #1142 availability discipline), attach the store — and every cold object (the SOLE
+/// durable copies of the offloaded records) must SURVIVE. Pre-fix, the attach-time orphan-object
+/// sweep took the empty-manifest floor fallback (the oldest LOCAL slot id, above every
+/// formerly-remote id) and hard-deleted them all. The damaged recovery is now durably recorded in
+/// the `cold-manifest.damaged` sentinel, and both startup sweeps refuse to run until an operator
+/// reconciles the cold store and deletes it.
+#[test]
+fn a_damaged_cold_manifest_never_lets_the_attach_sweep_destroy_the_sole_copies() {
+    let data_fs = InMemoryFs::new();
+    let cold_fs = InMemoryFs::new();
+    let offloaded;
+    {
+        let mut log = Log::open(data_fs.clone(), ManualClock::new(), config()).unwrap();
+        log.set_cold_store(
+            Arc::new(FsColdStore::new(cold_fs.clone())),
+            ColdStorageConfig::enabled(1),
+        );
+        append_n(&mut log, 60);
+        offloaded = log.offload_cold_segments().unwrap();
+        assert!(offloaded >= 2, "need a real offloaded prefix");
+    }
+    for id in 0..offloaded {
+        assert!(cold_fs.exists(&cold_object_name(id)).unwrap());
+    }
+    // The external damage: 0xFF over BOTH dual-slot checkpoint slots.
+    let ckpt = data_fs.open(COLD_MANIFEST_FILE).unwrap();
+    let len = usize::try_from(ckpt.len().unwrap()).unwrap();
+    ckpt.write_all_at(&vec![0xFF; len], 0).unwrap();
+    ckpt.sync_all().unwrap();
+
+    // RESTART: boots (availability over consistency), durably records the damage.
+    let mut log = Log::open(data_fs.clone(), ManualClock::new(), config()).unwrap();
+    assert!(
+        data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+        "the damaged recovery is durably recorded in the sentinel"
+    );
+
+    // ATTACH: the orphan-object sweep must REFUSE — every sole-copy object survives.
+    log.set_cold_store(
+        Arc::new(FsColdStore::new(cold_fs.clone())),
+        ColdStorageConfig::enabled(1),
+    );
+    for id in 0..offloaded {
+        assert!(
+            cold_fs.exists(&cold_object_name(id)).unwrap(),
+            "sole copy of object {id} must SURVIVE the damaged-manifest attach"
+        );
+    }
 }

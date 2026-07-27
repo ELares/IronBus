@@ -141,6 +141,33 @@ Offload runs best-effort on the retention tick and never fails a produce: a cold
 manifest is surfaced on the `ironbus_cold_offload_errors_total{reason}` counter (plus a `warn!`) and
 retried on the next tick. See [`METRICS.md`](METRICS.md).
 
+## Damaged manifest: the `cold-manifest.damaged` sentinel (operator runbook)
+
+The manifest checkpoint is dual-slot + CRC'd; a file whose BOTH slots carry a nonzero sequence yet
+BOTH fail their CRC is impossible from any crash, so it is provable EXTERNAL damage (bit rot, a lost
+extent, an operator overwrite). Per the #1142 discipline the broker still boots: the manifest
+recovers as EMPTY (surfaced on `ironbus_checkpoint_damaged_total{artifact="cold_manifest"}`), and the
+offloaded prefix becomes unreachable until reconciled — but is never silently deleted.
+
+A broker that cannot read its manifest can no longer prove ANY cold object is reaped. So at
+damaged-recovery time the log durably records the fact in a `cold-manifest.damaged` sentinel file
+next to the manifest (fsynced file, then fsynced directory entry), and BOTH #1153 startup orphan
+sweeps — the local restore-cache sweep at open and the cold-object sweep at backend attach — refuse
+to run while the sentinel exists (or while the in-memory damaged flag from the current boot is set),
+warning on every refusal. The durability is load-bearing: the next successful offload persists a
+fresh, VALID manifest over the damaged file, after which a later boot would see a healthy manifest
+whose remote floor sits above every formerly-remote id — without the sentinel, the object sweep
+would then classify every one of those objects "provably reaped" and destroy the sole copies.
+
+Recovery is an explicit operator action, in this order:
+
+1. Reconcile the cold store against the log: list the objects under this log's store root/prefix and
+   compare them with the current manifest (`cold-manifest.ckpt`) and your retention expectations.
+   Restore, archive, or deliberately discard anything the post-damage manifest no longer references —
+   those objects are the only remaining copies of whatever was offloaded before the damage.
+2. Delete `cold-manifest.damaged` from the log's data directory. Nothing else clears it.
+3. Restart (or re-attach the backend): both sweeps run normally again.
+
 ## Phase 2 scope vs deferred
 
 **Phase 2 (this change):** the `S3ColdStore` backend (SigV4 over aws-lc-rs; HTTPS over rustls +
@@ -150,5 +177,7 @@ the SigV4 test-vector proof + the full `ColdStore` contract + a log-driven offlo
 **Deferred (backend-agnostic follow-ups):** operator-facing CLI/serve wiring to select+configure the
 backend; IAM/ECS/STS credential auto-resolution; automatic OS/bundled TLS trust roots (so `ca_pem` is
 optional); connection pooling; a local restore cache with eviction; offload of compacted (v2) segments;
-async/background off-actor offload/prefetch; a startup orphan-object sweep. None touch the backend's
-signing or wire format.
+async/background off-actor offload/prefetch. None touch the backend's signing or wire format. (The
+startup orphan sweep, deferred here, shipped in #1153 for backends that can enumerate — `FsColdStore`
+today; `S3ColdStore` still skips it, `list()` being unimplemented there. It is sound only while
+exactly one log owns the store root — see #1190.)

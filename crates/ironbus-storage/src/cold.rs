@@ -61,6 +61,19 @@ pub const DEFAULT_KEEP_RECENT_SEGMENTS: u64 = 4;
 /// offloads has a byte-for-byte unchanged data directory (the default-OFF conformance guarantee).
 pub const COLD_MANIFEST_FILE: &str = "cold-manifest.ckpt";
 
+/// The durable DAMAGED-MANIFEST sentinel, written (fsynced file + directory entry) next to
+/// [`COLD_MANIFEST_FILE`] the moment a manifest open classifies the checkpoint as externally
+/// DAMAGED ([`RecoveredCheckpoint::Damaged`](crate::checkpoint::RecoveredCheckpoint), #1142) and
+/// recovers it as empty. While this file exists, BOTH #1153 startup orphan sweeps (the local
+/// restore-cache sweep at `Log::open` and the cold-object sweep at `Log::set_cold_store`) REFUSE
+/// to run: an empty-recovered manifest proves nothing about which objects are reaped, so any
+/// "provably reaped" classification could destroy the SOLE durable copy of offloaded records.
+/// Durability matters — a later offload persists a fresh, VALID manifest over the damaged file,
+/// after which only this sentinel still records that the remote set was lost (the delayed-destruction
+/// variant). It is cleared ONLY by explicit operator action after reconciling the cold store against
+/// the log (see `docs/TIERED_STORAGE.md`).
+pub const COLD_MANIFEST_DAMAGED_FILE: &str = "cold-manifest.damaged";
+
 /// The subdirectory of a log's data directory into which the startup orphan sweep (#1153)
 /// QUARANTINE-relocates a local `seg-<id>.log` file it cannot PROVE is a reaped-and-forgotten
 /// restore-cache leftover: the bytes are preserved for forensics (never destroyed on ambiguity),
@@ -1341,6 +1354,11 @@ impl ColdEntry {
 pub(crate) struct ColdManifest<F: RandomAccessFile> {
     checkpoint: ColdManifestCheckpoint<F>,
     entries: BTreeMap<u64, ColdEntry>,
+    /// Whether this open recovered the checkpoint from EXTERNAL damage (both slots nonzero-sequence
+    /// yet CRC-bad, #1142) as an EMPTY entry set. Carried for the manifest's lifetime so the #1153
+    /// orphan sweeps can fail closed: an empty-recovered manifest proves NOTHING about which cold
+    /// objects are reaped, and sweeping against it would destroy sole-copy remote data.
+    recovered_damaged: bool,
 }
 
 impl<F: RandomAccessFile> std::fmt::Debug for ColdManifest<F> {
@@ -1348,6 +1366,7 @@ impl<F: RandomAccessFile> std::fmt::Debug for ColdManifest<F> {
         // Unconditional (no `F: Debug` bound) so `Log`'s derived `Debug` holds for every `F::File`.
         f.debug_struct("ColdManifest")
             .field("entries", &self.entries.len())
+            .field("recovered_damaged", &self.recovered_damaged)
             .finish_non_exhaustive()
     }
 }
@@ -1357,14 +1376,17 @@ impl<F: RandomAccessFile> ColdManifest<F> {
     /// recovers as an empty manifest; a payload that is present but undecodable fails closed
     /// ([`StorageError::ColdManifestCorrupt`]); externally-damaged dual slots are surfaced on the
     /// `ironbus_checkpoint_damaged_total{artifact="cold_manifest"}` counter and then recovered as
-    /// empty (the #1142 discipline).
+    /// empty (the #1142 availability discipline) — but the damage is ALSO carried on the returned
+    /// manifest ([`ColdManifest::recovered_damaged`]) so the caller can durably record it and the
+    /// #1153 orphan sweeps can refuse to reason from an entry set that proves nothing.
     ///
     /// # Errors
     /// Returns [`StorageError::ColdManifestCorrupt`] on a CRC-valid but structurally invalid payload,
     /// or an IO error.
     pub(crate) fn open(file: F) -> Result<ColdManifest<F>, StorageError> {
         let (checkpoint, recovered) = ColdManifestCheckpoint::open(file)?;
-        if recovered.is_damaged() {
+        let recovered_damaged = recovered.is_damaged();
+        if recovered_damaged {
             record_checkpoint_damage(CheckpointArtifact::ColdManifest);
         }
         let entries = match recovered {
@@ -1375,7 +1397,15 @@ impl<F: RandomAccessFile> ColdManifest<F> {
         Ok(ColdManifest {
             checkpoint,
             entries,
+            recovered_damaged,
         })
+    }
+
+    /// Whether THIS open recovered the checkpoint from external dual-slot damage (#1142) as empty.
+    /// The in-memory half of the fail-closed pair guarding the #1153 orphan sweeps; the durable half
+    /// is the [`COLD_MANIFEST_DAMAGED_FILE`] sentinel the `Log` writes at damaged-recovery time.
+    pub(crate) fn recovered_damaged(&self) -> bool {
+        self.recovered_damaged
     }
 
     /// Decodes a manifest payload into its entry map, fail-closed on any structural inconsistency.
