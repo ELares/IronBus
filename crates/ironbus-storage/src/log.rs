@@ -10,7 +10,8 @@
 //! separate later work.
 
 use crate::cold::{
-    cold_object_name, ColdEntry, ColdManifest, ColdStorageConfig, ColdStore, COLD_MANIFEST_FILE,
+    cold_object_name, parse_cold_object_name, ColdEntry, ColdManifest, ColdStorageConfig,
+    ColdStore, COLD_MANIFEST_DAMAGED_FILE, COLD_MANIFEST_FILE, COLD_ORPHANS_SUBDIR,
 };
 use crate::fs::Filesystem;
 use crate::io::{InMemoryFile, RandomAccessFile};
@@ -1401,6 +1402,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // authoritative, contiguous chain for those ids; the on-disk cache copy is reconciled on
         // read (`ensure_segment_local` verifies it against the manifest before trusting it).
         let cold_manifest = Self::open_cold_manifest(&fs)?;
+        // #1153: BEFORE any chain reasoning, sweep local `seg-<id>.log` files ORPHANED by a crash
+        // mid-reap. The reap's crash-safe ordering (durable manifest-entry removal FIRST, then
+        // best-effort object + cache-file deletes) can leave a surviving restore-cache file for a
+        // now-reaped id sitting BELOW the still-remote prefix; the strict chain-continuity scan
+        // would hard-fail `SegmentChainBroken` on the gap and the broker would not boot. The sweep
+        // classifies against the freshly-recovered DURABLE manifest (never in-memory state) and is
+        // idempotent, so a crash mid-sweep re-runs cleanly at the next open. Absent manifest =>
+        // no-op (the default-OFF, byte-identical path).
+        if let Some(manifest) = cold_manifest.as_ref() {
+            Self::sweep_reaped_orphan_caches(&fs, manifest)?;
+        }
         let remote_ids: std::collections::BTreeSet<u64> = cold_manifest
             .as_ref()
             .map_or_else(std::collections::BTreeSet::new, |m| {
@@ -4553,9 +4565,20 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// analogue of `Engine::set_compaction_config`: the engine constructs a per-log-rooted backend and
     /// installs it here after [`Log::open`]. Enabling offload writes no bytes by itself — the first
     /// [`Log::offload_cold_segments`] call is what lazily creates the manifest and tiers segments out.
+    ///
+    /// SINGLE-OWNER CONTRACT (#1190): the store attached here must be rooted for THIS log alone —
+    /// exactly one log per store root. The attach-time [`Log::sweep_orphan_cold_objects`] deletes
+    /// any listed object its own manifest cannot account for, so a shared root would turn another
+    /// log's live objects into this log's "orphans" (see the sweep's doc comment for the required
+    /// prefix-scoping before any root sharing).
     pub fn set_cold_store(&mut self, store: Arc<dyn ColdStore>, config: ColdStorageConfig) {
         self.cold_store = Some(store);
         self.cold_config = config;
+        // #1153: with a backend now attached (the first moment after open a store handle exists),
+        // best-effort sweep the bounded object leak a crash mid-reap can leave. Safe on every
+        // attach: it deletes only objects PROVABLY reaped per the durable manifest, and a backend
+        // that cannot enumerate skips it.
+        self.sweep_orphan_cold_objects();
     }
 
     /// The tiered-storage policy currently in effect.
@@ -4590,7 +4613,324 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             return Ok(None);
         }
         let file = fs.open(COLD_MANIFEST_FILE).map_err(StorageError::Io)?;
-        Ok(Some(ColdManifest::open(file)?))
+        let manifest = ColdManifest::open(file)?;
+        if manifest.recovered_damaged() {
+            Self::record_cold_manifest_damage(fs)?;
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Durably records that the cold manifest recovered from EXTERNAL dual-slot damage (#1142) as
+    /// EMPTY, by writing the fsynced [`COLD_MANIFEST_DAMAGED_FILE`] sentinel (file, then directory
+    /// entry) into the manifest's directory at damaged-recovery time. Idempotent: an
+    /// already-present sentinel (a reboot on the still-damaged file, or a crash after a prior
+    /// write) keeps its content, but the directory is fsynced AGAIN — the prior boot may have
+    /// crashed (or hit an IO error) after creating the entry and before its dir fsync, so every
+    /// successful return of this function must leave the entry DURABLE, not merely present
+    /// (#1188 review).
+    ///
+    /// The DURABILITY is the point: on the damaged boot itself the in-memory
+    /// [`ColdManifest::recovered_damaged`] flag already blocks the #1153 sweeps, but the next
+    /// offload persists a fresh VALID manifest over the damaged file — after which a LATER boot
+    /// would see a healthy manifest with a high remote floor and (without this sentinel) the
+    /// object sweep would classify every formerly-remote object "provably reaped" and destroy the
+    /// sole copies (the delayed variant of the same bug). Only explicit operator deletion clears
+    /// the sentinel (see `docs/TIERED_STORAGE.md`).
+    fn record_cold_manifest_damage(fs: &F) -> Result<(), StorageError> {
+        match fs.create_new(COLD_MANIFEST_DAMAGED_FILE) {
+            Ok(file) => {
+                let msg =
+                    b"The cold-segment manifest (cold-manifest.ckpt) was found externally DAMAGED \
+                    (both checkpoint slots CRC-bad) and was recovered as EMPTY (#1142). The #1153 \
+                    startup orphan sweeps are DISABLED while this file exists: with the true remote \
+                    set unknown, 'provably reaped' cannot be proven and a sweep could destroy the \
+                    sole copies of offloaded segments. Reconcile the cold store against the log \
+                    (see docs/TIERED_STORAGE.md), then delete this file to re-enable the sweeps.\n";
+                file.write_all_at(msg, 0)?;
+                file.sync_all()?;
+            }
+            // Recorded by a prior boot on the same damaged file — but not necessarily DURABLY:
+            // that boot may have crashed (or hit an IO error) after `create_new` and before its
+            // `sync_dir`, leaving a directory entry a power loss would still drop. Fall through
+            // to the dir fsync below instead of early-returning, so EVERY successful return of
+            // this function leaves the entry durable. (Only the entry's EXISTENCE is
+            // load-bearing — the sweep guard probes existence, not content.)
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(StorageError::Io(e)),
+        }
+        // The sentinel's directory entry must survive a power loss, or a later boot on the
+        // persisted-over (valid-again) manifest would sweep unguarded. Runs on the AlreadyExists
+        // path too (one dir fsync per damaged boot): a sentinel that exists but is not durable
+        // would otherwise stay non-durable forever on that path, and the next offload's heal
+        // followed by a power cut would drop it while the healed manifest survives.
+        fs.sync_dir().map_err(StorageError::Io)?;
+        tracing::warn!(
+            sentinel = COLD_MANIFEST_DAMAGED_FILE,
+            "cold manifest recovered from EXTERNAL dual-slot damage as EMPTY; the durable \
+             damaged-manifest sentinel is recorded — the startup orphan sweeps stay disabled \
+             until an operator reconciles the cold store and deletes the sentinel (see \
+             docs/TIERED_STORAGE.md)"
+        );
+        Ok(())
+    }
+
+    /// The shared fail-closed guard of BOTH #1153 orphan sweeps: refuses (returns `true`, with an
+    /// operator-facing warning) while the manifest's in-memory damaged flag is set OR the durable
+    /// [`COLD_MANIFEST_DAMAGED_FILE`] sentinel exists. Defense-in-depth on purpose — the flag
+    /// covers the damaged boot itself even if the sentinel write raced a crash, and the sentinel
+    /// covers every LATER boot after a fresh manifest has persisted over the damaged file (the
+    /// delayed-destruction variant). `sweep` names the refusing sweep in the warning.
+    ///
+    /// # Errors
+    /// Propagates the sentinel-probe IO error; the caller must not sweep on a directory it could
+    /// not even probe.
+    fn cold_orphan_sweeps_blocked(
+        fs: &F,
+        manifest: &ColdManifest<F::File>,
+        sweep: &'static str,
+    ) -> Result<bool, StorageError> {
+        let damaged_flag = manifest.recovered_damaged();
+        let sentinel = fs
+            .exists(COLD_MANIFEST_DAMAGED_FILE)
+            .map_err(StorageError::Io)?;
+        if damaged_flag || sentinel {
+            tracing::warn!(
+                sweep,
+                recovered_damaged = damaged_flag,
+                sentinel_present = sentinel,
+                sentinel_file = COLD_MANIFEST_DAMAGED_FILE,
+                "cold-storage orphan sweep REFUSED: the cold manifest previously recovered from \
+                 EXTERNAL dual-slot damage as EMPTY (#1142), so nothing is provably reaped and a \
+                 sweep could destroy sole-copy cold objects; reconcile the cold store against the \
+                 log, then delete the cold-manifest.damaged sentinel to re-enable the sweeps (see \
+                 docs/TIERED_STORAGE.md)"
+            );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The startup ORPHAN sweep (#1153, the follow-up #1152 deferred): reconciles every local
+    /// `seg-<id>.log` file against the freshly-recovered durable cold manifest, at open, BEFORE the
+    /// chain-continuity scan, and clears the one state the crash-safe reap ordering can leave that
+    /// blocks a boot. A reap of a REMOTE segment durably removes the manifest entry FIRST and only
+    /// then best-effort deletes the cold object and any restore-cache file; a crash in between
+    /// leaves a local file for a now-reaped id BELOW the still-remote prefix — a local-chain gap the
+    /// strict scan hard-fails as `SegmentChainBroken` (no loss: the id was already retention-reaped,
+    /// and every retained byte is still remote + local), leaving the broker unbootable without
+    /// manual cleanup.
+    ///
+    /// ## The classification (computed ONLY from the durable manifest, fail-closed)
+    /// With `min`/`max` the smallest/largest manifest-REMOTE ids (an EMPTY manifest sweeps
+    /// nothing — there is no remote prefix to be provably below), each local `seg-<id>.log` is:
+    /// - `id` in the manifest → a legitimate restore CACHE (or the benign lingering local copy of
+    ///   the offload crash window). NEVER touched here; the existing purge-and-splice reconciles it.
+    /// - `id > max` → a LIVE-chain candidate (every live local segment sits ABOVE the remote
+    ///   prefix: ordinary ids are monotonic in offset, the remote set is the oldest contiguous
+    ///   prefix, and a compacted segment's id postdates everything it covers). NEVER touched here;
+    ///   recovery owns it.
+    /// - `id < min` → PROVABLY a reaped-and-forgotten orphan: absent from the durable manifest AND
+    ///   strictly below the still-remote prefix, so no live chain, no manifest entry, and no future
+    ///   read can reference it. Hard-DELETED — this simply completes the interrupted reap's own
+    ///   best-effort delete.
+    /// - `min < id < max` and NOT in the manifest → a hole INSIDE the remote prefix, impossible by
+    ///   the offload invariant (the remote set is a contiguous prefix), so the state is ambiguous.
+    ///   Fail-closed: QUARANTINE-relocated into the `orphans/` subdirectory — the bytes are
+    ///   preserved verbatim for forensics (never destroyed on ambiguity) while the flat directory
+    ///   is cleared so recovery can reason from the manifest alone.
+    ///
+    /// Idempotent by construction: the classification is a pure function of (directory, durable
+    /// manifest), deletes tolerate absence, and the relocate is copy-fsync-then-unlink with an
+    /// overwrite-tolerant copy, so a crash at ANY point mid-sweep re-runs to the same end state at
+    /// the next open. Runs only when a manifest exists, so a log that never offloaded keeps its
+    /// byte-for-byte-untouched data directory.
+    ///
+    /// ## Damaged-manifest refusal (fail-closed)
+    /// The whole classification is a pure function of the DURABLE manifest — so it is only sound
+    /// when the manifest is trustworthy. A manifest that recovered from external dual-slot damage
+    /// as EMPTY (#1142) proves nothing, and the durable [`COLD_MANIFEST_DAMAGED_FILE`] sentinel
+    /// records that state across later rewrites; while either holds
+    /// ([`Log::cold_orphan_sweeps_blocked`]), this sweep REFUSES to touch anything and warns. The
+    /// sentinel is cleared ONLY by explicit operator action after reconciling the cold store
+    /// against the log (see `docs/TIERED_STORAGE.md`).
+    ///
+    /// # Errors
+    /// Propagates a real IO error (never masked into a skipped file), exactly like the REMOTE-cache
+    /// purge that follows it; recovery then fails visibly rather than reasoning over a directory it
+    /// could not reconcile.
+    fn sweep_reaped_orphan_caches(
+        fs: &F,
+        manifest: &ColdManifest<F::File>,
+    ) -> Result<(), StorageError> {
+        if Self::cold_orphan_sweeps_blocked(fs, manifest, "reaped-orphan-caches")? {
+            return Ok(());
+        }
+        let entries = manifest.entries();
+        let (Some((&min_remote, _)), Some((&max_remote, _))) =
+            (entries.first_key_value(), entries.last_key_value())
+        else {
+            // An empty manifest has no remote prefix to be provably below: nothing is classifiable,
+            // so nothing is touched (fail-closed default).
+            return Ok(());
+        };
+        let mut changed = false;
+        for id in segment_ids(fs)? {
+            if id > max_remote || manifest.contains(id) {
+                continue;
+            }
+            let name = segment_file_name(id);
+            if id < min_remote {
+                // PROVABLY reaped (see above): complete the interrupted reap's delete. Tolerate a
+                // concurrent absence so a re-run after a crash mid-sweep is a clean no-op.
+                match fs.remove(&name) {
+                    Ok(()) => changed = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(StorageError::Io(e)),
+                }
+            } else {
+                // A non-manifest id INSIDE the remote prefix: ambiguous, so preserve the bytes.
+                Self::quarantine_relocate_orphan(fs, &name)?;
+                changed = true;
+            }
+        }
+        if changed {
+            // One durable directory sync covers every unlink above (same-dir batching, as the
+            // REMOTE-cache purge below does).
+            fs.sync_dir().map_err(StorageError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// The bounded chunk size of [`Log::quarantine_relocate_orphan`]'s streaming copy (1 MiB):
+    /// large enough to amortize per-call IO overhead, small enough that boot memory never scales
+    /// with the orphan's size.
+    const QUARANTINE_COPY_CHUNK_BYTES: u64 = 1 << 20;
+
+    /// QUARANTINE-relocates one ambiguous orphan file into the `orphans/` subdirectory (#1153):
+    /// copy the bytes, fsync the copy and the subdirectory, and only THEN unlink the original (the
+    /// caller dir-syncs the parent). Never destroys bytes — the copy is durable before the unlink —
+    /// and idempotent across a crash at any step: a partial copy left by a crashed sweep is simply
+    /// REWRITTEN from the still-present original on the re-run (open-or-create + exact `set_len`,
+    /// the same overwrite discipline as `FsColdStore::put`).
+    ///
+    /// The copy STREAMS in bounded chunks ([`Self::QUARANTINE_COPY_CHUNK_BYTES`]): an orphan can be
+    /// a full segment and this runs at BOOT, so a whole-file `Vec` would make startup memory scale
+    /// with the largest orphan (an OOM hazard), for zero durability benefit — the ordering
+    /// guarantee lives in the fsync-then-unlink sequencing, not in the copy's granularity.
+    fn quarantine_relocate_orphan(fs: &F, name: &str) -> Result<(), StorageError> {
+        let source = fs.open(name)?;
+        let len = source.len()?;
+        let orphans = fs.subdir(COLD_ORPHANS_SUBDIR)?;
+        let dest = match orphans.create_new(name) {
+            Ok(file) => file,
+            // A prior crashed sweep may have left a partial copy: rewrite it from the original.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => orphans.open(name)?,
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        let mut buf = vec![
+            0u8;
+            usize::try_from(len.min(Self::QUARANTINE_COPY_CHUNK_BYTES))
+                .expect("chunk is bounded to 1 MiB, which fits usize")
+        ];
+        let mut offset = 0u64;
+        while offset < len {
+            let n_u64 = (len - offset).min(Self::QUARANTINE_COPY_CHUNK_BYTES);
+            let n = usize::try_from(n_u64).expect("chunk is bounded to 1 MiB, which fits usize");
+            source.read_exact_at(&mut buf[..n], offset)?;
+            dest.write_all_at(&buf[..n], offset)?;
+            offset += n_u64;
+        }
+        dest.set_len(len)?;
+        dest.sync_all()?;
+        orphans.sync_dir()?;
+        // The copy is durable: the original may now leave the flat directory.
+        fs.remove(name)?;
+        Ok(())
+    }
+
+    /// Best-effort startup sweep of ORPHANED cold OBJECTS (#1153): deletes any object whose id is
+    /// provably reaped — absent from the durable manifest AND strictly below the floor no retained
+    /// data sits under (the smallest still-remote id) — closing the bounded object leak a crash
+    /// between the reap's durable manifest-entry removal and its best-effort object delete can
+    /// leave. Runs when the backend is attached (`Log::set_cold_store`, the first moment a store
+    /// handle exists after open).
+    ///
+    /// An EMPTY manifest sweeps NOTHING: with no remote prefix, "provably reaped" is unprovable —
+    /// in particular a manifest that recovered from external damage as empty (#1142) would make
+    /// every formerly-remote object look reaped, and deleting them destroys the SOLE copies. (The
+    /// one leak this refusal leaves — every remote segment reaped and the last object delete
+    /// crashed — is bounded and is cleared by this same sweep after the next offload re-establishes
+    /// a min-remote floor.) For the damaged case specifically the refusal is durable: the sweep
+    /// also refuses while [`Log::cold_orphan_sweeps_blocked`] holds (the in-memory damaged flag or
+    /// the [`COLD_MANIFEST_DAMAGED_FILE`] sentinel), which is what blocks the DELAYED variant where
+    /// a later offload persists a healthy-looking manifest over the damaged file.
+    ///
+    /// ## Single-owner contract (#1190)
+    /// LIST-BASED sweeping is sound ONLY while exactly ONE log owns the store root: `list()`
+    /// returning a key this log's manifest does not know is precisely what "orphan" MEANS here. If
+    /// two logs ever shared one root (they do not today — the engine roots each backend per log,
+    /// and `Log::set_cold_store` documents the contract at the attach point), each log's live
+    /// objects would be the other's "orphans" and this sweep would destroy them. Any future
+    /// root-sharing must move to per-log key prefixes with a prefix-scoped `list()` BEFORE this
+    /// sweep may keep running (ref #1190).
+    ///
+    /// NEVER deletes (a) an object the manifest still records REMOTE (the sole durable copy of live
+    /// data — the manifest check is the safety property, the floor is belt-and-braces), (b) an
+    /// object at or above the floor (a crash mid-offload legitimately leaves an uncommitted upload
+    /// for a still-local id; the idempotent re-offload overwrites it), or (c) any key that does not
+    /// parse as a canonical cold-object name (a foreign object is never classified). Best-effort
+    /// throughout — a list/delete failure only defers the sweep to the next open, exactly as the
+    /// reap treats its own object delete — and a backend that cannot enumerate (`list() == None`,
+    /// e.g. the S3 backend) skips it entirely, leaving today's bounded-leak behavior.
+    fn sweep_orphan_cold_objects(&self) {
+        let Some(store) = self.cold_store.as_ref() else {
+            return;
+        };
+        let Some(manifest) = self.cold_manifest.as_ref() else {
+            return;
+        };
+        match Self::cold_orphan_sweeps_blocked(&self.fs, manifest, "orphan-cold-objects") {
+            Ok(false) => {}
+            // Blocked: refuse (the guard already warned).
+            Ok(true) => return,
+            // The sentinel could not even be probed: refuse, with a DISTINCT warning — the
+            // guard's blocked-warning never fired on this path, and a persistently unreadable
+            // directory must not silently conceal the damage state. This sweep is best-effort
+            // by contract, and fail-closed beats sweeping over a directory whose damage record
+            // is unreadable.
+            Err(e) => {
+                tracing::warn!(
+                    sweep = "orphan-cold-objects",
+                    error = %e,
+                    sentinel_file = COLD_MANIFEST_DAMAGED_FILE,
+                    "cold-storage orphan sweep REFUSED: probing the damaged-manifest sentinel \
+                     FAILED, so the damage state is unknown; nothing is swept until the probe \
+                     succeeds (fail-closed)"
+                );
+                return;
+            }
+        }
+        let Some((&min_remote, _)) = manifest.entries().first_key_value() else {
+            // An EMPTY manifest proves nothing is reaped-remote (see above): sweep NOTHING. The
+            // superficially-attractive fallback floor (the oldest LOCAL slot id) sits ABOVE every
+            // formerly-remote id, so on an empty-recovered manifest it would classify every remote
+            // object "provably reaped" and hard-delete the only copies.
+            return;
+        };
+        let floor = min_remote;
+        let Ok(Some(keys)) = store.list() else {
+            return;
+        };
+        for key in keys {
+            let Some(id) = parse_cold_object_name(&key) else {
+                continue;
+            };
+            if id < floor && !manifest.contains(id) {
+                // Idempotent delete (absent is Ok), best-effort: a failure leaves the same bounded
+                // leak this sweep exists to clear, retried at the next open.
+                let _ = store.delete(&key);
+            }
+        }
     }
 
     /// Splices ALL the manifest's offloaded segments into `self.segments` as a contiguous PREFIX below
@@ -4685,7 +5025,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             self.fs.sync_dir().map_err(StorageError::Io)?;
             f
         };
-        self.cold_manifest = Some(ColdManifest::open(file)?);
+        let manifest = ColdManifest::open(file)?;
+        if manifest.recovered_damaged() {
+            // Unreachable through Log::open (which would have installed the manifest), but if a
+            // manifest file ever materializes between open and first offload, record its damage
+            // with the same durable fail-closed discipline.
+            Self::record_cold_manifest_damage(&self.fs)?;
+        }
+        self.cold_manifest = Some(manifest);
         Ok(())
     }
 
@@ -13116,6 +13463,724 @@ mod tests {
                 assert_eq!(&r.payload[..], survivors[i], "survivor {i} decrypts");
                 assert_eq!(&r.key[..], b"k");
                 assert!(!r.flags.contains(RecordFlags::ENCRYPTED));
+            }
+        }
+    }
+
+    /// #1153: the startup orphan/restore-cache sweep for the reap-crash chain-gap edge. A reap of a
+    /// REMOTE segment durably removes its manifest entry FIRST and only then best-effort deletes
+    /// the cold object and any restore-cache file; a crash in between leaves a local `seg-<id>.log`
+    /// for a now-reaped id BELOW the still-remote prefix (an unbootable `SegmentChainBroken` gap)
+    /// and a leaked cold object. These tests build that EXACT crash state through the public API
+    /// (an armed unlink fault + a delete-refusing backend on a real offload/restore/reap sequence)
+    /// and prove: the pre-sweep scan fails, the swept open boots with every retained byte intact,
+    /// the classification never touches a live or REMOTE file, the leaked object is swept when the
+    /// backend attaches (never a REMOTE object), and the whole sweep is idempotent across crashes.
+    mod cold_orphan_sweep {
+        use super::*;
+        use crate::cold::{ColdStoreError, FsColdStore};
+        use crate::fault::FaultFs;
+
+        /// Small segments so a modest workload rolls across many sealed segments (the cold-tiering
+        /// test shape).
+        fn cold_cfg() -> LogConfig {
+            LogConfig {
+                max_segment_bytes: 256,
+                ..LogConfig::default()
+            }
+        }
+
+        /// A [`ColdStore`] whose `delete` ALWAYS fails: the reap's best-effort object delete then
+        /// behaves exactly as a crash at that step (the manifest entry is already durably gone, the
+        /// object survives). `list` keeps the trait default (`None`), so attaching THIS store never
+        /// runs the object sweep — the crash state stays inert while it is being built.
+        #[derive(Debug)]
+        struct RefusingDeleteStore {
+            inner: FsColdStore<InMemoryFs>,
+        }
+
+        impl ColdStore for RefusingDeleteStore {
+            fn put(&self, key: &str, bytes: &[u8]) -> Result<(), ColdStoreError> {
+                self.inner.put(key, bytes)
+            }
+            fn get(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+                self.inner.get(key)
+            }
+            fn delete(&self, _key: &str) -> Result<(), ColdStoreError> {
+                Err(ColdStoreError::Io(std::io::Error::other(
+                    "injected: the process crashed before the reap's object delete",
+                )))
+            }
+            fn exists(&self, key: &str) -> Result<bool, ColdStoreError> {
+                self.inner.exists(key)
+            }
+        }
+
+        /// Reads every retained record from `start` as `(offset, payload)` pairs.
+        fn read_tail<F: Filesystem>(
+            log: &Log<F, ManualClock>,
+            start: Offset,
+        ) -> Vec<(u64, Vec<u8>)> {
+            log.read_from(start, 100_000)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.offset.get(), r.payload.to_vec()))
+                .collect()
+        }
+
+        /// Builds the EXACT #1153 crash state on a durable in-memory disk and returns
+        /// `(data_fs, cold_fs, expected_tail, earliest)`: a real offload tiers the oldest segments
+        /// out, restore-on-access re-materializes their cache files, and then `orphans` successive
+        /// reaps of the (remote) oldest segment each "crash" between the DURABLE manifest-entry
+        /// removal and the best-effort deletes — so each reaped id leaves BOTH a surviving
+        /// restore-cache file below the still-remote prefix AND a leaked cold object.
+        fn build_reap_crash_state(
+            orphans: u64,
+        ) -> (InMemoryFs, InMemoryFs, Vec<(u64, Vec<u8>)>, Offset) {
+            let data_fs = InMemoryFs::new();
+            let cold_fs = InMemoryFs::new();
+            let (fault_fs, control) = FaultFs::new(data_fs.clone());
+            let mut log = Log::open(fault_fs, ManualClock::new(), cold_cfg()).unwrap();
+            log.set_cold_store(
+                Arc::new(RefusingDeleteStore {
+                    inner: FsColdStore::new(cold_fs.clone()),
+                }),
+                ColdStorageConfig::enabled(1),
+            );
+            for i in 0..60u64 {
+                log.append(&Append {
+                    timestamp_ms: 1_700_000_000_000 + i,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: &i.to_le_bytes(),
+                })
+                .unwrap();
+                log.sync().unwrap();
+            }
+            let offloaded = log.offload_cold_segments().unwrap();
+            assert!(
+                offloaded > orphans,
+                "need a still-remote prefix ABOVE the reaped ids (offloaded {offloaded}, \
+                 reaping {orphans})"
+            );
+            // Restore-on-access: reading the offloaded prefix re-materializes each remote
+            // segment's `seg-<id>.log` as a verified restore-cache file.
+            let _ = log.read_from(Offset::ZERO, 100_000).unwrap();
+            for id in 0..offloaded {
+                assert!(
+                    data_fs.exists(&segment_file_name(id)).unwrap(),
+                    "the restore cache for remote segment {id} must exist"
+                );
+            }
+            // The interrupted reaps, oldest-first: each durable manifest-entry removal COMMITS,
+            // then the object delete fails (the refusing store) and the cache-file unlink fails
+            // (the armed single-shot fault) — byte-for-byte the mid-reap crash window.
+            for id in 0..orphans {
+                control.fail_remove_on(1);
+                log.reap_oldest_forced().unwrap().expect("a segment reaped");
+                assert!(
+                    !log.is_segment_remote(id),
+                    "the manifest no longer records the reaped segment {id}"
+                );
+            }
+            let earliest = log.earliest_offset();
+            let expected_tail = read_tail(&log, earliest);
+            drop(log); // the "crash": nothing after the durable manifest removals ever ran
+            for id in 0..orphans {
+                assert!(
+                    data_fs.exists(&segment_file_name(id)).unwrap(),
+                    "the orphaned cache file for reaped segment {id} survived"
+                );
+                assert!(
+                    cold_fs.exists(&cold_object_name(id)).unwrap(),
+                    "the cold object for reaped segment {id} leaked"
+                );
+            }
+            (data_fs, cold_fs, expected_tail, earliest)
+        }
+
+        /// THE REPRO (#1153): on the exact crash state, the pre-sweep recovery scan fails
+        /// `SegmentChainBroken` (the unbootable broker), and `Log::open` — which now runs the sweep
+        /// BEFORE the chain-continuity check — boots and serves every retained record intact.
+        #[test]
+        fn reap_crash_orphan_breaks_the_scan_and_the_sweep_heals_the_boot() {
+            let (data_fs, cold_fs, expected_tail, earliest) = build_reap_crash_state(1);
+
+            // (1) WITHOUT the sweep: the recovery enumeration (local seg files minus the manifest's
+            // REMOTE ids) hands the strict chain scan the orphan `seg-0.log` BELOW the still-remote
+            // prefix — a local-chain gap — and the scan hard-fails. This is precisely the scan the
+            // pre-#1153 `Log::open` ran on this state.
+            let manifest = ColdManifest::open(data_fs.open(COLD_MANIFEST_FILE).unwrap()).unwrap();
+            let ids: Vec<u64> = segment_ids(&data_fs)
+                .unwrap()
+                .into_iter()
+                .filter(|id| !manifest.contains(*id))
+                .collect();
+            assert!(
+                ids.contains(&0),
+                "the orphan is in the pre-sweep enumeration"
+            );
+            let Err(err) = Log::<InMemoryFs, ManualClock>::scan_recover_chain(&data_fs, &ids)
+            else {
+                panic!("without the sweep the scan must FAIL on the orphan's gap");
+            };
+            assert!(
+                matches!(err, StorageError::SegmentChainBroken { .. }),
+                "without the sweep the boot fails on the orphan's gap, got {err:?}"
+            );
+
+            // (2) WITH the sweep: the open SUCCEEDS, the orphan is gone, and the log resumes at the
+            // reap's earliest retained offset.
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert!(
+                !data_fs.exists(&segment_file_name(0)).unwrap(),
+                "the orphaned cache file was swept"
+            );
+            assert!(!log.is_segment_remote(0));
+            assert_eq!(log.earliest_offset(), earliest);
+            // (3) Every RETAINED record reads back intact (attach a backend for the remote fetches).
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            assert_eq!(
+                read_tail(&log, earliest),
+                expected_tail,
+                "all remaining data is durable and intact after the swept boot"
+            );
+        }
+
+        /// NEVER-DELETE-LIVE, at the classification level: for every bucket of the sweep's rule —
+        /// REMOTE (a legit restore cache), above the remote prefix (a live-chain candidate),
+        /// provably reaped (below the prefix, absent from the manifest), and the impossible
+        /// mid-prefix hole — only the provably-reaped file is deleted; the ambiguous one is
+        /// QUARANTINE-relocated byte-exact (never destroyed); the live and REMOTE files are never
+        /// touched. Running the sweep again changes nothing (idempotence of the classification).
+        #[test]
+        fn classification_deletes_only_provably_reaped_and_quarantines_ambiguity() {
+            let fs = InMemoryFs::new();
+            let mut manifest =
+                ColdManifest::open(fs.create_new(COLD_MANIFEST_FILE).unwrap()).unwrap();
+            for id in [2u64, 4] {
+                manifest
+                    .insert(ColdEntry {
+                        id,
+                        base_offset: id * 10,
+                        base_seq: id * 10,
+                        record_count: 10,
+                        max_timestamp_ms: 1,
+                        byte_len: 4096,
+                        crc32c: 0,
+                        compacted: false,
+                    })
+                    .unwrap();
+            }
+            // One local file per classification bucket, each with distinct bytes.
+            let write_seg = |id: u64, bytes: &[u8]| {
+                let f = fs.create_new(&segment_file_name(id)).unwrap();
+                f.write_all_at(bytes, 0).unwrap();
+                f.sync_all().unwrap();
+                fs.sync_dir().unwrap();
+            };
+            write_seg(0, b"reaped orphan below the remote prefix");
+            write_seg(2, b"legit restore cache for a REMOTE id");
+            write_seg(3, b"ambiguous hole INSIDE the remote prefix");
+            write_seg(6, b"live chain member above the prefix");
+
+            Log::<InMemoryFs, ManualClock>::sweep_reaped_orphan_caches(&fs, &manifest).unwrap();
+
+            // id 0 (< min REMOTE, absent from the manifest): PROVABLY reaped -> hard-deleted (the
+            // sweep completes the interrupted reap's own delete).
+            assert!(!fs.exists(&segment_file_name(0)).unwrap());
+            // id 2 (REMOTE): NEVER touched by the sweep.
+            assert!(fs.exists(&segment_file_name(2)).unwrap());
+            // id 6 (> max REMOTE): a live-chain candidate, NEVER touched.
+            assert!(fs.exists(&segment_file_name(6)).unwrap());
+            // id 3 (a non-manifest id INSIDE the prefix): ambiguous -> QUARANTINED byte-exact.
+            assert!(!fs.exists(&segment_file_name(3)).unwrap());
+            let orphans = fs.subdir(COLD_ORPHANS_SUBDIR).unwrap();
+            let blob = orphans.open(&segment_file_name(3)).unwrap();
+            let mut buf = vec![0u8; usize::try_from(blob.len().unwrap()).unwrap()];
+            blob.read_exact_at(&mut buf, 0).unwrap();
+            assert_eq!(
+                buf, b"ambiguous hole INSIDE the remote prefix",
+                "the ambiguous file's bytes are preserved verbatim, never destroyed"
+            );
+
+            // Idempotent: a re-run finds nothing to do and changes nothing.
+            let before = fs.list().unwrap();
+            Log::<InMemoryFs, ManualClock>::sweep_reaped_orphan_caches(&fs, &manifest).unwrap();
+            assert_eq!(fs.list().unwrap(), before);
+            assert!(fs.exists(&segment_file_name(2)).unwrap());
+            assert!(fs.exists(&segment_file_name(6)).unwrap());
+        }
+
+        /// An EMPTY manifest has no remote prefix to classify against: the sweep must touch
+        /// NOTHING (fail-closed), even with odd local files present.
+        #[test]
+        fn an_empty_manifest_sweeps_nothing() {
+            let fs = InMemoryFs::new();
+            let manifest = ColdManifest::open(fs.create_new(COLD_MANIFEST_FILE).unwrap()).unwrap();
+            for id in [0u64, 5] {
+                let f = fs.create_new(&segment_file_name(id)).unwrap();
+                f.write_all_at(b"x", 0).unwrap();
+                f.sync_all().unwrap();
+            }
+            fs.sync_dir().unwrap();
+            let before = fs.list().unwrap();
+            Log::<InMemoryFs, ManualClock>::sweep_reaped_orphan_caches(&fs, &manifest).unwrap();
+            assert_eq!(
+                fs.list().unwrap(),
+                before,
+                "nothing classifiable, nothing touched"
+            );
+        }
+
+        /// A crash MID-RELOCATE leaves a partial copy in `orphans/` while the original is still in
+        /// the flat directory. The re-run must REWRITE the copy from the still-present original
+        /// (exact length, byte-exact) and only then unlink — never trust the partial copy.
+        #[test]
+        fn a_partial_quarantine_copy_from_a_crashed_sweep_is_rewritten_not_trusted() {
+            let fs = InMemoryFs::new();
+            let mut manifest =
+                ColdManifest::open(fs.create_new(COLD_MANIFEST_FILE).unwrap()).unwrap();
+            for id in [2u64, 4] {
+                manifest
+                    .insert(ColdEntry {
+                        id,
+                        base_offset: id * 10,
+                        base_seq: id * 10,
+                        record_count: 10,
+                        max_timestamp_ms: 1,
+                        byte_len: 4096,
+                        crc32c: 0,
+                        compacted: false,
+                    })
+                    .unwrap();
+            }
+            let f = fs.create_new(&segment_file_name(3)).unwrap();
+            f.write_all_at(b"the real bytes", 0).unwrap();
+            f.sync_all().unwrap();
+            fs.sync_dir().unwrap();
+            // The crash artifact: a LONGER garbage copy a prior interrupted sweep left behind.
+            let orphans = fs.subdir(COLD_ORPHANS_SUBDIR).unwrap();
+            let partial = orphans.create_new(&segment_file_name(3)).unwrap();
+            partial
+                .write_all_at(b"garbage from a torn earlier copy attempt", 0)
+                .unwrap();
+            partial.sync_all().unwrap();
+            orphans.sync_dir().unwrap();
+
+            Log::<InMemoryFs, ManualClock>::sweep_reaped_orphan_caches(&fs, &manifest).unwrap();
+
+            assert!(
+                !fs.exists(&segment_file_name(3)).unwrap(),
+                "original unlinked"
+            );
+            let blob = orphans.open(&segment_file_name(3)).unwrap();
+            let mut buf = vec![0u8; usize::try_from(blob.len().unwrap()).unwrap()];
+            blob.read_exact_at(&mut buf, 0).unwrap();
+            assert_eq!(
+                buf, b"the real bytes",
+                "the partial copy was rewritten from the original, exact length included"
+            );
+        }
+
+        /// The ORPHANED-OBJECT sweep (#1153): attaching the backend deletes the cold object a
+        /// crashed reap leaked (its id is durably absent from the manifest and below the
+        /// still-remote prefix) — and NEVER an object the manifest still records REMOTE (those are
+        /// the sole durable copies of live data).
+        #[test]
+        fn attaching_the_store_sweeps_the_leaked_object_but_never_a_remote_one() {
+            let (data_fs, cold_fs, expected_tail, earliest) = build_reap_crash_state(1);
+            let mut log = Log::open(data_fs, ManualClock::new(), cold_cfg()).unwrap();
+            let remote_ids: Vec<u64> = (0..64).filter(|&id| log.is_segment_remote(id)).collect();
+            assert!(
+                !remote_ids.is_empty() && !remote_ids.contains(&0),
+                "a still-remote prefix above the reaped id, got {remote_ids:?}"
+            );
+            assert!(
+                cold_fs.exists(&cold_object_name(0)).unwrap(),
+                "the leak, pre-attach"
+            );
+
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+
+            assert!(
+                !cold_fs.exists(&cold_object_name(0)).unwrap(),
+                "the reaped id's leaked object is swept when the backend attaches"
+            );
+            for &id in &remote_ids {
+                assert!(
+                    cold_fs.exists(&cold_object_name(id)).unwrap(),
+                    "object {id} is still manifest-REMOTE and must SURVIVE the sweep"
+                );
+            }
+            assert_eq!(
+                read_tail(&log, earliest),
+                expected_tail,
+                "reads intact after the sweep"
+            );
+        }
+
+        /// IDEMPOTENCE, end to end: TWO interrupted reaps leave two orphans; a crash MID-SWEEP
+        /// (only part of the sweep's work done) re-runs cleanly at the next open; and a further
+        /// reopen is a no-op on an already-clean directory — every boot lands on the same state.
+        #[test]
+        fn the_sweep_is_idempotent_and_a_crash_mid_sweep_rejoins_cleanly() {
+            let (data_fs, cold_fs, expected_tail, earliest) = build_reap_crash_state(2);
+
+            // Simulate the crash MID-SWEEP: the sweep's first unlink (seg 0) completed, then the
+            // process died before the second (seg 1).
+            data_fs.remove(&segment_file_name(0)).unwrap();
+            data_fs.sync_dir().unwrap();
+
+            // The next open re-runs the sweep from scratch and boots.
+            let log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert!(
+                !data_fs.exists(&segment_file_name(1)).unwrap(),
+                "remaining orphan swept"
+            );
+            assert_eq!(log.earliest_offset(), earliest);
+            drop(log);
+            let after_first = data_fs.list().unwrap();
+
+            // A reopen of the already-clean directory is a no-op: same files, same boot.
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert_eq!(
+                data_fs.list().unwrap(),
+                after_first,
+                "the re-run sweep is a no-op"
+            );
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            // Both leaked objects were swept on attach; the retained tail is intact.
+            assert!(!cold_fs.exists(&cold_object_name(0)).unwrap());
+            assert!(!cold_fs.exists(&cold_object_name(1)).unwrap());
+            assert_eq!(read_tail(&log, earliest), expected_tail);
+        }
+
+        /// A minimal thread-local `tracing` subscriber recording every WARN-or-worse event's
+        /// rendered fields, so a test can assert the operator-facing refusal warning actually
+        /// fires. Hand-rolled on the `tracing` dev-dependency's `std` feature — no
+        /// `tracing-subscriber` crate enters the tree.
+        struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl tracing::Subscriber for WarnCapture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _id: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _id: &tracing::span::Id, _follows: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Render(String);
+                impl tracing::field::Visit for Render {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        let _ = write!(self.0, "{}={value:?} ", field.name());
+                    }
+                }
+                let mut rendered = Render(String::new());
+                event.record(&mut rendered);
+                self.0.lock().unwrap().push(rendered.0);
+            }
+            fn enter(&self, _id: &tracing::span::Id) {}
+            fn exit(&self, _id: &tracing::span::Id) {}
+        }
+
+        /// Appends `n` records (8-byte payloads), fsyncing each, so the workload rolls across many
+        /// 256-byte segments.
+        fn append_records<F: Filesystem>(log: &mut Log<F, ManualClock>, n: u64) {
+            for i in 0..n {
+                log.append(&Append {
+                    timestamp_ms: 1_700_000_000_000 + i,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: &i.to_le_bytes(),
+                })
+                .unwrap();
+                log.sync().unwrap();
+            }
+        }
+
+        /// Builds the CONFIRMED PR-#1188-review repro state: a healthy log offloads a cold prefix
+        /// to a plain [`FsColdStore`], then the dual-slot manifest checkpoint is overwritten with
+        /// `0xFF` — external damage (both slots nonzero-sequence, both CRC-bad), classified
+        /// `RecoveredCheckpoint::Damaged` and recovered as EMPTY (#1142). Returns
+        /// `(data_fs, cold_fs, remote_object_keys)`; the keys are the SOLE durable copies of every
+        /// offloaded record.
+        fn build_damaged_manifest_state() -> (InMemoryFs, InMemoryFs, Vec<String>) {
+            build_damaged_manifest_state_with_local_tail(0)
+        }
+
+        /// Like [`build_damaged_manifest_state`], but appends `extra_records` MORE records AFTER
+        /// the (healthy) offload, leaving extra sealed LOCAL segments behind — so a later boot
+        /// can offload (and thereby HEAL the damaged checkpoint) WITHOUT appending first, i.e.
+        /// without the segment-roll `sync_dir`s that would incidentally make a pending sentinel
+        /// directory entry durable and mask the #1188-review double-crash hole.
+        fn build_damaged_manifest_state_with_local_tail(
+            extra_records: u64,
+        ) -> (InMemoryFs, InMemoryFs, Vec<String>) {
+            let data_fs = InMemoryFs::new();
+            let cold_fs = InMemoryFs::new();
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            append_records(&mut log, 60);
+            let offloaded = log.offload_cold_segments().unwrap();
+            assert!(
+                offloaded >= 2,
+                "need a real offloaded prefix, got {offloaded}"
+            );
+            append_records(&mut log, extra_records);
+            drop(log);
+            let objects: Vec<String> = (0..offloaded).map(cold_object_name).collect();
+            for key in &objects {
+                assert!(cold_fs.exists(key).unwrap(), "{key} offloaded");
+            }
+            // The reviewer repro's external damage: 0xFF over BOTH checkpoint slots.
+            let ckpt = data_fs.open(COLD_MANIFEST_FILE).unwrap();
+            let len = usize::try_from(ckpt.len().unwrap()).unwrap();
+            ckpt.write_all_at(&vec![0xFF; len], 0).unwrap();
+            ckpt.sync_all().unwrap();
+            (data_fs, cold_fs, objects)
+        }
+
+        /// Boots once on the damaged manifest (which lands the durable sentinel) and PERSISTS OVER
+        /// the damage: new appends + a new offload rewrite a VALID manifest whose min-remote id
+        /// sits ABOVE every formerly-remote id — the exact precondition of the DELAYED-destruction
+        /// variant.
+        fn persist_over_damage(data_fs: &InMemoryFs, cold_fs: &InMemoryFs) {
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert!(
+                data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+                "the damaged recovery was durably recorded"
+            );
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            append_records(&mut log, 60);
+            assert!(
+                log.offload_cold_segments().unwrap() >= 1,
+                "the persist-over offload must land a fresh valid manifest"
+            );
+        }
+
+        /// THE CONFIRMED #1188 REVIEW BUG, exact repro: a damaged manifest recovers EMPTY (#1142
+        /// availability) and the broker BOOTS — but pre-fix, `sweep_orphan_cold_objects` then took
+        /// the empty-manifest floor fallback (the oldest LOCAL slot id, ABOVE every
+        /// formerly-remote id), so the next `set_cold_store` attach classified EVERY remote object
+        /// "provably reaped" and hard-deleted the SOLE copies. Now: the boot durably records the
+        /// damage (`cold-manifest.damaged`, fsynced), the attach-time sweep REFUSES with an
+        /// operator warning, and every object survives.
+        #[test]
+        fn a_damaged_manifest_boot_refuses_the_sweeps_and_every_sole_copy_survives() {
+            let (data_fs, cold_fs, objects) = build_damaged_manifest_state();
+
+            // Reopen: BOOTS (availability-over-consistency), recovers the manifest EMPTY, and
+            // durably records the damage (fsynced sentinel file + directory entry).
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert!(
+                data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+                "the damaged recovery must be durably recorded in the sentinel"
+            );
+
+            // Attach the store under a warn-capturing subscriber: the object sweep must REFUSE,
+            // loudly.
+            let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            tracing::subscriber::with_default(
+                WarnCapture(std::sync::Arc::clone(&warnings)),
+                || {
+                    log.set_cold_store(
+                        Arc::new(FsColdStore::new(cold_fs.clone())),
+                        ColdStorageConfig::enabled(1),
+                    );
+                },
+            );
+            for key in &objects {
+                assert!(
+                    cold_fs.exists(key).unwrap(),
+                    "sole copy {key} must SURVIVE the damaged-manifest attach"
+                );
+            }
+            let joined = warnings.lock().unwrap().join("\n");
+            assert!(
+                joined.contains("sweep REFUSED") && joined.contains("cold-manifest.damaged"),
+                "the refusal must warn the operator what happened and how to recover, got: {joined}"
+            );
+        }
+
+        /// The DELAYED variant: after the damaged-empty recovery, a NEW offload persists a VALID
+        /// manifest whose min-remote id sits ABOVE every formerly-remote id. A LATER boot then
+        /// sees a healthy manifest — the in-memory damaged flag is gone — and pre-fix the object
+        /// sweep's MAIN (min-remote-floor) branch would classify every old object "provably
+        /// reaped" and destroy it. The DURABLE sentinel is what still blocks both sweeps.
+        #[test]
+        fn the_delayed_variant_is_blocked_by_the_durable_sentinel() {
+            let (data_fs, cold_fs, old_objects) = build_damaged_manifest_state();
+            persist_over_damage(&data_fs, &cold_fs);
+
+            // The LATER boot: the manifest is valid again; only the sentinel remembers the damage.
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert!(
+                data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+                "the sentinel survives the persist-over"
+            );
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            for key in &old_objects {
+                assert!(
+                    cold_fs.exists(key).unwrap(),
+                    "old sole-copy {key} must survive the delayed variant"
+                );
+            }
+        }
+
+        /// The sentinel is cleared ONLY by explicit operator action: after reconciling the cold
+        /// store, deleting `cold-manifest.damaged` re-enables both sweeps, which then run normally
+        /// against the (healthy) manifest — the stranded pre-damage objects are reclaimed as
+        /// manifest-absent-below-the-floor, every manifest-REMOTE object survives, and every
+        /// retained record still reads back.
+        #[test]
+        fn clearing_the_sentinel_re_enables_the_sweeps() {
+            let (data_fs, cold_fs, old_objects) = build_damaged_manifest_state();
+            persist_over_damage(&data_fs, &cold_fs);
+
+            // The explicit operator action (after reconciliation, per docs/TIERED_STORAGE.md).
+            data_fs.remove(COLD_MANIFEST_DAMAGED_FILE).unwrap();
+            data_fs.sync_dir().unwrap();
+
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            // The sweep RAN again: the stranded (manifest-absent, below-the-floor) old objects are
+            // reclaimed...
+            for key in &old_objects {
+                assert!(
+                    !cold_fs.exists(key).unwrap(),
+                    "{key} is reclaimed once the operator clears the sentinel"
+                );
+            }
+            // ...while every manifest-REMOTE object and every retained record is intact.
+            let remote_ids: Vec<u64> = (0..1024).filter(|&id| log.is_segment_remote(id)).collect();
+            assert!(!remote_ids.is_empty(), "the persist-over prefix is remote");
+            for &id in &remote_ids {
+                assert!(cold_fs.exists(&cold_object_name(id)).unwrap());
+            }
+            let earliest = log.earliest_offset();
+            assert!(
+                !read_tail(&log, earliest).is_empty(),
+                "the retained records read back through the re-enabled state"
+            );
+        }
+
+        /// The #1188 verify-review MEDIUM: the sentinel's `AlreadyExists` arm must ALSO leave the
+        /// directory entry durable. The double-crash repro: boot A detects the damage and CREATES
+        /// the sentinel file, but its dir fsync fails (a crash/EIO before the entry is durable);
+        /// boot B re-detects the damage and hits `AlreadyExists` — pre-fix it returned WITHOUT
+        /// ever fsyncing the directory; B's offload then HEALS the checkpoint (the
+        /// manifest-insert file fsync is the commit), and a power cut in the heal→dir-fsync
+        /// window drops the never-fsynced sentinel entry while the healed manifest survives. The
+        /// next boot then sees a valid manifest, no damaged flag, and no sentinel — and its
+        /// attach sweep hard-deletes every formerly-remote SOLE copy. With the fix, boot B's
+        /// `AlreadyExists` path re-runs the dir fsync, the sentinel survives the cut, and the
+        /// sweeps still refuse.
+        #[test]
+        fn already_exists_sentinel_must_still_end_up_durable() {
+            // Extra sealed LOCAL segments, so boot B can offload (heal) WITHOUT appending —
+            // a segment roll's own `sync_dir` would incidentally make the pending sentinel
+            // entry durable and mask the hole.
+            let (data_fs, cold_fs, objects) = build_damaged_manifest_state_with_local_tail(60);
+
+            // BOOT A: detects the damage and CREATES the sentinel file, but the dir fsync fails
+            // — the open fails visibly, leaving a sentinel entry that is present but NOT durable.
+            let (fault_fs, control) = FaultFs::new(data_fs.clone());
+            control.set_fail_sync_dir(true);
+            assert!(
+                Log::open(fault_fs.clone(), ManualClock::new(), cold_cfg()).is_err(),
+                "boot A must surface the failed sentinel dir fsync"
+            );
+            assert!(
+                data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+                "the sentinel FILE was created (its directory entry is just not durable yet)"
+            );
+
+            // BOOT B: the transient fault is gone; the still-damaged manifest re-detects, and
+            // `record_cold_manifest_damage` takes the AlreadyExists arm. THE FIX: this boot must
+            // re-fsync the directory, making the sentinel entry durable.
+            control.set_fail_sync_dir(false);
+            let mut log = Log::open(fault_fs, ManualClock::new(), cold_cfg()).unwrap();
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            // B's offload HEALS the checkpoint: the manifest insert's own file fsync commits a
+            // valid slot over the damaged file. The re-armed dir-fsync fault then fails the
+            // offload's trailing `sync_dir` — the exact heal→dir-fsync crash window.
+            control.set_fail_sync_dir(true);
+            assert!(
+                log.offload_cold_segments().is_err(),
+                "the offload must reach (and fail at) the post-heal dir fsync"
+            );
+            drop(log);
+
+            // The power cut: every non-durable directory entry drops; every surviving file
+            // reverts to its last-fsynced content — which for the manifest INCLUDES the heal.
+            data_fs.simulate_power_loss();
+
+            // The next boot: a VALID (healed) manifest, no in-memory damaged flag. Only a
+            // DURABLE sentinel entry still remembers the damage.
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert!(
+                log.cold_offloaded_count() >= 1,
+                "the healed manifest must survive the cut (the delayed-destruction precondition)"
+            );
+            assert!(
+                data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+                "the sentinel must survive the power cut: the AlreadyExists boot must have \
+                 re-fsynced its directory entry"
+            );
+            let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            tracing::subscriber::with_default(
+                WarnCapture(std::sync::Arc::clone(&warnings)),
+                || {
+                    log.set_cold_store(
+                        Arc::new(FsColdStore::new(cold_fs.clone())),
+                        ColdStorageConfig::enabled(1),
+                    );
+                },
+            );
+            let joined = warnings.lock().unwrap().join("\n");
+            assert!(
+                joined.contains("sweep REFUSED"),
+                "the attach sweep must still REFUSE on the surviving sentinel, got: {joined}"
+            );
+            for key in &objects {
+                assert!(
+                    cold_fs.exists(key).unwrap(),
+                    "formerly-remote sole copy {key} must survive the double-crash sequence"
+                );
             }
         }
     }

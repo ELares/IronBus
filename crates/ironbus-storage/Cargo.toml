@@ -46,7 +46,6 @@ s3 = [
     "dep:hyper-util",
     "dep:http",
     "dep:http-body-util",
-    "dep:tracing",
     "dep:zeroize",
 ]
 
@@ -108,10 +107,14 @@ hyper = { version = "1", default-features = false, features = ["client", "http1"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 http = { version = "1", default-features = false, optional = true }
 http-body-util = { version = "0.1", default-features = false, optional = true }
-# The `s3` feature only: `tracing` for the plaintext-http-credentials warning (already in the lock via
-# the server); `zeroize` (already declared above for `encryption`) to wipe the derived SigV4 signing
-# key from memory after signing. Both pure Rust, already in the lock — no new crate.
-tracing = { version = "0.1", default-features = false, optional = true }
+# `tracing` (pure Rust, `default-features = false`, no build script, already in the lock via the
+# server — no new crate): originally `s3`-feature-only for the plaintext-http-credentials warning,
+# promoted UNCONDITIONAL by the #1153 orphan-sweep hardening (PR #1188 review): the damaged-cold-
+# manifest refusal in `log.rs` must warn the operator on every build, including the default one.
+# The shipped server binary already links `tracing` unconditionally, so the edge binary's crate
+# graph is unchanged. `zeroize` (declared above for `encryption`) wipes the derived SigV4 signing
+# key from memory after signing (`s3` only).
+tracing = { version = "0.1", default-features = false }
 
 # The cross-platform segment-preallocation primitive (#330, `docs/PREALLOCATION.md`) needs the
 # per-OS reservation syscall (Linux `posix_fallocate`, macOS `fcntl(F_PREALLOCATE)`). `libc` is the
@@ -132,6 +135,11 @@ criterion = "0.5"
 proptest = "1"
 serde_json = "1"
 tempfile = "3"
+# Test-only `std` features for the crate's own (default-features = false) `tracing` dependency, so
+# the damaged-cold-manifest tests can install a thread-local capture subscriber
+# (`tracing::subscriber::with_default`) and assert the operator warning actually fires. Same crate,
+# same version req as the normal dependency — feature unification only, no new lock entry.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
