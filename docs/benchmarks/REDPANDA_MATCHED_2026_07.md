@@ -269,3 +269,14 @@ Both of §4's structural findings reproduce, and the second is now much starker:
 ### 9.7 Scope
 
 Identical to §6: one VM, single-node brokers, guest loopback, no cluster claim; medians of 3, never a single run; P4/L2 remain N/A (Redpanda has no honest in-RAM mode). Raw data: [`matched-vm-harness/refresh-2026-07/`](matched-vm-harness/refresh-2026-07/) (`results.jsonl`, `p2multi.jsonl`, `rp_multi.jsonl`, the two `strace` summaries); the sections above (§1–§8) are the original early-July study, untouched.
+
+### 9.8 — post-#1198 C1 re-measure (acceptance)
+
+The §9.2 regression is fixed and re-measured. [#1198](https://github.com/ELares/IronBus/issues/1198) (PR [#1199](https://github.com/ELares/IronBus/pull/1199)) rebuilt the fd-run assembly exactly as §9.6 recommended — one bulk header-region read into a scratch buffer for an in-memory boundary walk, no `trim_fd_run` re-walk, plus a configurable min-splice threshold. The acceptance run used the same rig and the same protocol (§9.1's guest, the §9.2 `c1diag.sh` live-`serve` topology, pilot→freeze→3-timed-run medians, fresh broker + fresh ext4 data dir per run), at engine `0529fbd` — the PR as measured; the merged `main` (`a3d14ea`) adds only a 3-line non-unix cfg gate on top, no Linux behavior change. Raw rows: [`matched-vm-harness/refresh-2026-07/c1_postfix_1198.jsonl`](matched-vm-harness/refresh-2026-07/c1_postfix_1198.jsonl).
+
+| C1 (Tier-S durable consume) | sendfile AUTO-ON (shipped default) | FORCED OFF (`+nosplice`) | ON / OFF | vs Redpanda (§9.3 refresh medians) |
+| --- | ---: | ---: | :-- | :-- |
+| 128 B | **5,078,250** | 3,857,592 | **1.32×** | **IronBus 1.267×** (vs 4,009,623 †) |
+| 1 KiB | **1,792,798** | 1,677,688 | **1.07×** | **IronBus 2.068×** (vs 867,069) |
+
+The shipped default now beats its own copy path on both payloads — even on guest loopback, where §9.2 showed the splice win itself does not exist — because the syscall tax is gone: `strace -c -f` on the same 1 M-record @128 B workload counts **1,148 `pread64`s** on the splice path (was **2,010,730**; the copy path's own count is 1,134) with 497 `sendfile`s, ~one per batch. Against the refresh's own Redpanda medians, the C1 cell flips from §9.3's 3.21× Redpanda lead at 128 B to an **IronBus 1.267× lead**, and from a tie at 1 KiB to an **IronBus 2.068× lead** († §9.3's soft-cell flag on the Redpanda 128 B median applies unchanged). For the record: this regression was found by this study's own refresh (§9.2), fixed via #1198/PR #1199, and re-measured on the same rig — that loop is the matrix's job.
