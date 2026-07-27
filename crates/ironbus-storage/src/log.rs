@@ -4624,7 +4624,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// EMPTY, by writing the fsynced [`COLD_MANIFEST_DAMAGED_FILE`] sentinel (file, then directory
     /// entry) into the manifest's directory at damaged-recovery time. Idempotent: an
     /// already-present sentinel (a reboot on the still-damaged file, or a crash after a prior
-    /// write) is left untouched.
+    /// write) keeps its content, but the directory is fsynced AGAIN — the prior boot may have
+    /// crashed (or hit an IO error) after creating the entry and before its dir fsync, so every
+    /// successful return of this function must leave the entry DURABLE, not merely present
+    /// (#1188 review).
     ///
     /// The DURABILITY is the point: on the damaged boot itself the in-memory
     /// [`ColdManifest::recovered_damaged`] flag already blocks the #1153 sweeps, but the next
@@ -4634,28 +4637,39 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// sole copies (the delayed variant of the same bug). Only explicit operator deletion clears
     /// the sentinel (see `docs/TIERED_STORAGE.md`).
     fn record_cold_manifest_damage(fs: &F) -> Result<(), StorageError> {
-        let file = match fs.create_new(COLD_MANIFEST_DAMAGED_FILE) {
-            Ok(file) => file,
-            // Already durably recorded by a prior boot on the same damaged file.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(e) => return Err(StorageError::Io(e)),
-        };
-        let msg = b"The cold-segment manifest (cold-manifest.ckpt) was found externally DAMAGED \
+        match fs.create_new(COLD_MANIFEST_DAMAGED_FILE) {
+            Ok(file) => {
+                let msg =
+                    b"The cold-segment manifest (cold-manifest.ckpt) was found externally DAMAGED \
                     (both checkpoint slots CRC-bad) and was recovered as EMPTY (#1142). The #1153 \
                     startup orphan sweeps are DISABLED while this file exists: with the true remote \
                     set unknown, 'provably reaped' cannot be proven and a sweep could destroy the \
                     sole copies of offloaded segments. Reconcile the cold store against the log \
                     (see docs/TIERED_STORAGE.md), then delete this file to re-enable the sweeps.\n";
-        file.write_all_at(msg, 0)?;
-        file.sync_all()?;
+                file.write_all_at(msg, 0)?;
+                file.sync_all()?;
+            }
+            // Recorded by a prior boot on the same damaged file — but not necessarily DURABLY:
+            // that boot may have crashed (or hit an IO error) after `create_new` and before its
+            // `sync_dir`, leaving a directory entry a power loss would still drop. Fall through
+            // to the dir fsync below instead of early-returning, so EVERY successful return of
+            // this function leaves the entry durable. (Only the entry's EXISTENCE is
+            // load-bearing — the sweep guard probes existence, not content.)
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(StorageError::Io(e)),
+        }
         // The sentinel's directory entry must survive a power loss, or a later boot on the
-        // persisted-over (valid-again) manifest would sweep unguarded.
+        // persisted-over (valid-again) manifest would sweep unguarded. Runs on the AlreadyExists
+        // path too (one dir fsync per damaged boot): a sentinel that exists but is not durable
+        // would otherwise stay non-durable forever on that path, and the next offload's heal
+        // followed by a power cut would drop it while the healed manifest survives.
         fs.sync_dir().map_err(StorageError::Io)?;
         tracing::warn!(
             sentinel = COLD_MANIFEST_DAMAGED_FILE,
-            "cold manifest recovered from EXTERNAL dual-slot damage as EMPTY; wrote the durable \
-             damaged-manifest sentinel — the startup orphan sweeps stay disabled until an operator \
-             reconciles the cold store and deletes the sentinel (see docs/TIERED_STORAGE.md)"
+            "cold manifest recovered from EXTERNAL dual-slot damage as EMPTY; the durable \
+             damaged-manifest sentinel is recorded — the startup orphan sweeps stay disabled \
+             until an operator reconciles the cold store and deletes the sentinel (see \
+             docs/TIERED_STORAGE.md)"
         );
         Ok(())
     }
@@ -4877,10 +4891,24 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         };
         match Self::cold_orphan_sweeps_blocked(&self.fs, manifest, "orphan-cold-objects") {
             Ok(false) => {}
-            // Blocked (already warned), or the sentinel could not even be probed: refuse. This
-            // sweep is best-effort by contract, and fail-closed beats sweeping over a directory
-            // whose damage record is unreadable.
-            Ok(true) | Err(_) => return,
+            // Blocked: refuse (the guard already warned).
+            Ok(true) => return,
+            // The sentinel could not even be probed: refuse, with a DISTINCT warning — the
+            // guard's blocked-warning never fired on this path, and a persistently unreadable
+            // directory must not silently conceal the damage state. This sweep is best-effort
+            // by contract, and fail-closed beats sweeping over a directory whose damage record
+            // is unreadable.
+            Err(e) => {
+                tracing::warn!(
+                    sweep = "orphan-cold-objects",
+                    error = %e,
+                    sentinel_file = COLD_MANIFEST_DAMAGED_FILE,
+                    "cold-storage orphan sweep REFUSED: probing the damaged-manifest sentinel \
+                     FAILED, so the damage state is unknown; nothing is swept until the probe \
+                     succeeds (fail-closed)"
+                );
+                return;
+            }
         }
         let Some((&min_remote, _)) = manifest.entries().first_key_value() else {
             // An EMPTY manifest proves nothing is reaped-remote (see above): sweep NOTHING. The
@@ -13896,6 +13924,17 @@ mod tests {
         /// `(data_fs, cold_fs, remote_object_keys)`; the keys are the SOLE durable copies of every
         /// offloaded record.
         fn build_damaged_manifest_state() -> (InMemoryFs, InMemoryFs, Vec<String>) {
+            build_damaged_manifest_state_with_local_tail(0)
+        }
+
+        /// Like [`build_damaged_manifest_state`], but appends `extra_records` MORE records AFTER
+        /// the (healthy) offload, leaving extra sealed LOCAL segments behind — so a later boot
+        /// can offload (and thereby HEAL the damaged checkpoint) WITHOUT appending first, i.e.
+        /// without the segment-roll `sync_dir`s that would incidentally make a pending sentinel
+        /// directory entry durable and mask the #1188-review double-crash hole.
+        fn build_damaged_manifest_state_with_local_tail(
+            extra_records: u64,
+        ) -> (InMemoryFs, InMemoryFs, Vec<String>) {
             let data_fs = InMemoryFs::new();
             let cold_fs = InMemoryFs::new();
             let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
@@ -13909,6 +13948,7 @@ mod tests {
                 offloaded >= 2,
                 "need a real offloaded prefix, got {offloaded}"
             );
+            append_records(&mut log, extra_records);
             drop(log);
             let objects: Vec<String> = (0..offloaded).map(cold_object_name).collect();
             for key in &objects {
@@ -14053,6 +14093,95 @@ mod tests {
                 !read_tail(&log, earliest).is_empty(),
                 "the retained records read back through the re-enabled state"
             );
+        }
+
+        /// The #1188 verify-review MEDIUM: the sentinel's `AlreadyExists` arm must ALSO leave the
+        /// directory entry durable. The double-crash repro: boot A detects the damage and CREATES
+        /// the sentinel file, but its dir fsync fails (a crash/EIO before the entry is durable);
+        /// boot B re-detects the damage and hits `AlreadyExists` — pre-fix it returned WITHOUT
+        /// ever fsyncing the directory; B's offload then HEALS the checkpoint (the
+        /// manifest-insert file fsync is the commit), and a power cut in the heal→dir-fsync
+        /// window drops the never-fsynced sentinel entry while the healed manifest survives. The
+        /// next boot then sees a valid manifest, no damaged flag, and no sentinel — and its
+        /// attach sweep hard-deletes every formerly-remote SOLE copy. With the fix, boot B's
+        /// `AlreadyExists` path re-runs the dir fsync, the sentinel survives the cut, and the
+        /// sweeps still refuse.
+        #[test]
+        fn already_exists_sentinel_must_still_end_up_durable() {
+            // Extra sealed LOCAL segments, so boot B can offload (heal) WITHOUT appending —
+            // a segment roll's own `sync_dir` would incidentally make the pending sentinel
+            // entry durable and mask the hole.
+            let (data_fs, cold_fs, objects) = build_damaged_manifest_state_with_local_tail(60);
+
+            // BOOT A: detects the damage and CREATES the sentinel file, but the dir fsync fails
+            // — the open fails visibly, leaving a sentinel entry that is present but NOT durable.
+            let (fault_fs, control) = FaultFs::new(data_fs.clone());
+            control.set_fail_sync_dir(true);
+            assert!(
+                Log::open(fault_fs.clone(), ManualClock::new(), cold_cfg()).is_err(),
+                "boot A must surface the failed sentinel dir fsync"
+            );
+            assert!(
+                data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+                "the sentinel FILE was created (its directory entry is just not durable yet)"
+            );
+
+            // BOOT B: the transient fault is gone; the still-damaged manifest re-detects, and
+            // `record_cold_manifest_damage` takes the AlreadyExists arm. THE FIX: this boot must
+            // re-fsync the directory, making the sentinel entry durable.
+            control.set_fail_sync_dir(false);
+            let mut log = Log::open(fault_fs, ManualClock::new(), cold_cfg()).unwrap();
+            log.set_cold_store(
+                Arc::new(FsColdStore::new(cold_fs.clone())),
+                ColdStorageConfig::enabled(1),
+            );
+            // B's offload HEALS the checkpoint: the manifest insert's own file fsync commits a
+            // valid slot over the damaged file. The re-armed dir-fsync fault then fails the
+            // offload's trailing `sync_dir` — the exact heal→dir-fsync crash window.
+            control.set_fail_sync_dir(true);
+            assert!(
+                log.offload_cold_segments().is_err(),
+                "the offload must reach (and fail at) the post-heal dir fsync"
+            );
+            drop(log);
+
+            // The power cut: every non-durable directory entry drops; every surviving file
+            // reverts to its last-fsynced content — which for the manifest INCLUDES the heal.
+            data_fs.simulate_power_loss();
+
+            // The next boot: a VALID (healed) manifest, no in-memory damaged flag. Only a
+            // DURABLE sentinel entry still remembers the damage.
+            let mut log = Log::open(data_fs.clone(), ManualClock::new(), cold_cfg()).unwrap();
+            assert!(
+                log.cold_offloaded_count() >= 1,
+                "the healed manifest must survive the cut (the delayed-destruction precondition)"
+            );
+            assert!(
+                data_fs.exists(COLD_MANIFEST_DAMAGED_FILE).unwrap(),
+                "the sentinel must survive the power cut: the AlreadyExists boot must have \
+                 re-fsynced its directory entry"
+            );
+            let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            tracing::subscriber::with_default(
+                WarnCapture(std::sync::Arc::clone(&warnings)),
+                || {
+                    log.set_cold_store(
+                        Arc::new(FsColdStore::new(cold_fs.clone())),
+                        ColdStorageConfig::enabled(1),
+                    );
+                },
+            );
+            let joined = warnings.lock().unwrap().join("\n");
+            assert!(
+                joined.contains("sweep REFUSED"),
+                "the attach sweep must still REFUSE on the surviving sentinel, got: {joined}"
+            );
+            for key in &objects {
+                assert!(
+                    cold_fs.exists(key).unwrap(),
+                    "formerly-remote sole copy {key} must survive the double-crash sequence"
+                );
+            }
         }
     }
 }
