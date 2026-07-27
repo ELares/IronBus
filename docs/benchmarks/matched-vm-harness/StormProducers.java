@@ -109,6 +109,12 @@ public final class StormProducers {
                 props.put("linger.ms", "0");
                 props.put("max.in.flight.requests.per.connection", "1");
                 props.put("compression.type", "none");
+                // Plain at-least-once, matching IronBus's at-least-once ack semantics. Also load-
+                // bearing: with the 4.3.1 client's idempotence-on default, a herd of N concurrent
+                // InitProducerId handshakes against this broker races into a client-side
+                // FindCoordinator NPE (null key) that kills producer I/O threads. Disabling the
+                // idempotence layer (sequence numbers) is the charitable-config direction anyway.
+                props.put("enable.idempotence", "false");
                 // Bound the per-producer send buffer pool: the default 32 MiB x 128 producers
                 // would dwarf the guest; a sync send loop needs one small batch at a time.
                 props.put("buffer.memory", "1048576");

@@ -109,9 +109,17 @@ export XB_N="$N" XB_SIZE="$SIZE" XB_BROKER="$BROKER" XB_MODE="$MODE" \
 python3 <<'PYEOF'
 import json, os, sys
 
-d = json.load(open(os.environ["XB_RAW"]))
-if d.get("schema") != "storm-produce-v1":
-    sys.stderr.write("PARSE FAILURE: not a storm-produce-v1 result\n")
+# The result is the single storm-produce-v1 line; the Kafka client may interleave its own log
+# lines on stdout (no slf4j binding config in the perf-tools distro), so scan for the schema
+# marker instead of assuming a clean stream.
+d = None
+with open(os.environ["XB_RAW"]) as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith('{"schema":"storm-produce-v1"'):
+            d = json.loads(line)
+if d is None:
+    sys.stderr.write("PARSE FAILURE: no storm-produce-v1 line in the raw log\n")
     sys.exit(3)
 msgs = d["msgs_per_sec"]
 if not msgs or msgs != msgs or msgs <= 0:
