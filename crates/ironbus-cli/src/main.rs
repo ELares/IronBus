@@ -5772,6 +5772,9 @@ struct ServeConfig {
     /// — only pay once the avoided body copy is large enough). `0` splices every non-empty run.
     /// Threaded into [`EngineConfig::min_splice_bytes`]; `--no-zero-copy-sendfile` remains the full
     /// kill-switch. See `ironbus_server::engine::DEFAULT_MIN_SPLICE_BYTES` for the measured basis.
+    /// Server-only — read ONLY by the `#[cfg(unix)]` serve path (`open_engine_with`), so on a
+    /// non-unix build (which never serves) the field is inert, same as `zero_copy_sendfile` above.
+    #[cfg_attr(not(unix), allow(dead_code))]
     min_splice_bytes: u64,
     /// The per-stream DEFAULT message TTL in MILLISECONDS (V2-M4 #549, wired by #710): a record
     /// older than this (its durable producer `timestamp_ms + ttl` against the wall-clock seam) is
