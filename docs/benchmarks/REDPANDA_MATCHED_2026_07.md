@@ -171,3 +171,101 @@ On the ~2.8 ms EBS sync, **Redpanda's throughput peaks at ONE client and falls m
 ## 8. Artifacts and reproduction
 
 The guest-resident harness (`lib2.sh` / `cell2.sh` / `row2.sh` / `all2.sh` for the matrix, `p2multi.sh` and `rp_multi.sh` for the concurrency sweeps) and the raw `results.jsonl` / `p2multi.jsonl` / `rp_multi.jsonl` are archived under [`matched-vm-harness/`](matched-vm-harness/); the t4g run's raw data is under [`matched-vm-harness/t4g/`](matched-vm-harness/t4g/). The matrix follows a strict pilot→freeze→median protocol (labeled durability tiers, a fairness lint) so the VM study and the t4g run (§7) are directly comparable — the difference is only the substrate.
+
+## 9. 2026-07 refresh — the current engine, first sendfile-era run
+
+**This refresh found a shipped-code consume regression, and that finding leads the section.** The engine's Linux `sendfile(2)` zero-copy consume path — auto-on since [#1174](https://github.com/ELares/IronBus/pull/1174)/[#1178](https://github.com/ELares/IronBus/pull/1178), merged after the study above ran — costs C1 durable consume **3.4× at 128 B and 2.3× at 1 KiB on this substrate** (guest loopback, where the page-cache→NIC splice win does not exist). C1/128 B flips from the study's narrow IronBus win to a 3.2× Redpanda lead; C1/1 KiB from a 1.83× IronBus win to a tie. The matrix below measures the shipped defaults honestly, regression included, with clearly-labeled `+nosplice` diagnostic rows beside it. Elsewhere the refresh is good news: single-connection **P2/1 KiB flips to an IronBus 3.2× win** (was a 2.2× loss) and P3/1 KiB widens to 3.2×.
+
+### 9.1 Environment (what changed since §1, disclosed)
+
+- **Re-provisioned dedicated guest** ([`matched-vm-harness/provision2.sh`](matched-vm-harness/provision2.sh)): lima `vz`, 8 vCPU / 8 GiB, Ubuntu 26.04 LTS, kernel `7.0.0-15-generic`, single ext4 on virtio `vda1`, guest loopback — §1's documented substrate. **Deviation:** the disk is lima's default-shape **100 GiB** image (the original guest's was smaller); the per-cell 3 GiB byte cap and all fairness pins are unchanged.
+- **Engine:** `2c5de8a` (`main` at refresh time), built in-guest, release profile. Since the study: sendfile zero-copy consume (#1174/#1178 — Linux-only, never exercised by the study, which predates it), Tier-W batched delivery ([#1167](https://github.com/ELares/IronBus/pull/1167)), L0 produce-path leanness ([#1184](https://github.com/ELares/IronBus/pull/1184)), plus the #1040 pipelined sync tier the study already had.
+- **Redpanda:** v26.1.12, version pin unchanged (owner-gated); production mode revalidated at every broker start exactly as §1.
+- **Same harness, same protocol** (pilot→freeze→3-timed-medians, serial brokers, TMPDIR→ext4, JVM warm-up for Redpanda cells).
+- **Substrate drift, disclosed:** this VM instance runs the fsync-bound P1 row ~25–30 % below the study's instance **for both brokers** (IronBus 0.73×, Redpanda 0.82× of their study numbers at 128 B) — the drift is symmetric, which is the matched design doing its job. Ratios carry; absolutes do not. Several Redpanda cells also showed wider run-to-run spread on this instance than the study's ≤~8 % norm (P2/128 B 71 %, C1/128 B 41 %, P3/1 KiB 39 % across 3 runs); IronBus's P3/128 B spread was 46 %. Cells with spread that wide are noted below rather than silently averaged.
+
+### 9.2 The attribution: the regression is the sendfile splice path
+
+The refresh smoke found IronBus C1/128 B at ~1.3 M msg/s vs the study's 5.66 M, while Redpanda reproduced its own number on the same substrate (4.97 M smoke vs its 5.48 M study median) — the environment was comparable, the engine was not. C1 was then run at both payloads **both ways**: sendfile AUTO-ON (the shipped default) and FORCED OFF via the operator kill-switch `--no-zero-copy-sendfile`. The bench-spawned isolated broker hardcodes the toggle on, so the OFF arm runs through `bench --addr` live mode against a real `serve` broker (`--checkpoint-interval 1` to match the bench broker; live-ON reproduces the isolated smoke number — 1.32 M vs 1.30 M — so the two topologies are interchangeable). Medians of 3, fresh broker + fresh ext4 data dir per run ([`matched-vm-harness/c1diag.sh`](matched-vm-harness/c1diag.sh); raw rows in [`matched-vm-harness/refresh-2026-07/results.jsonl`](matched-vm-harness/refresh-2026-07/results.jsonl), mode `diag-live-*`, the OFF arm tagged `+nosplice`):
+
+| C1 (Tier-S durable consume) | sendfile AUTO-ON (shipped) | FORCED OFF (`+nosplice`) | OFF / ON | study (pre-sendfile) |
+| --- | ---: | ---: | :-- | ---: |
+| 128 B | 1,324,592 | 4,563,071 | **3.44×** | 5,659,915 |
+| 1 KiB | 846,280 | 1,961,457 | **2.32×** | 2,164,179 |
+
+OFF restores the study's numbers within that cell's documented spread on both payloads (1 KiB: 0.91× of the study; 128 B: 0.81× — on the cell §5 itself flagged at ~30 % run-to-run spread, and with Redpanda's own reproduction at 0.91× of its study median on this instance). **The sendfile path is the regression; the rest of the engine delta is clean** — which is what cleared the full matrix to run.
+
+**Mechanism, pinned by syscall counts** (`strace -c -f` on the serve pid, 1 M msgs @128 B, unrecorded runs; summaries in [`refresh-2026-07/`](matched-vm-harness/refresh-2026-07/)): the ON arm issued **2,010,730 `pread64` calls — ~2 per RECORD** — plus 504 `sendfile` (one per ~2048-record batch). The OFF copy path issued 1,134 `pread64` **in total** for the same delivered work. The splice write itself is cheap; the cost is the fd-run *assembly*: `raw_fd_range` walks the batch's frame headers with one positioned header read per frame (`frame_len_at`), and `trim_fd_run` then **re-walks the same frames** — two syscalls per record, where the copy path does one bulk region read and walks boundaries in-buffer. On a real NIC, sendfile saves the userspace copy and that trade can win; on loopback the win does not exist and the per-record header preads are a pure syscall tax.
+
+### 9.3 The refreshed matrix (shipped defaults, sendfile auto-on)
+
+Per the epic's honesty rules the matrix runs the SHIPPED config — auto-on, regression included. Medians of 3 (msg/s; L1 = produce→ack RTT µs, lower better). "Study" columns are §3's numbers.
+
+| Row | Size | IronBus | Redpanda | Winner (refresh) | IronBus (study) | Redpanda (study) | Winner (study) |
+| --- | --- | ---: | ---: | :-- | ---: | ---: | :-- |
+| **P1** sync-per-message | 128 B | 2,592 | 3,443 | Redpanda 1.33× | 3,569 | 4,207 | Redpanda 1.18× |
+| | 1 KiB | 2,553 | 2,551 | tie (1.00×) | 3,580 | 3,513 | tie (1.02×) |
+| **P2** group-commit | 128 B | 574,316 | 863,780 † | Redpanda 1.50× | 592,747 | 1,557,863 | Redpanda 2.63× |
+| | 1 KiB | **720,599** | 224,072 | **IronBus 3.22×** | 130,452 | 287,675 | Redpanda 2.21× |
+| **P3** relaxed (page-cache ack) | 128 B | 1,523,515 † | 1,718,107 | Redpanda 1.13× | 1,709,873 | 1,872,973 | Redpanda 1.10× |
+| | 1 KiB | **1,374,034** | 427,690 † | **IronBus 3.21×** | 843,143 | 464,588 | IronBus 1.81× |
+| **C1** consume / replay | 128 B | 1,250,838 | 4,009,623 † | **Redpanda 3.21×** | 5,659,915 | 5,482,456 | IronBus 1.03× |
+| | 1 KiB | 867,412 | 867,069 | tie (1.00×) | 2,164,179 | 1,183,940 | IronBus 1.83× |
+| *diagnostic* C1 `+nosplice` | 128 B | *4,563,071* | — | *(IronBus 1.14× vs RP above)* | | | |
+| | 1 KiB | *1,961,457* | — | *(IronBus 2.26× vs RP above)* | | | |
+
+† 3-run spread > 35 % on this instance (disclosed in §9.1); treat that cell's margin as soft.
+
+| Latency row | Size | IronBus p50 / p99 | Redpanda p50 / p99 | Study (IronBus) | Study (Redpanda) |
+| --- | --- | --- | --- | --- | --- |
+| **L1** durable produce→ack RTT | 128 B | **317 / 1,142 µs** | 1,000 / 8,000 µs | 285 / 368 µs | 2,000 / 9,000 µs |
+| | 1 KiB | **315 / 476 µs** | 1,000 / 7,000 µs | 282 / 342 µs | 2,000 / 9,000 µs |
+
+The `+nosplice` diagnostic rows are NOT matrix rows (different broker topology: a real `serve` process instead of the bench-spawned one) — they are the copy-path reference showing what C1 measures the moment the regression is fixed: back to a 1.14×/2.26× IronBus lead over the same-refresh Redpanda numbers. Redpanda's L1 stays throttled-tool-quantized to whole milliseconds (§3's caveat applies unchanged); IronBus's L1 p99 @128 B ran ~3× above the study on this instance (1,142 µs vs 368 µs) — the p50 story (3.2× lead) is the robust one.
+
+### 9.4 P2 under client concurrency (refresh)
+
+Same drivers as §4 (`bench --producers N` vs N parallel `kafka-producer-perf-test` clients, aggregate = total records ÷ wall window, medians of 3). Raw: [`refresh-2026-07/p2multi.jsonl`](matched-vm-harness/refresh-2026-07/p2multi.jsonl) / [`rp_multi.jsonl`](matched-vm-harness/refresh-2026-07/rp_multi.jsonl).
+
+**P2 @ 128 B (msg/s):**
+
+| Clients | IronBus | Redpanda | Ratio |
+| ---: | ---: | ---: | :-- |
+| 1 | 686,137 | 1,255,935 | Redpanda 1.83× |
+| 2 | 1,233,362 | — | |
+| 4 | 1,615,348 | 1,405,766 | **IronBus 1.15×** |
+| 8 | 1,468,990 | 846,996 † | **IronBus 1.73×** |
+| **peak** | **1,615,348** (×4) | 1,405,766 (×4) | **IronBus 1.15×** |
+
+**P2 @ 1 KiB (msg/s):**
+
+| Clients | IronBus | Redpanda | Ratio |
+| ---: | ---: | ---: | :-- |
+| 1 | 892,085 | 220,712 | **IronBus 4.04×** |
+| 2 | 1,249,043 | — | |
+| 4 | 1,360,321 | 216,610 † | **IronBus 6.28×** |
+| 8 | 1,321,003 | 223,828 | **IronBus 5.90×** |
+| **peak** | **1,360,321** (×4) | 223,828 (×8) | **IronBus 6.08×** |
+
+† 3-run spread > 40 % (Redpanda ×8 @128 B: 44.5 %; ×4 @1 KiB: 78.1 %) — soft cells, disclosed.
+
+Both of §4's structural findings reproduce, and the second is now much starker: **Redpanda still does not scale with clients** (128 B peaks at ×4 and drops ~40 % at ×8; 1 KiB sits flat at ~220 k at every client count on this instance), while **IronBus scales and holds the peak on both sizes** — 1.15× at 128 B, and at 1 KiB the peak-vs-peak margin has grown from the study's 2.19× to **6.1×** (IronBus 657 k → 1.36 M since the study; Redpanda's 1 KiB ceiling collapsed from ~300 k to ~224 k on this instance). Note the sweep's ×1 rows out-run the matrix's single-connection P2 rows for IronBus (`--producers 1` drives the connection harder than the plain `--stream` bench loop; both are reported, neither is swapped in for the other — the same discipline §4 used).
+
+### 9.5 What changed vs the study, cell by cell
+
+- **C1/128 B: IronBus win → 3.2× loss; C1/1 KiB: 1.83× win → tie.** The sendfile regression (§9.2), full stop. The `+nosplice` rows show both cells return to IronBus leads once fixed. This answers #1191's decision output for [#1041](https://github.com/ELares/IronBus/issues/1041): the priority is **fixing the splice-path assembly**, not the #1041 tail-ring build — the copy path already beats this instance's Redpanda on both C1 cells.
+- **P2/1 KiB: 2.2× loss → 3.2× WIN (single connection).** IronBus 130 k → 721 k (5.5×) on the work landed since the study — the [#1045](https://github.com/ELares/IronBus/issues/1045) session reorder ring (§4's named ceiling, since shipped) plus the L0 produce leanness (#1184); Redpanda 288 k → 224 k on this instance. The §4 single-connection ceiling story is obsolete at 1 KiB.
+- **P2/128 B: gap narrows, 2.63× → 1.50×** (IronBus flat 593 k → 574 k; Redpanda 1.56 M → 864 k on this instance, 71 % spread — soft cell). Per #1191's decision output, the last produce non-win has no obvious dedicated lever left (#1045 already shipped); re-measure this soft cell after the C1 fix before concluding anything.
+- **P3/1 KiB: 1.81× → 3.21× win** (IronBus 843 k → 1.37 M). P3/128 B unchanged (Redpanda ~1.1×).
+- **P2 under concurrency: the peak-vs-peak margin widens** — 128 B 1.11× → 1.15×, 1 KiB 2.19× → **6.1×** (§9.4); Redpanda's no-scaling-with-clients shape reproduces.
+- **P1 both sizes: unchanged shape** (128 B a modest Redpanda lead, 1 KiB a tie), both brokers ~25–30 % below the study absolutes — symmetric substrate drift, disclosed in §9.1.
+- **L1: IronBus keeps the outright latency win** (p50 3.2×; Redpanda's tool still whole-ms-quantized).
+
+### 9.6 The fix this attribution recommends (filed, not built here)
+
+1. **Fix the mechanism:** assemble the fd-run without per-record syscalls — one bulk header-region read (the copy path's own pattern) into a scratch buffer for the boundary walk, or reuse the anchor walk's frame-length plan so `trim_fd_run` never re-walks. Either removes ~2 M syscalls per 1 M records while keeping the splice write itself.
+2. **Guard the auto-on heuristic (the tunability principle):** engage the splice only when the expected spliced bytes per directive clear a configurable minimum (small-record batches take the copy path), an operator knob with a safe auto default rather than a baked-in one-way choice. The kill-switch already exists for operators; the heuristic makes the *default* honest on substrates where the splice cannot win.
+
+### 9.7 Scope
+
+Identical to §6: one VM, single-node brokers, guest loopback, no cluster claim; medians of 3, never a single run; P4/L2 remain N/A (Redpanda has no honest in-RAM mode). Raw data: [`matched-vm-harness/refresh-2026-07/`](matched-vm-harness/refresh-2026-07/) (`results.jsonl`, `p2multi.jsonl`, `rp_multi.jsonl`, the two `strace` summaries); the sections above (§1–§8) are the original early-July study, untouched.
