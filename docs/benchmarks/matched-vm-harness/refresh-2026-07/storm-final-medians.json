@@ -1,0 +1,62 @@
+{
+ "S1/8/ironbus": {
+  "runs": 3,
+  "count": 240000,
+  "msgs_per_sec": 7878.1,
+  "ack_p50_us": 934.4,
+  "ack_p99_us": 2336.12,
+  "ack_p50_us_pooled": 934.26,
+  "ack_p99_us_pooled": 2312.51,
+  "ack_p999_us_pooled": 3104.23
+ },
+ "S1/8/redpanda": {
+  "runs": 3,
+  "count": 240000,
+  "msgs_per_sec": 14958.7,
+  "ack_p50_us": 445.54,
+  "ack_p99_us": 1581.22,
+  "ack_p50_us_pooled": 444.34,
+  "ack_p99_us_pooled": 1554.76,
+  "ack_p999_us_pooled": 4005.11
+ },
+ "S1/32/ironbus": {
+  "runs": 3,
+  "count": 288000,
+  "msgs_per_sec": 8003.4,
+  "ack_p50_us": 3616.79,
+  "ack_p99_us": 9131.76,
+  "ack_p50_us_pooled": 3614.4,
+  "ack_p99_us_pooled": 9507.35,
+  "ack_p999_us_pooled": 23956.56
+ },
+ "S1/32/redpanda": {
+  "runs": 3,
+  "count": 288000,
+  "msgs_per_sec": 12316.6,
+  "ack_p50_us": 1367.01,
+  "ack_p99_us": 15343.57,
+  "ack_p50_us_pooled": 1345.18,
+  "ack_p99_us_pooled": 16202.1,
+  "ack_p999_us_pooled": 36643.22
+ },
+ "S1/128/ironbus": {
+  "runs": 3,
+  "count": 320000,
+  "msgs_per_sec": 5215.2,
+  "ack_p50_us": 15779.58,
+  "ack_p99_us": 129585.17,
+  "ack_p50_us_pooled": 15771.39,
+  "ack_p99_us_pooled": 131422.86,
+  "ack_p999_us_pooled": 739279.04
+ },
+ "S1/128/redpanda": {
+  "runs": 3,
+  "count": 320000,
+  "msgs_per_sec": 13433.4,
+  "ack_p50_us": 3874.04,
+  "ack_p99_us": 63274.67,
+  "ack_p50_us_pooled": 3646.31,
+  "ack_p99_us_pooled": 75030.91,
+  "ack_p999_us_pooled": 480315.89
+ }
+}

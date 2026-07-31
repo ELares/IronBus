@@ -12,6 +12,12 @@ identical substrate for both (removing the macOS study's Redpanda-in-VM confound
 - `p2multi.sh` — IronBus P2 under `bench --producers N` (1/2/4/8).
 - `rp_multi.sh` — Redpanda P2 under N parallel `kafka-producer-perf-test` clients (1/4/8).
 - `medians2.py` — dedupe (latest per cell) + medians + comparison table.
+- `storm2.sh` / `stormrow2.sh` — the #1192 S1 fsync-storm cell (N producers, each to its OWN
+  named stream/topic, per-message awaited durable acks; the row that gates #1193): one cell /
+  the frozen N ∈ {8, 32, 128} sweep. Drivers: `storm-produce` (Rust, `cargo build --release
+  -p ironbus-bench --bin storm-produce`) + `StormProducers.java` (its method-identical
+  kafka-clients twin, compiled by `storm2.sh`; needs a JDK in the guest).
+- `storm_medians.py` — the S1 medians + comparison table (`storm.jsonl` → `storm-final-medians.json`).
 
 ## Paths
 All paths are **guest-relative** (`$HOME/xb2`, `$HOME/IronBus`); the scripts assume the guest
@@ -20,4 +26,5 @@ copying the Kafka perf tools + provisioning Redpanda. No host paths, no account 
 
 ## Raw data
 `results.jsonl` (matrix), `p2multi.jsonl` (IronBus sweep), `rp_multi.jsonl` (Redpanda sweep) —
-the exact rows behind every number in the study doc.
+the exact rows behind every number in the study doc. The 2026-07 refresh + campaign cells live
+under `refresh-2026-07/` (`storm.jsonl` + `STORM_S1.md` are the #1192 S1 fsync-storm row).
