@@ -51,8 +51,13 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 
 [dev-dependencies]
 # The real broker, spawned in-process for the wire-compatibility round-trip test.
-ironbus-server = { path = "../ironbus-server", version = "0.1.0" }
-ironbus-storage = { path = "../ironbus-storage", version = "0.1.0" }
+# PATH-ONLY, for the same reason as `ironbus-client` (#1201): a dev-dependency carrying a
+# `version` must resolve from the registry at publish time, which would force the broker and
+# its storage engine onto crates.io purely to let this crate publish. Cargo omits path-only
+# dev-dependencies from the published manifest and dev-deps never enter a consumer's build,
+# so the in-process round-trip test below is unaffected.
+ironbus-server = { path = "../ironbus-server" }
+ironbus-storage = { path = "../ironbus-storage" }
 # A multi-thread runtime + macros + timers for `#[tokio::test]`: the broker's accept loop runs
 # on a blocking std thread (it is sync/thread-per-connection), so the test's runtime must be
 # able to make progress on the async client while that thread blocks.
