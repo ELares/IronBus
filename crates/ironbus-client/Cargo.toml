@@ -33,8 +33,14 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 
 [dev-dependencies]
-ironbus-server = { path = "../ironbus-server", version = "0.1.0" }
-ironbus-storage = { path = "../ironbus-storage", version = "0.1.0" }
+# PATH-ONLY, deliberately: a dev-dependency carrying a `version` must resolve from the
+# registry at publish time, so these would force `ironbus-server` and `ironbus-storage`
+# (the broker and its storage engine) onto crates.io purely to let the client publish.
+# Cargo omits path-only dev-dependencies from the published manifest, and dev-deps are
+# never part of a consumer's build, so dropping the version costs downstream nothing and
+# keeps the in-repo integration tests building exactly as before.
+ironbus-server = { path = "../ironbus-server" }
+ironbus-storage = { path = "../ironbus-storage" }
 
 [lints]
 workspace = true
