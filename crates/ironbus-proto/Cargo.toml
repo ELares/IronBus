@@ -15,7 +15,7 @@ criterion = "0.5"
 # SAME pure-Rust lz4 block codec ironbus-core stores with (ADR-0003), so the exported
 # `deliver_compressed` vector is byte-for-byte what a broker delivers. Kept on the ironbus-core
 # version line; never a runtime dependency of the proto crate.
-lz4_flex = { version = "0.10", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
+lz4_flex = { version = "0.11.6", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
 
 [lints]
 workspace = true
