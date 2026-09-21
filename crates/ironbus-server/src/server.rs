@@ -185,8 +185,13 @@ impl TlsTermination {
     }
 
     /// On a non-tls build there is no crypto stack, so every connection is plaintext.
+    ///
+    /// `unnecessary_wraps` is allowed for the same reason `unused_self` is beside it: this
+    /// variant can never fail, but the SIGNATURE must match the TLS variant's (the call
+    /// site uses `?`), and a shape that diverged per feature would be a second thing to
+    /// keep in sync.
     #[cfg(not(feature = "tls"))]
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn wrap(&self, socket: TcpStream) -> std::io::Result<Wire> {
         Ok(Wire::Plain(socket))
     }
