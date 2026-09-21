@@ -4500,6 +4500,8 @@ impl Session {
     /// so each record's header/body CRC is verified by the client exactly as for a per-record `Deliver`.
     /// NO lease, NO generation fence, NO cursor write — the batch header's `generation` is `0`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::unused_self)] // The spliced (Linux) branch calls through `self`; the copy
+                                  // path that remains on non-Linux never touches it.
     fn serve_stream_fetch_batch<
         F: Filesystem + 'static,
         C: Clock + Clone + 'static,

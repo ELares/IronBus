@@ -98,6 +98,7 @@ is_skipped_url() {
 	case "$1" in
 	*github.com/*/*/issues/N | *github.com/*/*/issues/N/) echo "ADR template placeholder (#N), filled in per ADR"; return 0 ;;
 	*'$'*) echo 'shell-variable placeholder (e.g. $addr) in a usage snippet, not a real endpoint'; return 0 ;;
+	*s3.example.com*) echo 'documented example endpoint for an S3-compatible store (docs/TIERED_STORAGE.md), not a real endpoint'; return 0 ;;
 	esac
 	return 1
 }
