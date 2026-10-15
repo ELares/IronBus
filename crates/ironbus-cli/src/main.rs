@@ -1045,7 +1045,7 @@ USAGE:
     ironbus stream (purge | rm) <name> --data-dir <dir> --force [--json]
     ironbus dlq (ls | peek [--limit <n>] | redrive) --data-dir <dir> [--json]
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
-    ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq [--exchange <name>]]
+    ironbus dump  --data-dir <dir> [--limit <n>] [--json [--digests]] [--dlq [--exchange <name>]]
                   [--raw] [--require-dict]
     ironbus scrub --data-dir <dir> [--json]
     ironbus verify --data-dir <dir> [--json]
@@ -1265,6 +1265,9 @@ Notes:
     reason (max-deliver-exceeded / ttl-expired / rejected), and the key/payload sizes (NDJSON
     with --json). It is read-only and never mutates the directory; an empty or never-poisoned
     broker (or a never-routed target) shows nothing.
+    dump --json --digests adds key_sha256 and payload_sha256 for exact decoded-content
+    reconciliation without printing keys or payloads. It refuses undecodable records and
+    reported loss; reject partial output on failure. It cannot combine with --raw or --dlq.
     dump --raw shows the on-disk frame and --require-dict fails strictly (exit 3) on a record
     whose dictionary is missing. A broker served with --compression lz4 (#12, #387, wired by
     #430, default lz4) stores each compressible payload at or over the 64-byte threshold as a
@@ -11679,8 +11682,7 @@ fn run_peek(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         from_offset,
         Some(limit),
         json,
-        false,
-        false,
+        InspectPayload::default(),
         out,
     )
 }
@@ -11698,6 +11700,7 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut exchange: Option<String> = None;
     let mut raw = false;
     let mut require_dict = false;
+    let mut digests = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -11710,6 +11713,10 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
             "--json" => {
                 json = true;
+                i += 1;
+            }
+            "--digests" => {
+                digests = true;
                 i += 1;
             }
             "--dlq" => {
@@ -11754,6 +11761,11 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("dump requires `--data-dir <dir>`".to_string()))?;
+    if digests && (!json || raw || dlq) {
+        return Err(CliError::Usage(
+            "`--digests` requires `--json` and cannot combine with `--raw` or `--dlq`".to_string(),
+        ));
+    }
     // `--raw` and `--require-dict` are rejected with `--dlq` as a usage error rather than
     // silently ignored: the DLQ view renders the sink's own entry form, not the record frame,
     // so neither flag has an effect there. NOT because the sink is compression-free: a
@@ -11773,7 +11785,18 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     if dlq {
         return cmd_inspect_dlq(Path::new(&data_dir), exchange.as_deref(), limit, json, out);
     }
-    cmd_inspect(Path::new(&data_dir), 0, limit, json, raw, require_dict, out)
+    cmd_inspect(
+        Path::new(&data_dir),
+        0,
+        limit,
+        json,
+        InspectPayload {
+            raw,
+            require_dict,
+            digests,
+        },
+        out,
+    )
 }
 
 /// Parses and runs `scrub` (#92): a strictly READ-ONLY offline full integrity scan of the data dir,
@@ -12158,6 +12181,13 @@ fn run_dict(_args: &[String], _out: &mut impl Write) -> Result<(), CliError> {
     ))
 }
 
+#[derive(Clone, Copy, Default)]
+struct InspectPayload {
+    raw: bool,
+    require_dict: bool,
+    digests: bool,
+}
+
 /// Decodes a data directory offline and writes its durable records (from `from_offset`, at most
 /// `limit` of them) to `out`, then a final note for any torn or corrupt tail recovery would
 /// skip, so the holes are shown, not hidden. Shared by `peek` (a bounded window) and `dump`
@@ -12169,8 +12199,7 @@ fn cmd_inspect(
     from_offset: u64,
     limit: Option<u64>,
     json: bool,
-    raw: bool,
-    require_dict: bool,
+    payload: InspectPayload,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let reader = OfflineReader::open(StdFs::new(data_dir.to_path_buf()))
@@ -12191,11 +12220,16 @@ fn cmd_inspect(
             if limit.is_some_and(|max| shown >= max) {
                 break 'segments;
             }
-            write_record(record, json, raw, require_dict, &resolver, out)?;
+            write_record(record, json, payload, &resolver, out)?;
             shown += 1;
         }
     }
     write_loss(reader.loss_report(), json, out)?;
+    if payload.digests && !reader.loss_report().is_empty() {
+        return Err(CliError::HandledCorruption(
+            "content digest inspection found record loss; discard partial output".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -12280,11 +12314,15 @@ fn decode_failure_reason(e: &DecompressError) -> String {
 fn write_record(
     record: &OwnedRecord,
     json: bool,
-    raw: bool,
-    require_dict: bool,
+    options: InspectPayload,
     resolver: &impl DictResolver,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    let InspectPayload {
+        raw,
+        require_dict,
+        digests,
+    } = options;
     // The strict dictionary gate (#92): an unresolvable non-zero `dict_id` is a hard failure
     // under `--require-dict`, checked from the descriptor alone so it gates `--raw` (which never
     // decodes) exactly like the decoded form.
@@ -12303,6 +12341,7 @@ fn write_record(
     // stored codec plus the decode outcome for a compressed one. `decoded` is `None` where no
     // decode is involved (an uncompressed record, or `--raw`), keeping those lines byte-identical
     // to the pre-#430 output.
+    let mut payload_digest = None;
     let (codec, bytes, decoded): (String, usize, Option<Result<(), String>>) =
         if record.flags.contains(RecordFlags::COMPRESSED) {
             let codec = match read_descriptor(&record.payload) {
@@ -12319,7 +12358,12 @@ fn write_record(
                     resolver,
                     DEFAULT_MAX_DECOMPRESSED_BYTES,
                 ) {
-                    Ok(payload) => (codec, payload.len(), Some(Ok(()))),
+                    Ok(payload) => {
+                        if digests {
+                            payload_digest = Some(inspect_sha256(&payload));
+                        }
+                        (codec, payload.len(), Some(Ok(())))
+                    }
                     Err(e) => (
                         codec,
                         record.payload.len(),
@@ -12328,8 +12372,17 @@ fn write_record(
                 }
             }
         } else {
+            if digests {
+                payload_digest = Some(inspect_sha256(&record.payload));
+            }
             ("none".to_string(), record.payload.len(), None)
         };
+    if digests && payload_digest.is_none() {
+        return Err(CliError::HandledCorruption(format!(
+            "offset {} cannot be decoded for content digest inspection",
+            record.offset.get()
+        )));
+    }
     if json {
         write!(
             out,
@@ -12343,6 +12396,13 @@ fn write_record(
             None => {}
             Some(Ok(())) => write!(out, ",\"decoded\":true")?,
             Some(Err(reason)) => write!(out, ",\"decoded\":false,\"reason\":\"{reason}\"")?,
+        }
+        if let Some(digest) = payload_digest {
+            write!(
+                out,
+                ",\"key_sha256\":\"{}\",\"payload_sha256\":\"{digest}\"",
+                inspect_sha256(&record.key)
+            )?;
         }
         writeln!(out, "}}")?;
     } else {
@@ -12362,6 +12422,12 @@ fn write_record(
         writeln!(out)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn inspect_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Writes a final summary of any torn or corrupt tail the durable prefix dropped (marking the
@@ -14581,11 +14647,19 @@ fn cmd_inspect(
     from_offset: u64,
     limit: Option<u64>,
     json: bool,
-    raw: bool,
-    require_dict: bool,
+    payload: InspectPayload,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let _ = (data_dir, from_offset, limit, json, raw, require_dict, out);
+    let _ = (
+        data_dir,
+        from_offset,
+        limit,
+        json,
+        payload.raw,
+        payload.require_dict,
+        payload.digests,
+        out,
+    );
     Err(CliError::Internal(
         "ironbus peek/dump require a Unix host in v1: on-disk storage is Unix-only".to_string(),
     ))
@@ -17007,6 +17081,155 @@ mod tests {
             assert!(line.contains(&format!("\"offset\":{i}")), "{line}");
             assert!(line.contains("\"crc\":\"ok\""), "{line}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_digests_match_original_bytes_and_leave_store_unchanged() {
+        use sha2::{Digest, Sha256};
+        for codec in [CompressionArg::None, CompressionArg::Lz4] {
+            let (dir, payload) = make_codec_data_dir("content-digests", codec);
+            let before = dir_snapshot(&dir);
+            let args = vec![
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--json".to_string(),
+            ];
+            let mut ordinary = Vec::new();
+            run_dump(&args, &mut ordinary).unwrap();
+            assert!(!String::from_utf8(ordinary).unwrap().contains("sha256"));
+            let mut args = args;
+            args.push("--digests".to_string());
+            let mut out = Vec::new();
+            run_dump(&args, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert_eq!(text.lines().count(), 1);
+            assert!(text.contains(&format!(
+                "\"payload_sha256\":\"{:x}\"",
+                Sha256::digest(&payload)
+            )));
+            // Independently known SHA-256 of the fixture's key "k".
+            assert!(text.contains("\"key_sha256\":\"8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a\""));
+            assert!(!text.contains("edge node telemetry"));
+            assert_eq!(before, dir_snapshot(&dir));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_digests_distinguish_equal_lengths_and_honor_limit_and_empty() {
+        use sha2::{Digest, Sha256};
+        let dir = make_data_dir("content-digest-limit", 3);
+        let base = vec![
+            "--data-dir".to_string(),
+            dir.display().to_string(),
+            "--json".to_string(),
+            "--digests".to_string(),
+        ];
+        let mut args = base.clone();
+        args.extend(["--limit".to_string(), "2".to_string()]);
+        let mut out = Vec::new();
+        run_dump(&args, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for (line, payload) in lines.iter().zip([b"msg-0", b"msg-1"]) {
+            assert!(line.contains("\"bytes\":5"));
+            assert!(line.contains(&format!(
+                "\"payload_sha256\":\"{:x}\"",
+                Sha256::digest(payload)
+            )));
+        }
+        args.pop();
+        args.push("0".to_string());
+        let mut out = Vec::new();
+        run_dump(&args, &mut out).unwrap();
+        assert!(out.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+        let empty = make_data_dir("content-digest-empty", 0);
+        let mut args = base;
+        args[1] = empty.display().to_string();
+        run_dump(&args, &mut out).unwrap();
+        assert!(out.is_empty());
+        std::fs::remove_dir_all(empty).unwrap();
+    }
+
+    #[test]
+    fn dump_digests_reject_incompatible_flags_before_opening_store() {
+        for flags in [
+            vec!["--digests"],
+            vec!["--json", "--digests", "--raw"],
+            vec!["--json", "--digests", "--dlq"],
+        ] {
+            let mut args = vec![
+                "--data-dir".to_string(),
+                "/not-present-content-digests".to_string(),
+            ];
+            args.extend(flags.into_iter().map(str::to_string));
+            let mut out = Vec::new();
+            assert!(matches!(run_dump(&args, &mut out), Err(CliError::Usage(_))));
+            assert!(out.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_digests_refuse_undecodable_record_without_digest_output() {
+        let dir = make_data_dir("content-digest-decode", 1);
+        let reader = OfflineReader::open(StdFs::new(dir.clone())).unwrap();
+        let mut records = reader.read_segment(reader.segment_ids()[0]).unwrap();
+        records[0].flags = RecordFlags::COMPRESSED;
+        // Original raw bytes are shorter than the descriptor. No guessing of
+        // logical bytes or hashing of the invalid stored frame is permitted.
+        let mut out = Vec::new();
+        let options = InspectPayload {
+            digests: true,
+            ..InspectPayload::default()
+        };
+        assert!(matches!(
+            write_record(
+                &records[0],
+                true,
+                options,
+                &inspect_dict_resolver(&dir),
+                &mut out
+            ),
+            Err(CliError::HandledCorruption(_))
+        ));
+        assert!(out.is_empty());
+        drop(reader);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_digests_report_torn_tail_and_fail_without_mutation() {
+        let dir = make_data_dir("content-digest-loss", 4);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("seg-0000000000000000.log"))
+            .unwrap();
+        file.set_len(file.metadata().unwrap().len() - 3).unwrap();
+        file.sync_all().unwrap();
+        let before = dir_snapshot(&dir);
+        let mut out = Vec::new();
+        let args = [
+            "--data-dir".to_string(),
+            dir.display().to_string(),
+            "--json".to_string(),
+            "--digests".to_string(),
+        ];
+        assert!(matches!(
+            run_dump(&args, &mut out),
+            Err(CliError::HandledCorruption(_))
+        ));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"loss\":"));
+        assert!(text.contains("\"offset\":2"));
+        assert!(!text.contains("\"offset\":3"));
+        assert_eq!(before, dir_snapshot(&dir));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
