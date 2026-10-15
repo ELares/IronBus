@@ -537,6 +537,7 @@ read-only. `--data-dir` is REQUIRED. Takes no positional arguments.
 | `--data-dir <dir>` | path | required | path | The data directory to read. |
 | `--limit <n>` | u64 | none (all records) | records | The maximum number of records to show. Omitted, every record is streamed. |
 | `--json` | flag (no value) | off (human text) | n/a | Emit NDJSON instead of the human line. |
+| `--digests` | flag (no value) | off | n/a | Add lowercase `key_sha256` and `payload_sha256` for original key and decoded logical payload bytes. Requires `--json`; rejects `--raw` and `--dlq`. Decode failure or reported loss exits 3; discard partial output. |
 | `--dlq` | flag (no value) | off | n/a | Stream the dead-letter sink (`dlq/`) instead of the main log. An absent or empty `dlq/` shows nothing. |
 | `--raw` | flag (no value) | off | n/a | Show the on-disk frame rather than the decoded logical message: for a compressed record (#430), `bytes` is the STORED (descriptor + stream) length and no decode is attempted; for a raw-stored record it renders the same field set as the decoded form. Rejected with `--dlq`. |
 | `--require-dict` | flag (no value) | off | n/a | Fail strictly (exit 3) on a record whose compression dictionary is missing, instead of degrading to `decoded:false`. The `lz4` path never references a dictionary (its `dict_id` is always 0), so this only trips on a `zstd`-build dictionary record whose sidecar is absent. Rejected with `--dlq`. |
@@ -551,7 +552,16 @@ structurally (`decoded:false` plus a `reason`, `missing-dict:<id>` for an unreso
 dictionary) unless `--require-dict` makes the missing dictionary strict (exit 3). `--raw`
 shows the stored frame instead and never decodes. A raw-stored record (sub-threshold,
 incompressible, or a `--compression none` broker) renders the historical field set
-unchanged under every flag combination.
+unchanged unless `--digests` explicitly adds the two digest fields.
+
+Use `ironbus dump --data-dir /private/stopped-store --json --digests` for content
+reconciliation without exporting message bodies. SHA-256 covers key and logical
+payload bytes separately, including empty or binary values. It does not cover
+headers, subjects, consumer positions or application effects. Inspect each named
+stream separately; this command reads only the selected directory. A successful
+limited dump covers only its selected prefix. Existing segment buffering limits
+remain unchanged. Keep forensic artifacts private and validate the exit status
+before accepting any output. No broker or worker starts and no files are written.
 
 ## `scrub` (offline; Unix only in v1)
 

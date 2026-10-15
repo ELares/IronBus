@@ -45,6 +45,8 @@ tls = ["ironbus-server/tls", "ironbus-client/tls"]
 encryption = ["ironbus-server/encryption", "ironbus-storage/encryption"]
 
 [dependencies]
+# Offline record digests; already linked by server authentication, no new crate.
+sha2 = { version = "0.10", default-features = false }
 ironbus-core = { path = "../ironbus-core", version = "0.1.0" }
 ironbus-proto = { path = "../ironbus-proto", version = "0.1.0" }
 ironbus-client = { path = "../ironbus-client", version = "0.1.0" }
@@ -113,10 +115,9 @@ bytes = { version = "1", default-features = false }
 # (#629/#631/#635, V2-M7). DEV-ONLY (never linked into the shipped `ironbus` binary), permissive
 # (MIT OR Apache-2.0), already in the workspace lock (the server/storage crates use it). The same
 # pure-Rust crypto crates the auth path uses are dev-deps here so a test can MINT a known
-# token-SHA-256 / Argon2id-PHC fixture; they are DEV-ONLY for the CLI (the runtime auth verification
+# Argon2id-PHC fixture; argon2 is DEV-ONLY for the CLI (the runtime auth verification
 # lives in `ironbus-server`, already a normal dependency).
 tempfile = "3"
-sha2 = { version = "0.10", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 # The `ironbus dev` end-to-end test (#796) launches the REAL `ironbus dev` binary as a subprocess and
 # then drives the live broker as a genuine client to prove the acceptance: the demo stream is
